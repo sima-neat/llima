@@ -1,0 +1,1269 @@
+#########################################################
+# Copyright (C) 2025 SiMa Technologies, Inc.
+#
+# This material is SiMa proprietary and confidential.
+#
+# This material may not be copied or distributed without
+# the express prior written permission of SiMa.
+#
+# All rights reserved.
+#########################################################
+import json
+import re
+from dataclasses import dataclass, asdict, field, InitVar
+from typing import Any
+import numpy as np
+from pathlib import Path
+
+from sima_lmm.config.layer_id import LayerID
+from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows
+from sima_utils.logging.sima_logger import sima_log_warning
+
+
+class ExtensibleEnum:
+    """
+    Enum-like base class that exposes class attributes as extensible constants
+    with name/value lookup helpers.
+    """
+    @classmethod
+    def _constants(cls) -> dict[str, Any]:
+        """Return all non-private, non-callable attributes."""
+        return {
+            k: v
+            for k, v in cls.__dict__.items()
+            if not k.startswith("_") and not callable(v)
+        }
+
+    @classmethod
+    def values(cls) -> list[Any]:
+        return list(cls._constants().values())
+
+    @classmethod
+    def names(cls) -> list[str]:
+        return list(cls._constants().keys())
+
+    @classmethod
+    def name_from_value(cls, value: Any) -> str:
+        for name, val in cls._constants().items():
+            if val == value:
+                return name
+        raise ValueError(f"{value!r} is not a valid value in {cls.__name__}")
+
+    @classmethod
+    def value_from_name(cls, name: str) -> Any:
+        try:
+            return cls._constants()[name]
+        except KeyError:
+            raise ValueError(f"{name!r} is not a valid name in {cls.__name__}")
+
+
+class ModelFormat(str, ExtensibleEnum):
+    """
+    Model file format.
+    """
+    FORMAT_HF = "hf"  # HuggingFace safetensors format
+    FORMAT_GGUF = "gguf"  # GGUF format
+
+
+class VlmArchType(str, ExtensibleEnum):
+    """VLM/LLM architecture type.
+    """
+    LLM_GEMMA = "llm-gemma"
+    LLM_GEMMA2 = "llm-gemma2"
+    LLM_GEMMA3 = "llm-gemma3"
+    LLM_LFM2 = "llm-lfm2"
+    LLM_LLAMA = "llm-llama"
+    LLM_MISTRAL = "llm-mistral"
+    LLM_PHI3 = "llm-phi3"
+    LLM_QWEN2 = "llm-qwen2"
+    LLM_QWEN3 = "llm-qwen3"
+    VLM_CUSTOM = "vlm-custom"
+    VLM_GEMMA3 = "vlm-gemma3"
+    VLM_LFM2_VL = "vlm-lfm2_vl"
+    VLM_LLAVA = "vlm-llava"
+    VLM_PALIGEMMA = "vlm-paligemma"
+    VLM_QWEN2_5_VL = "vlm-qwen2_5_vl"
+    VLM_QWEN3_VL = "vlm-qwen3_vl"
+
+class VisionArchType(str, ExtensibleEnum):
+    """Vision architecture type.
+    """
+    CLIP = "clip"
+    SIGLIP = "siglip"
+    SIGLIP2 = "siglip2"
+    QWEN2_VISION_ENCODER = "qwen2_5_vl"
+    QWEN3_VISION_ENCODER = "qwen3_vl"
+
+
+class LlmArchType(str, ExtensibleEnum):
+    """LLM architecture type.
+    """
+    LLAMA = "llama"
+    LFM = "lfm"
+    GEMMA = "gemma"
+    PHI = "phi"
+    QWEN = "qwen"
+    MISTRAL = "mistral"
+
+
+class LlmDataType(str, ExtensibleEnum):
+    """ LLM data type.
+    """
+    F32 = "float32"
+    F16 = "float16"
+    BF16 = "bfloat16"
+    Q4_0 = "mostly-Q4_0"
+    Q4_1 = "mostly-Q4_1"
+    Q8_0 = "mostly-Q8_0"
+    Q5_0 = "mostly-Q5_0"
+    Q5_1 = "mostly-Q5_1"
+    Q2_K = "mostly-Q2_K"
+    Q3_K_S = "mostly-Q3_K_S"
+    Q3_K_M = "mostly-Q3_K_M"
+    Q3_K_L = "mostly-Q3_K_L"
+    Q4_K_S = "mostly-Q4_K_S"
+    Q4_K_M = "mostly-Q4_K_M"
+    Q5_K_S = "mostly-Q5_K_S"
+    Q5_K_M = "mostly-Q5_K_M"
+    Q6_K = "mostly-Q6_K"
+    Q2_K_S = "mostly_Q2_K_S"
+
+
+class GgufFileType(int, ExtensibleEnum):
+    """ The type of the majority of the tensors in GGUF file.
+    """
+    F32 = 0
+    F16 = 1
+    Q4_0 = 2
+    Q4_1 = 3
+    Q8_0 = 7
+    Q5_0 = 8
+    Q5_1 = 9
+    Q2_K = 10
+    Q3_K_S = 11
+    Q3_K_M = 12
+    Q3_K_L = 13
+    Q4_K_S = 14
+    Q4_K_M = 15
+    Q5_K_S = 16
+    Q5_K_M = 17
+    Q6_K = 18
+    Q2_K_S = 21
+    BF16 = 32
+
+
+MLA_CONSTRAINTS: dict = {
+    "max_position_embeddings": 2048,  # k-v cache size
+}
+
+
+class BaseConfig(object):
+    """Base configuration with a set_config method.
+    """
+    def set_config(self, cfg):
+        if isinstance(cfg, dict):
+            for key, value in cfg.items():
+                if hasattr(self, key) and not isinstance(value, dict):
+                    attr = getattr(type(self), key, None)
+                    if isinstance(attr, property) and attr.fset is None:
+                        # Skip read-only properties (lfm2 has num_patches in config.json but it is something else)
+                        continue
+                    setattr(self, key, value)
+
+
+@dataclass
+class VisionModelConfig(BaseConfig):
+    """Configuration of Vision Encoder.
+
+    Attributes:
+        model_type: The type of the model.
+        image_size: The resolution of input images.
+        patch_size: The patch size to divide an image.
+        hidden_size: The dimension of embedding.
+        intermediate_size: The dimension of MLP layer.
+        num_attention_heads: The numbder of attention heads.
+        num_hidden_layers: The number of transformer blocks.
+        hidden_act: The type of activation in MLP.
+        layer_norm_eps: The small value to prevent division by zero.
+        spatial_merge_size: Qwen-VL: Spatial merge factor per dimension (e.g., 2 merges 2x2 patches).
+        temporal_patch_size: Qwen-VL: Number of frames in the temporal dimension per patch.
+        window_size: Qwen2.5-VL: Window size for windowed attention blocks.
+        num_position_embeddings: Qwen3-VL: Number of learnable position embeddings.
+        fullatt_block_indexes: Qwen2.5-VL: Layer indices using full attention instead of windowed.
+        deepstack_visual_indexes: Qwen3-VL: Layer indices for intermediate deepstack merger outputs.
+    """
+    model_type: str = ""
+    arch: VisionArchType = VisionArchType.CLIP
+    image_size: int | list[int] = 0
+    patch_size: int = 0
+    cls_embed: bool = False
+    hidden_size: int = 0
+    intermediate_size: int = 0
+    num_attention_heads: int = 0
+    num_hidden_layers: int = 0
+    hidden_act: str = "gelu_pytorch_tanh"
+    layer_norm_eps: float = 1e-6
+    spatial_merge_size: int = 0
+    temporal_patch_size: int = 0
+    window_size: int = 0
+    num_position_embeddings: int = 0
+    fullatt_block_indexes: list[int] = field(default_factory=list)
+    deepstack_visual_indexes: list[int] = field(default_factory=list)
+
+    def set_config(self, arch: VisionArchType, model_cfg: dict, vision_cfg: dict):
+        if "num_attention_heads" not in vision_cfg and "num_heads" in vision_cfg:
+            vision_cfg["num_attention_heads"] = vision_cfg["num_heads"]
+        if "num_hidden_layers" not in vision_cfg and "depth" in vision_cfg:
+            vision_cfg["num_hidden_layers"] = vision_cfg["depth"]
+        super().set_config(vision_cfg)
+
+        self.arch = arch
+        self.image_size = vision_cfg.get("image_size") or model_cfg.get("tile_size", 0)
+        self.cls_embed = arch == VisionArchType.CLIP
+
+    @property
+    def num_patches(self) -> int | list[int]:
+        if isinstance(self.image_size, int):
+            return self.image_size // self.patch_size
+        elif isinstance(self.image_size, list):
+            return [l // self.patch_size for l in self.image_size]
+        else:
+            raise ValueError("image_size must be int or list of int")
+
+
+    @property
+    def seq_len(self) -> int:
+        if isinstance(self.num_patches, int):
+            return self.num_patches ** 2 + self.cls_embed
+        elif isinstance(self.num_patches, list):
+            return int(np.prod(self.num_patches)) + self.cls_embed
+        else:
+            raise ValueError("image_size must be int or list of int")
+
+
+@dataclass
+class MMConnectionConfig(BaseConfig):
+    """Configuration of Multi-Modal Connection.
+
+    The MM connection consists of 1 or 2 linear layers.
+
+    Attributes:
+        num_layers: The number of linear layers in the connection.
+        hidden_act: The type of activation if num_layers is 2.
+        mm_tokens_per_image: The number of tokens projected for each image.
+            If mm_tokens_per_image is less than num_patches, AvgPool is inserted.
+        proj_dim: The number of projected tokens for an image.
+        downsample_factor: Reduces vision tokens by factor² via PixelUnshuffle.
+    """
+    num_layers: int = 2
+    hidden_act: str = "gelu"
+    mm_tokens_per_image: int = 0
+    proj_dim: int = 0
+    downsample_factor: int = 1
+
+    def set_config(self, vm_arch: VisionArchType, lm_hidden_size: int, model_cfg: dict):
+        super().set_config(model_cfg)
+        self.hidden_act = None if vm_arch == VisionArchType.SIGLIP else "gelu"
+        self.num_layers = 2 if self.hidden_act == "gelu" else 1
+        self.proj_dim = lm_hidden_size
+        if "mm_tokens_per_image" in model_cfg:
+            self.mm_tokens_per_image = model_cfg["mm_tokens_per_image"]
+        elif "num_image_tokens" in model_cfg.get("vision_config", {}):
+            self.mm_tokens_per_image = model_cfg["vision_config"]["num_image_tokens"]
+        elif "num_image_tokens" in model_cfg.get("text_config", {}):
+            self.mm_tokens_per_image = model_cfg["text_config"]["num_image_tokens"]
+
+
+@dataclass
+class TokenEmbedConfig(BaseConfig):
+    """Configuration of tokenizer and embedding.
+
+    Attributes:
+        vocab_size: The size of vocabulary of the tokenizer.
+    """
+    vocab_size: int = 0
+
+    # Keep as InitVar for backward compatibility.
+    tokenizer_type: InitVar[str] = ""
+    tokenizer_path: InitVar[str] = ""
+    special_tokens: InitVar[dict] = dict()
+
+
+@dataclass
+class RopeScalingConfig(BaseConfig):
+    """Configuration of RoPE Scaling.
+
+    Attributes:
+        factor: The scaling factor.
+        low_freq_factor: The low frequency factor (llama3).
+        high_freq_factor: The high frequency factor (llama3).
+        original_max_position_embeddings: The original context length used in model training with
+            the given RoPS settings.
+        long_factor: List of scaling factors for long context (longrope).
+        short_factor: List of scaling factors for short context (longrope).
+        rope_type: The type of RoPE scaling method. Supported types are "linear" or "default",
+            "llama3", "longrope", and "mrope".
+        mrope_section: The section configuration for mRoPE (multimodal RoPE).
+        mrope_interleaved: Whether to mix mRoPE frequencies across dimensions (for Qwen3-VL).
+    """
+    factor: float = 1.0
+    low_freq_factor: float = 0
+    high_freq_factor: float = 0
+    original_max_position_embeddings: int = 0
+    long_factor: list[float] | None = None
+    short_factor: list[float] | None = None
+    rope_type: str = "default"
+    mrope_section: list[int] | None = None
+    mrope_interleaved: bool = False
+
+    def set_config(self, cfg: dict):
+        super().set_config(cfg)
+        # Some models have type instead of rope_type
+        if "type" in cfg and "rope_type" not in cfg:
+            self.rope_type = cfg["type"]
+        
+
+
+@dataclass
+class RoPEConfig(BaseConfig):
+    """Configuration of Rotary Position Embedding.
+
+    Attributes:
+        rope_theta: The theta for RoPE.
+        rope_local_base_freq: The local base frequency.
+        rope_dimension_count: The number of head dimensions rotated by RoPE.
+        rope_scaling: The settings for RoPE scaling.
+    """
+    rope_theta: float = 10000
+    rope_local_base_freq: float = 10000
+    rope_dimension_count: int = 0
+    rope_scaling: RopeScalingConfig = field(default_factory=RopeScalingConfig)
+
+    def set_config(self, text_cfg: dict):
+        head_dim = text_cfg.get("head_dim") or (
+            text_cfg.get("hidden_size", 0) // text_cfg.get("num_attention_heads", 1)
+        )
+        if "rope_parameters" in text_cfg:
+            # HF transformers 5.x format, partial rotary factor is hf only
+            rope_params = text_cfg["rope_parameters"]
+            full = rope_params.get("full_attention", rope_params)
+            local = rope_params.get("sliding_attention", full)
+            self.rope_theta = full.get("rope_theta", 10000)
+            self.rope_local_base_freq = local.get("rope_theta", self.rope_theta)
+            self.rope_scaling = RopeScalingConfig()
+            self.rope_scaling.set_config(full)
+            if not self.rope_dimension_count and "partial_rotary_factor" in full:
+                self.rope_dimension_count = int(head_dim * full["partial_rotary_factor"])
+        else:
+            # GGUF format: flat keys (rope_theta, rope_type, factor, etc.)
+            # rope_dimension_count is gguf only
+            # HF Legacy Format
+            self.rope_theta = text_cfg.get("rope_theta", 10000)
+            self.rope_local_base_freq = text_cfg.get("rope_local_base_freq", self.rope_theta)
+            self.rope_scaling = RopeScalingConfig()
+            self.rope_scaling.set_config(text_cfg)
+            if "rope_scaling" in text_cfg:
+                self.rope_scaling.set_config(text_cfg["rope_scaling"])
+            self.rope_dimension_count = text_cfg.get("rope_dimension_count", 0)
+            if not self.rope_dimension_count and "partial_rotary_factor" in text_cfg:
+                self.rope_dimension_count = int(head_dim * text_cfg["partial_rotary_factor"])
+
+        if not self.rope_dimension_count:
+            self.rope_dimension_count = head_dim
+
+
+@dataclass
+class AttentionBlockConfig(BaseConfig):
+    """Configuration of attention block.
+
+    Attributes:
+        num_attention_heads: The number of attention heads.
+        num_key_value_heads: The number of key/value heads.
+        head_dim: The dimension of query, key, and value heads.
+        swa_enable: The flag to turn on sliding window attention.
+        sliding_window: The size of sliding window for SWA.
+        attention_bias: Reserved for future.
+        attention_dropout: Reserved for future.
+        query_pre_attn_scalar: Reserved for future.
+    """
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 0
+    swa_enable: bool = False
+    sliding_window: int = 0
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    query_pre_attn_scalar: int = 0
+
+    def set_config(self, text_cfg: dict, layer_types: list[str]):
+        super().set_config(text_cfg)
+        hidden_size = text_cfg.get("hidden_size", 0)
+        self.head_dim = text_cfg.get("head_dim", 0)
+        if not self.head_dim and self.num_attention_heads:
+            assert hidden_size % self.num_attention_heads == 0
+            self.head_dim = hidden_size // self.num_attention_heads
+        self.swa_enable = any("sliding_attention" in lt for lt in layer_types)
+        if self.sliding_window is None:
+            self.sliding_window = 0
+
+    @property
+    def q_size(self) -> int:
+        return self.num_attention_heads * self.head_dim
+
+    @property
+    def kv_size(self) -> int:
+        return self.num_key_value_heads * self.head_dim
+
+
+@dataclass
+class MlpBlockConfig(BaseConfig):
+    """Configuration of MLP block.
+
+    Attributes:
+        intermediate_size: The dimension of MLP layer.
+        act: The type of activation.
+        num_layers: The number of layers in MLP.
+        mlp_bias: Reserved for future use.
+    """
+    intermediate_size: int = 0
+    act: str = "silu"
+    num_layers: int = 3
+    mlp_bias: bool = False
+
+    def set_config(self, text_cfg: dict, lm_arch: "LlmArchType"):
+        super().set_config(text_cfg)
+        self.act = (
+            text_cfg.get("hidden_act") or text_cfg.get("hidden_activation")
+            or ("gelu_tanh" if lm_arch == LlmArchType.GEMMA else "silu")
+        )
+
+
+@dataclass
+class LoraConfig(BaseConfig):
+    """Configuration of LoRA adapter for inference.
+
+    If LoRA is enabled, the parallel path for LoRA will be added to the base model,
+    so that the output becomes:
+        y' = Wx + ((alpha/rank) * ABx) + b
+    where the output of the base model is y = Wx + b.
+
+    Attributes:
+        lora_alpha: A scaling factor, equal to (alpha/rank), that controls the adapter's influence
+            on the base model's weights. Typically, alpha = rank or 2*rank.
+        r: The rank of LoRA decomposition.
+        layers_to_transform: A list of integers for layers (or transformer blocks) to be adapted,
+            for example, [0, 2, 5] means layers 0, 2, and 5 only. None means all layers.
+        layers_pattern: Pattern to match layer names in target_modules, if layers_to_transform is
+            specified. None means default pattern, which is "layers.<Idx>.<Blk>.<module>". Typically
+            use it for custom models that deviate from transformer naming convention.
+        target_modules: A list of string for module names or a regex string to apply LoRA.
+            For list of names, either an exact match will be performed or it is checked if the name
+            of the module ends with a string in the list. Typically names are selected from
+            ["k_proj", "v_proj", "q_proj", "o_proj", "gate_proj", "up_proj", "down_proj"].
+            For a single string, a regex match will be performed.
+    """
+    lora_alpha: float = 0
+    r: int = 0
+    layers_to_transform: list[int] | None = None
+    layers_pattern: list[str] | None = None
+    target_modules: list[str] | str | None = None
+
+
+@dataclass
+class DraftConfig(BaseConfig):
+    """Configuration of a speculative decoding draft model.
+
+    Attributes:
+        draft_vocab_size: The vocabulary size used by the draft model's lm_head. Smaller than the
+            target model's vocab_size.
+        num_hidden_layers: Number of transformer layers in the draft model. Always 1 for EAGLE.
+        hidden_size: Hidden dimension of the draft model. Must match the target model's hidden_size.
+    """
+    draft_vocab_size: int = 0
+    num_hidden_layers: int = 0
+    hidden_size: int = 0
+    speculative_budget: int = 16
+
+
+@dataclass
+class LanguageModelConfig(BaseConfig):
+    """Configuration of LLM.
+
+    Attributes:
+        model_type: The type of LLM.
+        data_type: The data type.
+        arch: The architecture of the LLM.
+        token_cfg: The settings of tokenizer.
+        rope_cfg: The settings of RoPE.
+        attn_cfg: The settings of attention block.
+        mlp_cfg: The settings of MLP block.
+        hidden_size: The dimension of the embedding.
+        num_hidden_layers: The number of transformer blocks.
+        max_position_embeddings: The context length.
+        rms_norm_eps: The small value in RMS norm to prevent zero devision.
+        rms_norm_unit_offset: Whether to add 1 to the weights in
+            RMS norm layers before multiplying.  This parameter is
+            created during loading, not read from a configuration file.
+        layer_types: Type of each layer ('full_attention', 'sliding_attention', or 'conv').
+        attn_logit_softcapping: Gemma 2 attention logit soft capping.
+        final_logit_softcapping: Gemma 2 final logit soft capping.
+        lm_head_num_splits: The number of head splits by the compiler.
+        lm_head_split_dim: The dimension of split head by the compiler.
+        conv_L_cache: LFM2 short conv cache length; number of tokens used by conv.
+        conv_bias: Whether conv layers use bias (LFM2).
+        lora_cfg: The configuration of LoRA for the base model.
+    """
+    model_type: str = ""
+    data_type: LlmDataType = LlmDataType.BF16
+    arch: LlmArchType = LlmArchType.LLAMA
+    token_cfg: TokenEmbedConfig = field(default_factory=TokenEmbedConfig)
+    rope_cfg: RoPEConfig = field(default_factory=RoPEConfig)
+    attn_cfg: AttentionBlockConfig = field(default_factory=AttentionBlockConfig)
+    mlp_cfg: MlpBlockConfig = field(default_factory=MlpBlockConfig)
+    hidden_size: int = 0
+    num_hidden_layers: int = 0
+    max_position_embeddings: int = 0
+    rms_norm_eps: float = 1e-05
+    rms_norm_unit_offset: bool = False
+    layer_types: list[str] = field(default_factory=list)
+    attn_logit_softcapping: float | None = None
+    final_logit_softcapping: float | None = None
+    lm_head_num_splits: int = 1
+    lm_head_split_dim: int = 0
+    conv_L_cache: int = 3
+    conv_bias: bool = False
+    lora_cfg: LoraConfig | None  = None
+    draft_cfg: DraftConfig | None = None
+
+    def __post_init__(self):
+        self.lm_head_split_dim = self.token_cfg.vocab_size
+
+    @staticmethod
+    def load(cfg: dict) -> "LanguageModelConfig":
+        cfg["token_cfg"] = TokenEmbedConfig(**cfg["token_cfg"])
+        if cfg["rope_cfg"].get("rope_scaling") is not None:
+            cfg["rope_cfg"]["rope_scaling"] = RopeScalingConfig(**cfg["rope_cfg"]["rope_scaling"])
+        cfg["rope_cfg"] = RoPEConfig(**cfg["rope_cfg"])
+        cfg["attn_cfg"] = AttentionBlockConfig(**cfg["attn_cfg"])
+        cfg["mlp_cfg"] = MlpBlockConfig(**cfg["mlp_cfg"])
+        cfg["data_type"] = LlmDataType(cfg["data_type"])
+        cfg["arch"] = LlmArchType(cfg["arch"])
+        if cfg.get("lora_cfg") is not None:
+            cfg["lora_cfg"] = LoraConfig(**cfg["lora_cfg"])
+        if cfg.get("draft_cfg") is not None:
+            cfg["draft_cfg"] = DraftConfig(**cfg["draft_cfg"])
+        lmc = LanguageModelConfig(**cfg)
+        lmc._calc_lm_head_splits()
+        return lmc
+
+    def set_config(self, text_cfg: dict, dtype: "LlmDataType", lm_arch: "LlmArchType", model_format: "ModelFormat"):
+        self.model_type = text_cfg["model_type"]
+        self.data_type = dtype
+        self.arch = lm_arch
+
+        layer_types = text_cfg.get("layer_types") or []
+        sliding_window = text_cfg.get("sliding_window", 0) or 0
+        num_hidden_layers = text_cfg.get("num_hidden_layers", 0)
+        if not layer_types:
+            if sliding_window > 0:
+                layer_types = ["sliding_attention"] * num_hidden_layers
+            else:
+                layer_types = ["full_attention"] * num_hidden_layers
+
+        self.token_cfg.set_config(text_cfg)
+        self.rope_cfg.set_config(text_cfg)
+        self.attn_cfg.set_config(text_cfg, layer_types)
+        self.mlp_cfg.set_config(text_cfg, lm_arch)
+
+        self.hidden_size = text_cfg.get("hidden_size", 0)
+        self.num_hidden_layers = num_hidden_layers
+        self.max_position_embeddings = text_cfg.get("max_position_embeddings", 0)
+        self.rms_norm_eps = text_cfg.get("rms_norm_eps", text_cfg.get("norm_eps", 1e-05))
+        self.rms_norm_unit_offset = model_format == ModelFormat.FORMAT_HF and lm_arch == LlmArchType.GEMMA
+        self.layer_types = layer_types
+
+        for key in ("attn_logit_softcapping", "final_logit_softcapping", "conv_L_cache", "conv_bias"):
+            if key in text_cfg:
+                setattr(self, key, text_cfg[key])
+
+        # LFM2 adjusts intermediate_size in the model code, not in config.
+        # Apply the same adjustment to match the actual weight dimensions.
+        if text_cfg.get("block_auto_adjust_ff_dim", False):
+            intermediate_size = int(2 * self.mlp_cfg.intermediate_size / 3)
+            block_ffn_dim_multiplier = text_cfg.get("block_ffn_dim_multiplier")
+            if block_ffn_dim_multiplier is not None:
+                intermediate_size = int(block_ffn_dim_multiplier * intermediate_size)
+                block_multiple_of = text_cfg.get("block_multiple_of", 256)
+                intermediate_size = block_multiple_of * (
+                    (intermediate_size + block_multiple_of - 1) // block_multiple_of
+                )
+            self.mlp_cfg.intermediate_size = intermediate_size
+
+        # Enable mRoPE automatically when sections are provided
+        rope_scaling_cfg = getattr(self.rope_cfg, "rope_scaling", None)
+        if rope_scaling_cfg and getattr(rope_scaling_cfg, "mrope_section", None):
+            rope_scaling_cfg.rope_type = "mrope"
+        self._calc_lm_head_splits()
+
+    def set_lora_adapter(self, cfg: dict | None):
+        if cfg is None:
+            self.lora_cfg = None
+        else:
+            self.lora_cfg = LoraConfig()
+            self.lora_cfg.set_config(cfg)
+
+    def set_draft_model(self, cfg: dict | None):
+        if cfg is None:
+            self.draft_cfg = None
+        else:
+            self.draft_cfg = DraftConfig()
+            self.draft_cfg.set_config(cfg)
+            if self.draft_cfg.hidden_size != self.hidden_size:
+                raise ValueError(
+                    f"Draft model hidden_size ({self.draft_cfg.hidden_size}) "
+                    f"does not match target model hidden_size ({self.hidden_size})."
+                )
+
+    def is_lora_target_module(self, base_name: str, module_name: str) -> bool:
+        """
+        Check if a module is a LoRA target.
+
+        The layer index is checked against lora_cfg.layers_to_transform.
+        The module name is checked against lora_cfg.target_modules.
+        The pattern name is checked against lora_cfg.layers_pattern.
+
+        Args:
+            base_name: The base name for the named module, including layer index.
+            module_name: The name of the module without layer and block.
+
+        Returns:
+            True if the module is a LoRA target.
+        """
+        lora_module_name = f"{base_name}.{module_name}"
+        if "language_model.model." in lora_module_name:  # LoRA twist to base name.
+            lora_module_name = lora_module_name.replace("language_model.model.", "language_model.")
+
+        # Check layer index if specified.
+        if self.lora_cfg.layers_to_transform is not None:
+            idx = [int(word) for word in base_name.split(".") if word.isdigit()]
+            assert len(idx) == 1, f"Found unexpected layer index in base name {base_name}"
+            if idx[0] not in self.lora_cfg.layers_to_transform:
+                return False
+
+        # Check custom name pattern if specified.
+        if self.lora_cfg.layers_pattern is not None:
+            if not all(p in lora_module_name for p in self.lora_cfg.layers_pattern):
+                return False
+
+        # Check module name.
+        if "all-linear" in self.lora_cfg.target_modules:
+            return True
+        if isinstance(self.lora_cfg.target_modules, list):
+            full_match = any(
+                lora_module_name == s or module_name == s for s in self.lora_cfg.target_modules
+            )
+            partial_match = any(lora_module_name.endswith(s) for s in self.lora_cfg.target_modules)
+            if full_match or partial_match:
+                return True
+        else:
+            assert isinstance(self.lora_cfg.target_modules, str)
+            if re.fullmatch(lora_module_name, self.lora_cfg.target_modules):
+                return True
+
+        # Check for bundled name if the module name is not found.
+        if module_name == "q_proj" or module_name == "k_proj" or module_name == "v_proj":
+            bundle_name = "qkv_proj"
+        elif module_name == "gate_proj" or module_name == "up_proj":
+            bundle_name = "gate_up_proj"
+        else:
+            return False
+        return bundle_name in self.lora_cfg.target_modules
+
+    def get_lora_rank(self, base_name: str, module_name: str) -> int | None:
+        lora_rank = self.lora_cfg.r if self.is_lora_target_module(base_name, module_name) else None
+        return lora_rank
+
+    def _calc_lm_head_splits(self):
+        # Determine splitting the lm_head by the output feature dimensions is needed.
+        num_bytes_per_element = 2
+        mla_instr_max_num_channels = 8192
+        compiler_max_num_channel_splits = 16
+        num_channels_per_block = 16
+        max_num_channels_per_split = (
+            mla_instr_max_num_channels * compiler_max_num_channel_splits // num_bytes_per_element
+        )
+        num_channels = self.token_cfg.vocab_size
+
+        max_num_channel_blocks_per_split = ceil_div(
+            max_num_channels_per_split, num_channels_per_block
+        )
+        num_channel_blocks = ceil_div(num_channels, num_channels_per_block)
+
+        num_splits = ceil_div(num_channel_blocks, max_num_channel_blocks_per_split)
+        assert num_splits > 0, f"{num_channel_blocks}, {max_num_channel_blocks_per_split}"
+        split_dim = ceil_div(num_channel_blocks, num_splits) * num_channels_per_block
+        last_split_dim = num_channels - (num_splits - 1) * split_dim
+
+        assert 0 < split_dim <= max_num_channels_per_split
+        assert 0 < last_split_dim <= max_num_channels_per_split
+
+        self.lm_head_num_splits = num_splits
+        self.lm_head_split_dim = split_dim
+
+
+@dataclass
+class PipelineConfig(BaseConfig):
+    """Configuration of VLM pipeline.
+
+    Attributes:
+        system_prompt: The system prompt.
+        max_num_tokens: The max number of tokens including the input and generated tokens.
+        input_token_group_size: The group size of input token.
+        input_token_group_offsets: The group offsets of input token.
+        return_logits: Return logits at the last layer.
+        use_strided_kv_cache: Enables strided access to the KV cache stored in DRAM, affecting both
+            read and write operations.
+        enable_filter_sharing: Enables filter sharing between group and single models.
+        quantize_embeddings: Enables embedding quantization to reduce memory consumption.
+        split_mlp: Split the MLP into multiple stages in order to reduce TTFT.
+    """
+    system_prompt: str | None = None
+    chat_template: str | None = None
+    max_num_tokens: int = 1024
+    input_token_group_size: int = 1
+    input_token_group_offsets: list[int] | None = None
+    future_token_mask_size: int = 1
+    return_logits: bool = False
+    use_strided_kv_cache: bool = False
+    enable_filter_sharing: bool = False
+    quantize_embeddings: bool = False
+    split_mlp: bool = False
+
+    def set_system_prompt(self, prompt: str | None):
+        self.system_prompt = prompt
+
+    def set_chat_template(self, chat_template: str | None):
+        self.chat_template = chat_template
+
+    def set_max_num_tokens(self, max_num_tokens: int):
+        assert max_num_tokens > 0
+        self.max_num_tokens = max_num_tokens
+
+    def set_group_size(self, size: int):
+        self.input_token_group_size = size
+
+    def set_group_offsets(self, offsets: list[int]):
+        self.input_token_group_offsets = offsets
+
+    def set_future_token_mask_size(self, mask_size: int):
+        self.future_token_mask_size = mask_size
+
+    def set_return_logits(self, return_logits: bool):
+        self.return_logits = return_logits
+
+    def set_strided_kv_cache(self, use_strided_kv_cache: bool):
+        self.use_strided_kv_cache = use_strided_kv_cache
+
+    def set_enable_filter_sharing(self, enable_filter_sharing: bool):
+        self.enable_filter_sharing = enable_filter_sharing
+
+    def set_quantize_embeddings(self, quantize_embeddings: bool):
+        self.quantize_embeddings = quantize_embeddings
+
+    def set_split_mlp(self, split_mlp: bool):
+        self.split_mlp = split_mlp
+
+
+@dataclass
+class VlmConfig(BaseConfig):
+    """Configuration of Vision Language Model.
+
+    Attributes:
+        model_name (str): The name of the model.
+        model_type (str): The type of the model.
+        vm_cfg (VisionModelConfig | None): The settings of vision model.
+        mm_cfg (MMConnectionConfig | None): The settings of multi-modal connection.
+        lm_cfg (LanguageModelConfig): The settings of language model.
+        pipeline_cfg (PipelineConfig): The settings of application pipeline.
+    """
+    model_name: str = ""
+    model_type: VlmArchType | None = None
+    vm_cfg: VisionModelConfig | None = None
+    mm_cfg: MMConnectionConfig | None = None
+    lm_cfg: LanguageModelConfig = field(default_factory=LanguageModelConfig)
+    pipeline_cfg: PipelineConfig = field(default_factory=PipelineConfig)
+
+    @staticmethod
+    def load(vlm_cfg: dict) -> "VlmConfig":
+        if vlm_cfg.get("vm_cfg") is not None:
+            vlm_cfg["vm_cfg"]["arch"] = VisionArchType(vlm_cfg["vm_cfg"]["arch"])
+            vlm_cfg["vm_cfg"] = VisionModelConfig(**vlm_cfg["vm_cfg"])
+        if vlm_cfg.get("mm_cfg") is not None:
+            vlm_cfg["mm_cfg"] = MMConnectionConfig(**vlm_cfg["mm_cfg"])
+        vlm_cfg["lm_cfg"] = LanguageModelConfig.load(vlm_cfg["lm_cfg"])
+        vlm_cfg["pipeline_cfg"] = PipelineConfig(**vlm_cfg["pipeline_cfg"])
+        vlm_cfg["model_type"] = VlmArchType(vlm_cfg["model_type"])
+        vc = VlmConfig(**vlm_cfg)
+        return vc
+
+    def set_config(
+        self, dtype: LlmDataType, model_type: str, vm_arch: VisionArchType | None,
+        lm_arch: LlmArchType, text_cfg: dict, vision_cfg: dict, model_cfg: dict, *,
+        model_format: ModelFormat
+    ):
+        self.lm_cfg = LanguageModelConfig()
+        self.lm_cfg.set_config(text_cfg, dtype, lm_arch, model_format)
+        self.vm_cfg = VisionModelConfig()
+        self.mm_cfg = MMConnectionConfig()
+        if vm_arch is not None:
+            self.vm_cfg.set_config(vm_arch, model_cfg, vision_cfg)
+            self.mm_cfg.set_config(vm_arch, self.lm_cfg.hidden_size, model_cfg)
+        self.pipeline_cfg = PipelineConfig()
+
+    @staticmethod
+    def from_hf_config(
+        model_format: ModelFormat, model_path: Path, model_cfg: dict,
+        image_resolution: list[int] | None = None
+    ) -> "VlmConfig":
+        """
+        Generate SiMa's configuration for VLM
+        from a HuggingFace config dict and MLA constraints.
+
+        This function does not access the filesystem.
+
+        Args:
+            model_format: The format of the source model.
+            model_path: The path of the source model.
+            model_cfg: The config dict of the source model.
+            image_resolution: The resolution of the input image.
+
+        Returns:
+            VlmConfig for the model.
+        """
+        source_model_name = model_path.name
+        is_vlm = _is_vlm_model(model_cfg)
+        text_config = model_cfg["text_config"] if is_vlm else model_cfg
+        vision_config = model_cfg["vision_config"] if is_vlm else None
+
+        # Check model type
+        assert "model_type" in model_cfg and "architectures" in model_cfg
+        model_type = model_cfg["model_type"]
+        text_model_type = text_config["model_type"]
+        vision_model_type = vision_config["model_type"] if is_vlm else None
+        vm_arch, lm_arch, gen = get_model_arch_gen(
+            is_vlm, model_type, text_model_type, vision_model_type
+        )
+        assert vm_arch is None or vm_arch in VisionArchType.values()
+        assert lm_arch in LlmArchType.values()
+
+        # Check data type
+        if model_cfg.get("dtype"):
+            data_type = LlmDataType(model_cfg["dtype"])
+        elif model_cfg.get("torch_dtype"):
+            data_type = LlmDataType(model_cfg["torch_dtype"])
+        elif text_config.get("dtype"):
+            data_type = LlmDataType(text_config["dtype"])
+        elif text_config.get("torch_dtype"):
+            data_type = LlmDataType(text_config["torch_dtype"])
+        else:
+            assert model_format == ModelFormat.FORMAT_GGUF
+            gguf_type = model_cfg["data_type"]
+            assert gguf_type in GgufFileType.values()
+            gguf_name = GgufFileType.name_from_value(gguf_type)
+            data_type = LlmDataType.value_from_name(gguf_name)
+
+        vlm_cfg = VlmConfig()
+        vlm_cfg.set_config(
+            data_type, model_type, vm_arch, lm_arch, text_config, vision_config,
+            model_cfg, model_format=model_format
+        )
+        vlm_cfg.model_name = source_model_name
+
+        if is_vlm:
+            vlm_cfg.model_type = VlmArchType(f"vlm-{model_type}")
+            if image_resolution is None and vlm_cfg.vm_cfg.arch in (
+                    VisionArchType.QWEN2_VISION_ENCODER,
+                    VisionArchType.QWEN3_VISION_ENCODER,
+                ):
+                raise RuntimeError(
+                    "Qwen-VL models require --input_height and --input_width arguments"
+                )
+            if image_resolution is not None:
+                if vlm_cfg.vm_cfg.arch == VisionArchType.SIGLIP2:
+                    height, width = image_resolution
+                    if height * width > 262144:
+                        raise RuntimeError(f"Input image resolution ({height}x{width}) exceeds the maximum allowed 262,144 pixels for single-block processing in Siglip2.")
+                    if height % 32 != 0 or width % 32 != 0:
+                        raise RuntimeError(f"Input image dimensions ({height}x{width}) must be divisible by 32 for Siglip2 based models.")
+                    vlm_cfg.vm_cfg.image_size = image_resolution
+                elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER):
+                    height, width = image_resolution
+                    divisor = vlm_cfg.vm_cfg.patch_size * vlm_cfg.vm_cfg.spatial_merge_size
+                    if height % divisor != 0 or width % divisor != 0:
+                        raise RuntimeError(
+                            f"For Qwen-VL, image dimensions ({height}x{width}) must be divisible by "
+                            f"(patch_size * spatial_merge_size), which is {divisor}."
+                        )
+                    vlm_cfg.vm_cfg.image_size = image_resolution
+                else:
+                    sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2 or Qwen-VL based.")
+            if vlm_cfg.vm_cfg.arch == VisionArchType.SIGLIP2:
+                if isinstance(vlm_cfg.vm_cfg.image_size, list):
+                    h, w = vlm_cfg.vm_cfg.image_size
+                else:
+                    h = w = vlm_cfg.vm_cfg.image_size
+                ps = vlm_cfg.vm_cfg.patch_size
+                df = vlm_cfg.mm_cfg.downsample_factor
+                if h % (ps * df) != 0 or w % (ps * df) != 0:
+                    raise ValueError(
+                        f"Image dimensions ({h}x{w}) must be divisible by "
+                        f"patch_size * downsample_factor ({ps * df})."
+                    )
+                vlm_cfg.mm_cfg.mm_tokens_per_image = (h // ps // df) * (w // ps // df)
+            elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER):
+                if isinstance(vlm_cfg.vm_cfg.image_size, list):
+                    h, w = vlm_cfg.vm_cfg.image_size
+                else:
+                    h = w = vlm_cfg.vm_cfg.image_size
+                grid_h = h // vlm_cfg.vm_cfg.patch_size // vlm_cfg.vm_cfg.spatial_merge_size
+                grid_w = w // vlm_cfg.vm_cfg.patch_size // vlm_cfg.vm_cfg.spatial_merge_size
+                vlm_cfg.mm_cfg.mm_tokens_per_image = grid_h * grid_w
+            elif vlm_cfg.vm_cfg.arch == VisionArchType.CLIP:
+                imgs = vlm_cfg.vm_cfg.image_size
+                ps = vlm_cfg.vm_cfg.patch_size
+                vlm_cfg.mm_cfg.mm_tokens_per_image = (imgs // ps) ** 2
+            if vlm_cfg.model_type == VlmArchType.VLM_LFM2_VL:
+                if not vlm_cfg.vm_cfg.temporal_patch_size:
+                    vlm_cfg.vm_cfg.temporal_patch_size = 1
+        else:
+            vlm_cfg.model_type = VlmArchType(f"llm-{lm_arch}{gen or ''}")
+            if vlm_cfg.model_type == VlmArchType.LLM_PHI3:
+                # Phi3 has a sliding window that is much larger than the max_num_tokens
+                # used during compilation, hence disable the sliding window.
+                vlm_cfg.lm_cfg.attn_cfg.swa_enable = False
+                vlm_cfg.lm_cfg.layer_types = ["full_attention"] * vlm_cfg.lm_cfg.num_hidden_layers
+            vlm_cfg.mm_cfg = None
+            vlm_cfg.vm_cfg = None
+
+        apply_mla_constraint(vlm_cfg)
+        return vlm_cfg
+
+    @property
+    def is_multimodal(self) -> bool:
+        return self.vm_cfg is not None and self.mm_cfg is not None
+
+    @property
+    def is_supported_multimodal(self) -> bool:
+        return (
+            self.is_multimodal
+            and not (self.model_type == VlmArchType.VLM_GEMMA3 and self.vm_cfg.image_size > 448)
+        )
+
+    def config_pipeline(
+        self,
+        system_prompt: str | None,
+        chat_template: str | None,
+        max_num_tokens: int,
+        language_group_size: int,
+        language_group_offsets: list[int],
+        future_token_mask_size: int,
+    ):
+        self.pipeline_cfg.set_system_prompt(system_prompt)
+        self.pipeline_cfg.set_chat_template(chat_template)
+        self.pipeline_cfg.set_max_num_tokens(max_num_tokens)
+        self.pipeline_cfg.set_group_size(language_group_size)
+        self.pipeline_cfg.set_group_offsets(language_group_offsets)
+        self.pipeline_cfg.set_future_token_mask_size(future_token_mask_size)
+
+    def get_layer_ids(self) -> list[LayerID]:
+        """
+        Get IDs of all layers that comprise the model.
+        """
+        lm_cfg = self.lm_cfg
+        pipeline_cfg = self.pipeline_cfg
+
+        layers = []
+        layer_types = getattr(lm_cfg, "layer_types", [])
+
+        if layer_types:
+            if len(layer_types) != lm_cfg.num_hidden_layers:
+                raise ValueError(
+                    f"layer_types length ({len(layer_types)}) must match "
+                    f"num_hidden_layers ({lm_cfg.num_hidden_layers})."
+                )
+            has_attn = False
+            has_conv = False
+            conv_layer_indices: list[int] = []
+            for i, t in enumerate(layer_types):
+                if t == "conv":
+                    has_conv = True
+                    conv_layer_indices.append(i)
+                    layers.append(LayerID("group_conv", i))
+                    layers.append(LayerID("single_conv", i))
+                elif t == "full_attention" or t == "sliding_attention":
+                    has_attn = True
+                    layers.append(LayerID("group_pre", i))
+                    if i < lm_cfg.num_hidden_layers - 1 or lm_cfg.draft_cfg is not None:
+                        layers.append(LayerID("group_post", i))
+                    layers.append(LayerID("single_pre", i))
+                    layers.append(LayerID("single_post", i))
+                else:
+                    raise ValueError(f"Unsupported layer type: {t}")
+            # Cache models are shared across layers; include only for kinds that exist
+            if has_attn:
+                layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
+                layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
+            if has_conv and layer_types[-1] == "conv":
+                layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
+        else:
+            # Fallback: attention-only if no layer_types
+            layers.extend(LayerID("group_pre", n) for n in range(lm_cfg.num_hidden_layers))
+            layers.extend(
+                LayerID("group_post", n) 
+                for n in range(lm_cfg.num_hidden_layers - (lm_cfg.draft_cfg is None))
+            )
+            layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
+            layers.extend(LayerID("single_pre", n) for n in range(lm_cfg.num_hidden_layers))
+            layers.extend(LayerID("single_post", n) for n in range(lm_cfg.num_hidden_layers))
+            layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
+        if self.vm_cfg is not None and self.is_supported_multimodal:
+            layers.extend(LayerID("vision", n) for n in range(vision_model_layer_count(self.vm_cfg)))
+
+        return layers
+
+
+def _load_json_file(path: Path):
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"JSON file not found: {path}")
+    except json.JSONDecodeError:
+        raise ValueError(f"Invalid JSON format in: {path}")
+
+
+def _write_json_file(data: str, path: Path):
+    with open(path, "w") as outfile:
+        outfile.write(data)
+
+
+def model_file_type(path: Path) -> ModelFormat:
+    """
+    Infer a model's file type.  Raise an exception if it is unknown.
+    This function may try to access the file at the given path.
+    """
+    if str(path).endswith(".gguf"):
+        return ModelFormat.FORMAT_GGUF
+    elif path.is_dir():
+        return ModelFormat.FORMAT_HF
+    else:
+        raise ValueError("Can't determine format of model file " + str(path))
+
+
+
+def _is_vlm_model(hf_cfg: dict) -> bool:
+    """Check if a HuggingFace model is VLM.
+
+    There are two indications in HF's config file:
+     - The "architectures" field is a list containing "xxxForConditionalGeneration";
+     - There are separate "text_config" and "vision_config".
+    """
+    return "ConditionalGeneration" in hf_cfg["architectures"][0] \
+        and "vision_config" in hf_cfg
+
+
+def get_model_arch_gen(
+    is_vlm: bool, model_type: str, text_type: str, vision_type : str
+    ) -> tuple[VisionArchType | None, LlmArchType, str]:
+    """Derive VLM architecture and version from the model types.
+
+    Args:
+        is_vlm: Is the model a vlm or llm
+        model_type: The type of a model.
+        text_type: The type of language model.
+        vision_type: If vlm, type of vision model.
+
+    Returns:
+        Tuple of vision architecture, LLM architecture and version.
+    """
+    lm_arch = None
+    t_reg = re.fullmatch(
+        r"(?P<arch>[a-zA-Z]+)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
+        text_type,
+    )
+    for arch in LlmArchType.values():
+        if arch == t_reg.group("arch"):
+            lm_arch = LlmArchType(arch)
+            break
+
+    if lm_arch is None:
+        raise NotImplementedError(f"Unsupported LLM architecture: {text_type}")
+
+    if is_vlm:
+        vm_arch = VisionArchType(vision_type.split("_vision_model")[0])
+    else:
+        vm_arch = None
+
+    gen = t_reg.group("gen")
+    return vm_arch, lm_arch, gen
+
+
+def llm_parameter_count(text_cfg: dict) -> int:
+    """Calculate parameter count of an LLM model.
+
+    Args:
+        cfg (dict): The configuration dictionary of the model.
+
+    Returns:
+        The size of the model in terms of the parameter count.
+    """
+    vocab_size = text_cfg["vocab_size"]
+
+    embed_dim = text_cfg["hidden_size"]
+    intermediate_size = text_cfg["intermediate_size"]
+    num_hidden_layers = text_cfg["num_hidden_layers"]
+
+    num_attention_heads = text_cfg["num_attention_heads"]
+    num_key_value_heads = text_cfg["num_key_value_heads"]
+
+    head_dim = text_cfg["head_dim"]
+
+    # (vocab_size, embed_dim)
+    count_token_embedding = vocab_size * embed_dim
+
+    # Group Query Attention
+    w_q = w_o = embed_dim * num_attention_heads * head_dim
+    w_k = w_v = embed_dim * num_key_value_heads * head_dim
+    count_attention = w_q + w_o + w_k + w_v
+
+    # 3-layer MLP
+    count_mlp = 3 * embed_dim * intermediate_size
+
+    count_layer_rms = 2 * embed_dim
+
+    count_lm_rms = embed_dim
+
+    total = count_attention + count_mlp + count_layer_rms
+    total *= num_hidden_layers
+    total += count_token_embedding + count_lm_rms
+    return total
+
+
+def apply_mla_constraint(vlm_cfg: VlmConfig) -> None:
+    """Apply MLA constraints.
+
+    TODO: modify RoPE if context_length (max_position_embeddings) is changed.
+
+    Args:
+        vlm_cfg (VlmConfig): The configuration of VLM model.
+
+    Returns:
+        None. Change is made in place.
+    """
+    cfg = vlm_cfg.lm_cfg
+    if cfg is not None:
+        for key, value in MLA_CONSTRAINTS.items():
+            if getattr(cfg, key) > value:
+                setattr(cfg, key, value)
+
+
+def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
+    """
+    Get the indices of all group cache models for the pipeline configuration.
+
+    Returns:
+        Indices of group cache models in ascending order.
+    """
+    if cfg.input_token_group_offsets is None:
+        raise RuntimeError("Group token offsets have not been computed")
+
+    return list(cfg.input_token_group_offsets)
+
+
+def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
+    """
+    Get the indices of all single cache models for the pipeline configuration.
+
+    Returns:
+        Indices of single cache models in ascending order.
+    """
+    # A model is used for each batch of future_token_mask_size tokens.
+    # The model's index is the last token's index in the batch.  The last
+    # batch's index is the last token's index, even if it is not evenly
+    # spaced.  For example, given future_token_mask_size=5 and
+    # max_num_tokens=24, the indices will be 4, 9, 14, 19, 23.
+    incr = cfg.future_token_mask_size
+    single_cache_token_idx_list = list(
+        range(incr - 1, cfg.max_num_tokens, incr)
+    )
+
+    if cfg.max_num_tokens - 1 not in single_cache_token_idx_list:
+        single_cache_token_idx_list.append(cfg.max_num_tokens - 1)
+
+    return single_cache_token_idx_list
+
+
+def vision_model_layer_count(cfg: VisionModelConfig) -> int:
+    """
+    Get the number of layers in the vision model.
+    """
+    elem_size = 2
+    seq_len = cfg.seq_len
+    num_mla_rows_per_head = seq_len * ceil_div_row(seq_len) * elem_size
+    is_single_vision_model = num_mla_rows_per_head <= mla_max_num_rows
+
+    if is_single_vision_model:
+        return 1
+    elif cfg.model_type == VlmArchType.VLM_LLAVA:
+        # Last vision layer of LLAVA is unused
+        return cfg.num_hidden_layers - 1
+    else:
+        return cfg.num_hidden_layers
+
+
+if __name__ == "__main__":
+    import sys
+    from sima_lmm.gguf.gguf_conversion import GgufModel
+    from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
+    from sima_lmm.preproc.vlm_helper import VlmHelper
+
+    input_path = sys.argv[1]
+    lora_path = sys.argv[2] if len(sys.argv) == 3 else None
+
+    print(f"Model is: {input_path}")
+    print(f"LoRA is: {lora_path}")
+
+    model_path = Path(input_path)
+    model_format = model_file_type(model_path)
+    match model_format:
+        case ModelFormat.FORMAT_GGUF:
+            gguf_model = GgufModel(model_path)
+            model_config = gguf_model.model_config
+        case ModelFormat.FORMAT_HF:
+            hf_cache = LocalHuggingFaceModel.create_from_directory(
+                directory=model_path,
+                layer_names=None,
+            )
+            model_config = hf_cache.config
+        case _:
+            raise ValueError("Can't determine format of model file " + str(input_path))
+
+    vlm_cfg = VlmConfig.from_hf_config(model_format, model_path, model_config)
+
+    if lora_path is not None:
+        lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
+        vlm_cfg.lm_cfg.set_lora_adapter(lora_config)
+
+    output_filename = (
+        f"sima-{vlm_cfg.model_type}-{vlm_cfg.lm_cfg.arch.value}"
+        f"-{vlm_cfg.lm_cfg.gen.value}-{vlm_cfg.lm_cfg.size}.json"
+    )
+    json_vlm = json.dumps(asdict(vlm_cfg), indent=4)
+    _write_json_file(json_vlm, Path(output_filename))
+
+    # Load back from the saved file.
+    sima_dict = _load_json_file(Path(output_filename))
+    sima_vlm = VlmConfig.load(sima_dict)
+
+    assert sima_vlm == vlm_cfg
+    print("Test of round-trip VLM config is successful!")

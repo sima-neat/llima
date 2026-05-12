@@ -1,0 +1,30 @@
+[submodule "third_party/json"]
+	path = third_party/json
+	url = https://github.com/nlohmann/json.git
+[submodule "third_party/fmt"]
+	path = third_party/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "third_party/spdlog"]
+	path = third_party/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "third_party/minja"]
+	path = third_party/minja
+	url = https://github.com/ochafik/minja.git
+[submodule "third_party/tokenizers-cpp"]
+	path = third_party/tokenizers-cpp
+	url = https://github.com/mlc-ai/tokenizers-cpp
+[submodule "third_party/cnpy"]
+	path = third_party/cnpy
+	url = https://github.com/rogersce/cnpy
+[submodule "third_party/eigen"]
+	path = third_party/eigen
+	url = https://gitlab.com/libeigen/eigen.git
+[submodule "third_party/cpp-httplib"]
+	path = third_party/cpp-httplib
+	url = https://github.com/yhirose/cpp-httplib.git
+[submodule "third_party/llama.cpp"]
+	path = third_party/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+[submodule "third_party/msgpack-c"]
+	path = third_party/msgpack-c
+	url = https://github.com/msgpack/msgpack-c

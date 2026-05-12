@@ -1,0 +1,76 @@
+
+[build-system]
+requires = [
+    "scikit-build-core",
+    "pyyaml",
+    "nanobind>=2.12.0",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "sima-lmm"
+description = "SiMa.ai LMM library"
+requires-python = ">=3.11"
+dynamic = ["version", "dependencies", "optional-dependencies"]
+authors = [{name = "SiMa.ai", email = "support@sima.ai"}]
+license-files = [
+    "LICENSE",
+    "third_party/json/LICENSE.MIT",
+    "third_party/fmt/LICENSE",
+    "third_party/spdlog/LICENSE",
+    "third_party/minja/LICENSE",
+    "third_party/tokenizers-cpp/LICENSE",
+    "third_party/eigen/LICENSE",
+    "third_party/cpp-httplib/LICENSE",
+    "third_party/llama.cpp/LICENSE",
+    "third_party/msgpack-c/LICENSE_1_0.txt",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Unix",
+    "License :: Other/Proprietary License",
+]
+
+[project.urls]
+homepage = "https://sima.ai"
+
+[project.scripts]
+llima = "sima_lmm.devkit.devkit_demo:main"
+llima-compile = "sima_lmm.host.compile_lmm:main"
+llima-compile-lora = "sima_lmm.host.compile_lora_adapter:main"
+llima-deploy = "sima_lmm.host.deploy_lmm:main"
+llima-deploy-lora = "sima_lmm.host.deploy_lora:main"
+llima-benchmark = "sima_lmm.host.benchmark:main"
+
+[tool.scikit-build]
+logging.level = "DEBUG"
+experimental = true
+wheel.cmake = false
+wheel.exclude = ["sima_lmm/devkit/cpp/*", "**/__pycache__", "**/*.pyc"]
+sdist.include = ["sima_lmm/VERSION"]
+sdist.exclude = ["**/__pycache__", "**/*.pyc"]
+wheel.install-dir = "sima_lmm"
+build.verbose = true
+
+[tool.scikit-build.metadata.version]
+provider = "pyproject_metadata"
+provider-path = "."
+
+[tool.scikit-build.metadata.dependencies]
+provider = "pyproject_metadata"
+provider-path = "."
+
+[tool.scikit-build.metadata.optional-dependencies]
+provider = "pyproject_metadata"
+provider-path = "."
+
+[[tool.scikit-build.overrides]]
+if.env.CROSS_COMPILE = "aarch64-linux-gnu-"
+wheel.cmake = true
+cmake.define.CMAKE_TOOLCHAIN_FILE = "toolchain-sima.cmake"
+
+[[tool.scikit-build.overrides]]
+if.platform-machine = "aarch64"
+wheel.cmake = true

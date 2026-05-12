@@ -1,0 +1,423 @@
+#########################################################
+# Copyright (C) 2025 SiMa Technologies, Inc.
+#
+# This material is SiMa proprietary and confidential.
+#
+# This material may not be copied or distributed without
+# the express prior written permission of SiMa.
+#
+# All rights reserved.
+#########################################################
+
+import logging
+import numpy as np
+import time
+
+from dataclasses import asdict, dataclass
+
+from afe.ir.tensor_type import ScalarType
+from afe.ir.quantization_conv import block_quantize_weight_tensor
+
+from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
+
+from sima_lmm.gguf.gguf_conversion import GgufModel
+from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
+from sima_lmm.model.base import (
+    BaseModel, EvalMode, FileGenMode, FileGenPrecision, LoraGenMode, GenConfiguration
+)
+from sima_lmm.model.language_pre_model import LanguagePreModel
+from sima_lmm.model.language_post_model import LanguagePostModel
+from sima_lmm.model.language_cache_model import LanguageCacheModel
+from sima_lmm.model.language_conv_model import LanguageConvModel
+from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
+from sima_lmm.utils import calc_freq_real_imag, round_up_to
+from sima_lmm.config.layer_id import LayerID
+from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
+
+
+bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
+
+@dataclass
+class LanguageModel(BaseModel):
+    """Language model implementation.
+
+    The language model consists of a stack of transformer layers and some layers after the last
+    transformer layer to obtain the output probability or next token index.
+
+    The implementation assumes a transformer is broken up into 3 parts.
+    1. PreCacheModel: Pre cache model implements the transformer layer up to the batched
+        matrix-multiply in the self-attention block.
+    2. CacheModel: Cache model implements the self-attention block of a transformer layer without
+        the qkv projection.
+    3. PostCacheModel: Post cache model implements the transformer layer after the self-attention
+        block, including the layers after the last transformer layer.
+    """
+    def __post_init__(self):
+        if self.cfg.pipeline_cfg.input_token_group_offsets:
+            self.cfg.pipeline_cfg.input_token_group_offsets.sort()
+
+    def gen_files(
+        self,
+        gen_mode: FileGenMode,
+        *,
+        gen_config: GenConfiguration,
+        log_level: int = logging.NOTSET,
+        num_processes: int = 1,
+        resume: bool = False,
+    ):
+        """
+        Generates files based on the provided file generation mode.
+
+        Args:
+            gen_mode: File generation mode.
+            gen_config: Generation configuration of precision and lora for each layer.
+                Layer IDs can be obtained using VlmConfig.get_layer_ids.
+                The precision dict is a map from layer ID to precision for each layer to be
+                processed. Unrecognized layer IDs will be ignored.  Layers that are not in the map
+                will not be processed.
+                The lora dict is a map from layer ID to lora graph mode for each layer.
+            log_level: Logging level.
+            resume: Generate the files if missing.
+        """
+        # Create a list of all models to compile
+        model_list = list()
+        num_tokens = self.cfg.pipeline_cfg.input_token_group_size
+        single_model_num_tokens = 1 if self.cfg.lm_cfg.draft_cfg is None else self.cfg.lm_cfg.draft_cfg.speculative_budget
+        if (
+            gen_mode in [FileGenMode.SOURCE_TO_FP, FileGenMode.SOURCE_TO_QUANT]
+            and self.cfg.pipeline_cfg.quantize_embeddings
+        ):
+            _, embeddings_scale = self.get_embeddings_tensor()
+        else:
+            embeddings_scale = None
+
+        precision = gen_config["precision"]
+        lora_mode = gen_config.get("lora", None)
+
+        for layer_id, curr_precision in precision.items():
+            part_model = None
+            match layer_id.part:
+                case "group_pre":
+                    part_model = self._get_part_model(
+                        "pre", num_tokens, layer_idx=layer_id.part_idx,
+                        embeddings_scale=embeddings_scale
+                    )
+                case "single_pre":
+                    part_model = self._get_part_model(
+                        "pre", single_model_num_tokens, layer_idx=layer_id.part_idx,
+                        embeddings_scale=embeddings_scale
+                    )
+                case "group_post":
+                    part_model = self._get_part_model(
+                        "post", num_tokens, layer_idx=layer_id.part_idx,
+                        embeddings_scale=embeddings_scale
+                    )
+                case "single_post":
+                    part_model = self._get_part_model(
+                        "post", single_model_num_tokens, layer_idx=layer_id.part_idx,
+                        embeddings_scale=embeddings_scale
+                    )
+                case "group_cache":
+                    part_model = self._get_part_model(
+                        "cache", num_tokens, token_idx=layer_id.part_idx
+                    )
+                case "single_cache":
+                    part_model = self._get_part_model(
+                        "cache", single_model_num_tokens, token_idx=layer_id.part_idx
+                    )
+                case "group_conv":
+                    part_model = self._get_part_model(
+                        "conv_fused", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_conv":
+                    part_model = self._get_part_model(
+                        "conv_fused", 1, layer_idx=layer_id.part_idx
+                    )
+                case "conv_post_final":
+                    part_model = self._get_part_model(
+                        "conv_post_final", 1, layer_idx=layer_id.part_idx
+                    )
+                case _:
+                    # Not a part of this model
+                    continue
+            curr_cfg = {"precision": curr_precision}
+            if lora_mode:
+                curr_cfg["lora"] = lora_mode[layer_id]
+            model_list.append((part_model, curr_cfg))
+
+        # Finished creating model_list.  Compile these models.
+        self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
+
+    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+        assert self.vlm_helper is not None
+        assert len(ifms) == 1
+        input_embeds = ifms[0]
+        embeddings_tensor, _ = self.get_embeddings_tensor()
+
+        # Obtain sliding window config.
+        swa_enable = self.cfg.lm_cfg.attn_cfg.swa_enable
+        sliding_window = self.cfg.lm_cfg.attn_cfg.sliding_window
+        layer_types = self.cfg.lm_cfg.layer_types
+
+        # Initialize rope.
+        global_freq_real, global_freq_imag = self.calc_freq_real_imag(False)
+        if swa_enable:
+            local_freq_real, local_freq_imag = self.calc_freq_real_imag(True)
+
+        # Initialize cache.
+        kv_size = self.cfg.lm_cfg.attn_cfg.head_dim * self.cfg.lm_cfg.attn_cfg.num_key_value_heads
+        cache_key = [
+            np.zeros((1, 1, self.cfg.pipeline_cfg.max_num_tokens, kv_size), dtype=np.float32)
+            for _ in range(self.cfg.lm_cfg.num_hidden_layers)
+        ]
+        cache_val = [
+            np.zeros((1, 1, self.cfg.pipeline_cfg.max_num_tokens, kv_size), dtype=np.float32)
+            for _ in range(self.cfg.lm_cfg.num_hidden_layers)
+        ]
+
+        # Determine group models.
+        token_group_offsets = self.cfg.pipeline_cfg.input_token_group_offsets
+        num_input_tokens = input_embeds.shape[2]
+        group_token_idx_list = list()
+        padded_token_size = 1
+
+        token_idx_set = set(range(self.cfg.pipeline_cfg.max_num_tokens))
+        if token_group_offsets:
+            for i in token_group_offsets:
+                padded_token_size = i + self.cfg.pipeline_cfg.input_token_group_size
+                tmp_token_idx_set = (
+                    token_idx_set - set(range(i, min(num_input_tokens, padded_token_size)))
+                )
+                if len(tmp_token_idx_set) != len(token_idx_set):
+                    token_idx_set = tmp_token_idx_set
+                    token_idx_set.add(i)
+                    group_token_idx_list.append(i)
+                if num_input_tokens <= padded_token_size:
+                    break
+        token_idx_list = sorted(list(token_idx_set))
+
+        # Pad the input embedding if needed and determine which token indices to run.
+        if (padding := padded_token_size - num_input_tokens) > 0:
+            input_embeds = np.pad(input_embeds, ((0, 0), (0, 0), (0, padding), (0, 0)))
+
+        # For paligemma, the original implementation requires all the input tokens to be processed
+        # together (attention mask = 0) to obtain the matching output.
+        if (
+            self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+            and padded_token_size < num_input_tokens
+        ):
+            sima_log_warning(
+                f"Number of input tokens ({num_input_tokens}) is greater than the maximum allowed"
+                f" number of tokens ({padded_token_size}) for PaliGemma."
+                "\nPlease increase the estimated_max_num_query_tokens in config_pipeline()."
+            )
+
+        # Run language model.
+        perf_cnt_begin = time.perf_counter_ns()
+
+        new_tokens = list()
+        post_ofms = None
+        new_token = None
+        for token_idx in token_idx_list:
+            if token_idx in group_token_idx_list:
+                num_tokens = self.cfg.pipeline_cfg.input_token_group_size
+                next_token_idx = min(num_input_tokens, token_idx + num_tokens)
+            else:
+                num_tokens = 1
+                next_token_idx = token_idx + 1
+            sima_log_info("Processing token no. %d-%d", token_idx, next_token_idx)
+
+            use_input_tokens = token_idx < num_input_tokens
+            if not use_input_tokens:
+                perf_cnt_begin = time.perf_counter_ns()
+
+            for layer_idx in range(self.cfg.lm_cfg.num_hidden_layers):
+                is_global = (self.layer_types[layer_idx] == "full_attention")
+                pre_ifms = list()
+                if layer_idx == 0:
+                    if use_input_tokens:
+                        pre_ifms.append(input_embeds[..., token_idx:token_idx + num_tokens, :])
+                    else:
+                        assert new_token is not None
+                        pre_ifms.append(
+                            np.expand_dims(embeddings_tensor[new_token], axis=(0, 1, 2))
+                        )
+                else:
+                    assert post_ofms is not None
+                    pre_ifms.append(post_ofms[0])
+                if is_global:
+                    pre_ifms.append(global_freq_real[..., token_idx:token_idx + num_tokens, :])
+                    pre_ifms.append(global_freq_imag[..., token_idx:token_idx + num_tokens, :])
+                else:
+                    pre_ifms.append(local_freq_real[..., token_idx:token_idx + num_tokens, :])
+                    pre_ifms.append(local_freq_imag[..., token_idx:token_idx + num_tokens, :])
+                pre_model = self._get_part_model("pre", num_tokens, layer_idx=layer_idx)
+                pre_ofms = pre_model.run_model(eval_mode, pre_ifms)
+
+                # Update cache.
+                cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
+                cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[2]
+
+                # For multi-token models, there is no need to run the cache and post models for the
+                # last hidden layer since pre model already updates the cache.
+                if num_tokens > 1 and layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
+                    if token_idx + num_tokens >= num_input_tokens:
+                        # The last input token is included. Run the cache and post model for the
+                        # last input token to generate the first output token.
+                        idx = num_input_tokens - 1 - token_idx
+                        pre_ifms[0] = pre_ifms[0][..., idx:idx + 1, :]
+                        pre_ofms[0] = pre_ofms[0][..., idx:idx + 1, :]
+                        num_tokens = 1
+                        token_idx = num_input_tokens - 1
+                    else:
+                        break
+
+                if is_global:
+                    token_idx_begin = 0
+                else:
+                    token_idx_begin = max(0, token_idx + num_tokens - sliding_window)
+                if self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
+                    aligned_token_idx = min(
+                        round_up_to(token_idx+1, self.cfg.pipeline_cfg.future_token_mask_size) - 1,
+                        self.cfg.pipeline_cfg.max_num_tokens - 1
+                    )
+                else:
+                    aligned_token_idx = token_idx
+                cache_ifms = [
+                    pre_ofms[0],
+                    cache_key[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :],
+                    cache_val[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
+                ]
+                if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and num_tokens > 1:
+                    assert is_global
+                    mask = np.zeros((1, 1, num_tokens, token_idx + num_tokens), dtype=np.float32)
+                    mask[0, 0, :, num_input_tokens - token_idx:] = np.finfo(np.float32).min
+                    cache_ifms.insert(2, mask)
+                elif self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
+                    mask = np.full(
+                        (1, 1, 1, aligned_token_idx + 1 - token_idx_begin),
+                        np.finfo(np.float32).min,
+                        dtype=np.float32
+                    )
+                    mask[..., :token_idx + 1 - token_idx_begin] = 0
+                    cache_ifms.insert(2, mask)
+
+                cache_model = self._get_part_model(
+                    "cache", num_tokens, token_idx=aligned_token_idx - token_idx_begin
+                )
+                cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
+
+                post_ifms = [pre_ifms[0], cache_ofms[0]]
+                post_model = self._get_part_model("post", num_tokens, layer_idx=layer_idx)
+                post_ofms = post_model.run_model(eval_mode, post_ifms)
+
+            # Download the argmax output.
+            if num_input_tokens <= next_token_idx:
+                if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
+                    new_token = post_ofms[0].item()
+                else:
+                    lm_output = np.concatenate(post_ofms, axis=-1)
+                    new_token = np.argmax(lm_output)
+                if self.cfg.pipeline_cfg.return_logits:
+                    new_tokens.append(lm_output)
+                else:
+                    new_tokens.append(new_token)
+                perf_cnt_delta = (time.perf_counter_ns() - perf_cnt_begin) * 1e-9
+
+                if self.cfg.pipeline_cfg.return_logits:
+                    sima_log_info("Got logit: %s in %ds", lm_output, perf_cnt_delta)
+                else:
+                    sima_log_info("Got token: %d in %fs", new_token, perf_cnt_delta)
+
+                if new_token in self.vlm_helper.stop_tokens:
+                    break
+
+        # Return the generated tokens.
+        return np.array([new_tokens])
+
+    def calc_freq_real_imag(self, use_swa: bool) -> tuple[np.ndarray, np.ndarray]:
+        if use_swa:
+            theta = self.cfg.lm_cfg.rope_cfg.rope_local_base_freq
+            rope_type = "default"
+        else:
+            theta = self.cfg.lm_cfg.rope_cfg.rope_theta
+            rope_type = self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
+        rope_dimension_count = self.cfg.lm_cfg.rope_cfg.rope_dimension_count
+        scaling_cfg = asdict(self.cfg.lm_cfg.rope_cfg.rope_scaling)
+        max_num_tokens = self.cfg.pipeline_cfg.max_num_tokens
+        idx_base = 1 if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA else 0
+        return calc_freq_real_imag(
+            max_num_tokens, rope_type, theta, rope_dimension_count, scaling_cfg, idx_base
+        )
+
+    def get_embeddings_tensor(self) -> tuple[np.ndarray, float | np.ndarray | None]:
+        assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
+        embeddings_name = f"{self.hf_model.language_model_param_base_name}.embed_tokens.weight"
+        if isinstance(self.hf_model, LocalHuggingFaceModel):
+            embeddings_tensor = self.hf_model.load_np_param(embeddings_name)
+        else:
+            assert isinstance(self.hf_model, GgufModel)
+            embeddings_tensor = self.hf_model.load_np_param(embeddings_name, force_float=True)
+        embeddings_tensor = embeddings_tensor.astype(np.float32)
+        if self.cfg.lm_cfg.arch == LlmArchType.GEMMA:
+            embeddings_tensor *= self.cfg.lm_cfg.hidden_size ** 0.5
+
+        if self.cfg.pipeline_cfg.quantize_embeddings:
+            # Reshape to (1, 1, vocab_size, 1, hidden_size)
+            embeddings_tensor = embeddings_tensor.reshape(
+                1, 1, embeddings_tensor.shape[0], 1, embeddings_tensor.shape[1]
+            )
+            q_embeddings, scale = block_quantize_weight_tensor(
+                embeddings_tensor, per_channel=False, bits=8, c_block_size=None
+            )
+            q_embeddings = q_embeddings.reshape(q_embeddings.shape[-3], q_embeddings.shape[-1])
+            return q_embeddings, scale
+
+        return embeddings_tensor.astype(bfloat16).astype(np.float32), None
+
+    def _get_part_model(
+        self, part: str, num_tokens: int, layer_idx: int | None = None,
+        token_idx: int | None = None, embeddings_scale: float | np.ndarray | None = None
+    ) -> BaseModel:
+        match part:
+            case "pre":
+                model_name = f"{self.model_name}_n{num_tokens}_pre_layer{layer_idx}"
+                assert layer_idx is not None
+                return LanguagePreModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                    embeddings_scale=embeddings_scale
+                )
+            case "post":
+                model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
+                assert layer_idx is not None
+                return LanguagePostModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                    final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
+                    embeddings_scale=embeddings_scale
+                )
+            case "cache":
+                model_name = f"{self.model_name}_n{num_tokens}_cache_token{token_idx}"
+                assert token_idx is not None
+                return LanguageCacheModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
+                    logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping
+                )
+            case "conv_fused":
+                model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_conv"
+                assert layer_idx is not None
+                return LanguageConvModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                    final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
+                )
+            case "conv_post_final":
+                model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}_conv_final"
+                assert layer_idx is not None
+                return LanguageConvPostModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                    final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
+                )

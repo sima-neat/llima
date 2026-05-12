@@ -1,0 +1,41 @@
+#########################################################
+# Copyright (C) 2025 SiMa Technologies, Inc.
+#
+# This material is SiMa proprietary and confidential.
+#
+# This material may not be copied or distributed without
+# the express prior written permission of SiMa.
+#
+# All rights reserved.
+#########################################################
+
+version: 1  # Unused, must be set to 1.
+formatters:
+  simple:
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: simple
+    stream: ext://sys.stderr
+  console_noformat:
+    class: logging.StreamHandler
+    level: INFO
+    stream: ext://sys.stderr
+  file:
+    class: logging.FileHandler
+    level: INFO
+    formatter: simple
+    filename: run.log
+    mode: w
+loggers:
+# Example how to configure logger that will not propagate messages to its parent logger.
+  tests:
+    level: INFO
+    handlers: [console_noformat]
+    propagate: no
+root:
+  level: DEBUG
+  handlers: [file]
+disable_existing_loggers: False
