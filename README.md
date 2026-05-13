@@ -8,38 +8,16 @@ Model compilation is not documented in this repository. Compile models in the
 NEAT SDK using the ModelSDK plugin, then copy the generated runtime model
 directory to the DevKit.
 
-## Runtime Layout
+## Debian Packages
 
-- `sima_lmm/devkit` - Python runtime entry points and model loading helpers.
-- `sima_lmm/devkit/cpp` - C++ runtime, Python bindings, CLI, web, and ZMQ server.
-- `sima_lmm/config` - Runtime configuration dataclasses.
-- `sima_lmm/model` - Python model representation used by tooling.
-- `sima_lmm/assets` - Sample media used for runtime warm-up.
+The DevKit runtime is delivered as three Debian packages:
+
+- `sima-lmm-core` - C++ runtime library: `libsima_lmm_runtime.so`.
+- `sima-lmm-dev` - public C++ headers and `SimaLMM` CMake package metadata.
+- `sima-lmm-cli` - lean Python runtime package, nanobind extension, and `llima`
+  command-line entry point.
 
 ## Runtime Requirements
-
-Build and run on a Modalix DevKit with the NEAT runtime packages installed.
-The MLA path uses the system MLASHM dispatcher:
-
-- `libneatdispatchercore.so`
-- `libsimaaimem.so`
-- a running `mlashmcomplex` service
-
-Building LLIMA also requires the NEAT internals development package:
-
-- `neat-internals-dev` - dispatcher/config headers and the `NeatInternals`
-  CMake package used by LLIMA's dispatcher backend.
-
-If using the workspace appcomplex service, the LLIMA shell must use the same
-MLASHM endpoints as the service:
-
-```bash
-export MLASHM_CTRL_PATH=/tmp/mlactrl_workspace
-export MLASHM_DATA_PATH=/mlashmdata_workspace
-export MLASHM_RUNTIME_SHM_PATH=/dev/shm/mlashmdata_workspace
-```
-
-## Build On DevKit
 
 Install basic build dependencies:
 
@@ -56,6 +34,9 @@ LLIMA:
 sudo apt install ./neat-internals-dev_*_arm64.deb
 ```
 
+`neat-internals-dev` provides dispatcher/config headers and the `NeatInternals`
+CMake package used by LLIMA's dispatcher backend.
+
 Install Rust, then restart the shell or source the generated cargo environment:
 
 ```bash
@@ -69,14 +50,9 @@ Populate public third-party dependencies:
 git submodule update --init --recursive
 ```
 
+## Build On DevKit
+
 ### Debian Runtime Packages
-
-The DevKit runtime is delivered as three Debian packages:
-
-- `sima-lmm-core` - C++ runtime library: `libsima_lmm_runtime.so`.
-- `sima-lmm-dev` - public C++ headers and `SimaLMM` CMake package metadata.
-- `sima-lmm-cli` - lean Python runtime package, nanobind extension, and `llima`
-  command-line entry point.
 
 Build all runtime packages:
 
@@ -96,13 +72,16 @@ Build only selected packages:
 ./scripts/release/build_llima_deb.sh --clean --package sima-lmm-cli
 ```
 
-Install the generated runtime packages:
+### Install Debian Packages
+
+Install the generated runtime packages on the DevKit:
 
 ```bash
 sudo apt install ./sima-lmm-*-core.deb ./sima-lmm-*-cli.deb
 ```
 
-Install `sima-lmm-dev` only on systems that compile C++ consumers against LLIMA:
+Install `sima-lmm-dev` only on systems that compile C++ consumers against
+LLIMA:
 
 ```bash
 sudo apt install ./sima-lmm-*-dev.deb
@@ -168,14 +147,6 @@ SIMA_LLIMA_RUN_PROFILE=1         # log per-model runtime latency
 SIMA_LLIMA_RUN_DISABLE_QUEUE=1   # run models immediately instead of queueing
 SIMA_LLIMA_RUN_DISABLE_VISION=1  # language-only debugging
 ```
-
-Dispatcher diagnostics:
-
-```bash
-SIMA_RPCMLASHM_PROFILE=1
-SIMA_MLASHM_MULTI_IO_STATS=1
-```
-
 ## Interactive CLI Commands
 
 Inside `llima run --mode cli`:
