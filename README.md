@@ -1,21 +1,26 @@
-# LLIMA
+# LLiMa
 
-LLIMA is the on-device runtime for SiMa.ai generative models. It provides the
-Python and C++ runtime used to run LLM, VLM, and ASR model packages on a Modalix
-DevKit.
+LLiMa is SiMa.ai's framework for compiling, deploying, and running GenAI models,
+including LLMs, VLMs, and ASR models.
 
-Model compilation is not documented in this repository. Compile models in the
-NEAT SDK using the ModelSDK plugin, then copy the generated runtime model
-directory to the DevKit.
+This repository provides both runtime code and SDK-side compile/deploy tooling.
+It can be installed on a Modalix DevKit to run compiled model directories, and
+in the NEAT SDK for model compilation workflows. The Debian package sections
+below focus on the DevKit runtime installation.
 
-## Debian Packages
+## Packages
 
-The DevKit runtime is delivered as three Debian packages:
+The Modalix DevKit runtime is delivered as three Debian packages:
 
 - `sima-lmm-core` - C++ runtime library: `libsima_lmm_runtime.so`.
 - `sima-lmm-dev` - public C++ headers and `SimaLMM` CMake package metadata.
-- `sima-lmm-cli` - lean Python runtime package, nanobind extension, and `llima`
+- `sima-lmm-cli` - lean Python runtime package, nanobind extension, and `LLiMa`
   command-line entry point.
+
+The NEAT SDK compile/deploy tooling is delivered as a pure Python wheel:
+
+- `sima-lmm[sdk]` - compiler SDK dependencies, including internal SiMa packages.
+- `sima-lmm[sdk_ext]` - external MoLE, benchmark, and evaluation dependencies.
 
 ## Runtime Requirements
 
@@ -28,14 +33,14 @@ python3 -m pip install --user build
 ```
 
 Install the matching NEAT internals development package before configuring
-LLIMA:
+LLiMa:
 
 ```bash
 sudo apt install ./neat-internals-dev_*_arm64.deb
 ```
 
 `neat-internals-dev` provides dispatcher/config headers and the `NeatInternals`
-CMake package used by LLIMA's dispatcher backend.
+CMake package used by LLiMa's dispatcher backend.
 
 Install Rust, then restart the shell or source the generated cargo environment:
 
@@ -57,19 +62,19 @@ git submodule update --init --recursive
 Build all runtime packages:
 
 ```bash
-./scripts/release/build_llima_deb.sh --clean
+./scripts/release/build_LLiMa_deb.sh --clean
 ```
 
-The packages are written to the LLIMA repo root, matching NEAT core's main CPack
+The packages are written to the LLiMa repo root, matching NEAT core's main CPack
 behavior. The script uses CPack and creates a local `build/.deb-build-venv` for
 CMake's Python build requirements, including nanobind.
 
 Build only selected packages:
 
 ```bash
-./scripts/release/build_llima_deb.sh --clean --core
-./scripts/release/build_llima_deb.sh --clean --core --dev
-./scripts/release/build_llima_deb.sh --clean --package sima-lmm-cli
+./scripts/release/build_LLiMa_deb.sh --clean --core
+./scripts/release/build_LLiMa_deb.sh --clean --core --dev
+./scripts/release/build_LLiMa_deb.sh --clean --package sima-lmm-cli
 ```
 
 ### Install Debian Packages
@@ -81,7 +86,7 @@ sudo apt install ./sima-lmm-*-core.deb ./sima-lmm-*-cli.deb
 ```
 
 Install `sima-lmm-dev` only on systems that compile C++ consumers against
-LLIMA:
+LLiMa:
 
 ```bash
 sudo apt install ./sima-lmm-*-dev.deb
@@ -95,10 +100,10 @@ dependency sets:
 - `sima-lmm[sdk]` - compiler SDK dependencies, including internal SiMa packages.
 - `sima-lmm[sdk_ext]` - external MoLE, benchmark, and evaluation dependencies.
 
-Build a wheel:
+Build a pure Python SDK wheel:
 
 ```bash
-python3 -m build --wheel -Cbuild-dir="build/{wheel_tag}"
+python3 -m build --wheel -Cbuild-dir="build/{wheel_tag}" -Cwheel.cmake=false
 ```
 
 Install the wheel with an optional dependency set when needed:
@@ -108,48 +113,41 @@ python3 -m pip install "dist/sima_lmm-*.whl[sdk]"
 python3 -m pip install "dist/sima_lmm-*.whl[sdk_ext]"
 ```
 
-If the source tree is on an NFS share and the build cannot write generated
-files, make the workspace writable from the DevKit:
-
-```bash
-sudo chmod -R u+rwX,go+rwX /workspace/neat/llima
-```
-
 ## Run
 
-LLIMA expects a compiled runtime model directory produced by the NEAT SDK
+LLiMa expects a compiled runtime model directory produced by the NEAT SDK
 ModelSDK plugin. The directory should contain the runtime configuration and
 compiled ELF files required by the DevKit runtime.
 
 Run the CLI:
 
 ```bash
-llima run <model_dir> --mode cli
+LLiMa run <model_dir> --mode cli
 ```
 
 Run the web server:
 
 ```bash
-llima run <model_dir> --mode web
+LLiMa run <model_dir> --mode web
 ```
 
 Model resolution order:
 
 1. Use the provided path if it exists.
-2. Check `/media/nvme/llima/models/<model>`.
-3. Check `$LLIMA_MODELS_PATH/<model>` if set.
+2. Check `/media/nvme/LLiMa/models/<model>`.
+3. Check `$LLiMa_MODELS_PATH/<model>` if set.
 
 ## Useful Runtime Environment Variables
 
 ```bash
-SIMA_LLIMA_RUN_PRINT_INOUTS=1    # log model input/output tensor summaries
-SIMA_LLIMA_RUN_PROFILE=1         # log per-model runtime latency
-SIMA_LLIMA_RUN_DISABLE_QUEUE=1   # run models immediately instead of queueing
-SIMA_LLIMA_RUN_DISABLE_VISION=1  # language-only debugging
+SIMA_LLiMa_RUN_PRINT_INOUTS=1    # log model input/output tensor summaries
+SIMA_LLiMa_RUN_PROFILE=1         # log per-model runtime latency
+SIMA_LLiMa_RUN_DISABLE_QUEUE=1   # run models immediately instead of queueing
+SIMA_LLiMa_RUN_DISABLE_VISION=1  # language-only debugging
 ```
 ## Interactive CLI Commands
 
-Inside `llima run --mode cli`:
+Inside `LLiMa run --mode cli`:
 
 - `add image <file>` - add an image.
 - `clear image` - clear all images.
