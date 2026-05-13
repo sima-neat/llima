@@ -37,11 +37,7 @@ class LanguageConvModel(LanguagePartBaseModel):
     Outputs:
         - hidden (1, hidden, 1, num_tokens) for non-last layer
         - if last layer, same as LanguagePostModel (argmax or split logits)
-        - conv_cache_out:
-            * grouped prefill (num_tokens > 1): full concat state
-              (1, hidden, 1, num_tokens + L - 1), where concat = [conv_cache, bx]
-            * decode (num_tokens == 1): rolling window state
-              (1, hidden, 1, L - 1), i.e. concat[..., 1:]
+        - conv_cache_out (1, L, 1, hidden) updated cache
     """
 
     num_tokens: int
@@ -72,12 +68,10 @@ class LanguageConvModel(LanguagePartBaseModel):
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
         )
         cache_shape = (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.lm_cfg.conv_L_cache - 1)
-        output_cache_shape = (
-            1,
-            self.cfg.lm_cfg.hidden_size,
-            1,
-            self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 2,
-        )
+        if self.num_tokens > 1:
+            output_cache_shape = (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+        else:
+            output_cache_shape = (1, self.cfg.lm_cfg.hidden_size, 1, 1)
 
         self._onnx_builder.create_input_node("conv_cache", cache_shape)
 
@@ -119,16 +113,7 @@ class LanguageConvModel(LanguagePartBaseModel):
         tail = self._onnx_builder.build_op(
             f"{base_name}.tail.concat", [prev_last, bx], "Concat", axis=3
         )
-        conv_cache_out = self._onnx_builder.build_op(
-            f"{base_name}.tail.window",
-            [
-                tail,
-                np.array([1], dtype=np.int64),
-                np.array([self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 1], dtype=np.int64),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
+        conv_cache_out = bx
 
         w_raw = self.get_hf_param(f"{base_name}.conv.weight")
         if isinstance(w_raw, tuple):
@@ -224,13 +209,7 @@ class LanguageConvModel(LanguagePartBaseModel):
         bx = builder.create_mul_node(b, x)
 
         tail = builder.create_concat_node([mla_input_conv_cache, bx], 2)
-        conv_cache_out = builder.create_slice_node(
-            tail,
-            [1],
-            [self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 1],
-            [1],
-            [2],
-        )
+        conv_cache_out = bx
 
         conv_out = build_conv(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.conv", tail,

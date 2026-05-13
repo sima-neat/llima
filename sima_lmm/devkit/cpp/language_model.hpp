@@ -101,23 +101,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void clear_cached_token_ids() { _cached_token_ids.clear(); }
 
     private:
-        struct CachedState {
-            // Hidden-layer indices belonging to this stateful family.
-            std::vector<uint8_t> layer_indices;
-            // MLA buffer name prefix; full name is `{prefix}{layer_idx}`.
-            std::string buffer_name_prefix;
-            // Sequence positions in one tail snapshot (e.g. conv_L_cache - 1).
-            uint16_t tail_len;
-            // Elements per sequence position (e.g. hidden_size).
-            uint32_t num_elems;
-            // Bytes per element.
-            size_t elem_size;
-            // Bytes per tail snapshot = tail_len * num_elems * elem_size.
-            size_t tail_bytes;
-            // Tail snapshots indexed as [layer_slot][boundary_idx][byte_offset].
-            std::vector<std::vector<std::vector<uint8_t>>> checkpoints;
-        };
-
         virtual void _initialize() override;
         virtual void _finalize() override;
         void _define_buffer_freq_table(const std::string& name);
@@ -129,20 +112,15 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<MLABufferSlice>& ifms,
             const std::vector<MLABufferSlice>& ofms
         );
+        void _define_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
         void _define_attn_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
-        void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
-        void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
+        void _define_conv_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
         void _define_models();
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(uint16_t num_tokens, uint16_t token_idx);
         std::filesystem::path _get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
-        uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
-        void _save_state_checkpoint(
-            size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
-        );
-        void _move_state_tail_for_decode(uint16_t valid_tokens);
 
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
@@ -173,8 +151,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         Eigen::bfloat16* _embeddings_tensor_ptr;
         std::vector<uint32_t> _cached_token_ids;
         uint32_t _cached_first_generated_token;
-        std::vector<uint16_t> _checkpoint_boundaries;
-        std::vector<CachedState> _cached_states;
 
         std::atomic<bool> _is_running;
         std::optional<std::string> _reloc_name;

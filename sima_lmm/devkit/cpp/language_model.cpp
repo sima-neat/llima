@@ -28,8 +28,6 @@
 //
 //**************************************************************************
 
-#include <algorithm>
-#include <cstring>
 #include <regex>
 
 #include <Eigen/Dense>
@@ -83,58 +81,6 @@ LanguageModel::LanguageModel(
         } else {
             _cfg.lm_cfg.layer_types.resize(_cfg.lm_cfg.num_hidden_layers, "full_attention");
         }
-    }
-
-    if (_use_group_token_models) {
-        // Collect indices for all stateful layer families.
-        std::vector<uint8_t> conv_layer_indices;
-        for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-            if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-                conv_layer_indices.emplace_back(layer_idx);
-            }
-        }
-        // Future: collect mamba_layer_indices, deltanet_layer_indices, etc.
-
-        // Build _checkpoint_boundaries once if ANY stateful layer family exists.
-        // Future: extend the condition with `|| !mamba_layer_indices.empty() || ...`.
-        if (!conv_layer_indices.empty()) {
-            const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
-            const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
-            // Checkpoint at each grouped start offset stores the state tail before that block.
-            for (const auto& offset: offsets) {
-                if (offset) {
-                    _checkpoint_boundaries.emplace_back(offset);
-                }
-            }
-            if (!offsets.empty()) {
-                // Extra boundary after last grouped block supports reuse beyond grouped offsets.
-                uint32_t extra_boundary = offsets.back() + group_size;
-                if (extra_boundary < _cfg.pipeline_cfg.max_num_tokens) {
-                    _checkpoint_boundaries.emplace_back(extra_boundary);
-                }
-            }
-        }
-
-        //Per-family CachedState init. Each stateful layer family gets its own block.
-        if (!conv_layer_indices.empty()) {
-            LanguageModel::CachedState conv_state;
-            conv_state.buffer_name_prefix = "conv_cache_history_l";
-            conv_state.tail_len = std::max<uint16_t>(1, _cfg.lm_cfg.conv_L_cache - 1);
-            conv_state.num_elems = _cfg.lm_cfg.hidden_size;
-            conv_state.elem_size = sizeof(Eigen::bfloat16);
-            conv_state.tail_bytes = static_cast<size_t>(
-                conv_state.tail_len * conv_state.num_elems * conv_state.elem_size
-            );
-            conv_state.layer_indices = std::move(conv_layer_indices);
-
-            const auto num_boundaries = _checkpoint_boundaries.size();
-            conv_state.checkpoints.resize(conv_state.layer_indices.size());
-            for (auto& checkpoints: conv_state.checkpoints) {
-                checkpoints.resize(num_boundaries, std::vector<uint8_t>(conv_state.tail_bytes));
-            }
-            _cached_states.emplace_back(std::move(conv_state));
-        }
-        // Future: similar block for mamba/Deltanet families.
     }
     _initialize();
 }
@@ -283,13 +229,8 @@ uint32_t LanguageModel::run_model_prefill(
     if (!timer_ttft.has_value())
         timer_ttft = ChronoTimer{true};
     const uint16_t num_input_tokens = input_token_ids.size();
-    const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
     uint16_t token_idx{};
     uint32_t next_token_id{};
-    uint16_t last_group_valid_tokens = 0;
-    if (!_cached_states.empty()) {
-        num_cached_tokens = _prepare_state_checkpoints_for_prefill(num_cached_tokens);
-    }
 
     if (num_input_tokens == num_cached_tokens) {
         // All input tokens are already cached.
@@ -308,9 +249,7 @@ uint32_t LanguageModel::run_model_prefill(
                 continue;
             if (token_idx <= num_cached_tokens && token_idx + num_tokens > num_cached_tokens)
                 break;
-            // Number of cached tokens are greater than the supported group offsets.
             token_idx = num_cached_tokens;
-            it = offsets.end();
             break;
         }
 
@@ -318,9 +257,6 @@ uint32_t LanguageModel::run_model_prefill(
             if (it != offsets.end()) {
                 assert(token_idx >= *it && token_idx < *it + num_tokens);
                 token_idx = *it;
-                last_group_valid_tokens = std::min(
-                    num_input_tokens, static_cast<uint16_t>(token_idx + num_tokens)
-                ) - token_idx;
                 next_token_id = run_model_once(num_tokens, token_idx, num_input_tokens, 0);
                 ++it;
                 token_idx += num_tokens;
@@ -335,13 +271,6 @@ uint32_t LanguageModel::run_model_prefill(
                 );
                 return next_token_id;
             }
-        }
-        if (
-            !_cached_states.empty() 
-            && last_group_valid_tokens > 0
-            && last_group_valid_tokens < group_size
-        ) {
-            _move_state_tail_for_decode(last_group_valid_tokens);
         }
     } else {
         for (token_idx = num_cached_tokens; token_idx < num_input_tokens; ++token_idx) {
@@ -372,7 +301,6 @@ void LanguageModel::run_model_decode(
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
         _cached_token_ids.emplace_back(token_id);
         token_id = next_token_id;
-
         auto duration = timer_tps.stop(true);
         _notify_new_token(next_token_id, duration);
         if (_stop_token_ids.contains(token_id)) {
@@ -477,8 +405,7 @@ uint32_t LanguageModel::run_model_once(
             }
             _post_model_map.at(model_key).add_to_queue(&ifm_map);
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-            LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
-            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+            _conv_model_map.at(model_key).add_to_queue(&ifm_map);
 
             if (
                 num_input_tokens > next_token_idx
@@ -501,7 +428,7 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
-            _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+            _conv_final_model_map.at(model_key).add_to_queue(&ifm_map);
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
@@ -511,18 +438,6 @@ uint32_t LanguageModel::run_model_once(
 
     // Run all the queued models.
     MLAModelWithBuffer::run_queue();
-
-    // If this run landed exactly on a checkpoint boundary, save the tail.
-    if (!_cached_states.empty()) {
-        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
-            if (_checkpoint_boundaries[i] == next_token_idx) {
-                // With custom group offsets, a partial prefill group can land on a boundary;
-                const uint16_t valid_tokens = next_token_idx - token_idx;
-                _save_state_checkpoint(i, num_tokens, valid_tokens);
-                break;
-            }
-        }
-    }
 
     if (logits_ptr) {
         assert(num_tokens == 1 && _cfg.pipeline_cfg.return_logits);
@@ -611,7 +526,7 @@ void LanguageModel::_initialize() {
         );
     }
 
-    // Clear the KV caches and caches states.
+    // Clear the KV caches.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
@@ -622,97 +537,6 @@ void LanguageModel::_initialize() {
     }
 
     _logger->info("Language model initialize completed");
-}
-
-// Restore the latest checkpoint <= num_cached_tokens so grouped prefill can resume from a saved position.
-uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens) {
-    // Manual clamp semantics: if cache reuse asks past the last grouped block,
-    // clamp to last_offset + group_size before selecting a checkpoint boundary.
-    const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
-    const uint16_t clamp_token_count =
-        static_cast<uint16_t>(offsets.back() + _cfg.pipeline_cfg.input_token_group_size);
-    if (num_cached_tokens > clamp_token_count) {
-        num_cached_tokens = clamp_token_count;
-    }
-
-    // Restore latest checkpoint boundary <= requested cache length.
-    auto it = std::upper_bound(
-        _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), num_cached_tokens
-    );
-    if (it == _checkpoint_boundaries.begin()) {
-        for (const auto& state: _cached_states) {
-            for (const auto& layer_idx: state.layer_indices) {
-                get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx)).clear();
-            }
-        }
-        return 0;
-    }
-    --it;
-    uint16_t restored_token_count = *it;
-    auto requested_boundary = std::distance(_checkpoint_boundaries.begin(), it);
-    const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
-    for (auto& state: _cached_states) {
-        const size_t dst_offset = static_cast<size_t>(
-            tail_begin * state.num_elems * state.elem_size
-        );
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& checkpoints = state.checkpoints[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.upload(
-                checkpoints[requested_boundary].data(),
-                dst_offset,
-                state.tail_bytes,
-                true
-            );
-        }
-    }
-    return restored_token_count;
-}
-
-
-void LanguageModel::_save_state_checkpoint(
-    size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
-) {
-    // Save the L-1 tail of each stateful layer's MLA buffer
-    // so a future prefill can resume from this boundary without replay.
-    const uint32_t tail_row_offset = (num_tokens > 1)
-        ? static_cast<uint32_t>(valid_tokens - 1)
-        : static_cast<uint32_t>(_cfg.pipeline_cfg.input_token_group_size - 1);
-
-    for (auto& state: _cached_states) {
-        const size_t src_offset_bytes = tail_row_offset * state.num_elems * state.elem_size;
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
-            auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
-            std::memcpy(
-                state.checkpoints[layer_slot][boundary_idx].data(),
-                ptr + src_offset_bytes,
-                state.tail_bytes
-            );
-        }
-    }
-}
-
-
-void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
-    // After a partial last group, move the valid tail to the end of the conv buffer,
-    //  where the decode MLAModel expects it.
-    const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
-    for (auto& state: _cached_states) {
-        const size_t src_offset_bytes = (valid_tokens - 1) * state.num_elems * state.elem_size;
-        const size_t dst_offset_bytes = tail_begin * state.num_elems * state.elem_size;
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
-            auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
-            std::memmove(ptr + dst_offset_bytes, ptr + src_offset_bytes, state.tail_bytes);
-            buf.flush_cache();
-        }
-    }
 }
 
 
@@ -764,8 +588,10 @@ void LanguageModel::_define_buffers() {
             _cfg.lm_cfg.attn_cfg.get_kv_size()
         };
     }
-    const uint16_t conv_working_len = _cfg.pipeline_cfg.input_token_group_size + _cfg.lm_cfg.conv_L_cache - 2;
-    std::vector<size_t> conv_cache_shape{conv_working_len, _cfg.lm_cfg.hidden_size};
+    std::vector<size_t> conv_cache_shape{
+        _cfg.pipeline_cfg.max_num_tokens + _cfg.lm_cfg.conv_L_cache - 1,
+        _cfg.lm_cfg.hidden_size
+    };
     for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
         if (_cfg.lm_cfg.layer_types[i] == "conv") {
             define_buffer(fmt::format("conv_cache_history_l{}", i), conv_cache_shape);
@@ -833,6 +659,16 @@ void LanguageModel::_define_model(
 ) {
     LanguageModelMap& map = get_model_map(model_type);
     map.emplace(key, MLAModelWithBuffer(model_path, ifms, ofms));
+}
+
+
+void LanguageModel::_define_models_iter(
+    uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+) {
+    if (_cfg.lm_cfg.layer_types[layer_idx] == "conv")
+        _define_conv_models_iter(num_tokens, token_idx, layer_idx);
+    else
+        _define_attn_models_iter(num_tokens, token_idx, layer_idx);
 }
 
 
@@ -1023,17 +859,10 @@ void LanguageModel::_define_attn_models_iter(
 }
 
 
-void LanguageModel::_define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx) {
-    if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-        _define_conv_models_iter(num_tokens, layer_idx);
-    }
-}
-
-
-void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx) {
-    LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-    const uint16_t tail_size = std::max<uint16_t>(1, _cfg.lm_cfg.conv_L_cache - 1);
-    const uint16_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
+void LanguageModel::_define_conv_models_iter(
+    uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+) {
+    LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
 
     // Conv model.
     std::vector<MLABufferSlice> conv_ifms;
@@ -1048,19 +877,16 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
     conv_ifms.emplace_back(
         MLABufferSlice{
             &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
-            {tail_begin, 0},
-            {tail_size, _cfg.lm_cfg.hidden_size}
+            {token_idx, 0},
+            {_cfg.lm_cfg.conv_L_cache - 1, _cfg.lm_cfg.hidden_size}
         }
     );
     conv_ofms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))});
     conv_ofms.emplace_back(
         MLABufferSlice(
             &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
-            {num_tokens > 1 ? 0 : tail_begin, 0},
-            {
-                static_cast<uint32_t>(num_tokens + tail_size - 1),
-                _cfg.lm_cfg.hidden_size
-            }
+            {token_idx + _cfg.lm_cfg.conv_L_cache - 1, 0},
+            {num_tokens, _cfg.lm_cfg.hidden_size}
         )
     );
     _define_model(
@@ -1107,33 +933,18 @@ void LanguageModel::_define_models() {
     for (const auto& num_tokens: num_tokens_vec) {
         const auto& max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
         const auto& num_hidden_layers = _cfg.lm_cfg.num_hidden_layers;
-
         if (num_tokens == 1) {
             for (uint16_t token_idx = 0; token_idx < max_num_tokens; ++token_idx) {
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
-                    if (
-                        _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-                        || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-                    ) {
-                        _define_attn_models_iter(num_tokens, token_idx, layer_idx);
-                    }
+                    _define_models_iter(num_tokens, token_idx, layer_idx);
                 }
             }
         } else {
             for (const auto& token_idx: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
-                    if (
-                        _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-                        || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-                    ) {
-                        _define_attn_models_iter(num_tokens, token_idx, layer_idx);
-                    }
+                    _define_models_iter(num_tokens, token_idx, layer_idx);
                 }
             }
-        }
-
-        for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
-            _define_state_models_iter(num_tokens, layer_idx);
         }
     }
 }
@@ -1141,7 +952,7 @@ void LanguageModel::_define_models() {
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
     // Swap the model weights with the data from the `{_devkit_dir}/../npy_files/{reloc_name}`.
-    // Instead of overwriting the model-owned DRAM space, allocate new buffers populated
+    // Instead of overwrite the dram space allocated by the mla-rt, allocate new buffers populated
     // with the data read from the npy files and relocates the dram addresses of the dma
     // descriptors so that the models use the weights from the new buffers.
 
