@@ -27,10 +27,3 @@
 #  SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
 #
 # **************************************************************************
-
-from pathlib import Path
-
-
-def library_dir() -> str:
-    "Return the path to the sima-lmm runtime library directory."
-    return Path(__file__).absolute().parent / "lib"

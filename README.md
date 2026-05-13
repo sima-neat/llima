@@ -25,6 +25,11 @@ The MLA path uses the system MLASHM dispatcher:
 - `libsimaaimem.so`
 - a running `mlashmcomplex` service
 
+Building LLIMA also requires the NEAT internals development package:
+
+- `neat-internals-dev` - dispatcher/config headers and the `NeatInternals`
+  CMake package used by LLIMA's dispatcher backend.
+
 If using the workspace appcomplex service, the LLIMA shell must use the same
 MLASHM endpoints as the service:
 
@@ -40,8 +45,15 @@ Install basic build dependencies:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3-pip libfftw3-dev libyaml-cpp-dev cppzmq-dev simaai-memory-lib-dev
+sudo apt install -y git cmake pkg-config python3-pip python3-venv python3-dev libfftw3-dev libyaml-cpp-dev cppzmq-dev libreadline-dev simaai-memory-lib-dev
 python3 -m pip install --user build
+```
+
+Install the matching NEAT internals development package before configuring
+LLIMA:
+
+```bash
+sudo apt install ./neat-internals-dev_*_arm64.deb
 ```
 
 Install Rust, then restart the shell or source the generated cargo environment:
@@ -57,16 +69,64 @@ Populate public third-party dependencies:
 git submodule update --init --recursive
 ```
 
+### Debian Runtime Packages
+
+The DevKit runtime is delivered as three Debian packages:
+
+- `sima-lmm-core` - C++ runtime library: `libsima_lmm_runtime.so`.
+- `sima-lmm-dev` - public C++ headers and `SimaLMM` CMake package metadata.
+- `sima-lmm-cli` - lean Python runtime package, nanobind extension, and `llima`
+  command-line entry point.
+
+Build all runtime packages:
+
+```bash
+./scripts/release/build_llima_deb.sh --clean
+```
+
+The packages are written to the LLIMA repo root, matching NEAT core's main CPack
+behavior. The script uses CPack and creates a local `build/.deb-build-venv` for
+CMake's Python build requirements, including nanobind.
+
+Build only selected packages:
+
+```bash
+./scripts/release/build_llima_deb.sh --clean --core
+./scripts/release/build_llima_deb.sh --clean --core --dev
+./scripts/release/build_llima_deb.sh --clean --package sima-lmm-cli
+```
+
+Install the generated runtime packages:
+
+```bash
+sudo apt install ./sima-lmm-*-core.deb ./sima-lmm-*-cli.deb
+```
+
+Install `sima-lmm-dev` only on systems that compile C++ consumers against LLIMA:
+
+```bash
+sudo apt install ./sima-lmm-*-dev.deb
+```
+
+### Python Wheels For SDK Work
+
+The Python wheel path is still used for SDK/build-facing workflows and optional
+dependency sets:
+
+- `sima-lmm[sdk]` - compiler SDK dependencies, including internal SiMa packages.
+- `sima-lmm[sdk_ext]` - external MoLE, benchmark, and evaluation dependencies.
+
 Build a wheel:
 
 ```bash
-GIT_HASH=local python3 -m build --wheel -Cbuild-dir="build/{wheel_tag}"
+python3 -m build --wheel -Cbuild-dir="build/{wheel_tag}"
 ```
 
-Or install editable for active development:
+Install the wheel with an optional dependency set when needed:
 
 ```bash
-GIT_HASH=local python3 -m pip install -e . -Cbuild-dir="build/{wheel_tag}"
+python3 -m pip install "dist/sima_lmm-*.whl[sdk]"
+python3 -m pip install "dist/sima_lmm-*.whl[sdk_ext]"
 ```
 
 If the source tree is on an NFS share and the build cannot write generated

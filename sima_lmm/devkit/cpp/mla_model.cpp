@@ -77,7 +77,7 @@ void disconnect_mla_rt() {
 std::map<std::filesystem::path, uint16_t> MLAModelWithBuffer::_unique_model_path_to_idx_map;
 std::vector<std::filesystem::path> MLAModelWithBuffer::_unique_model_paths;
 std::vector<mla_model_p> MLAModelWithBuffer::_unique_model_ptrs;
-std::vector<MLAModelWithBuffer::QueuedRun> MLAModelWithBuffer::_queue;
+std::vector<simaaidispatcher::JobMLA> MLAModelWithBuffer::_queue;
 simaaidispatcher::DispatcherBase* MLAModelWithBuffer::_dispatcher = nullptr;
 
 
@@ -321,42 +321,22 @@ void MLAModelWithBuffer::add_to_queue(
 
     load();
     _update_buf_addrs(ifm_map_ptr, ofm_map_ptr);
-    MLAModelWithBuffer::_queue.push_back(QueuedRun{
-        _model_idx,
-        _make_bindings(_ifms, ifm_map_ptr, simaaidispatcher::RuntimeBindingRole::Input),
-        _make_bindings(_ofms, ofm_map_ptr, simaaidispatcher::RuntimeBindingRole::Output)
-    });
+    MLAModelWithBuffer::_queue.push_back(_make_job(ifm_map_ptr, ofm_map_ptr));
 }
 
 
 void MLAModelWithBuffer::run_queue() {
-    if (!MLAModelWithBuffer::_enable_queue) {
-        // Run queue is disabled. Models were run when add_to_queue is called. Nothing to be done.
-        return;
-    }
+    if (!MLAModelWithBuffer::_enable_queue || MLAModelWithBuffer::_queue.empty()) return;
 
     auto* dispatcher = _get_dispatcher();
     try {
-        for (const auto& item: MLAModelWithBuffer::_queue) {
-            simaaidispatcher::JobMLA job;
-            job.handle = _unique_model_ptrs[item.model_idx];
-            job.batchSize = 1;
-            job.batchModel = 1;
-            job.cb = nullptr;
-            job.timeout = std::chrono::duration<double>(0);
-            job.priority = 0;
-            job.bindingTable.inputBindings = item.ifm_bindings;
-            job.bindingTable.outputBindings = item.ofm_bindings;
-
-            const int rc = dispatcher->run(job);
-            if (rc != 0) {
-                throw std::runtime_error(fmt::format(
-                    "MLASHM dispatcher queued run failed for {}: rc={} ({})",
-                    _unique_model_paths[item.model_idx],
-                    rc,
-                    dispatcher->lastErrorString()
-                ));
-            }
+        const int rc = dispatcher->runQueue(MLAModelWithBuffer::_queue);
+        if (rc != 0) {
+            throw std::runtime_error(fmt::format(
+                "MLASHM dispatcher runQueue failed: rc={} ({})",
+                rc,
+                dispatcher->lastErrorString()
+            ));
         }
     } catch (...) {
         MLAModelWithBuffer::_queue.clear();

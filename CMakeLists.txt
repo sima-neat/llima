@@ -1,10 +1,49 @@
 cmake_minimum_required(VERSION 3.24)
 
+if(NOT DEFINED SKBUILD_PROJECT_NAME)
+    set(SKBUILD_PROJECT_NAME sima_lmm)
+endif()
+if(NOT DEFINED SKBUILD_PROJECT_VERSION)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.in" SIMA_LMM_VERSION_IN)
+    foreach(_sima_lmm_version_part major minor patch)
+        string(REGEX MATCH
+            "${_sima_lmm_version_part}:[ \t]*([0-9]+)"
+            _sima_lmm_version_match
+            "${SIMA_LMM_VERSION_IN}"
+        )
+        if("${CMAKE_MATCH_1}" STREQUAL "")
+            message(FATAL_ERROR "Unable to parse ${_sima_lmm_version_part} from VERSION.in")
+        endif()
+        set("SIMA_LMM_VERSION_${_sima_lmm_version_part}" "${CMAKE_MATCH_1}")
+    endforeach()
+    set(SKBUILD_PROJECT_VERSION
+        "${SIMA_LMM_VERSION_major}.${SIMA_LMM_VERSION_minor}.${SIMA_LMM_VERSION_patch}"
+    )
+endif()
+
 project(${SKBUILD_PROJECT_NAME} VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 # Target names.
 set(TARGET_BIND cpp_ext)
 set(TARGET_RUNTIME sima_lmm_runtime)
+option(SIMA_LMM_BUILD_PYTHON "Build the Python nanobind extension." ON)
+set(SYSROOT "" CACHE PATH "Optional target sysroot prefix")
+set(
+    SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR
+    "devkit"
+    CACHE STRING
+    "Install destination for the cpp_ext Python extension. Wheels install relative to sima_lmm."
+)
+option(SIMA_LMM_INSTALL_PYTHON_PACKAGE "Install the lean sima_lmm Python runtime package." OFF)
+set(
+    SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR
+    "lib/python3/dist-packages/sima_lmm"
+    CACHE STRING
+    "Install destination for the lean sima_lmm Python runtime package."
+)
 
 # Set the build flags.
 set(CMAKE_CXX_STANDARD 20)
@@ -15,20 +54,24 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 endif()
 
-# Find all the dependencies.
-find_package(Python 3.11 COMPONENTS Interpreter Development REQUIRED)
+# Find Python binding dependencies only when building the extension. The C++ runtime package can
+# be configured and installed without Python/nanobind.
+if(SIMA_LMM_BUILD_PYTHON)
+    find_package(Python 3.11 COMPONENTS Interpreter Development REQUIRED)
 
-# Use the pypi version of nanobind instead of the official repo since it is a "pre-built" library.
-# The nanobind is installed when python/pip runs the pyproject.toml.
-execute_process(
-    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
-    OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
-)
-find_package(nanobind CONFIG REQUIRED NO_CMAKE_FIND_ROOT_PATH)
+    # Use the pypi version of nanobind instead of the official repo since it is a "pre-built"
+    # library. nanobind is installed when python/pip runs the pyproject.toml.
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
+    )
+    find_package(nanobind CONFIG REQUIRED NO_CMAKE_FIND_ROOT_PATH)
+endif()
 
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
+find_package(NeatInternals REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
 find_package(PkgConfig REQUIRED)
@@ -39,6 +82,8 @@ pkg_check_modules(AVFORMAT REQUIRED libavformat)
 pkg_check_modules(AVUTIL REQUIRED libavutil)
 pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
 pkg_check_modules(CPPZMQ REQUIRED cppzmq)
+pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
+pkg_check_modules(Readline REQUIRED IMPORTED_TARGET readline)
 
 include(FetchContent)
 set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "Force offline build")
@@ -60,6 +105,7 @@ macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
             FILES "${${NAME}_SOURCE_DIR}/${LICENSE_NAME}"
             DESTINATION "docs/licenses"
             RENAME "LICENSE.${NAME}"
+            COMPONENT dev
         )
     else()
         message(STATUS "Using system-provided package for ${NAME}")
@@ -77,7 +123,8 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(json LICENSE.MIT)
 
-set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     fmt
     SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt"
@@ -85,6 +132,7 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(fmt LICENSE)
 
+set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     spdlog
@@ -108,19 +156,12 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(tokenizers_cpp LICENSE)
 
+set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     cnpy
     SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy"
 )
 Safe_FetchContent_MakeAvailable(cnpy LICENSE)
-if(TARGET example1)
-    set_target_properties(example1 PROPERTIES EXCLUDE_FROM_ALL TRUE)
-endif()
-set_target_properties(
-    cnpy PROPERTIES
-    CXX_VISIBILITY_PRESET default
-    VISIBILITY_INLINES_HIDDEN OFF
-)
 
 set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -144,6 +185,8 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(httplib LICENSE)
 
+set(LLAMA_TOOLS_INSTALL OFF CACHE BOOL "" FORCE)
+set(LLAMA_TESTS_INSTALL OFF CACHE BOOL "" FORCE)
 set(LLAMA_HTTPLIB OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
@@ -154,26 +197,19 @@ Safe_FetchContent_MakeAvailable(llama LICENSE)
 
 if(NOT TARGET msgpack-cxx)
     set(MSGPACK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(MSGPACK_USE_BOOST OFF CACHE BOOL "" FORCE)
     set(MSGPACK_CXX20 ON CACHE BOOL "" FORCE)
+    set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack-c")
+    if(NOT EXISTS "${MSGPACK_CXX_SOURCE_DIR}/CMakeLists.txt")
+        set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tokenizers-cpp/msgpack")
+    endif()
     FetchContent_Declare(
         msgpack-cxx
-        SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack-c"
+        SOURCE_DIR "${MSGPACK_CXX_SOURCE_DIR}"
         FIND_PACKAGE_ARGS 7.0.0 NAMES msgpack-cxx
     )
     Safe_FetchContent_MakeAvailable(msgpack-cxx LICENSE_1_0.txt)
 endif()
-
-set(
-    EXTERNAL_LIBS
-    fmt spdlog minja tokenizers_cpp cnpy httplib llama ggml ggml-base ggml-cpu msgpack-cxx
-)
-
-foreach(lib_target ${EXTERNAL_LIBS})
-    if(TARGET ${lib_target})
-        set_target_properties(${lib_target} PROPERTIES INSTALL_RPATH "\$ORIGIN")
-    endif()
-endforeach()
-
 
 find_library(
     SIMAAI_DISPATCHER_LIB
@@ -184,7 +220,7 @@ find_library(
         "${SYSROOT}/usr/lib"
     REQUIRED
 )
-
+get_filename_component(SIMAAI_DISPATCHER_LIB_DIR "${SIMAAI_DISPATCHER_LIB}" DIRECTORY)
 
 # Build the core library.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
@@ -195,12 +231,15 @@ list(FILTER SOURCES EXCLUDE REGEX "sima_lmm/devkit/cpp/binding.cpp")
 add_library(${TARGET_RUNTIME} SHARED ${SOURCES})
 set_target_properties(${TARGET_RUNTIME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
 message(STATUS "Using MLA dispatcher library: ${SIMAAI_DISPATCHER_LIB}")
-set_target_properties(${TARGET_RUNTIME} PROPERTIES INSTALL_RPATH "\$ORIGIN")
+set_target_properties(
+    ${TARGET_RUNTIME} PROPERTIES
+    INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_LIB_DIR}"
+)
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
 
 target_compile_options(
     ${TARGET_RUNTIME}
-    PUBLIC
+    PRIVATE
     $<$<STREQUAL:"${CMAKE_SYSTEM_PROCESSOR}","aarch64">:-march=armv8.2-a+crypto>
     $<$<STREQUAL:"${CMAKE_SYSTEM_PROCESSOR}","aarch64">:-mtune=cortex-a65>
     "--param" "destructive-interference-size=64"
@@ -212,64 +251,230 @@ target_compile_options(
 target_include_directories(
     ${TARGET_RUNTIME}
     PUBLIC
-    "sima_lmm/devkit/cpp"
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit/cpp>
+    $<BUILD_INTERFACE:${MSGPACK_CXX_SOURCE_DIR}/include>
     # cnpy include directory is not automatically added when library is linked.
-    ${cnpy_SOURCE_DIR}
+    $<BUILD_INTERFACE:${cnpy_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${httplib_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${llama_SOURCE_DIR}/ggml/include>
     # tokenizers_cpp include directory is not added to tokenizers_c target.
-    ${tokenizers_cpp_SOURCE_DIR}/include
+    $<BUILD_INTERFACE:${tokenizers_cpp_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(
     ${TARGET_RUNTIME}
+    PRIVATE
+        OpenMP::OpenMP_CXX
+        OpenSSL::Crypto
+        PkgConfig::FFTW3
+        cnpy-static
+        simaaimem
+        ${SIMAAI_DISPATCHER_LIB}
     PUBLIC
-    OpenMP::OpenMP_CXX
+    NeatInternals::Headers
     opencv_core
     opencv_imgproc
     opencv_imgcodecs
-    OpenSSL::Crypto
-    PkgConfig::FFTW3
     ${AVCODEC_LIBRARIES}
     ${AVFORMAT_LIBRARIES}
     ${AVUTIL_LIBRARIES}
     ${SWRESAMPLE_LIBRARIES}
     ${CPPZMQ_LIBRARIES}
+    PkgConfig::JSONCPP
     msgpack-cxx
     fmt::fmt
     spdlog::spdlog
     Eigen3::Eigen
     nlohmann_json::nlohmann_json
     minja
-    cnpy
     tokenizers_c
     httplib::httplib
     llama
-    simaaimem
-    ${SIMAAI_DISPATCHER_LIB}
+    PkgConfig::Readline
 )
 # For simaai headers. Currently this is for simaai-memory-lib. Add it to the end so that it can
 # search other paths first.
-target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PUBLIC "${SYSROOT}/usr/include/simaai")
-target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PUBLIC "${SYSROOT}/usr/include")
-
-nanobind_add_module(
-    ${TARGET_BIND}
-    NB_SHARED
-    NOMINSIZE
-    LTO
-    sima_lmm/devkit/cpp/binding.cpp
+target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PUBLIC
+    $<BUILD_INTERFACE:${SYSROOT}/usr/include/simaai>
+    $<BUILD_INTERFACE:${SYSROOT}/usr/include>
 )
 
-target_link_libraries(
-    ${TARGET_BIND}
-    PRIVATE
-    ${TARGET_RUNTIME}
-)
-set_target_properties(${TARGET_BIND} PROPERTIES INSTALL_RPATH "\$ORIGIN/../lib")
+if(SIMA_LMM_BUILD_PYTHON)
+    nanobind_add_module(
+        ${TARGET_BIND}
+        NOMINSIZE
+        LTO
+        sima_lmm/devkit/cpp/binding.cpp
+    )
 
+    target_link_libraries(
+        ${TARGET_BIND}
+        PRIVATE
+        ${TARGET_RUNTIME}
+    )
+    set_target_properties(${TARGET_BIND} PROPERTIES INSTALL_RPATH "\$ORIGIN/../lib")
+endif()
+
+set(SIMA_LMM_PUBLIC_HEADERS
+    sima_lmm/devkit/cpp/base_model.hpp
+    sima_lmm/devkit/cpp/chat.hpp
+    sima_lmm/devkit/cpp/eigen_types.hpp
+    sima_lmm/devkit/cpp/image_processor.hpp
+    sima_lmm/devkit/cpp/language_model.hpp
+    sima_lmm/devkit/cpp/mla_buffer.hpp
+    sima_lmm/devkit/cpp/mla_model.hpp
+    sima_lmm/devkit/cpp/rope_utils.hpp
+    sima_lmm/devkit/cpp/setup.hpp
+    sima_lmm/devkit/cpp/text_streamer.hpp
+    sima_lmm/devkit/cpp/tokenizer.hpp
+    sima_lmm/devkit/cpp/utils.hpp
+    sima_lmm/devkit/cpp/vision_language_model.hpp
+    sima_lmm/devkit/cpp/vision_model.hpp
+    sima_lmm/devkit/cpp/vlm_config.hpp
+    sima_lmm/devkit/cpp/vlm_helper.hpp
+    sima_lmm/devkit/cpp/whisper_config.hpp
+    sima_lmm/devkit/cpp/whisper_model.hpp
+)
+
+if(SIMA_LMM_BUILD_PYTHON)
+    install(
+        TARGETS ${TARGET_BIND}
+        LIBRARY DESTINATION ${SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR}
+        COMPONENT cli
+    )
+endif()
 install(
-    TARGETS
-    nanobind fmt spdlog msgpack-cxx llama ggml ggml-base ggml-cpu cnpy minja
-    LIBRARY DESTINATION lib
+    TARGETS ${TARGET_RUNTIME}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT core
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
-install(TARGETS ${TARGET_BIND} LIBRARY DESTINATION devkit)
-install(TARGETS ${TARGET_RUNTIME})
+install(
+    FILES ${SIMA_LMM_PUBLIC_HEADERS}
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/sima_lmm
+    COMPONENT dev
+)
+
+# Header-only/public-header dependencies used by the installed LLIMA headers.
+install(DIRECTORY "${eigen_SOURCE_DIR}/Eigen" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(DIRECTORY "${json_SOURCE_DIR}/include/nlohmann" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(DIRECTORY "${fmt_SOURCE_DIR}/include/fmt" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(DIRECTORY "${spdlog_SOURCE_DIR}/include/spdlog" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(DIRECTORY "${minja_SOURCE_DIR}/include/minja" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(FILES "${httplib_SOURCE_DIR}/httplib.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(DIRECTORY "${tokenizers_cpp_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(DIRECTORY "${llama_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+install(DIRECTORY "${llama_SOURCE_DIR}/ggml/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SimaLMMConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SimaLMM
+)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SimaLMMTargets.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMTargets.cmake"
+    @ONLY
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(
+    FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfigVersion.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMTargets.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SimaLMM
+    COMPONENT dev
+)
+
+if(SIMA_LMM_INSTALL_PYTHON_PACKAGE)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sima_lmm_VERSION"
+"major: ${SIMA_LMM_VERSION_major}
+minor: ${SIMA_LMM_VERSION_minor}
+patch: ${SIMA_LMM_VERSION_patch}
+")
+
+    install(
+        FILES
+            "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/__init__.py"
+        DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
+        COMPONENT cli
+    )
+    install(
+        FILES "${CMAKE_CURRENT_BINARY_DIR}/sima_lmm_VERSION"
+        DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
+        RENAME VERSION
+        COMPONENT cli
+    )
+    install(
+        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/assets"
+        DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
+        COMPONENT cli
+        PATTERN "__pycache__" EXCLUDE
+    )
+    install(
+        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit"
+        DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
+        COMPONENT cli
+        PATTERN "cpp" EXCLUDE
+        PATTERN "__pycache__" EXCLUDE
+        PATTERN "*.pyc" EXCLUDE
+    )
+
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/llima"
+"#!/usr/bin/python3
+from sima_lmm.devkit.devkit_demo import main
+if __name__ == \"__main__\":
+    main()
+")
+    install(
+        PROGRAMS "${CMAKE_CURRENT_BINARY_DIR}/llima"
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT cli
+    )
+endif()
+
+# ------------------------------------------------------------------------------
+# CPack (DEB)
+# ------------------------------------------------------------------------------
+
+set(CPACK_PACKAGE_NAME "sima-lmm")
+set(CPACK_PACKAGE_VENDOR "SiMa.ai")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SiMa LMM runtime")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_CONTACT "SiMa.ai Build Team <build@sima.ai>")
+set(CPACK_GENERATOR "DEB")
+set(CPACK_COMPONENTS_ALL core dev cli)
+set(CPACK_DEB_COMPONENT_INSTALL ON)
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "SiMa.ai Build Team <build@sima.ai>")
+set(CPACK_DEBIAN_PACKAGE_SECTION "libs")
+set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
+
+set(CPACK_COMPONENT_CORE_DESCRIPTION
+    "SiMa LMM shared C++ runtime library")
+set(CPACK_COMPONENT_DEV_DESCRIPTION
+    "SiMa LMM C++ development headers and CMake package")
+set(CPACK_COMPONENT_CLI_DESCRIPTION
+    "SiMa LMM Python runtime CLI")
+
+set(CPACK_DEBIAN_CORE_PACKAGE_NAME "sima-lmm-core")
+set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
+set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
+
+set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
+    "neat-runtime, simaai-memory-lib")
+set(CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
+    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), neat-internals-dev, simaai-memory-lib-dev")
+set(CPACK_DEBIAN_CLI_PACKAGE_DEPENDS
+    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), simaai-utils, python3")
+
+set(CPACK_INSTALL_CMAKE_PROJECTS
+    "${CMAKE_BINARY_DIR};${PROJECT_NAME};ALL;/"
+)
+
+include(CPack)

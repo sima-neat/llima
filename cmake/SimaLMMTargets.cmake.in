@@ -1,0 +1,11 @@
+if(TARGET SimaLMM::sima_lmm_runtime)
+  return()
+endif()
+
+add_library(SimaLMM::sima_lmm_runtime SHARED IMPORTED)
+
+set_target_properties(SimaLMM::sima_lmm_runtime PROPERTIES
+  IMPORTED_LOCATION "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/libsima_lmm_runtime.so"
+  INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@;@OpenCV_INCLUDE_DIRS@;@SYSROOT@/usr/include/simaai;@SYSROOT@/usr/include"
+  INTERFACE_COMPILE_FEATURES cxx_std_20
+)

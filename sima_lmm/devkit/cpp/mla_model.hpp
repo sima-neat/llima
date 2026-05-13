@@ -99,12 +99,6 @@ class MLAModelWithBuffer {
         }
 
     private:
-        struct QueuedRun {
-            uint16_t model_idx;
-            std::vector<simaaidispatcher::RuntimeBufferBinding> ifm_bindings;
-            std::vector<simaaidispatcher::RuntimeBufferBinding> ofm_bindings;
-        };
-
         void _update_buf_addrs(
             std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
@@ -136,7 +130,7 @@ class MLAModelWithBuffer {
         static std::map<std::filesystem::path, uint16_t> _unique_model_path_to_idx_map;
         static std::vector<std::filesystem::path> _unique_model_paths;
         static std::vector<mla_model_p> _unique_model_ptrs;
-        static std::vector<QueuedRun> _queue;
+        static std::vector<simaaidispatcher::JobMLA> _queue;
         static simaaidispatcher::DispatcherBase* _dispatcher;
         static inline bool _profile = false;
         static inline bool _print_inouts = false;
