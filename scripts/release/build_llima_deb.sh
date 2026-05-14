@@ -30,6 +30,45 @@ DO_CLEAN=0
 EXTRA_CMAKE_ARGS=()
 COMPONENTS=()
 
+has_cmake_define() {
+  local name="$1"
+  local arg
+  for arg in "${EXTRA_CMAKE_ARGS[@]}"; do
+    if [[ "${arg}" == "-D${name}="* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+running_in_neat_sdk() {
+  if [[ -f /etc/sdk-release ]]; then
+    return 0
+  fi
+  if [[ -n "${SYSROOT:-}" && -d "${SYSROOT}" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+apply_default_sdk_toolchain() {
+  local toolchain_file="${ROOT_DIR}/toolchain-sima.cmake"
+
+  if ! running_in_neat_sdk; then
+    return 0
+  fi
+  if has_cmake_define "CMAKE_TOOLCHAIN_FILE"; then
+    return 0
+  fi
+  if [[ ! -f "${toolchain_file}" ]]; then
+    echo "ERROR: NEAT SDK detected but toolchain file is missing: ${toolchain_file}" >&2
+    exit 1
+  fi
+
+  echo "[build] NEAT SDK detected; defaulting to ${toolchain_file}"
+  EXTRA_CMAKE_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${toolchain_file}")
+}
+
 version_from_version_in() {
   local key
   local value
@@ -105,6 +144,18 @@ ensure_python_build_env() {
   fi
 }
 
+ensure_writable_cargo_home() {
+  local cargo_home="${LLIMA_CARGO_HOME:-${CARGO_HOME:-}}"
+
+  if [[ -z "${cargo_home}" || ! -w "${cargo_home}" ]]; then
+    cargo_home="${BUILD_DIR}/.cargo-home"
+  fi
+
+  mkdir -p "${cargo_home}"
+  export CARGO_HOME="${cargo_home}"
+  echo "[build] Using Cargo home: ${CARGO_HOME}"
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --build-dir)
@@ -169,7 +220,9 @@ if [ "${#COMPONENTS[@]}" -gt 0 ]; then
 fi
 
 check_local_build_tools
+ensure_writable_cargo_home
 ensure_python_build_env
+apply_default_sdk_toolchain
 
 LLIMA_VERSION="$(version_from_version_in)"
 MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || true)"

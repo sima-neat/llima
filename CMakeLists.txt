@@ -150,6 +150,9 @@ FetchContent_Declare(
 Safe_FetchContent_MakeAvailable(minja LICENSE)
 
 set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
+set(MSGPACK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(MSGPACK_USE_BOOST OFF CACHE BOOL "" FORCE)
+set(MSGPACK_CXX20 ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     tokenizers_cpp
     SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tokenizers-cpp"
@@ -196,9 +199,6 @@ FetchContent_Declare(
 Safe_FetchContent_MakeAvailable(llama LICENSE)
 
 if(NOT TARGET msgpack-cxx)
-    set(MSGPACK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-    set(MSGPACK_USE_BOOST OFF CACHE BOOL "" FORCE)
-    set(MSGPACK_CXX20 ON CACHE BOOL "" FORCE)
     set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack-c")
     if(NOT EXISTS "${MSGPACK_CXX_SOURCE_DIR}/CMakeLists.txt")
         set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/tokenizers-cpp/msgpack")
