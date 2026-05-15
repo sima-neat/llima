@@ -13,7 +13,9 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, Linux, X64, neat]
+    runs-on:
+      group: elxr-sdk-containers
+      labels: [self-hosted, Linux, X64, elxr-sdk, cutting-edge]
 
     steps:
       - name: Checkout
