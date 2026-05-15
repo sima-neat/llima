@@ -13,7 +13,7 @@ Usage: $(basename "$0") [options] [--] [extra cmake configure args...]
 Options:
   --build-dir <dir>   CMake build directory (default: llima/build-deb)
   --jobs <count>      Parallel build jobs (default: nproc; env: LLIMA_DEB_BUILD_JOBS)
-  --clean             Remove stale sima-lmm*.deb outputs before packaging
+  --clean             Remove the build directory and stale sima-lmm*.deb outputs
   --all               Build all sima-lmm binary packages (default)
   --core              Package only sima-lmm-core
   --dev               Package only sima-lmm-dev
@@ -108,12 +108,87 @@ add_component() {
 
 check_local_build_tools() {
   local tool
-  for tool in cmake cpack python3; do
+  for tool in cmake cpack git python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       echo "ERROR: $tool is required" >&2
       exit 1
     fi
   done
+}
+
+run_as_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+    return $?
+  fi
+  echo "ERROR: Root permissions are required and sudo is not available." >&2
+  exit 1
+}
+
+ensure_git_submodules() {
+  local path
+  local missing=0
+
+  if [[ ! -f "$ROOT_DIR/.gitmodules" ]]; then
+    return
+  fi
+
+  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "[build] Updating git submodules"
+    git -C "$ROOT_DIR" submodule update --init --recursive
+  else
+    echo "[build] Source tree is not a git checkout; checking submodule directories"
+  fi
+
+  while read -r path; do
+    if [[ -z "$path" ]]; then
+      continue
+    fi
+    if [[ ! -d "$ROOT_DIR/$path" ]] ||
+       [[ -z "$(find "$ROOT_DIR/$path" -mindepth 1 -maxdepth 1 2>/dev/null)" ]]; then
+      echo "ERROR: Missing git submodule content: $path" >&2
+      missing=1
+    fi
+  done < <(git -C "$ROOT_DIR" config --file "$ROOT_DIR/.gitmodules" --get-regexp path | awk '{print $2}')
+
+  if [[ "$missing" -ne 0 ]]; then
+    echo "ERROR: Required third-party sources are missing." >&2
+    echo "       Run: git -C \"$ROOT_DIR\" submodule update --init --recursive" >&2
+    exit 1
+  fi
+}
+
+ensure_sdk_sysroot_packages() {
+  local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
+  local overlay_script="/usr/local/bin/install-sysroot-overlay.sh"
+  local packages=(
+    libopencv-flann406:arm64
+    libopencv-dnn406:arm64
+    libopencv-features2d406:arm64
+    libopencv-objdetect406:arm64
+    libopencv-video406:arm64
+    libssl-dev:arm64
+    libpgm-dev:arm64
+  )
+
+  if ! running_in_neat_sdk; then
+    return
+  fi
+  if [[ "${LLIMA_SKIP_SYSROOT_OVERLAY:-0}" == "1" ]]; then
+    echo "[build] Skipping SDK sysroot package overlay"
+    return
+  fi
+  if [[ ! -x "${overlay_script}" ]]; then
+    echo "ERROR: SDK sysroot overlay installer not found: ${overlay_script}" >&2
+    exit 1
+  fi
+
+  echo "[build] Installing llima SDK sysroot package overlay"
+  run_as_root "${overlay_script}" "${sysroot}" "${packages[@]}"
 }
 
 detect_build_jobs() {
@@ -220,9 +295,9 @@ if [ "${#COMPONENTS[@]}" -gt 0 ]; then
 fi
 
 check_local_build_tools
-ensure_writable_cargo_home
-ensure_python_build_env
+ensure_git_submodules
 apply_default_sdk_toolchain
+ensure_sdk_sysroot_packages
 
 LLIMA_VERSION="$(version_from_version_in)"
 MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
@@ -231,8 +306,13 @@ if [ -z "$MULTIARCH" ]; then
 fi
 
 if [ "$DO_CLEAN" -eq 1 ]; then
+  echo "[build] Removing build directory: $BUILD_DIR"
+  rm -rf "$BUILD_DIR"
   rm -f "$ROOT_DIR"/sima-lmm*.deb
 fi
+
+ensure_writable_cargo_home
+ensure_python_build_env
 
 echo "[build] Configuring sima-lmm $LLIMA_VERSION for arch=$ARCH"
 cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
