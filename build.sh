@@ -4,7 +4,12 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
+NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-https://artifacts.sima-neat.com/internals/sima-neat-internals-beta_changes-latest.tar.gz}"
+ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 ARCH=arm64
+ELXR_SDK=OFF
+ELXR_SDK_VERSION=""
+ELXR_VERSION=""
 
 usage() {
   cat <<EOF
@@ -46,20 +51,38 @@ has_cmake_define() {
   return 1
 }
 
-running_in_neat_sdk() {
-  if [[ -f /etc/sdk-release ]]; then
-    return 0
+detect_elxr_sdk() {
+  ELXR_SDK=OFF
+  ELXR_SDK_VERSION=""
+  ELXR_VERSION=""
+
+  if [[ -f "${ELXR_SDK_RELEASE_FILE}" ]]; then
+    ELXR_SDK_VERSION="$(sed -n 's/^SDK Version[[:space:]]*=[[:space:]]*//p' "${ELXR_SDK_RELEASE_FILE}" | head -n1)"
+    ELXR_VERSION="$(sed -n 's/^eLXr Version[[:space:]]*=[[:space:]]*//p' "${ELXR_SDK_RELEASE_FILE}" | head -n1)"
+    if [[ -n "${ELXR_SDK_VERSION}" && -n "${ELXR_VERSION}" ]]; then
+      ELXR_SDK=ON
+      return
+    fi
   fi
+
   if [[ -n "${SYSROOT:-}" && -d "${SYSROOT}" ]]; then
-    return 0
+    ELXR_SDK=ON
   fi
-  return 1
+
+  echo "[build] eLxr SDK mode: ${ELXR_SDK}"
+  if [[ "${ELXR_SDK}" == "ON" ]]; then
+    if [[ -n "${ELXR_SDK_VERSION}" || -n "${ELXR_VERSION}" ]]; then
+      echo "[build]   SDK Version : ${ELXR_SDK_VERSION:-unknown}"
+      echo "[build]   eLXr Version: ${ELXR_VERSION:-unknown}"
+    fi
+    echo "[build]   SYSROOT     : ${SYSROOT:-/opt/toolchain/aarch64/modalix}"
+  fi
 }
 
 apply_default_sdk_toolchain() {
   local toolchain_file="${ROOT_DIR}/toolchain-sima.cmake"
 
-  if ! running_in_neat_sdk; then
+  if [[ "${ELXR_SDK}" != "ON" ]]; then
     return 0
   fi
   if has_cmake_define "CMAKE_TOOLCHAIN_FILE"; then
@@ -113,7 +136,7 @@ add_component() {
 
 check_local_build_tools() {
   local tool
-  for tool in cmake cpack git python3 dpkg-architecture; do
+  for tool in cmake cpack git python3 dpkg-architecture dpkg-deb tar; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       echo "ERROR: $tool is required" >&2
       exit 1
@@ -148,6 +171,39 @@ install_deps() {
     python3-pip \
     python3-venv \
     dpkg-dev
+}
+
+download_file() {
+  local url="$1"
+  local out="$2"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "${url}" -o "${out}"
+    return $?
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -O "${out}" "${url}"
+    return $?
+  fi
+
+  echo "ERROR: curl or wget is required to download build artifacts." >&2
+  return 1
+}
+
+compute_sha256() {
+  local path="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${path}" | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${path}" | awk '{print $1}'
+    return 0
+  fi
+
+  echo "ERROR: sha256sum or shasum is required to verify build artifacts." >&2
+  return 1
 }
 
 ensure_git_submodules() {
@@ -196,7 +252,7 @@ ensure_sdk_sysroot_packages() {
     libpgm-dev:arm64
   )
 
-  if ! running_in_neat_sdk; then
+  if [[ "${ELXR_SDK}" != "ON" ]]; then
     return
   fi
   if [[ "${LLIMA_SKIP_SYSROOT_OVERLAY:-0}" == "1" ]]; then
@@ -210,6 +266,115 @@ ensure_sdk_sysroot_packages() {
 
   echo "[build] Installing llima SDK sysroot package overlay"
   run_as_root "${overlay_script}" "${sysroot}" "${packages[@]}"
+}
+
+ensure_neat_internals() {
+  local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
+  local archive_url="${NEAT_INTERNALS_ARCHIVE_URL}"
+  local archive_name
+  archive_name="$(basename "${archive_url}")"
+
+  if [[ -z "${archive_url}" ]]; then
+    echo "ERROR: NEAT_INTERNALS_ARCHIVE_URL resolved to an empty URL." >&2
+    exit 1
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d /tmp/llima-neat-internals.XXXXXX)"
+  local archive_path="${tmp_dir}/${archive_name}"
+  local checksum_path="${archive_path}.sha256"
+  local extract_dir="${tmp_dir}/extract"
+
+  echo "[build] Downloading NEAT internals artifact:"
+  echo "[build]   ${archive_url}"
+  download_file "${archive_url}" "${archive_path}"
+  download_file "${archive_url}.sha256" "${checksum_path}"
+
+  local expected_sha actual_sha
+  expected_sha="$(awk '{print $1}' "${checksum_path}" | tr -d '[:space:]' | head -n1)"
+  if [[ -z "${expected_sha}" || ! "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "ERROR: Invalid sha256 content in ${archive_url}.sha256" >&2
+    exit 1
+  fi
+  actual_sha="$(compute_sha256 "${archive_path}")"
+  if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+    echo "ERROR: sha256 mismatch for ${archive_name}" >&2
+    echo "  expected: ${expected_sha}" >&2
+    echo "  actual  : ${actual_sha}" >&2
+    exit 1
+  fi
+
+  mkdir -p "${extract_dir}"
+  tar -xzf "${archive_path}" -C "${extract_dir}"
+
+  local deb_patterns=(
+    'neat-runtime_*_arm64.deb'
+    'neat-gst-plugins_*_arm64.deb'
+    'neat-internals-dev_*_arm64.deb'
+  )
+  local debs=()
+  local pattern deb
+  for pattern in "${deb_patterns[@]}"; do
+    deb="$(find "${extract_dir}" -maxdepth 1 -type f -name "${pattern}" | sort | head -n 1)"
+    if [[ -z "${deb}" ]]; then
+      echo "ERROR: No ${pattern} found in ${archive_name}" >&2
+      exit 1
+    fi
+    debs+=("${deb}")
+  done
+
+  if [[ "${ELXR_SDK}" == "ON" ]]; then
+    if [[ ! -d "${sysroot}" ]]; then
+      echo "ERROR: SYSROOT does not exist: ${sysroot}" >&2
+      exit 1
+    fi
+    echo "[build] Installing NEAT internals deb payloads into SDK sysroot:"
+    echo "[build]   ${sysroot}"
+    for deb in "${debs[@]}"; do
+      echo "[build]   $(basename "${deb}")"
+      run_as_root dpkg-deb -x "${deb}" "${sysroot}"
+    done
+  else
+    if ! command -v apt >/dev/null 2>&1; then
+      echo "ERROR: apt is required to install NEAT internals deb packages outside SDK mode." >&2
+      exit 1
+    fi
+    echo "[build] Installing NEAT internals deb packages into host system"
+    run_as_root apt install -y --allow-downgrades "${debs[@]}"
+  fi
+
+  local config_dir dispatcher_header profiler_lib tensorbuffer_plugin
+  if [[ "${ELXR_SDK}" == "ON" ]]; then
+    config_dir="${sysroot}/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
+    dispatcher_header="${sysroot}/usr/include/dispatcher.h"
+    profiler_lib="${sysroot}/usr/lib/aarch64-linux-gnu/neat/runtime/libsimaaineatprofiler.so"
+    tensorbuffer_plugin="${sysroot}/usr/lib/aarch64-linux-gnu/neat/gst-plugins/libgstneattensorbuffer.so"
+  else
+    config_dir="/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
+    dispatcher_header="/usr/include/dispatcher.h"
+    profiler_lib="/usr/lib/aarch64-linux-gnu/neat/runtime/libsimaaineatprofiler.so"
+    tensorbuffer_plugin="/usr/lib/aarch64-linux-gnu/neat/gst-plugins/libgstneattensorbuffer.so"
+  fi
+
+  if [[ ! -d "${config_dir}" ]]; then
+    echo "ERROR: NeatInternals CMake package not found after install: ${config_dir}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${dispatcher_header}" ]]; then
+    echo "ERROR: dispatcher.h not found after install: ${dispatcher_header}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${profiler_lib}" ]]; then
+    echo "ERROR: NEAT runtime library not found after install: ${profiler_lib}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${tensorbuffer_plugin}" ]]; then
+    echo "ERROR: NEAT GStreamer plugin not found after install: ${tensorbuffer_plugin}" >&2
+    exit 1
+  fi
+
+  rm -rf "${tmp_dir}"
+  echo "[build] NEAT internals are ready."
 }
 
 detect_build_jobs() {
@@ -370,6 +535,8 @@ fi
 
 check_local_build_tools
 ensure_git_submodules
+detect_elxr_sdk
+ensure_neat_internals
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
 

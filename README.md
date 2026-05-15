@@ -89,17 +89,6 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-LLiMa depends on the matching NEAT internals development package. In SDK
-containers, the release helper can install the published internals artifacts into
-the SDK sysroot:
-
-```bash
-./scripts/release/install_neat_internals_dev.sh
-```
-
-`neat-internals-dev` provides dispatcher/config headers and the `NeatInternals`
-CMake package used by LLiMa's dispatcher backend.
-
 ## Run
 
 LLiMa expects a compiled runtime model directory produced by the NEAT SDK
