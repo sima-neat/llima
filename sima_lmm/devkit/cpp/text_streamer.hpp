@@ -36,6 +36,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <stop_token>
 #include <string>
