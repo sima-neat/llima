@@ -263,9 +263,52 @@ ensure_sdk_sysroot_packages() {
     echo "ERROR: SDK sysroot overlay installer not found: ${overlay_script}" >&2
     exit 1
   fi
+  if sdk_sysroot_overlay_ready "${sysroot}"; then
+    echo "[build] llima SDK sysroot package overlay already present"
+    return
+  fi
 
   echo "[build] Installing llima SDK sysroot package overlay"
   run_as_root "${overlay_script}" "${sysroot}" "${packages[@]}"
+}
+
+path_exists_any() {
+  local pattern
+  for pattern in "$@"; do
+    if compgen -G "${pattern}" >/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_sysroot_path() {
+  local label="$1"
+  shift
+
+  if path_exists_any "$@"; then
+    return 0
+  fi
+
+  echo "[build] Missing llima SDK sysroot overlay payload: ${label}" >&2
+  return 1
+}
+
+sdk_sysroot_overlay_ready() {
+  local sysroot="$1"
+  local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
+  local missing=0
+
+  require_sysroot_path "OpenCV flann" "${libdir}/libopencv_flann.so.406*" || missing=1
+  require_sysroot_path "OpenCV dnn" "${libdir}/libopencv_dnn.so.406*" || missing=1
+  require_sysroot_path "OpenCV features2d" "${libdir}/libopencv_features2d.so.406*" || missing=1
+  require_sysroot_path "OpenCV objdetect" "${libdir}/libopencv_objdetect.so.406*" || missing=1
+  require_sysroot_path "OpenCV video" "${libdir}/libopencv_video.so.406*" || missing=1
+  require_sysroot_path "OpenSSL headers" "${sysroot}/usr/include/openssl/ssl.h" || missing=1
+  require_sysroot_path "OpenSSL crypto library" "${libdir}/libcrypto.so" "${libdir}/libcrypto.so.*" || missing=1
+  require_sysroot_path "OpenPGM library" "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" || missing=1
+
+  [[ "${missing}" -eq 0 ]]
 }
 
 ensure_neat_internals() {
