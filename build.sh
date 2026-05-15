@@ -588,6 +588,8 @@ MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || tru
 if [ -z "$MULTIARCH" ]; then
   MULTIARCH="aarch64-linux-gnu"
 fi
+PYTHON_ABI_TAG="cpython-311"
+PYTHON_TARGET_SOABI="${PYTHON_ABI_TAG}-${MULTIARCH}"
 
 if [ "$DO_CLEAN" -eq 1 ]; then
   echo "[build] Removing build directory: $BUILD_DIR"
@@ -600,11 +602,13 @@ ensure_writable_cargo_home
 ensure_python_build_env
 
 echo "[build] Configuring sima-lmm $LLIMA_VERSION for arch=$ARCH"
+echo "[build] Python extension SOABI: $PYTHON_TARGET_SOABI"
 cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_INSTALL_LIBDIR="lib/$MULTIARCH" \
   -DPython_EXECUTABLE="$BUILD_VENV/bin/python" \
+  -DSKBUILD_SOABI="$PYTHON_TARGET_SOABI" \
   -DSIMA_LMM_BUILD_PYTHON=ON \
   -DSIMA_LMM_INSTALL_PYTHON_PACKAGE=ON \
   -DSIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR="lib/python3/dist-packages/sima_lmm/devkit" \
