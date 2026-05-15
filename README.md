@@ -1,11 +1,11 @@
+<img src="docs/images/simaai_logo.png" alt="SiMa.ai" width="240" />
+
 # LLiMa
 
 [![Build and Publish](https://github.com/sima-neat/llima/actions/workflows/build-and-publish-tar.yml/badge.svg)](https://github.com/sima-neat/llima/actions/workflows/build-and-publish-tar.yml)
 ![Runtime](https://img.shields.io/badge/runtime-LLM%20%7C%20VLM%20%7C%20ASR-green)
 ![Language](https://img.shields.io/badge/C%2B%2B-20-informational)
 ![Python](https://img.shields.io/badge/Python-3.11-informational)
-
-<img src="docs/images/simaai_logo.png" alt="SiMa.ai" width="240" />
 
 LLiMa is SiMa.ai's runtime and SDK-facing toolkit for generative AI models on
 Modalix DevKits, including LLMs, VLMs, and ASR models.
