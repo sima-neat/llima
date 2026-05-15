@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <iterator>
 #include <iostream>
+#include <stdexcept>
 
 #include <cnpy.h>
 #include <fmt/ranges.h>
@@ -90,6 +91,20 @@ ArrayXXbf WhisperPreprocessor::preprocess(
     auto audio_tensor = _load_audio_ffmpeg(audio_file_name);
     auto log_spec = _log_mel_spectrogram(audio_tensor);
     return log_spec;
+}
+
+
+ArrayXXbf WhisperPreprocessor::preprocess_pcm(
+    std::span<const float> pcm,
+    uint32_t sample_rate
+) {
+    if (sample_rate != SAMPLE_RATE) {
+        throw std::runtime_error("WhisperPreprocessor::preprocess_pcm requires 16 kHz PCM");
+    }
+    ArrayXf audio_tensor = ArrayXf::Zero(N_SAMPLES);
+    const auto copy_len = std::min<size_t>(pcm.size(), N_SAMPLES);
+    std::copy_n(pcm.data(), copy_len, audio_tensor.data());
+    return _log_mel_spectrogram(audio_tensor);
 }
 
 
@@ -286,15 +301,33 @@ std::string WhisperModel::run_model(
     const std::string& language
 ) {
     std::lock_guard<std::mutex> lock(_mutex);
-    ChronoTimer timer_ttft(true);
     _logger->info("Audio file: {}", audio_file_name);
+
+    ArrayXXbf audio_tensor = _preprocessor.preprocess(audio_file_name);
+    return _run_model(audio_tensor, language);
+}
+
+
+std::string WhisperModel::run_model_from_pcm(
+    std::span<const float> pcm,
+    uint32_t sample_rate,
+    const std::string& language
+) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    ArrayXXbf mel = _preprocessor.preprocess_pcm(pcm, sample_rate);
+    return _run_model(mel, language);
+}
+
+
+std::string WhisperModel::_run_model(
+    const ArrayXXbf& mel,
+    const std::string& language
+) {
+    ChronoTimer timer_ttft(true);
     _logger->info("Language: {}", language);
 
-    // Preprocess audio file.
-    ArrayXXbf audio_tensor = _preprocessor.preprocess(audio_file_name);
-
     // Upload audio_tensor and run the encoder model.
-    get_buffer("encoder_ifm").upload(audio_tensor.data());
+    get_buffer("encoder_ifm").upload(mel.data());
     _encoder_model_ptr->run();
 
     // Update language token id.

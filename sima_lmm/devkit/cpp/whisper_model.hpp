@@ -36,6 +36,7 @@
 #include <memory>
 #include <tuple>
 #include <mutex>
+#include <span>
 #include <vector>
 
 #include <fftw3.h>
@@ -63,6 +64,7 @@ class WhisperPreprocessor {
         ~WhisperPreprocessor();
 
         ArrayXXbf preprocess(const std::filesystem::path& audio_file_name);
+        ArrayXXbf preprocess_pcm(std::span<const float> pcm, uint32_t sample_rate);
 
         static constexpr uint32_t SAMPLE_RATE = 16000;
         static constexpr uint32_t N_FFT = 400;
@@ -96,10 +98,14 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::string run_model(
             const std::filesystem::path& audio_file_name, const std::string& language
         );
+        std::string run_model_from_pcm(
+            std::span<const float> pcm, uint32_t sample_rate, const std::string& language
+        );
 
     private:
         virtual void _initialize() override;
         virtual void _finalize() override;
+        std::string _run_model(const ArrayXXbf& mel, const std::string& language);
 
         virtual void _define_buffers() override;
         void _define_model(
