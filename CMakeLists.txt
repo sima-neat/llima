@@ -220,7 +220,6 @@ find_library(
         "${SYSROOT}/usr/lib"
     REQUIRED
 )
-get_filename_component(SIMAAI_DISPATCHER_LIB_DIR "${SIMAAI_DISPATCHER_LIB}" DIRECTORY)
 set(SIMAAI_DISPATCHER_INSTALL_LIB_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/neat/runtime")
 
 # Build the core library.
@@ -470,8 +469,13 @@ set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "neat-runtime, simaai-memory-lib")
-set(CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
-    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), neat-internals-dev, simaai-memory-lib-dev, nlohmann-json3-dev, libeigen3-dev, libfmt-dev, libspdlog-dev, libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, libssl-dev, cppzmq-dev, libzmq3-dev")
+string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
+    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
+    "neat-internals-dev, simaai-memory-lib-dev, "
+    "nlohmann-json3-dev, libeigen3-dev, libfmt-dev, libspdlog-dev, "
+    "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
+    "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
+    "libssl-dev, cppzmq-dev, libzmq3-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), simaai-utils, python3")
 
