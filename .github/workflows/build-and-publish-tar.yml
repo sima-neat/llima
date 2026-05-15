@@ -61,11 +61,6 @@ jobs:
         run: |
           ./build.sh --install-deps-only
 
-      - name: Install NEAT internals into SDK sysroot
-        shell: bash
-        run: |
-          ./scripts/release/install_neat_internals_dev.sh
-
       - name: Build Debian packages and distribution archive
         shell: bash
         env:
