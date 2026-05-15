@@ -62,19 +62,20 @@ git submodule update --init --recursive
 Build all runtime packages:
 
 ```bash
-./scripts/release/build_LLiMa_deb.sh --clean
+./build.sh --all --clean
 ```
 
 The packages are written to the LLiMa repo root, matching NEAT core's main CPack
-behavior. The script uses CPack and creates a local `build/.deb-build-venv` for
-CMake's Python build requirements, including nanobind.
+behavior. The script uses CPack and creates a local `build-deb/.deb-build-venv`
+for CMake's Python build requirements, including nanobind. A distribution
+archive is written to `dist/`.
 
 Build only selected packages:
 
 ```bash
-./scripts/release/build_LLiMa_deb.sh --clean --core
-./scripts/release/build_LLiMa_deb.sh --clean --core --dev
-./scripts/release/build_LLiMa_deb.sh --clean --package sima-lmm-cli
+./build.sh --clean --core
+./build.sh --clean --core --dev
+./build.sh --clean --package sima-lmm-cli
 ```
 
 ### Install Debian Packages

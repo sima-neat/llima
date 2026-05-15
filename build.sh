@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
 ARCH=arm64
@@ -11,10 +11,13 @@ usage() {
 Usage: $(basename "$0") [options] [--] [extra cmake configure args...]
 
 Options:
+  --install-deps-only
+                      Install host build dependencies, then exit
   --build-dir <dir>   CMake build directory (default: llima/build-deb)
   --jobs <count>      Parallel build jobs (default: nproc; env: LLIMA_DEB_BUILD_JOBS)
   --clean             Remove the build directory and stale sima-lmm*.deb outputs
-  --all               Build all sima-lmm binary packages (default)
+  --all               Build all sima-lmm binary packages and create dist archive (default)
+  --no-dist           Skip dist tarball creation
   --core              Package only sima-lmm-core
   --dev               Package only sima-lmm-dev
   --cli               Package only sima-lmm-cli
@@ -27,6 +30,8 @@ EOF
 }
 
 DO_CLEAN=0
+INSTALL_DEPS_ONLY=0
+SKIP_DIST=0
 EXTRA_CMAKE_ARGS=()
 COMPONENTS=()
 
@@ -108,7 +113,7 @@ add_component() {
 
 check_local_build_tools() {
   local tool
-  for tool in cmake cpack git python3; do
+  for tool in cmake cpack git python3 dpkg-architecture; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       echo "ERROR: $tool is required" >&2
       exit 1
@@ -127,6 +132,22 @@ run_as_root() {
   fi
   echo "ERROR: Root permissions are required and sudo is not available." >&2
   exit 1
+}
+
+install_deps() {
+  run_as_root apt-get update
+  run_as_root apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    pkg-config \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    dpkg-dev
 }
 
 ensure_git_submodules() {
@@ -231,8 +252,52 @@ ensure_writable_cargo_home() {
   echo "[build] Using Cargo home: ${CARGO_HOME}"
 }
 
+package_dist_archive() {
+  if [ "${#COMPONENTS[@]}" -gt 0 ]; then
+    echo "[build] Skipping dist archive because a subset of components was selected"
+    return
+  fi
+
+  local version archive_name latest_name
+  version="$1"
+  archive_name="${ARCHIVE_NAME:-sima-llima-${version}.tar.gz}"
+  latest_name="${LATEST_NAME:-}"
+
+  local required_debs=(
+    "sima-lmm-${version}-Linux-cli.deb"
+    "sima-lmm-${version}-Linux-core.deb"
+    "sima-lmm-${version}-Linux-dev.deb"
+  )
+
+  mkdir -p "${ROOT_DIR}/dist"
+
+  for deb in "${required_debs[@]}"; do
+    if [[ ! -f "${ROOT_DIR}/${deb}" ]]; then
+      echo "Expected Debian package not found: ${ROOT_DIR}/${deb}" >&2
+      find "${ROOT_DIR}" -maxdepth 1 -type f -name 'sima-lmm*.deb' -printf '  %p\n' | sort >&2
+      return 1
+    fi
+  done
+
+  tar -C "${ROOT_DIR}" -czf "${ROOT_DIR}/dist/${archive_name}" "${required_debs[@]}"
+  sha256sum "${ROOT_DIR}/dist/${archive_name}" | awk '{print $1}' > "${ROOT_DIR}/dist/${archive_name}.sha256"
+  ls -lh "${ROOT_DIR}/dist/${archive_name}"
+  cat "${ROOT_DIR}/dist/${archive_name}.sha256"
+
+  if [[ -n "${latest_name}" ]]; then
+    cp "${ROOT_DIR}/dist/${archive_name}" "${ROOT_DIR}/dist/${latest_name}"
+    sha256sum "${ROOT_DIR}/dist/${latest_name}" | awk '{print $1}' > "${ROOT_DIR}/dist/${latest_name}.sha256"
+    ls -lh "${ROOT_DIR}/dist/${latest_name}"
+    cat "${ROOT_DIR}/dist/${latest_name}.sha256"
+  fi
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --install-deps-only)
+      INSTALL_DEPS_ONLY=1
+      shift
+      ;;
     --build-dir)
       BUILD_DIR="${2:-}"
       shift 2
@@ -247,6 +312,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --all)
       COMPONENTS=()
+      shift
+      ;;
+    --no-dist)
+      SKIP_DIST=1
       shift
       ;;
     --core)
@@ -283,6 +352,11 @@ done
 
 BUILD_VENV="$BUILD_DIR/.deb-build-venv"
 
+if [ "$INSTALL_DEPS_ONLY" -eq 1 ]; then
+  install_deps
+  exit 0
+fi
+
 detect_build_jobs
 
 if ! [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
@@ -308,6 +382,7 @@ fi
 if [ "$DO_CLEAN" -eq 1 ]; then
   echo "[build] Removing build directory: $BUILD_DIR"
   rm -rf "$BUILD_DIR"
+  rm -rf "$ROOT_DIR/dist"
   rm -f "$ROOT_DIR"/sima-lmm*.deb
 fi
 
@@ -356,4 +431,8 @@ else
     find "$ROOT_DIR" -maxdepth 1 -type f -name "sima-lmm-${component}_*.deb" -printf '  %p\n'
     find "$ROOT_DIR" -maxdepth 1 -type f -name "sima-lmm-${component}-*.deb" -printf '  %p\n'
   done | sort -u
+fi
+
+if [ "$SKIP_DIST" -eq 0 ]; then
+  package_dist_archive "$LLIMA_VERSION"
 fi
