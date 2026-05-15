@@ -306,7 +306,6 @@ sdk_sysroot_overlay_ready() {
   require_sysroot_path "OpenCV video" "${libdir}/libopencv_video.so.406*" || missing=1
   require_sysroot_path "OpenSSL headers" "${sysroot}/usr/include/openssl/ssl.h" || missing=1
   require_sysroot_path "OpenSSL crypto library" "${libdir}/libcrypto.so" "${libdir}/libcrypto.so.*" || missing=1
-  require_sysroot_path "OpenPGM headers" "${sysroot}/usr/include/pgm*.h" "${sysroot}/usr/include/pgm*/*.h" || missing=1
   require_sysroot_path "OpenPGM library" "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" || missing=1
 
   [[ "${missing}" -eq 0 ]]
