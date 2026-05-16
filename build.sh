@@ -242,16 +242,6 @@ ensure_git_submodules() {
 ensure_sdk_sysroot_packages() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local overlay_script="/usr/local/bin/install-sysroot-overlay.sh"
-  local packages=(
-    libopencv-flann406:arm64
-    libopencv-dnn406:arm64
-    libopencv-features2d406:arm64
-    libopencv-objdetect406:arm64
-    libopencv-video406:arm64
-    libeigen3-dev
-    libssl-dev:arm64
-    libpgm-dev:arm64
-  )
 
   if [[ "${ELXR_SDK}" != "ON" ]]; then
     return
@@ -264,13 +254,75 @@ ensure_sdk_sysroot_packages() {
     echo "ERROR: SDK sysroot overlay installer not found: ${overlay_script}" >&2
     exit 1
   fi
-  if sdk_sysroot_overlay_ready "${sysroot}"; then
+
+  ensure_sdk_sysroot_header_package "${sysroot}" "libeigen3-dev" "Eigen" \
+    "${sysroot}/usr/include/eigen3/unsupported/Eigen/CXX11/Tensor" \
+    "${sysroot}/usr/share/eigen3/cmake/Eigen3Config.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "nlohmann-json3-dev" "nlohmann_json" \
+    "${sysroot}/usr/include/nlohmann/json.hpp" \
+    "${sysroot}/usr/share/cmake/nlohmann_json/nlohmann_jsonConfig.cmake"
+
+  local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
+  local packages=()
+
+  path_exists_any "${libdir}/libopencv_flann.so.406*" ||
+    packages+=(libopencv-flann406:arm64)
+  path_exists_any "${libdir}/libopencv_dnn.so.406*" ||
+    packages+=(libopencv-dnn406:arm64)
+  path_exists_any "${libdir}/libopencv_features2d.so.406*" ||
+    packages+=(libopencv-features2d406:arm64)
+  path_exists_any "${libdir}/libopencv_objdetect.so.406*" ||
+    packages+=(libopencv-objdetect406:arm64)
+  path_exists_any "${libdir}/libopencv_video.so.406*" ||
+    packages+=(libopencv-video406:arm64)
+  path_exists_any "${sysroot}/usr/include/openssl/ssl.h" "${libdir}/libcrypto.so" "${libdir}/libcrypto.so.*" ||
+    packages+=(libssl-dev:arm64)
+  path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" ||
+    packages+=(libpgm-dev:arm64)
+
+  if [[ "${#packages[@]}" -eq 0 ]]; then
     echo "[build] llima SDK sysroot package overlay already present"
     return
   fi
 
-  echo "[build] Installing llima SDK sysroot package overlay"
+  echo "[build] Installing missing llima SDK sysroot package overlay payloads"
   run_as_root "${overlay_script}" "${sysroot}" "${packages[@]}"
+}
+
+ensure_sdk_sysroot_header_package() {
+  local sysroot="$1"
+  local package="$2"
+  local label="$3"
+  shift 3
+
+  if path_exists_any "$@"; then
+    return
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "ERROR: apt-get and dpkg-deb are required to install ${package} into the SDK sysroot." >&2
+    exit 1
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d /tmp/llima-sysroot-header.XXXXXX)"
+
+  echo "[build] Installing SDK sysroot header package: ${package} (${label})"
+  (
+    cd "${tmp_dir}"
+    apt-get download "${package}"
+  )
+
+  local deb
+  deb="$(find "${tmp_dir}" -maxdepth 1 -type f -name "${package}_*.deb" | sort | head -n 1)"
+  if [[ -z "${deb}" ]]; then
+    echo "ERROR: Failed to download ${package}." >&2
+    rm -rf "${tmp_dir}"
+    exit 1
+  fi
+
+  run_as_root dpkg-deb -x "${deb}" "${sysroot}"
+  rm -rf "${tmp_dir}"
 }
 
 path_exists_any() {
@@ -281,37 +333,6 @@ path_exists_any() {
     fi
   done
   return 1
-}
-
-require_sysroot_path() {
-  local label="$1"
-  shift
-
-  if path_exists_any "$@"; then
-    return 0
-  fi
-
-  echo "[build] Missing llima SDK sysroot overlay payload: ${label}" >&2
-  return 1
-}
-
-sdk_sysroot_overlay_ready() {
-  local sysroot="$1"
-  local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
-  local missing=0
-
-  require_sysroot_path "OpenCV flann" "${libdir}/libopencv_flann.so.406*" || missing=1
-  require_sysroot_path "OpenCV dnn" "${libdir}/libopencv_dnn.so.406*" || missing=1
-  require_sysroot_path "OpenCV features2d" "${libdir}/libopencv_features2d.so.406*" || missing=1
-  require_sysroot_path "OpenCV objdetect" "${libdir}/libopencv_objdetect.so.406*" || missing=1
-  require_sysroot_path "OpenCV video" "${libdir}/libopencv_video.so.406*" || missing=1
-  require_sysroot_path "Eigen Tensor headers" "${sysroot}/usr/include/eigen3/unsupported/Eigen/CXX11/Tensor" || missing=1
-  require_sysroot_path "Eigen CMake package" "${sysroot}/usr/share/eigen3/cmake/Eigen3Config.cmake" || missing=1
-  require_sysroot_path "OpenSSL headers" "${sysroot}/usr/include/openssl/ssl.h" || missing=1
-  require_sysroot_path "OpenSSL crypto library" "${libdir}/libcrypto.so" "${libdir}/libcrypto.so.*" || missing=1
-  require_sysroot_path "OpenPGM library" "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" || missing=1
-
-  [[ "${missing}" -eq 0 ]]
 }
 
 ensure_neat_internals() {
