@@ -29,6 +29,9 @@
 //**************************************************************************
 
 #include <iostream>
+#include <optional>
+
+#include <fmt/format.h>
 
 #include "cli.hpp"
 #include "utils.hpp"
@@ -103,6 +106,17 @@ void CLI::run() {
     auto chat = _vision_language_model_ptr->create_chat();
     std::string command;
     ReadlineSupport readline_support;
+    std::optional<double> last_ttft;
+    std::optional<double> last_tps;
+    _vision_language_model_ptr->set_info_callback(
+        [&](const std::string& metric_type, double metric_value) {
+            if (metric_type == "ttft") {
+                last_ttft = metric_value;
+            } else if (metric_type == "tps") {
+                last_tps = metric_value;
+            }
+        }
+    );
     while (true) {
         auto maybe_command = ReadlineSupport::read_line(">>> ");
         if (!maybe_command) break;
@@ -183,9 +197,17 @@ void CLI::run() {
         }
         std::cout << "Assistant: " << std::flush;
 
+        last_ttft.reset();
+        last_tps.reset();
         auto response = _vision_language_model_ptr->run_model(chat);
         if (response.has_value()) {
             chat.add_response(trim(std::move(response.value())));
+            if (last_ttft.has_value()) {
+                std::cout << "TTFT: " << fmt::format("{:.2f}s", *last_ttft) << std::endl;
+            }
+            if (last_tps.has_value()) {
+                std::cout << "TPS: " << fmt::format("{:.2f}", *last_tps) << std::endl;
+            }
         } else {
             chat.clear_history();
             std::cout << std::endl

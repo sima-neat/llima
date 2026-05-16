@@ -70,6 +70,18 @@ static void setup_llama_cpp_logger() {
     );
 }
 
+void set_log_level(spdlog::level::level_enum log_level) {
+    spdlog::set_level(log_level);
+    if (auto default_logger = spdlog::default_logger()) {
+        default_logger->set_level(log_level);
+    }
+    for (const char* logger_name : {"llima", "VLM", "STREAM", "llama", "Whisper"}) {
+        if (auto logger = spdlog::get(logger_name)) {
+            logger->set_level(log_level);
+        }
+    }
+}
+
 void connect(
     const std::vector<std::string>& mla_rt_args,
     const std::filesystem::path& log_file_name,
@@ -81,7 +93,7 @@ void connect(
     auto logger = spdlog::basic_logger_mt<spdlog::async_factory>("llima", log_file_name, true);
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%l] %v");
     spdlog::set_default_logger(logger);
-    spdlog::set_level(log_level);
+    set_log_level(log_level);
     spdlog::flush_every(std::chrono::seconds(1));
 
     // Configure the llama.cpp log level.

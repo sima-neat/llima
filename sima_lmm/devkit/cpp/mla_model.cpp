@@ -359,14 +359,10 @@ void MLAModelWithBuffer::update_reloc(const std::map<std::string, uint64_t>& rel
 void MLAModelWithBuffer::load_all_models(
     bool do_parallel_load, std::optional<std::filesystem::path> relative_dir
 ) {
-    if (do_parallel_load) {
-        spdlog::warn(
-            "MLA dispatcher backend currently serializes load_all_models; requested parallel load is ignored"
-        );
-    }
-
     spdlog::info("Loading models through MLASHM dispatcher with relative_dir = {}", relative_dir);
     auto* dispatcher = _get_dispatcher();
+    std::vector<std::filesystem::path> file_names;
+    std::vector<uint16_t> indices;
     for (const auto& [file_name, idx]: _unique_model_path_to_idx_map) {
         if (relative_dir.has_value() && !file_name.string().starts_with(relative_dir.value().string())) {
             continue;
@@ -374,15 +370,53 @@ void MLAModelWithBuffer::load_all_models(
         if (_unique_model_ptrs[idx]) {
             continue;
         }
-        _unique_model_ptrs[idx] = dispatcher->load(file_name.string());
-        if (!_unique_model_ptrs[idx]) {
+        file_names.push_back(file_name);
+        indices.push_back(idx);
+    }
+
+    if (file_names.empty()) {
+        return;
+    }
+
+    if (do_parallel_load) {
+        std::vector<std::string> paths;
+        paths.reserve(file_names.size());
+        for (const auto& file_name: file_names) {
+            paths.push_back(file_name.string());
+        }
+        auto handles = dispatcher->loadMany(paths);
+        if (handles.size() != file_names.size()) {
             throw std::runtime_error(fmt::format(
-                "Failed to load model through MLASHM dispatcher: {} ({})",
-                file_name,
+                "Bulk MLASHM model load returned {} handles for {} models ({})",
+                handles.size(),
+                file_names.size(),
                 dispatcher->lastErrorString()
             ));
         }
-        spdlog::info("Loaded model: {}", file_name);
+        for (std::size_t i = 0; i < file_names.size(); ++i) {
+            _unique_model_ptrs[indices[i]] = handles[i];
+            if (!_unique_model_ptrs[indices[i]]) {
+                throw std::runtime_error(fmt::format(
+                    "Failed to bulk load model through MLASHM dispatcher: {} ({})",
+                    file_names[i],
+                    dispatcher->lastErrorString()
+                ));
+            }
+            spdlog::info("Loaded model: {}", file_names[i]);
+        }
+        return;
+    }
+
+    for (std::size_t i = 0; i < file_names.size(); ++i) {
+        _unique_model_ptrs[indices[i]] = dispatcher->load(file_names[i].string());
+        if (!_unique_model_ptrs[indices[i]]) {
+            throw std::runtime_error(fmt::format(
+                "Failed to load model through MLASHM dispatcher: {} ({})",
+                file_names[i],
+                dispatcher->lastErrorString()
+            ));
+        }
+        spdlog::info("Loaded model: {}", file_names[i]);
     }
 }
 
