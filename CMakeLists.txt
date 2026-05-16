@@ -44,7 +44,6 @@ set(
     CACHE STRING
     "Install destination for the lean sima_lmm Python runtime package."
 )
-
 # Set the build flags.
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,6 +71,7 @@ find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
 find_package(NeatInternals REQUIRED)
+find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
 find_package(PkgConfig REQUIRED)
@@ -112,17 +112,6 @@ macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
     endif()
 endmacro()
 
-# For other libraries that do not have pypi package, debian package or the packages with required
-# versions, use git submodule to download source first and build it to avoid downloading dynamically
-# at build time.
-set(JSON_Diagnostics ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    json
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/json"
-    FIND_PACKAGE_ARGS 3.12.1 NAMES nlohmann_json
-)
-Safe_FetchContent_MakeAvailable(json LICENSE.MIT)
-
 set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
@@ -143,11 +132,25 @@ Safe_FetchContent_MakeAvailable(spdlog LICENSE)
 
 set(MINJA_TEST_ENABLED OFF CACHE BOOL "" FORCE)
 set(MINJA_EXAMPLE_ENABLED OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
+set(minja_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/minja")
+add_library(minja INTERFACE)
+target_include_directories(
     minja
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/minja"
+    INTERFACE
+    $<BUILD_INTERFACE:${minja_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-Safe_FetchContent_MakeAvailable(minja LICENSE)
+target_link_libraries(
+    minja
+    INTERFACE
+    nlohmann_json::nlohmann_json
+)
+install(
+    FILES "${minja_SOURCE_DIR}/LICENSE"
+    DESTINATION "docs/licenses"
+    RENAME "LICENSE.minja"
+    COMPONENT dev
+)
 
 set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
 set(MSGPACK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -166,14 +169,7 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(cnpy LICENSE)
 
-set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    eigen
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/eigen"
-    FIND_PACKAGE_ARGS 5.0.1 NAMES Eigen3
-)
-Safe_FetchContent_MakeAvailable(eigen LICENSE)
+find_package(Eigen3 3.4 REQUIRED NO_MODULE)
 
 # https://github.com/yhirose/cpp-httplib/issues/2313
 find_package(zstd CONFIG REQUIRED)
@@ -327,6 +323,7 @@ set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/language_model.hpp
     sima_lmm/devkit/cpp/mla_buffer.hpp
     sima_lmm/devkit/cpp/mla_model.hpp
+    sima_lmm/devkit/cpp/nlohmann_optional.hpp
     sima_lmm/devkit/cpp/rope_utils.hpp
     sima_lmm/devkit/cpp/setup.hpp
     sima_lmm/devkit/cpp/text_streamer.hpp
@@ -472,7 +469,7 @@ set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
     "neat-internals-dev, simaai-memory-lib-dev, "
-    "nlohmann-json3-dev, libeigen3-dev, libfmt-dev, libspdlog-dev, "
+    "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
     "libssl-dev, cppzmq-dev, libzmq3-dev")

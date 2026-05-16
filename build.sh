@@ -248,6 +248,7 @@ ensure_sdk_sysroot_packages() {
     libopencv-features2d406:arm64
     libopencv-objdetect406:arm64
     libopencv-video406:arm64
+    libeigen3-dev
     libssl-dev:arm64
     libpgm-dev:arm64
   )
@@ -304,6 +305,8 @@ sdk_sysroot_overlay_ready() {
   require_sysroot_path "OpenCV features2d" "${libdir}/libopencv_features2d.so.406*" || missing=1
   require_sysroot_path "OpenCV objdetect" "${libdir}/libopencv_objdetect.so.406*" || missing=1
   require_sysroot_path "OpenCV video" "${libdir}/libopencv_video.so.406*" || missing=1
+  require_sysroot_path "Eigen Tensor headers" "${sysroot}/usr/include/eigen3/unsupported/Eigen/CXX11/Tensor" || missing=1
+  require_sysroot_path "Eigen CMake package" "${sysroot}/usr/share/eigen3/cmake/Eigen3Config.cmake" || missing=1
   require_sysroot_path "OpenSSL headers" "${sysroot}/usr/include/openssl/ssl.h" || missing=1
   require_sysroot_path "OpenSSL crypto library" "${libdir}/libcrypto.so" "${libdir}/libcrypto.so.*" || missing=1
   require_sysroot_path "OpenPGM library" "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" || missing=1
@@ -600,6 +603,10 @@ fi
 
 ensure_writable_cargo_home
 ensure_python_build_env
+CMAKE_SOABI_ARGS=()
+if [[ "${ELXR_SDK}" == "ON" ]]; then
+  CMAKE_SOABI_ARGS+=("-DSKBUILD_SOABI=cpython-311-${MULTIARCH}")
+fi
 
 echo "[build] Configuring sima-lmm $LLIMA_VERSION for arch=$ARCH"
 echo "[build] Python extension SOABI: $PYTHON_TARGET_SOABI"
@@ -614,6 +621,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DSIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR="lib/python3/dist-packages/sima_lmm/devkit" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
   -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$ARCH" \
+  "${CMAKE_SOABI_ARGS[@]}" \
   "${EXTRA_CMAKE_ARGS[@]}"
 
 echo "[build] Building sima-lmm targets with $BUILD_JOBS parallel job(s)"
