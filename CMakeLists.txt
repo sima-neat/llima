@@ -220,7 +220,7 @@ find_library(
         "${SYSROOT}/usr/lib"
     REQUIRED
 )
-get_filename_component(SIMAAI_DISPATCHER_LIB_DIR "${SIMAAI_DISPATCHER_LIB}" DIRECTORY)
+set(SIMAAI_DISPATCHER_INSTALL_LIB_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/neat/runtime")
 
 # Build the core library.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
@@ -233,7 +233,7 @@ set_target_properties(${TARGET_RUNTIME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION 
 message(STATUS "Using MLA dispatcher library: ${SIMAAI_DISPATCHER_LIB}")
 set_target_properties(
     ${TARGET_RUNTIME} PROPERTIES
-    INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_LIB_DIR}"
+    INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
 )
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
 
@@ -313,7 +313,10 @@ if(SIMA_LMM_BUILD_PYTHON)
         PRIVATE
         ${TARGET_RUNTIME}
     )
-    set_target_properties(${TARGET_BIND} PROPERTIES INSTALL_RPATH "\$ORIGIN/../lib")
+    set_target_properties(
+        ${TARGET_BIND} PROPERTIES
+        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
+    )
 endif()
 
 set(SIMA_LMM_PUBLIC_HEADERS
@@ -357,13 +360,11 @@ install(
     COMPONENT dev
 )
 
-# Header-only/public-header dependencies used by the installed LLIMA headers.
-install(DIRECTORY "${eigen_SOURCE_DIR}/Eigen" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(DIRECTORY "${json_SOURCE_DIR}/include/nlohmann" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(DIRECTORY "${fmt_SOURCE_DIR}/include/fmt" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(DIRECTORY "${spdlog_SOURCE_DIR}/include/spdlog" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
+# Header-only/public-header dependencies used by the installed LLiMa headers.
+# Do not install headers that are owned by Debian -dev packages into /usr/include:
+# doing so conflicts with normal package ownership (for example nlohmann-json3-dev).
+# Dependencies without a reliable SDK package are still vendored for now.
 install(DIRECTORY "${minja_SOURCE_DIR}/include/minja" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(FILES "${httplib_SOURCE_DIR}/httplib.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
 install(DIRECTORY "${tokenizers_cpp_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
 install(DIRECTORY "${llama_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
 install(DIRECTORY "${llama_SOURCE_DIR}/ggml/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
@@ -468,8 +469,13 @@ set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "neat-runtime, simaai-memory-lib")
-set(CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
-    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), neat-internals-dev, simaai-memory-lib-dev")
+string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
+    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
+    "neat-internals-dev, simaai-memory-lib-dev, "
+    "nlohmann-json3-dev, libeigen3-dev, libfmt-dev, libspdlog-dev, "
+    "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
+    "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
+    "libssl-dev, cppzmq-dev, libzmq3-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), simaai-utils, python3")
 

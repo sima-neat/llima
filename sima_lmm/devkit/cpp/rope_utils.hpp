@@ -28,6 +28,9 @@
 //
 //**************************************************************************
 
+#ifndef _SIMA_LLIMA_ROPE_UTILS_
+#define _SIMA_LLIMA_ROPE_UTILS_
+
 #include <cassert>
 #include <vector>
 
@@ -62,3 +65,5 @@ RopeTable calc_mrope_with_image(
 
 }
 }
+
+#endif
