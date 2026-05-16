@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
-NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-https://artifacts.sima-neat.com/internals/sima-neat-internals-beta_changes-latest.tar.gz}"
+NEAT_INTERNALS_BASE_URL="${NEAT_INTERNALS_BASE_URL:-https://artifacts.sima-neat.com/internals}"
+NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-}"
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 ARCH=arm64
 ELXR_SDK=OFF
@@ -206,6 +207,29 @@ compute_sha256() {
   return 1
 }
 
+current_branch_slug() {
+  local branch
+  branch="$(git -C "${ROOT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -z "${branch}" || "${branch}" == "HEAD" ]]; then
+    branch="main"
+  fi
+  echo "${branch}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g; s/^-+//; s/-+$//'
+}
+
+resolve_neat_internals_archive_url() {
+  if [[ -n "${NEAT_INTERNALS_ARCHIVE_URL}" ]]; then
+    printf '%s\n' "${NEAT_INTERNALS_ARCHIVE_URL}"
+    return
+  fi
+
+  local branch_slug
+  branch_slug="$(current_branch_slug)"
+  if [[ -z "${branch_slug}" ]]; then
+    branch_slug="main"
+  fi
+  printf '%s/sima-neat-internals-%s-latest.tar.gz\n' "${NEAT_INTERNALS_BASE_URL}" "${branch_slug}"
+}
+
 ensure_git_submodules() {
   local path
   local missing=0
@@ -337,7 +361,8 @@ path_exists_any() {
 
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
-  local archive_url="${NEAT_INTERNALS_ARCHIVE_URL}"
+  local archive_url
+  archive_url="$(resolve_neat_internals_archive_url)"
   local archive_name
   archive_name="$(basename "${archive_url}")"
 
@@ -375,9 +400,11 @@ ensure_neat_internals() {
   tar -xzf "${archive_path}" -C "${extract_dir}"
 
   local deb_patterns=(
+    'simaai-common_*_all.deb'
     'neat-runtime_*_arm64.deb'
     'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
+    'appcomplex_*_arm64.deb'
   )
   local debs=()
   local pattern deb
