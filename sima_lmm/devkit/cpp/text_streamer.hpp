@@ -43,7 +43,6 @@
 #include <thread>
 #include <vector>
 
-#include <httplib.h>
 #include <spdlog/spdlog.h>
 
 #include "tokenizer.hpp"
