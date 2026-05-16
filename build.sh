@@ -285,6 +285,13 @@ ensure_sdk_sysroot_packages() {
   ensure_sdk_sysroot_header_package "${sysroot}" "nlohmann-json3-dev" "nlohmann_json" \
     "${sysroot}/usr/include/nlohmann/json.hpp" \
     "${sysroot}/usr/share/cmake/nlohmann_json/nlohmann_jsonConfig.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libfmt-dev:arm64" "fmt" \
+    "${sysroot}/usr/include/fmt/core.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/cmake/fmt/fmt-config.cmake" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/cmake/fmt/fmtConfig.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libspdlog-dev:arm64" "spdlog" \
+    "${sysroot}/usr/include/spdlog/spdlog.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/cmake/spdlog/spdlogConfig.cmake"
 
   local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
   local packages=()
@@ -299,8 +306,14 @@ ensure_sdk_sysroot_packages() {
     packages+=(libopencv-objdetect406:arm64)
   path_exists_any "${libdir}/libopencv_video.so.406*" ||
     packages+=(libopencv-video406:arm64)
-  path_exists_any "${sysroot}/usr/include/openssl/ssl.h" "${libdir}/libcrypto.so" "${libdir}/libcrypto.so.*" ||
+  if [[ ! -f "${sysroot}/usr/include/openssl/ssl.h" ||
+        ! -e "${libdir}/libcrypto.so" ]]; then
     packages+=(libssl-dev:arm64)
+  fi
+  path_exists_any "${libdir}/libfmt.so.9.1.0" ||
+    packages+=(libfmt9:arm64)
+  path_exists_any "${libdir}/libspdlog.so.1.10.0" ||
+    packages+=(libspdlog1.10:arm64)
   path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" ||
     packages+=(libpgm-dev:arm64)
 

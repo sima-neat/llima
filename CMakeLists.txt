@@ -112,23 +112,10 @@ macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
     endif()
 endmacro()
 
-set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    fmt
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt"
-    FIND_PACKAGE_ARGS 12.1.0 NAMES fmt
-)
-Safe_FetchContent_MakeAvailable(fmt LICENSE)
+find_package(fmt 9.1 CONFIG REQUIRED)
 
-set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
-set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    spdlog
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog"
-    FIND_PACKAGE_ARGS 1.17.0 NAMES spdlog
-)
-Safe_FetchContent_MakeAvailable(spdlog LICENSE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+find_package(spdlog 1.10 CONFIG REQUIRED)
 
 set(MINJA_TEST_ENABLED OFF CACHE BOOL "" FORCE)
 set(MINJA_EXAMPLE_ENABLED OFF CACHE BOOL "" FORCE)
@@ -471,7 +458,7 @@ set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime, simaai-memory-lib")
+    "neat-runtime, simaai-memory-lib, libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
     "neat-internals-dev, simaai-memory-lib-dev, "

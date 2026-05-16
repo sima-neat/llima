@@ -359,7 +359,6 @@ void MLAModelWithBuffer::update_reloc(const std::map<std::string, uint64_t>& rel
 void MLAModelWithBuffer::load_all_models(
     bool do_parallel_load, std::optional<std::filesystem::path> relative_dir
 ) {
-    spdlog::info("Loading models through MLASHM dispatcher with relative_dir = {}", relative_dir);
     auto* dispatcher = _get_dispatcher();
     std::vector<std::filesystem::path> file_names;
     std::vector<uint16_t> indices;
