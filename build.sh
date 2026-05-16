@@ -630,11 +630,7 @@ fi
 check_local_build_tools
 ensure_git_submodules
 detect_elxr_sdk
-if [[ "${LLIMA_SKIP_NEAT_INTERNALS:-0}" == "1" ]]; then
-  echo "[build] Skipping NEAT internals install because LLIMA_SKIP_NEAT_INTERNALS=1"
-else
-  ensure_neat_internals
-fi
+ensure_neat_internals
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
 
