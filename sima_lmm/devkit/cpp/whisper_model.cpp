@@ -379,7 +379,9 @@ std::string WhisperModel::_run_model(
                     std::piecewise_construct,
                     std::forward_as_tuple(0),
                     std::forward_as_tuple(
-                        &get_buffer("token_embeddings"), std::vector<uint32_t>{new_tokens.back(), 0}
+                        &get_buffer("token_embeddings"),
+                        std::vector<uint32_t>{new_tokens.back(), 0},
+                        std::vector<uint32_t>{1, _cfg.d_model}
                     )
                 );
             }
