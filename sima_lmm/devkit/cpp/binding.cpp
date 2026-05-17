@@ -59,9 +59,7 @@ NB_MODULE(cpp_ext, m) {
         [](
             const std::vector<std::string>& mla_rt_args,
             const std::string& log_file_name,
-            int log_level,
-            const std::optional<std::filesystem::path>& sample_image_file_name,
-            const std::optional<std::filesystem::path>& sample_audio_file_name
+            int log_level
         ) {
             // Convert python logging level to spdlog logging level.
             // logging.CRITICAL	50	spdlog::level::critical
@@ -97,16 +95,11 @@ NB_MODULE(cpp_ext, m) {
                         + std::to_string(log_level)
                     );
             }
-            connect(
-                mla_rt_args, log_file_name, spdlog_log_level, sample_image_file_name,
-                sample_audio_file_name
-            );
+            connect(mla_rt_args, log_file_name, spdlog_log_level);
         },
         nb::arg("mla_rt_args"),
         nb::arg("log_file_name"),
-        nb::arg("log_level") = 0,
-        nb::arg("sample_image_file_name") = nb::none(),
-        nb::arg("sample_audio_file_name") = nb::none()
+        nb::arg("log_level") = 0
     );
     m.def("disconnect_cpp", &disconnect);
 

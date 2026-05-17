@@ -225,6 +225,11 @@ set_target_properties(
     INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
 )
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
+target_compile_definitions(
+    ${TARGET_RUNTIME}
+    PRIVATE
+        SIMA_LMM_DEFAULT_ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/sima_lmm/assets"
+)
 
 target_compile_options(
     ${TARGET_RUNTIME}
@@ -345,6 +350,12 @@ install(
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 install(
+    DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/assets"
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/sima_lmm
+    COMPONENT core
+    PATTERN "__pycache__" EXCLUDE
+)
+install(
     FILES ${SIMA_LMM_PUBLIC_HEADERS}
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/sima_lmm
     COMPONENT dev
@@ -401,12 +412,6 @@ patch: ${SIMA_LMM_VERSION_patch}
         DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
         RENAME VERSION
         COMPONENT cli
-    )
-    install(
-        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/assets"
-        DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
-        COMPONENT cli
-        PATTERN "__pycache__" EXCLUDE
     )
     install(
         DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit"
