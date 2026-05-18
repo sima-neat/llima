@@ -6,6 +6,8 @@ BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
 NEAT_INTERNALS_BASE_URL="${NEAT_INTERNALS_BASE_URL:-https://artifacts.sima-neat.com/internals}"
 NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-}"
+NEAT_INTERNALS_MANIFEST="${NEAT_INTERNALS_MANIFEST:-${ROOT_DIR}/deps/manifest.json}"
+NEAT_INTERNALS_RESOLVED_REF=""
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 ARCH=arm64
 ELXR_SDK=OFF
@@ -207,13 +209,87 @@ compute_sha256() {
   return 1
 }
 
-current_branch_slug() {
-  local branch
-  branch="$(git -C "${ROOT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  if [[ -z "${branch}" || "${branch}" == "HEAD" ]]; then
-    branch="main"
+extract_json_string() {
+  local key="$1"
+  local file="$2"
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "${file}" | head -n1
+}
+
+manifest_has_json_string_key() {
+  local key="$1"
+  local file="$2"
+  grep -Eq "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "${file}"
+}
+
+sanitize_branch_key() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' |
+    sed -E 's#[^a-z0-9._-]+#-#g; s/^-+//; s/-+$//'
+}
+
+current_branch_name() {
+  if [[ -n "${GITHUB_HEAD_REF:-}" ]]; then
+    printf '%s\n' "${GITHUB_HEAD_REF}"
+    return 0
   fi
-  echo "${branch}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g; s/^-+//; s/-+$//'
+  if [[ -n "${GITHUB_REF_NAME:-}" ]]; then
+    printf '%s\n' "${GITHUB_REF_NAME}"
+    return 0
+  fi
+  if command -v git >/dev/null 2>&1 &&
+     git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "${ROOT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null
+    return 0
+  fi
+  printf '\n'
+}
+
+internals_checksum_available() {
+  local ref="$1"
+  local probe_path
+  probe_path="$(mktemp /tmp/llima-neat-internals-probe.XXXXXX)"
+  if download_file "${NEAT_INTERNALS_BASE_URL}/sima-neat-internals-${ref}.tar.gz.sha256" \
+      "${probe_path}" >/dev/null 2>&1; then
+    rm -f "${probe_path}"
+    return 0
+  fi
+  rm -f "${probe_path}"
+  return 1
+}
+
+resolve_neat_internals_ref() {
+  if [[ ! -f "${NEAT_INTERNALS_MANIFEST}" ]]; then
+    echo "ERROR: Missing manifest: ${NEAT_INTERNALS_MANIFEST}" >&2
+    return 1
+  fi
+
+  if ! manifest_has_json_string_key "internals" "${NEAT_INTERNALS_MANIFEST}"; then
+    echo "ERROR: ${NEAT_INTERNALS_MANIFEST} must define an internals string." >&2
+    return 1
+  fi
+
+  local manifest_ref
+  manifest_ref="$(extract_json_string "internals" "${NEAT_INTERNALS_MANIFEST}")"
+  if [[ -n "${manifest_ref}" ]]; then
+    printf '%s\n' "${manifest_ref}"
+    return 0
+  fi
+
+  local branch branch_key candidate
+  branch="$(current_branch_name)"
+  branch_key="$(sanitize_branch_key "${branch}")"
+  if [[ -n "${branch_key}" && "${branch_key}" != "head" ]]; then
+    candidate="${branch_key}-latest"
+    if internals_checksum_available "${candidate}"; then
+      echo "Resolved empty internals manifest to matching branch artifact: ${candidate}" >&2
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    echo "No internals artifact found for branch '${branch}' (${candidate}); using develop-latest." >&2
+  else
+    echo "Could not determine current branch for internals snap; using develop-latest." >&2
+  fi
+
+  printf '%s\n' "develop-latest"
 }
 
 resolve_neat_internals_archive_url() {
@@ -222,12 +298,12 @@ resolve_neat_internals_archive_url() {
     return
   fi
 
-  local branch_slug
-  branch_slug="$(current_branch_slug)"
-  if [[ -z "${branch_slug}" ]]; then
-    branch_slug="main"
+  local internals_ref
+  if ! internals_ref="$(resolve_neat_internals_ref)"; then
+    return 1
   fi
-  printf '%s/sima-neat-internals-%s-latest.tar.gz\n' "${NEAT_INTERNALS_BASE_URL}" "${branch_slug}"
+  NEAT_INTERNALS_RESOLVED_REF="${internals_ref}"
+  printf '%s/sima-neat-internals-%s.tar.gz\n' "${NEAT_INTERNALS_BASE_URL}" "${internals_ref}"
 }
 
 ensure_git_submodules() {
@@ -385,7 +461,9 @@ path_exists_any() {
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local archive_url
-  archive_url="$(resolve_neat_internals_archive_url)"
+  if ! archive_url="$(resolve_neat_internals_archive_url)"; then
+    exit 1
+  fi
   local archive_name
   archive_name="$(basename "${archive_url}")"
 
