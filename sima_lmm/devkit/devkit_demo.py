@@ -71,7 +71,7 @@ def _read_text_file(path: Path, label: str) -> str:
 
 def _kill_existing_llima_session() -> None:
     result = subprocess.run(
-        ["pkill", "--older", "60", "-f", "[l]lima"],
+        ["sudo", "pkill", "--older", "60", "-f", "[l]lima"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -319,6 +319,24 @@ def _add_benchmark_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def main() -> None:
+    if (
+        len(sys.argv) > 1
+        and sys.argv[1] in ("run", "benchmark-server")
+        and hasattr(os, "geteuid")
+        and os.geteuid() != 0
+    ):
+        llima_cmd = [
+            "sudo",
+            "-E",
+            sys.executable,
+            "-m",
+            "sima_lmm.devkit.devkit_demo",
+            *sys.argv[1:],
+        ]
+        print("Re-executing with sudo for device access...", flush=True)
+        result = subprocess.run(llima_cmd)
+        sys.exit(result.returncode)
+
     parser = argparse.ArgumentParser(description="Llima unified CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_run_parser(subparsers)

@@ -24,6 +24,7 @@ from sima_lmm.model.base import (
     BaseModel, FileGenMode, TensorTessellateParameters, GenConfiguration, LayerConfiguration
 )
 from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
 from sima_lmm.model.sima_builder import (
     SimaBuilder, build_conv, build_activation, activation_type,
@@ -117,6 +118,8 @@ class VisionModel(BaseModel):
         # Dispatch based on model type
         if self.cfg.model_type in (VlmArchType.VLM_QWEN2_5_VL, VlmArchType.VLM_QWEN3_VL):
             return QwenVisionLayerModel(**kwargs)
+        elif self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            return Gemma4VisionLayerModel(**kwargs)
         else:
             return StandardVisionLayerModel(**kwargs)
 
@@ -425,11 +428,13 @@ class StandardVisionLayerModel(BaseModel):
                     f"{base_name}.pixel_unshuffle", reshaped_input, factor
                 )
 
-                norm_output = self._onnx_builder.build_layer_norm(
-                    f"{base_name}.layer_norm", unshuffled_nchw, self.cfg.vm_cfg.layer_norm_eps
-                )
+                projector_input = unshuffled_nchw
+                if self.cfg.mm_cfg.projector_use_layernorm:
+                    projector_input = self._onnx_builder.build_layer_norm(
+                        f"{base_name}.layer_norm", projector_input, self.cfg.vm_cfg.layer_norm_eps
+                    )
 
-                fc1 = self._onnx_builder.build_conv(f"{base_name}.linear_1", norm_output)
+                fc1 = self._onnx_builder.build_conv(f"{base_name}.linear_1", projector_input)
                 act = self._onnx_builder.build_activation(
                     f"{base_name}.act", fc1, self.cfg.mm_cfg.hidden_act
                 )

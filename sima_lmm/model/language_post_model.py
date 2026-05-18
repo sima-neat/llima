@@ -25,7 +25,7 @@ from sima_lmm.model.sima_builder import (
     SimaBuilder, build_conv_from_dense_with_lora,
     build_activation, activation_type, activation_dtype
 )
-from sima_lmm.config.vlm_config import LlmArchType
+from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 from sima_lmm.utils import ceil_div
 
 
@@ -36,6 +36,10 @@ class LanguagePostModel(LanguagePostBaseModel):
     def __post_init__(self):
         assert self.num_tokens >= 1
         assert 0 <= self.layer_idx < self.cfg.lm_cfg.num_hidden_layers
+
+    @property
+    def layer_type(self) -> str:
+        return self.cfg.lm_cfg.layer_types[self.layer_idx]
 
     @property
     def enable_filter_sharing(self) -> bool:
@@ -52,8 +56,13 @@ class LanguagePostModel(LanguagePostBaseModel):
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
         )
         self._onnx_builder.create_input_node(
-            "self_attn", (1, self.cfg.lm_cfg.attn_cfg.q_size, 1, self.num_tokens)
+            "self_attn", (1, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type), 1, self.num_tokens)
         )
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            self._onnx_builder.create_input_node(
+                "per_layer_input",
+                (1, self.cfg.lm_cfg.hidden_size_per_layer_input, 1, self.num_tokens),
+            )
 
         llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
         if self.cfg.vm_cfg and self.layer_idx in llm_injection_layers and self.num_tokens > 1:
@@ -82,7 +91,9 @@ class LanguagePostModel(LanguagePostBaseModel):
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, attn_out_name)
 
-        o_proj = self._onnx_builder.build_conv_from_dense_with_lora(f"{base_name}.self_attn.{attn_out_name}", input_nodes[1], lora_rank)
+        o_proj = self._onnx_builder.build_conv_from_dense_with_lora(
+            f"{base_name}.self_attn.{attn_out_name}", input_nodes[1], lora_rank
+        )
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
         if has_ffn_norms:
@@ -118,6 +129,10 @@ class LanguagePostModel(LanguagePostBaseModel):
             )
 
         final_output = add2
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            final_output = self._build_onnx_per_layer_input_branch(
+                base_name, final_output, input_nodes[2]
+            )
         llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
         if self.layer_idx in llm_injection_layers and self.num_tokens > 1:
             deepstack_features_input = input_nodes[2]
@@ -130,7 +145,72 @@ class LanguagePostModel(LanguagePostBaseModel):
             return [final_output]
 
         # Include the operations after the last transformer layer into last post cache model.
-        return self._build_onnx_post_transformer(base_name, add2)
+        return self._build_onnx_post_transformer(base_name, final_output)
+
+    def _build_onnx_per_layer_input_branch(
+        self, base_name: str, hidden_states: OnnxNode, per_layer_input: OnnxNode
+    ) -> OnnxNode:
+        residual = hidden_states
+        gate = self._onnx_builder.build_conv_from_dense_with_lora(
+            f"{base_name}.per_layer_input_gate", hidden_states, None
+        )
+        act = self._onnx_builder.build_activation(
+            f"{base_name}.per_layer_input_act", gate, self.cfg.lm_cfg.mlp_cfg.act
+        )
+        mul = self._onnx_builder.build_op(
+            f"{base_name}.per_layer_input_mul", [act, per_layer_input], "Mul"
+        )
+        proj = self._onnx_builder.build_conv_from_dense_with_lora(
+            f"{base_name}.per_layer_projection", mul, None
+        )
+        norm = self._build_rms_norm(f"{base_name}.post_per_layer_input_norm", proj)
+        add = self._onnx_builder.build_op(
+            f"{base_name}.per_layer_input_add", [residual, norm], "Add"
+        )
+        layer_scalar = self._onnx_builder.create_initializer(
+            f"{base_name}.layer_scalar",
+            self.get_hf_param(f"{base_name}.layer_scalar").astype(np.float32).reshape(1, 1, 1, 1),
+        )
+        return self._onnx_builder.build_op(
+            f"{base_name}.layer_scalar_mul", [add, layer_scalar], "Mul"
+        )
+
+    def _build_sima_per_layer_input_branch(
+        self,
+        builder: SimaBuilder,
+        base_name: str,
+        hidden_states: NodeOrHandle,
+        per_layer_input: NodeOrHandle,
+        quantizable: bool,
+        merged_lora: bool = False,
+    ) -> NodeOrHandle:
+        residual = hidden_states
+        gate = build_conv_from_dense_with_lora(
+            builder,
+            self.get_hf_param,
+            self.check_hf_param,
+            f"{base_name}.per_layer_input_gate",
+            hidden_states,
+            None,
+            merged_lora=merged_lora,
+        )
+        act = build_activation(builder, gate, self.cfg.lm_cfg.mlp_cfg.act, quantizable)
+        mul = builder.create_mul_node(act, per_layer_input)
+        proj = build_conv_from_dense_with_lora(
+            builder,
+            self.get_hf_param,
+            self.check_hf_param,
+            f"{base_name}.per_layer_projection",
+            mul,
+            None,
+            merged_lora=merged_lora,
+        )
+        norm = self._build_sima_rms_norm(builder, f"{base_name}.post_per_layer_input_norm", proj)
+        add = builder.create_add_node(residual, norm)
+        layer_scalar = builder.create_constant_node(
+            self.get_hf_param(f"{base_name}.layer_scalar").astype(np.float32).reshape(1)
+        )
+        return builder.create_mul_node(add, layer_scalar)
 
     def gen_model_sdk_files_directly(
         self,
@@ -150,7 +230,10 @@ class LanguagePostModel(LanguagePostBaseModel):
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
-        self_attn_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.q_size)
+        self_attn_shape = (
+            1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type),
+        )
+        per_layer_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size_per_layer_input)
 
         if self.cfg.pipeline_cfg.quantize_embeddings and self.layer_idx == 0:
             input_dtype = ScalarType.int8
@@ -170,6 +253,11 @@ class LanguagePostModel(LanguagePostBaseModel):
             "self_attn", TensorType(activation_type(quantizable), self_attn_shape)
         )
         subnet_inputs = [model_input_input, model_input_self_attn]
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            model_input_per_layer = builder.create_placeholder_node(
+                "per_layer_input", TensorType(activation_type(quantizable), per_layer_shape)
+            )
+            subnet_inputs.append(model_input_per_layer)
         if needs_deepstack:
             model_input_deepstack = builder.create_placeholder_node(
                 "deepstack_features", TensorType(activation_type(quantizable), input_shape)
@@ -184,6 +272,11 @@ class LanguagePostModel(LanguagePostBaseModel):
         mla_input_self_attn = builder.create_placeholder_node(
             "MLA_0/self_attn", TensorType(activation_type(quantizable), self_attn_shape)
         )
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            mla_input_per_layer = builder.create_placeholder_node(
+                "MLA_0/per_layer_input",
+                TensorType(activation_type(quantizable), per_layer_shape),
+            )
         mla_input_deepstack = None
         if needs_deepstack:
             mla_input_deepstack = builder.create_placeholder_node(
@@ -251,8 +344,17 @@ class LanguagePostModel(LanguagePostBaseModel):
 
         # Add deepstack features if needed
         final_output = add2
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            final_output = self._build_sima_per_layer_input_branch(
+                builder,
+                base_name,
+                final_output,
+                mla_input_per_layer,
+                quantizable,
+                merged_lora,
+            )
         if needs_deepstack and mla_input_deepstack is not None:
-            final_output = builder.create_add_node(add2, mla_input_deepstack)
+            final_output = builder.create_add_node(final_output, mla_input_deepstack)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
             outputs = self._build_post_transformer(builder, final_output, quantizable)

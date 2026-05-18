@@ -65,6 +65,7 @@ class Chat {
 
         void set_tools(nlohmann::ordered_json tools);
         const nlohmann::ordered_json& get_tools() const { return _tools; }
+        bool has_tools() const { return _tools.is_array() && !_tools.empty(); }
 
         void add_image(std::filesystem::path image_path);
         void clear_images();

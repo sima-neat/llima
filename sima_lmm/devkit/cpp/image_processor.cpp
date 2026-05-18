@@ -212,8 +212,11 @@ cv::Mat ImageProcessor::_pad_to_square(cv::Mat image) {
 
 
 std::vector<Eigen::bfloat16> ImageProcessor::_cast_and_patchify(cv::Mat image) {
-    if (_vlm_cfg.model_type.starts_with("vlm-lfm2")) {
-        return _cast_and_patchify_lfm2(std::move(image));
+    if (
+        _vlm_cfg.model_type.starts_with("vlm-lfm2")
+        || _vlm_cfg.model_type.starts_with("vlm-gemma4")
+    ) {
+        return _cast_and_patchify_lfm2_gemma4(std::move(image));
     } else if (_vlm_cfg.model_type.starts_with("vlm-qwen")) {
         return _cast_and_patchify_qwen(std::move(image));
     } else {
@@ -228,7 +231,7 @@ std::vector<Eigen::bfloat16> ImageProcessor::_cast_and_patchify(cv::Mat image) {
 }
 
 
-std::vector<Eigen::bfloat16> ImageProcessor::_cast_and_patchify_lfm2(cv::Mat image) {
+std::vector<Eigen::bfloat16> ImageProcessor::_cast_and_patchify_lfm2_gemma4(cv::Mat image) {
     // Prepare parameters.
     const auto& vm_cfg = _vlm_cfg.vm_cfg.value();
     const Eigen::Index channel = 3;

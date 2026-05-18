@@ -30,6 +30,7 @@ from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
+from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
@@ -125,6 +126,14 @@ class LanguageModel(BaseModel):
                     part_model = self._get_part_model(
                         "cache", single_model_num_tokens, token_idx=layer_id.part_idx
                     )
+                case "group_sliding_cache":
+                    part_model = self._get_part_model(
+                        "sliding_cache", num_tokens, token_idx=layer_id.part_idx
+                    )
+                case "single_sliding_cache":
+                    part_model = self._get_part_model(
+                        "sliding_cache", 1, token_idx=layer_id.part_idx
+                    )
                 case "group_conv":
                     part_model = self._get_part_model(
                         "conv_fused", num_tokens, layer_idx=layer_id.part_idx
@@ -137,6 +146,10 @@ class LanguageModel(BaseModel):
                     part_model = self._get_part_model(
                         "conv_post_final", 1, layer_idx=layer_id.part_idx
                     )
+                case "group_per_layer":
+                    part_model = self._get_part_model("per_layer", num_tokens)
+                case "single_per_layer":
+                    part_model = self._get_part_model("per_layer", 1)
                 case _:
                     # Not a part of this model
                     continue
@@ -350,17 +363,20 @@ class LanguageModel(BaseModel):
             max_num_tokens, rope_type, theta, rope_dimension_count, scaling_cfg, idx_base
         )
 
-    def get_embeddings_tensor(self) -> tuple[np.ndarray, float | np.ndarray | None]:
+    def get_embeddings_tensor(
+        self,
+        weight_name: str | None = None,
+        embed_scale: float = 1.0,
+    ) -> tuple[np.ndarray, float | np.ndarray | None]:
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
-        embeddings_name = f"{self.hf_model.language_model_param_base_name}.embed_tokens.weight"
+
         if isinstance(self.hf_model, LocalHuggingFaceModel):
-            embeddings_tensor = self.hf_model.load_np_param(embeddings_name)
+            embeddings_tensor = self.hf_model.load_np_param(weight_name)
         else:
             assert isinstance(self.hf_model, GgufModel)
-            embeddings_tensor = self.hf_model.load_np_param(embeddings_name, force_float=True)
+            embeddings_tensor = self.hf_model.load_np_param(weight_name, force_float=True)
         embeddings_tensor = embeddings_tensor.astype(np.float32)
-        if self.cfg.lm_cfg.arch == LlmArchType.GEMMA:
-            embeddings_tensor *= self.cfg.lm_cfg.hidden_size ** 0.5
+        embeddings_tensor *= embed_scale
 
         if self.cfg.pipeline_cfg.quantize_embeddings:
             # Reshape to (1, 1, vocab_size, 1, hidden_size)
@@ -405,6 +421,15 @@ class LanguageModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping
                 )
+            case "sliding_cache":
+                model_name = f"{self.model_name}_n{num_tokens}_sliding_cache_token{token_idx}"
+                assert token_idx is not None
+                return LanguageCacheModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
+                    logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
+                    layer_type="sliding_attention"
+                )
             case "conv_fused":
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_conv"
                 assert layer_idx is not None
@@ -420,4 +445,10 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
+                )
+            case "per_layer":
+                model_name = f"{self.model_name}_n{num_tokens}_per_layer"
+                return LanguagePerLayerModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens
                 )

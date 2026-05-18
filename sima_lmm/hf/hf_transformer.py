@@ -503,6 +503,11 @@ class LocalHuggingFaceModel:
 
     @cached_property
     def language_model_param_base_name(self) -> str:
+        for name in self.weight_map.keys():
+            parts = name.split(".")
+            if "language_model" in parts and "layers" in parts:
+                return ".".join(parts[:parts.index("layers")])
+
         base_names = list()
         for name in self.weight_map.keys():
             if "lm_head" in name:

@@ -35,6 +35,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,7 @@ class VlmHelper {
         Tokenizer* get_tokenizer() { return _tokenizer_ptr.get(); }
         std::set<uint32_t> get_stop_token_ids() const { return _stop_token_ids; }
         std::optional<uint32_t> get_image_token_id() const { return _image_token_id; }
+        std::optional<uint32_t> get_pad_token_id() const { return _pad_token_id; }
 
     private:
         void _init_chat_template(
@@ -85,6 +87,7 @@ class VlmHelper {
         );
         void _init_stop_token_ids(const std::filesystem::path& devkit_dir);
         void _init_image_token_id(const nlohmann::json& tokenizer_config_json);
+        void _init_pad_token_id(const nlohmann::json& tokenizer_config_json);
         void _init_image_processor(const std::filesystem::path& devkit_dir);
 
         const VlmConfig& _vlm_cfg;
@@ -95,6 +98,7 @@ class VlmHelper {
         std::string _bos_token;
         std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;
+        std::optional<uint32_t> _pad_token_id;
 };
 
 }

@@ -35,15 +35,23 @@ GGUF_CONFIG_MAP : dict = {
         "attention.head_count_kv": "num_key_value_heads",
         "attention.key_length": "head_dim",
         "attention.value_length": "head_dim",
+        "attention.key_length_swa": "sliding_head_dim",
+        "attention.value_length_swa": "sliding_head_dim",
         "attention.layer_norm_rms_epsilon": "rms_norm_eps",
         "attention.sliding_window": "sliding_window",
+        "attention.shared_kv_layers": "num_kv_shared_layers",
+        "attention.sliding_window_pattern": "sliding_window_pattern",
 
         "rope.freq_base": "rope_theta",
+        "rope.freq_base_swa": "rope_local_base_freq",
         "rope.dimension_count": "rope_dimension_count",
+        "rope.dimension_count_swa": "sliding_rope_dimension_count",
         "rope.scaling.type": "rope_type",
         "rope.scaling.factor": "factor",
         "rope.scaling.original_context_length": "original_max_position_embeddings",
-        "shortconv.l_cache": "conv_L_cache"
+        "shortconv.l_cache": "conv_L_cache",
+        "final_logit_softcapping": "final_logit_softcapping",
+        "embedding_length_per_layer_input": "hidden_size_per_layer_input",
     },
     "tokenizer": {
         "ggml.model": "tokenizer_type",
@@ -54,6 +62,9 @@ GGUF_CONFIG_MAP : dict = {
 DEFAULT_HF_GGUF_WEIGHT_MAP : dict = {
     # HF name : GGUF name
     "model.embed_tokens.weight": "token_embd.weight",
+    "model.embed_tokens_per_layer.weight": "per_layer_token_embd.weight",
+    "model.per_layer_model_projection.weight": "per_layer_model_proj.weight",
+    "model.per_layer_projection_norm.weight": "per_layer_proj_norm.weight",
     "model.norm.weight" : "output_norm.weight",
     "model.embedding_norm.weight" : "token_embd_norm.weight",
     "lm_head.weight": "output.weight",
@@ -71,6 +82,10 @@ DEFAULT_HF_GGUF_WEIGHT_MAP : dict = {
     ".self_attn.o_proj.weight": ".attn_output.weight",
     ".self_attn.out_proj.weight": ".attn_output.weight",
     ".post_attention_layernorm.weight": ".post_attention_norm.weight",
+    ".per_layer_input_gate.weight": ".inp_gate.weight",
+    ".per_layer_projection.weight": ".proj.weight",
+    ".post_per_layer_input_norm.weight": ".post_norm.weight",
+    ".layer_scalar": ".layer_output_scale.weight",
     ".mlp.down_proj.weight": ".ffn_down.weight",
     ".mlp.gate_proj.weight": ".ffn_gate.weight",
     ".mlp.up_proj.weight": ".ffn_up.weight",
@@ -350,6 +365,16 @@ class GgufModel:
                     # Assign all other mapped values directly
                     cfg[mapped_key] = value.contents()
 
+        # Keep the base MLP width; shared Gemma4 layers widen it later.
+        if isinstance(cfg.get("intermediate_size"), (list, np.ndarray)):
+            intermediate_sizes = cfg["intermediate_size"]
+            unique_intermediate_sizes = sorted(set(intermediate_sizes))
+            cfg["intermediate_size"] = min(intermediate_sizes)
+            if (len(unique_intermediate_sizes) == 2
+                and unique_intermediate_sizes[1] == 2 * unique_intermediate_sizes[0]
+            ):
+                cfg["use_double_wide_mlp"] = True
+
         #configure sliding window attention configs
         if "sliding_window" in cfg:
             sliding_window = cfg["sliding_window"]
@@ -376,6 +401,7 @@ class GgufModel:
         if "num_hidden_layers" in cfg:
             # Get the set of all tensor names from the model
             tensor_names = self.tensor_info.keys()
+            sliding_window_pattern = cfg.get("sliding_window_pattern")
 
             for layer_idx in range(cfg["num_hidden_layers"]):
                 # Check for a tensor name that only exists in conv layers
@@ -383,7 +409,12 @@ class GgufModel:
                 if conv_tensor_name in tensor_names:
                     layer_types.append("conv")
                 else:
-                    if (layer_idx + 1) % (swa_ratio + 1) == 0:
+                    if sliding_window_pattern is not None:
+                        if sliding_window_pattern[layer_idx]:
+                            layer_types.append("sliding_attention")
+                        else:
+                            layer_types.append("full_attention")
+                    elif (layer_idx + 1) % (swa_ratio + 1) == 0:
                         layer_types.append("full_attention")
                     else:
                         layer_types.append("sliding_attention")
@@ -412,6 +443,12 @@ class GgufModel:
         # For gemma3 models, setting rope_local_base_freq as per llama-cpp
         if "gemma3" == cfg["model_type"]:
             cfg["rope_local_base_freq"] = 10000
+        elif "gemma4" == cfg["model_type"]:
+            # GGUF stores the full-attention head width; normalize to the HF-style
+            # proportional-RoPE config used by the rest of the codebase.
+            cfg["rope_type"] = "proportional"
+            if "rope_dimension_count" in cfg:
+                cfg["rope_dimension_count"] //= 4
             
         # Llama 3.x GGUF files do not store rope scaling metadata; hardcode known values.
         # Llama 3.2 uses factor 32.0, Llama 3.1 uses factor 8.0.

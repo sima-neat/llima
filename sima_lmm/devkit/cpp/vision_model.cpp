@@ -91,7 +91,11 @@ void VisionModel::_finalize() {
 
 
 void VisionModel::_define_buffers() {
-    if (_cfg.model_type.starts_with("vlm-lfm2") || _cfg.model_type.starts_with("vlm-qwen")) {
+    if (
+        _cfg.model_type.starts_with("vlm-lfm2")
+        || _cfg.model_type.starts_with("vlm-qwen")
+        || _cfg.model_type.starts_with("vlm-gemma4")
+    ) {
         // In Huggingface, the patchify step is implemented in the image preprocessor instead of the
         // model.
         size_t num_channels = 3;

@@ -18,7 +18,7 @@ from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.model.base import BaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import SimaBuilder, build_conv, build_logit_softcapping
-from sima_lmm.config.vlm_config import LlmArchType
+from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 from sima_lmm.utils import ceil_div
 
 
@@ -30,12 +30,23 @@ class LanguagePartBaseModel(BaseModel):
             base_name, input_node, self.cfg.lm_cfg.rms_norm_eps, weight_offset
         )
 
-    def _build_sima_rms_norm(self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
+    def _build_sima_rms_norm(
+        self,
+        builder: SimaBuilder,
+        base_name: str,
+        input_node: NodeOrHandle,
+        weightless: bool = False,
+        num_channels: int | None = None,
+    ) -> NodeOrHandle:
         """
         Create an RMS norm with a multiplication applied to its outputs.
         """
-        weight_offset = 1.0 if self.cfg.lm_cfg.rms_norm_unit_offset else 0.0
-        weight_tensor = self.get_hf_param(f"{base_name}.weight") + weight_offset
+        if weightless:
+            assert num_channels is not None
+            weight_tensor = np.ones(num_channels, dtype=np.float32)
+        else:
+            weight_offset = 1.0 if self.cfg.lm_cfg.rms_norm_unit_offset else 0.0
+            weight_tensor = self.get_hf_param(f"{base_name}.weight") + weight_offset
 
         # Reduce the precision of epsilon so that it is exactly representable in float32
         epsilon = float(np.float32(self.cfg.lm_cfg.rms_norm_eps))
@@ -66,14 +77,16 @@ class LanguagePartBaseModel(BaseModel):
             # Split MLP into multiple parts if intermediate_size is larger than max ch number
             # in order to prevent Large Tensor Helper activation in n2a compiler.
             # For single token models do splitting only if filter sharing is enabled.
-            num_parts = ceil_div(self.cfg.lm_cfg.mlp_cfg.intermediate_size, max_ch)
+            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
+            num_parts = ceil_div(intermediate_size, max_ch)
         else:
+            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
             num_parts = 1
 
         for part in range(num_parts):
             part_idx = f".{part}" if num_parts > 1 else ""
             offset = part * max_ch
-            size = min(max_ch, (self.cfg.lm_cfg.mlp_cfg.intermediate_size - offset))
+            size = min(max_ch, (intermediate_size - offset))
             weight_slice_by_input_channels = (offset, size, 0, part) if num_parts > 1 else None
             weight_slice_by_output_ch = (offset, size, 1, part) if num_parts > 1 else None
 
@@ -145,13 +158,15 @@ class LanguagePartBaseModel(BaseModel):
             # Split MLP into multiple parts if intermediate_size is larger than max ch number
             # in order to prevent Large Tensor Helper activation in n2a compiler.
             # For single token models do splitting only if filter sharing is enabled.
-            num_parts = ceil_div(self.cfg.lm_cfg.mlp_cfg.intermediate_size, max_ch)
+            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
+            num_parts = ceil_div(intermediate_size, max_ch)
         else:
+            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
             num_parts = 1
 
         for part in range(num_parts):
             offset = part * max_ch
-            size = min(max_ch, (self.cfg.lm_cfg.mlp_cfg.intermediate_size - offset ))
+            size = min(max_ch, (intermediate_size - offset ))
             weight_slice_by_input_channels = (offset, size, -1, part) if num_parts > 1 else None
             weight_slice_by_output_ch = (offset, size, -3, part) if num_parts > 1 else None
 
@@ -288,7 +303,9 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             kwargs["bias_process_func"] = param_process_func
             lm_head = self._onnx_builder.build_conv(f"lm_head.{i}", rms_norm2, **kwargs)
             if self.final_softcapping is not None:
-                assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and self.cfg.lm_cfg.model_type == "gemma2"
+                assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and (
+                    self.cfg.model_type in (VlmArchType.LLM_GEMMA2, VlmArchType.VLM_GEMMA4)
+                )
                 lm_head = self._onnx_builder.build_logit_softcapping(
                     f"{base_name}.final_softcap.{i}", lm_head, self.cfg.lm_cfg.final_logit_softcapping
                 )
@@ -340,7 +357,10 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             lm_head = build_conv(builder, self.get_hf_param, self.check_hf_param,
                                  f"lm_head.{i}", rms_norm, **kwargs)
             if self.final_softcapping is not None:
-                assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and self.cfg.lm_cfg.model_type == "gemma2"
+                assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and (
+                    self.cfg.lm_cfg.model_type == "gemma2"
+                    or self.cfg.model_type == VlmArchType.VLM_GEMMA4
+                )
                 lm_head = build_logit_softcapping(
                     builder, lm_head, self.cfg.lm_cfg.final_logit_softcapping, quantizable
                 )

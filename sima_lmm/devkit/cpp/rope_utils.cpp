@@ -99,21 +99,23 @@ static Eigen::ArrayXf calc_rope_scaling_longrope(
     }
 }
 
-
+// rope_dimension_count controls the width of the rotary table
+// head_dim_for_frequency controls the inverse-frequency spacing.
 RopeTable calc_freq_real_imag(
     uint16_t max_num_tokens,
     const std::string& rope_type,
     double theta,
-    uint16_t head_dim,
+    uint16_t rope_dimension_count,
+    uint16_t head_dim_for_frequency,
     RopeScalingConfig& rope_scaling_cfg
 ) {
-    // Ensure that the head_dim is always an even number.
-    assert(head_dim % 2 == 0);
-    uint16_t freq_dim = head_dim / 2;
-    auto inv_freq_seq = Eigen::ArrayXd::LinSpaced(freq_dim, 0, head_dim - 2);
-    Eigen::ArrayXf inv_freq = Eigen::pow(theta, inv_freq_seq / head_dim).inverse().cast<float>();
+    assert(rope_dimension_count % 2 == 0);
+    assert(head_dim_for_frequency % 2 == 0);
+    uint16_t freq_dim = rope_dimension_count / 2;
+    auto inv_freq_seq = Eigen::ArrayXd::LinSpaced(freq_dim, 0, rope_dimension_count - 2);
+    Eigen::ArrayXf inv_freq = Eigen::pow(theta, inv_freq_seq / head_dim_for_frequency).inverse().cast<float>();
     Eigen::ArrayXf scaled_inv_freq;
-    if (rope_type == "" || rope_type == "default" || rope_type == "mrope") {
+    if (rope_type == "" || rope_type == "default" || rope_type == "mrope" || rope_type == "proportional") {
         scaled_inv_freq = inv_freq;
     } else if (rope_type == "linear") {
         scaled_inv_freq = inv_freq / rope_scaling_cfg.factor;
@@ -138,8 +140,8 @@ RopeTable calc_freq_real_imag(
     std::vector<Eigen::bfloat16> re_vec(max_num_tokens * freq_dim);
     std::vector<Eigen::bfloat16> im_vec(max_num_tokens * freq_dim);
     if (num_scaled_freq < freq_dim) {
-        // Insert a for indices that are not scaled.
-        MatrixXXbf padded_re = MatrixXXbf::Zero(max_num_tokens, freq_dim);
+        // Unscaled dimensions must use identity rotation (cos=1, sin=0), not zero.
+        MatrixXXbf padded_re = MatrixXXbf::Ones(max_num_tokens, freq_dim);
         MatrixXXbf padded_im = MatrixXXbf::Zero(max_num_tokens, freq_dim);
         padded_re.block(0, 0, max_num_tokens, num_scaled_freq) = re;
         padded_im.block(0, 0, max_num_tokens, num_scaled_freq) = im;

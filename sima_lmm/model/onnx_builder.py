@@ -536,30 +536,40 @@ class OnnxBuilder:
         return post_transpose
 
     def build_rms_norm(
-        self, base_name: str, input_node: OnnxNode, epsilon: float, weight_offset: float
+        self, base_name: str, input_node: OnnxNode, epsilon: float, weight_offset: float = 0.0,
+        weightless: bool = False, num_channels: int = 0,
     ) -> OnnxNode:
         """Builds nodes for RMS norm operation.
 
         Args:
-            base_name: Base name of the operator. This is used to create the nodes.
-            input_node: The input node of the split node.
-            epsilon: Epsilon of the RMS normalization.
-            weight_offset: Offset to the weights.
-        Returns:
-            Created RMS norm nodes.
+            base_name: Base name of the operator.
+            input_node: Input node.
+            epsilon: RMS norm epsilon.
+            weight_offset: Offset added to the loaded weight. Ignored when weightless=True.
+            weightless: If True, use an all-ones weight instead of loading from the HF param
+                store. Requires num_channels > 0. The all-ones weight keeps the RMS norm
+                mathematically identity-scaled while still producing the full
+                Mul→ReduceMean→Add→Sqrt→Div→Mul(weight) graph pattern that AFE fuses into a
+                single kernel (avoiding bf16 precision loss in the un-fused fallback).
+            num_channels: Number of channels for the all-ones weight. Required when weightless=True.
         """
         mul1 = self.build_op(f"{base_name}.mul1", [input_node, input_node], "Mul")
         mean = self.build_op(f"{base_name}.mean", [mul1], "ReduceMean", axes=[1], keepdims=1)
         add = self.build_op(f"{base_name}.add", [mean, epsilon], "Add")
         sqrt = self.build_op(f"{base_name}.sqrt", [add], "Sqrt")
         div = self.build_op(f"{base_name}.div", [input_node, sqrt], "Div")
-        weight_tensor = self.get_param_func(f"{base_name}.weight") + weight_offset
+        if weightless:
+            if num_channels <= 0:
+                raise ValueError("num_channels must be > 0 when weightless=True")
+            weight_tensor = np.ones(num_channels, dtype=np.float32)
+        else:
+            weight_tensor = self.get_param_func(f"{base_name}.weight") + weight_offset
         weight = self.create_initializer(
             f"{base_name}.weight", value=weight_tensor, reshape_str="c->nchw"
         )
         mul2 = self.build_op(f"{base_name}.mul2", [div, weight], "Mul")
         return mul2
-
+    
     def build_logit_softcapping(self, base_name: str, input_node: OnnxNode, scalar: float) -> OnnxNode:
         """Build nodes for logit soft capping.
 

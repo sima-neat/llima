@@ -22,8 +22,10 @@ class LayerID:
 
     Args:
         part: Type of layer.  Valid values are 'group_pre',
-            'group_cache', 'group_post', 'single_pre',
-            'single_cache', 'single_post', 'group_conv','single_conv', 'conv_post_final', 'vision'.
+            'group_cache', 'group_sliding_cache', 'group_post', 'single_pre',
+            'single_cache', 'single_sliding_cache', 'single_post', 'group_conv',
+            'single_conv', 'conv_post_final', 'vision', 'group_per_layer',
+            'single_per_layer'.
         part_idx: Index of the layer.
     """
     part: str
