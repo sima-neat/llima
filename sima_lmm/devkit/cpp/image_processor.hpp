@@ -74,7 +74,7 @@ class ImageProcessor {
         cv::Mat _convert_to_rgb(cv::Mat image);
         cv::Mat _pad_to_square(cv::Mat image);
         std::vector<Eigen::bfloat16> _cast_and_patchify(cv::Mat image);
-        std::vector<Eigen::bfloat16> _cast_and_patchify_lfm2(cv::Mat image);
+        std::vector<Eigen::bfloat16> _cast_and_patchify_lfm2_gemma4(cv::Mat image);
         std::vector<Eigen::bfloat16> _cast_and_patchify_qwen(cv::Mat image);
 
         const VlmConfig& _vlm_cfg;

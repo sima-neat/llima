@@ -76,6 +76,7 @@ VlmHelper::VlmHelper(
         _init_stop_token_ids(devkit_dir);
         if (_vlm_cfg.is_multimodal()) {
             _init_image_token_id(tokenizer_config_json);
+            _init_pad_token_id(tokenizer_config_json);
             _init_image_processor(devkit_dir);
         }
     } else {
@@ -142,6 +143,13 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                 replace += "<|image_pad|>";
             }
             num_images = find_and_replace_all(formatted_prompt, search, replace);
+        } else if (_vlm_cfg.model_type == "vlm-gemma4") {
+            std::string search = "<|image|>";
+            std::string replace = "";
+            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) {
+                replace += "<|image|>";
+            }
+            num_images = find_and_replace_all(formatted_prompt, search, replace);
         } else {
             throw std::runtime_error(
                 fmt::format("Image support for {} is not implemented", _vlm_cfg.model_type)
@@ -183,7 +191,11 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // Encode the formatted prompt to token ids.
     auto add_special_tokens = !formatted_prompt.starts_with(_bos_token);
     auto input_token_ids = _tokenizer_ptr->encode(formatted_prompt, add_special_tokens);
-    return {std::move(formatted_prompt), std::move(input_token_ids), std::move(image_tensors)};
+    return {
+        std::move(formatted_prompt),
+        std::move(input_token_ids),
+        std::move(image_tensors)
+    };
 }
 
 
@@ -288,6 +300,14 @@ void VlmHelper::_init_image_token_id(const nlohmann::json& tokenizer_config_json
     }
     _image_token_id = _tokenizer_ptr->token_to_id(image_token);
 }
+
+
+void VlmHelper::_init_pad_token_id(const nlohmann::json& tokenizer_config_json) {
+    if (!tokenizer_config_json.contains("pad_token") || tokenizer_config_json["pad_token"].is_null())
+        return;
+    _pad_token_id = _tokenizer_ptr->token_to_id(tokenizer_config_json["pad_token"].get<std::string>());
+}
+
 
 
 void VlmHelper::_init_image_processor(const std::filesystem::path& devkit_dir) {

@@ -47,7 +47,7 @@ from afe.ir.operations import PlaceholderOp
 from afe.ir.tensor_type import ScalarType
 import afe.ir.serializer
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import BaseConfig, VlmConfig
+from sima_lmm.config.vlm_config import BaseConfig, VlmConfig, VlmArchType
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.model.onnx_builder import OnnxBuilder
@@ -489,6 +489,15 @@ class BaseModel(ABC):
             if not self.cfg.pipeline_cfg.quantize_embeddings:
                 embeddings = embeddings.astype(bfloat16)
             np.save(embeddings_file_name, embeddings)
+
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            per_layer_embeddings_file_name = (
+                self.sima_devkit_path / f"{self.language_model_name}_per_layer_embeddings.bin"
+            )
+            if not (resume and per_layer_embeddings_file_name.is_file()):
+                per_layer_embeddings = self.get_language_per_layer_embeddings_tensor()
+                per_layer_embeddings.astype(bfloat16).tofile(per_layer_embeddings_file_name)
+
 
         if isinstance(self.hf_model, LocalHuggingFaceModel):
             # Copy the HF files.

@@ -44,6 +44,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
     num_tokens: int
     token_idx: int
     logit_softcapping: float | None
+    layer_type: str = "full_attention"
 
     def __post_init__(self):
         assert self.num_tokens >= 1
@@ -59,6 +60,18 @@ class LanguageCacheModel(LanguagePartBaseModel):
             return self.token_idx + 1
         return self.token_idx + self.num_tokens
 
+    @property
+    def _head_dim(self) -> int:
+        return self.cfg.lm_cfg.attn_cfg.get_head_dim(self.layer_type)
+
+    @property
+    def _q_size(self) -> int:
+        return self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type)
+
+    @property
+    def _kv_size(self) -> int:
+        return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
+
     def gen_onnx_files(self):
         base_name = f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
 
@@ -68,7 +81,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             "query",
             (
                 1,
-                self.cfg.lm_cfg.attn_cfg.head_dim,
+                self._head_dim,
                 self.cfg.lm_cfg.attn_cfg.num_attention_heads,
                 self.num_tokens
             )
@@ -77,12 +90,12 @@ class LanguageCacheModel(LanguagePartBaseModel):
         if self.cfg.pipeline_cfg.use_strided_kv_cache:
             kv_cache_shape =  (
                 1,
-                self.cfg.lm_cfg.attn_cfg.head_dim,
+                self._head_dim,
                 self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
                 self.context_length
             )
         else:
-            kv_cache_shape = (1, self.cfg.lm_cfg.attn_cfg.kv_size, 1, self.context_length)
+            kv_cache_shape = (1, self._kv_size, 1, self.context_length)
         self._onnx_builder.create_input_node(f"cached_keys", kv_cache_shape)
         if (
             (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
@@ -101,7 +114,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
         output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
         self._onnx_builder.create_output_node(
-            output_name, (1, self.cfg.lm_cfg.attn_cfg.q_size, 1, self.num_tokens)
+            output_name, (1, self._q_size, 1, self.num_tokens)
         )
         self._onnx_builder.create_and_save_model()
 
@@ -125,7 +138,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         assert len(input_nodes) == 1
         kv_concat_shape = (
             1,
-            self.cfg.lm_cfg.attn_cfg.head_dim,
+            self._head_dim,
             attn_heads,
             self.context_length
         )
@@ -206,7 +219,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             self.cfg.lm_cfg.attn_cfg.num_attention_heads
             // self.cfg.lm_cfg.attn_cfg.num_key_value_heads
         )
-        kv_size = self.cfg.lm_cfg.attn_cfg.head_dim * self.cfg.lm_cfg.attn_cfg.num_key_value_heads
+        kv_size = self._kv_size
         if self.cfg.pipeline_cfg.use_strided_kv_cache:
             raise RuntimeError("Strided KV cache is not implemented in SiMa IR code generation")
 
@@ -218,15 +231,15 @@ class LanguageCacheModel(LanguagePartBaseModel):
             1,
             self.cfg.lm_cfg.attn_cfg.num_attention_heads,
             self.context_length,
-            self.cfg.lm_cfg.attn_cfg.head_dim
+            self._head_dim
         )
         input_shape = (
             1,
             self.cfg.lm_cfg.attn_cfg.num_attention_heads,
             self.num_tokens,
-            self.cfg.lm_cfg.attn_cfg.head_dim
+            self._head_dim
         )
-        output_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.q_size)
+        output_shape = (1, 1, self.num_tokens, self._q_size)
 
         # Shape of the result of the first matrix multiply (input * key)
         key_shape = (
@@ -241,7 +254,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             1,
             self.cfg.lm_cfg.attn_cfg.num_attention_heads,
             self.num_tokens,
-            self.cfg.lm_cfg.attn_cfg.head_dim
+            self._head_dim
         )
 
         # Shape of the attention mask
@@ -405,7 +418,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             1,
             self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             max(self.context_length, self.cfg.pipeline_cfg.max_num_tokens),
-            self.cfg.lm_cfg.attn_cfg.head_dim
+            self._head_dim
         )
 
         k_cache_tessellate_params = TensorTessellateParameters(
@@ -441,7 +454,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             1,
             self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             self.cfg.pipeline_cfg.max_num_tokens,
-            self.cfg.lm_cfg.attn_cfg.head_dim
+            self._head_dim
         )
 
         k_cache_tessellate_params = TensorTessellateParameters(

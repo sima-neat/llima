@@ -47,7 +47,10 @@ VisionLanguageModel::VisionLanguageModel(
         _vision_model_ptr = std::make_unique<VisionModel>(model_path);
     }
     _language_model_ptr = std::make_unique<LanguageModel>(
-        model_path, _vlm_helper.get_stop_token_ids(), _vlm_helper.get_image_token_id(),
+        model_path,
+        _vlm_helper.get_stop_token_ids(),
+        _vlm_helper.get_image_token_id(),
+        _vlm_helper.get_pad_token_id(),
         _text_streamer, do_parallel_load
     );
 

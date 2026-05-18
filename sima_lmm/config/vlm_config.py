@@ -79,6 +79,7 @@ class VlmArchType(str, ExtensibleEnum):
     LLM_QWEN3 = "llm-qwen3"
     VLM_CUSTOM = "vlm-custom"
     VLM_GEMMA3 = "vlm-gemma3"
+    VLM_GEMMA4 = "vlm-gemma4"
     VLM_LFM2_VL = "vlm-lfm2_vl"
     VLM_LLAVA = "vlm-llava"
     VLM_PALIGEMMA = "vlm-paligemma"
@@ -93,6 +94,7 @@ class VisionArchType(str, ExtensibleEnum):
     SIGLIP2 = "siglip2"
     QWEN2_VISION_ENCODER = "qwen2_5_vl"
     QWEN3_VISION_ENCODER = "qwen3_vl"
+    GEMMA4_VISION_ENCODER = "gemma4_vision"
 
 
 class LlmArchType(str, ExtensibleEnum):
@@ -185,12 +187,13 @@ class VisionModelConfig(BaseConfig):
         num_hidden_layers: The number of transformer blocks.
         hidden_act: The type of activation in MLP.
         layer_norm_eps: The small value to prevent division by zero.
-        spatial_merge_size: Qwen-VL: Spatial merge factor per dimension (e.g., 2 merges 2x2 patches).
+        spatial_merge_size: Vision token merge/pool factor per dimension.
         temporal_patch_size: Qwen-VL: Number of frames in the temporal dimension per patch.
         window_size: Qwen2.5-VL: Window size for windowed attention blocks.
         num_position_embeddings: Qwen3-VL: Number of learnable position embeddings.
         fullatt_block_indexes: Qwen2.5-VL: Layer indices using full attention instead of windowed.
         deepstack_visual_indexes: Qwen3-VL: Layer indices for intermediate deepstack merger outputs.
+        rope_theta: Vision RoPE theta.
     """
     model_type: str = ""
     arch: VisionArchType = VisionArchType.CLIP
@@ -209,6 +212,7 @@ class VisionModelConfig(BaseConfig):
     num_position_embeddings: int = 0
     fullatt_block_indexes: list[int] = field(default_factory=list)
     deepstack_visual_indexes: list[int] = field(default_factory=list)
+    rope_theta: float = 10000.0
 
     def set_config(self, arch: VisionArchType, model_cfg: dict, vision_cfg: dict):
         if "num_attention_heads" not in vision_cfg and "num_heads" in vision_cfg:
@@ -220,6 +224,11 @@ class VisionModelConfig(BaseConfig):
         self.arch = arch
         self.image_size = vision_cfg.get("image_size") or model_cfg.get("tile_size", 0)
         self.cls_embed = arch == VisionArchType.CLIP
+        if arch == VisionArchType.GEMMA4_VISION_ENCODER:
+            self.spatial_merge_size = vision_cfg.get("pooling_kernel_size", 1)
+        if "rope_parameters" in vision_cfg:
+            rope_params = vision_cfg["rope_parameters"]
+            self.rope_theta = rope_params.get("rope_theta", self.rope_theta)
 
     @property
     def num_patches(self) -> int | list[int]:
@@ -254,12 +263,14 @@ class MMConnectionConfig(BaseConfig):
             If mm_tokens_per_image is less than num_patches, AvgPool is inserted.
         proj_dim: The number of projected tokens for an image.
         downsample_factor: Reduces vision tokens by factor² via PixelUnshuffle.
+        projector_use_layernorm: Whether to apply LayerNorm, which is absent in LFM2.5-VL projector.
     """
     num_layers: int = 2
     hidden_act: str = "gelu"
     mm_tokens_per_image: int = 0
     proj_dim: int = 0
     downsample_factor: int = 1
+    projector_use_layernorm: bool = True
 
     def set_config(self, vm_arch: VisionArchType, lm_hidden_size: int, model_cfg: dict):
         super().set_config(model_cfg)
@@ -332,28 +343,37 @@ class RoPEConfig(BaseConfig):
         rope_theta: The theta for RoPE.
         rope_local_base_freq: The local base frequency.
         rope_dimension_count: The number of head dimensions rotated by RoPE.
+        sliding_rope_dimension_count: Optional sliding-attention RoPE width override.
         rope_scaling: The settings for RoPE scaling.
     """
     rope_theta: float = 10000
     rope_local_base_freq: float = 10000
     rope_dimension_count: int = 0
+    sliding_rope_dimension_count: int | None = None
     rope_scaling: RopeScalingConfig = field(default_factory=RopeScalingConfig)
 
     def set_config(self, text_cfg: dict):
-        head_dim = text_cfg.get("head_dim") or (
+        sliding_head_dim = text_cfg.get("head_dim") or (
             text_cfg.get("hidden_size", 0) // text_cfg.get("num_attention_heads", 1)
         )
+        head_dim = text_cfg.get("global_head_dim") or sliding_head_dim
         if "rope_parameters" in text_cfg:
             # HF transformers 5.x format, partial rotary factor is hf only
             rope_params = text_cfg["rope_parameters"]
-            full = rope_params.get("full_attention", rope_params)
-            local = rope_params.get("sliding_attention", full)
-            self.rope_theta = full.get("rope_theta", 10000)
-            self.rope_local_base_freq = local.get("rope_theta", self.rope_theta)
+            full_rope = rope_params.get("full_attention", rope_params)
+            sliding_rope = rope_params.get("sliding_attention", full_rope)
+            self.rope_theta = full_rope.get("rope_theta", 10000)
+            self.rope_local_base_freq = sliding_rope.get("rope_theta", self.rope_theta)
             self.rope_scaling = RopeScalingConfig()
-            self.rope_scaling.set_config(full)
-            if not self.rope_dimension_count and "partial_rotary_factor" in full:
-                self.rope_dimension_count = int(head_dim * full["partial_rotary_factor"])
+            self.rope_scaling.set_config(full_rope)
+            if not self.rope_dimension_count and "partial_rotary_factor" in full_rope:
+                self.rope_dimension_count = int(head_dim * full_rope["partial_rotary_factor"])
+            # Gemma4 uses a different rotary width for sliding-attention heads.
+            if text_cfg.get("global_head_dim") is not None:
+                if "partial_rotary_factor" in sliding_rope:
+                    self.sliding_rope_dimension_count = int(sliding_head_dim * sliding_rope["partial_rotary_factor"])
+                else:
+                    self.sliding_rope_dimension_count = sliding_head_dim
         else:
             # GGUF format: flat keys (rope_theta, rope_type, factor, etc.)
             # rope_dimension_count is gguf only
@@ -367,9 +387,15 @@ class RoPEConfig(BaseConfig):
             self.rope_dimension_count = text_cfg.get("rope_dimension_count", 0)
             if not self.rope_dimension_count and "partial_rotary_factor" in text_cfg:
                 self.rope_dimension_count = int(head_dim * text_cfg["partial_rotary_factor"])
+            self.sliding_rope_dimension_count = text_cfg.get("sliding_rope_dimension_count")
 
         if not self.rope_dimension_count:
             self.rope_dimension_count = head_dim
+
+    def get_rope_dimension_count(self, layer_type: str) -> int:
+        if layer_type == "sliding_attention" and self.sliding_rope_dimension_count is not None:
+            return self.sliding_rope_dimension_count
+        return self.rope_dimension_count
 
 
 @dataclass
@@ -379,7 +405,8 @@ class AttentionBlockConfig(BaseConfig):
     Attributes:
         num_attention_heads: The number of attention heads.
         num_key_value_heads: The number of key/value heads.
-        head_dim: The dimension of query, key, and value heads.
+        head_dim: The full/default dimension of query, key, and value heads.
+        sliding_head_dim: Optional sliding-attention head dimension override.
         swa_enable: The flag to turn on sliding window attention.
         sliding_window: The size of sliding window for SWA.
         attention_bias: Reserved for future.
@@ -389,6 +416,7 @@ class AttentionBlockConfig(BaseConfig):
     num_attention_heads: int = 0
     num_key_value_heads: int = 0
     head_dim: int = 0
+    sliding_head_dim: int | None = None
     swa_enable: bool = False
     sliding_window: int = 0
     attention_bias: bool = False
@@ -402,17 +430,23 @@ class AttentionBlockConfig(BaseConfig):
         if not self.head_dim and self.num_attention_heads:
             assert hidden_size % self.num_attention_heads == 0
             self.head_dim = hidden_size // self.num_attention_heads
+        if "global_head_dim" in text_cfg and text_cfg["global_head_dim"] is not None:
+            self.sliding_head_dim = self.head_dim
+            self.head_dim = text_cfg["global_head_dim"]
         self.swa_enable = any("sliding_attention" in lt for lt in layer_types)
         if self.sliding_window is None:
             self.sliding_window = 0
 
-    @property
-    def q_size(self) -> int:
-        return self.num_attention_heads * self.head_dim
+    def get_head_dim(self, layer_type: str) -> int:
+        if layer_type == "sliding_attention" and self.sliding_head_dim is not None:
+            return self.sliding_head_dim
+        return self.head_dim
 
-    @property
-    def kv_size(self) -> int:
-        return self.num_key_value_heads * self.head_dim
+    def get_q_size(self, layer_type: str) -> int:
+        return self.num_attention_heads * self.get_head_dim(layer_type)
+
+    def get_kv_size(self, layer_type: str) -> int:
+        return self.num_key_value_heads * self.get_head_dim(layer_type)
 
 
 @dataclass
@@ -434,7 +468,7 @@ class MlpBlockConfig(BaseConfig):
         super().set_config(text_cfg)
         self.act = (
             text_cfg.get("hidden_act") or text_cfg.get("hidden_activation")
-            or ("gelu_tanh" if lm_arch == LlmArchType.GEMMA else "silu")
+            or ("gelu_pytorch_tanh" if lm_arch == LlmArchType.GEMMA else "silu")
         )
 
 
@@ -505,6 +539,9 @@ class LanguageModelConfig(BaseConfig):
             RMS norm layers before multiplying.  This parameter is
             created during loading, not read from a configuration file.
         layer_types: Type of each layer ('full_attention', 'sliding_attention', or 'conv').
+        hidden_size_per_layer_input: Gemma4 per-layer residual embedding input size.
+        num_kv_shared_layers: Gemma4 count of final layers that reuse earlier K/V caches.
+        use_double_wide_mlp: Gemma4 doubles shared-layer MLP width when enabled.
         attn_logit_softcapping: Gemma 2 attention logit soft capping.
         final_logit_softcapping: Gemma 2 final logit soft capping.
         lm_head_num_splits: The number of head splits by the compiler.
@@ -526,6 +563,9 @@ class LanguageModelConfig(BaseConfig):
     rms_norm_eps: float = 1e-05
     rms_norm_unit_offset: bool = False
     layer_types: list[str] = field(default_factory=list)
+    hidden_size_per_layer_input: int = 0
+    num_kv_shared_layers: int = 0
+    use_double_wide_mlp: bool = False
     attn_logit_softcapping: float | None = None
     final_logit_softcapping: float | None = None
     lm_head_num_splits: int = 1
@@ -579,10 +619,22 @@ class LanguageModelConfig(BaseConfig):
         self.num_hidden_layers = num_hidden_layers
         self.max_position_embeddings = text_cfg.get("max_position_embeddings", 0)
         self.rms_norm_eps = text_cfg.get("rms_norm_eps", text_cfg.get("norm_eps", 1e-05))
-        self.rms_norm_unit_offset = model_format == ModelFormat.FORMAT_HF and lm_arch == LlmArchType.GEMMA
+        self.rms_norm_unit_offset = (
+            model_format == ModelFormat.FORMAT_HF
+            and lm_arch == LlmArchType.GEMMA
+            and not self.model_type.startswith("gemma4")
+        )
         self.layer_types = layer_types
 
-        for key in ("attn_logit_softcapping", "final_logit_softcapping", "conv_L_cache", "conv_bias"):
+        for key in (
+            "attn_logit_softcapping",
+            "final_logit_softcapping",
+            "conv_L_cache",
+            "conv_bias",
+            "hidden_size_per_layer_input",
+            "num_kv_shared_layers",
+            "use_double_wide_mlp",
+        ):
             if key in text_cfg:
                 setattr(self, key, text_cfg[key])
 
@@ -604,6 +656,15 @@ class LanguageModelConfig(BaseConfig):
         if rope_scaling_cfg and getattr(rope_scaling_cfg, "mrope_section", None):
             rope_scaling_cfg.rope_type = "mrope"
         self._calc_lm_head_splits()
+
+    def is_kv_shared_layer(self, layer_idx: int) -> bool:
+        first_shared_layer = self.num_hidden_layers - self.num_kv_shared_layers
+        return self.num_kv_shared_layers > 0 and layer_idx >= first_shared_layer
+
+    def get_effective_intermediate_size(self, layer_idx: int) -> int:
+        if self.use_double_wide_mlp and self.is_kv_shared_layer(layer_idx):
+            return self.mlp_cfg.intermediate_size * 2
+        return self.mlp_cfg.intermediate_size
 
     def set_lora_adapter(self, cfg: dict | None):
         if cfg is None:
@@ -884,9 +945,10 @@ class VlmConfig(BaseConfig):
             if image_resolution is None and vlm_cfg.vm_cfg.arch in (
                     VisionArchType.QWEN2_VISION_ENCODER,
                     VisionArchType.QWEN3_VISION_ENCODER,
+                    VisionArchType.GEMMA4_VISION_ENCODER,
                 ):
                 raise RuntimeError(
-                    "Qwen-VL models require --input_height and --input_width arguments"
+                    f"{vlm_cfg.vm_cfg.arch} models require --input_height and --input_width arguments"
                 )
             if image_resolution is not None:
                 if vlm_cfg.vm_cfg.arch == VisionArchType.SIGLIP2:
@@ -896,17 +958,22 @@ class VlmConfig(BaseConfig):
                     if height % 32 != 0 or width % 32 != 0:
                         raise RuntimeError(f"Input image dimensions ({height}x{width}) must be divisible by 32 for Siglip2 based models.")
                     vlm_cfg.vm_cfg.image_size = image_resolution
-                elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER):
+                elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER, VisionArchType.GEMMA4_VISION_ENCODER):
                     height, width = image_resolution
                     divisor = vlm_cfg.vm_cfg.patch_size * vlm_cfg.vm_cfg.spatial_merge_size
                     if height % divisor != 0 or width % divisor != 0:
                         raise RuntimeError(
-                            f"For Qwen-VL, image dimensions ({height}x{width}) must be divisible by "
+                            f"For {vlm_cfg.vm_cfg.arch}, image dimensions ({height}x{width}) must be divisible by "
                             f"(patch_size * spatial_merge_size), which is {divisor}."
                         )
+                    seq_len = (height // vlm_cfg.vm_cfg.patch_size) * (width // vlm_cfg.vm_cfg.patch_size)
+                    if seq_len * ceil_div_row(seq_len) * 2 > mla_max_num_rows:
+                        raise RuntimeError(
+                            f"Input image resolution ({height}x{width}) exceeds the maximum allowed for "
+                            f"single-ELF vision encoding for {vlm_cfg.vm_cfg.arch} ")
                     vlm_cfg.vm_cfg.image_size = image_resolution
                 else:
-                    sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2 or Qwen-VL based.")
+                    sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2, Qwen-VL, or Gemma4 based.")
             if vlm_cfg.vm_cfg.arch == VisionArchType.SIGLIP2:
                 if isinstance(vlm_cfg.vm_cfg.image_size, list):
                     h, w = vlm_cfg.vm_cfg.image_size
@@ -920,7 +987,7 @@ class VlmConfig(BaseConfig):
                         f"patch_size * downsample_factor ({ps * df})."
                     )
                 vlm_cfg.mm_cfg.mm_tokens_per_image = (h // ps // df) * (w // ps // df)
-            elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER):
+            elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER, VisionArchType.GEMMA4_VISION_ENCODER):
                 if isinstance(vlm_cfg.vm_cfg.image_size, list):
                     h, w = vlm_cfg.vm_cfg.image_size
                 else:
@@ -932,11 +999,15 @@ class VlmConfig(BaseConfig):
                 imgs = vlm_cfg.vm_cfg.image_size
                 ps = vlm_cfg.vm_cfg.patch_size
                 vlm_cfg.mm_cfg.mm_tokens_per_image = (imgs // ps) ** 2
-            if vlm_cfg.model_type == VlmArchType.VLM_LFM2_VL:
+            if vlm_cfg.model_type in (VlmArchType.VLM_LFM2_VL, VlmArchType.VLM_GEMMA4):
                 if not vlm_cfg.vm_cfg.temporal_patch_size:
                     vlm_cfg.vm_cfg.temporal_patch_size = 1
         else:
-            vlm_cfg.model_type = VlmArchType(f"llm-{lm_arch}{gen or ''}")
+            # Keep GGUF Gemma4 naming consistent with the existing VLM_GEMMA4 language path.
+            if lm_arch == LlmArchType.GEMMA and gen == "4":
+                vlm_cfg.model_type = VlmArchType.VLM_GEMMA4
+            else:
+                vlm_cfg.model_type = VlmArchType(f"llm-{lm_arch}{gen or ''}")
             if vlm_cfg.model_type == VlmArchType.LLM_PHI3:
                 # Phi3 has a sliding window that is much larger than the max_num_tokens
                 # used during compilation, hence disable the sliding window.
@@ -1013,6 +1084,10 @@ class VlmConfig(BaseConfig):
             if has_attn:
                 layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
                 layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
+                if (lm_cfg.attn_cfg.sliding_head_dim is not None
+                        and lm_cfg.attn_cfg.sliding_head_dim != lm_cfg.attn_cfg.head_dim):
+                    layers.extend(LayerID("group_sliding_cache", n) for n in group_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
+                    layers.extend(LayerID("single_sliding_cache", n) for n in single_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
             if has_conv and layer_types[-1] == "conv":
                 layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
         else:
@@ -1028,6 +1103,13 @@ class VlmConfig(BaseConfig):
             layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
         if self.vm_cfg is not None and self.is_supported_multimodal:
             layers.extend(LayerID("vision", n) for n in range(vision_model_layer_count(self.vm_cfg)))
+
+        if (
+            self.model_type == VlmArchType.VLM_GEMMA4
+            and lm_cfg.hidden_size_per_layer_input > 0
+        ):
+            layers.append(LayerID("group_per_layer", 0))
+            layers.append(LayerID("single_per_layer", 0))
 
         return layers
 
@@ -1180,6 +1262,25 @@ def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     return list(cfg.input_token_group_offsets)
 
 
+def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
+    """
+    Get the indices of all group sliding-window cache models.
+
+    For sliding attention the effective cache_model_token_idx saturates at
+    sliding_window - group_size once the window is fully filled.  Any group offset
+    beyond that point maps to the same compiled model, so we only keep offsets
+    strictly below the transition and add the transition itself.
+
+    Returns:
+        Indices of group sliding cache models in ascending order.
+    """
+    transition = sliding_window - cfg.input_token_group_size
+    indices = [n for n in group_cache_model_indices(cfg) if n < transition]
+    if transition > 0:
+        indices.append(transition)
+    return indices
+
+
 def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     """
     Get the indices of all single cache models for the pipeline configuration.
@@ -1201,6 +1302,21 @@ def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
         single_cache_token_idx_list.append(cfg.max_num_tokens - 1)
 
     return single_cache_token_idx_list
+
+
+def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
+    """
+    Get the indices of all single-token sliding-window cache models.
+
+    For single-token decode, the effective cache index saturates at sliding_window - 1 once
+    the window is fully filled. Only the future_token_mask_size-aligned bucket indices up to
+    and including sliding_window - 1 are unique; everything beyond maps to the same compiled
+    model.
+
+    Returns:
+        Indices of single sliding cache models in ascending order.
+    """
+    return [n for n in single_cache_model_indices(cfg) if n < sliding_window]
 
 
 def vision_model_layer_count(cfg: VisionModelConfig) -> int:
