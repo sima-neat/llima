@@ -39,12 +39,12 @@
 #include <string>
 #include <thread>
 
-#include <httplib.h>
-
 #include "chat.hpp"
 #include "utils.hpp"
 #include "vision_language_model.hpp"
 #include "whisper_model.hpp"
+
+#include <httplib.h>
 
 
 namespace simaai {

@@ -17,7 +17,6 @@ license-files = [
     "LICENSE",
     "third_party/minja/LICENSE",
     "third_party/tokenizers-cpp/LICENSE",
-    "third_party/cpp-httplib/LICENSE",
     "third_party/llama.cpp/LICENSE",
     "third_party/msgpack-c/LICENSE_1_0.txt",
 ]

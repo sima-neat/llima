@@ -292,6 +292,12 @@ ensure_sdk_sysroot_packages() {
   ensure_sdk_sysroot_header_package "${sysroot}" "libspdlog-dev:arm64" "spdlog" \
     "${sysroot}/usr/include/spdlog/spdlog.h" \
     "${sysroot}/usr/lib/aarch64-linux-gnu/cmake/spdlog/spdlogConfig.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libbrotli-dev:arm64" "brotli" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/libbrotlicommon.pc" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/libbrotlidec.pc" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/libbrotlienc.pc"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libcpp-httplib-dev:arm64" "cpp-httplib" \
+    "${sysroot}/usr/include/httplib.h"
 
   local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
   local packages=()
@@ -314,6 +320,8 @@ ensure_sdk_sysroot_packages() {
     packages+=(libfmt9:arm64)
   path_exists_any "${libdir}/libspdlog.so.1.10.0" ||
     packages+=(libspdlog1.10:arm64)
+  path_exists_any "${libdir}/libcpp-httplib.so.0.11*" ||
+    packages+=(libcpp-httplib0.11:arm64)
   path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" ||
     packages+=(libpgm-dev:arm64)
 
@@ -351,7 +359,9 @@ ensure_sdk_sysroot_header_package() {
   )
 
   local deb
-  deb="$(find "${tmp_dir}" -maxdepth 1 -type f -name "${package}_*.deb" | sort | head -n 1)"
+  local package_deb_name
+  package_deb_name="${package%%:*}"
+  deb="$(find "${tmp_dir}" -maxdepth 1 -type f -name "${package_deb_name}_*.deb" | sort | head -n 1)"
   if [[ -z "${deb}" ]]; then
     echo "ERROR: Failed to download ${package}." >&2
     rm -rf "${tmp_dir}"

@@ -158,18 +158,12 @@ Safe_FetchContent_MakeAvailable(cnpy LICENSE)
 
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)
 
-# https://github.com/yhirose/cpp-httplib/issues/2313
-find_package(zstd CONFIG REQUIRED)
-if (NOT TARGET zstd::libzstd)
-    add_library(zstd::libzstd INTERFACE IMPORTED)
-    set_property(TARGET zstd::libzstd PROPERTY INTERFACE_LINK_LIBRARIES zstd)
-endif()
-FetchContent_Declare(
-    httplib
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib"
-    FIND_PACKAGE_ARGS 0.30.1 NAMES httplib
+pkg_check_modules(HTTPLIB REQUIRED cpp-httplib)
+find_library(HTTPLIB_LIBRARY
+    NAMES cpp-httplib
+    PATHS ${HTTPLIB_LIBRARY_DIRS}
+    NO_DEFAULT_PATH
 )
-Safe_FetchContent_MakeAvailable(httplib LICENSE)
 
 set(LLAMA_TOOLS_INSTALL OFF CACHE BOOL "" FORCE)
 set(LLAMA_TESTS_INSTALL OFF CACHE BOOL "" FORCE)
@@ -241,6 +235,7 @@ target_compile_options(
     -ffunction-sections
     -fdata-sections
 )
+target_compile_options(${TARGET_RUNTIME} PUBLIC ${HTTPLIB_CFLAGS_OTHER})
 
 target_include_directories(
     ${TARGET_RUNTIME}
@@ -249,12 +244,12 @@ target_include_directories(
     $<BUILD_INTERFACE:${MSGPACK_CXX_SOURCE_DIR}/include>
     # cnpy include directory is not automatically added when library is linked.
     $<BUILD_INTERFACE:${cnpy_SOURCE_DIR}>
-    $<BUILD_INTERFACE:${httplib_SOURCE_DIR}>
     $<BUILD_INTERFACE:${llama_SOURCE_DIR}/ggml/include>
     # tokenizers_cpp include directory is not added to tokenizers_c target.
     $<BUILD_INTERFACE:${tokenizers_cpp_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+target_include_directories(${TARGET_RUNTIME} SYSTEM PUBLIC ${HTTPLIB_INCLUDE_DIRS})
 
 target_link_libraries(
     ${TARGET_RUNTIME}
@@ -283,7 +278,7 @@ target_link_libraries(
     nlohmann_json::nlohmann_json
     minja
     tokenizers_c
-    httplib::httplib
+    ${HTTPLIB_LIBRARY}
     llama
     PkgConfig::Readline
 )
