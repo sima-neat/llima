@@ -28,8 +28,10 @@
 //
 //**************************************************************************
 
+#include <cctype>
 #include <fstream>
 #include <regex>
+#include <string_view>
 
 #include "web.hpp"
 
@@ -874,12 +876,33 @@ static std::string gemma4_bare_to_json(const std::string& text) {
     return std::regex_replace(with_quoted_keys, unquoted_val, ":\"$1\"");
 }
 
+static nlohmann::json parse_plain_json_tool_calls(std::string_view text, int& id_counter) {
+    nlohmann::json result = nlohmann::json::array();
+    size_t pos = 0;
+    while (pos < text.size()) {
+        while (pos < text.size() &&
+               (std::isspace(static_cast<unsigned char>(text[pos])) != 0 || text[pos] == ';')) {
+            ++pos;
+        }
+        if (pos == text.size()) break;
+        if (text[pos] != '{') return nullptr;
+        auto close = find_matching_brace(text, pos);
+        if (close == std::string_view::npos) return nullptr;
+        auto parsed = nlohmann::json::parse(std::string(text.substr(pos, close - pos + 1)));
+        auto entry = build_tool_call_entry(parsed, id_counter);
+        if (entry.is_null()) return nullptr;
+        result.push_back(entry);
+        pos = close + 1;
+    }
+    return result.empty() ? nullptr : result;
+}
+
 // Returns a tool_calls JSON array if the text is a valid tool call, otherwise null.
 // Handles four formats:
-//   Gemma4-style:   call:name{args}...
-//   Mistral-style:  [{"name":...}]
+//   Gemma4-style:   call:name{args}...  (<|tool_call>, <tool_call|>, <|"|> special tokens stripped)
+//   Mistral-style:  [{"name":...}]      ([TOOL_CALLS] special token stripped, leaving bare JSON array)
 //   Qwen-style:     <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
-//   Llama-style:    {"name": "...", "parameters": {...}}
+//   Llama-style:    {"name": "...", "parameters": {...}}; {"name": "...", ...}
 static nlohmann::json try_parse_tool_call(std::string_view text) {
     int id_counter = 0;
     try {
@@ -905,8 +928,23 @@ static nlohmann::json try_parse_tool_call(std::string_view text) {
             return result;
         }
 
+        const std::string mistral_prefix = "[TOOL_CALLS] ";
+        auto mistral_pos = text.find(mistral_prefix);
+        if (mistral_pos != std::string::npos) {
+            auto array_start = mistral_pos + mistral_prefix.size();
+            auto parsed = nlohmann::json::parse(std::string(text.substr(array_start)));
+            if (!parsed.is_array()) return nullptr;
+            nlohmann::json result = nlohmann::json::array();
+            for (const auto& item : parsed) {
+                auto entry = build_tool_call_entry(item, id_counter);
+                if (entry.is_null()) return nullptr;
+                result.push_back(entry);
+            }
+            return result;
+        }
+
         if (text.starts_with('[')) {
-            auto parsed = nlohmann::json::parse(text);
+            auto parsed = nlohmann::json::parse(std::string(text));
             if (parsed.is_array()) {
                 nlohmann::json result = nlohmann::json::array();
                 for (const auto& item : parsed) {
@@ -940,10 +978,7 @@ static nlohmann::json try_parse_tool_call(std::string_view text) {
             if (!result.empty()) return result;
         }
 
-        auto parsed = nlohmann::json::parse(std::string(text));
-        auto entry = build_tool_call_entry(parsed, id_counter);
-        if (entry.is_null()) return nullptr;
-        return nlohmann::json::array({entry});
+        return parse_plain_json_tool_calls(text, id_counter);
 
     } catch (...) {
         return nullptr;
