@@ -40,9 +40,9 @@
 #include <Eigen/Dense>
 #include <fmt/format.h>
 
-#include <simaai_memory.h>
-
 #include "utils.hpp"
+
+typedef struct simaai_memory_t simaai_memory_t;
 
 namespace simaai {
 namespace llima {
@@ -73,8 +73,8 @@ class MLABuffer {
         uint64_t get_buf_len(
             const std::optional<std::vector<uint32_t>>& shape = std::nullopt
         ) const;
-        void flush_cache() const { simaai_memory_flush_cache(_simaai_mem_ptr); }
-        void invalidate_cache() const { simaai_memory_invalidate_cache(_simaai_mem_ptr); }
+        void flush_cache() const;
+        void invalidate_cache() const;
 
         const std::string& get_name() const { return _name; }
         const std::string& get_dtype() const { return _dtype; }
