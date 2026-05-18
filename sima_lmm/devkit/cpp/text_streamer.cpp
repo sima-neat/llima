@@ -110,7 +110,7 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
                 _callback_info("FULL", 0.0);
                 _is_streaming.store(false);
                 _is_streaming.notify_one();
-                std::cout << "Cache full. Please clear history." << std::endl << std::flush;
+                _logger->info("Cache full. Please clear history.");
                 break;
             case DecodeCallbackType::STOP:
                 end();
@@ -169,7 +169,8 @@ void TextStreamer::end() {
     }
     _on_finalized_text(printable_text, true);
 
-    // Print out stats.
+    // Emit generation stats through the logger. Callers that need structured metrics receive
+    // them through the info callback.
     std::vector<std::string> messages;
     messages.emplace_back("");
     if (_time_to_first_token < 0) {
@@ -210,9 +211,7 @@ void TextStreamer::end() {
 
     for (const auto& message: messages) {
         _logger->info(message);
-        std::cout << message << std::endl;
     }
-    std::cout << std::flush;
 
     // Reset the stats.
     _time_to_first_token = -1;

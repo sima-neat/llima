@@ -58,6 +58,7 @@ class ImageProcessor {
 
         std::vector<Eigen::bfloat16> preprocess(const std::filesystem::path image_path);
         std::vector<Eigen::bfloat16> preprocess(const std::vector<uint8_t>& image_path);
+        std::vector<Eigen::bfloat16> preprocess(const cv::Mat& rgb_image);
 
         static void read_env_vars() {
             // Set the debug info from env variables.

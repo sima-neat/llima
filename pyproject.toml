@@ -15,13 +15,8 @@ dynamic = ["version", "dependencies", "optional-dependencies"]
 authors = [{name = "SiMa.ai", email = "support@sima.ai"}]
 license-files = [
     "LICENSE",
-    "third_party/json/LICENSE.MIT",
-    "third_party/fmt/LICENSE",
-    "third_party/spdlog/LICENSE",
     "third_party/minja/LICENSE",
     "third_party/tokenizers-cpp/LICENSE",
-    "third_party/eigen/LICENSE",
-    "third_party/cpp-httplib/LICENSE",
     "third_party/llama.cpp/LICENSE",
     "third_party/msgpack-c/LICENSE_1_0.txt",
 ]

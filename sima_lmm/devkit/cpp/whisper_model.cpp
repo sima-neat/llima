@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <iterator>
 #include <iostream>
+#include <stdexcept>
 
 #include <cnpy.h>
 #include <fmt/ranges.h>
@@ -90,6 +91,20 @@ ArrayXXbf WhisperPreprocessor::preprocess(
     auto audio_tensor = _load_audio_ffmpeg(audio_file_name);
     auto log_spec = _log_mel_spectrogram(audio_tensor);
     return log_spec;
+}
+
+
+ArrayXXbf WhisperPreprocessor::preprocess_pcm(
+    std::span<const float> pcm,
+    uint32_t sample_rate
+) {
+    if (sample_rate != SAMPLE_RATE) {
+        throw std::runtime_error("WhisperPreprocessor::preprocess_pcm requires 16 kHz PCM");
+    }
+    ArrayXf audio_tensor = ArrayXf::Zero(N_SAMPLES);
+    const auto copy_len = std::min<size_t>(pcm.size(), N_SAMPLES);
+    std::copy_n(pcm.data(), copy_len, audio_tensor.data());
+    return _log_mel_spectrogram(audio_tensor);
 }
 
 
@@ -271,13 +286,21 @@ WhisperModel::WhisperModel(
     std::filesystem::path model_path, bool do_parallel_load
 ) : BaseModel(model_path),
     _preprocessor(_devkit_dir),
-    _do_parallel_load(do_parallel_load)
+    _do_parallel_load(do_parallel_load),
+    _is_running(false)
 {
     _tokenizer_ptr = Tokenizer::from_hf_json(_devkit_dir / "tokenizer.json");
+    _text_streamer = std::make_unique<TextStreamer>(
+        _tokenizer_ptr.get(),
+        [](const std::string&, double) {},
+        [](const std::string&, bool) {}
+    );
     _initialize();
 
     // Run one dummy query to cache the system prompt and warm up other libraries.
+    _text_streamer->disable();
     run_model(sample_audio_file_name.value(), "en");
+    _text_streamer->enable();
 }
 
 
@@ -286,15 +309,41 @@ std::string WhisperModel::run_model(
     const std::string& language
 ) {
     std::lock_guard<std::mutex> lock(_mutex);
-    ChronoTimer timer_ttft(true);
     _logger->info("Audio file: {}", audio_file_name);
+
+    ArrayXXbf audio_tensor = _preprocessor.preprocess(audio_file_name);
+    return _run_model(audio_tensor, language);
+}
+
+
+std::string WhisperModel::run_model_from_pcm(
+    std::span<const float> pcm,
+    uint32_t sample_rate,
+    const std::string& language
+) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    ArrayXXbf mel = _preprocessor.preprocess_pcm(pcm, sample_rate);
+    return _run_model(mel, language);
+}
+
+
+std::string WhisperModel::_run_model(
+    const ArrayXXbf& mel,
+    const std::string& language
+) {
+    _is_running.store(true, std::memory_order_relaxed);
+    struct RunningGuard {
+        std::atomic<bool>& running;
+        ~RunningGuard() {
+            running.store(false, std::memory_order_relaxed);
+        }
+    } running_guard{_is_running};
+
+    ChronoTimer timer_ttft(true);
     _logger->info("Language: {}", language);
 
-    // Preprocess audio file.
-    ArrayXXbf audio_tensor = _preprocessor.preprocess(audio_file_name);
-
     // Upload audio_tensor and run the encoder model.
-    get_buffer("encoder_ifm").upload(audio_tensor.data());
+    get_buffer("encoder_ifm").upload(mel.data());
     _encoder_model_ptr->run();
 
     // Update language token id.
@@ -326,9 +375,14 @@ std::string WhisperModel::run_model(
     MLAModelWithBuffer::run_queue();
     new_token_buf.invalidate_cache();
     new_tokens.emplace_back(new_token_ptr[0]);
-    _logger->info("Time to the first token: {:d} in {:.5f}s", new_tokens.back(), timer_ttft.stop());
-    if (new_tokens.back() == _stop_token_id)
+    const double ttft = timer_ttft.stop();
+    _logger->info("Time to the first token: {:d} in {:.5f}s", new_tokens.back(), ttft);
+    _text_streamer->push(DecodeCallbackType::TTFT, new_tokens.back(), ttft);
+    if (new_tokens.back() == _stop_token_id) {
+        _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
+        _text_streamer->wait_streaming();
         return _tokenizer_ptr->decode(new_tokens, true);
+    }
 
     // Run decoder pre/cache/post models to generate other tokens.
     ChronoTimer timer_tps(true);
@@ -337,6 +391,9 @@ std::string WhisperModel::run_model(
         token_idx < _cfg.max_target_positions;
         ++token_idx
     ) {
+        if (!_is_running.load(std::memory_order_relaxed))
+            break;
+
         for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
             WhisperDecoderModelMapKey model_key{layer_idx, token_idx};
 
@@ -346,7 +403,9 @@ std::string WhisperModel::run_model(
                     std::piecewise_construct,
                     std::forward_as_tuple(0),
                     std::forward_as_tuple(
-                        &get_buffer("token_embeddings"), std::vector<uint32_t>{new_tokens.back(), 0}
+                        &get_buffer("token_embeddings"),
+                        std::vector<uint32_t>{new_tokens.back(), 0},
+                        std::vector<uint32_t>{1, _cfg.d_model}
                     )
                 );
             }
@@ -358,12 +417,22 @@ std::string WhisperModel::run_model(
         MLAModelWithBuffer::run_queue();
         new_token_buf.invalidate_cache();
         new_tokens.emplace_back(new_token_ptr[0]);
-        _logger->info("Got token {:d} in {:.5f}s", new_tokens.back(), timer_tps.stop(true));
+        const double ttnt = timer_tps.stop(true);
+        _logger->info("Got token {:d} in {:.5f}s", new_tokens.back(), ttnt);
 
         if (new_tokens.back() == _stop_token_id)
             break;
+
+        _text_streamer->push(DecodeCallbackType::TPS, new_tokens.back(), ttnt);
     }
+    _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
+    _text_streamer->wait_streaming();
     return _tokenizer_ptr->decode(new_tokens, true);
+}
+
+
+void WhisperModel::stop_model() {
+    _is_running.store(false, std::memory_order_relaxed);
 }
 
 

@@ -44,7 +44,6 @@ set(
     CACHE STRING
     "Install destination for the lean sima_lmm Python runtime package."
 )
-
 # Set the build flags.
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -72,6 +71,7 @@ find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
 find_package(NeatInternals REQUIRED)
+find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
 find_package(PkgConfig REQUIRED)
@@ -112,42 +112,32 @@ macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
     endif()
 endmacro()
 
-# For other libraries that do not have pypi package, debian package or the packages with required
-# versions, use git submodule to download source first and build it to avoid downloading dynamically
-# at build time.
-set(JSON_Diagnostics ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    json
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/json"
-    FIND_PACKAGE_ARGS 3.12.1 NAMES nlohmann_json
-)
-Safe_FetchContent_MakeAvailable(json LICENSE.MIT)
+find_package(fmt 9.1 CONFIG REQUIRED)
 
-set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    fmt
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt"
-    FIND_PACKAGE_ARGS 12.1.0 NAMES fmt
-)
-Safe_FetchContent_MakeAvailable(fmt LICENSE)
-
-set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
-set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    spdlog
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/spdlog"
-    FIND_PACKAGE_ARGS 1.17.0 NAMES spdlog
-)
-Safe_FetchContent_MakeAvailable(spdlog LICENSE)
+find_package(spdlog 1.10 CONFIG REQUIRED)
 
 set(MINJA_TEST_ENABLED OFF CACHE BOOL "" FORCE)
 set(MINJA_EXAMPLE_ENABLED OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
+set(minja_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/minja")
+add_library(minja INTERFACE)
+target_include_directories(
     minja
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/minja"
+    INTERFACE
+    $<BUILD_INTERFACE:${minja_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-Safe_FetchContent_MakeAvailable(minja LICENSE)
+target_link_libraries(
+    minja
+    INTERFACE
+    nlohmann_json::nlohmann_json
+)
+install(
+    FILES "${minja_SOURCE_DIR}/LICENSE"
+    DESTINATION "docs/licenses"
+    RENAME "LICENSE.minja"
+    COMPONENT dev
+)
 
 set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
 set(MSGPACK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -166,27 +156,14 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(cnpy LICENSE)
 
-set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    eigen
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/eigen"
-    FIND_PACKAGE_ARGS 5.0.1 NAMES Eigen3
-)
-Safe_FetchContent_MakeAvailable(eigen LICENSE)
+find_package(Eigen3 3.4 REQUIRED NO_MODULE)
 
-# https://github.com/yhirose/cpp-httplib/issues/2313
-find_package(zstd CONFIG REQUIRED)
-if (NOT TARGET zstd::libzstd)
-    add_library(zstd::libzstd INTERFACE IMPORTED)
-    set_property(TARGET zstd::libzstd PROPERTY INTERFACE_LINK_LIBRARIES zstd)
-endif()
-FetchContent_Declare(
-    httplib
-    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib"
-    FIND_PACKAGE_ARGS 0.30.1 NAMES httplib
+pkg_check_modules(HTTPLIB REQUIRED cpp-httplib)
+find_library(HTTPLIB_LIBRARY
+    NAMES cpp-httplib
+    PATHS ${HTTPLIB_LIBRARY_DIRS}
+    NO_DEFAULT_PATH
 )
-Safe_FetchContent_MakeAvailable(httplib LICENSE)
 
 set(LLAMA_TOOLS_INSTALL OFF CACHE BOOL "" FORCE)
 set(LLAMA_TESTS_INSTALL OFF CACHE BOOL "" FORCE)
@@ -229,13 +206,24 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
 list(FILTER SOURCES EXCLUDE REGEX "sima_lmm/devkit/cpp/binding.cpp")
 
 add_library(${TARGET_RUNTIME} SHARED ${SOURCES})
-set_target_properties(${TARGET_RUNTIME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
+set_target_properties(
+    ${TARGET_RUNTIME}
+    PROPERTIES
+    INTERPROCEDURAL_OPTIMIZATION TRUE
+    CXX_VISIBILITY_PRESET default
+    VISIBILITY_INLINES_HIDDEN OFF
+)
 message(STATUS "Using MLA dispatcher library: ${SIMAAI_DISPATCHER_LIB}")
 set_target_properties(
     ${TARGET_RUNTIME} PROPERTIES
     INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
 )
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
+target_compile_definitions(
+    ${TARGET_RUNTIME}
+    PRIVATE
+        SIMA_LMM_DEFAULT_ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/sima_lmm/assets"
+)
 
 target_compile_options(
     ${TARGET_RUNTIME}
@@ -247,6 +235,7 @@ target_compile_options(
     -ffunction-sections
     -fdata-sections
 )
+target_compile_options(${TARGET_RUNTIME} PUBLIC ${HTTPLIB_CFLAGS_OTHER})
 
 target_include_directories(
     ${TARGET_RUNTIME}
@@ -255,12 +244,12 @@ target_include_directories(
     $<BUILD_INTERFACE:${MSGPACK_CXX_SOURCE_DIR}/include>
     # cnpy include directory is not automatically added when library is linked.
     $<BUILD_INTERFACE:${cnpy_SOURCE_DIR}>
-    $<BUILD_INTERFACE:${httplib_SOURCE_DIR}>
     $<BUILD_INTERFACE:${llama_SOURCE_DIR}/ggml/include>
     # tokenizers_cpp include directory is not added to tokenizers_c target.
     $<BUILD_INTERFACE:${tokenizers_cpp_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+target_include_directories(${TARGET_RUNTIME} SYSTEM PUBLIC ${HTTPLIB_INCLUDE_DIRS})
 
 target_link_libraries(
     ${TARGET_RUNTIME}
@@ -289,7 +278,7 @@ target_link_libraries(
     nlohmann_json::nlohmann_json
     minja
     tokenizers_c
-    httplib::httplib
+    ${HTTPLIB_LIBRARY}
     llama
     PkgConfig::Readline
 )
@@ -327,6 +316,7 @@ set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/language_model.hpp
     sima_lmm/devkit/cpp/mla_buffer.hpp
     sima_lmm/devkit/cpp/mla_model.hpp
+    sima_lmm/devkit/cpp/nlohmann_optional.hpp
     sima_lmm/devkit/cpp/rope_utils.hpp
     sima_lmm/devkit/cpp/setup.hpp
     sima_lmm/devkit/cpp/text_streamer.hpp
@@ -353,6 +343,12 @@ install(
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT core
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(
+    DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/assets"
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/sima_lmm
+    COMPONENT core
+    PATTERN "__pycache__" EXCLUDE
 )
 install(
     FILES ${SIMA_LMM_PUBLIC_HEADERS}
@@ -413,12 +409,6 @@ patch: ${SIMA_LMM_VERSION_patch}
         COMPONENT cli
     )
     install(
-        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/assets"
-        DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
-        COMPONENT cli
-        PATTERN "__pycache__" EXCLUDE
-    )
-    install(
         DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit"
         DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
         COMPONENT cli
@@ -468,11 +458,11 @@ set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime, simaai-memory-lib")
+    "neat-runtime, simaai-memory-lib, libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
     "neat-internals-dev, simaai-memory-lib-dev, "
-    "nlohmann-json3-dev, libeigen3-dev, libfmt-dev, libspdlog-dev, "
+    "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
     "libssl-dev, cppzmq-dev, libzmq3-dev")

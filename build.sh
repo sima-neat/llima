@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
-NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-https://artifacts.sima-neat.com/internals/sima-neat-internals-beta_changes-latest.tar.gz}"
+NEAT_INTERNALS_BASE_URL="${NEAT_INTERNALS_BASE_URL:-https://artifacts.sima-neat.com/internals}"
+NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-}"
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 ARCH=arm64
 ELXR_SDK=OFF
@@ -206,6 +207,29 @@ compute_sha256() {
   return 1
 }
 
+current_branch_slug() {
+  local branch
+  branch="$(git -C "${ROOT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -z "${branch}" || "${branch}" == "HEAD" ]]; then
+    branch="main"
+  fi
+  echo "${branch}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#-#g; s/^-+//; s/-+$//'
+}
+
+resolve_neat_internals_archive_url() {
+  if [[ -n "${NEAT_INTERNALS_ARCHIVE_URL}" ]]; then
+    printf '%s\n' "${NEAT_INTERNALS_ARCHIVE_URL}"
+    return
+  fi
+
+  local branch_slug
+  branch_slug="$(current_branch_slug)"
+  if [[ -z "${branch_slug}" ]]; then
+    branch_slug="main"
+  fi
+  printf '%s/sima-neat-internals-%s-latest.tar.gz\n' "${NEAT_INTERNALS_BASE_URL}" "${branch_slug}"
+}
+
 ensure_git_submodules() {
   local path
   local missing=0
@@ -242,15 +266,6 @@ ensure_git_submodules() {
 ensure_sdk_sysroot_packages() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local overlay_script="/usr/local/bin/install-sysroot-overlay.sh"
-  local packages=(
-    libopencv-flann406:arm64
-    libopencv-dnn406:arm64
-    libopencv-features2d406:arm64
-    libopencv-objdetect406:arm64
-    libopencv-video406:arm64
-    libssl-dev:arm64
-    libpgm-dev:arm64
-  )
 
   if [[ "${ELXR_SDK}" != "ON" ]]; then
     return
@@ -263,13 +278,98 @@ ensure_sdk_sysroot_packages() {
     echo "ERROR: SDK sysroot overlay installer not found: ${overlay_script}" >&2
     exit 1
   fi
-  if sdk_sysroot_overlay_ready "${sysroot}"; then
+
+  ensure_sdk_sysroot_header_package "${sysroot}" "libeigen3-dev" "Eigen" \
+    "${sysroot}/usr/include/eigen3/unsupported/Eigen/CXX11/Tensor" \
+    "${sysroot}/usr/share/eigen3/cmake/Eigen3Config.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "nlohmann-json3-dev" "nlohmann_json" \
+    "${sysroot}/usr/include/nlohmann/json.hpp" \
+    "${sysroot}/usr/share/cmake/nlohmann_json/nlohmann_jsonConfig.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libfmt-dev:arm64" "fmt" \
+    "${sysroot}/usr/include/fmt/core.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/cmake/fmt/fmt-config.cmake" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/cmake/fmt/fmtConfig.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libspdlog-dev:arm64" "spdlog" \
+    "${sysroot}/usr/include/spdlog/spdlog.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/cmake/spdlog/spdlogConfig.cmake"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libbrotli-dev:arm64" "brotli" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/libbrotlicommon.pc" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/libbrotlidec.pc" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/libbrotlienc.pc"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libcpp-httplib-dev:arm64" "cpp-httplib" \
+    "${sysroot}/usr/include/httplib.h"
+
+  local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
+  local packages=()
+
+  path_exists_any "${libdir}/libopencv_flann.so.406*" ||
+    packages+=(libopencv-flann406:arm64)
+  path_exists_any "${libdir}/libopencv_dnn.so.406*" ||
+    packages+=(libopencv-dnn406:arm64)
+  path_exists_any "${libdir}/libopencv_features2d.so.406*" ||
+    packages+=(libopencv-features2d406:arm64)
+  path_exists_any "${libdir}/libopencv_objdetect.so.406*" ||
+    packages+=(libopencv-objdetect406:arm64)
+  path_exists_any "${libdir}/libopencv_video.so.406*" ||
+    packages+=(libopencv-video406:arm64)
+  if [[ ! -f "${sysroot}/usr/include/openssl/ssl.h" ||
+        ! -e "${libdir}/libcrypto.so" ]]; then
+    packages+=(libssl-dev:arm64)
+  fi
+  path_exists_any "${libdir}/libfmt.so.9.1.0" ||
+    packages+=(libfmt9:arm64)
+  path_exists_any "${libdir}/libspdlog.so.1.10.0" ||
+    packages+=(libspdlog1.10:arm64)
+  path_exists_any "${libdir}/libcpp-httplib.so.0.11*" ||
+    packages+=(libcpp-httplib0.11:arm64)
+  path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" ||
+    packages+=(libpgm-dev:arm64)
+
+  if [[ "${#packages[@]}" -eq 0 ]]; then
     echo "[build] llima SDK sysroot package overlay already present"
     return
   fi
 
-  echo "[build] Installing llima SDK sysroot package overlay"
+  echo "[build] Installing missing llima SDK sysroot package overlay payloads"
   run_as_root "${overlay_script}" "${sysroot}" "${packages[@]}"
+}
+
+ensure_sdk_sysroot_header_package() {
+  local sysroot="$1"
+  local package="$2"
+  local label="$3"
+  shift 3
+
+  if path_exists_any "$@"; then
+    return
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "ERROR: apt-get and dpkg-deb are required to install ${package} into the SDK sysroot." >&2
+    exit 1
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d /tmp/llima-sysroot-header.XXXXXX)"
+
+  echo "[build] Installing SDK sysroot header package: ${package} (${label})"
+  (
+    cd "${tmp_dir}"
+    apt-get download "${package}"
+  )
+
+  local deb
+  local package_deb_name
+  package_deb_name="${package%%:*}"
+  deb="$(find "${tmp_dir}" -maxdepth 1 -type f -name "${package_deb_name}_*.deb" | sort | head -n 1)"
+  if [[ -z "${deb}" ]]; then
+    echo "ERROR: Failed to download ${package}." >&2
+    rm -rf "${tmp_dir}"
+    exit 1
+  fi
+
+  run_as_root dpkg-deb -x "${deb}" "${sysroot}"
+  rm -rf "${tmp_dir}"
 }
 
 path_exists_any() {
@@ -282,38 +382,10 @@ path_exists_any() {
   return 1
 }
 
-require_sysroot_path() {
-  local label="$1"
-  shift
-
-  if path_exists_any "$@"; then
-    return 0
-  fi
-
-  echo "[build] Missing llima SDK sysroot overlay payload: ${label}" >&2
-  return 1
-}
-
-sdk_sysroot_overlay_ready() {
-  local sysroot="$1"
-  local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
-  local missing=0
-
-  require_sysroot_path "OpenCV flann" "${libdir}/libopencv_flann.so.406*" || missing=1
-  require_sysroot_path "OpenCV dnn" "${libdir}/libopencv_dnn.so.406*" || missing=1
-  require_sysroot_path "OpenCV features2d" "${libdir}/libopencv_features2d.so.406*" || missing=1
-  require_sysroot_path "OpenCV objdetect" "${libdir}/libopencv_objdetect.so.406*" || missing=1
-  require_sysroot_path "OpenCV video" "${libdir}/libopencv_video.so.406*" || missing=1
-  require_sysroot_path "OpenSSL headers" "${sysroot}/usr/include/openssl/ssl.h" || missing=1
-  require_sysroot_path "OpenSSL crypto library" "${libdir}/libcrypto.so" "${libdir}/libcrypto.so.*" || missing=1
-  require_sysroot_path "OpenPGM library" "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" || missing=1
-
-  [[ "${missing}" -eq 0 ]]
-}
-
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
-  local archive_url="${NEAT_INTERNALS_ARCHIVE_URL}"
+  local archive_url
+  archive_url="$(resolve_neat_internals_archive_url)"
   local archive_name
   archive_name="$(basename "${archive_url}")"
 
@@ -351,9 +423,11 @@ ensure_neat_internals() {
   tar -xzf "${archive_path}" -C "${extract_dir}"
 
   local deb_patterns=(
+    'simaai-common_*_all.deb'
     'neat-runtime_*_arm64.deb'
     'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
+    'appcomplex_*_arm64.deb'
   )
   local debs=()
   local pattern deb
@@ -600,6 +674,10 @@ fi
 
 ensure_writable_cargo_home
 ensure_python_build_env
+CMAKE_SOABI_ARGS=()
+if [[ "${ELXR_SDK}" == "ON" ]]; then
+  CMAKE_SOABI_ARGS+=("-DSKBUILD_SOABI=cpython-311-${MULTIARCH}")
+fi
 
 echo "[build] Configuring sima-lmm $LLIMA_VERSION for arch=$ARCH"
 echo "[build] Python extension SOABI: $PYTHON_TARGET_SOABI"
@@ -614,6 +692,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DSIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR="lib/python3/dist-packages/sima_lmm/devkit" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
   -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$ARCH" \
+  "${CMAKE_SOABI_ARGS[@]}" \
   "${EXTRA_CMAKE_ARGS[@]}"
 
 echo "[build] Building sima-lmm targets with $BUILD_JOBS parallel job(s)"

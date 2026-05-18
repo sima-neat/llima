@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <bit>
 #include <fstream>
+#include <stdexcept>
 
 #include "eigen_types.hpp"
 #include "image_processor.hpp"
@@ -103,6 +104,15 @@ std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const std::vector<uint8_
 
     // Preprocess.
     return _preprocess(std::move(image));
+}
+
+
+std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const cv::Mat& rgb_image) {
+    if (rgb_image.type() != CV_8UC3) {
+        throw std::runtime_error("ImageProcessor::preprocess requires CV_8UC3 RGB input");
+    }
+
+    return _preprocess(rgb_image.clone());
 }
 
 

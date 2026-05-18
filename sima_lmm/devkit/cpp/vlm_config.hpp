@@ -37,6 +37,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "nlohmann_optional.hpp"
 #include "utils.hpp"
 
 namespace simaai {

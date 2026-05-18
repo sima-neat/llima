@@ -29,13 +29,14 @@
 //**************************************************************************
 
 #include <fstream>
+
+#include "web.hpp"
+
 #include <fmt/chrono.h>
-#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 
 #include "utils.hpp"
-#include "web.hpp"
 
 namespace simaai {
 namespace llima {
@@ -138,7 +139,7 @@ void WEB::run() {
 
     auto cors_handler = [this](const httplib::Request& req, httplib::Response& res) {
         this->_set_cors_headers(res);
-        res.status = httplib::StatusCode::OK_200;
+        res.status = 200;
     };
 
     _http_server.Options("/v1/chat/completions", cors_handler);
@@ -181,7 +182,7 @@ void WEB::_handle_stop(const httplib::Request& req, httplib::Response& res) {
     _stop_and_detach_vlm_thread();
 
     // Send response immediately
-    res.status = httplib::StatusCode::OK_200;
+    res.status = 200;
     _logger->info("VLM completed.");
 }
 
@@ -355,6 +356,28 @@ std::string WEB::_format_ollama_ndjson_chunk(
     return chunk.dump() + "\n";
 }
 
+std::string WEB::_format_audio_sse_chunk(
+    const std::string& text,
+    bool finished,
+    std::optional<std::string> finish_reason,
+    std::optional<double> ttft,
+    std::optional<double> tps
+) {
+    nlohmann::json chunk;
+    chunk["object"] = finished ? "audio.transcription.done" : "audio.transcription.chunk";
+    chunk["text"] = text;
+    if (finished) {
+        chunk["finish_reason"] = finish_reason.value_or("stop");
+    }
+    if (ttft.has_value()) {
+        chunk["ttft"] = ttft.value();
+    }
+    if (tps.has_value()) {
+        chunk["tps"] = tps.value();
+    }
+    return "data: " + chunk.dump() + "\n\n";
+}
+
 
 void WEB::_handle_chat_completions(
     const httplib::Request& req,
@@ -384,7 +407,7 @@ void WEB::_handle_chat_completions(
         }
     } catch (const std::exception& e) {
         _logger->error("Error in chat handler: {}", e.what());
-        res.status = httplib::StatusCode::InternalServerError_500;
+        res.status = 500;
         nlohmann::json error_body = {{"error", e.what()}};
         if (is_openai) {
              error_body = {
@@ -398,8 +421,8 @@ void WEB::_handle_chat_completions(
 void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Response& res) {
     _set_cors_headers(res);
     try {
-        if (!req.form.has_file("file")) {
-            res.status = httplib::StatusCode::BadRequest_400;
+        if (!req.has_file("file")) {
+            res.status = 400;
             res.set_content(R"({"error": "No 'file' part"})", "application/json");
             return;
         }
@@ -407,7 +430,7 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
         // Barge-in check
         _stop_and_detach_vlm_thread();
 
-        const auto& file = req.form.get_file("file");
+        const auto file = req.get_file_value("file");
 
         std::ofstream output_file(_AUDIO_FILE_NAME, std::ios::out | std::ios::binary);
         output_file.write(file.content.c_str(), file.content.size());
@@ -415,32 +438,111 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
 
         // Get language from form data
         std::string language = "en";
-        // Check both fields and files just in case
-        if (req.form.has_field("language")) {
-            language = req.form.get_field("language");
-        } else if (req.form.has_file("language")) {
-            const auto& lang_file = req.form.get_file("language");
+        // Older cpp-httplib stores plain multipart fields in params.
+        if (req.has_param("language")) {
+            language = req.get_param_value("language");
+        } else if (req.has_file("language")) {
+            const auto lang_file = req.get_file_value("language");
             if (!lang_file.content.empty()) {
                 language = lang_file.content;
             }
         }
 
         if (!_whisper_model_ptr) {
-            res.status = httplib::StatusCode::ServiceUnavailable_503;
+            res.status = 503;
             res.set_content(R"({"error": "Whisper model not loaded"})", "application/json");
             return;
         }
 
-        auto text = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
+        bool stream = false;
+        if (req.has_param("stream")) {
+            auto value = req.get_param_value("stream");
+            stream = value == "true" || value == "1" || value == "True";
+        } else if (req.has_file("stream")) {
+            auto value = req.get_file_value("stream").content;
+            stream = value == "true" || value == "1" || value == "True";
+        }
 
+        if (stream) {
+            _execute_streaming_audio_transcription(res, language);
+            return;
+        }
+
+        auto text = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
         nlohmann::json response = {{"text", text}};
         res.set_content(response.dump(), "application/json");
 
     } catch (const std::exception& e) {
         _logger->error("Error in transcription: {}", e.what());
-        res.status = httplib::StatusCode::InternalServerError_500;
+        res.status = 500;
         res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
     }
+}
+
+void WEB::_execute_streaming_audio_transcription(
+    httplib::Response& res,
+    const std::string& language
+) {
+    res.set_header("Content-Type", "text/event-stream");
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("Connection", "keep-alive");
+
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [this, language](size_t offset, httplib::DataSink &sink) {
+            (void)offset;
+            std::optional<double> ttft_value;
+            std::optional<double> tps_value;
+
+            struct WhisperCallbackGuard {
+                WhisperModel* model;
+                ~WhisperCallbackGuard() {
+                    model->set_info_callback([](const std::string&, double) {});
+                    model->set_text_callback([](const std::string&, bool) {});
+                }
+            } callback_guard{_whisper_model_ptr.get()};
+
+            auto info_callback = [&](const std::string& metric_type, double metric_value) {
+                if (metric_type == "ttft") {
+                    ttft_value = metric_value;
+                    return;
+                }
+                if (metric_type == "tps") {
+                    tps_value = metric_value;
+                    return;
+                }
+                if (metric_type == "END" || metric_type == "FULL") {
+                    const std::string finish_reason = metric_type == "FULL" ? "length" : "stop";
+                    std::string chunk = _format_audio_sse_chunk(
+                        "", true, finish_reason, ttft_value, tps_value
+                    ) + "data: [DONE]\n\n";
+                    sink.write(chunk.data(), chunk.size());
+                }
+            };
+
+            auto text_callback = [&](const std::string& text, bool stream_end) {
+                if (text.empty())
+                    return;
+                std::string chunk = _format_audio_sse_chunk(text, false);
+                sink.write(chunk.data(), chunk.size());
+            };
+
+            try {
+                _whisper_model_ptr->set_info_callback(info_callback);
+                _whisper_model_ptr->set_text_callback(text_callback);
+                _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
+            } catch (const std::exception& e) {
+                nlohmann::json error;
+                error["object"] = "audio.transcription.error";
+                error["error"] = e.what();
+                std::string chunk = "data: " + error.dump() + "\n\ndata: [DONE]\n\n";
+                sink.write(chunk.data(), chunk.size());
+            }
+
+            sink.done();
+            return true;
+        }
+    );
 }
 
 
@@ -466,7 +568,7 @@ std::optional<Chat> WEB::_prepare_chat_context(
     } else if (json_data.contains("prompt")) {
         chat.add_query(json_data["prompt"]);
     } else {
-        res.status = httplib::StatusCode::BadRequest_400;
+        res.status = 400;
         res.set_content(R"({"error": "Missing messages or prompt"})", "application/json");
         return std::nullopt;
     }
@@ -756,7 +858,7 @@ void WEB::_handle_set_lora(const httplib::Request& req, httplib::Response& res) 
 
     auto json_data = nlohmann::json::parse(req.body);
     if (!json_data.contains("name")) {
-        res.status = httplib::StatusCode::BadRequest_400;
+        res.status = 400;
         res.set_content(R"({"error": "Missing name"})", "application/json");
         return;
     }
@@ -765,11 +867,11 @@ void WEB::_handle_set_lora(const httplib::Request& req, httplib::Response& res) 
 
     try {
         _vision_language_model_ptr->set_reloc(json_data["name"]);
-        res.status = httplib::StatusCode::OK_200;
+        res.status = 200;
         _logger->info("Set LoRA weights completed.");
     } catch (const std::exception& e) {
         _logger->error("Failed to set LoRA weights");
-        res.status = httplib::StatusCode::InternalServerError_500;
+        res.status = 500;
         nlohmann::json error_body = {{"error", e.what()}};
         res.set_content(error_body.dump(), "application/json");
     }
@@ -783,7 +885,7 @@ void WEB::_handle_unset_lora(const httplib::Request& req, httplib::Response& res
     _vision_language_model_ptr->unset_reloc();
 
     // Send response immediately
-    res.status = httplib::StatusCode::OK_200;
+    res.status = 200;
     _logger->info("Set LoRA weights completed.");
 }
 
