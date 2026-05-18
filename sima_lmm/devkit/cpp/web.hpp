@@ -98,6 +98,13 @@ class EXPORT WEB {
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt
         );
+        std::string _format_audio_sse_chunk(
+            const std::string& text,
+            bool finished,
+            std::optional<std::string> finish_reason = std::nullopt,
+            std::optional<double> ttft = std::nullopt,
+            std::optional<double> tps = std::nullopt
+        );
 
         // Helpers for chat completion
         std::optional<Chat> _prepare_chat_context(
@@ -119,6 +126,10 @@ class EXPORT WEB {
             Chat& chat, 
             const std::string& model, 
             bool is_openai
+        );
+        void _execute_streaming_audio_transcription(
+            httplib::Response& res,
+            const std::string& language
         );
 
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;

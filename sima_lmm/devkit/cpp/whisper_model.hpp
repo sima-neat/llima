@@ -35,6 +35,7 @@
 #include <map>
 #include <memory>
 #include <tuple>
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <vector>
@@ -50,6 +51,7 @@ extern "C" {
 
 #include "base_model.hpp"
 #include "eigen_types.hpp"
+#include "text_streamer.hpp"
 #include "tokenizer.hpp"
 #include "whisper_config.hpp"
 
@@ -101,6 +103,16 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::string run_model_from_pcm(
             std::span<const float> pcm, uint32_t sample_rate, const std::string& language
         );
+        void set_info_callback(TextStreamer::InfoCallback callback) {
+            _text_streamer->set_info_callback(callback);
+        }
+        void set_text_callback(TextStreamer::TextCallback callback) {
+            _text_streamer->set_text_callback(callback);
+        }
+        void wait_for_streamer_completion() {
+            _text_streamer->wait_streaming();
+        }
+        void stop_model();
 
     private:
         virtual void _initialize() override;
@@ -129,6 +141,8 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         WhisperPreprocessor _preprocessor;
         bool _do_parallel_load;
         std::unique_ptr<Tokenizer> _tokenizer_ptr;
+        std::unique_ptr<TextStreamer> _text_streamer;
+        std::atomic<bool> _is_running;
 
         std::unique_ptr<MLAModelWithBuffer> _encoder_model_ptr;
         std::map<uint8_t, MLAModelWithBuffer> _decoder_init_model_map;

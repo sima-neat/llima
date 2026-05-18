@@ -102,7 +102,7 @@ CLI::~CLI() {
 
 
 void CLI::run() {
-    std::string language;
+    std::string language = "en";
     auto chat = _vision_language_model_ptr->create_chat();
     std::string command;
     ReadlineSupport readline_support;
@@ -188,8 +188,21 @@ void CLI::run() {
                 std::cout << "Audio file not found: " << audio_file_name << std::endl;
                 continue;
             }
+            std::cout << "Transcribed query: " << std::flush;
+            _whisper_model_ptr->set_text_callback(
+                [](const std::string& text, bool stream_end) {
+                    std::cout << text << std::flush;
+                    if (stream_end)
+                        std::cout << std::endl;
+                }
+            );
+            struct WhisperTextCallbackGuard {
+                WhisperModel* model;
+                ~WhisperTextCallbackGuard() {
+                    model->set_text_callback([](const std::string&, bool) {});
+                }
+            } callback_guard{_whisper_model_ptr.get()};
             auto query = _whisper_model_ptr->run_model(audio_file_name, language);
-            std::cout << "Transcribed query: " << query << std::endl;
             chat.add_query(query);
         } else {
             std::cout << "Query: " << command << std::endl;
