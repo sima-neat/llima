@@ -505,7 +505,7 @@ ensure_neat_internals() {
     'neat-runtime_*_arm64.deb'
     'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
-    'appcomplex_*_arm64.deb'
+    'neat-appcomplex_*_arm64.deb'
   )
   local debs=()
   local pattern deb
