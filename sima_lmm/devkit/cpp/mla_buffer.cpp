@@ -32,6 +32,7 @@
 #include <set>
 
 #include <fmt/ranges.h>
+#include <simaai_memory.h>
 
 #include "mla_buffer.hpp"
 
@@ -135,6 +136,13 @@ void MLABuffer::free() {
     _simaai_mem_ptr = nullptr;
 }
 
+void MLABuffer::flush_cache() const {
+    simaai_memory_flush_cache(_simaai_mem_ptr);
+}
+
+void MLABuffer::invalidate_cache() const {
+    simaai_memory_invalidate_cache(_simaai_mem_ptr);
+}
 
 void MLABuffer::clear(bool flush) {
     std::memset(_virtual_addr, 0, _size_padded);
