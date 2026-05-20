@@ -1,13 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
 import json
 import re
 from dataclasses import dataclass, asdict, field, InitVar

@@ -1,14 +1,3 @@
-#########################################################
-# Copyright (C) 2024 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
-
 import logging
 import os
 

@@ -1,14 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
-
 # Use explicift re-export to avoid the imported-but-unused lint error.
 from sima_lmm.model.base import (
     EvalMode as EvalMode,

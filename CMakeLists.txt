@@ -88,6 +88,44 @@ pkg_check_modules(Readline REQUIRED IMPORTED_TARGET readline)
 include(FetchContent)
 set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "Force offline build")
 
+set(SIMA_LMM_CORE_DOC_DIR "${CMAKE_INSTALL_DATADIR}/doc/sima-lmm-core")
+set(SIMA_LMM_DEV_DOC_DIR "${CMAKE_INSTALL_DATADIR}/doc/sima-lmm-dev")
+set(SIMA_LMM_CLI_DOC_DIR "${CMAKE_INSTALL_DATADIR}/doc/sima-lmm-cli")
+
+function(install_sima_lmm_project_copyright COMPONENT DOC_DIR)
+    install(
+        FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        DESTINATION "${DOC_DIR}"
+        RENAME "copyright"
+        COMPONENT ${COMPONENT}
+    )
+endfunction()
+
+function(install_sima_lmm_third_party_license LICENSE_FILE LICENSE_NAME)
+    if(NOT EXISTS "${LICENSE_FILE}")
+        message(WARNING "Third-party license file not found: ${LICENSE_FILE}")
+        return()
+    endif()
+
+    foreach(_sima_lmm_component IN ITEMS core dev)
+        if(_sima_lmm_component STREQUAL "core")
+            set(_sima_lmm_doc_dir "${SIMA_LMM_CORE_DOC_DIR}")
+        else()
+            set(_sima_lmm_doc_dir "${SIMA_LMM_DEV_DOC_DIR}")
+        endif()
+        install(
+            FILES "${LICENSE_FILE}"
+            DESTINATION "${_sima_lmm_doc_dir}/third_party"
+            RENAME "${LICENSE_NAME}"
+            COMPONENT ${_sima_lmm_component}
+        )
+    endforeach()
+endfunction()
+
+install_sima_lmm_project_copyright(core "${SIMA_LMM_CORE_DOC_DIR}")
+install_sima_lmm_project_copyright(dev "${SIMA_LMM_DEV_DOC_DIR}")
+install_sima_lmm_project_copyright(cli "${SIMA_LMM_CLI_DOC_DIR}")
+
 macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
     FetchContent_GetProperties(${NAME})
     if(NOT ${NAME}_POPULATED)
@@ -99,13 +137,9 @@ macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
         # Add the directory manually with EXCLUDE_FROM_ALL.
         add_subdirectory("${${NAME}_SOURCE_DIR}" "${${NAME}_BINARY_DIR}" EXCLUDE_FROM_ALL)
 
-        # Install the license file.
-        message(STATUS "Install license file: ${${NAME}_SOURCE_DIR}/${LICENSE_NAME}")
-        install(
-            FILES "${${NAME}_SOURCE_DIR}/${LICENSE_NAME}"
-            DESTINATION "docs/licenses"
-            RENAME "LICENSE.${NAME}"
-            COMPONENT dev
+        install_sima_lmm_third_party_license(
+            "${${NAME}_SOURCE_DIR}/${LICENSE_NAME}"
+            "LICENSE.${NAME}"
         )
     else()
         message(STATUS "Using system-provided package for ${NAME}")
@@ -132,11 +166,9 @@ target_link_libraries(
     INTERFACE
     nlohmann_json::nlohmann_json
 )
-install(
-    FILES "${minja_SOURCE_DIR}/LICENSE"
-    DESTINATION "docs/licenses"
-    RENAME "LICENSE.minja"
-    COMPONENT dev
+install_sima_lmm_third_party_license(
+    "${minja_SOURCE_DIR}/LICENSE"
+    "LICENSE.minja"
 )
 
 set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
@@ -175,6 +207,7 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(llama LICENSE)
 
+set(SIMA_LMM_MSGPACK_LICENSE_INSTALLED OFF)
 if(NOT TARGET msgpack-cxx)
     set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack-c")
     if(NOT EXISTS "${MSGPACK_CXX_SOURCE_DIR}/CMakeLists.txt")
@@ -186,7 +219,40 @@ if(NOT TARGET msgpack-cxx)
         FIND_PACKAGE_ARGS 7.0.0 NAMES msgpack-cxx
     )
     Safe_FetchContent_MakeAvailable(msgpack-cxx LICENSE_1_0.txt)
+    set(SIMA_LMM_MSGPACK_LICENSE_INSTALLED ON)
 endif()
+
+if(NOT DEFINED MSGPACK_CXX_SOURCE_DIR)
+    set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack-c")
+endif()
+if(NOT SIMA_LMM_MSGPACK_LICENSE_INSTALLED)
+    install_sima_lmm_third_party_license(
+        "${MSGPACK_CXX_SOURCE_DIR}/LICENSE_1_0.txt"
+        "LICENSE.msgpack-cxx"
+    )
+endif()
+install_sima_lmm_third_party_license(
+    "${MSGPACK_CXX_SOURCE_DIR}/NOTICE"
+    "NOTICE.msgpack-cxx"
+)
+set(SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_PATHS
+    "third_party/tokenizers-cpp/sentencepiece/LICENSE"
+    "third_party/llama.cpp/licenses/LICENSE-jsonhpp"
+)
+set(SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_NAMES
+    "LICENSE.sentencepiece"
+    "LICENSE.llama.cpp-jsonhpp"
+)
+list(LENGTH SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_PATHS _sima_lmm_extra_license_count)
+math(EXPR _sima_lmm_extra_license_last "${_sima_lmm_extra_license_count} - 1")
+foreach(_sima_lmm_license_index RANGE ${_sima_lmm_extra_license_last})
+    list(GET SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_PATHS ${_sima_lmm_license_index} _sima_lmm_license_path)
+    list(GET SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_NAMES ${_sima_lmm_license_index} _sima_lmm_license_name)
+    install_sima_lmm_third_party_license(
+        "${CMAKE_CURRENT_SOURCE_DIR}/${_sima_lmm_license_path}"
+        "${_sima_lmm_license_name}"
+    )
+endforeach()
 
 find_library(
     SIMAAI_DISPATCHER_LIB
