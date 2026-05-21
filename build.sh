@@ -834,14 +834,14 @@ package_dist_archive() {
   mkdir -p "${ROOT_DIR}/dist"
 
   for deb in "${required_debs[@]}"; do
-    if [[ ! -f "${ROOT_DIR}/${deb}" ]]; then
-      echo "Expected Debian package not found: ${ROOT_DIR}/${deb}" >&2
-      find "${ROOT_DIR}" -maxdepth 1 -type f -name 'sima-lmm*.deb' -printf '  %p\n' | sort >&2
+    if [[ ! -f "${ROOT_DIR}/dist/${deb}" ]]; then
+      echo "Expected Debian package not found: ${ROOT_DIR}/dist/${deb}" >&2
+      find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name 'sima-lmm*.deb' -printf '  %p\n' | sort >&2
       return 1
     fi
   done
 
-  tar -C "${ROOT_DIR}" -czf "${ROOT_DIR}/dist/${archive_name}" "${required_debs[@]}"
+  tar -C "${ROOT_DIR}/dist" -czf "${ROOT_DIR}/dist/${archive_name}" "${required_debs[@]}"
   sha256sum "${ROOT_DIR}/dist/${archive_name}" | awk '{print $1}' > "${ROOT_DIR}/dist/${archive_name}.sha256"
   ls -lh "${ROOT_DIR}/dist/${archive_name}"
   cat "${ROOT_DIR}/dist/${archive_name}.sha256"
@@ -852,6 +852,61 @@ package_dist_archive() {
     ls -lh "${ROOT_DIR}/dist/${latest_name}"
     cat "${ROOT_DIR}/dist/${latest_name}.sha256"
   fi
+}
+
+generate_package_metadata() {
+  if [ "${#COMPONENTS[@]}" -gt 0 ]; then
+    echo "[build] Skipping package metadata because a subset of components was selected"
+    return
+  fi
+
+  local version package_dir metadata_tmp
+  version="$1"
+  package_dir="$(mktemp -d /tmp/llima-package-metadata.XXXXXX)"
+  metadata_tmp="${package_dir}/metadata.json"
+
+  local required_debs=(
+    "sima-lmm-${version}-Linux-cli.deb"
+    "sima-lmm-${version}-Linux-core.deb"
+    "sima-lmm-${version}-Linux-dev.deb"
+  )
+
+  for deb in "${required_debs[@]}"; do
+    if [[ ! -f "${ROOT_DIR}/dist/${deb}" ]]; then
+      echo "Expected Debian package not found for metadata: ${ROOT_DIR}/dist/${deb}" >&2
+      rm -rf "${package_dir}"
+      return 1
+    fi
+    cp -f "${ROOT_DIR}/dist/${deb}" "${package_dir}/"
+  done
+
+  if ! command -v sima-cli >/dev/null 2>&1; then
+    echo "[build] sima-cli not found; skipping package metadata generation."
+    rm -rf "${package_dir}"
+    return
+  fi
+  if ! sima-cli packages build --help >/dev/null 2>&1; then
+    echo "[build] sima-cli packages build is unavailable; skipping package metadata generation."
+    rm -rf "${package_dir}"
+    return
+  fi
+
+  echo "[build] Building package metadata: dist/metadata.json"
+  SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli packages build "${package_dir}" \
+    --name "gh:sima-neat/llima" \
+    --version "${version}" \
+    --description "SiMa.ai Lean Language and Image Modalix Application packages" \
+    --install-script 'echo "llima package downloaded"'
+
+  if [[ ! -f "${metadata_tmp}" ]]; then
+    echo "Expected metadata not generated: ${metadata_tmp}" >&2
+    rm -rf "${package_dir}"
+    return 1
+  fi
+
+  cp -f "${metadata_tmp}" "${ROOT_DIR}/dist/metadata.json"
+  rm -rf "${package_dir}"
+  ls -lh "${ROOT_DIR}/dist/metadata.json"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -978,9 +1033,13 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
 echo "[build] Building sima-lmm targets with $BUILD_JOBS parallel job(s)"
 cmake --build "$BUILD_DIR" --parallel "$BUILD_JOBS"
 
+mkdir -p "$ROOT_DIR/dist"
+rm -f "$ROOT_DIR"/sima-lmm*.deb
+rm -f "$ROOT_DIR/dist"/sima-lmm*.deb
+
 CPACK_ARGS=(
   --config "$BUILD_DIR/CPackConfig.cmake"
-  -D "CPACK_PACKAGE_DIRECTORY=$ROOT_DIR"
+  -D "CPACK_PACKAGE_DIRECTORY=$ROOT_DIR/dist"
 )
 
 if [ "${#COMPONENTS[@]}" -eq 0 ]; then
@@ -998,14 +1057,15 @@ cpack "${CPACK_ARGS[@]}"
 
 echo "[build] Generated packages:"
 if [ "${#COMPONENTS[@]}" -eq 0 ]; then
-  find "$ROOT_DIR" -maxdepth 1 -type f -name 'sima-lmm*.deb' -printf '  %p\n' | sort
+  find "$ROOT_DIR/dist" -maxdepth 1 -type f -name 'sima-lmm*.deb' -printf '  %p\n' | sort
 else
   for component in "${COMPONENTS[@]}"; do
-    find "$ROOT_DIR" -maxdepth 1 -type f -name "sima-lmm-${component}_*.deb" -printf '  %p\n'
-    find "$ROOT_DIR" -maxdepth 1 -type f -name "sima-lmm-${component}-*.deb" -printf '  %p\n'
+    find "$ROOT_DIR/dist" -maxdepth 1 -type f -name "sima-lmm-${component}_*.deb" -printf '  %p\n'
+    find "$ROOT_DIR/dist" -maxdepth 1 -type f -name "sima-lmm-${component}-*.deb" -printf '  %p\n'
   done | sort -u
 fi
 
 if [ "$SKIP_DIST" -eq 0 ]; then
+  generate_package_metadata "$LLIMA_VERSION"
   package_dist_archive "$LLIMA_VERSION"
 fi

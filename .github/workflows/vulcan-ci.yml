@@ -164,22 +164,19 @@ jobs:
 
         test -f "${primary_archive}.sha256"
         sha256sum -c <(awk -v file="$(basename "${primary_archive}")" '{print $1 "  dist/" file}' "${primary_archive}.sha256")
-        llima_version="$(
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          manifest = json.loads(Path("deps/manifest.json").read_text())
-          print(manifest.get("platform-version", "").strip())
-          PY
-        )"
+        llima_version="$(python3 -c 'import json; from pathlib import Path; print(json.loads(Path("deps/manifest.json").read_text()).get("platform-version", "").strip())')"
         if [[ -z "${llima_version}" ]]; then
           echo "deps/manifest.json must define platform-version." >&2
           exit 1
         fi
+        test -f "dist/sima-lmm-${llima_version}-Linux-core.deb"
+        test -f "dist/sima-lmm-${llima_version}-Linux-dev.deb"
+        test -f "dist/sima-lmm-${llima_version}-Linux-cli.deb"
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-core.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-dev.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-cli.deb" >/dev/null
+        test -f dist/metadata.json
+        python3 -m json.tool dist/metadata.json >/dev/null
         ls -lh dist
 
   publish-vulcan-artifacts:
