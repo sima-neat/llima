@@ -500,19 +500,25 @@ ensure_neat_internals() {
   mkdir -p "${extract_dir}"
   tar -xzf "${archive_path}" -C "${extract_dir}"
 
-  local deb_patterns=(
-    'simaai-common_*_all.deb'
+  local deb_pattern_groups=(
+    'neat-common_*_all.deb simaai-common_*_all.deb'
     'neat-runtime_*_arm64.deb'
     'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
-    'neat-appcomplex_*_arm64.deb'
+    'neat-appcomplex_*_arm64.deb appcomplex_*_arm64.deb'
   )
   local debs=()
-  local pattern deb
-  for pattern in "${deb_patterns[@]}"; do
-    deb="$(find "${extract_dir}" -maxdepth 1 -type f -name "${pattern}" | sort | head -n 1)"
+  local pattern_group pattern deb
+  for pattern_group in "${deb_pattern_groups[@]}"; do
+    deb=""
+    for pattern in ${pattern_group}; do
+      deb="$(find "${extract_dir}" -maxdepth 1 -type f -name "${pattern}" | sort | head -n 1)"
+      if [[ -n "${deb}" ]]; then
+        break
+      fi
+    done
     if [[ -z "${deb}" ]]; then
-      echo "ERROR: No ${pattern} found in ${archive_name}" >&2
+      echo "ERROR: No matching deb found in ${archive_name}; expected one of: ${pattern_group}" >&2
       exit 1
     fi
     debs+=("${deb}")
