@@ -93,6 +93,8 @@ jobs:
           -e GITHUB_REF_NAME="${{ github.ref_name }}" \
           -e GITHUB_REF_TYPE="${{ github.ref_type }}" \
           -e GITHUB_SHA="${{ github.sha }}" \
+          -e NEAT_VULCAN_ENV="${{ vars.VULCAN_ENV || 'dev' }}" \
+          -e NEAT_INTERNALS_VULCAN_REPOSITORY="internals" \
           "${sdk_container}" \
           bash -lc '
             set -euo pipefail

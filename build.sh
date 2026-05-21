@@ -6,8 +6,13 @@ BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
 NEAT_INTERNALS_BASE_URL="${NEAT_INTERNALS_BASE_URL:-https://artifacts.sima-neat.com/internals}"
 NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-}"
+NEAT_INTERNALS_SOURCE="${NEAT_INTERNALS_SOURCE:-vulcan}"
+NEAT_INTERNALS_VULCAN_REPOSITORY="${NEAT_INTERNALS_VULCAN_REPOSITORY:-internals}"
+NEAT_INTERNALS_SNAP_POLICY="${NEAT_INTERNALS_SNAP_POLICY:-ON}"
 NEAT_INTERNALS_MANIFEST="${NEAT_INTERNALS_MANIFEST:-${ROOT_DIR}/deps/manifest.json}"
 NEAT_INTERNALS_RESOLVED_REF=""
+NEAT_VULCAN_ENV="${NEAT_VULCAN_ENV:-dev}"
+NEAT_VULCAN_BASE_URL="${NEAT_VULCAN_BASE_URL:-}"
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 ARCH=arm64
 ELXR_SDK=OFF
@@ -270,7 +275,47 @@ resolve_neat_internals_ref() {
   local manifest_ref
   manifest_ref="$(extract_json_string "internals" "${NEAT_INTERNALS_MANIFEST}")"
   if [[ -n "${manifest_ref}" ]]; then
-    printf '%s\n' "${manifest_ref}"
+    case "${manifest_ref}" in
+      *:*)
+        printf '%s\n' "${manifest_ref}"
+        ;;
+      *-latest)
+        printf '%s:latest\n' "${manifest_ref%-latest}"
+        ;;
+      *)
+        printf '%s\n' "${manifest_ref}"
+        ;;
+    esac
+    return 0
+  fi
+
+  local branch branch_key
+  branch="$(current_branch_name)"
+  branch_key="$(sanitize_branch_key "${branch}")"
+  if [[ -n "${branch_key}" && "${branch_key}" != "head" ]]; then
+    printf '%s\n' "${branch_key}:latest"
+    return 0
+  fi
+
+  echo "Could not determine current branch for internals snap; using develop:latest." >&2
+  printf '%s\n' "develop:latest"
+}
+
+resolve_neat_internals_archive_ref() {
+  if [[ ! -f "${NEAT_INTERNALS_MANIFEST}" ]]; then
+    echo "ERROR: Missing manifest: ${NEAT_INTERNALS_MANIFEST}" >&2
+    return 1
+  fi
+
+  if ! manifest_has_json_string_key "internals" "${NEAT_INTERNALS_MANIFEST}"; then
+    echo "ERROR: ${NEAT_INTERNALS_MANIFEST} must define an internals string." >&2
+    return 1
+  fi
+
+  local manifest_ref
+  manifest_ref="$(extract_json_string "internals" "${NEAT_INTERNALS_MANIFEST}")"
+  if [[ -n "${manifest_ref}" ]]; then
+    printf '%s\n' "${manifest_ref/:/-}"
     return 0
   fi
 
@@ -299,11 +344,86 @@ resolve_neat_internals_archive_url() {
   fi
 
   local internals_ref
-  if ! internals_ref="$(resolve_neat_internals_ref)"; then
+  if ! internals_ref="$(resolve_neat_internals_archive_ref)"; then
     return 1
   fi
   NEAT_INTERNALS_RESOLVED_REF="${internals_ref}"
   printf '%s/sima-neat-internals-%s.tar.gz\n' "${NEAT_INTERNALS_BASE_URL}" "${internals_ref}"
+}
+
+require_sima_cli_vulcan_install() {
+  if ! command -v sima-cli >/dev/null 2>&1; then
+    echo "ERROR: sima-cli is required for Vulcan internals artifact access." >&2
+    exit 1
+  fi
+  if ! sima-cli vulcan install --help >/dev/null 2>&1; then
+    echo "ERROR: sima-cli with Vulcan install support is required." >&2
+    exit 1
+  fi
+}
+
+fetch_neat_internals_vulcan_artifacts() {
+  local internals_ref="$1"
+  local output_dir="$2"
+
+  require_sima_cli_vulcan_install
+
+  local -a base_args=(
+    vulcan
+    --env "${NEAT_VULCAN_ENV}"
+  )
+  if [[ -n "${NEAT_VULCAN_BASE_URL}" ]]; then
+    base_args+=(--base-url "${NEAT_VULCAN_BASE_URL}")
+  fi
+
+  local resolve_output resolved_ref
+  if ! resolve_output="$(sima-cli "${base_args[@]}" install "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" --json)"; then
+    if [[ "${NEAT_INTERNALS_SNAP_POLICY}" != "ON" || "${internals_ref}" == "develop:latest" ]]; then
+      echo "ERROR: Failed to resolve internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
+      exit 1
+    fi
+
+    echo "No internals Vulcan artifact found for '${internals_ref}'; retrying develop:latest." >&2
+    internals_ref="develop:latest"
+    if ! resolve_output="$(sima-cli "${base_args[@]}" install "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" --json)"; then
+      echo "ERROR: Failed to resolve fallback internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
+      exit 1
+    fi
+  fi
+
+  resolved_ref="$(python3 - <<'PY' "${resolve_output}"
+import json
+import sys
+
+text = sys.argv[1]
+start = text.find("{")
+if start < 0:
+    raise SystemExit("missing JSON object in sima-cli vulcan install --json output")
+payload = json.loads(text[start:])
+ref = str(payload.get("ref", "")).strip()
+spec = str(payload.get("resolved_spec", "")).strip()
+if not ref or not spec:
+    raise SystemExit("sima-cli vulcan install --json did not return ref and resolved_spec")
+print(f"{ref}:{spec}")
+PY
+)"
+  NEAT_INTERNALS_RESOLVED_REF="${resolved_ref}"
+
+  local -a install_args=(
+    "${base_args[@]}"
+    install
+    -d "${output_dir}"
+    "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${resolved_ref}"
+  )
+
+  echo "[build] Fetching NEAT internals packages from Vulcan:"
+  echo "[build]   ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${resolved_ref}"
+  rm -rf "${output_dir}"
+  mkdir -p "${output_dir}"
+  if ! sima-cli "${install_args[@]}"; then
+    echo "ERROR: Failed to fetch internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${resolved_ref}" >&2
+    exit 1
+  fi
 }
 
 ensure_git_submodules() {
@@ -460,45 +580,55 @@ path_exists_any() {
 
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
-  local archive_url
-  if ! archive_url="$(resolve_neat_internals_archive_url)"; then
-    exit 1
-  fi
-  local archive_name
-  archive_name="$(basename "${archive_url}")"
-
-  if [[ -z "${archive_url}" ]]; then
-    echo "ERROR: NEAT_INTERNALS_ARCHIVE_URL resolved to an empty URL." >&2
-    exit 1
-  fi
-
   local tmp_dir
   tmp_dir="$(mktemp -d /tmp/llima-neat-internals.XXXXXX)"
-  local archive_path="${tmp_dir}/${archive_name}"
-  local checksum_path="${archive_path}.sha256"
   local extract_dir="${tmp_dir}/extract"
+  local archive_name="Vulcan internals artifact"
 
-  echo "[build] Downloading NEAT internals artifact:"
-  echo "[build]   ${archive_url}"
-  download_file "${archive_url}" "${archive_path}"
-  download_file "${archive_url}.sha256" "${checksum_path}"
+  if [[ -n "${NEAT_INTERNALS_ARCHIVE_URL}" || "${NEAT_INTERNALS_SOURCE}" == "archive" ]]; then
+    local archive_url
+    if ! archive_url="$(resolve_neat_internals_archive_url)"; then
+      exit 1
+    fi
+    archive_name="$(basename "${archive_url}")"
 
-  local expected_sha actual_sha
-  expected_sha="$(awk '{print $1}' "${checksum_path}" | tr -d '[:space:]' | head -n1)"
-  if [[ -z "${expected_sha}" || ! "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "ERROR: Invalid sha256 content in ${archive_url}.sha256" >&2
-    exit 1
+    if [[ -z "${archive_url}" ]]; then
+      echo "ERROR: NEAT_INTERNALS_ARCHIVE_URL resolved to an empty URL." >&2
+      exit 1
+    fi
+
+    local archive_path="${tmp_dir}/${archive_name}"
+    local checksum_path="${archive_path}.sha256"
+
+    echo "[build] Downloading NEAT internals artifact:"
+    echo "[build]   ${archive_url}"
+    download_file "${archive_url}" "${archive_path}"
+    download_file "${archive_url}.sha256" "${checksum_path}"
+
+    local expected_sha actual_sha
+    expected_sha="$(awk '{print $1}' "${checksum_path}" | tr -d '[:space:]' | head -n1)"
+    if [[ -z "${expected_sha}" || ! "${expected_sha}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      echo "ERROR: Invalid sha256 content in ${archive_url}.sha256" >&2
+      exit 1
+    fi
+    actual_sha="$(compute_sha256 "${archive_path}")"
+    if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+      echo "ERROR: sha256 mismatch for ${archive_name}" >&2
+      echo "  expected: ${expected_sha}" >&2
+      echo "  actual  : ${actual_sha}" >&2
+      exit 1
+    fi
+
+    mkdir -p "${extract_dir}"
+    tar -xzf "${archive_path}" -C "${extract_dir}"
+  else
+    local internals_ref
+    if ! internals_ref="$(resolve_neat_internals_ref)"; then
+      exit 1
+    fi
+    extract_dir="${tmp_dir}/package"
+    fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
   fi
-  actual_sha="$(compute_sha256 "${archive_path}")"
-  if [[ "${actual_sha}" != "${expected_sha}" ]]; then
-    echo "ERROR: sha256 mismatch for ${archive_name}" >&2
-    echo "  expected: ${expected_sha}" >&2
-    echo "  actual  : ${actual_sha}" >&2
-    exit 1
-  fi
-
-  mkdir -p "${extract_dir}"
-  tar -xzf "${archive_path}" -C "${extract_dir}"
 
   local deb_pattern_groups=(
     'neat-common_*_all.deb simaai-common_*_all.deb'
@@ -512,7 +642,7 @@ ensure_neat_internals() {
   for pattern_group in "${deb_pattern_groups[@]}"; do
     deb=""
     for pattern in ${pattern_group}; do
-      deb="$(find "${extract_dir}" -maxdepth 1 -type f -name "${pattern}" | sort | head -n 1)"
+      deb="$(find "${extract_dir}" -maxdepth 3 -type f -name "${pattern}" | sort | head -n 1)"
       if [[ -n "${deb}" ]]; then
         break
       fi
