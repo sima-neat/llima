@@ -220,10 +220,59 @@ extract_json_string() {
   sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "${file}" | head -n1
 }
 
-manifest_has_json_string_key() {
+manifest_has_json_key() {
   local key="$1"
   local file="$2"
-  grep -Eq "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "${file}"
+  python3 - "${key}" "${file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+key = sys.argv[1]
+manifest_path = Path(sys.argv[2])
+data = json.loads(manifest_path.read_text(encoding="utf-8"))
+raise SystemExit(0 if key in data else 1)
+PY
+}
+
+manifest_dependency_spec() {
+  local key="$1"
+  local file="$2"
+  python3 - "${key}" "${file}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+key = sys.argv[1]
+manifest_path = Path(sys.argv[2])
+data = json.loads(manifest_path.read_text(encoding="utf-8"))
+if key not in data:
+    raise SystemExit(f"ERROR: {manifest_path} must define '{key}'.")
+
+value = data[key]
+if isinstance(value, str):
+    print("__SNAP__" if not value.strip() else value.strip())
+    raise SystemExit(0)
+
+if isinstance(value, dict):
+    policy = str(value.get("policy", "")).strip().lower()
+    if policy == "snap":
+        print("__SNAP__")
+        raise SystemExit(0)
+    if policy:
+        raise SystemExit(f"ERROR: unsupported {key}.policy in {manifest_path}: {policy!r}")
+
+    spec = str(value.get("spec", "")).strip()
+    branch = str(value.get("branch", value.get("ref", ""))).strip()
+    if branch:
+        print(f"{branch}:{spec or 'latest'}")
+        raise SystemExit(0)
+
+raise SystemExit(
+    f"ERROR: {manifest_path} field '{key}' must be a string, "
+    "or an object with {'policy':'snap'} or {'branch':'...', 'spec':'...'}."
+)
+PY
 }
 
 sanitize_branch_key() {
@@ -267,14 +316,16 @@ resolve_neat_internals_ref() {
     return 1
   fi
 
-  if ! manifest_has_json_string_key "internals" "${NEAT_INTERNALS_MANIFEST}"; then
-    echo "ERROR: ${NEAT_INTERNALS_MANIFEST} must define an internals string." >&2
+  if ! manifest_has_json_key "internals" "${NEAT_INTERNALS_MANIFEST}"; then
+    echo "ERROR: ${NEAT_INTERNALS_MANIFEST} must define an internals dependency." >&2
     return 1
   fi
 
   local manifest_ref
-  manifest_ref="$(extract_json_string "internals" "${NEAT_INTERNALS_MANIFEST}")"
-  if [[ -n "${manifest_ref}" ]]; then
+  if ! manifest_ref="$(manifest_dependency_spec "internals" "${NEAT_INTERNALS_MANIFEST}")"; then
+    return 1
+  fi
+  if [[ "${manifest_ref}" != "__SNAP__" ]]; then
     case "${manifest_ref}" in
       *:*)
         printf '%s\n' "${manifest_ref}"
@@ -307,14 +358,16 @@ resolve_neat_internals_archive_ref() {
     return 1
   fi
 
-  if ! manifest_has_json_string_key "internals" "${NEAT_INTERNALS_MANIFEST}"; then
-    echo "ERROR: ${NEAT_INTERNALS_MANIFEST} must define an internals string." >&2
+  if ! manifest_has_json_key "internals" "${NEAT_INTERNALS_MANIFEST}"; then
+    echo "ERROR: ${NEAT_INTERNALS_MANIFEST} must define an internals dependency." >&2
     return 1
   fi
 
   local manifest_ref
-  manifest_ref="$(extract_json_string "internals" "${NEAT_INTERNALS_MANIFEST}")"
-  if [[ -n "${manifest_ref}" ]]; then
+  if ! manifest_ref="$(manifest_dependency_spec "internals" "${NEAT_INTERNALS_MANIFEST}")"; then
+    return 1
+  fi
+  if [[ "${manifest_ref}" != "__SNAP__" ]]; then
     printf '%s\n' "${manifest_ref/:/-}"
     return 0
   fi
