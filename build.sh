@@ -6,7 +6,7 @@ BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
 NEAT_INTERNALS_BASE_URL="${NEAT_INTERNALS_BASE_URL:-https://artifacts.sima-neat.com/internals}"
 NEAT_INTERNALS_ARCHIVE_URL="${NEAT_INTERNALS_ARCHIVE_URL:-}"
-NEAT_INTERNALS_SOURCE="${NEAT_INTERNALS_SOURCE:-vulcan}"
+NEAT_INTERNALS_SOURCE="${NEAT_INTERNALS_SOURCE:-auto}"
 NEAT_INTERNALS_VULCAN_REPOSITORY="${NEAT_INTERNALS_VULCAN_REPOSITORY:-internals}"
 NEAT_INTERNALS_SNAP_POLICY="${NEAT_INTERNALS_SNAP_POLICY:-ON}"
 NEAT_INTERNALS_MANIFEST="${NEAT_INTERNALS_MANIFEST:-${ROOT_DIR}/deps/manifest.json}"
@@ -415,6 +415,10 @@ require_sima_cli_vulcan_install() {
   fi
 }
 
+sima_cli_vulcan_install_available() {
+  command -v sima-cli >/dev/null 2>&1 && sima-cli vulcan install --help >/dev/null 2>&1
+}
+
 fetch_neat_internals_vulcan_artifacts() {
   local internals_ref="$1"
   local output_dir="$2"
@@ -638,7 +642,23 @@ ensure_neat_internals() {
   local extract_dir="${tmp_dir}/extract"
   local archive_name="Vulcan internals artifact"
 
-  if [[ -n "${NEAT_INTERNALS_ARCHIVE_URL}" || "${NEAT_INTERNALS_SOURCE}" == "archive" ]]; then
+  if [[ "${NEAT_INTERNALS_SOURCE}" == "vulcan" ]]; then
+    local internals_ref
+    if ! internals_ref="$(resolve_neat_internals_ref)"; then
+      exit 1
+    fi
+    extract_dir="${tmp_dir}/package"
+    fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
+  elif [[ -z "${NEAT_INTERNALS_ARCHIVE_URL}" &&
+          "${NEAT_INTERNALS_SOURCE}" == "auto" ]] &&
+       sima_cli_vulcan_install_available; then
+    local internals_ref
+    if ! internals_ref="$(resolve_neat_internals_ref)"; then
+      exit 1
+    fi
+    extract_dir="${tmp_dir}/package"
+    fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
+  else
     local archive_url
     if ! archive_url="$(resolve_neat_internals_archive_url)"; then
       exit 1
@@ -674,13 +694,6 @@ ensure_neat_internals() {
 
     mkdir -p "${extract_dir}"
     tar -xzf "${archive_path}" -C "${extract_dir}"
-  else
-    local internals_ref
-    if ! internals_ref="$(resolve_neat_internals_ref)"; then
-      exit 1
-    fi
-    extract_dir="${tmp_dir}/package"
-    fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
   fi
 
   local deb_pattern_groups=(
