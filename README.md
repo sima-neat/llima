@@ -162,6 +162,13 @@ python3 -m pip install "dist/sima_lmm-*.whl[sdk_ext]"
 
 ## Documentation
 
-Full GenAI documentation is published here:
+LLiMa documentation is maintained in this repository:
 
-https://docs.sima.ai/pages/genai/main.html
+| Topic | Description |
+| --- | --- |
+| [Introduction to LLiMa](docs/introduction.md) | Overview of LLiMa, supported models, model manager commands, and capabilities. |
+| [System Requirements & Setup](docs/setup.md) | Prerequisites and system requirements for model compilation. |
+| [GenAI Model Compilation](docs/compilation_genai.md) | Complete guide to compiling LLM and VLM models for Modalix. |
+| [Model Deployment](docs/deployment.md) | Deploy compiled models to Modalix devices. |
+| [Runtime & Orchestration](docs/runtime.md) | Run and orchestrate models on the Modalix platform. |
+| [MoLE - Modalix Language Model Evaluator](docs/mole.md) | Benchmark LLM accuracy and performance on Modalix. |
