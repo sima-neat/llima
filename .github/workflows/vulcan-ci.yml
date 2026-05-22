@@ -1,6 +1,6 @@
 name: Vulcan CI
 
-run-name: ${{ github.event.head_commit.message || github.event.pull_request.title || github.ref_name || 'Vulcan CI' }} (${{ vars.VULCAN_ENV || 'dev' }}, ${{ vars.VULCAN_SDK_CACHE || 'sdk-latest' }}, ${{ vars.VULCAN_CAPACITY || 'default' }})
+run-name: ${{ github.event.head_commit.message || github.event.pull_request.title || github.ref_name || 'Vulcan CI' }} (${{ vars.VULCAN_ENV || 'dev' }})
 
 on:
   push:
@@ -24,49 +24,20 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  validate-vulcan-config:
-    name: Validate Vulcan config
-    runs-on: ubuntu-latest
-    environment: ${{ vars.VULCAN_ENV || 'dev' }}
-    env:
-      VULCAN_ARTIFACT_BUCKET: ${{ vars.VULCAN_ARTIFACT_BUCKET }}
-      VULCAN_ARTIFACT_PUBLISHER_ROLE_ARN: ${{ vars.VULCAN_ARTIFACT_PUBLISHER_ROLE_ARN }}
-      VULCAN_ARTIFACT_KMS_KEY_ID: ${{ vars.VULCAN_ARTIFACT_KMS_KEY_ID }}
-      VULCAN_ARTIFACT_CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.VULCAN_ARTIFACT_CLOUDFRONT_DISTRIBUTION_ID }}
-    steps:
-      - name: Check required Vulcan variables
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          missing=0
-          for name in \
-            VULCAN_ARTIFACT_BUCKET \
-            VULCAN_ARTIFACT_PUBLISHER_ROLE_ARN \
-            VULCAN_ARTIFACT_KMS_KEY_ID \
-            VULCAN_ARTIFACT_CLOUDFRONT_DISTRIBUTION_ID
-          do
-            if [[ -z "${!name:-}" ]]; then
-              echo "Missing required org or environment variable: ${name}" >&2
-              missing=1
-            else
-              echo "Found ${name}"
-            fi
-          done
-
-          if [[ "${missing}" -ne 0 ]]; then
-            echo "Configure the missing variables at the sima-neat org level, visible to the public sima-neat/llima repository, or in the selected Vulcan environment." >&2
-            exit 1
-          fi
+  resolve-vulcan-config:
+    name: Resolve Vulcan Config
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
+    with:
+      vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
 
   build:
     name: Build LLiMa on Vulcan
-    needs: validate-vulcan-config
+    needs: resolve-vulcan-config
     uses: sima-neat/.github/.github/workflows/vulcan-build.yml@main
     with:
-      vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
-      sdk_cache: ${{ vars.VULCAN_SDK_CACHE || 'sdk-latest' }}
-      capacity: ${{ vars.VULCAN_CAPACITY || 'default' }}
+      vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      sdk_cache: ${{ needs.resolve-vulcan-config.outputs.sdk_cache }}
+      capacity: ${{ needs.resolve-vulcan-config.outputs.capacity }}
       fetch_depth: 0
       checkout_submodules: recursive
       ensure_sdk_container: true
@@ -93,7 +64,7 @@ jobs:
           -e GITHUB_REF_NAME="${{ github.ref_name }}" \
           -e GITHUB_REF_TYPE="${{ github.ref_type }}" \
           -e GITHUB_SHA="${{ github.sha }}" \
-          -e NEAT_VULCAN_ENV="${{ vars.VULCAN_ENV || 'dev' }}" \
+          -e NEAT_VULCAN_ENV="${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
           -e NEAT_INTERNALS_SOURCE="vulcan" \
           -e NEAT_INTERNALS_VULCAN_REPOSITORY="internals" \
           "${sdk_container}" \
@@ -181,15 +152,17 @@ jobs:
 
   publish-vulcan-artifacts:
     name: Publish to Vulcan
-    needs: build
+    needs:
+      - resolve-vulcan-config
+      - build
     uses: sima-neat/.github/.github/workflows/vulcan-publish-artifacts.yml@main
     with:
-      aws_region: ${{ vars.VULCAN_AWS_REGION || 'us-west-2' }}
-      environment_name: ${{ vars.VULCAN_ENV || 'dev' }}
-      bucket: ${{ vars.VULCAN_ARTIFACT_BUCKET }}
-      role_to_assume: ${{ vars.VULCAN_ARTIFACT_PUBLISHER_ROLE_ARN }}
-      sse_kms_key_id: ${{ vars.VULCAN_ARTIFACT_KMS_KEY_ID }}
-      cloudfront_distribution_id: ${{ vars.VULCAN_ARTIFACT_CLOUDFRONT_DISTRIBUTION_ID }}
+      aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
+      environment_name: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      bucket: ${{ needs.resolve-vulcan-config.outputs.artifact_bucket }}
+      role_to_assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
+      sse_kms_key_id: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
+      cloudfront_distribution_id: ${{ needs.resolve-vulcan-config.outputs.artifact_cloudfront_distribution_id }}
       artifact_folder: "."
       artifact_pattern: sima-llima-dist
       artifact_glob: "*"
@@ -198,12 +171,14 @@ jobs:
   promote-latest-tag:
     name: Promote Vulcan latest tag
     if: ${{ github.ref_type == 'branch' }}
-    needs: publish-vulcan-artifacts
+    needs:
+      - resolve-vulcan-config
+      - publish-vulcan-artifacts
     uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
     with:
-      aws_region: ${{ vars.VULCAN_AWS_REGION || 'us-west-2' }}
-      environment_name: ${{ vars.VULCAN_ENV || 'dev' }}
-      bucket: ${{ vars.VULCAN_ARTIFACT_BUCKET }}
-      role_to_assume: ${{ vars.VULCAN_ARTIFACT_PUBLISHER_ROLE_ARN }}
-      sse_kms_key_id: ${{ vars.VULCAN_ARTIFACT_KMS_KEY_ID }}
+      aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
+      environment_name: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      bucket: ${{ needs.resolve-vulcan-config.outputs.artifact_bucket }}
+      role_to_assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
+      sse_kms_key_id: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
       artifact_folder: "."
