@@ -546,7 +546,6 @@ ensure_neat_internals() {
   local deb_pattern_groups=(
     'neat-common_*_all.deb simaai-common_*_all.deb'
     'neat-runtime_*_arm64.deb'
-    'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
     'neat-appcomplex_*_arm64.deb appcomplex_*_arm64.deb'
   )
@@ -587,33 +586,30 @@ ensure_neat_internals() {
     run_as_root apt install -y --allow-downgrades "${debs[@]}"
   fi
 
-  local config_dir dispatcher_header profiler_lib tensorbuffer_plugin
+  local config_dir dispatcher_factory_header dispatcher_base_header runtime_lib
+  local missing=()
+
   if [[ "${ELXR_SDK}" == "ON" ]]; then
     config_dir="${sysroot}/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_header="${sysroot}/usr/include/dispatcher.h"
-    profiler_lib="${sysroot}/usr/lib/aarch64-linux-gnu/neat/runtime/libsimaaineatprofiler.so"
-    tensorbuffer_plugin="${sysroot}/usr/lib/aarch64-linux-gnu/neat/gst-plugins/libgstneattensorbuffer.so"
+    dispatcher_factory_header="${sysroot}/usr/include/dispatcherfactory.hh"
+    dispatcher_base_header="${sysroot}/usr/include/dispatcherbase.hh"
+    runtime_lib="${sysroot}/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
   else
     config_dir="/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_header="/usr/include/dispatcher.h"
-    profiler_lib="/usr/lib/aarch64-linux-gnu/neat/runtime/libsimaaineatprofiler.so"
-    tensorbuffer_plugin="/usr/lib/aarch64-linux-gnu/neat/gst-plugins/libgstneattensorbuffer.so"
+    dispatcher_factory_header="/usr/include/dispatcherfactory.hh"
+    dispatcher_base_header="/usr/include/dispatcherbase.hh"
+    runtime_lib="/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
   fi
 
-  if [[ ! -d "${config_dir}" ]]; then
-    echo "ERROR: NeatInternals CMake package not found after install: ${config_dir}" >&2
-    exit 1
-  fi
-  if [[ ! -f "${dispatcher_header}" ]]; then
-    echo "ERROR: dispatcher.h not found after install: ${dispatcher_header}" >&2
-    exit 1
-  fi
-  if [[ ! -f "${profiler_lib}" ]]; then
-    echo "ERROR: NEAT runtime library not found after install: ${profiler_lib}" >&2
-    exit 1
-  fi
-  if [[ ! -f "${tensorbuffer_plugin}" ]]; then
-    echo "ERROR: NEAT GStreamer plugin not found after install: ${tensorbuffer_plugin}" >&2
+  [[ -d "${config_dir}" ]] || missing+=("${config_dir}")
+  [[ -f "${dispatcher_factory_header}" ]] || missing+=("${dispatcher_factory_header}")
+  [[ -f "${dispatcher_base_header}" ]] || missing+=("${dispatcher_base_header}")
+  [[ -f "${runtime_lib}" ]] || missing+=("${runtime_lib}")
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo "ERROR: NEAT internals artifact install is incomplete." >&2
+    echo "Missing:" >&2
+    printf '  %s\n' "${missing[@]}" >&2
     exit 1
   fi
 

@@ -319,11 +319,25 @@ void MLAModelWithBuffer::run_queue() {
 
 void MLAModelWithBuffer::update_reloc(const std::map<std::string, uint64_t>& reloc_addr_map) {
     if (reloc_addr_map.empty()) return;
-    spdlog::warn(
-        "MLA dispatcher backend does not support update_reloc yet; ignoring relocation for {}: {}",
-        _unique_model_paths[_model_idx],
-        reloc_addr_map
-    );
+
+    load();
+    std::vector<DADDR_LEN> reloc_addrs;
+    reloc_addrs.reserve(reloc_addr_map.size());
+    for (const auto& [_, addr]: reloc_addr_map) {
+        (void)_;
+        reloc_addrs.emplace_back(static_cast<DADDR>(addr), 0);
+    }
+
+    auto* dispatcher = _get_dispatcher();
+    const int rc = dispatcher->updateReloc(_unique_model_ptrs[_model_idx], reloc_addrs);
+    if (rc != 0) {
+        throw std::runtime_error(fmt::format(
+            "Failed to update relocations through MLASHM dispatcher: {} rc={} ({})",
+            _unique_model_paths[_model_idx],
+            rc,
+            dispatcher->lastErrorString()
+        ));
+    }
 }
 
 
