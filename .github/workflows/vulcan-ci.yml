@@ -77,7 +77,7 @@ jobs:
             rm -f sima-cli-install.py
             export PATH="${HOME}/.sima-cli/.venv/bin:${PATH}"
             sima-cli version
-            sima-cli vulcan install --help >/dev/null
+            sima-cli neat install --help >/dev/null
 
             cd /workspace
 

@@ -303,13 +303,13 @@ resolve_neat_internals_ref() {
   printf '%s\n' "develop:latest"
 }
 
-require_sima_cli_vulcan_install() {
+require_sima_cli_neat_install() {
   if ! command -v sima-cli >/dev/null 2>&1; then
     echo "ERROR: sima-cli is required for Vulcan internals artifact access." >&2
     exit 1
   fi
-  if ! SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli install --help 2>/dev/null | grep -q -- '--vulcan'; then
-    echo "ERROR: sima-cli with Vulcan install support is required." >&2
+  if ! SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli neat install --help >/dev/null 2>&1; then
+    echo "ERROR: sima-cli with Neat artifact install support is required." >&2
     exit 1
   fi
 }
@@ -318,11 +318,11 @@ fetch_neat_internals_vulcan_artifacts() {
   local internals_ref="$1"
   local output_dir="$2"
 
-  require_sima_cli_vulcan_install
+  require_sima_cli_neat_install
 
   local -a base_args=(
+    neat
     install
-    --vulcan
     --env "${NEAT_VULCAN_ENV}"
   )
   if [[ -n "${NEAT_VULCAN_BASE_URL}" ]]; then
@@ -351,12 +351,12 @@ import sys
 text = sys.argv[1]
 start = text.find("{")
 if start < 0:
-    raise SystemExit("missing JSON object in sima-cli vulcan install --json output")
+    raise SystemExit("missing JSON object in sima-cli neat install --json output")
 payload = json.loads(text[start:])
 ref = str(payload.get("ref", "")).strip()
 spec = str(payload.get("resolved_spec", "")).strip()
 if not ref or not spec:
-    raise SystemExit("sima-cli vulcan install --json did not return ref and resolved_spec")
+    raise SystemExit("sima-cli neat install --json did not return ref and resolved_spec")
 print(f"{ref}:{spec}")
 PY
 )"
