@@ -48,6 +48,11 @@ jobs:
       build_command: |
         set -euo pipefail
 
+        if [[ -n "${GITHUB_WORKSPACE:-}" && -d "${GITHUB_WORKSPACE}" && "${GITHUB_WORKSPACE}" != "/" ]]; then
+          find "${GITHUB_WORKSPACE}" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          df -h
+        fi
+
         sdk_container="$(docker ps --filter 'ancestor=ghcr.io/sima-neat/sdk:latest' --format '{{.Names}}' | head -n 1)"
         if [[ -z "${sdk_container}" ]]; then
           sdk_container="$(docker ps --filter 'name=sdk' --format '{{.Names}}' | head -n 1)"
