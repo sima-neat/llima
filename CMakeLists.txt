@@ -523,8 +523,13 @@ set(CPACK_DEBIAN_CORE_PACKAGE_NAME "sima-lmm-core")
 set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
-set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime, simaai-memory-lib (= 2.0.0), libfmt9, libspdlog1.10")
+string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
+    "neat-runtime, simaai-memory-lib (= 2.0.0), "
+    "libcpp-httplib0.11, libfftw3-double3, "
+    "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
+    "libavcodec59, libavformat59, libavutil57, libswresample4, "
+    "libzmq5, libssl3, libreadline8, libgomp1, "
+    "libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
     "neat-internals-dev, "
