@@ -973,7 +973,17 @@ void LanguageModel::_define_attn_models_iter(
             {num_tokens, (uint32_t)get_buffer(buf_name).get_shape().back()}
         }
     );
-    pre_ofms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_buffer2", num_tokens))});
+    pre_ofms.emplace_back(
+        MLABufferSlice{
+            &get_buffer(fmt::format("n{}_buffer2", num_tokens)),
+            {0, 0, 0},
+            {
+                _cfg.lm_cfg.attn_cfg.num_attention_heads,
+                num_tokens,
+                _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
+            }
+        }
+    );
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         pre_ofms.emplace_back(
             MLABufferSlice(
@@ -1031,7 +1041,15 @@ void LanguageModel::_define_attn_models_iter(
     }
 
     std::vector<MLABufferSlice> cache_ifms{
-        MLABufferSlice{&get_buffer(fmt::format("n{}_buffer2", num_tokens))},
+        MLABufferSlice{
+            &get_buffer(fmt::format("n{}_buffer2", num_tokens)),
+            {0, 0, 0},
+            {
+                _cfg.lm_cfg.attn_cfg.num_attention_heads,
+                num_tokens,
+                _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
+            }
+        },
         MLABufferSlice{
             &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
             cache_kv_cache_offset,
@@ -1056,7 +1074,11 @@ void LanguageModel::_define_attn_models_iter(
         }
     );
     std::vector<MLABufferSlice> cache_ofms{
-        MLABufferSlice{&get_buffer(fmt::format("n{}_buffer3", num_tokens))}
+        MLABufferSlice{
+            &get_buffer(fmt::format("n{}_buffer3", num_tokens)),
+            {0, 0},
+            {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}
+        }
     };
     _define_model(
         "cache",
