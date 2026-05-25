@@ -79,15 +79,16 @@ MLAModelWithBuffer::MLAModelWithBuffer(
 void MLAModelWithBuffer::load() {
     if (_unique_model_ptrs[_model_idx]) return;
     auto* dispatcher = _get_dispatcher();
-    _unique_model_ptrs[_model_idx] = dispatcher->load(_unique_model_paths[_model_idx].string());
+    const auto model_path = std::filesystem::absolute(_unique_model_paths[_model_idx]);
+    _unique_model_ptrs[_model_idx] = dispatcher->load(model_path.string());
     if (!_unique_model_ptrs[_model_idx]) {
         throw std::runtime_error(fmt::format(
             "Failed to load model through MLASHM dispatcher: {} ({})",
-            _unique_model_paths[_model_idx],
+            model_path,
             dispatcher->lastErrorString()
         ));
     }
-    spdlog::info("Loaded model: {}", _unique_model_paths[_model_idx]);
+    spdlog::info("Loaded model: {}", model_path);
 }
 
 
@@ -351,7 +352,7 @@ void MLAModelWithBuffer::load_all_models(
         std::vector<std::string> paths;
         paths.reserve(file_names.size());
         for (const auto& file_name: file_names) {
-            paths.push_back(file_name.string());
+            paths.push_back(std::filesystem::absolute(file_name).string());
         }
         auto handles = dispatcher->loadMany(paths);
         if (handles.size() != file_names.size()) {
@@ -377,15 +378,16 @@ void MLAModelWithBuffer::load_all_models(
     }
 
     for (std::size_t i = 0; i < file_names.size(); ++i) {
-        _unique_model_ptrs[indices[i]] = dispatcher->load(file_names[i].string());
+        const auto model_path = std::filesystem::absolute(file_names[i]);
+        _unique_model_ptrs[indices[i]] = dispatcher->load(model_path.string());
         if (!_unique_model_ptrs[indices[i]]) {
             throw std::runtime_error(fmt::format(
                 "Failed to load model through MLASHM dispatcher: {} ({})",
-                file_names[i],
+                model_path,
                 dispatcher->lastErrorString()
             ));
         }
-        spdlog::info("Loaded model: {}", file_names[i]);
+        spdlog::info("Loaded model: {}", model_path);
     }
 }
 
