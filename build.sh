@@ -546,6 +546,7 @@ ensure_neat_internals() {
   local deb_pattern_groups=(
     'neat-common_*_all.deb simaai-common_*_all.deb'
     'neat-runtime_*_arm64.deb'
+    'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
     'neat-appcomplex_*_arm64.deb appcomplex_*_arm64.deb'
   )
