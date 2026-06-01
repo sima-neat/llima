@@ -2,5 +2,8 @@
   "internals": {
     "policy": "snap"
   },
-  "platform-version": "2.1.0"
+  "sdk": {
+    "channel": "develop"
+  },
+  "platform-version": "2.1.1"
 }
