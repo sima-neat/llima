@@ -532,7 +532,7 @@ string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
-    "neat-internals-dev (>= 2.1.0~), neat-internals-dev (<< 2.2), "
+    "neat-internals-dev (>= 2.1.1~), neat-internals-dev (<< 2.2), "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
