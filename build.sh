@@ -832,9 +832,7 @@ fi
 check_local_build_tools
 ensure_git_submodules
 detect_elxr_sdk
-# Temporarily skip pulling/installing internals from Vulcan so builds can use
-# locally produced internals packages already installed into the SDK/sysroot.
-# ensure_neat_internals
+ensure_neat_internals
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
 
