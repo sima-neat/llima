@@ -7,10 +7,10 @@ import yaml
 
 def _version_info_from_manifest():
     manifest = Path(__file__).parent / "deps" / "manifest.json"
-    version = str(json.loads(manifest.read_text(encoding="utf-8")).get("platform-version", "")).strip()
+    version = str(json.loads(manifest.read_text(encoding="utf-8")).get("package-version", "")).strip()
     parts = version.split(".")
     if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        raise RuntimeError(f"ERROR: unable to parse platform-version from {manifest}")
+        raise RuntimeError(f"ERROR: unable to parse package-version from {manifest}")
     return {
         "major": parts[0],
         "minor": parts[1],
@@ -18,8 +18,24 @@ def _version_info_from_manifest():
     }, version
 
 
+def _tag_version_override():
+    if os.environ.get("GITHUB_REF_TYPE") == "tag" and os.environ.get("GITHUB_REF_NAME"):
+        return os.environ["GITHUB_REF_NAME"].removeprefix("v")
+
+    proc = subprocess.Popen(
+        ['git', 'describe', '--tags', '--exact-match'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()
+    if proc.returncode == 0:
+        return proc.stdout.read().decode('utf-8').rstrip().removeprefix("v")
+    return None
+
+
 def get_version(pkg_dir):
     vinfo, version = _version_info_from_manifest()
+    version = _tag_version_override() or version
 
     if "GIT_HASH" in os.environ:
         # In tox the .git directory is not available so do this instead
