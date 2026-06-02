@@ -3,22 +3,22 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED SKBUILD_PROJECT_NAME)
     set(SKBUILD_PROJECT_NAME sima_lmm)
 endif()
+
+set(SIMA_LMM_PLATFORM_VERSION "")
+execute_process(
+    COMMAND python3 -c "import json; print(json.load(open('deps/manifest.json', encoding='utf-8'))['platform-version'])"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    RESULT_VARIABLE PLATFORM_VERSION_RESULT
+    OUTPUT_VARIABLE SIMA_LMM_PLATFORM_VERSION
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT PLATFORM_VERSION_RESULT EQUAL 0 OR SIMA_LMM_PLATFORM_VERSION STREQUAL "")
+    message(FATAL_ERROR "Failed to read platform-version from deps/manifest.json")
+endif()
+
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.in" SIMA_LMM_VERSION_IN)
-    foreach(_sima_lmm_version_part major minor patch)
-        string(REGEX MATCH
-            "${_sima_lmm_version_part}:[ \t]*([0-9]+)"
-            _sima_lmm_version_match
-            "${SIMA_LMM_VERSION_IN}"
-        )
-        if("${CMAKE_MATCH_1}" STREQUAL "")
-            message(FATAL_ERROR "Unable to parse ${_sima_lmm_version_part} from VERSION.in")
-        endif()
-        set("SIMA_LMM_VERSION_${_sima_lmm_version_part}" "${CMAKE_MATCH_1}")
-    endforeach()
-    set(SKBUILD_PROJECT_VERSION
-        "${SIMA_LMM_VERSION_major}.${SIMA_LMM_VERSION_minor}.${SIMA_LMM_VERSION_patch}"
-    )
+    set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PLATFORM_VERSION}")
 endif()
 
 project(${SKBUILD_PROJECT_NAME} VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX)
@@ -457,9 +457,9 @@ install(
 
 if(SIMA_LMM_INSTALL_PYTHON_PACKAGE)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sima_lmm_VERSION"
-"major: ${SIMA_LMM_VERSION_major}
-minor: ${SIMA_LMM_VERSION_minor}
-patch: ${SIMA_LMM_VERSION_patch}
+"major: ${PROJECT_VERSION_MAJOR}
+minor: ${PROJECT_VERSION_MINOR}
+patch: ${PROJECT_VERSION_PATCH}
 ")
 
     install(

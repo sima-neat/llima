@@ -102,19 +102,8 @@ apply_default_sdk_toolchain() {
   EXTRA_CMAKE_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${toolchain_file}")
 }
 
-version_from_version_in() {
-  local key
-  local value
-  local parts=()
-  for key in major minor patch; do
-    value="$(awk -F: -v key="$key" '$1 == key { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2 }' "$ROOT_DIR/VERSION.in")"
-    if [ -z "$value" ]; then
-      echo "ERROR: Unable to parse $key from $ROOT_DIR/VERSION.in" >&2
-      exit 1
-    fi
-    parts+=("$value")
-  done
-  printf '%s.%s.%s\n' "${parts[0]}" "${parts[1]}" "${parts[2]}"
+version_from_manifest() {
+  (cd "$ROOT_DIR" && python3 -c "import json; print(json.load(open('deps/manifest.json', encoding='utf-8'))['platform-version'])")
 }
 
 add_component() {
@@ -839,7 +828,7 @@ ensure_neat_internals
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
 
-LLIMA_VERSION="$(version_from_version_in)"
+LLIMA_VERSION="$(version_from_manifest)"
 MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
 if [ -z "$MULTIARCH" ]; then
   MULTIARCH="aarch64-linux-gnu"

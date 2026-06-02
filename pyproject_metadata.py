@@ -1,13 +1,25 @@
 import os
+import json
 from pathlib import Path
 import subprocess
 import yaml
 
 
+def _version_info_from_manifest():
+    manifest = Path(__file__).parent / "deps" / "manifest.json"
+    version = str(json.loads(manifest.read_text(encoding="utf-8")).get("platform-version", "")).strip()
+    parts = version.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        raise RuntimeError(f"ERROR: unable to parse platform-version from {manifest}")
+    return {
+        "major": parts[0],
+        "minor": parts[1],
+        "patch": parts[2],
+    }, version
+
+
 def get_version(pkg_dir):
-    with open(Path(__file__).parent / "VERSION.in") as fh:
-        vinfo = yaml.load(fh.read(), Loader=yaml.BaseLoader)
-        version = ".".join([vinfo["major"], vinfo["minor"], vinfo["patch"]])
+    vinfo, version = _version_info_from_manifest()
 
     if "GIT_HASH" in os.environ:
         # In tox the .git directory is not available so do this instead
@@ -27,9 +39,6 @@ def get_version(pkg_dir):
         print(pkg_dir)
         fh.write(yaml.dump(vinfo))
 
-    # This comes from Jenkins for upstream/downstream builds
-    if 'DEV_VERSION' in os.environ:
-        version = version + ".dev0+" + os.environ['DEV_VERSION']
     return version
 
 
