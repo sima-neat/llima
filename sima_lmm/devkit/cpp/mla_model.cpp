@@ -1,8 +1,12 @@
 
 #include <algorithm>
+#include <any>
 #include <cstdint>
+#include <future>
+#include <memory>
 #include <stdexcept>
 #include <sstream>
+#include <utility>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -14,6 +18,65 @@
 
 namespace simaai {
 namespace llima {
+
+namespace {
+
+struct MlaQueueCompletion {
+    int32_t rc = 0;
+    std::size_t failed_index = simaaidispatcher::DispatcherBase::NoFailedQueueIndex;
+    std::string detail;
+};
+
+using MlaQueuePromise = std::shared_ptr<std::promise<MlaQueueCompletion>>;
+
+MlaQueueCompletion submit_mla_partition_queue_and_wait(
+    simaaidispatcher::DispatcherBase* dispatcher,
+    std::vector<simaaidispatcher::JobMLA>&& jobs
+) {
+    auto promise = std::make_shared<std::promise<MlaQueueCompletion>>();
+    auto future = promise->get_future();
+
+    simaaidispatcher::DispatcherBase::MlaPartitionQueueRequest request;
+    request.jobs = std::move(jobs);
+    request.userData = promise;
+    request.cb = [](
+        int32_t rc,
+        std::size_t failed_index,
+        const simaaidispatcher::DispatcherBase::ErrorSnapshot& error,
+        const simaaidispatcher::DispatcherBase::ProfileSnapshot&,
+        std::any user_data
+    ) {
+        auto completion = std::any_cast<MlaQueuePromise>(user_data);
+        MlaQueueCompletion result;
+        result.rc = rc;
+        result.failed_index = failed_index;
+        result.detail = error.detail;
+        completion->set_value(std::move(result));
+    };
+
+    const int32_t submit_rc = dispatcher->submitMlaPartitionQueue(std::move(request));
+    if (submit_rc != 0) {
+        return {submit_rc, simaaidispatcher::DispatcherBase::NoFailedQueueIndex,
+                dispatcher->lastErrorString()};
+    }
+
+    MlaQueueCompletion result = future.get();
+    if (result.rc != 0 && result.detail.empty()) {
+        result.detail = dispatcher->lastErrorString();
+    }
+    return result;
+}
+
+MlaQueueCompletion submit_mla_job_and_wait(
+    simaaidispatcher::DispatcherBase* dispatcher,
+    simaaidispatcher::JobMLA&& job
+) {
+    std::vector<simaaidispatcher::JobMLA> jobs;
+    jobs.push_back(std::move(job));
+    return submit_mla_partition_queue_and_wait(dispatcher, std::move(jobs));
+}
+
+}
 
 void connect_mla_rt(const std::vector<std::string>& args) {
     if (MLAModelWithBuffer::_dispatcher) return;
@@ -267,13 +330,14 @@ void MLAModelWithBuffer::run(
 
     auto job = _make_job(ifm_map_ptr, ofm_map_ptr);
     auto* dispatcher = _get_dispatcher();
-    const int rc = dispatcher->run(job);
-    if (rc != 0) {
+    auto result = submit_mla_job_and_wait(dispatcher, std::move(job));
+    if (result.rc != 0) {
         throw std::runtime_error(fmt::format(
-            "MLASHM dispatcher run failed for {}: rc={} ({})",
+            "MLASHM dispatcher run failed for {}: rc={} failed_index={} ({})",
             _unique_model_paths[_model_idx],
-            rc,
-            dispatcher->lastErrorString()
+            result.rc,
+            result.failed_index,
+            result.detail.empty() ? dispatcher->lastErrorString() : result.detail
         ));
     }
 
@@ -301,19 +365,23 @@ void MLAModelWithBuffer::run_queue() {
 
     auto* dispatcher = _get_dispatcher();
     try {
-        const int rc = dispatcher->runQueue(MLAModelWithBuffer::_queue);
-        if (rc != 0) {
+        auto result = submit_mla_partition_queue_and_wait(
+            dispatcher,
+            std::move(MLAModelWithBuffer::_queue)
+        );
+        if (result.rc != 0) {
             throw std::runtime_error(fmt::format(
-                "MLASHM dispatcher runQueue failed: rc={} ({})",
-                rc,
-                dispatcher->lastErrorString()
+                "MLASHM dispatcher runQueue failed: rc={} failed_index={} ({})",
+                result.rc,
+                result.failed_index,
+                result.detail.empty() ? dispatcher->lastErrorString() : result.detail
             ));
         }
     } catch (...) {
-        MLAModelWithBuffer::_queue.clear();
+        MLAModelWithBuffer::_queue = {};
         throw;
     }
-    MLAModelWithBuffer::_queue.clear();
+    MLAModelWithBuffer::_queue = {};
 }
 
 
