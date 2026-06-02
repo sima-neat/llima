@@ -348,24 +348,6 @@ class LocalHuggingFaceModel:
             lora_config = json.load(f)
         return lora_config
 
-    @staticmethod
-    def load_draft_model(draft_model_path: Path | str) -> dict:
-        directory = Path(draft_model_path) if isinstance(draft_model_path, str) else draft_model_path
-        draft_path = find_file(directory, HF_DRAFT_MODEL_CONFIG_FILE)
-        assert draft_path, f"No draft model found in draft_path: {draft_path}"
-        with draft_path.open('r') as f:
-            draft_model_config = json.load(f)
-
-        # check if draft model is valid
-        is_single_layer = draft_model_config.get("num_hidden_layers") == 1
-        has_draft_vocab = "draft_vocab_size" in draft_model_config
-        if not(is_single_layer and has_draft_vocab):
-            raise ValueError(
-                f"Model at {draft_model_path} does not appear to be a valid draft model. "
-                f"Expected num_hidden_layers=1 and a draft_vocab_size field in config.json."
-            )
-        return draft_model_config
-
     def param_exists(self, param_name: str) -> bool:
         """Check if a parameter exists in the model.
         
@@ -503,7 +485,7 @@ class LocalHuggingFaceModel:
             if "lm_head" in name:
                 continue
             for part_name in name.split("."):
-                if part_name in ("language_model", "model"):
+                if part_name in ("language_model", "model", "midlayer"):
                     base_names.append(part_name)
                 elif base_names:
                     return ".".join(base_names)

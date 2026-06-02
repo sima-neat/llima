@@ -472,12 +472,14 @@ class BaseModel(ABC):
                 json.dump(cfg_dict, f, indent=4)
 
         # Obtain the embeddings tensor from the hf model.
+        # Skipped when the model doesn't include embed_tokens (e.g. EAGLE3 draft).
         embeddings_file_name = self.sima_devkit_path / f"{self.language_model_name}_embeddings.npy"
         if not (resume and embeddings_file_name.is_file()):
             embeddings = self.get_language_embeddings_tensor()
-            if not self.cfg.pipeline_cfg.quantize_embeddings:
-                embeddings = embeddings.astype(bfloat16)
-            np.save(embeddings_file_name, embeddings)
+            if embeddings is not None:
+                if not self.cfg.pipeline_cfg.quantize_embeddings:
+                    embeddings = embeddings.astype(bfloat16)
+                np.save(embeddings_file_name, embeddings)
 
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             per_layer_embeddings_file_name = (
@@ -517,6 +519,15 @@ class BaseModel(ABC):
                     )
                 with open(precision_file_name, "w") as f:
                     json.dump(precision_list, f, indent=4)
+
+            # Save the EAGLE3 draft model's d2t/t2d mapping tensors if present
+            for tensor_name in ("d2t", "t2d"):
+                out_path = self.sima_devkit_path / f"{tensor_name}.npy"
+                if resume and out_path.is_file():
+                    continue
+                if tensor_name in self.hf_model.weight_map:
+                    tensor = self.hf_model.load_np_param(tensor_name)
+                    np.save(out_path, tensor)
         else:
             assert isinstance(self.hf_model, GgufModel)
             # Copy the GGUF file to construct the VlmHelper.

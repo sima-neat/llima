@@ -1,10 +1,13 @@
+import copy
 import logging
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import LlmArchType, ModelFormat, VlmConfig, VisionArchType, model_file_type
+from sima_lmm.config.vlm_config import (
+    LlmArchType, ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
+)
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import (
@@ -50,7 +53,7 @@ class VisionLanguageModel(BaseModel):
     def __post_init__(self):
         self.language_model = LanguageModel(
             self.cfg, self.language_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-            hf_model=self.hf_model, vlm_helper=self.vlm_helper
+            hf_model=self.hf_model, vlm_helper=self.vlm_helper,
         )
 
     @staticmethod
@@ -70,7 +73,8 @@ class VisionLanguageModel(BaseModel):
         enable_filter_sharing: bool = False,
         quantize_embeddings: bool = False,
         split_mlp: bool = False,
-        image_resolution: list[int] | None = None
+        image_resolution: list[int] | None = None,
+        target_model: "VisionLanguageModel | None" = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -88,6 +92,8 @@ class VisionLanguageModel(BaseModel):
                 enabled.
             quantize_embeddings: True if embedding table is quantized.
             split_mlp: True if mlp is being split into multiple parts.
+            target_model: Target VisionLanguageModel when constructing a draft model.
+                Copies tokenizer and embeddings (if missing) from it. None for non-draft models.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -121,7 +127,39 @@ class VisionLanguageModel(BaseModel):
             )
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
 
-        vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
+        if target_model is not None:
+            # Some draft models use target model's tokenization scheme.
+            tokenizer_files = ("tokenizer_config.json", "tokenizer.json", "tokenizer.model")
+            has_tokenizer = any(
+                list(Path(hf_cache_path).rglob(f)) for f in tokenizer_files
+            )
+            if has_tokenizer:
+                vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
+            else:
+                vlm_helper = target_model.vlm_helper
+
+            # Set speculative decoding configs for the draft model
+            vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
+            )
+
+            # If the draft's HF config has rope_scaling=null, inherit from the target's HF config.
+            # The draft's source config.json typically omits rope_scaling and rope_theta entirely;
+            # transformers then fills rope_scaling=None and rope_theta=10000 (LlamaConfig defaults).
+            # Inherit both from the target so the draft uses the same rotary base as the target.
+            text_cfg = model_config.get("text_config", model_config)
+            if "rope_scaling" in text_cfg and text_cfg["rope_scaling"] is None:
+                vlm_cfg.lm_cfg.rope_cfg.rope_scaling = copy.deepcopy(
+                    target_model.cfg.lm_cfg.rope_cfg.rope_scaling
+                )
+                vlm_cfg.lm_cfg.rope_cfg.rope_theta = (
+                    target_model.cfg.lm_cfg.rope_cfg.rope_theta
+                )
+                vlm_cfg.lm_cfg.rope_cfg.rope_local_base_freq = (
+                    target_model.cfg.lm_cfg.rope_cfg.rope_local_base_freq
+                )
+        else:
+            vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
 
         return VisionLanguageModel(
             cfg=vlm_cfg,
@@ -129,16 +167,18 @@ class VisionLanguageModel(BaseModel):
             model_name=model_name,
             onnx_path=Path(onnx_path),
             sima_path=Path(sima_path),
-            vlm_helper=vlm_helper
+            vlm_helper=vlm_helper,
         )
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
         self.cfg.lm_cfg.set_lora_adapter(lora_config)
 
-    def set_draft_model(self, draft_model_path: Path):
-        draft_model_config = LocalHuggingFaceModel.load_draft_model(draft_model_path)
-        self.cfg.lm_cfg.set_draft_model(draft_model_config)
+    def configure_speculative_decoding(self, is_draft: bool = False):
+        speculative_budget = SPECULATIVE_BUDGET["draft"] if is_draft else SPECULATIVE_BUDGET["target"]
+        self.cfg.lm_cfg.set_speculative_decoding_config(
+            dict(is_draft=is_draft, speculative_budget=speculative_budget)
+        )
 
     def gen_files(
         self,

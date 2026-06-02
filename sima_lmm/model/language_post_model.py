@@ -38,8 +38,13 @@ class LanguagePostModel(LanguagePostBaseModel):
     def split_mlp(self) -> bool:
         return self.cfg.pipeline_cfg.split_mlp
 
+    @property
+    def _layer_base_name(self) -> str:
+        base = self.hf_model.language_model_param_base_name
+        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+
     def gen_onnx_files(self):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         self.create_onnx_builder()
         self._onnx_builder.create_input_node(
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
@@ -207,7 +212,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         log_level: int,
         quantizable: bool,
     ):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         g = self._build_sima_nodes(base_name, quantizable, merged_lora)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))

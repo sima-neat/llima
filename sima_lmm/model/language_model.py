@@ -19,6 +19,7 @@ from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
+from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.layer_id import LayerID
@@ -72,7 +73,7 @@ class LanguageModel(BaseModel):
         # Create a list of all models to compile
         model_list = list()
         num_tokens = self.cfg.pipeline_cfg.input_token_group_size
-        single_model_num_tokens = 1 if self.cfg.lm_cfg.draft_cfg is None else self.cfg.lm_cfg.draft_cfg.speculative_budget
+        single_model_num_tokens = self._single_model_num_tokens
         if (
             gen_mode in [FileGenMode.SOURCE_TO_FP, FileGenMode.SOURCE_TO_QUANT]
             and self.cfg.pipeline_cfg.quantize_embeddings
@@ -134,6 +135,14 @@ class LanguageModel(BaseModel):
                 case "conv_post_final":
                     part_model = self._get_part_model(
                         "conv_post_final", 1, layer_idx=layer_id.part_idx
+                    )
+                case "group_draft_fc":
+                    part_model = self._get_part_model(
+                        "draft_fc", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_draft_fc":
+                    part_model = self._get_part_model(
+                        "draft_fc", single_model_num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "group_per_layer":
                     part_model = self._get_part_model("per_layer", num_tokens)
@@ -356,9 +365,14 @@ class LanguageModel(BaseModel):
         self,
         weight_name: str | None = None,
         embed_scale: float = 1.0,
-    ) -> tuple[np.ndarray, float | np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, float | np.ndarray | None]:
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
-
+        is_draft = (
+            self.cfg.lm_cfg.speculative_decoding_cfg is not None
+            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
+        )
+        if is_draft and weight_name not in self.hf_model.weight_map:
+            return None, None
         if isinstance(self.hf_model, LocalHuggingFaceModel):
             embeddings_tensor = self.hf_model.load_np_param(weight_name)
         else:
@@ -379,6 +393,12 @@ class LanguageModel(BaseModel):
             return q_embeddings, scale
 
         return embeddings_tensor.astype(bfloat16).astype(np.float32), None
+
+    @property
+    def _single_model_num_tokens(self) -> int:
+        if self.cfg.lm_cfg.speculative_decoding_cfg is None:
+            return 1
+        return self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
 
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,
@@ -434,6 +454,12 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
+                )
+            case "draft_fc":
+                model_name = f"{self.model_name}_n{num_tokens}_draft_fc"
+                return LanguageDraftFCModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens
                 )
             case "per_layer":
                 model_name = f"{self.model_name}_n{num_tokens}_per_layer"

@@ -40,8 +40,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
     @property
     def _is_speculative_decoding(self) -> bool:
-        return (self.cfg.lm_cfg.draft_cfg is not None
-                and self.num_tokens == self.cfg.lm_cfg.draft_cfg.speculative_budget)
+        return (self.cfg.lm_cfg.speculative_decoding_cfg is not None
+                and self.num_tokens == self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget)
 
     @property
     def context_length(self) -> int:

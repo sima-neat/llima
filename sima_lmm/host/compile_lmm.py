@@ -21,7 +21,6 @@ from sima_lmm.host.configuration_helper import (
 from sima_lmm.host.compile_lora_adapter import compile_lora_adapter
 from sima_lmm.model import FileGenMode, FileGenPrecision, VisionLanguageModel
 
-
 def _print_precisions(precision: dict[LayerID, FileGenPrecision], for_quantize: bool):
     """
     Print diagnostic message about layers and precisions that will be processed.
@@ -53,15 +52,16 @@ def gen_files(
     language_group_size: int, language_group_offsets: list[int] | None,
     future_token_mask_size: int, use_strided_kv_cache: bool, enable_filter_sharing: bool,
     quantize_embeddings: bool, split_mlp: bool, return_logits: bool, log_level: int,
-    image_resolution: list[int] | None, draft_model_path: Path | None
+    image_resolution: list[int] | None, draft_model_path: Path | None, draft_output_path: Path | None
 ):
     enable_verbose_error_messages()
+    models = list()
 
-    model = VisionLanguageModel.from_hf_cache(
+    base_model = VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=Path(f"{output_path}/onnx_files"),
-        sima_path=Path(f"{output_path}/sima_files"),
+        onnx_path=Path(output_path / "onnx_files"),
+        sima_path=Path(output_path / "sima_files"),
         max_num_tokens=max_num_tokens,
         system_prompt=system_prompt,
         chat_template=chat_template,
@@ -75,64 +75,83 @@ def gen_files(
         split_mlp=split_mlp,
         image_resolution=image_resolution
     )
+    models.append(base_model)
 
     # Check if LoRA adapter is needed.
     if lora_path is not None:
-        model.set_lora_adapter(lora_path)
-    
+        base_model.set_lora_adapter(lora_path)
+
     # Check if draft model is provided
     if draft_model_path is not None:
-        model.set_draft_model(draft_model_path)
+        base_model.configure_speculative_decoding(is_draft=False)
+        draft_model = VisionLanguageModel.from_hf_cache(
+            hf_cache_path=draft_model_path,
+            model_name=draft_model_path.name,
+            onnx_path=Path(draft_output_path / "onnx_files"),
+            sima_path=Path(draft_output_path / "sima_files"),
+            max_num_tokens=max_num_tokens,
+            system_prompt=system_prompt,
+            chat_template=chat_template,
+            override_language_group_size=language_group_size,
+            override_language_group_offsets=language_group_offsets,
+            override_language_future_token_mask_size=future_token_mask_size,
+            return_logits=return_logits,
+            use_strided_kv_cache=use_strided_kv_cache,
+            enable_filter_sharing=enable_filter_sharing,
+            quantize_embeddings=quantize_embeddings,
+            split_mlp=split_mlp,
+            image_resolution=image_resolution,
+            target_model=base_model
+        )
+        models.append(draft_model)
 
-    if configuration_path is None:
-        gen_config = default_configuration(model)
-    else:
-        gen_config = read_configuration_file(model, configuration_path)
+    for model in models:
+        if configuration_path is None:
+            gen_config = default_configuration(model)
+        else:
+            gen_config = read_configuration_file(model, configuration_path)
 
-    if file_gen_mode == FileGenMode.ALL:
-        # Use different compiler stages for HF and for GGUF
-        if isinstance(model.hf_model, LocalHuggingFaceModel):
-            # Check if this is an llm-compressor quantized model (AWQ/GPTQ)
-            if model.hf_model.is_compressed_tensors_model():
-                # Pre-quantized models use MODEL_SDK_DIRECT like GGUF
+        if file_gen_mode == FileGenMode.ALL:
+            # Use different compiler stages for HF and for GGUF
+            if isinstance(model.hf_model, LocalHuggingFaceModel):
+                # Check if this is an llm-compressor quantized model (AWQ/GPTQ)
+                if model.hf_model.is_compressed_tensors_model():
+                    # Pre-quantized models use MODEL_SDK_DIRECT like GGUF
+                    modes = [
+                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
+                        FileGenMode.MODEL_SDK_COMPILE
+                    ]
+                elif lora_path is not None or quantize_embeddings:
+                    # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
+                    modes = [
+                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
+                        FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
+                    ]
+                else:
+                    # Use ONNX mode, no need to track LoRA weights
+                    modes = [
+                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
+                        FileGenMode.MODEL_SDK_COMPILE
+                    ]
+            else:
+                assert isinstance(model.hf_model, GgufModel)
                 modes = [
                     FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                     FileGenMode.MODEL_SDK_COMPILE
                 ]
-            elif lora_path is not None or quantize_embeddings:
-                # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
-                modes = [
-                    FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
-                    FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
-                ]
-            else:
-                # Use ONNX mode, no need to track LoRA weights
-                modes = [
-                    FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                    FileGenMode.MODEL_SDK_COMPILE
-                ]
         else:
-            assert isinstance(model.hf_model, GgufModel)
-            modes = [
-                FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
-                FileGenMode.MODEL_SDK_COMPILE
-            ]
-    else:
-        if isinstance(model.hf_model, GgufModel) and file_gen_mode == FileGenMode.SOURCE_TO_ONNX:
-            _abort("ONNX generation mode not supported for GGUF models")
-        modes = [file_gen_mode]
+            if isinstance(model.hf_model, GgufModel) and file_gen_mode == FileGenMode.SOURCE_TO_ONNX:
+                _abort("ONNX generation mode not supported for GGUF models")
+            modes = [file_gen_mode]
 
-    _print_precisions(gen_config["precision"], FileGenMode.SOURCE_TO_QUANT in modes or FileGenMode.FP_TO_QUANT in modes)
+        _print_precisions(gen_config["precision"], FileGenMode.SOURCE_TO_QUANT in modes or FileGenMode.FP_TO_QUANT in modes)
 
-    for mode in modes:
-        model.gen_files(
-            mode, gen_config=gen_config, log_level=log_level, num_processes=num_processes,
-            resume=resume
-        )
-        print(f"Generated all mode={mode.name} files", flush=True)
-
-    if model.cfg.lm_cfg.draft_cfg is not None:
-        raise NotImplementedError("Draft model generation is not implemented yet")
+        for mode in modes:
+            model.gen_files(
+                mode, gen_config=gen_config, log_level=log_level, num_processes=num_processes,
+                resume=resume
+            )
+            print(f"Generated mode={mode.name} files for {model.model_name}", flush=True)
 
 def _safe_resolve(p: Path) -> Path:
     """
@@ -295,6 +314,10 @@ def main():
         "--input_width", type=int, metavar="N",
         help="The width of the input image (for Siglip2 based models)"
     )
+    group.add_argument(
+        "--draft_model_path", type=Path,
+        help="Path of the EAGLE3 draft model for the base (target) model."
+    )
 
     group = parser.add_argument_group("Options to compile LoRA")
     group.add_argument(
@@ -310,10 +333,6 @@ def main():
     group.add_argument(
         "--compile_lora", type=bool, action=argparse.BooleanOptionalAction, default=True,
         help="Set to compile LoRA weights."
-    )
-    group.add_argument(
-        "--draft_model_path", type=Path,
-        help="Path of the EAGLE3 draft model for the base (target) model."
     )
 
     group = parser.add_argument_group("Advanced options")
@@ -333,10 +352,20 @@ def main():
         num_processes = psutil.cpu_count(logical=False)
 
     if args.output is None:
-        output_path = Path(args.model_path.name)
+        if args.draft_model_path is not None:
+            base_output_path = Path(f"{args.model_path.name}-speculative-decoding")
+        else:
+            base_output_path = Path(args.model_path.name)
     else:
-        output_path = Path(args.output)
+        base_output_path = Path(args.output)
 
+    if args.draft_model_path is not None:
+        output_path = base_output_path / args.model_path.name
+        draft_output_path = base_output_path / args.draft_model_path.name
+    else:
+        output_path = base_output_path
+        draft_output_path = None
+     
     check_output_path_conflict(args.model_path, output_path)
 
     try:
@@ -411,7 +440,7 @@ def main():
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
         args.language_group_size, language_group_offsets, args.future_token_mask_size,
         args.use_strided_kv_cache, args.enable_filter_sharing, args.quantize_embeddings,
-        split_mlp, args.return_logits, log_level, image_resolution, args.draft_model_path
+        split_mlp, args.return_logits, log_level, image_resolution, args.draft_model_path, draft_output_path
     )
 
     # Compile LoRA weights if requested.

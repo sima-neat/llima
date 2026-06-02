@@ -44,6 +44,11 @@ class LanguagePreModel(LanguagePartBaseModel):
         return self.cfg.pipeline_cfg.enable_filter_sharing
 
     @property
+    def _layer_base_name(self) -> str:
+        base = self.hf_model.language_model_param_base_name
+        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+    
+    @property
     def layer_type(self) -> str:
         return self.cfg.lm_cfg.layer_types[self.layer_idx]
 
@@ -67,11 +72,15 @@ class LanguagePreModel(LanguagePartBaseModel):
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
     def gen_onnx_files(self):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         self.create_onnx_builder()
         self._onnx_builder.create_input_node(
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
         )
+        if self.is_draft:
+            self._onnx_builder.create_input_node(
+                "hidden_states", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+            )
         self._onnx_builder.create_input_node(
             "freq_real", (1, self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2, 1, self.num_tokens)
         )
@@ -124,11 +133,26 @@ class LanguagePreModel(LanguagePartBaseModel):
             else f"{base_name}.input_layernorm"
         )
         rms_norm = self._build_rms_norm(norm_name, input_nodes[0])
-        q_out = self._build_onnx_attn_query(f"{base_name}.self_attn", [rms_norm, *input_nodes[1:]])
+        if self.is_draft:
+            # EAGLE3 draft model also normalizes the target hidden_states.
+            hidden_states_norm = self._build_rms_norm(
+                f"{base_name}.hidden_norm", input_nodes[1]
+            )
+            attn_input = self._onnx_builder.build_op(
+                base_name=f"{base_name}.concat",
+                input_nodes=[rms_norm, hidden_states_norm],
+                op_type="Concat",
+                axis=1,
+            )
+            freq_start = 2
+        else:
+            attn_input = rms_norm
+            freq_start = 1
+        q_out = self._build_onnx_attn_query(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
         if self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
             return [q_out]
-        k_out = self._build_onnx_attn_key(f"{base_name}.self_attn", [rms_norm, *input_nodes[1:]])
-        v_out = self._build_onnx_attn_value(f"{base_name}.self_attn", rms_norm)
+        k_out = self._build_onnx_attn_key(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
+        v_out = self._build_onnx_attn_value(f"{base_name}.self_attn", attn_input)
         return [q_out, k_out, v_out]
 
     def _build_onnx_rotary_emb(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
@@ -336,7 +360,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         layer_cfg: LayerConfiguration,
         log_level: int, quantizable: bool
     ):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         g = self._build_sima_nodes(base_name, quantizable, merged_lora)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
@@ -361,6 +385,11 @@ class LanguagePreModel(LanguagePartBaseModel):
         model_input_input = builder.create_placeholder_node(
             "input", TensorType(input_dtype, input_shape)
         )
+        # EAGLE3 draft model has an extra hidden_states input
+        if self.is_draft:
+            model_input_hidden_states = builder.create_placeholder_node(
+                "hidden_states", TensorType(activation_type(quantizable), input_shape)
+            )
         model_input_freq_real = builder.create_placeholder_node(
             "freq_real", TensorType(activation_type(quantizable), freq_shape)
         )
@@ -369,10 +398,18 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
 
         # MLA subgraph inputs are the same as the model inputs, except the node names are different
-        builder.begin_subnet([model_input_input, model_input_freq_real, model_input_freq_imag])
+        subnet_inputs = [model_input_input, model_input_freq_real, model_input_freq_imag]
+        if self.is_draft:
+            subnet_inputs.insert(1, model_input_hidden_states)
+        builder.begin_subnet(subnet_inputs)
         mla_input_input = builder.create_placeholder_node(
             "MLA_0/input", TensorType(input_dtype, input_shape)
         )
+        # EAGLE3 draft model has an extra hidden_states input
+        if self.is_draft:
+            mla_input_hidden_states = builder.create_placeholder_node(
+                "MLA_0/hidden_states", TensorType(activation_type(quantizable), input_shape)
+            )
         mla_input_freq_real = builder.create_placeholder_node(
             "MLA_0/freq_real", TensorType(activation_type(quantizable), freq_shape)
         )
@@ -400,14 +437,22 @@ class LanguagePreModel(LanguagePartBaseModel):
         rms_norm = self._build_sima_rms_norm(
             builder, norm_name, rms_norm_in
         )
+        # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
+        if self.is_draft:
+            hidden_states_norm = self._build_sima_rms_norm(
+                builder, f"{base_name}.hidden_norm", mla_input_hidden_states
+            )
+            attn_input = builder.create_concat_node([rms_norm, hidden_states_norm], 3)
+        else:
+            attn_input = rms_norm
         mla_q_out = self._build_sima_attn_query(
-            builder, f"{base_name}.self_attn", rms_norm, mla_input_freq_real, mla_input_freq_imag,
+            builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real, mla_input_freq_imag,
             quantizable, merged_lora
         )
         mla_k_out = self._build_sima_attn_key(
-            builder, f"{base_name}.self_attn", rms_norm, mla_input_freq_real, mla_input_freq_imag, merged_lora
+            builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real, mla_input_freq_imag, merged_lora
         )
-        mla_v_out = self._build_sima_attn_value(builder, f"{base_name}.self_attn", rms_norm, merged_lora)
+        mla_v_out = self._build_sima_attn_value(builder, f"{base_name}.self_attn", attn_input, merged_lora)
         _ = builder.create_tuple_node([mla_q_out, mla_k_out, mla_v_out])
 
         mla_node = builder.finish_subnet("MLA_0")
