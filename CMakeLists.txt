@@ -3,25 +3,36 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED SKBUILD_PROJECT_NAME)
     set(SKBUILD_PROJECT_NAME sima_lmm)
 endif()
+
+set(SIMA_LMM_PLATFORM_VERSION "")
+set(SIMA_LMM_PACKAGE_BASE_VERSION "")
+execute_process(
+    COMMAND python3 -c "import json; data=json.load(open('deps/manifest.json', encoding='utf-8')); print(data['platform-version']); print(data['package-version'])"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    RESULT_VARIABLE PLATFORM_VERSION_RESULT
+    OUTPUT_VARIABLE SIMA_LMM_MANIFEST_VERSIONS
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT PLATFORM_VERSION_RESULT EQUAL 0 OR SIMA_LMM_MANIFEST_VERSIONS STREQUAL "")
+    message(FATAL_ERROR "Failed to read package-version and platform-version from deps/manifest.json")
+endif()
+string(REPLACE "\n" ";" SIMA_LMM_MANIFEST_VERSION_LIST "${SIMA_LMM_MANIFEST_VERSIONS}")
+list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PLATFORM_VERSION)
+list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PACKAGE_BASE_VERSION)
+
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.in" SIMA_LMM_VERSION_IN)
-    foreach(_sima_lmm_version_part major minor patch)
-        string(REGEX MATCH
-            "${_sima_lmm_version_part}:[ \t]*([0-9]+)"
-            _sima_lmm_version_match
-            "${SIMA_LMM_VERSION_IN}"
-        )
-        if("${CMAKE_MATCH_1}" STREQUAL "")
-            message(FATAL_ERROR "Unable to parse ${_sima_lmm_version_part} from VERSION.in")
-        endif()
-        set("SIMA_LMM_VERSION_${_sima_lmm_version_part}" "${CMAKE_MATCH_1}")
-    endforeach()
-    set(SKBUILD_PROJECT_VERSION
-        "${SIMA_LMM_VERSION_major}.${SIMA_LMM_VERSION_minor}.${SIMA_LMM_VERSION_patch}"
-    )
+    set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
 endif()
 
 project(${SKBUILD_PROJECT_NAME} VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX)
+set(SIMA_LMM_PACKAGE_VERSION "${PROJECT_VERSION}" CACHE STRING "Debian package version for sima-lmm artifacts.")
+string(REPLACE "." ";" SIMA_LMM_PACKAGE_BASE_VERSION_PARTS "${SIMA_LMM_PACKAGE_BASE_VERSION}")
+list(GET SIMA_LMM_PACKAGE_BASE_VERSION_PARTS 0 SIMA_LMM_PACKAGE_BASE_VERSION_MAJOR)
+list(GET SIMA_LMM_PACKAGE_BASE_VERSION_PARTS 1 SIMA_LMM_PACKAGE_BASE_VERSION_MINOR)
+math(EXPR SIMA_LMM_NEXT_PACKAGE_MINOR "${SIMA_LMM_PACKAGE_BASE_VERSION_MINOR} + 1")
+set(SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
+set(SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION_MAJOR}.${SIMA_LMM_NEXT_PACKAGE_MINOR}.0")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -72,7 +83,7 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
-find_package(NeatInternals REQUIRED)
+find_package(NeatInternals ${SIMA_LMM_PLATFORM_VERSION} CONFIG REQUIRED)
 find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
@@ -468,7 +479,7 @@ configure_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
+    VERSION ${SIMA_LMM_PLATFORM_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 install(
@@ -482,9 +493,9 @@ install(
 
 if(SIMA_LMM_INSTALL_PYTHON_PACKAGE)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sima_lmm_VERSION"
-"major: ${SIMA_LMM_VERSION_major}
-minor: ${SIMA_LMM_VERSION_minor}
-patch: ${SIMA_LMM_VERSION_patch}
+"major: ${PROJECT_VERSION_MAJOR}
+minor: ${PROJECT_VERSION_MINOR}
+patch: ${PROJECT_VERSION_PATCH}
 ")
 
     install(
@@ -528,7 +539,7 @@ endif()
 set(CPACK_PACKAGE_NAME "sima-lmm")
 set(CPACK_PACKAGE_VENDOR "SiMa.ai")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SiMa LMM runtime")
-set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VERSION "${SIMA_LMM_PACKAGE_VERSION}")
 set(CPACK_PACKAGE_CONTACT "SiMa.ai Build Team <build@sima.ai>")
 set(CPACK_GENERATOR "DEB")
 set(CPACK_COMPONENTS_ALL core dev cli)
@@ -549,7 +560,9 @@ set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime, simaai-memory-lib (= 2.1.1), "
+    "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
+    "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
+    "simaai-memory-lib (= ${SIMA_LMM_PLATFORM_VERSION}), "
     "libcpp-httplib0.11, libfftw3-double3, "
     "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
     "libavcodec59, libavformat59, libavutil57, libswresample4, "
@@ -557,7 +570,8 @@ string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
-    "neat-internals-dev (>= 2.1.1~), neat-internals-dev (<< 2.2), "
+    "neat-internals-dev (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
+    "neat-internals-dev (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "

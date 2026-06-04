@@ -103,19 +103,12 @@ apply_default_sdk_toolchain() {
   EXTRA_CMAKE_ARGS+=("-DCMAKE_TOOLCHAIN_FILE=${toolchain_file}")
 }
 
-version_from_version_in() {
-  local key
-  local value
-  local parts=()
-  for key in major minor patch; do
-    value="$(awk -F: -v key="$key" '$1 == key { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2 }' "$ROOT_DIR/VERSION.in")"
-    if [ -z "$value" ]; then
-      echo "ERROR: Unable to parse $key from $ROOT_DIR/VERSION.in" >&2
-      exit 1
-    fi
-    parts+=("$value")
-  done
-  printf '%s.%s.%s\n' "${parts[0]}" "${parts[1]}" "${parts[2]}"
+compute_package_version() {
+  if [[ -n "${LLIMA_PACKAGE_VERSION:-}" ]]; then
+    printf '%s\n' "${LLIMA_PACKAGE_VERSION}"
+    return 0
+  fi
+  bash "${ROOT_DIR}/tools/compute_package_version.sh"
 }
 
 add_component() {
@@ -561,7 +554,6 @@ ensure_neat_internals() {
     'neat-runtime_*_arm64.deb'
     'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
-    'neat-appcomplex_*_arm64.deb appcomplex_*_arm64.deb'
   )
   local debs=()
   local pattern_group pattern deb
@@ -851,7 +843,8 @@ ensure_neat_internals
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
 
-LLIMA_VERSION="$(version_from_version_in)"
+LLIMA_VERSION="$(compute_package_version)"
+LLIMA_PROJECT_VERSION="${LLIMA_VERSION%%+*}"
 MULTIARCH="$(dpkg-architecture -a"$ARCH" -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
 if [ -z "$MULTIARCH" ]; then
   MULTIARCH="aarch64-linux-gnu"
@@ -908,6 +901,8 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DSIMA_LMM_INSTALL_PYTHON_PACKAGE=ON \
   -DSIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR="lib/python3/dist-packages/sima_lmm/devkit" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
+  -DSKBUILD_PROJECT_VERSION="$LLIMA_PROJECT_VERSION" \
+  -DSIMA_LMM_PACKAGE_VERSION="$LLIMA_VERSION" \
   -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$ARCH" \
   "${CMAKE_SOABI_ARGS[@]}" \
   "${CMAKE_PYTHON_ARGS[@]}" \
