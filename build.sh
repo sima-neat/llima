@@ -7,6 +7,7 @@ BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
 NEAT_INTERNALS_VULCAN_REPOSITORY="${NEAT_INTERNALS_VULCAN_REPOSITORY:-internals}"
 NEAT_INTERNALS_SNAP_POLICY="${NEAT_INTERNALS_SNAP_POLICY:-ON}"
 NEAT_INTERNALS_MANIFEST="${NEAT_INTERNALS_MANIFEST:-${ROOT_DIR}/deps/manifest.json}"
+NEAT_INTERNALS_PACKAGE_DIR="${NEAT_INTERNALS_PACKAGE_DIR:-}"
 NEAT_INTERNALS_RESOLVED_REF=""
 NEAT_VULCAN_ENV="${NEAT_VULCAN_ENV:-stg}"
 NEAT_VULCAN_BASE_URL="${NEAT_VULCAN_BASE_URL:-}"
@@ -533,15 +534,27 @@ path_exists_any() {
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local tmp_dir
-  tmp_dir="$(mktemp -d /tmp/llima-neat-internals.XXXXXX)"
-  local extract_dir="${tmp_dir}/package"
+  tmp_dir=""
+  local extract_dir
   local archive_name="Vulcan internals artifact"
 
-  local internals_ref
-  if ! internals_ref="$(resolve_neat_internals_ref)"; then
-    exit 1
+  if [[ -n "${NEAT_INTERNALS_PACKAGE_DIR}" ]]; then
+    if [[ ! -d "${NEAT_INTERNALS_PACKAGE_DIR}" ]]; then
+      echo "ERROR: NEAT_INTERNALS_PACKAGE_DIR does not exist: ${NEAT_INTERNALS_PACKAGE_DIR}" >&2
+      exit 1
+    fi
+    extract_dir="${NEAT_INTERNALS_PACKAGE_DIR}"
+    archive_name="local internals package directory"
+    echo "[build] Using local NEAT internals packages: ${extract_dir}"
+  else
+    tmp_dir="$(mktemp -d /tmp/llima-neat-internals.XXXXXX)"
+    extract_dir="${tmp_dir}/package"
+    local internals_ref
+    if ! internals_ref="$(resolve_neat_internals_ref)"; then
+      exit 1
+    fi
+    fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
   fi
-  fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
 
   local deb_pattern_groups=(
     'neat-common_*_all.deb simaai-common_*_all.deb'
@@ -614,7 +627,9 @@ ensure_neat_internals() {
     exit 1
   fi
 
-  rm -rf "${tmp_dir}"
+  if [[ -n "${tmp_dir}" ]]; then
+    rm -rf "${tmp_dir}"
+  fi
   echo "[build] NEAT internals are ready."
 }
 
@@ -854,8 +869,32 @@ fi
 ensure_writable_cargo_home
 ensure_python_build_env
 CMAKE_SOABI_ARGS=()
+CMAKE_PYTHON_ARGS=("-DPython_EXECUTABLE=$BUILD_VENV/bin/python")
 if [[ "${ELXR_SDK}" == "ON" ]]; then
   CMAKE_SOABI_ARGS+=("-DSKBUILD_SOABI=cpython-311-${MULTIARCH}")
+  SDK_SYSROOT="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
+  SDK_PYTHON_EXECUTABLE="${SDK_SYSROOT}/usr/bin/python3"
+  SDK_PYTHON_INCLUDE_DIR="${SDK_SYSROOT}/usr/include/python3.11"
+  SDK_PYTHON_LIBRARY="${SDK_SYSROOT}/usr/lib/${MULTIARCH}/libpython3.11.so"
+  if [[ ! -x "${SDK_PYTHON_EXECUTABLE}" ]]; then
+    echo "ERROR: SDK Python executable not found: ${SDK_PYTHON_EXECUTABLE}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SDK_PYTHON_INCLUDE_DIR}/Python.h" ]]; then
+    echo "ERROR: SDK Python headers not found: ${SDK_PYTHON_INCLUDE_DIR}/Python.h" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SDK_PYTHON_LIBRARY}" ]]; then
+    echo "ERROR: SDK Python library not found: ${SDK_PYTHON_LIBRARY}" >&2
+    exit 1
+  fi
+  nanobind_cmake_dir="$("$BUILD_VENV/bin/python" -m nanobind --cmake_dir)"
+  CMAKE_PYTHON_ARGS=(
+    "-DPython_EXECUTABLE=${SDK_PYTHON_EXECUTABLE}"
+    "-DPython_INCLUDE_DIR=${SDK_PYTHON_INCLUDE_DIR}"
+    "-DPython_LIBRARY=${SDK_PYTHON_LIBRARY}"
+    "-Dnanobind_ROOT=${nanobind_cmake_dir}"
+  )
 fi
 
 echo "[build] Configuring sima-lmm $LLIMA_VERSION for arch=$ARCH"
@@ -864,7 +903,6 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_INSTALL_LIBDIR="lib/$MULTIARCH" \
-  -DPython_EXECUTABLE="$BUILD_VENV/bin/python" \
   -DSKBUILD_SOABI="$PYTHON_TARGET_SOABI" \
   -DSIMA_LMM_BUILD_PYTHON=ON \
   -DSIMA_LMM_INSTALL_PYTHON_PACKAGE=ON \
@@ -872,6 +910,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
   -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$ARCH" \
   "${CMAKE_SOABI_ARGS[@]}" \
+  "${CMAKE_PYTHON_ARGS[@]}" \
   "${EXTRA_CMAKE_ARGS[@]}"
 
 echo "[build] Building sima-lmm targets with $BUILD_JOBS parallel job(s)"
