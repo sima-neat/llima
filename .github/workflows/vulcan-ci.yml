@@ -140,9 +140,9 @@ jobs:
 
         test -f "${primary_archive}.sha256"
         sha256sum -c <(awk -v file="$(basename "${primary_archive}")" '{print $1 "  dist/" file}' "${primary_archive}.sha256")
-        llima_version="$(python3 -c 'import json; from pathlib import Path; print(json.loads(Path("deps/manifest.json").read_text()).get("platform-version", "").strip())')"
+        llima_version="$(bash tools/compute_package_version.sh)"
         if [[ -z "${llima_version}" ]]; then
-          echo "deps/manifest.json must define platform-version." >&2
+          echo "Unable to compute LLiMa package version." >&2
           exit 1
         fi
         test -f "dist/sima-lmm-${llima_version}-Linux-core.deb"
