@@ -882,10 +882,15 @@ if [[ "${ELXR_SDK}" == "ON" ]]; then
     exit 1
   fi
   nanobind_cmake_dir="$("$BUILD_VENV/bin/python" -m nanobind --cmake_dir)"
+  export PKG_CONFIG="${PKG_CONFIG:-/usr/bin/pkg-config}"
+  export PKG_CONFIG_EXECUTABLE="${PKG_CONFIG_EXECUTABLE:-${PKG_CONFIG}}"
+  export PKG_CONFIG_SYSROOT_DIR="${PKG_CONFIG_SYSROOT_DIR:-${SDK_SYSROOT}}"
+  export PKG_CONFIG_LIBDIR="${PKG_CONFIG_LIBDIR:-${SDK_SYSROOT}/usr/lib/${MULTIARCH}/pkgconfig:${SDK_SYSROOT}/usr/lib/pkgconfig:${SDK_SYSROOT}/usr/share/pkgconfig}"
   CMAKE_PYTHON_ARGS=(
-    "-DPython_EXECUTABLE=${SDK_PYTHON_EXECUTABLE}"
+    "-DPython_EXECUTABLE=$BUILD_VENV/bin/python"
     "-DPython_INCLUDE_DIR=${SDK_PYTHON_INCLUDE_DIR}"
     "-DPython_LIBRARY=${SDK_PYTHON_LIBRARY}"
+    "-DPKG_CONFIG_EXECUTABLE=${PKG_CONFIG_EXECUTABLE}"
     "-Dnanobind_ROOT=${nanobind_cmake_dir}"
   )
 fi
