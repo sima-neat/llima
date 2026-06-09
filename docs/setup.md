@@ -1,8 +1,10 @@
-# System Requirements & Setup
+# System Requirements
 
-## System Requirements
-
-For GenAI model compilation and deployment, you only need the **ModelSDK container** from PaletteSDK, not the full PaletteSDK installation. The ModelSDK container needs to be installed on a machine that matches the following requirements.
+For GenAI model compilation and deployment, use the **ModelSDK container**
+provided with Palette SDK. You do not need the full Palette SDK development
+environment unless you are also building host or Neat Framework applications.
+The ModelSDK container needs to be installed on a machine that matches the
+following requirements.
 
 | Parameter | Description |
 |----|----|
