@@ -21,6 +21,9 @@ string(REPLACE "\n" ";" SIMA_LMM_MANIFEST_VERSION_LIST "${SIMA_LMM_MANIFEST_VERS
 list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PLATFORM_VERSION)
 list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PACKAGE_BASE_VERSION)
 
+set(SIMA_LMM_MEMORY_LIB_VERSION "2.1.1" CACHE STRING
+    "Debian package version required for simaai-memory-lib.")
+
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
     set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
 endif()
@@ -574,7 +577,7 @@ set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
     "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
-    "simaai-memory-lib (= ${SIMA_LMM_PLATFORM_VERSION}), "
+    "simaai-memory-lib (= ${SIMA_LMM_MEMORY_LIB_VERSION}), "
     "libcpp-httplib0.11, libfftw3-double3, "
     "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
     "libavcodec59, libavformat59, libavutil57, libswresample4, "
