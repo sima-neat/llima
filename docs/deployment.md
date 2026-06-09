@@ -2,7 +2,9 @@
 
 ## Overview
 
-After compilation, models need to be deployed to the Modalix device for execution. The ModelSDK container provides the `llima-deploy` utility to streamline this process:
+After compilation, models need to be deployed to the Modalix device for
+execution. The ModelSDK extension provides the `llima-deploy` utility to
+streamline this process:
 
 ``` console
 sima-user@docker-image-id:/home/docker$ llima-deploy <source_directory> <destination_directory>
@@ -54,7 +56,7 @@ sima-user@docker-image-id:/home/docker$ scp -r llama3_2 sima@192.168.1.20:/media
 ```
 
 > [!NOTE]
-> Replace `192.168.1.20` with the actual IP address of your Modalix device, if it was changed.
+> `192.168.1.20` is an example Modalix IP address. Use the IP address of your device.
 
 Once deployed, SSH into the Modalix device and run the model:
 
@@ -62,14 +64,10 @@ Once deployed, SSH into the Modalix device and run the model:
 modalix:~$ ssh sima@192.168.1.20
 ```
 
-Then run the model using the `llima` CLI or the full GenAI demo script. See [Runtime & Orchestration](runtime.md) for details.
+Then run the model using the `llima` CLI. See [LLiMa CLI](runtime.md) for details.
 
 ``` console
 modalix:~$ llima run <model_name>
-```
-
-``` console
-modalix:/media/nvme/llima$ ./run.sh
 ```
 
 ## Troubleshooting

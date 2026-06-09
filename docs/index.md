@@ -1,64 +1,33 @@
-# Introduction to LLiMa
+# GenAI with LLiMa
 
-## Overview
+LLiMa is the GenAI toolkit in the ModelSDK extension for compiling, testing,
+benchmarking, deploying, and running LLM, VLM, and ASR models on Modalix.
 
-The GenAI Model Compilation feature streamlines the process of compiling GenAI models from three input formats: HuggingFace safetensors, GGUF files, and pre-quantized compressed tensor models (e.g. GPTQ/AWQ models created with llm-compressor). For a wide set of different models like `Llama`, `Gemma`, `Phi`, `Qwen`, `Mistral` or `LFM` from Hugging Face, the SDK automatically generates all required binary/elf files along with the Python orchestration script, enabling direct execution on the Sima.ai Modalix platform.
+LLiMa supports three input formats:
 
-SiMa has precompiled several popular models and published them on [Hugging Face](https://huggingface.co/simaai). LLiMa is not installed by default. To get started, create the LLiMa directory structure and install it globally on your Modalix device:
+- **Hugging Face safetensors** — standard LLM and VLM model directories
+- **GGUF files** — LLM models packaged in GGUF format
+- **Compressed tensor models** — pre-quantized GPTQ/AWQ-style safetensor models
 
-``` console
-modalix:~$ cd /media/nvme && mkdir llima && cd llima
-modalix:~$ sima-cli install -v 2.1.0 tools/llima -t full
-```
+SiMa.ai also publishes precompiled GenAI models on
+[Hugging Face](https://huggingface.co/simaai). Start there when a suitable model
+already exists.
 
-This creates the required directories (including `/media/nvme/llima/models` for model storage) and makes the `llima` CLI available system-wide.
+For concrete GenAI demos, check our [Neat Apps portal](https://apps.sima-neat.com/portal/index.html).
 
-### Model Manager
+## LLiMa Availability
 
-LLiMa includes a model manager accessible via the `llima` CLI. It lets you search, download, and run precompiled models directly from the command line. Models are stored under `/media/nvme/llima/models` by default; this path can be overridden by setting the `LLIMA_MODELS_PATH` environment variable.
+LLiMa compilation tools are installed by default in the ModelSDK extension.
+The LLiMa runtime is installed natively on Modalix as part of the Neat runtime.
+See [Neat Framework installation](/getting-started/installation/neat-framework/)
+for the runtime installation flow.
 
-Browse available models:
-
-``` console
-modalix:~$ llima search
-modalix:~$ llima search qwen
-```
-
-Download a model by name (without the `simaai/` org prefix):
-
-``` console
-modalix:~$ llima pull Qwen3-VL-8B-Instruct-a16w4
-```
-
-List and remove locally installed models:
-
-``` console
-modalix:~$ llima list
-modalix:~$ llima rm Qwen3-VL-8B-Instruct-a16w4
-```
-
-Run a model directly in CLI or web mode:
-
-``` console
-modalix:~$ llima run Qwen3-VL-8B-Instruct-a16w4
-modalix:~$ llima run Qwen3-VL-8B-Instruct-a16w4 --mode web
-```
-
-More details on the full set of `llima run` options can be found in [Runtime & Orchestration](runtime.md).
-
-### GenAI Demo
-
-For the full GenAI demo experience — including the web frontend and speech-to-text/text-to-speech support — use the `run.sh` script instead:
-
-``` console
-modalix:/media/nvme/llima$ ./run.sh
-```
-
-This prompts you to select a precompiled model and launches the complete demo application.
+For concrete GenAI demos, check our [Neat Apps portal](https://apps.sima-neat.com/portal/index.html).
 
 ## Supported Models
 
-The following table shows the supported model architectures and their capabilities:
+The following table shows the supported model architectures and their
+capabilities:
 
 | Model Architecture | Type | Supported Sizes |
 |----|----|----|
@@ -87,7 +56,7 @@ The following table shows the supported model architectures and their capabiliti
 | Model Architecture | Only models based on the architectures listed above are supported. |
 | Model Parameters | Only models with parameter count less than 10B are supported. |
 | HF Models | Models must be downloaded from Hugging Face and contain: `config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json` and weights in safetensors format |
-| GGUF Models | GGUF format is supported for LLMs only. VLMs must be compiled from the Hugging Face safetensors format. Note that performance may decrease compared to HuggingFace safetensor compilation. |
+| GGUF Models | GGUF format is supported for LLMs only. VLMs must be compiled from the Hugging Face safetensors format. Note that performance may decrease compared to Hugging Face safetensor compilation. |
 | Compressed Tensor Models | Pre-quantized safetensor models (GPTQ/AWQ) created with llm-compressor are supported for LLMs only. The model must use symmetric quantization. These models can achieve better accuracy than standard INT4 quantization while maintaining high performance. |
 | Gemma3 VLM | Supported with modified SigLip 448 vision encoder |
 | LLAMA 3.2 Vision | Vision models are not supported |

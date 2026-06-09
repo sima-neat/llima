@@ -1,8 +1,10 @@
-# System Requirements & Setup
+# System Requirements
 
-## System Requirements
-
-For GenAI model compilation and deployment, you only need the **ModelSDK container** from PaletteSDK, not the full PaletteSDK installation. The ModelSDK container needs to be installed on a machine that matches the following requirements.
+For GenAI model compilation and deployment, use the **ModelSDK extension**
+provided with Palette SDK. You do not need the full Palette SDK development
+workflow unless you are also building host or Neat Framework applications.
+The ModelSDK extension needs to be installed on a machine that matches the
+following requirements.
 
 | Parameter | Description |
 |----|----|
@@ -15,7 +17,7 @@ For GenAI model compilation and deployment, you only need the **ModelSDK contain
 
 ## Prerequisites
 
-- Ensure that the latest [`sima-cli`](https://pypi.org/project/sima-cli/#history) is installed in the ModelSDK container.
+- Ensure that the latest [`sima-cli`](https://pypi.org/project/sima-cli/#history) is installed in the ModelSDK extension environment.
 - Have access to the required SiMa.ai release assets for your SDK environment.
 - Have a valid Hugging Face account to download open-source models.
 - Some models, such as `google/paligemma`, require accepting a license agreement on Hugging Face. Make sure to review and accept the license before attempting to download these models.
