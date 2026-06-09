@@ -1,8 +1,10 @@
-# GenAI Model Compilation
+# Model Compilation
 
 ## Overview
 
-The **ModelSDK container** provides a command-line tool `llima-compile` to compile models from HuggingFace safetensors, GGUF files, or pre-quantized compressed tensor models (GPTQ/AWQ):
+The **ModelSDK container** provides the LLiMa command-line tool
+`llima-compile` to compile models from Hugging Face safetensors, GGUF files, or
+pre-quantized compressed tensor models (GPTQ/AWQ):
 
 ``` console
 llima-compile [options] <model_path>
@@ -20,13 +22,13 @@ When you run this command, the tool handles the entire compilation pipeline incl
 **For GGUF Models:**
 
 1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **MODEL_SDK_DIRECT** - Convert GGUF directly to Model SDK format (quantization already applied)
+2.  **MODEL_SDK_DIRECT** - Convert GGUF directly to ModelSDK format (quantization already applied)
 3.  **COMPILE** - Compile to Modalix machine code
 
 **For Pre-quantized Compressed Tensor Models (GPTQ/AWQ):**
 
 1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **SOURCE_TO_QUANT** - Convert compressed tensor model directly to Model SDK format
+2.  **SOURCE_TO_QUANT** - Convert compressed tensor model directly to ModelSDK format
 3.  **COMPILE** - Compile to Modalix machine code
 
 > [!NOTE]

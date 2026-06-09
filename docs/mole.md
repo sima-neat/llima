@@ -11,7 +11,7 @@ It extends [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm
 
 ## Installation
 
-MoLE requires LLiMa to be installed on the Modalix device first. See [Introduction to LLiMa](introduction.md) for installation instructions.
+MoLE requires the LLiMa runtime on the Modalix device. See [Neat Framework installation](/getting-started/installation/neat-framework/) for the runtime installation flow.
 
 Install MoLE on your Modalix device using the `sima-cli`:
 
@@ -58,7 +58,7 @@ Evaluates model quality against standard tasks:
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 
 > [!IMPORTANT]
-> Accuracy benchmarking with `-b modalix` requires the model to be compiled with the `--return_logits` flag. See [GenAI Model Compilation](compilation_genai.md). If the model was compiled without this flag, benchmarking will fail at runtime.
+> Accuracy benchmarking with `-b modalix` requires the model to be compiled with the `--return_logits` flag. See [Model Compilation](compilation_genai.md). If the model was compiled without this flag, benchmarking will fail at runtime.
 
 To use the HuggingFace backend as a reference baseline:
 
