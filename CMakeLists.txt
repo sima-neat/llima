@@ -67,7 +67,19 @@ endif()
 # Find Python binding dependencies only when building the extension. The C++ runtime package can
 # be configured and installed without Python/nanobind.
 if(SIMA_LMM_BUILD_PYTHON)
-    find_package(Python 3.11 COMPONENTS Interpreter Development REQUIRED)
+    if(CMAKE_CROSSCOMPILING AND DEFINED Python_INCLUDE_DIR AND DEFINED Python_LIBRARY)
+        find_package(Python 3.11 COMPONENTS Interpreter REQUIRED)
+        set(Python_INCLUDE_DIRS "${Python_INCLUDE_DIR}")
+        if(NOT TARGET Python::Module)
+            add_library(Python::Module INTERFACE IMPORTED)
+            set_target_properties(Python::Module PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${Python_INCLUDE_DIR}"
+                INTERFACE_LINK_LIBRARIES "${Python_LIBRARY}"
+            )
+        endif()
+    else()
+        find_package(Python 3.11 COMPONENTS Interpreter Development REQUIRED)
+    endif()
 
     # Use the pypi version of nanobind instead of the official repo since it is a "pre-built"
     # library. nanobind is installed when python/pip runs the pyproject.toml.
