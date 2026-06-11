@@ -3,8 +3,8 @@
 ## Overview
 
 After compilation, models need to be deployed to the Modalix device for
-execution. The ModelSDK extension provides the `llima-deploy` utility to
-streamline this process:
+execution. Model Compiler provides the `llima-deploy` utility to streamline this
+process:
 
 ``` console
 sima-user@docker-image-id:/home/docker$ llima-deploy <source_directory> <destination_directory>
@@ -55,8 +55,9 @@ sima-user@docker-image-id:/home/docker$ llima-deploy Llama-3.2-3B-Instruct_out l
 sima-user@docker-image-id:/home/docker$ scp -r llama3_2 sima@192.168.1.20:/media/nvme/llima/
 ```
 
-> [!NOTE]
-> `192.168.1.20` is an example Modalix IP address. Use the IP address of your device.
+:::note
+`192.168.1.20` is an example Modalix IP address. Use the IP address of your device.
+:::
 
 Once deployed, SSH into the Modalix device and run the model:
 
