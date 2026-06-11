@@ -1,6 +1,6 @@
 # GenAI with LLiMa
 
-LLiMa is the GenAI toolkit in the ModelSDK container for compiling, testing,
+LLiMa is the GenAI toolkit in Model Compiler for compiling, testing,
 benchmarking, deploying, and running LLM, VLM, and ASR models on Modalix.
 
 LLiMa supports three input formats:
@@ -17,7 +17,7 @@ For concrete GenAI demos, check our [Neat Apps portal](https://apps.sima-neat.co
 
 ## LLiMa Availability
 
-LLiMa compilation tools are installed by default in the ModelSDK container.
+LLiMa compilation tools are installed by default in Model Compiler.
 The LLiMa runtime is installed natively on Modalix as part of the Neat runtime.
 See [Neat Framework installation](/getting-started/installation/neat-framework/)
 for the runtime installation flow.

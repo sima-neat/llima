@@ -7,12 +7,12 @@
 ![Language](https://img.shields.io/badge/C%2B%2B-20-informational)
 ![Python](https://img.shields.io/badge/Python-3.11-informational)
 
-LLiMa is SiMa.ai's runtime and ModelSDK-facing toolkit for generative AI models on
-Modalix DevKits, including LLMs, VLMs, and ASR models.
+LLiMa is SiMa.ai's runtime and Model Compiler toolkit for generative AI models
+on Modalix DevKits, including LLMs, VLMs, and ASR models.
 
 It provides a C++ runtime, Python bindings, a command-line experience, and
-ModelSDK-side compile/deploy tooling for running compiled GenAI model directories on
-SiMa hardware.
+Model Compiler tooling for running compiled GenAI model directories on SiMa
+hardware.
 
 ## Packages
 
@@ -23,7 +23,7 @@ The Modalix DevKit runtime is delivered as three Debian packages:
 - `sima-lmm-cli`: lean Python runtime package, nanobind extension, and `llima`
   command-line entry point.
 
-The ModelSDK compile/deploy tooling is delivered as a Python wheel:
+The Model Compiler tooling is delivered as a Python wheel:
 
 - `sima-lmm[sdk]`: compiler SDK dependencies, including internal SiMa packages.
 - `sima-lmm[sdk_ext]`: external MoLE, benchmark, and evaluation dependencies.
@@ -91,9 +91,9 @@ source "$HOME/.cargo/env"
 
 ## Run
 
-LLiMa expects a compiled runtime model directory produced by the ModelSDK
-container. The directory must contain runtime configuration and compiled
-ELF files required by the DevKit runtime.
+LLiMa expects a compiled runtime model directory produced by Model Compiler. The
+directory must contain runtime configuration and compiled ELF files required by
+the DevKit runtime.
 
 The LLiMa model zoo is hosted on Hugging Face:
 

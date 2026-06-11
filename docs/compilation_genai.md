@@ -2,9 +2,9 @@
 
 ## Overview
 
-The **ModelSDK container** provides the LLiMa command-line tool
-`llima-compile` to compile models from Hugging Face safetensors, GGUF files, or
-pre-quantized compressed tensor models (GPTQ/AWQ):
+**Model Compiler** provides the LLiMa command-line tool `llima-compile` to
+compile models from Hugging Face safetensors, GGUF files, or pre-quantized
+compressed tensor models (GPTQ/AWQ):
 
 ``` console
 llima-compile [options] <model_path>
@@ -31,8 +31,9 @@ When you run this command, the tool handles the entire compilation pipeline incl
 2.  **SOURCE_TO_QUANT** - Convert compressed tensor model directly to ModelSDK format
 3.  **COMPILE** - Compile to Modalix machine code
 
-> [!NOTE]
-> Compressed tensor models are safetensor models pre-quantized with [llm-compressor](https://github.com/vllm-project/llm-compressor) (e.g. GPTQ or AWQ). Supported for LLMs only. A GPU is recommended for the quantization step.
+:::note
+Compressed tensor models are safetensor models pre-quantized with [llm-compressor](https://github.com/vllm-project/llm-compressor) (e.g. GPTQ or AWQ). Supported for LLMs only. A GPU is recommended for the quantization step.
+:::
 
 You can run individual stages using `--onnx`, `--quantize`, `--model_sdk`, `--compile`, or `--devkit` flags if needed.
 
@@ -121,8 +122,9 @@ The function returns a dictionary with:
   - `"LORA_BRANCH"`: Compiles parallel LoRA branches with zero weights alongside the base model. Adapter weights are loaded from `.npy` files at runtime, enabling dynamic switching between adapters without restarting the model. Use this mode when you need to swap adapters on the fly.
   - `"LORA_MERGED"`: LoRA weights are merged into the base model weights at runtime. The adapter becomes permanently active for the session with no ability to switch or remove it. Use this mode when you always want the adapter applied and do not need dynamic switching.
 
-> [!NOTE]
-> **Best Practice:** Use INT8 (`A_BF16_W_INT8`) for group layers to maintain quality during prefill, INT4 (`A_BF16_W_INT4`) for single-token layers for fast generation, and BF16 for vision encoders to preserve image understanding quality. For most models, this configuration provides the optimal balance between model accuracy, throughput, and memory usage.
+:::note
+**Best Practice:** Use INT8 (`A_BF16_W_INT8`) for group layers to maintain quality during prefill, INT4 (`A_BF16_W_INT4`) for single-token layers for fast generation, and BF16 for vision encoders to preserve image understanding quality. For most models, this configuration provides the optimal balance between model accuracy, throughput, and memory usage.
+:::
 
 ## Examples
 
@@ -208,8 +210,9 @@ def get_layer_configuration(model_properties, layer):
 
 LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter to be dynamically applied or removed at runtime without recompiling the base model. The base model is compiled with parallel LoRA branches (initialized to zero), and the adapter weights are compiled separately into `.npy` files that are loaded on demand.
 
-> [!NOTE]
-> `--enable_filter_sharing` is required when compiling with LoRA. LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
+:::note
+`--enable_filter_sharing` is required when compiling with LoRA. LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
+:::
 
 1.  **Download the base model and LoRA adapter**:
 

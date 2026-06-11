@@ -57,8 +57,9 @@ Evaluates model quality against standard tasks:
 | `--board_ssh_user` | SSH username for the Modalix board. Optional, default: `sima`. \# |
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 
-> [!IMPORTANT]
-> Accuracy benchmarking with `-b modalix` requires the model to be compiled with the `--return_logits` flag. See [Model Compilation](compilation_genai.md). If the model was compiled without this flag, benchmarking will fail at runtime.
+:::important
+Accuracy benchmarking with `-b modalix` requires the model to be compiled with the `--return_logits` flag. See [Model Compilation](compilation_genai.md). If the model was compiled without this flag, benchmarking will fail at runtime.
+:::
 
 To use the HuggingFace backend as a reference baseline:
 
