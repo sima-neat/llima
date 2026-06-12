@@ -255,6 +255,19 @@ current_branch_name() {
   printf '\n'
 }
 
+current_exact_tag() {
+  if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
+    printf '%s\n' "${GITHUB_REF_NAME}"
+    return 0
+  fi
+  if command -v git >/dev/null 2>&1 &&
+     git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "${ROOT_DIR}" describe --tags --exact-match HEAD 2>/dev/null || true
+    return 0
+  fi
+  printf '\n'
+}
+
 resolve_neat_internals_ref() {
   if [[ ! -f "${NEAT_INTERNALS_MANIFEST}" ]]; then
     echo "ERROR: Missing manifest: ${NEAT_INTERNALS_MANIFEST}" >&2
@@ -285,7 +298,13 @@ resolve_neat_internals_ref() {
     return 0
   fi
 
-  local branch branch_key
+  local branch branch_key tag
+  tag="$(current_exact_tag)"
+  if [[ -n "${tag}" ]]; then
+    printf '%s\n' "${tag}:latest"
+    return 0
+  fi
+
   branch="$(current_branch_name)"
   branch_key="$(sanitize_branch_key "${branch}")"
   if [[ -n "${branch_key}" && "${branch_key}" != "head" ]]; then
@@ -323,8 +342,13 @@ fetch_neat_internals_vulcan_artifacts() {
     base_args+=(--base-url "${NEAT_VULCAN_BASE_URL}")
   fi
 
-  local resolve_output resolved_ref
+  local exact_tag resolve_output resolved_ref
   if ! resolve_output="$(SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli "${base_args[@]}" "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" --json)"; then
+    exact_tag="$(current_exact_tag)"
+    if [[ -n "${exact_tag}" && "${internals_ref}" == "${exact_tag}:latest" ]]; then
+      echo "ERROR: Failed to resolve exact tag-snap internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
+      exit 1
+    fi
     if [[ "${NEAT_INTERNALS_SNAP_POLICY}" != "ON" || "${internals_ref}" == "develop:latest" ]]; then
       echo "ERROR: Failed to resolve internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
       exit 1
