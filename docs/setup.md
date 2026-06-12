@@ -19,7 +19,7 @@ With 128GB machine, compilation can take several hours to complete depends on th
 
 ## Prerequisites
 
-- Ensure that the latest [`sima-cli`](https://pypi.org/project/sima-cli/#history) is installed in Model Compiler.
+- Ensure that the latest [`sima-cli`](/tools/sima-cli/) is installed in Model Compiler.
 - Have access to the required SiMa.ai release assets for your SDK environment.
 - Have a valid Hugging Face account to download open-source models.
 - Some models, such as `google/paligemma`, require accepting a license agreement on Hugging Face. Make sure to review and accept the license before attempting to download these models.
