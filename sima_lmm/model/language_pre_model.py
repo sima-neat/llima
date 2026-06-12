@@ -1,14 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
-
 import numpy as np
 from dataclasses import dataclass
 
@@ -26,6 +15,7 @@ from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
     SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype
 )
+from sima_lmm.config.vlm_config import VlmArchType
 
 
 bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
@@ -53,6 +43,29 @@ class LanguagePreModel(LanguagePartBaseModel):
     def enable_filter_sharing(self) -> bool:
         return self.cfg.pipeline_cfg.enable_filter_sharing
 
+    @property
+    def layer_type(self) -> str:
+        return self.cfg.lm_cfg.layer_types[self.layer_idx]
+
+    @property
+    def _is_proportional_rope_layer(self) -> bool:
+        return (
+            self.layer_type == "full_attention"
+            and self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type == "proportional"
+        )
+
+    @property
+    def _head_dim(self) -> int:
+        return self.cfg.lm_cfg.attn_cfg.get_head_dim(self.layer_type)
+
+    @property
+    def _q_size(self) -> int:
+        return self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type)
+
+    @property
+    def _kv_size(self) -> int:
+        return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
+
     def gen_onnx_files(self):
         base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
         self.create_onnx_builder()
@@ -60,10 +73,10 @@ class LanguagePreModel(LanguagePartBaseModel):
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
         )
         self._onnx_builder.create_input_node(
-            "freq_real", (1, self.cfg.lm_cfg.rope_cfg.rope_dimension_count // 2, 1, self.num_tokens)
+            "freq_real", (1, self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2, 1, self.num_tokens)
         )
         self._onnx_builder.create_input_node(
-            "freq_imag", (1, self.cfg.lm_cfg.rope_cfg.rope_dimension_count // 2, 1, self.num_tokens)
+            "freq_imag", (1, self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2, 1, self.num_tokens)
         )
         output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
 
@@ -72,30 +85,31 @@ class LanguagePreModel(LanguagePartBaseModel):
             self._onnx_builder.get_node_output_name(output_nodes[0]),
             (
                 1,
-                self.cfg.lm_cfg.attn_cfg.head_dim,
+                self._head_dim,
                 self.cfg.lm_cfg.attn_cfg.num_attention_heads,
                 self.num_tokens
             )
         )
 
-        # RoPE embedded q_proj and v_proj (1, Head_Dim, n_kv, n_tokens).
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            # saved in cache as (1, Head_Dim, n_kv, n_tokens).
-            kv_cache_shape = (
-                    1,
-                    self.cfg.lm_cfg.attn_cfg.head_dim,
-                    self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                    self.num_tokens
-                 )
-        else:
-            # saved in cache as (1, Head_Dim * n_kv, 1, n_tokens).
-            kv_cache_shape = (1, self.cfg.lm_cfg.attn_cfg.kv_size, 1, self.num_tokens)
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[1]), kv_cache_shape
-        )
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[2]), kv_cache_shape
-        )
+        if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
+            # RoPE embedded k_proj and v_proj (1, Head_Dim, n_kv, n_tokens).
+            if self.cfg.pipeline_cfg.use_strided_kv_cache:
+                # saved in cache as (1, Head_Dim, n_kv, n_tokens).
+                kv_cache_shape = (
+                        1,
+                        self._head_dim,
+                        self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                        self.num_tokens
+                     )
+            else:
+                # saved in cache as (1, Head_Dim * n_kv, 1, n_tokens).
+                kv_cache_shape = (1, self._kv_size, 1, self.num_tokens)
+            self._onnx_builder.create_output_node(
+                self._onnx_builder.get_node_output_name(output_nodes[1]), kv_cache_shape
+            )
+            self._onnx_builder.create_output_node(
+                self._onnx_builder.get_node_output_name(output_nodes[2]), kv_cache_shape
+            )
 
         self._onnx_builder.create_and_save_model()
 
@@ -111,17 +125,31 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
         rms_norm = self._build_rms_norm(norm_name, input_nodes[0])
         q_out = self._build_onnx_attn_query(f"{base_name}.self_attn", [rms_norm, *input_nodes[1:]])
+        if self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
+            return [q_out]
         k_out = self._build_onnx_attn_key(f"{base_name}.self_attn", [rms_norm, *input_nodes[1:]])
         v_out = self._build_onnx_attn_value(f"{base_name}.self_attn", rms_norm)
         return [q_out, k_out, v_out]
 
     def _build_onnx_rotary_emb(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
+        layer_head_dim = self._head_dim
+        layer_rope_dimension_count = self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type)
+        imag_start = (
+            layer_head_dim // 2
+            if self._is_proportional_rope_layer
+            else layer_rope_dimension_count // 2
+        )
+        imag_end = (
+            layer_head_dim // 2 + layer_rope_dimension_count // 2
+            if self._is_proportional_rope_layer
+            else layer_rope_dimension_count
+        )
         real_in = self._onnx_builder.build_op(
             f"{base_name}.real_in",
             [
                 input_nodes[0],
                 np.array([0], dtype=np.int64),
-                np.array([self.cfg.lm_cfg.rope_cfg.rope_dimension_count // 2], dtype=np.int64),
+                np.array([layer_rope_dimension_count // 2], dtype=np.int64),
                 np.array([1], dtype=np.int64)
             ],
             "Slice"
@@ -130,8 +158,8 @@ class LanguagePreModel(LanguagePartBaseModel):
             f"{base_name}.imag_in",
             [
                 input_nodes[0],
-                np.array([self.cfg.lm_cfg.rope_cfg.rope_dimension_count // 2], dtype=np.int64),
-                np.array([self.cfg.lm_cfg.rope_cfg.rope_dimension_count], dtype=np.int64),
+                np.array([imag_start], dtype=np.int64),
+                np.array([imag_end], dtype=np.int64),
                 np.array([1], dtype=np.int64)
             ],
             "Slice"
@@ -155,15 +183,43 @@ class LanguagePreModel(LanguagePartBaseModel):
         rotary_out = self._onnx_builder.build_op(
             f"{base_name}.concat", [real_out, imag_out], "Concat", axis=1
         )
-        if self.cfg.lm_cfg.rope_cfg.rope_dimension_count == self.cfg.lm_cfg.attn_cfg.head_dim:
+        if self._is_proportional_rope_layer:
+            mid1 = self._onnx_builder.build_op(
+                f"{base_name}.mid1",
+                [
+                    input_nodes[0],
+                    np.array([layer_rope_dimension_count // 2], dtype=np.int64),
+                    np.array([layer_head_dim // 2], dtype=np.int64),
+                    np.array([1], dtype=np.int64)
+                ],
+                "Slice"
+            )
+            mid2 = self._onnx_builder.build_op(
+                f"{base_name}.mid2",
+                [
+                    input_nodes[0],
+                    np.array([layer_head_dim // 2 + layer_rope_dimension_count // 2], dtype=np.int64),
+                    np.array([layer_head_dim], dtype=np.int64),
+                    np.array([1], dtype=np.int64)
+                ],
+                "Slice"
+            )
+            return self._onnx_builder.build_op(
+                f"{base_name}.concat_proportional",
+                [real_out, mid1, imag_out, mid2],
+                "Concat",
+                axis=1,
+            )
+
+        if layer_rope_dimension_count == layer_head_dim:
             return rotary_out
 
         tail = self._onnx_builder.build_op(
             f"{base_name}.tail",
             [
                 input_nodes[0],
-                np.array([self.cfg.lm_cfg.rope_cfg.rope_dimension_count], dtype=np.int64),
-                np.array([self.cfg.lm_cfg.attn_cfg.head_dim], dtype=np.int64),
+                np.array([layer_rope_dimension_count], dtype=np.int64),
+                np.array([layer_head_dim], dtype=np.int64),
                 np.array([1], dtype=np.int64)
             ],
             "Slice"
@@ -178,8 +234,8 @@ class LanguagePreModel(LanguagePartBaseModel):
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "q_proj")
         q_proj = self._onnx_builder.build_conv_from_dense_with_lora(
             f"{base_name}.q_proj", input_nodes[0], lora_rank,
-            q_size=self.cfg.lm_cfg.attn_cfg.q_size,
-            kv_size=self.cfg.lm_cfg.attn_cfg.kv_size
+            q_size=self._q_size,
+            kv_size=self._kv_size
         )
         reshape = self._onnx_builder.build_split_and_concat(
             f"{base_name}.q_proj.reshape", q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads,
@@ -198,12 +254,13 @@ class LanguagePreModel(LanguagePartBaseModel):
         rotary_emb = self._build_onnx_rotary_emb(
             f"{base_name}.q_proj.rotary", [reshape, input_nodes[1], input_nodes[2]]
         )
-        scaled_rotary_emb = self._onnx_builder.build_op(
-            f"{base_name}.q_proj.scaled_rotary_emb",
-            [rotary_emb, self.cfg.lm_cfg.attn_cfg.head_dim**-0.5],
-            "Mul"
-        )
-        return scaled_rotary_emb
+        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
+            rotary_emb = self._onnx_builder.build_op(
+                f"{base_name}.q_proj.scaled_rotary_emb",
+                [rotary_emb, self._head_dim**-0.5],
+                "Mul"
+            )
+        return rotary_emb
 
     def _build_onnx_attn_key(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
         lora_rank = None
@@ -211,8 +268,8 @@ class LanguagePreModel(LanguagePartBaseModel):
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "k_proj")
         k_proj = self._onnx_builder.build_conv_from_dense_with_lora(
             f"{base_name}.k_proj", input_nodes[0], lora_rank,
-            q_size=self.cfg.lm_cfg.attn_cfg.q_size,
-            kv_size=self.cfg.lm_cfg.attn_cfg.kv_size
+            q_size=self._q_size,
+            kv_size=self._kv_size
         )
         reshape1 = self._onnx_builder.build_split_and_concat(
             f"{base_name}.k_proj.reshape1", k_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
@@ -247,18 +304,32 @@ class LanguagePreModel(LanguagePartBaseModel):
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "v_proj")
         v_proj = self._onnx_builder.build_conv_from_dense_with_lora(
             f"{base_name}.v_proj", input_node, lora_rank,
-            q_size=self.cfg.lm_cfg.attn_cfg.q_size,
-            kv_size=self.cfg.lm_cfg.attn_cfg.kv_size
+            q_size=self._q_size,
+            kv_size=self._kv_size
         )
 
-        if not self.cfg.pipeline_cfg.use_strided_kv_cache:
+        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
+            if self.cfg.pipeline_cfg.use_strided_kv_cache:
+                return self._onnx_builder.build_split_and_concat(
+                    f"{base_name}.v_proj", v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                    split_axis=1, concat_axis=2,
+                )
             return v_proj
 
         split = self._onnx_builder.build_split_and_concat(
             f"{base_name}.v_proj", v_proj,  self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             split_axis=1, concat_axis=2
         )
-        return split
+        split = self._onnx_builder.build_rms_norm(
+            f"{base_name}.v_norm", split, float(self.cfg.lm_cfg.rms_norm_eps),
+            weightless=True, num_channels=self._head_dim,
+        )
+        if self.cfg.pipeline_cfg.use_strided_kv_cache:
+            return split
+        return self._onnx_builder.build_split_and_concat(
+            f"{base_name}.v_proj.flatten", split, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            split_axis=2, concat_axis=1
+        )
 
     def gen_model_sdk_files_directly(
         self,
@@ -276,7 +347,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             1,
             1,
             self.num_tokens,
-            self.cfg.lm_cfg.rope_cfg.rope_dimension_count // 2
+            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2
         )
         if self.cfg.pipeline_cfg.use_strided_kv_cache:
             raise RuntimeError("Strided KV cache is not implemented in SiMa IR code generation")
@@ -356,9 +427,15 @@ class LanguagePreModel(LanguagePartBaseModel):
         """
         Create nodes that compute rotary embedding.
         """
-        real_in = builder.create_slice_node(data, [0], [self.cfg.lm_cfg.rope_cfg.rope_dimension_count // 2], [1], [3])
+        layer_head_dim = self._head_dim
+        layer_rope_dimension_count = self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type)
+        half_rope_dim = layer_rope_dimension_count // 2
+        imag_start = layer_head_dim // 2 if self._is_proportional_rope_layer else half_rope_dim
+        imag_end = imag_start + half_rope_dim
+
+        real_in = builder.create_slice_node(data, [0], [half_rope_dim], [1], [3])
         imag_in = builder.create_slice_node(
-            data, [self.cfg.lm_cfg.rope_cfg.rope_dimension_count // 2], [self.cfg.lm_cfg.rope_cfg.rope_dimension_count], [1], [3]
+            data, [imag_start], [imag_end], [1], [3]
         )
         real_out = builder.create_subtract_node(
             builder.create_mul_node(real_in, freq_real),
@@ -368,14 +445,19 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder.create_mul_node(real_in, freq_imag),
             builder.create_mul_node(imag_in, freq_real)
         )
+        if self._is_proportional_rope_layer:
+            mid1 = builder.create_slice_node(data, [half_rope_dim], [layer_head_dim // 2], [1], [3])
+            mid2 = builder.create_slice_node(data, [imag_end], [layer_head_dim], [1], [3])
+            return builder.create_concat_node([real_out, mid1, imag_out, mid2], 3)
+
         rotary_out = builder.create_concat_node([real_out, imag_out], 3)
-        if self.cfg.lm_cfg.rope_cfg.rope_dimension_count == self.cfg.lm_cfg.attn_cfg.head_dim:
+        if layer_rope_dimension_count == layer_head_dim:
             return rotary_out
 
         tail = builder.create_slice_node(
             data,
-            [self.cfg.lm_cfg.rope_cfg.rope_dimension_count],
-            [self.cfg.lm_cfg.attn_cfg.head_dim],
+            [layer_rope_dimension_count],
+            [layer_head_dim],
             [1],
             [3],
         )
@@ -392,8 +474,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         q_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.q_proj", rms_norm,
             lora_rank, merged_lora=merged_lora,
-            q_size=self.cfg.lm_cfg.attn_cfg.q_size,
-            kv_size=self.cfg.lm_cfg.attn_cfg.kv_size
+            q_size=self._q_size,
+            kv_size=self._kv_size
          )
 
         if self.cfg.lm_cfg.attn_cfg.num_attention_heads > 1:
@@ -417,12 +499,15 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder, reshape1, freq_real, freq_imag
         )
 
-        head_dim = self.cfg.lm_cfg.attn_cfg.head_dim
-        scaled_rotary_emb = builder.create_mul_node(
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            return rotary_emb
+
+        return builder.create_mul_node(
             rotary_emb,
-            builder.create_constant_node(np.array([head_dim**-0.5], dtype=activation_dtype(quantizable)))
+            builder.create_constant_node(
+                np.array([self._head_dim**-0.5], dtype=activation_dtype(quantizable))
+            )
         )
-        return scaled_rotary_emb
 
     def _build_sima_attn_key(
             self, builder: SimaBuilder, base_name: str,
@@ -435,8 +520,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         k_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.k_proj", rms_norm,
             lora_rank, merged_lora=merged_lora,
-            q_size=self.cfg.lm_cfg.attn_cfg.q_size,
-            kv_size=self.cfg.lm_cfg.attn_cfg.kv_size
+            q_size=self._q_size,
+            kv_size=self._kv_size
         )
 
         reshape1 = builder.create_slice_concat_node(
@@ -473,10 +558,33 @@ class LanguagePreModel(LanguagePartBaseModel):
         v_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.v_proj", input_node,
             lora_rank, merged_lora=merged_lora,
-            q_size=self.cfg.lm_cfg.attn_cfg.q_size,
-            kv_size=self.cfg.lm_cfg.attn_cfg.kv_size
+            q_size=self._q_size,
+            kv_size=self._kv_size
         )
-        return v_proj
+        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
+            return v_proj
+
+        split = builder.create_slice_concat_node(
+            v_proj,
+            axis=1,
+            split_axis=3,
+            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            split_repeat=1,
+        )
+        split = self._build_sima_rms_norm(
+            builder,
+            f"{base_name}.v_norm",
+            split,
+            weightless=True,
+            num_channels=self._head_dim,
+        )
+        return builder.create_slice_concat_node(
+            split,
+            axis=3,
+            split_axis=1,
+            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            split_repeat=1,
+        )
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """

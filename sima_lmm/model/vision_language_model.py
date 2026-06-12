@@ -1,21 +1,10 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
-
 import logging
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import ModelFormat, VlmConfig,VisionArchType, model_file_type
+from sima_lmm.config.vlm_config import LlmArchType, ModelFormat, VlmConfig, VisionArchType, model_file_type
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import (
@@ -291,5 +280,25 @@ class VisionLanguageModel(BaseModel):
         return self.language_model.run_model(eval_mode, [input_embeds])
 
     def get_language_embeddings_tensor(self) -> np.ndarray:
-        embeddings_tensor, _ = self.language_model.get_embeddings_tensor()
+        base_name = self.hf_model.language_model_param_base_name
+        embeddings_tensor, _ = self.language_model.get_embeddings_tensor(
+            weight_name=f"{base_name}.embed_tokens.weight",
+            embed_scale=(
+                self.cfg.lm_cfg.hidden_size ** 0.5
+                if self.cfg.lm_cfg.arch == LlmArchType.GEMMA
+                else 1.0
+            )
+        )
         return embeddings_tensor
+
+    def get_language_per_layer_embeddings_tensor(self) -> np.ndarray:
+        base_name = self.hf_model.language_model_param_base_name
+        per_layer_embeddings, _ = self.language_model.get_embeddings_tensor(
+            weight_name=f"{base_name}.embed_tokens_per_layer.weight",
+            embed_scale=(
+                self.cfg.lm_cfg.hidden_size_per_layer_input ** 0.5
+                if self.cfg.lm_cfg.arch == LlmArchType.GEMMA
+                else 1.0
+            ),
+        )
+        return per_layer_embeddings

@@ -1,38 +1,12 @@
-//**************************************************************************
-//||                        SiMa.ai CONFIDENTIAL                          ||
-//||   Unpublished Copyright (c) 2022-2025 SiMa.ai, All Rights Reserved.  ||
-//**************************************************************************
-// NOTICE:  All information contained herein is, and remains the property of
-// SiMa.ai. The intellectual and technical concepts contained herein are
-// proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-// patents in process, and are protected by trade secret or copyright law.
-//
-// Dissemination of this information or reproduction of this material is
-// strictly forbidden unless prior written permission is obtained from
-// SiMa.ai.  Access to the source code contained herein is hereby forbidden
-// to anyone except current SiMa.ai employees, managers or contractors who
-// have executed Confidentiality and Non-disclosure agreements explicitly
-// covering such access.
-//
-// The copyright notice above does not evidence any actual or intended
-// publication or disclosure  of  this source code, which includes information
-// that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-//
-// ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-// DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-// CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-// LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-// CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-// REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-// SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-//
-//**************************************************************************
-
 
 #include <algorithm>
+#include <any>
 #include <cstdint>
+#include <future>
+#include <memory>
 #include <stdexcept>
 #include <sstream>
+#include <utility>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -44,6 +18,65 @@
 
 namespace simaai {
 namespace llima {
+
+namespace {
+
+struct MlaQueueCompletion {
+    int32_t rc = 0;
+    std::size_t failed_index = simaaidispatcher::DispatcherBase::NoFailedQueueIndex;
+    std::string detail;
+};
+
+using MlaQueuePromise = std::shared_ptr<std::promise<MlaQueueCompletion>>;
+
+MlaQueueCompletion submit_mla_partition_queue_and_wait(
+    simaaidispatcher::DispatcherBase* dispatcher,
+    std::vector<simaaidispatcher::JobMLA>&& jobs
+) {
+    auto promise = std::make_shared<std::promise<MlaQueueCompletion>>();
+    auto future = promise->get_future();
+
+    simaaidispatcher::DispatcherBase::MlaPartitionQueueRequest request;
+    request.jobs = std::move(jobs);
+    request.userData = promise;
+    request.cb = [](
+        int32_t rc,
+        std::size_t failed_index,
+        const simaaidispatcher::DispatcherBase::ErrorSnapshot& error,
+        const simaaidispatcher::DispatcherBase::ProfileSnapshot&,
+        std::any user_data
+    ) {
+        auto completion = std::any_cast<MlaQueuePromise>(user_data);
+        MlaQueueCompletion result;
+        result.rc = rc;
+        result.failed_index = failed_index;
+        result.detail = error.detail;
+        completion->set_value(std::move(result));
+    };
+
+    const int32_t submit_rc = dispatcher->submitMlaPartitionQueue(std::move(request));
+    if (submit_rc != 0) {
+        return {submit_rc, simaaidispatcher::DispatcherBase::NoFailedQueueIndex,
+                dispatcher->lastErrorString()};
+    }
+
+    MlaQueueCompletion result = future.get();
+    if (result.rc != 0 && result.detail.empty()) {
+        result.detail = dispatcher->lastErrorString();
+    }
+    return result;
+}
+
+MlaQueueCompletion submit_mla_job_and_wait(
+    simaaidispatcher::DispatcherBase* dispatcher,
+    simaaidispatcher::JobMLA&& job
+) {
+    std::vector<simaaidispatcher::JobMLA> jobs;
+    jobs.push_back(std::move(job));
+    return submit_mla_partition_queue_and_wait(dispatcher, std::move(jobs));
+}
+
+}
 
 void connect_mla_rt(const std::vector<std::string>& args) {
     if (MLAModelWithBuffer::_dispatcher) return;
@@ -109,15 +142,16 @@ MLAModelWithBuffer::MLAModelWithBuffer(
 void MLAModelWithBuffer::load() {
     if (_unique_model_ptrs[_model_idx]) return;
     auto* dispatcher = _get_dispatcher();
-    _unique_model_ptrs[_model_idx] = dispatcher->load(_unique_model_paths[_model_idx].string());
+    const auto model_path = std::filesystem::absolute(_unique_model_paths[_model_idx]);
+    _unique_model_ptrs[_model_idx] = dispatcher->load(model_path.string());
     if (!_unique_model_ptrs[_model_idx]) {
         throw std::runtime_error(fmt::format(
             "Failed to load model through MLASHM dispatcher: {} ({})",
-            _unique_model_paths[_model_idx],
+            model_path,
             dispatcher->lastErrorString()
         ));
     }
-    spdlog::info("Loaded model: {}", _unique_model_paths[_model_idx]);
+    spdlog::info("Loaded model: {}", model_path);
 }
 
 
@@ -296,13 +330,14 @@ void MLAModelWithBuffer::run(
 
     auto job = _make_job(ifm_map_ptr, ofm_map_ptr);
     auto* dispatcher = _get_dispatcher();
-    const int rc = dispatcher->run(job);
-    if (rc != 0) {
+    auto result = submit_mla_job_and_wait(dispatcher, std::move(job));
+    if (result.rc != 0) {
         throw std::runtime_error(fmt::format(
-            "MLASHM dispatcher run failed for {}: rc={} ({})",
+            "MLASHM dispatcher run failed for {}: rc={} failed_index={} ({})",
             _unique_model_paths[_model_idx],
-            rc,
-            dispatcher->lastErrorString()
+            result.rc,
+            result.failed_index,
+            result.detail.empty() ? dispatcher->lastErrorString() : result.detail
         ));
     }
 
@@ -330,19 +365,23 @@ void MLAModelWithBuffer::run_queue() {
 
     auto* dispatcher = _get_dispatcher();
     try {
-        const int rc = dispatcher->runQueue(MLAModelWithBuffer::_queue);
-        if (rc != 0) {
+        auto result = submit_mla_partition_queue_and_wait(
+            dispatcher,
+            std::move(MLAModelWithBuffer::_queue)
+        );
+        if (result.rc != 0) {
             throw std::runtime_error(fmt::format(
-                "MLASHM dispatcher runQueue failed: rc={} ({})",
-                rc,
-                dispatcher->lastErrorString()
+                "MLASHM dispatcher runQueue failed: rc={} failed_index={} ({})",
+                result.rc,
+                result.failed_index,
+                result.detail.empty() ? dispatcher->lastErrorString() : result.detail
             ));
         }
     } catch (...) {
-        MLAModelWithBuffer::_queue.clear();
+        MLAModelWithBuffer::_queue = {};
         throw;
     }
-    MLAModelWithBuffer::_queue.clear();
+    MLAModelWithBuffer::_queue = {};
 }
 
 
@@ -381,7 +420,7 @@ void MLAModelWithBuffer::load_all_models(
         std::vector<std::string> paths;
         paths.reserve(file_names.size());
         for (const auto& file_name: file_names) {
-            paths.push_back(file_name.string());
+            paths.push_back(std::filesystem::absolute(file_name).string());
         }
         auto handles = dispatcher->loadMany(paths);
         if (handles.size() != file_names.size()) {
@@ -407,15 +446,16 @@ void MLAModelWithBuffer::load_all_models(
     }
 
     for (std::size_t i = 0; i < file_names.size(); ++i) {
-        _unique_model_ptrs[indices[i]] = dispatcher->load(file_names[i].string());
+        const auto model_path = std::filesystem::absolute(file_names[i]);
+        _unique_model_ptrs[indices[i]] = dispatcher->load(model_path.string());
         if (!_unique_model_ptrs[indices[i]]) {
             throw std::runtime_error(fmt::format(
                 "Failed to load model through MLASHM dispatcher: {} ({})",
-                file_names[i],
+                model_path,
                 dispatcher->lastErrorString()
             ));
         }
-        spdlog::info("Loaded model: {}", file_names[i]);
+        spdlog::info("Loaded model: {}", model_path);
     }
 }
 

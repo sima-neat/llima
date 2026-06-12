@@ -3,25 +3,36 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED SKBUILD_PROJECT_NAME)
     set(SKBUILD_PROJECT_NAME sima_lmm)
 endif()
+
+set(SIMA_LMM_PLATFORM_VERSION "")
+set(SIMA_LMM_PACKAGE_BASE_VERSION "")
+execute_process(
+    COMMAND python3 -c "import json; data=json.load(open('deps/manifest.json', encoding='utf-8')); print(data['platform-version']); print(data['package-version'])"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    RESULT_VARIABLE PLATFORM_VERSION_RESULT
+    OUTPUT_VARIABLE SIMA_LMM_MANIFEST_VERSIONS
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT PLATFORM_VERSION_RESULT EQUAL 0 OR SIMA_LMM_MANIFEST_VERSIONS STREQUAL "")
+    message(FATAL_ERROR "Failed to read package-version and platform-version from deps/manifest.json")
+endif()
+string(REPLACE "\n" ";" SIMA_LMM_MANIFEST_VERSION_LIST "${SIMA_LMM_MANIFEST_VERSIONS}")
+list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PLATFORM_VERSION)
+list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PACKAGE_BASE_VERSION)
+
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
-    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.in" SIMA_LMM_VERSION_IN)
-    foreach(_sima_lmm_version_part major minor patch)
-        string(REGEX MATCH
-            "${_sima_lmm_version_part}:[ \t]*([0-9]+)"
-            _sima_lmm_version_match
-            "${SIMA_LMM_VERSION_IN}"
-        )
-        if("${CMAKE_MATCH_1}" STREQUAL "")
-            message(FATAL_ERROR "Unable to parse ${_sima_lmm_version_part} from VERSION.in")
-        endif()
-        set("SIMA_LMM_VERSION_${_sima_lmm_version_part}" "${CMAKE_MATCH_1}")
-    endforeach()
-    set(SKBUILD_PROJECT_VERSION
-        "${SIMA_LMM_VERSION_major}.${SIMA_LMM_VERSION_minor}.${SIMA_LMM_VERSION_patch}"
-    )
+    set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
 endif()
 
 project(${SKBUILD_PROJECT_NAME} VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX)
+set(SIMA_LMM_PACKAGE_VERSION "${PROJECT_VERSION}" CACHE STRING "Debian package version for sima-lmm artifacts.")
+string(REPLACE "." ";" SIMA_LMM_PACKAGE_BASE_VERSION_PARTS "${SIMA_LMM_PACKAGE_BASE_VERSION}")
+list(GET SIMA_LMM_PACKAGE_BASE_VERSION_PARTS 0 SIMA_LMM_PACKAGE_BASE_VERSION_MAJOR)
+list(GET SIMA_LMM_PACKAGE_BASE_VERSION_PARTS 1 SIMA_LMM_PACKAGE_BASE_VERSION_MINOR)
+math(EXPR SIMA_LMM_NEXT_PACKAGE_MINOR "${SIMA_LMM_PACKAGE_BASE_VERSION_MINOR} + 1")
+set(SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
+set(SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION_MAJOR}.${SIMA_LMM_NEXT_PACKAGE_MINOR}.0")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -70,7 +81,7 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
-find_package(NeatInternals REQUIRED)
+find_package(NeatInternals ${SIMA_LMM_PLATFORM_VERSION} CONFIG REQUIRED)
 find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
@@ -88,6 +99,44 @@ pkg_check_modules(Readline REQUIRED IMPORTED_TARGET readline)
 include(FetchContent)
 set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "Force offline build")
 
+set(SIMA_LMM_CORE_DOC_DIR "${CMAKE_INSTALL_DATADIR}/doc/sima-lmm-core")
+set(SIMA_LMM_DEV_DOC_DIR "${CMAKE_INSTALL_DATADIR}/doc/sima-lmm-dev")
+set(SIMA_LMM_CLI_DOC_DIR "${CMAKE_INSTALL_DATADIR}/doc/sima-lmm-cli")
+
+function(install_sima_lmm_project_copyright COMPONENT DOC_DIR)
+    install(
+        FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        DESTINATION "${DOC_DIR}"
+        RENAME "copyright"
+        COMPONENT ${COMPONENT}
+    )
+endfunction()
+
+function(install_sima_lmm_third_party_license LICENSE_FILE LICENSE_NAME)
+    if(NOT EXISTS "${LICENSE_FILE}")
+        message(WARNING "Third-party license file not found: ${LICENSE_FILE}")
+        return()
+    endif()
+
+    foreach(_sima_lmm_component IN ITEMS core dev)
+        if(_sima_lmm_component STREQUAL "core")
+            set(_sima_lmm_doc_dir "${SIMA_LMM_CORE_DOC_DIR}")
+        else()
+            set(_sima_lmm_doc_dir "${SIMA_LMM_DEV_DOC_DIR}")
+        endif()
+        install(
+            FILES "${LICENSE_FILE}"
+            DESTINATION "${_sima_lmm_doc_dir}/third_party"
+            RENAME "${LICENSE_NAME}"
+            COMPONENT ${_sima_lmm_component}
+        )
+    endforeach()
+endfunction()
+
+install_sima_lmm_project_copyright(core "${SIMA_LMM_CORE_DOC_DIR}")
+install_sima_lmm_project_copyright(dev "${SIMA_LMM_DEV_DOC_DIR}")
+install_sima_lmm_project_copyright(cli "${SIMA_LMM_CLI_DOC_DIR}")
+
 macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
     FetchContent_GetProperties(${NAME})
     if(NOT ${NAME}_POPULATED)
@@ -99,13 +148,9 @@ macro(Safe_FetchContent_MakeAvailable NAME LICENSE_NAME)
         # Add the directory manually with EXCLUDE_FROM_ALL.
         add_subdirectory("${${NAME}_SOURCE_DIR}" "${${NAME}_BINARY_DIR}" EXCLUDE_FROM_ALL)
 
-        # Install the license file.
-        message(STATUS "Install license file: ${${NAME}_SOURCE_DIR}/${LICENSE_NAME}")
-        install(
-            FILES "${${NAME}_SOURCE_DIR}/${LICENSE_NAME}"
-            DESTINATION "docs/licenses"
-            RENAME "LICENSE.${NAME}"
-            COMPONENT dev
+        install_sima_lmm_third_party_license(
+            "${${NAME}_SOURCE_DIR}/${LICENSE_NAME}"
+            "LICENSE.${NAME}"
         )
     else()
         message(STATUS "Using system-provided package for ${NAME}")
@@ -132,11 +177,9 @@ target_link_libraries(
     INTERFACE
     nlohmann_json::nlohmann_json
 )
-install(
-    FILES "${minja_SOURCE_DIR}/LICENSE"
-    DESTINATION "docs/licenses"
-    RENAME "LICENSE.minja"
-    COMPONENT dev
+install_sima_lmm_third_party_license(
+    "${minja_SOURCE_DIR}/LICENSE"
+    "LICENSE.minja"
 )
 
 set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF CACHE BOOL "" FORCE)
@@ -175,6 +218,7 @@ FetchContent_Declare(
 )
 Safe_FetchContent_MakeAvailable(llama LICENSE)
 
+set(SIMA_LMM_MSGPACK_LICENSE_INSTALLED OFF)
 if(NOT TARGET msgpack-cxx)
     set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack-c")
     if(NOT EXISTS "${MSGPACK_CXX_SOURCE_DIR}/CMakeLists.txt")
@@ -186,7 +230,40 @@ if(NOT TARGET msgpack-cxx)
         FIND_PACKAGE_ARGS 7.0.0 NAMES msgpack-cxx
     )
     Safe_FetchContent_MakeAvailable(msgpack-cxx LICENSE_1_0.txt)
+    set(SIMA_LMM_MSGPACK_LICENSE_INSTALLED ON)
 endif()
+
+if(NOT DEFINED MSGPACK_CXX_SOURCE_DIR)
+    set(MSGPACK_CXX_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/msgpack-c")
+endif()
+if(NOT SIMA_LMM_MSGPACK_LICENSE_INSTALLED)
+    install_sima_lmm_third_party_license(
+        "${MSGPACK_CXX_SOURCE_DIR}/LICENSE_1_0.txt"
+        "LICENSE.msgpack-cxx"
+    )
+endif()
+install_sima_lmm_third_party_license(
+    "${MSGPACK_CXX_SOURCE_DIR}/NOTICE"
+    "NOTICE.msgpack-cxx"
+)
+set(SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_PATHS
+    "third_party/tokenizers-cpp/sentencepiece/LICENSE"
+    "third_party/llama.cpp/licenses/LICENSE-jsonhpp"
+)
+set(SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_NAMES
+    "LICENSE.sentencepiece"
+    "LICENSE.llama.cpp-jsonhpp"
+)
+list(LENGTH SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_PATHS _sima_lmm_extra_license_count)
+math(EXPR _sima_lmm_extra_license_last "${_sima_lmm_extra_license_count} - 1")
+foreach(_sima_lmm_license_index RANGE ${_sima_lmm_extra_license_last})
+    list(GET SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_PATHS ${_sima_lmm_license_index} _sima_lmm_license_path)
+    list(GET SIMA_LMM_EXTRA_THIRD_PARTY_LICENSE_NAMES ${_sima_lmm_license_index} _sima_lmm_license_name)
+    install_sima_lmm_third_party_license(
+        "${CMAKE_CURRENT_SOURCE_DIR}/${_sima_lmm_license_path}"
+        "${_sima_lmm_license_name}"
+    )
+endforeach()
 
 find_library(
     SIMAAI_DISPATCHER_LIB
@@ -284,7 +361,7 @@ target_link_libraries(
 )
 # For simaai headers. Currently this is for simaai-memory-lib. Add it to the end so that it can
 # search other paths first.
-target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PUBLIC
+target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
     $<BUILD_INTERFACE:${SYSROOT}/usr/include/simaai>
     $<BUILD_INTERFACE:${SYSROOT}/usr/include>
 )
@@ -377,7 +454,7 @@ configure_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION}
+    VERSION ${SIMA_LMM_PLATFORM_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 install(
@@ -391,9 +468,9 @@ install(
 
 if(SIMA_LMM_INSTALL_PYTHON_PACKAGE)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sima_lmm_VERSION"
-"major: ${SIMA_LMM_VERSION_major}
-minor: ${SIMA_LMM_VERSION_minor}
-patch: ${SIMA_LMM_VERSION_patch}
+"major: ${PROJECT_VERSION_MAJOR}
+minor: ${PROJECT_VERSION_MINOR}
+patch: ${PROJECT_VERSION_PATCH}
 ")
 
     install(
@@ -437,7 +514,7 @@ endif()
 set(CPACK_PACKAGE_NAME "sima-lmm")
 set(CPACK_PACKAGE_VENDOR "SiMa.ai")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SiMa LMM runtime")
-set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VERSION "${SIMA_LMM_PACKAGE_VERSION}")
 set(CPACK_PACKAGE_CONTACT "SiMa.ai Build Team <build@sima.ai>")
 set(CPACK_GENERATOR "DEB")
 set(CPACK_COMPONENTS_ALL core dev cli)
@@ -457,11 +534,19 @@ set(CPACK_DEBIAN_CORE_PACKAGE_NAME "sima-lmm-core")
 set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
-set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime, simaai-memory-lib, libfmt9, libspdlog1.10")
+string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
+    "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
+    "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
+    "simaai-memory-lib (= 2.0.0), "
+    "libcpp-httplib0.11, libfftw3-double3, "
+    "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
+    "libavcodec59, libavformat59, libavutil57, libswresample4, "
+    "libzmq5, libssl3, libreadline8, libgomp1, "
+    "libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
-    "neat-internals-dev, simaai-memory-lib-dev, "
+    "neat-internals-dev (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
+    "neat-internals-dev (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "

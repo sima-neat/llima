@@ -1,14 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
-
 import json
 import os
 import shutil
@@ -194,15 +183,31 @@ def _download_file(url: str, dest: Path, label: str) -> None:
             print(f"\rDownloading {label}: done", flush=True)
 
 
+def _ensure_writable_models_root(path: Path) -> Path | None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    if path.is_dir() and os.access(path, os.W_OK):
+        return path
+    return None
+
+
 def _select_download_root() -> Path:
-    if NVME_MODELS_ROOT.exists() and os.access(NVME_MODELS_ROOT, os.W_OK):
-        return NVME_MODELS_ROOT
     env_root = _env_models_root()
     if env_root is not None:
-        return env_root
+        root = _ensure_writable_models_root(env_root)
+        if root is not None:
+            return root
+        raise RuntimeError(f"LLIMA_MODELS_PATH is not writable: {env_root}")
+
+    root = _ensure_writable_models_root(NVME_MODELS_ROOT)
+    if root is not None:
+        return root
+
     raise RuntimeError(
-        "No writable models path. Create /media/nvme/llima/models "
-        "or set LLIMA_MODELS_PATH."
+        "No writable models path. Could not create /media/nvme/llima/models "
+        "and LLIMA_MODELS_PATH is not set."
     )
 
 

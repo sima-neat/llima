@@ -1,0 +1,7 @@
+{
+  "internals": {
+    "policy": "snap"
+  },
+  "package-version": "0.1.0",
+  "platform-version": "2.0.0"
+}

@@ -1,13 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
 import json
 import math
 from dataclasses import dataclass, field
@@ -503,6 +493,11 @@ class LocalHuggingFaceModel:
 
     @cached_property
     def language_model_param_base_name(self) -> str:
+        for name in self.weight_map.keys():
+            parts = name.split(".")
+            if "language_model" in parts and "layers" in parts:
+                return ".".join(parts[:parts.index("layers")])
+
         base_names = list()
         for name in self.weight_map.keys():
             if "lm_head" in name:

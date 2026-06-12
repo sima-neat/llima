@@ -1,33 +1,3 @@
-//**************************************************************************
-//||                        SiMa.ai CONFIDENTIAL                          ||
-//||   Unpublished Copyright (c) 2022-2025 SiMa.ai, All Rights Reserved.  ||
-//**************************************************************************
-// NOTICE:  All information contained herein is, and remains the property of
-// SiMa.ai. The intellectual and technical concepts contained herein are
-// proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-// patents in process, and are protected by trade secret or copyright law.
-//
-// Dissemination of this information or reproduction of this material is
-// strictly forbidden unless prior written permission is obtained from
-// SiMa.ai.  Access to the source code contained herein is hereby forbidden
-// to anyone except current SiMa.ai employees, managers or contractors who
-// have executed Confidentiality and Non-disclosure agreements explicitly
-// covering such access.
-//
-// The copyright notice above does not evidence any actual or intended
-// publication or disclosure  of  this source code, which includes information
-// that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-//
-// ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-// DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-// CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-// LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-// CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-// REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-// SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-//
-//**************************************************************************
-
 #ifndef _SIMA_LLIMA_VLM_CONFIG_
 #define _SIMA_LLIMA_VLM_CONFIG_
 
@@ -137,10 +107,19 @@ struct RoPEConfig {
     double rope_theta;
     double rope_local_base_freq;
     uint32_t rope_dimension_count = 0;
+    std::optional<uint32_t> sliding_rope_dimension_count;
     RopeScalingConfig rope_scaling;
+
+    uint32_t get_rope_dimension_count(const std::string& layer_type) const {
+        if (layer_type == "sliding_attention" && sliding_rope_dimension_count.has_value()) {
+            return sliding_rope_dimension_count.value();
+        }
+        return rope_dimension_count;
+    }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    RoPEConfig, rope_theta, rope_local_base_freq, rope_dimension_count, rope_scaling
+    RoPEConfig, rope_theta, rope_local_base_freq, rope_dimension_count,
+    sliding_rope_dimension_count, rope_scaling
 )
 
 
@@ -148,17 +127,28 @@ struct AttentionBlockConfig {
     uint8_t num_attention_heads;
     uint8_t num_key_value_heads;
     uint32_t head_dim;
+    std::optional<uint32_t> sliding_head_dim;
     bool swa_enable;
     uint8_t swa_ratio = 0;  // Deprecated in 2.1.
     std::optional<uint32_t> sliding_window;
 
 
-    uint32_t get_q_size() const { return num_attention_heads * head_dim; }
-    uint32_t get_kv_size() const { return num_key_value_heads * head_dim; }
+    uint32_t get_head_dim(const std::string& layer_type) const {
+        if (layer_type == "sliding_attention" && sliding_head_dim.has_value()) {
+            return sliding_head_dim.value();
+        }
+        return head_dim;
+    }
+    uint32_t get_q_size(const std::string& layer_type) const {
+        return num_attention_heads * get_head_dim(layer_type);
+    }
+    uint32_t get_kv_size(const std::string& layer_type) const {
+        return num_key_value_heads * get_head_dim(layer_type);
+    }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    AttentionBlockConfig, num_attention_heads, num_key_value_heads, head_dim, swa_enable, swa_ratio,
-    sliding_window
+    AttentionBlockConfig, num_attention_heads, num_key_value_heads, head_dim, sliding_head_dim,
+    swa_enable, swa_ratio, sliding_window
 )
 
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
@@ -173,10 +163,33 @@ struct LanguageModelConfig {
     uint32_t lm_head_split_dim;
     LayerTypes layer_types = {};
     uint32_t conv_L_cache = 3;
+    uint32_t hidden_size_per_layer_input = 0;
+    uint32_t num_kv_shared_layers = 0;
+    double rms_norm_eps = 1e-05;
+    bool rms_norm_unit_offset = false;
+
+    bool is_kv_shared_layer(uint8_t layer_idx) const {
+        uint8_t first_shared_layer = num_hidden_layers - num_kv_shared_layers;
+        return num_kv_shared_layers > 0 && layer_idx >= first_shared_layer;
+    }
+
+    uint8_t get_kv_source_layer(uint8_t layer_idx) const {
+        if (!is_kv_shared_layer(layer_idx)) {
+            return layer_idx;
+        }
+        for (int idx = num_hidden_layers - num_kv_shared_layers - 1; idx >= 0; --idx) {
+            if (layer_types[idx] == layer_types[layer_idx]) {
+                return static_cast<uint8_t>(idx);
+            }
+        }
+        return layer_idx;
+    }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     LanguageModelConfig, token_cfg, rope_cfg, attn_cfg, num_hidden_layers, hidden_size,
-    lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache
+    lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache,
+    hidden_size_per_layer_input, num_kv_shared_layers,
+    rms_norm_eps, rms_norm_unit_offset
 )
 
 

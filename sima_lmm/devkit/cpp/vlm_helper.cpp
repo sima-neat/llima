@@ -1,33 +1,3 @@
-//**************************************************************************
-//||                        SiMa.ai CONFIDENTIAL                          ||
-//||   Unpublished Copyright (c) 2022-2025 SiMa.ai, All Rights Reserved.  ||
-//**************************************************************************
-// NOTICE:  All information contained herein is, and remains the property of
-// SiMa.ai. The intellectual and technical concepts contained herein are
-// proprietary to SiMa and may be covered by U.S. and Foreign Patents,
-// patents in process, and are protected by trade secret or copyright law.
-//
-// Dissemination of this information or reproduction of this material is
-// strictly forbidden unless prior written permission is obtained from
-// SiMa.ai.  Access to the source code contained herein is hereby forbidden
-// to anyone except current SiMa.ai employees, managers or contractors who
-// have executed Confidentiality and Non-disclosure agreements explicitly
-// covering such access.
-//
-// The copyright notice above does not evidence any actual or intended
-// publication or disclosure  of  this source code, which includes information
-// that is confidential and/or proprietary, and is a trade secret, of SiMa.ai.
-//
-// ANY REPRODUCTION, MODIFICATION, DISTRIBUTION, PUBLIC PERFORMANCE, OR PUBLIC
-// DISPLAY OF OR THROUGH USE OF THIS SOURCE CODE WITHOUT THE EXPRESS WRITTEN
-// CONSENT OF SiMa.ai IS STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE
-// LAWS AND INTERNATIONAL TREATIES. THE RECEIPT OR POSSESSION OF THIS SOURCE
-// CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS TO
-// REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE, USE, OR
-// SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
-//
-//**************************************************************************
-
 #include <fstream>
 #include <string_view>
 
@@ -76,6 +46,7 @@ VlmHelper::VlmHelper(
         _init_stop_token_ids(devkit_dir);
         if (_vlm_cfg.is_multimodal()) {
             _init_image_token_id(tokenizer_config_json);
+            _init_pad_token_id(tokenizer_config_json);
             _init_image_processor(devkit_dir);
         }
     } else {
@@ -142,6 +113,13 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                 replace += "<|image_pad|>";
             }
             num_images = find_and_replace_all(formatted_prompt, search, replace);
+        } else if (_vlm_cfg.model_type == "vlm-gemma4") {
+            std::string search = "<|image|>";
+            std::string replace = "";
+            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) {
+                replace += "<|image|>";
+            }
+            num_images = find_and_replace_all(formatted_prompt, search, replace);
         } else {
             throw std::runtime_error(
                 fmt::format("Image support for {} is not implemented", _vlm_cfg.model_type)
@@ -183,7 +161,11 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // Encode the formatted prompt to token ids.
     auto add_special_tokens = !formatted_prompt.starts_with(_bos_token);
     auto input_token_ids = _tokenizer_ptr->encode(formatted_prompt, add_special_tokens);
-    return {std::move(formatted_prompt), std::move(input_token_ids), std::move(image_tensors)};
+    return {
+        std::move(formatted_prompt),
+        std::move(input_token_ids),
+        std::move(image_tensors)
+    };
 }
 
 
@@ -288,6 +270,14 @@ void VlmHelper::_init_image_token_id(const nlohmann::json& tokenizer_config_json
     }
     _image_token_id = _tokenizer_ptr->token_to_id(image_token);
 }
+
+
+void VlmHelper::_init_pad_token_id(const nlohmann::json& tokenizer_config_json) {
+    if (!tokenizer_config_json.contains("pad_token") || tokenizer_config_json["pad_token"].is_null())
+        return;
+    _pad_token_id = _tokenizer_ptr->token_to_id(tokenizer_config_json["pad_token"].get<std::string>());
+}
+
 
 
 void VlmHelper::_init_image_processor(const std::filesystem::path& devkit_dir) {
