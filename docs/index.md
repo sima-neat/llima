@@ -22,8 +22,6 @@ The LLiMa runtime is installed natively on Modalix as part of the Neat runtime.
 See [Neat Framework installation](/getting-started/installation/neat-framework/)
 for the runtime installation flow.
 
-For concrete GenAI demos, check our [Neat Apps portal](https://apps.sima-neat.com/portal/index.html).
-
 ## Supported Models
 
 The following table shows the supported model architectures and their
