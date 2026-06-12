@@ -13,7 +13,8 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype
+    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype,
+    create_channel_slice
 )
 from sima_lmm.config.vlm_config import VlmArchType
 
@@ -449,18 +450,28 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real, mla_input_freq_imag,
             quantizable, merged_lora
         )
-        mla_k_out = self._build_sima_attn_key(
-            builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real, mla_input_freq_imag, merged_lora
-        )
-        mla_v_out = self._build_sima_attn_value(builder, f"{base_name}.self_attn", attn_input, merged_lora)
-        _ = builder.create_tuple_node([mla_q_out, mla_k_out, mla_v_out])
+        output_nodes = [mla_q_out]
+        if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
+            output_nodes.extend([
+                self._build_sima_attn_key(
+                    builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real,
+                    mla_input_freq_imag, merged_lora
+                ),
+                self._build_sima_attn_value(
+                    builder, f"{base_name}.self_attn", attn_input, merged_lora
+                )
+            ])
+        if len(output_nodes) > 1:
+            _ = builder.create_tuple_node(output_nodes)
 
         mla_node = builder.finish_subnet("MLA_0")
 
         if activation_type(quantizable) != ScalarType.float32:
-            # Cast each output to float32
-            tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-            builder.create_tuple_node([builder.create_cast_node(x, ScalarType.float32) for x in tuple_items])
+            if len(output_nodes) == 1:
+                builder.create_cast_node(mla_node, ScalarType.float32)
+            else:
+                tuple_items = builder.create_tuple_get_item_nodes(mla_node)
+                builder.create_tuple_node([builder.create_cast_node(x, ScalarType.float32) for x in tuple_items])
 
         net = builder.finish(self.model_name)
         return net
@@ -478,10 +489,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         imag_start = layer_head_dim // 2 if self._is_proportional_rope_layer else half_rope_dim
         imag_end = imag_start + half_rope_dim
 
-        real_in = builder.create_slice_node(data, [0], [half_rope_dim], [1], [3])
-        imag_in = builder.create_slice_node(
-            data, [imag_start], [imag_end], [1], [3]
-        )
+        real_in = create_channel_slice(builder, data, 0, half_rope_dim)
+        imag_in = create_channel_slice(builder, data, imag_start, imag_end)
         real_out = builder.create_subtract_node(
             builder.create_mul_node(real_in, freq_real),
             builder.create_mul_node(imag_in, freq_imag)
@@ -491,21 +500,15 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder.create_mul_node(imag_in, freq_real)
         )
         if self._is_proportional_rope_layer:
-            mid1 = builder.create_slice_node(data, [half_rope_dim], [layer_head_dim // 2], [1], [3])
-            mid2 = builder.create_slice_node(data, [imag_end], [layer_head_dim], [1], [3])
+            mid1 = create_channel_slice(builder, data, half_rope_dim, layer_head_dim // 2)
+            mid2 = create_channel_slice(builder, data, imag_end, layer_head_dim)
             return builder.create_concat_node([real_out, mid1, imag_out, mid2], 3)
 
         rotary_out = builder.create_concat_node([real_out, imag_out], 3)
         if layer_rope_dimension_count == layer_head_dim:
             return rotary_out
 
-        tail = builder.create_slice_node(
-            data,
-            [layer_rope_dimension_count],
-            [layer_head_dim],
-            [1],
-            [3],
-        )
+        tail = create_channel_slice(builder, data, layer_rope_dimension_count, layer_head_dim)
         return builder.create_concat_node([rotary_out, tail], 3)
 
     def _build_sima_attn_query(

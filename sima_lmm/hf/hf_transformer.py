@@ -1,20 +1,20 @@
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Self
 
 import numpy as np
-import safetensors.numpy
 import torch
 import transformers
+from safetensors import safe_open
 from PIL import Image
 from ml_dtypes import bfloat16, int4
 from transformers import AutoConfig, MistralConfig
 from transformers.image_utils import load_images
 from sima_utils.logging.sima_logger import sima_log_info
-import os
 
 
 HF_SINGLE_MODEL_FILENAME = 'model.safetensors'
@@ -286,12 +286,9 @@ class LocalHuggingFaceModel:
             # This means there is no .index.json, so the weight-map needs to be build manually.
             # Weight-map structure {'model_param_name': 'safetensors_file_name'}
             weight_files = {HF_SINGLE_MODEL_FILENAME: weight_file}
-            index_data = {
-                'weight_map': {
-                    k: HF_SINGLE_MODEL_FILENAME
-                    for k in safetensors.numpy.load_file(weight_file).keys()
-                }
-            }
+            with safe_open(weight_file, framework="numpy") as f:
+                tensor_names = list(f.keys())
+            index_data = {'weight_map': dict.fromkeys(tensor_names, HF_SINGLE_MODEL_FILENAME)}
         else:
             # There is no `model.safetensors`, so we use the `model.safetensors.index.json`.
             index_file = find_file(
@@ -422,7 +419,7 @@ class LocalHuggingFaceModel:
         assert model_shard, f'Could not find {param_name} in the model cache.'
 
         safetensors_file = self.weights[model_shard]
-        return safetensors.numpy.load_file(filename=safetensors_file)[param_name]
+        return self._load_safetensors_tensor(safetensors_file, param_name)
 
     def _load_raw_tensor(self, tensor_name: str) -> np.ndarray:
         """Load a raw tensor from safetensors files by exact name."""
@@ -434,13 +431,21 @@ class LocalHuggingFaceModel:
             raise KeyError(f'Could not find {tensor_name} in the model cache.')
 
         safetensors_file = self.weights[model_shard]
-        return safetensors.numpy.load_file(filename=safetensors_file)[tensor_name]
+        return self._load_safetensors_tensor(safetensors_file, tensor_name)
+
+    def _load_safetensors_tensor(self, safetensors_file: Path, tensor_name: str) -> np.ndarray:
+        """Load one tensor without materializing every tensor in the safetensors file."""
+        with safe_open(safetensors_file, framework="numpy") as f:
+            return f.get_tensor(tensor_name)
 
 
     def load_all_params(self):
         self.params = dict()
-        for safetensors_filename in self.weights.values():
-            self.params.update(safetensors.numpy.load_file(filename=safetensors_filename))
+        for safetensors_filename in set(self.weights.values()):
+            with safe_open(safetensors_filename, framework="numpy") as f:
+                self.params.update(
+                    {tensor_name: f.get_tensor(tensor_name) for tensor_name in f.keys()}
+                )
 
     def unload_all_params(self):
         self.params = None

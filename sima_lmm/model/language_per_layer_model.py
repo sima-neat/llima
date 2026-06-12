@@ -107,6 +107,7 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
 
     def _build_sima_nodes(self, lm_base: str, quantizable: bool):
         L = self.cfg.lm_cfg.num_hidden_layers
+        H = self.cfg.lm_cfg.hidden_size_per_layer_input
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
 
         model_input_staging = builder.create_placeholder_node(

@@ -66,6 +66,7 @@ def build_conv(
     bias_process_func = kwargs.pop("bias_process_func", lambda x: x)
     q_size = kwargs.pop("q_size", None)
     kv_size = kwargs.pop("kv_size", None)
+    activation = kwargs.pop("activation", None)
 
     # Some models have bundled weights with a different name for a layer.
     if not check_param_func(src_weight_name):
@@ -133,7 +134,7 @@ def build_conv(
     if check_param_func(src_bias_name):
         bias_tensor = get_param_func(src_bias_name)
         bias_tensor = bias_process_func(bias_tensor)
-        if bias_tensor.dtype == bfloat16:
+        if bias_tensor.dtype in (bfloat16, np.float16):
             bias_tensor = bias_tensor.astype(np.float32)
     else:
         bias_tensor = None
@@ -150,8 +151,51 @@ def build_conv(
         batch_size=1,
         input_type=ifm_type.scalar
     )
-    conv = builder.create_conv_node(ifm, weight_tensor, bias_tensor, conv_attrs, None, scales=scales)
+    conv = builder.create_conv_node(ifm, weight_tensor, bias_tensor, conv_attrs, activation, scales=scales)
     return conv
+
+
+def create_channel_slice(
+        builder: SimaBuilder,
+        input_node: NodeOrHandle,
+        begin: int,
+        end: int,
+) -> NodeOrHandle:
+    """
+    Create a channel-axis slice that respects MLA channel slice alignment.
+
+    The TVM/ONNX path rewrites channel slices with non-16-aligned boundaries into 1x1
+    selector convolutions. The direct SiMaBuilder path needs to do the same for
+    models such as Qwen2.5-VL, whose RoPE split is 80 -> 40 + 40.
+    """
+    input_type = get_expected_tensor_value(
+        input_node.type if isinstance(input_node, NodeHandle) else input_node.get_type().output
+    )
+    channel_axis = len(input_type.shape) - 1
+    assert 0 <= begin < end <= input_type.shape[channel_axis]
+
+    if begin % 16 == 0 and end % 16 == 0:
+        return builder.create_slice_node(input_node, [begin], [end], [1], [channel_axis])
+
+    input_channels = input_type.shape[channel_axis]
+    output_channels = end - begin
+    weights = np.zeros((1, 1, input_channels, 1, output_channels), dtype=np.float32)
+    for out_channel in range(output_channels):
+        weights[0, 0, begin + out_channel, 0, out_channel] = 1.0
+
+    conv_attrs = attributes.ConvAttrs(
+        stride=(1, 1),
+        dilation=(1, 1),
+        padding=((0, 0), (0, 0)),
+        output_padding=((0, 0), (0, 0)),
+        is_transposed=False,
+        weight_shape=weights.shape,
+        reloc_name=None,
+        input_spatial_shape=input_type.shape[1:-1],
+        batch_size=input_type.shape[0],
+        input_type=input_type.scalar,
+    )
+    return builder.create_conv_node(input_node, weights, None, conv_attrs)
 
 
 def derive_lora_name_from_base_model(base_name: str) -> str:
@@ -296,6 +340,42 @@ def build_logit_softcapping(
     )
 
 
+def build_space_to_depth(
+    builder: SimaBuilder, data: NodeOrHandle, blocksize: int
+) -> AwesomeNode:
+    """
+    Implement SpaceToDepth as a strided convolution with a binary weight pattern.
+
+    Input NHWC (1, H, W, C) -> output NHWC (1, H//blocksize, W//blocksize, C*blocksize*blocksize).
+    """
+    ifm_type = get_expected_tensor_value(
+        data.type if isinstance(data, NodeHandle) else data.get_type().output
+    )
+    in_channels = ifm_type.shape[3]
+    out_channels = in_channels * (blocksize ** 2)
+
+    weights = np.zeros((out_channels, in_channels, blocksize, blocksize), dtype=np.float32)
+    for i in range(in_channels):
+        for j in range(blocksize):
+            for k in range(blocksize):
+                weights[i + (j * blocksize + k) * in_channels, i, j, k] = 1.0
+
+    weights = np.transpose(np.expand_dims(weights, 0), (3, 4, 2, 0, 1))
+    conv_attrs = ConvAttrs(
+        stride=(blocksize, blocksize),
+        dilation=(1, 1),
+        padding=((0, 0), (0, 0)),
+        output_padding=((0, 0), (0, 0)),
+        is_transposed=False,
+        weight_shape=weights.shape,
+        reloc_name=None,
+        input_spatial_shape=ifm_type.shape[1:3],
+        batch_size=1,
+        input_type=ifm_type.scalar,
+    )
+    return builder.create_conv_node(data, weights, None, conv_attrs)
+
+
 def build_activation(
     builder: SimaBuilder, input_node: NodeOrHandle, act_type: str, quantizable: bool
 ) -> NodeOrHandle:
@@ -322,7 +402,20 @@ def build_activation(
         case "silu":
             last = builder.create_swish_node(input_node)
         case "gelu":
-            last = builder.create_gelu_node(input_node)
+            # AFE's GELU node does not support bfloat16, so expand GELU via Erf.
+            dtype = activation_dtype(quantizable)
+            scaled = builder.create_mul_node(
+                input_node,
+                builder.create_constant_node(np.array(1 / math.sqrt(2), dtype=dtype)),
+            )
+            erf = builder.create_erf_node(scaled)
+            shifted = builder.create_add_node(
+                erf, builder.create_constant_node(np.array(1.0, dtype=dtype))
+            )
+            mul = builder.create_mul_node(input_node, shifted)
+            last = builder.create_mul_node(
+                mul, builder.create_constant_node(np.array(0.5, dtype=dtype))
+            )
         case "gelu_tanh" | "gelu_pytorch_tanh":
             dtype = activation_dtype(quantizable)
             value_a = 2 * math.sqrt(2 / math.pi)
@@ -408,7 +501,7 @@ def load_tensor_from_source(
         src_layout, dst_layout = reshape_str.split("->")
         assert len(t.shape) == len(src_layout)
         t = layout_array(t, src_layout, dst_layout)
-    if t.dtype == bfloat16:
+    if t.dtype in (bfloat16, np.float16):
         t = t.astype(np.float32)  # Model SDK requires float32
     return t
 
