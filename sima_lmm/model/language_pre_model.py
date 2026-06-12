@@ -103,17 +103,12 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
             # RoPE embedded k_proj and v_proj (1, Head_Dim, n_kv, n_tokens).
-            if self.cfg.pipeline_cfg.use_strided_kv_cache:
-                # saved in cache as (1, Head_Dim, n_kv, n_tokens).
-                kv_cache_shape = (
-                        1,
-                        self._head_dim,
-                        self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                        self.num_tokens
-                     )
-            else:
-                # saved in cache as (1, Head_Dim * n_kv, 1, n_tokens).
-                kv_cache_shape = (1, self._kv_size, 1, self.num_tokens)
+            kv_cache_shape = (
+                1,
+                self._head_dim,
+                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                self.num_tokens
+            )
             self._onnx_builder.create_output_node(
                 self._onnx_builder.get_node_output_name(output_nodes[1]), kv_cache_shape
             )
@@ -313,15 +308,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         rotary_emb = self._build_onnx_rotary_emb(
             f"{base_name}.k_proj", [reshape1, input_nodes[1], input_nodes[2]]
         )
-
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            return rotary_emb
-
-        reshape2 = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.k_proj.reshape2", rotary_emb,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads, split_axis=2, concat_axis=1
-        )
-        return reshape2
+        return rotary_emb
 
     def _build_onnx_attn_value(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
         lora_rank = None
@@ -334,12 +321,10 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
 
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
-            if self.cfg.pipeline_cfg.use_strided_kv_cache:
-                return self._onnx_builder.build_split_and_concat(
-                    f"{base_name}.v_proj", v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                    split_axis=1, concat_axis=2,
-                )
-            return v_proj
+            return self._onnx_builder.build_split_and_concat(
+                f"{base_name}.v_proj", v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                split_axis=1, concat_axis=2,
+            )
 
         split = self._onnx_builder.build_split_and_concat(
             f"{base_name}.v_proj", v_proj,  self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
@@ -349,12 +334,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             f"{base_name}.v_norm", split, float(self.cfg.lm_cfg.rms_norm_eps),
             weightless=True, num_channels=self._head_dim,
         )
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            return split
-        return self._onnx_builder.build_split_and_concat(
-            f"{base_name}.v_proj.flatten", split, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            split_axis=2, concat_axis=1
-        )
+        return split
 
     def gen_model_sdk_files_directly(
         self,
@@ -374,9 +354,6 @@ class LanguagePreModel(LanguagePartBaseModel):
             self.num_tokens,
             self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2
         )
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            raise RuntimeError("Strided KV cache is not implemented in SiMa IR code generation")
-
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
 
         if self.cfg.pipeline_cfg.quantize_embeddings and self.layer_idx == 0:
@@ -589,12 +566,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         rotary_emb = self._build_sima_rotary_emb(
             builder, reshape1, freq_real, freq_imag
         )
-
-        reshape2 = builder.create_slice_concat_node(
-            rotary_emb, axis=3, split_axis=1,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads, split_repeat=1
-        )
-        return reshape2
+        return rotary_emb
 
 
     def _build_sima_attn_value(
@@ -610,8 +582,14 @@ class LanguagePreModel(LanguagePartBaseModel):
             kv_size=self._kv_size
         )
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
-            return v_proj
+            # Strided cache stores KV heads explicitly instead of flattened into kv_size.
+            return builder.create_slice_concat_node(
+                v_proj, axis=1, split_axis=3,
+                split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                split_repeat=1
+            )
 
+        # Gemma4 applies value RMS norm per KV head before writing V to cache.
         split = builder.create_slice_concat_node(
             v_proj,
             axis=1,
@@ -626,13 +604,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             weightless=True,
             num_channels=self._head_dim,
         )
-        return builder.create_slice_concat_node(
-            split,
-            axis=3,
-            split_axis=1,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            split_repeat=1,
-        )
+        return split
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """
@@ -644,16 +616,12 @@ class LanguagePreModel(LanguagePartBaseModel):
         """
         Get the DRAM layouts to use for this model's inputs on the MLA.
         """
-        if not self.cfg.pipeline_cfg.use_strided_kv_cache:
-            # Use default tessellate params.
-            return {}
-
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
             1,
             self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             self.cfg.pipeline_cfg.max_num_tokens,
-            self.cfg.lm_cfg.attn_cfg.head_dim
+            self._head_dim
         )
 
         k_cache_tessellate_params = TensorTessellateParameters(

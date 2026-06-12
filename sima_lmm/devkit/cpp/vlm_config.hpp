@@ -215,7 +215,7 @@ struct PipelineConfig {
     std::optional<std::vector<uint16_t>> input_token_group_offsets;
     uint16_t future_token_mask_size;
     bool return_logits;
-    bool use_strided_kv_cache;
+    bool use_strided_kv_cache = true;
     bool enable_filter_sharing;
     bool quantize_embeddings = false;
 };

@@ -69,7 +69,6 @@ class VisionLanguageModel(BaseModel):
         override_language_group_offsets: list[int] | None = None,
         override_language_future_token_mask_size: int = 1,
         return_logits: bool = False,
-        use_strided_kv_cache: bool = False,
         enable_filter_sharing: bool = False,
         quantize_embeddings: bool = False,
         split_mlp: bool = False,
@@ -87,7 +86,6 @@ class VisionLanguageModel(BaseModel):
             max_num_tokens: Maximum number of tokens, including both input and output tokens.
             system_prompt: System prompt.
             return_logits: Return logits at the last layer output instead of argmax token IDs.
-            use_strided_kv_cache: True if strided access to kv cache is enabled.
             enable_filter_sharing: True if sharing filters between group and single models is
                 enabled.
             quantize_embeddings: True if embedding table is quantized.
@@ -115,7 +113,6 @@ class VisionLanguageModel(BaseModel):
             override_language_group_offsets, override_language_future_token_mask_size
         )
 
-        vlm_cfg.pipeline_cfg.set_strided_kv_cache(use_strided_kv_cache)
         vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)
         vlm_cfg.pipeline_cfg.set_split_mlp(split_mlp)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)

@@ -50,9 +50,9 @@ def gen_files(
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
     language_group_size: int, language_group_offsets: list[int] | None,
-    future_token_mask_size: int, use_strided_kv_cache: bool, enable_filter_sharing: bool,
-    quantize_embeddings: bool, split_mlp: bool, return_logits: bool, log_level: int,
-    image_resolution: list[int] | None, draft_model_path: Path | None, draft_output_path: Path | None
+    future_token_mask_size: int, enable_filter_sharing: bool, quantize_embeddings: bool,
+    split_mlp: bool, return_logits: bool, log_level: int, image_resolution: list[int] | None,
+    draft_model_path: Path | None, draft_output_path: Path | None
 ):
     enable_verbose_error_messages()
     models = list()
@@ -69,7 +69,6 @@ def gen_files(
         override_language_group_offsets=language_group_offsets,
         override_language_future_token_mask_size=future_token_mask_size,
         return_logits=return_logits,
-        use_strided_kv_cache=use_strided_kv_cache,
         enable_filter_sharing=enable_filter_sharing,
         quantize_embeddings=quantize_embeddings,
         split_mlp=split_mlp,
@@ -96,7 +95,6 @@ def gen_files(
             override_language_group_offsets=language_group_offsets,
             override_language_future_token_mask_size=future_token_mask_size,
             return_logits=return_logits,
-            use_strided_kv_cache=use_strided_kv_cache,
             enable_filter_sharing=enable_filter_sharing,
             quantize_embeddings=quantize_embeddings,
             split_mlp=split_mlp,
@@ -270,11 +268,6 @@ def main():
         help="Return logits at the last layer output."
     )
     group.add_argument(
-        "--use_strided_kv_cache", action=argparse.BooleanOptionalAction, default=False,
-        help="Enables strided access to the KV cache stored in DRAM, affecting both read and "
-             "write operations."
-    )
-    group.add_argument(
         "--enable_filter_sharing", action=argparse.BooleanOptionalAction, default=False,
         help=(
             "Enables filter sharing between group and single models to reduce the overall DRAM"
@@ -439,8 +432,8 @@ def main():
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
         args.language_group_size, language_group_offsets, args.future_token_mask_size,
-        args.use_strided_kv_cache, args.enable_filter_sharing, args.quantize_embeddings,
-        split_mlp, args.return_logits, log_level, image_resolution, args.draft_model_path, draft_output_path
+        args.enable_filter_sharing, args.quantize_embeddings, split_mlp, args.return_logits,
+        log_level, image_resolution, args.draft_model_path, draft_output_path
     )
 
     # Compile LoRA weights if requested.

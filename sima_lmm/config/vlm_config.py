@@ -791,8 +791,6 @@ class PipelineConfig(BaseConfig):
         input_token_group_size: The group size of input token.
         input_token_group_offsets: The group offsets of input token.
         return_logits: Return logits at the last layer.
-        use_strided_kv_cache: Enables strided access to the KV cache stored in DRAM, affecting both
-            read and write operations.
         enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
         split_mlp: Split the MLP into multiple stages in order to reduce TTFT.
@@ -804,7 +802,6 @@ class PipelineConfig(BaseConfig):
     input_token_group_offsets: list[int] | None = None
     future_token_mask_size: int = 1
     return_logits: bool = False
-    use_strided_kv_cache: bool = False
     enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
     split_mlp: bool = False
@@ -830,9 +827,6 @@ class PipelineConfig(BaseConfig):
 
     def set_return_logits(self, return_logits: bool):
         self.return_logits = return_logits
-
-    def set_strided_kv_cache(self, use_strided_kv_cache: bool):
-        self.use_strided_kv_cache = use_strided_kv_cache
 
     def set_enable_filter_sharing(self, enable_filter_sharing: bool):
         self.enable_filter_sharing = enable_filter_sharing

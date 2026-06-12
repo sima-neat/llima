@@ -76,15 +76,12 @@ class LanguageCacheModel(LanguagePartBaseModel):
             )
         )
 
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            kv_cache_shape =  (
-                1,
-                self._head_dim,
-                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                self.context_length
-            )
-        else:
-            kv_cache_shape = (1, self._kv_size, 1, self.context_length)
+        kv_cache_shape =  (
+            1,
+            self._head_dim,
+            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            self.context_length
+        )
         self._onnx_builder.create_input_node(f"cached_keys", kv_cache_shape)
         if (
             (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
@@ -118,12 +115,6 @@ class LanguageCacheModel(LanguagePartBaseModel):
         assert attn_heads % kv_heads == 0
         expansion_factor = attn_heads // kv_heads
 
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            split_axis = 2
-        else:
-            split_axis = 1
-        concat_axis = 2
-
         assert len(input_nodes) == 1
         kv_concat_shape = (
             1,
@@ -133,7 +124,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         )
         reshape_kv = self._onnx_builder.build_split_expand_concat(
             f"{base_name}.reshape", input_nodes[0], kv_heads, expansion_factor,
-            split_axis=split_axis, concat_axis=concat_axis, concat_shape=kv_concat_shape
+            split_axis=2, concat_axis=2, concat_shape=kv_concat_shape
         )
 
         return [reshape_kv]
@@ -204,21 +195,10 @@ class LanguageCacheModel(LanguagePartBaseModel):
             self.cfg.lm_cfg.attn_cfg.num_attention_heads
             % self.cfg.lm_cfg.attn_cfg.num_key_value_heads == 0
         )
-        expansion_factor = (
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads
-            // self.cfg.lm_cfg.attn_cfg.num_key_value_heads
-        )
-        kv_size = self._kv_size
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            raise RuntimeError("Strided KV cache is not implemented in SiMa IR code generation")
-
-        # Shape of input key and value tensors
-        kv_tensor_shape = (1, 1, self.context_length, kv_size)
-
-        # Shape of key and value after reshaping for batch matrix multiply 
-        kv_expand_shape = (
+        # Shape of input key and value tensors.
+        kv_tensor_shape = (
             1,
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads,
+            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             self.context_length,
             self._head_dim
         )
@@ -301,30 +281,9 @@ class LanguageCacheModel(LanguagePartBaseModel):
             "MLA_0/cached_values", TensorType(activation_type(quantizable), kv_tensor_shape)
         )
 
-        # Reshape and replicate keys and values.
-        if kv_tensor_shape[-1] == 1 or kv_tensor_shape[-1] == kv_expand_shape[-1]:
-            # Use broadcast to replicate array elements
-            reshape_keys = builder.create_broadcast_to_node(
-                mla_input_cached_keys, kv_expand_shape
-            )
-            reshape_values = builder.create_broadcast_to_node(
-                mla_input_cached_values, kv_expand_shape
-            )
-        else:
-            # Cannot use broadcast
-            reshape_keys = builder.create_slice_concat_node(
-                mla_input_cached_keys, axis=1, split_axis=3,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                split_repeat=expansion_factor
-            )
-            reshape_values = builder.create_slice_concat_node(
-                mla_input_cached_values, axis=1, split_axis=3,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                split_repeat=expansion_factor
-            )
-
         # First multiply (input * key)
-        bmm1 = builder.create_batch_matmul_node(mla_input_input, reshape_keys, True)
+        # BatchMatMul repeats the smaller H dimension for GQA.
+        bmm1 = builder.create_batch_matmul_node(mla_input_input, mla_input_cached_keys, True)
         assert get_expected_tensor_value(bmm1.get_type().output).shape == key_shape
 
         if self.logit_softcapping is not None:
@@ -366,7 +325,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         softmax = builder.create_softmax_node(bmm1, 3)
 
         # Second multiply ((input * key) * value)
-        bmm2 = builder.create_batch_matmul_node(softmax, reshape_values, False)
+        bmm2 = builder.create_batch_matmul_node(softmax, mla_input_cached_values, False)
         assert get_expected_tensor_value(bmm2.get_type().output).shape == value_shape
         output = builder.create_slice_concat_node(
             bmm2, axis=3, split_axis=1,
@@ -398,9 +357,6 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 dram_layout=TensorDRAMLayout.HWC
             )
             tessellate_params = {2:attn_mask_tessellate_params}
-
-        if not self.cfg.pipeline_cfg.use_strided_kv_cache:
-            return tessellate_params
 
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
@@ -434,10 +390,6 @@ class LanguageCacheModel(LanguagePartBaseModel):
         """
         Get the custom tessellate params for model's output on the MLA.
         """
-        if not self.cfg.pipeline_cfg.use_strided_kv_cache:
-            # Use default tessellate params.
-            return {}
-
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
             1,
