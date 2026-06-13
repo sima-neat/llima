@@ -30,27 +30,23 @@ The Model Compiler tooling is delivered as a Python wheel:
 
 ## Install
 
-Download the latest `main` branch runtime bundle:
+Install the latest LLiMa runtime packages on the DevKit with `sima-cli`:
 
 ```bash
-curl -fLO https://artifacts.sima-neat.com/llima/sima-llima-main-latest.tar.gz
-curl -fLO https://artifacts.sima-neat.com/llima/sima-llima-main-latest.tar.gz.sha256
-echo "$(cat sima-llima-main-latest.tar.gz.sha256)  sima-llima-main-latest.tar.gz" | sha256sum -c -
-tar -xzf sima-llima-main-latest.tar.gz
+sima-cli neat install llima
 ```
 
-Install the runtime packages on the DevKit:
+To install a specific release, branch, or artifact reference, include it in the
+target:
 
 ```bash
-sudo apt install ./sima-lmm-*-Linux-core.deb ./sima-lmm-*-Linux-cli.deb
+sima-cli neat install llima@<version-or-ref>
 ```
 
-Install the development package only on systems that compile C++ consumers
-against LLiMa:
-
-```bash
-sudo apt install ./sima-lmm-*-Linux-dev.deb
-```
+This installs the LLiMa Debian packages required by the Modalix runtime,
+including the CLI, C++ runtime, and development components. Use
+`sima-cli neat install --help` for the full target syntax and environment
+options.
 
 ## Build LLiMa
 
