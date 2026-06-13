@@ -19,7 +19,7 @@ For concrete GenAI demos, check our [Neat Apps portal](https://apps.sima-neat.co
 
 LLiMa compilation tools are installed by default in Model Compiler.
 The LLiMa runtime is installed natively on Modalix as part of the Neat runtime.
-See [Neat Framework installation](/getting-started/installation/neat-framework/)
+See [Neat Framework installation](/getting-started/neat-library/)
 for the runtime installation flow.
 
 ## Supported Models
@@ -31,21 +31,23 @@ capabilities:
 |----|----|----|
 | [Llama 2](https://huggingface.co/collections/meta-llama/llama-2-family) | LLM | [7b](https://huggingface.co/simaai/Llama-2-7b-chat-hf-a16w4) |
 | [Llama 3.1](https://huggingface.co/collections/meta-llama/llama-31) | LLM | [8b](https://huggingface.co/simaai/Llama-3.1-8B-Instruct-a16w4) |
-| [Llama 3.2](https://huggingface.co/collections/meta-llama/llama-32) | LLM | 1b, [3b](https://huggingface.co/simaai/Llama-3.2-3B-Instruct-a16w4) |
+| [Llama 3.2](https://huggingface.co/collections/meta-llama/llama-32) | LLM | [1b](https://huggingface.co/simaai/Llama-3.2-1B-Instruct-GPTQ-a16w4), [3b](https://huggingface.co/simaai/Llama-3.2-3B-Instruct-a16w4) |
 | [Gemma 1](https://huggingface.co/collections/google/gemma-release) | LLM | 2b, 7b |
 | [Gemma 2](https://huggingface.co/collections/google/gemma-2-release) | LLM | 2b, 9b |
 | [Gemma 3](https://huggingface.co/collections/google/gemma-3-release) | LLM | [1b](https://huggingface.co/simaai/gemma-3-1b-it-a16w4), [4b](https://huggingface.co/simaai/gemma-3-4b-it-a16w4) |
 | [Phi 3.5 mini](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) | LLM | [3.8b](https://huggingface.co/simaai/Phi-3.5-mini-instruct-a16w4) |
-| [Qwen 2.5](https://huggingface.co/collections/Qwen/qwen25) | LLM | [0.5b](https://huggingface.co/simaai/Qwen2.5-0.5B-instruct), [1.5b](https://huggingface.co/simaai/Qwen2.5-1.5B-instruct), 3b, [7b](https://huggingface.co/simaai/Qwen2.5-7B-instruct) |
-| [Qwen 3](https://huggingface.co/collections/Qwen/qwen3) | LLM | [0.6b](https://huggingface.co/simaai/Qwen3-0.6B), [1.7b](https://huggingface.co/simaai/Qwen3-1.7B), [4b](https://huggingface.co/simaai/Qwen3-4B-Instruct-2507), [8b](https://huggingface.co/simaai/Qwen3-8B) |
+| [Qwen 2.5](https://huggingface.co/collections/Qwen/qwen25) | LLM | [0.5b](https://huggingface.co/simaai/Qwen2.5-0.5B-Instruct-GPTQ-a16w4), [1.5b](https://huggingface.co/simaai/Qwen2.5-1.5B-Instruct-GPTQ-a16w4), [3b](https://huggingface.co/simaai/Qwen2.5-3B-Instruct-GPTQ-a16w4), [7b](https://huggingface.co/simaai/Qwen2.5-7B-Instruct-GPTQ-a16w4) |
+| [Qwen 3](https://huggingface.co/collections/Qwen/qwen3) | LLM | [0.6b](https://huggingface.co/simaai/Qwen3-0.6B-GPTQ-a16w4), [1.7b](https://huggingface.co/simaai/Qwen3-1.7B-GPTQ-a16w4), [4b](https://huggingface.co/simaai/Qwen3-4B-Instruct-2507-GPTQ-a16w4), [8b](https://huggingface.co/simaai/Qwen3-8B-GPTQ-a16w4) |
 | [Mistral 1](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) | LLM | [7b](https://huggingface.co/simaai/Mistral-7B-Instruct-v0.3-a16w4) |
-| [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2) | LLM | 350m, 1.2b, 2.6b |
+| [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2) | LLM | [350m](https://huggingface.co/simaai/LFM2-350M-a16w4), [1.2b](https://huggingface.co/simaai/LFM2-1.2B-a16w4), [2.6b](https://huggingface.co/simaai/LFM2-2.6B-a16w4) |
 | [Llava 1.5](https://huggingface.co/llava-hf/llava-1.5-7b-hf) | VLM | [7b](https://huggingface.co/simaai/llava-1.5-7b-hf-a16w4) |
 | [PaliGemma](https://huggingface.co/google/paligemma-3b-pt-224) | VLM | [3b](https://huggingface.co/simaai/paligemma-3b-pt-224-a16w8) |
-| [Gemma 3](https://huggingface.co/simaai/gemma3-siglip448) | VLM | [4b](https://huggingface.co/simaai/gemma3-siglip448-a16w4) |
-| [Qwen 2.5 VL](https://huggingface.co/collections/Qwen/qwen25-vl) | VLM | [3b](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct), [7b](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) |
-| [Qwen 3 VL](https://huggingface.co/collections/Qwen/qwen3-vl) | VLM | 2b, [4b](https://huggingface.co/simaai/Qwen3-VL-4B-Instruct-a16w4), [8b](https://huggingface.co/simaai/Qwen3-VL-8B-Instruct-a16w4) |
+| [Gemma 3](https://huggingface.co/simaai/gemma3-siglip448-a16w4) | VLM | [4b](https://huggingface.co/simaai/gemma3-siglip448-a16w4) |
+| [Gemma 4](https://huggingface.co/collections/google/gemma-4) | VLM | [E2B](https://huggingface.co/simaai/gemma4-E2B-it), [E4B](https://huggingface.co/simaai/gemma4-E4B-it) |
+| [Qwen 2.5 VL](https://huggingface.co/collections/Qwen/qwen25-vl) | VLM | [3b](https://huggingface.co/simaai/Qwen2.5-VL-3B-Instruct-GPTQ-a16w4), [7b](https://huggingface.co/simaai/Qwen2.5-VL-7B-Instruct-GPTQ-a16w4) |
+| [Qwen 3 VL](https://huggingface.co/collections/Qwen/qwen3-vl) | VLM | [2b](https://huggingface.co/simaai/Qwen3-VL-2B-Instruct-GPTQ-a16w4), [4b](https://huggingface.co/simaai/Qwen3-VL-4B-Instruct-GPTQ-a16w4), [8b](https://huggingface.co/simaai/Qwen3-VL-8B-Instruct-GPTQ-a16w4) |
 | [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2-vl) | VLM | [450m](https://huggingface.co/simaai/LFM2-VL-450M-a16w4), [1.6b](https://huggingface.co/simaai/LFM2-VL-1.6B-a16w4), [3b](https://huggingface.co/simaai/LFM2-VL-3B-a16w4) |
+| [Whisper](https://huggingface.co/openai/whisper-small) | ASR | [small](https://huggingface.co/simaai/whisper-small-a16w8) |
 
 ## Limitations
 

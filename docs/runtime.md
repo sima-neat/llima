@@ -50,7 +50,7 @@ For all available options, run `llima run -h`.
 **Examples**
 
 ``` console
-modalix:~$ llima run Qwen3-VL-4B-Instruct-a16w4
+modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
 ```
 
 ## Interactive Commands
