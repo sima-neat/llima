@@ -69,38 +69,22 @@ class MLAModelWithBuffer {
         }
 
     private:
-        void _update_buf_addrs(
-            std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
-            std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
-        );
         void _debug_inouts(const std::string& name, std::map<uint8_t, MLABufferSlice>* fm_map_ptr);
-        simaaidispatcher::JobMLA _make_job(
+        simaaidispatcher::PreparedMlaRunRef _prepare_run_ref(
             std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
-        ) const;
-        std::vector<simaaidispatcher::RuntimeBufferBinding> _make_bindings(
-            const std::vector<MLABufferSlice>& default_slices,
-            std::map<uint8_t, MLABufferSlice>* override_map_ptr,
-            simaaidispatcher::RuntimeBindingRole role
-        ) const;
-        static simaaidispatcher::RuntimeBufferBinding _make_binding(
-            const std::vector<MLABufferSlice>& default_slices,
-            const MLABufferSlice& effective_slice,
-            uint8_t logical_idx,
-            simaaidispatcher::RuntimeBindingRole role
         );
         static simaaidispatcher::DispatcherBase* _get_dispatcher();
 
         uint16_t _model_idx;
         std::vector<MLABufferSlice> _ifms;
-        std::vector<uint64_t> _ifm_buf_addrs;
         std::vector<MLABufferSlice> _ofms;
-        std::vector<uint64_t> _ofm_buf_addrs;
+        simaaidispatcher::PreparedMlaPlan _prepared_plan;
 
         static std::map<std::filesystem::path, uint16_t> _unique_model_path_to_idx_map;
         static std::vector<std::filesystem::path> _unique_model_paths;
         static std::vector<mla_model_p> _unique_model_ptrs;
-        static std::vector<simaaidispatcher::JobMLA> _queue;
+        static simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest _queue_request;
         static simaaidispatcher::DispatcherBase* _dispatcher;
         static inline bool _profile = false;
         static inline bool _print_inouts = false;

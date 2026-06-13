@@ -21,6 +21,9 @@ string(REPLACE "\n" ";" SIMA_LMM_MANIFEST_VERSION_LIST "${SIMA_LMM_MANIFEST_VERS
 list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PLATFORM_VERSION)
 list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PACKAGE_BASE_VERSION)
 
+set(SIMA_LMM_MEMORY_LIB_VERSION "2.1.1" CACHE STRING
+    "Debian package version required for simaai-memory-lib.")
+
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
     set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
 endif()
@@ -67,14 +70,28 @@ endif()
 # Find Python binding dependencies only when building the extension. The C++ runtime package can
 # be configured and installed without Python/nanobind.
 if(SIMA_LMM_BUILD_PYTHON)
-    find_package(Python 3.11 COMPONENTS Interpreter Development REQUIRED)
+    if(CMAKE_CROSSCOMPILING AND DEFINED Python_INCLUDE_DIR AND DEFINED Python_LIBRARY)
+        find_package(Python 3.11 COMPONENTS Interpreter REQUIRED)
+        set(Python_INCLUDE_DIRS "${Python_INCLUDE_DIR}")
+        if(NOT TARGET Python::Module)
+            add_library(Python::Module INTERFACE IMPORTED)
+            set_target_properties(Python::Module PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${Python_INCLUDE_DIR}"
+                INTERFACE_LINK_LIBRARIES "${Python_LIBRARY}"
+            )
+        endif()
+    else()
+        find_package(Python 3.11 COMPONENTS Interpreter Development REQUIRED)
+    endif()
 
     # Use the pypi version of nanobind instead of the official repo since it is a "pre-built"
     # library. nanobind is installed when python/pip runs the pyproject.toml.
-    execute_process(
-        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
-        OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
-    )
+    if(NOT DEFINED nanobind_ROOT)
+        execute_process(
+            COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+            OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
+        )
+    endif()
     find_package(nanobind CONFIG REQUIRED NO_CMAKE_FIND_ROOT_PATH)
 endif()
 
@@ -95,6 +112,29 @@ pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
 pkg_check_modules(CPPZMQ REQUIRED cppzmq)
 pkg_check_modules(JSONCPP REQUIRED IMPORTED_TARGET jsoncpp)
 pkg_check_modules(Readline REQUIRED IMPORTED_TARGET readline)
+
+set(SIMA_LMM_CPPZMQ_LIBRARIES ${CPPZMQ_LIBRARIES})
+if(CMAKE_SYSROOT AND NOT TARGET zmq)
+    set(_SIMA_LMM_ZMQ_LIBRARY_CANDIDATES "")
+    foreach(_SIMA_LMM_ZMQ_LIBDIR IN ITEMS
+            "${CMAKE_SYSROOT}/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}"
+            "${CMAKE_SYSROOT}/usr/lib/aarch64-linux-gnu"
+            "${CMAKE_SYSROOT}/usr/lib")
+        if(IS_DIRECTORY "${_SIMA_LMM_ZMQ_LIBDIR}")
+            file(GLOB _SIMA_LMM_ZMQ_LIBS "${_SIMA_LMM_ZMQ_LIBDIR}/libzmq.so.*")
+            list(APPEND _SIMA_LMM_ZMQ_LIBRARY_CANDIDATES ${_SIMA_LMM_ZMQ_LIBS})
+        endif()
+    endforeach()
+    if(_SIMA_LMM_ZMQ_LIBRARY_CANDIDATES)
+        list(REMOVE_DUPLICATES _SIMA_LMM_ZMQ_LIBRARY_CANDIDATES)
+        list(SORT _SIMA_LMM_ZMQ_LIBRARY_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+        list(GET _SIMA_LMM_ZMQ_LIBRARY_CANDIDATES 0 _SIMA_LMM_ZMQ_LIBRARY)
+        add_library(zmq SHARED IMPORTED GLOBAL)
+        set_target_properties(zmq PROPERTIES IMPORTED_LOCATION "${_SIMA_LMM_ZMQ_LIBRARY}")
+        set(SIMA_LMM_CPPZMQ_LIBRARIES zmq)
+        message(STATUS "Using sysroot ZeroMQ shared library: ${_SIMA_LMM_ZMQ_LIBRARY}")
+    endif()
+endif()
 
 include(FetchContent)
 set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL "Force offline build")
@@ -346,7 +386,7 @@ target_link_libraries(
     ${AVFORMAT_LIBRARIES}
     ${AVUTIL_LIBRARIES}
     ${SWRESAMPLE_LIBRARIES}
-    ${CPPZMQ_LIBRARIES}
+    ${SIMA_LMM_CPPZMQ_LIBRARIES}
     PkgConfig::JSONCPP
     msgpack-cxx
     fmt::fmt
@@ -537,7 +577,7 @@ set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
     "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
-    "simaai-memory-lib (= 2.0.0), "
+    "simaai-memory-lib (= ${SIMA_LMM_MEMORY_LIB_VERSION}), "
     "libcpp-httplib0.11, libfftw3-double3, "
     "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
     "libavcodec59, libavformat59, libavutil57, libswresample4, "
