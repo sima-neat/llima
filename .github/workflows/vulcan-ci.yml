@@ -175,7 +175,7 @@ jobs:
 
   promote-latest-tag:
     name: Promote Vulcan latest tag
-    if: ${{ github.ref_type == 'branch' }}
+    if: ${{ github.ref_type == 'branch' || github.ref_type == 'tag' }}
     needs:
       - resolve-vulcan-config
       - publish-vulcan-artifacts
