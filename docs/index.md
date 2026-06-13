@@ -13,7 +13,7 @@ SiMa.ai also publishes precompiled GenAI models on
 [Hugging Face](https://huggingface.co/simaai). Start there when a suitable model
 already exists.
 
-For concrete GenAI demos, check our [Neat Apps portal](https://apps.sima-neat.com/portal/index.html).
+For concrete GenAI demos, see the [examples](https://developer.sima.ai/examples).
 
 ## LLiMa Availability
 
