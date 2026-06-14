@@ -11,7 +11,7 @@ It extends [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm
 
 ## Installation
 
-MoLE requires the LLiMa runtime on the Modalix device. See [Neat Framework installation](/getting-started/installation/neat-framework/) for the runtime installation flow.
+MoLE requires the LLiMa runtime on the Modalix device. See [Neat Framework installation](/getting-started/neat-library/) for the runtime installation flow.
 
 Install MoLE on your Modalix device using the `sima-cli`:
 
