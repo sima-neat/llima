@@ -134,11 +134,36 @@ std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
     // The text streamer is disabled for this mode.
     _text_streamer.disable();
     std::vector<Eigen::bfloat16> logits;
-    for (size_t i = 0; i < input_token_ids.size(); ++i) {
-        _language_model_ptr->run_model_once(1, i, 0, input_token_ids[i], &logits);
+    try {
+        for (size_t i = 0; i < input_token_ids.size(); ++i) {
+            _language_model_ptr->run_model_once(1, i, 0, input_token_ids[i], &logits);
+        }
+        _text_streamer.enable();
+        return logits;
+    } catch (...) {
+        _text_streamer.enable();
+        throw;
     }
-    _text_streamer.enable();
-    return logits;
+}
+
+
+LogLikelihoodResult VisionLanguageModel::run_model_for_loglikelihood(
+    std::span<const uint32_t> input_token_ids,
+    size_t continuation_start,
+    std::span<const uint32_t> continuation_token_ids
+) {
+    // Score only the continuation tokens needed by lm-eval.
+    _text_streamer.disable();
+    try {
+        auto result = _language_model_ptr->run_model_for_loglikelihood(
+            input_token_ids, continuation_start, continuation_token_ids
+        );
+        _text_streamer.enable();
+        return result;
+    } catch (...) {
+        _text_streamer.enable();
+        throw;
+    }
 }
 
 

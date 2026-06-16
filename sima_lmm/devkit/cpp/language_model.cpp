@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -18,6 +20,45 @@
 
 namespace simaai {
 namespace llima {
+
+namespace {
+
+LogLikelihoodResult score_logits(
+    std::span<const Eigen::bfloat16> logits, uint32_t target_token_id
+) {
+    if (target_token_id >= logits.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Target token id {} is outside logits vocabulary size {}",
+                target_token_id,
+                logits.size()
+            )
+        );
+    }
+
+    double max_logit = -std::numeric_limits<double>::infinity();
+    uint32_t argmax_token_id = 0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        const double value = static_cast<float>(logits[i]);
+        if (value > max_logit) {
+            max_logit = value;
+            argmax_token_id = static_cast<uint32_t>(i);
+        }
+    }
+
+    double exp_sum = 0.0;
+    for (const auto logit : logits) {
+        exp_sum += std::exp(static_cast<float>(logit) - max_logit);
+    }
+
+    const double target_logit = static_cast<float>(logits[target_token_id]);
+    return {
+        target_logit - (max_logit + std::log(exp_sum)),
+        argmax_token_id == target_token_id
+    };
+}
+
+}
 
 namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
@@ -408,12 +449,100 @@ void LanguageModel::run_model_decode(
 }
 
 
+LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
+    std::span<const uint32_t> input_token_ids,
+    size_t continuation_start,
+    std::span<const uint32_t> continuation_token_ids
+) {
+    if (!_cfg.pipeline_cfg.return_logits) {
+        throw std::runtime_error(
+            "model not compiled with --return_logits; "
+            "accuracy/loglikelihood tasks are unsupported"
+        );
+    }
+    if (input_token_ids.empty()) {
+        throw std::runtime_error("Loglikelihood request must include at least one input token");
+    }
+    if (input_token_ids.size() > _max_num_tokens) {
+        throw std::runtime_error(
+            fmt::format(
+                "Loglikelihood input length {} exceeds max_num_tokens {}",
+                input_token_ids.size(),
+                _max_num_tokens
+            )
+        );
+    }
+    if (continuation_token_ids.empty()) {
+        throw std::runtime_error("Loglikelihood request must include continuation token ids");
+    }
+    if (continuation_start > input_token_ids.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Continuation start {} exceeds input length {}",
+                continuation_start,
+                input_token_ids.size()
+            )
+        );
+    }
+    if (continuation_start + continuation_token_ids.size() > input_token_ids.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Continuation span [{}:{}) exceeds input length {}",
+                continuation_start,
+                continuation_start + continuation_token_ids.size(),
+                input_token_ids.size()
+            )
+        );
+    }
+
+    _is_running = true;
+    double total_logprob = 0.0;
+    bool is_greedy = true;
+    const size_t continuation_end = continuation_start + continuation_token_ids.size();
+
+    try {
+        for (size_t token_idx = 0; token_idx < input_token_ids.size(); ++token_idx) {
+            if (token_idx >= continuation_start && token_idx < continuation_end) {
+                std::vector<Eigen::bfloat16> logits;
+                logits.reserve(_cfg.lm_cfg.token_cfg.vocab_size);
+                run_model_once(
+                    1, token_idx, 0, input_token_ids[token_idx], &logits
+                );
+                if (logits.size() != _cfg.lm_cfg.token_cfg.vocab_size) {
+                    throw std::runtime_error(
+                        fmt::format(
+                            "Expected {} logits, got {}",
+                            _cfg.lm_cfg.token_cfg.vocab_size,
+                            logits.size()
+                        )
+                    );
+                }
+                const auto token_score = score_logits(
+                    logits, continuation_token_ids[token_idx - continuation_start]
+                );
+                total_logprob += token_score.logprob;
+                is_greedy = is_greedy && token_score.is_greedy;
+            } else {
+                run_model_once(1, token_idx, 0, input_token_ids[token_idx], nullptr, true);
+            }
+        }
+    } catch (...) {
+        _is_running = false;
+        throw;
+    }
+
+    _is_running = false;
+    return {total_logprob, is_greedy};
+}
+
+
 uint32_t LanguageModel::run_model_once(
     uint16_t num_tokens,
     uint16_t token_idx,
     uint16_t num_input_tokens,
     uint32_t token_id,
-    std::vector<Eigen::bfloat16>* logits_ptr
+    std::vector<Eigen::bfloat16>* logits_ptr,
+    bool skip_output
 ) {
     uint16_t next_token_idx;
     if (num_tokens > 1) {
@@ -714,8 +843,20 @@ uint32_t LanguageModel::run_model_once(
         }
     }
 
+    if (skip_output) {
+        return 0;
+    }
+
     if (logits_ptr) {
-        assert(num_tokens == 1 && _cfg.pipeline_cfg.return_logits);
+        if (num_tokens != 1) {
+            throw std::runtime_error("Logit export only supports single-token model calls");
+        }
+        if (!_cfg.pipeline_cfg.return_logits) {
+            throw std::runtime_error(
+                "model not compiled with --return_logits; "
+                "accuracy/loglikelihood tasks are unsupported"
+            );
+        }
         MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
         buf_ptr->invalidate_cache();
 

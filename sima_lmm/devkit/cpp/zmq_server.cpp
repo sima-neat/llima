@@ -1,3 +1,5 @@
+#include <array>
+
 #include <fmt/ranges.h>
 
 #include "zmq_server.hpp"
@@ -68,73 +70,121 @@ void ZMQServer::run() {
             }
             _logger->info("Received a request");
 
-            // Unpack the metadata and check the values.
-            msgpack::object_handle handle = msgpack::unpack(
-                reinterpret_cast<char*>(request_messages[0].data()), request_messages[0].size()
-            );
-            auto request_metadata = handle.get().as<ZMQRequestMetadata>();
-            if (
-                request_metadata.tensor_shape.size() != 2
-                || request_metadata.tensor_shape[0] != 1
-                || request_metadata.tensor_shape[1] <= 0
-            )
-                throw std::runtime_error(
-                    fmt::format("Invalid shape: {}", request_metadata.tensor_shape)
-                );
-            if (request_metadata.tensor_dtype != "uint32")
-                throw std::runtime_error(
-                    fmt::format("Invalid dtype: {}", request_metadata.tensor_dtype)
-                );
-            _logger->info(
-                "type: {}, dtype: {}, shape: {}, max_num_tokens: {}, stop_token_ids: {}",
-                request_metadata.type,
-                request_metadata.tensor_dtype,
-                request_metadata.tensor_shape,
-                request_metadata.max_num_tokens.value_or(0),
-                request_metadata.stop_token_ids.value_or(std::set<uint32_t>())
-            );
-
-            // Construct input token ids.
-            std::span<const uint32_t> input_token_ids(
-                reinterpret_cast<const uint32_t*>(request_messages[1].data()),
-                request_metadata.tensor_shape[1]
-            );
-
-            // Service the request and populate the response messages.
             ZMQResponseMetadata response_metadata;
             std::array<zmq::message_t, 2> response_messages;
             ChronoTimer inference_timer(true);
-            if (request_metadata.type == "generate") {
-                // Given a list of input token ids, return the list of generated token ids.
-                auto result = _vision_language_model_ptr->run_model(
-                    input_token_ids, request_metadata.max_num_tokens,
-                    request_metadata.stop_token_ids
+            try {
+                // Unpack the metadata and check the values.
+                msgpack::object_handle handle = msgpack::unpack(
+                    reinterpret_cast<char*>(request_messages[0].data()), request_messages[0].size()
                 );
-                response_metadata.tensor_dtype = "uint32";
-                response_metadata.tensor_shape = {1, result.size()};
-                response_messages[1] = {result.data(), result.size() * 4};
-            } else if (request_metadata.type == "model_call") {
-                // Given a list of input token ids, return the list of computed logits.
-                auto result = _vision_language_model_ptr->run_model_for_logits(input_token_ids);
-                response_metadata.tensor_dtype = "bfloat16";
-                response_metadata.tensor_shape = {
-                    1, input_token_ids.size(), result.size() / input_token_ids.size()
-                };
-                response_messages[1] = {result.data(), result.size() * 2};
-            } else if (request_metadata.type == "generate_for_perf") {
-                // Given a list of input token ids, return the list of time to generate the next
-                // token. The first item of the list is the TTFT.
-                auto result = _vision_language_model_ptr->run_model_for_ttnt(
-                    input_token_ids, request_metadata.max_num_tokens,
-                    request_metadata.stop_token_ids
+                auto request_metadata = handle.get().as<ZMQRequestMetadata>();
+                if (
+                    request_metadata.tensor_shape.size() != 2
+                    || request_metadata.tensor_shape[0] != 1
+                    || request_metadata.tensor_shape[1] <= 0
+                )
+                    throw std::runtime_error(
+                        fmt::format("Invalid shape: {}", request_metadata.tensor_shape)
+                    );
+                if (request_metadata.tensor_dtype != "uint32")
+                    throw std::runtime_error(
+                        fmt::format("Invalid dtype: {}", request_metadata.tensor_dtype)
+                    );
+                _logger->info(
+                    "type: {}, dtype: {}, shape: {}, max_num_tokens: {}, stop_token_ids: {}, "
+                    "continuation_start: {}, continuation_tokens: {}",
+                    request_metadata.type,
+                    request_metadata.tensor_dtype,
+                    request_metadata.tensor_shape,
+                    request_metadata.max_num_tokens.value_or(0),
+                    request_metadata.stop_token_ids.value_or(std::set<uint32_t>()),
+                    request_metadata.continuation_start.value_or(0),
+                    request_metadata.continuation_token_ids.value_or(std::vector<uint32_t>())
                 );
-                response_metadata.tensor_dtype = "float64";
-                response_metadata.tensor_shape = {1, result.size()};
-                response_messages[1] = {result.data(), result.size() * 8};
-            } else {
-                throw std::runtime_error(
-                    fmt::format("Unknown request type: {}", request_metadata.type)
+
+                // Construct input token ids.
+                std::span<const uint32_t> input_token_ids(
+                    reinterpret_cast<const uint32_t*>(request_messages[1].data()),
+                    request_metadata.tensor_shape[1]
                 );
+
+                // Service the request and populate the response messages.
+                if (request_metadata.type == "generate") {
+                    // Given a list of input token ids, return the list of generated token ids.
+                    auto result = _vision_language_model_ptr->run_model(
+                        input_token_ids, request_metadata.max_num_tokens,
+                        request_metadata.stop_token_ids
+                    );
+                    response_metadata.tensor_dtype = "uint32";
+                    response_metadata.tensor_shape = {1, result.size()};
+                    response_messages[1] = {result.data(), result.size() * sizeof(uint32_t)};
+                } else if (request_metadata.type == "model_call") {
+                    if (request_metadata.continuation_token_ids.has_value()) {
+                        const auto& continuation_token_ids = (
+                            request_metadata.continuation_token_ids.value()
+                        );
+                        if (
+                            !request_metadata.continuation_start.has_value()
+                            && continuation_token_ids.size() > input_token_ids.size()
+                        ) {
+                            throw std::runtime_error(
+                                fmt::format(
+                                    "Continuation length {} exceeds input length {}",
+                                    continuation_token_ids.size(),
+                                    input_token_ids.size()
+                                )
+                            );
+                        }
+                        const auto continuation_start = request_metadata.continuation_start.value_or(
+                            input_token_ids.size() - continuation_token_ids.size()
+                        );
+                        auto result = _vision_language_model_ptr->run_model_for_loglikelihood(
+                            input_token_ids, continuation_start, continuation_token_ids
+                        );
+                        std::array<double, 2> response_data{
+                            result.logprob, result.is_greedy? 1.0 : 0.0
+                        };
+                        response_metadata.tensor_dtype = "float64";
+                        response_metadata.tensor_shape = {1, response_data.size()};
+                        response_metadata.result_type = "loglikelihood";
+                        response_messages[1] = {
+                            response_data.data(), response_data.size() * sizeof(double)
+                        };
+                    } else {
+                        // Given a list of input token ids, return the list of computed logits.
+                        auto result = _vision_language_model_ptr->run_model_for_logits(
+                            input_token_ids
+                        );
+                        response_metadata.tensor_dtype = "bfloat16";
+                        response_metadata.tensor_shape = {
+                            1, input_token_ids.size(), result.size() / input_token_ids.size()
+                        };
+                        response_messages[1] = {
+                            result.data(), result.size() * sizeof(Eigen::bfloat16)
+                        };
+                    }
+                } else if (request_metadata.type == "generate_for_perf") {
+                    // Given a list of input token ids, return the list of time to generate the next
+                    // token. The first item of the list is the TTFT.
+                    auto result = _vision_language_model_ptr->run_model_for_ttnt(
+                        input_token_ids, request_metadata.max_num_tokens,
+                        request_metadata.stop_token_ids
+                    );
+                    response_metadata.tensor_dtype = "float64";
+                    response_metadata.tensor_shape = {1, result.size()};
+                    response_messages[1] = {result.data(), result.size() * sizeof(double)};
+                } else {
+                    throw std::runtime_error(
+                        fmt::format("Unknown request type: {}", request_metadata.type)
+                    );
+                }
+            } catch (const std::exception& e) {
+                response_metadata.tensor_dtype = "";
+                response_metadata.tensor_shape = {};
+                response_metadata.error = e.what();
+                response_messages[1] = zmq::message_t();
+                _logger->error("Request failed: {}", e.what());
             }
             response_metadata.infer_time_ns = inference_timer.stop<std::nano>();
 

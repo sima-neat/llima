@@ -182,8 +182,9 @@ def make_table(
     latex_writer = LatexTableWriter()
     latex_writer.headers = all_headers
 
+    safe_table_title = table_title.replace("[", "(").replace("]", ")")
     rich_table = Table(
-        title=table_title,
+        title=safe_table_title,
         show_header=True,
         box=rich.box.SQUARE,
         header_style=f"bold {Colors.MAGENTA.value}",

@@ -24,6 +24,11 @@
 namespace simaai {
 namespace llima {
 
+struct LogLikelihoodResult {
+    double logprob;
+    bool is_greedy;
+};
+
 // Key to access the language model map: (num_tokens, layer_idx, token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
@@ -59,7 +64,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t token_idx,
             uint16_t num_input_tokens,
             uint32_t token_id,
-            std::vector<Eigen::bfloat16>* logits_ptr = nullptr
+            std::vector<Eigen::bfloat16>* logits_ptr = nullptr,
+            bool skip_output = false
+        );
+        LogLikelihoodResult run_model_for_loglikelihood(
+            std::span<const uint32_t> input_token_ids,
+            size_t continuation_start,
+            std::span<const uint32_t> continuation_token_ids
         );
         // Speculative-decoding entry point: target invokes this, passing the
         // draft as a reference. Returns the newly generated token IDs, or
