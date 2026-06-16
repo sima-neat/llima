@@ -170,6 +170,18 @@ def prepare_mole(
     )
 
 
+def _table_title(config: Config, grouped: bool = False) -> str:
+    suffix = "Grouped Evaluation Results" if grouped else "Evaluation Results"
+    if config.backend == "modalix":
+        board = config.board.board_name if config.board is not None else "Modalix"
+        board_model = (
+            f" (board model: {config.board.model})"
+            if config.board and config.board.model else ""
+        )
+        return f"Modalix backend on {board}{board_model}: {config.model_id} {suffix}"
+    return f"HF backend: {config.model_id} {suffix}"
+
+
 def run(config: Config) -> dict[str, Any]:
     """
     run Runs LLM Evaluation based on the provided Config object.
@@ -239,13 +251,13 @@ def run(config: Config) -> dict[str, Any]:
     assert results, "Results were not generated!"
     evaluation_tracker.save_results_aggregated(results=results, samples=None)
 
-    table = make_table(result_dict=results, table_title=f"{config.model_id} Evaluation Results")
+    table = make_table(result_dict=results, table_title=_table_title(config))
     rich.print(table)
     if "groups" in results:
         table = make_table(
             result_dict=results,
             column="group",
-            table_title=f"{config.model_id} Grouped Evaluation Results"
+            table_title=_table_title(config, grouped=True)
         )
         rich.print(table)
 
