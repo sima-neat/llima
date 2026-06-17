@@ -45,7 +45,8 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         LogLikelihoodResult run_model_for_loglikelihood(
             std::span<const uint32_t> input_token_ids,
             size_t continuation_start,
-            std::span<const uint32_t> continuation_token_ids
+            std::span<const uint32_t> continuation_token_ids,
+            bool use_group_prefill = false
         );
         std::vector<double> run_model_for_ttnt(
             std::span<const uint32_t> input_token_ids,

@@ -68,7 +68,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LogLikelihoodResult run_model_for_loglikelihood(
             std::span<const uint32_t> input_token_ids,
             size_t continuation_start,
-            std::span<const uint32_t> continuation_token_ids
+            std::span<const uint32_t> continuation_token_ids,
+            bool use_group_prefill = false
         );
         void stop_model() { _is_running = false; }
 
@@ -134,6 +135,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
+        LogLikelihoodResult _run_model_once_for_loglikelihood(
+            uint16_t token_idx, uint32_t input_token_id, uint32_t target_token_id
+        );
         std::vector<uint32_t> _get_per_layer_token_ids(
             std::span<const uint32_t> input_token_ids
         ) const;

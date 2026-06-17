@@ -122,13 +122,14 @@ std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
 LogLikelihoodResult VisionLanguageModel::run_model_for_loglikelihood(
     std::span<const uint32_t> input_token_ids,
     size_t continuation_start,
-    std::span<const uint32_t> continuation_token_ids
+    std::span<const uint32_t> continuation_token_ids,
+    bool use_group_prefill
 ) {
     // Score only the continuation tokens needed by lm-eval.
     _text_streamer.disable();
     try {
         auto result = _language_model_ptr->run_model_for_loglikelihood(
-            input_token_ids, continuation_start, continuation_token_ids
+            input_token_ids, continuation_start, continuation_token_ids, use_group_prefill
         );
         _text_streamer.enable();
         return result;

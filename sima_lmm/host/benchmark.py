@@ -31,6 +31,10 @@ def main():
     common_parser.add_argument(
         "--board_ssh_pass", type=str, default=None, help="Board user password for SSH connection."
     )
+    common_parser.add_argument(
+        "--modalix_group_prefill", action=argparse.BooleanOptionalAction, default=False,
+        help="Use grouped prefix prefill for Modalix loglikelihood scoring"
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     acc_parser = subparsers.add_parser(
@@ -75,7 +79,8 @@ def main():
         do_start_server=args.board_start_server,
         do_perf=args.command == "perf",
         max_num_tokens=args.max_num_tokens,
-        max_new_tokens=args.max_new_tokens
+        max_new_tokens=args.max_new_tokens,
+        modalix_group_prefill=args.modalix_group_prefill
     )
     if config is None:
         parser.error("Invalid argument combinations")

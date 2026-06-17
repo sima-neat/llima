@@ -29,10 +29,11 @@ struct ZMQRequestMetadata {
     std::optional<std::set<uint32_t>> stop_token_ids;
     std::optional<size_t> continuation_start;
     std::optional<std::vector<uint32_t>> continuation_token_ids;
+    bool use_group_prefill = false;
 
     MSGPACK_DEFINE_MAP(
         type, tensor_dtype, tensor_shape, max_num_tokens, stop_token_ids, continuation_start,
-        continuation_token_ids
+        continuation_token_ids, use_group_prefill
     );
 };
 
