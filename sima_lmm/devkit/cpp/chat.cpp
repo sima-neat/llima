@@ -21,14 +21,10 @@ void Chat::set_system_prompt(std::string system_prompt) {
         return;
     }
 
-    // Start a new message with the system prompt.
+    // System/developer content is consumed as a plain string by Gemma4 and other chat templates.
     nlohmann::ordered_json system_message;
     system_message["role"] = "system";
-    if (_vlm_helper.is_multimodal()) {
-        system_message["content"].push_back({{"type", "text"}, {"text", std::move(system_prompt)}});
-    } else {
-        system_message["content"] = std::move(system_message);
-    }
+    system_message["content"] = std::move(system_prompt);
     _messages = nlohmann::ordered_json::array({system_message});
 }
 
@@ -48,7 +44,10 @@ void Chat::add_query(std::string query) {
     // Check how many images need to be added to this message in addition to the query.
     uint32_t num_images_in_messages = 0;
     for (const auto& message: _messages) {
-        for (const auto& item: message["content"]) {
+        const auto& content = message["content"];
+        if (!content.is_array())
+            continue;
+        for (const auto& item: content) {
             if (item.at("type") == "image")
                 ++num_images_in_messages;
         }
