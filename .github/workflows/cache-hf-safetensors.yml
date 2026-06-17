@@ -27,7 +27,7 @@ on:
         type: string
         default: tools/hf-safetensors/manifest.txt
       huggingface_token:
-        description: Optional Hugging Face token for guarded models. Prefer the HUGGINGFACE_TOKEN secret when available.
+        description: Optional Hugging Face token for guarded models. Prefer the HF_TOKEN secret when available.
         required: false
         type: string
         default: ""
@@ -76,7 +76,8 @@ jobs:
       ARTIFACT_KMS_KEY_ID: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
       ARTIFACT_BASE_URL: ${{ needs.resolve-vulcan-config.outputs.artifact_base_url }}
       ARTIFACT_CLOUDFRONT_DISTRIBUTION_ID: ${{ needs.resolve-vulcan-config.outputs.artifact_cloudfront_distribution_id }}
-      HUGGINGFACE_TOKEN: ${{ inputs.huggingface_token || secrets.HUGGINGFACE_TOKEN }}
+      HF_TOKEN: ${{ inputs.huggingface_token || secrets.HF_TOKEN || secrets.HUGGINGFACE_TOKEN }}
+      HUGGINGFACE_TOKEN: ${{ inputs.huggingface_token || secrets.HF_TOKEN || secrets.HUGGINGFACE_TOKEN }}
 
     steps:
       - name: Checkout

@@ -343,7 +343,11 @@ def publish_probe(args: argparse.Namespace) -> None:
 def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
     prefix = cache_prefix(args.cache_root, spec.repo_id)
     print(f"Resolving {spec.repo_id}@{spec.revision}")
-    token = os.environ.get("HUGGINGFACE_TOKEN", "").strip() or None
+    token = (
+        os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGINGFACE_TOKEN", "").strip()
+        or None
+    )
     info = api.model_info(repo_id=spec.repo_id, revision=spec.revision, token=token)
     resolved_revision = info.sha
     if not resolved_revision:
