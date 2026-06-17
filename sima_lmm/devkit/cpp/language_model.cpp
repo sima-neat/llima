@@ -470,26 +470,63 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     _is_running = true;
     double total_logprob = 0.0;
     bool is_greedy = true;
+    double model_token_seconds = 0.0;
+    double score_logits_seconds = 0.0;
+    double prefill_seconds = 0.0;
+    size_t model_token_count = 0;
+    size_t scored_token_count = 0;
     const size_t continuation_end = continuation_start + continuation_token_ids.size();
     size_t token_idx_begin = 0;
+
+    auto score_current_logits = [this](uint32_t target_token_id) -> LogLikelihoodResult {
+        MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
+        buf_ptr->invalidate_cache();
+
+        const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+            buf_ptr->get_virtual_addr()
+        );
+        ChronoTimer timer_score_logits(true);
+        auto result = score_logits(
+            std::span<const Eigen::bfloat16>(logits_ptr, _cfg.lm_cfg.token_cfg.vocab_size),
+            target_token_id
+        );
+        result.score_logits_seconds = timer_score_logits.stop();
+        return result;
+    };
 
     try {
         const size_t group_size = _cfg.pipeline_cfg.input_token_group_size;
         const bool should_group_prefill = (
             use_group_prefill && _use_group_token_models && group_size > 1
-            && continuation_start >= group_size
         );
         if (should_group_prefill) {
+            ChronoTimer timer_prefill(true);
             create_input_buffers(input_token_ids);
-            std::span<const uint32_t> prefix_input_tokens(
-                input_token_ids.data(), continuation_start
+
+            // Include the final context token so the grouped prefill output scores the first
+            // continuation token, matching normal generation prefill behavior for short prompts.
+            const size_t prefill_token_count = continuation_start + 1;
+            std::span<const uint32_t> prefill_input_tokens(
+                input_token_ids.data(), prefill_token_count
             );
-            const auto num_cached_tokens = _set_input_text_embeds(prefix_input_tokens);
-            run_model_prefill(prefix_input_tokens, num_cached_tokens, std::nullopt);
+            auto num_cached_tokens = _set_input_text_embeds(prefill_input_tokens);
+            if (num_cached_tokens >= prefill_token_count && prefill_token_count > 0) {
+                // Force the last prefill block to run so n1_buffer4 contains logits for the
+                // final context token, not stale logits from a previous request.
+                num_cached_tokens = static_cast<uint16_t>(prefill_token_count - 1);
+            }
+            run_model_prefill(prefill_input_tokens, num_cached_tokens, std::nullopt);
             if (!_is_running.load(std::memory_order_relaxed)) {
                 throw std::runtime_error("Loglikelihood group prefill was interrupted");
             }
-            token_idx_begin = continuation_start;
+            prefill_seconds += timer_prefill.stop();
+
+            const auto first_token_score = score_current_logits(continuation_token_ids[0]);
+            total_logprob += first_token_score.logprob;
+            score_logits_seconds += first_token_score.score_logits_seconds;
+            is_greedy = is_greedy && first_token_score.is_greedy;
+            ++scored_token_count;
+            token_idx_begin = prefill_token_count;
         }
 
         for (size_t token_idx = token_idx_begin; token_idx < input_token_ids.size(); ++token_idx) {
@@ -500,9 +537,16 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
                     continuation_token_ids[token_idx - continuation_start]
                 );
                 total_logprob += token_score.logprob;
+                model_token_seconds += token_score.model_token_seconds;
+                score_logits_seconds += token_score.score_logits_seconds;
                 is_greedy = is_greedy && token_score.is_greedy;
+                ++model_token_count;
+                ++scored_token_count;
             } else {
+                ChronoTimer timer_model_token(true);
                 run_model_once(1, token_idx, 0, input_token_ids[token_idx], nullptr, true);
+                model_token_seconds += timer_model_token.stop();
+                ++model_token_count;
             }
         }
     } catch (...) {
@@ -511,7 +555,23 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     }
 
     _is_running = false;
-    return {total_logprob, is_greedy};
+    const double measured_seconds = model_token_seconds + score_logits_seconds + prefill_seconds;
+    const double model_token_avg = (
+        model_token_count? model_token_seconds / model_token_count : 0.0
+    );
+    const double score_logits_avg = (
+        scored_token_count? score_logits_seconds / scored_token_count : 0.0
+    );
+    _logger->info(
+        "Loglikelihood timing: input_tokens={}, continuation_tokens={}, "
+        "model_token_calls={}, scored_tokens={}, prefill_tokens={}, "
+        "model_token_time={:.6f}s, score_logits_time={:.6f}s, prefill_time={:.6f}s, "
+        "measured_time={:.6f}s, model_token_avg={:.6f}s, score_logits_avg={:.6f}s",
+        input_token_ids.size(), continuation_token_ids.size(), model_token_count,
+        scored_token_count, token_idx_begin, model_token_seconds, score_logits_seconds,
+        prefill_seconds, measured_seconds, model_token_avg, score_logits_avg
+    );
+    return {total_logprob, is_greedy, model_token_seconds, score_logits_seconds, prefill_seconds};
 }
 
 
@@ -525,17 +585,24 @@ LogLikelihoodResult LanguageModel::_run_model_once_for_loglikelihood(
         );
     }
 
+    ChronoTimer timer_model_token(true);
     run_model_once(1, token_idx, 0, input_token_id, nullptr, true);
+    const double model_token_seconds = timer_model_token.stop();
+
     MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
     buf_ptr->invalidate_cache();
 
     const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
         buf_ptr->get_virtual_addr()
     );
-    return score_logits(
+    ChronoTimer timer_score_logits(true);
+    auto result = score_logits(
         std::span<const Eigen::bfloat16>(logits_ptr, _cfg.lm_cfg.token_cfg.vocab_size),
         target_token_id
     );
+    result.model_token_seconds = model_token_seconds;
+    result.score_logits_seconds = timer_score_logits.stop();
+    return result;
 }
 
 
