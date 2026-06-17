@@ -93,14 +93,15 @@ void ZMQServer::run() {
                     );
                 _logger->info(
                     "type: {}, dtype: {}, shape: {}, max_num_tokens: {}, stop_token_ids: {}, "
-                    "continuation_start: {}, continuation_tokens: {}",
+                    "continuation_start: {}, continuation_tokens: {}, use_group_prefill: {}",
                     request_metadata.type,
                     request_metadata.tensor_dtype,
                     request_metadata.tensor_shape,
                     request_metadata.max_num_tokens.value_or(0),
                     request_metadata.stop_token_ids.value_or(std::set<uint32_t>()),
                     request_metadata.continuation_start.value_or(0),
-                    request_metadata.continuation_token_ids.value_or(std::vector<uint32_t>())
+                    request_metadata.continuation_token_ids.value_or(std::vector<uint32_t>()),
+                    request_metadata.use_group_prefill
                 );
 
                 // Construct input token ids.
@@ -140,7 +141,8 @@ void ZMQServer::run() {
                             input_token_ids.size() - continuation_token_ids.size()
                         );
                         auto result = _vision_language_model_ptr->run_model_for_loglikelihood(
-                            input_token_ids, continuation_start, continuation_token_ids
+                            input_token_ids, continuation_start, continuation_token_ids,
+                            request_metadata.use_group_prefill
                         );
                         std::array<double, 2> response_data{
                             result.logprob, result.is_greedy? 1.0 : 0.0

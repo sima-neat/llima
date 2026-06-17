@@ -452,7 +452,8 @@ void LanguageModel::run_model_decode(
 LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     std::span<const uint32_t> input_token_ids,
     size_t continuation_start,
-    std::span<const uint32_t> continuation_token_ids
+    std::span<const uint32_t> continuation_token_ids,
+    bool use_group_prefill
 ) {
     if (!_cfg.pipeline_cfg.return_logits) {
         throw std::runtime_error(
@@ -499,26 +500,33 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     double total_logprob = 0.0;
     bool is_greedy = true;
     const size_t continuation_end = continuation_start + continuation_token_ids.size();
+    size_t token_idx_begin = 0;
 
     try {
-        for (size_t token_idx = 0; token_idx < input_token_ids.size(); ++token_idx) {
+        const size_t group_size = _cfg.pipeline_cfg.input_token_group_size;
+        const bool should_group_prefill = (
+            use_group_prefill && _use_group_token_models && group_size > 1
+            && continuation_start >= group_size
+        );
+        if (should_group_prefill) {
+            create_input_buffers(input_token_ids);
+            std::span<const uint32_t> prefix_input_tokens(
+                input_token_ids.data(), continuation_start
+            );
+            const auto num_cached_tokens = _set_input_text_embeds(prefix_input_tokens);
+            run_model_prefill(prefix_input_tokens, num_cached_tokens, std::nullopt);
+            if (!_is_running.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("Loglikelihood group prefill was interrupted");
+            }
+            token_idx_begin = continuation_start;
+        }
+
+        for (size_t token_idx = token_idx_begin; token_idx < input_token_ids.size(); ++token_idx) {
             if (token_idx >= continuation_start && token_idx < continuation_end) {
-                std::vector<Eigen::bfloat16> logits;
-                logits.reserve(_cfg.lm_cfg.token_cfg.vocab_size);
-                run_model_once(
-                    1, token_idx, 0, input_token_ids[token_idx], &logits
-                );
-                if (logits.size() != _cfg.lm_cfg.token_cfg.vocab_size) {
-                    throw std::runtime_error(
-                        fmt::format(
-                            "Expected {} logits, got {}",
-                            _cfg.lm_cfg.token_cfg.vocab_size,
-                            logits.size()
-                        )
-                    );
-                }
-                const auto token_score = score_logits(
-                    logits, continuation_token_ids[token_idx - continuation_start]
+                const auto token_score = _run_model_once_for_loglikelihood(
+                    static_cast<uint16_t>(token_idx),
+                    input_token_ids[token_idx],
+                    continuation_token_ids[token_idx - continuation_start]
                 );
                 total_logprob += token_score.logprob;
                 is_greedy = is_greedy && token_score.is_greedy;
@@ -533,6 +541,30 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
 
     _is_running = false;
     return {total_logprob, is_greedy};
+}
+
+
+LogLikelihoodResult LanguageModel::_run_model_once_for_loglikelihood(
+    uint16_t token_idx, uint32_t input_token_id, uint32_t target_token_id
+) {
+    if (!_cfg.pipeline_cfg.return_logits) {
+        throw std::runtime_error(
+            "model not compiled with --return_logits; "
+            "accuracy/loglikelihood tasks are unsupported"
+        );
+    }
+
+    run_model_once(1, token_idx, 0, input_token_id, nullptr, true);
+    MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
+    buf_ptr->invalidate_cache();
+
+    const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+        buf_ptr->get_virtual_addr()
+    );
+    return score_logits(
+        std::span<const Eigen::bfloat16>(logits_ptr, _cfg.lm_cfg.token_cfg.vocab_size),
+        target_token_id
+    );
 }
 
 
@@ -2270,6 +2302,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
             }
             if (
                 num_images == 0
+                && token_idx == num_cached_tokens
                 && token_idx < _cached_token_ids.size()
                 && token_id == _cached_token_ids[token_idx]
             )

@@ -42,6 +42,7 @@ class Config:
         do_perf: Whether to perform performance benchmarking.
         max_num_tokens: Max number of tokens. Used only for perf benchmarking.
         max_new_tokens: Max number of new tokens. Used only for perf benchmarking.
+        modalix_group_prefill: Use grouped prefix prefill for Modalix loglikelihood scoring.
         batch_size: The batch size to use for the evaluation, defaults to 1.
         random_seed: The random seed to ensure reproducibility, defaults to 42.
     """
@@ -57,6 +58,7 @@ class Config:
     do_perf: bool
     max_num_tokens: int
     max_new_tokens: int | None
+    modalix_group_prefill: bool
     batch_size: int = dataclasses.field(init=False, default=1)
     random_seed: int = dataclasses.field(init=False, default=42)
 
@@ -74,7 +76,8 @@ def prepare_mole(
     do_start_server: bool = False,
     do_perf: bool = False,
     max_num_tokens: int = 1024,
-    max_new_tokens: int = 256
+    max_new_tokens: int = 256,
+    modalix_group_prefill: bool = False
 ) -> Config | None:
     """
     prepare_mole Prepares and validates the configuration for a MOLE evaluation run.
@@ -90,6 +93,7 @@ def prepare_mole(
         do_perf: Whether to perform performance benchmarking.
         max_num_tokens: Max number of tokens.
         max_new_tokens: Max number of new tokens. Used only for perf benchmarking.
+        modalix_group_prefill: Use grouped prefix prefill for Modalix loglikelihood scoring.
 
     Returns:
         A Config object if the setup is successful, otherwise None.
@@ -167,6 +171,7 @@ def prepare_mole(
         do_perf=do_perf,
         max_num_tokens=max_num_tokens,
         max_new_tokens=max_new_tokens,
+        modalix_group_prefill=modalix_group_prefill,
     )
 
 
@@ -211,7 +216,8 @@ def run(config: Config) -> dict[str, Any]:
                 config.board.start_server()
             lm = ModalixLM(
                 board=config.board, pretrained=config.model_id, batch_size=config.batch_size,
-                max_length=config.max_num_tokens, device=config.device
+                max_length=config.max_num_tokens, device=config.device,
+                group_prefill=config.modalix_group_prefill
             )
         else:
             lm = HuggingFaceLM(
