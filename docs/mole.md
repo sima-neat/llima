@@ -11,7 +11,7 @@ It extends [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm
 
 ## Installation
 
-MoLE is a host-side benchmarking tool. Install and run it on the host or SDK container, not on the Modalix device. The Modalix device only needs the LLiMa runtime and the `llima benchmark-server` process. See [Neat Framework installation](/getting-started/neat-library/) for the runtime installation flow.
+MoLE is a host-side benchmarking tool. Install and run it on the host machine outside the SDK Docker container, not from the SDK container and not on the Modalix device. The Modalix device only needs the LLiMa runtime and the `llima benchmark-server` process. See [Neat Framework installation](/getting-started/neat-library/) for the runtime installation flow.
 
 Install MoLE on the host using `sima-cli`:
 
