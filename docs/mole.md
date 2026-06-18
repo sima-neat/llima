@@ -53,7 +53,6 @@ Evaluates model quality against standard tasks:
 | `--board_ip` | IP address of the Modalix board. Required for `-b modalix`. |
 | `--board_model` | Path to the compiled model directory on the Modalix device (e.g., `/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`). Required for `-b modalix`. |
 | `--max_num_tokens` | Maximum context length. Must be equal to or smaller than the value used during compilation. |
-| `--modalix_group_prefill` | Optional Modalix loglikelihood mode that uses grouped prefix prefill before scoring continuation tokens. This can improve multiple-choice benchmarks with long shared contexts, but the default path remains the per-token scalar scorer. |
 | `-n, --num_samples` | Number of samples to evaluate. Runs the full task set if not specified. |
 | `--board_ssh_user` | SSH username for the Modalix board. Optional, default: `sima`. \# |
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
@@ -64,7 +63,7 @@ Accuracy and loglikelihood benchmarking with `-b modalix` requires the deployed 
 
 In `-b modalix` mode, result tables are labeled as Modalix backend results and include the board target. The HuggingFace `model_id` still appears because MoLE uses it for tokenization and task metadata.
 
-For models compiled with grouped prefill layers, `--modalix_group_prefill` can reuse those layers for the prompt prefix of each loglikelihood request, then score the continuation tokens exactly as scalar log probabilities on the board. This is opt-in because very short prefixes may not benefit from grouped execution.
+For Modalix loglikelihood requests, the board uses grouped prefill by default when the compiled model provides grouped prefill layers, then scores continuation tokens exactly as scalar log probabilities on the board. Models without grouped prefill support continue to use the scalar per-token scoring path.
 
 To use the HuggingFace backend as a reference baseline:
 

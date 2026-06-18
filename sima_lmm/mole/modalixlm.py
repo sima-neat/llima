@@ -89,7 +89,6 @@ class ModalixLM(HFLM):
         gguf_file = kwargs.pop("gguf_file", None)
         truncation = kwargs.pop("truncation", False)
         logits_cache = kwargs.pop("logits_cache", True)
-        group_prefill = kwargs.pop("group_prefill", False)
         chat_template_args = kwargs.pop("chat_template_args", None)
         enable_thinking = kwargs.pop("enable_thinking", None)
         think_end_token = kwargs.pop("think_end_token", None)
@@ -162,7 +161,6 @@ class ModalixLM(HFLM):
         )
         self.custom_prefix_token_id = prefix_token_id
 
-        self.group_prefill = bool(group_prefill)
         self.profile_data = []
         self.last_profile_data: dict = {}
 
@@ -337,8 +335,6 @@ class ModalixLM(HFLM):
             "continuation_start": continuation_start,
             "continuation_token_ids": continuation_tokens,
         }
-        if self.group_prefill:
-            metadata["use_group_prefill"] = True
         result = self._zmq_infer(
             tensor=tensor,
             request_type="model_call",
