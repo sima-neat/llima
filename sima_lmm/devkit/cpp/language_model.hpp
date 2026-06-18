@@ -72,7 +72,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids,
             size_t continuation_start,
             std::span<const uint32_t> continuation_token_ids,
-            bool use_group_prefill = false
+            bool use_group_prefill = true
         );
         void stop_model() { _is_running = false; }
 
