@@ -526,7 +526,9 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
                 total_logprob += token_score.logprob;
                 is_greedy = is_greedy && token_score.is_greedy;
             } else {
-                run_model_once(1, token_idx, 0, input_token_ids[token_idx], nullptr, true);
+                _run_model_once_for_loglikelihood_logits(
+                    static_cast<uint16_t>(token_idx), input_token_ids[token_idx]
+                );
             }
         }
     } catch (...) {
@@ -536,6 +538,82 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
 
     _is_running = false;
     return {total_logprob, is_greedy};
+}
+
+
+void LanguageModel::_run_model_once_for_loglikelihood_logits(
+    uint16_t token_idx, uint32_t input_token_id
+) {
+    constexpr uint16_t num_tokens = 1;
+    const uint16_t next_token_idx = token_idx + 1;
+    _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
+
+    // Loglikelihood only needs the single-token decode path to refresh n1_buffer4.
+    // Keep this separate from run_model_once(), which is shared by normal generation.
+    if (_uses_per_layer_inputs()) {
+        LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
+        std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
+        per_layer_ifm_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(1),
+            std::forward_as_tuple(
+                &get_buffer("embeddings"),
+                std::vector<uint32_t>{input_token_id, 0},
+                std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+            )
+        );
+        _per_layer_model_map.at(per_layer_key).add_to_queue(&per_layer_ifm_map);
+    }
+
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        LanguageModelMapKey model_key(num_tokens, layer_idx, token_idx);
+
+        std::map<uint8_t, MLABufferSlice> ifm_map;
+        if (layer_idx == 0) {
+            ifm_map.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(0),
+                std::forward_as_tuple(
+                    &get_buffer("embeddings"),
+                    std::vector<uint32_t>{input_token_id, 0},
+                    std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+                )
+            );
+        }
+        if (
+            _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
+            || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
+        ) {
+            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
+            _cache_model_map.at(model_key).add_to_queue();
+            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
+            LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
+            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+
+            if (layer_idx != (_cfg.lm_cfg.num_hidden_layers - 1)) {
+                continue;
+            }
+
+            ifm_map.clear();
+            _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+        } else {
+            throw std::runtime_error(
+                std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
+            );
+        }
+    }
+
+    MLAModelWithBuffer::run_queue();
+
+    if (!_cached_states.empty()) {
+        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
+            if (_checkpoint_boundaries[i] == next_token_idx) {
+                _save_state_checkpoint(i, num_tokens, 1);
+                break;
+            }
+        }
+    }
 }
 
 
@@ -549,7 +627,7 @@ LogLikelihoodResult LanguageModel::_run_model_once_for_loglikelihood(
         );
     }
 
-    run_model_once(1, token_idx, 0, input_token_id, nullptr, true);
+    _run_model_once_for_loglikelihood_logits(token_idx, input_token_id);
 
     MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
     buf_ptr->invalidate_cache();
@@ -569,8 +647,7 @@ uint32_t LanguageModel::run_model_once(
     uint16_t token_idx,
     uint16_t num_input_tokens,
     uint32_t token_id,
-    std::vector<Eigen::bfloat16>* logits_ptr,
-    bool skip_output
+    std::vector<Eigen::bfloat16>* logits_ptr
 ) {
     uint16_t next_token_idx;
     if (num_tokens > 1) {
@@ -745,20 +822,8 @@ uint32_t LanguageModel::run_model_once(
         }
     }
 
-    if (skip_output) {
-        return 0;
-    }
-
     if (logits_ptr) {
-        if (num_tokens != 1) {
-            throw std::runtime_error("Logit export only supports single-token model calls");
-        }
-        if (!_cfg.pipeline_cfg.return_logits) {
-            throw std::runtime_error(
-                "model not compiled with --return_logits; "
-                "accuracy/loglikelihood tasks are unsupported"
-            );
-        }
+        assert(num_tokens == 1 && _cfg.pipeline_cfg.return_logits);
         MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
         buf_ptr->invalidate_cache();
 

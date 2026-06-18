@@ -62,8 +62,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t token_idx,
             uint16_t num_input_tokens,
             uint32_t token_id,
-            std::vector<Eigen::bfloat16>* logits_ptr = nullptr,
-            bool skip_output = false
+            std::vector<Eigen::bfloat16>* logits_ptr = nullptr
         );
         LogLikelihoodResult run_model_for_loglikelihood(
             std::span<const uint32_t> input_token_ids,
@@ -135,6 +134,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
+        void _run_model_once_for_loglikelihood_logits(
+            uint16_t token_idx, uint32_t input_token_id
+        );
         LogLikelihoodResult _run_model_once_for_loglikelihood(
             uint16_t token_idx, uint32_t input_token_id, uint32_t target_token_id
         );
