@@ -63,8 +63,6 @@ Accuracy and loglikelihood benchmarking with `-b modalix` requires the deployed 
 
 In `-b modalix` mode, result tables are labeled as Modalix backend results and include the board target. The HuggingFace `model_id` still appears because MoLE uses it for tokenization and task metadata.
 
-For Modalix loglikelihood requests, the board uses grouped prefill by default when the compiled model provides grouped prefill layers, then scores continuation tokens exactly as scalar log probabilities on the board. Models without grouped prefill support continue to use the scalar per-token scoring path.
-
 To use the HuggingFace backend as a reference baseline:
 
 ``` console
