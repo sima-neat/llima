@@ -141,7 +141,8 @@ void disconnect_mla_rt() {
 std::map<std::filesystem::path, uint16_t> MLAModelWithBuffer::_unique_model_path_to_idx_map;
 std::vector<std::filesystem::path> MLAModelWithBuffer::_unique_model_paths;
 std::vector<mla_model_p> MLAModelWithBuffer::_unique_model_ptrs;
-simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest MLAModelWithBuffer::_queue_request;
+thread_local simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest
+    MLAModelWithBuffer::_queue_request;
 simaaidispatcher::DispatcherBase* MLAModelWithBuffer::_dispatcher = nullptr;
 
 
