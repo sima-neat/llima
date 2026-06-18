@@ -27,9 +27,6 @@ namespace llima {
 struct LogLikelihoodResult {
     double logprob;
     bool is_greedy;
-    double model_token_seconds = 0.0;
-    double score_logits_seconds = 0.0;
-    double prefill_seconds = 0.0;
 };
 
 // Key to access the language model map: (num_tokens, layer_idx, token_idx).
