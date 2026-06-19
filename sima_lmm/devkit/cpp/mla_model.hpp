@@ -84,7 +84,8 @@ class MLAModelWithBuffer {
         static std::map<std::filesystem::path, uint16_t> _unique_model_path_to_idx_map;
         static std::vector<std::filesystem::path> _unique_model_paths;
         static std::vector<mla_model_p> _unique_model_ptrs;
-        static simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest _queue_request;
+        static thread_local simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest
+            _queue_request;
         static simaaidispatcher::DispatcherBase* _dispatcher;
         static inline bool _profile = false;
         static inline bool _print_inouts = false;
