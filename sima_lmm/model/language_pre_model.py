@@ -48,7 +48,7 @@ class LanguagePreModel(LanguagePartBaseModel):
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
         return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
-    
+
     @property
     def layer_type(self) -> str:
         return self.cfg.lm_cfg.layer_types[self.layer_idx]

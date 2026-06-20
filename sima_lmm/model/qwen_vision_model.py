@@ -434,7 +434,7 @@ class QwenVisionLayerModel(BaseModel):
 
         inv_freq = 1.0 / (10000.0 ** (np.arange(0, half_dim, 2, dtype=np.float32) / half_dim))
         max_hw = max(grid_h, grid_w)
-        freq_table = np.outer(inv_freq, np.arange(max_hw, dtype=np.float32))  
+        freq_table = np.outer(inv_freq, np.arange(max_hw, dtype=np.float32))
 
         block_rows = np.arange(merged_h)[:, None, None, None]
         block_cols = np.arange(merged_w)[None, :, None, None]

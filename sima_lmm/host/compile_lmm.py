@@ -358,7 +358,7 @@ def main():
     else:
         output_path = base_output_path
         draft_output_path = None
-     
+
     check_output_path_conflict(args.model_path, output_path)
 
     try:
