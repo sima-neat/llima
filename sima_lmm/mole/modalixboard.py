@@ -41,7 +41,10 @@ class ModalixBoard:
         )
         conn.run("pkill --older 60 -f '[l]lima' 2>/dev/null", warn=True)
         remote_home = shlex.quote(f"/home/{self.ssh_user}")
-        conn.run(f"cd {remote_home} && nohup {server_cmd} > server.log 2>&1 < /dev/null &")
+        conn.run(
+            f"cd {remote_home} && nohup {server_cmd} > server.log 2>&1 < /dev/null &",
+            disown=True,
+        )
         conn.close()
 
         # Wait until the port is open.
