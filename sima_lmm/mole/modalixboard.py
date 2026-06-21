@@ -1,4 +1,5 @@
 import os
+import shlex
 import socket
 import time
 from dataclasses import dataclass, field
@@ -24,23 +25,23 @@ class ModalixBoard:
     def start_server(self):
         logger.info("Starting ZMQ server")
         # Start the llima benchmark server on the board.
-        # Use nohup to prevent the process from closing with the session.
-        server_cmd = f""
+        llima_cmd = "llima"
         if self.venv_path is not None:
-            server_cmd += f"{self.venv_path}/bin/"
-        server_cmd += (
-            f"llima benchmark-server {self.model} --port {self.port} > server.log 2>&1"
+            llima_cmd = f"{self.venv_path}/bin/llima"
+        server_cmd = (
+            f"{shlex.quote(llima_cmd)} benchmark-server "
+            f"{shlex.quote(str(self.model))} --port {shlex.quote(str(self.port))}"
         )
         logger.info(f"Starting server on {self.address}:{self.port}")
         logger.debug(server_cmd)
         if self.ssh_password is None:
             self.ssh_password = getpass(f"{self.ssh_user}@{self.address}'s pasword: ")
-        server_cmd += f" <<< '{self.ssh_password}' &"
         conn = Connection(
             host=self.address, user=self.ssh_user, connect_kwargs={"password": self.ssh_password}
         )
-        conn.sudo(f"pkill -f '[l]lima' 2>/dev/null <<< '{self.ssh_password}'", warn=True)
-        conn.sudo(server_cmd)
+        conn.run("pkill --older 60 -f '[l]lima' 2>/dev/null", warn=True)
+        remote_home = shlex.quote(f"/home/{self.ssh_user}")
+        conn.run(f"cd {remote_home} && nohup {server_cmd} > server.log 2>&1 < /dev/null &")
         conn.close()
 
         # Wait until the port is open.
@@ -62,7 +63,7 @@ class ModalixBoard:
         conn = Connection(
             host=self.address, user=self.ssh_user, connect_kwargs={"password": self.ssh_password}
         )
-        conn.sudo(f"pkill -f '[l]lima' 2>/dev/null <<< '{self.ssh_password}'", warn=True)
+        conn.run("pkill -f '[l]lima' 2>/dev/null", warn=True)
         conn.close()
 
     @property
