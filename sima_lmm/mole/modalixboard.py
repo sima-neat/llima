@@ -39,7 +39,9 @@ class ModalixBoard:
         conn = Connection(
             host=self.address, user=self.ssh_user, connect_kwargs={"password": self.ssh_password}
         )
+        conn.run("pkill -f '[l]lima benchmark-server' 2>/dev/null", warn=True)
         conn.run("pkill --older 60 -f '[l]lima' 2>/dev/null", warn=True)
+        time.sleep(2)
         remote_home = shlex.quote(f"/home/{self.ssh_user}")
         conn.run(
             f"cd {remote_home} && nohup {server_cmd} > server.log 2>&1 < /dev/null &",
@@ -62,12 +64,23 @@ class ModalixBoard:
             raise RuntimeError("Timeout: failed to start the benchmark server")
         logger.info("Started ZMQ server")
 
+    def wait_for_server_stop(self, timeout: int = 30) -> bool:
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                if s.connect_ex((self.address, self.port)) != 0:
+                    return True
+            time.sleep(1)
+        return False
+
     def stop_server(self):
         conn = Connection(
             host=self.address, user=self.ssh_user, connect_kwargs={"password": self.ssh_password}
         )
-        conn.run("pkill -f '[l]lima' 2>/dev/null", warn=True)
+        conn.run("pkill -f '[l]lima benchmark-server' 2>/dev/null", warn=True)
         conn.close()
+        self.wait_for_server_stop(timeout=10)
 
     @property
     def tcp_uri(self) -> str:

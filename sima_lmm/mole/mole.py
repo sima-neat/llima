@@ -205,6 +205,7 @@ def run(config: Config) -> dict[str, Any]:
 
     need_exit = False
     detected_error = False
+    lm = None
     try:
         if config.backend == "modalix":
             if config.do_start_server:
@@ -243,7 +244,14 @@ def run(config: Config) -> dict[str, Any]:
         detected_error = True
     finally:
         if config.backend == "modalix" and config.do_start_server:
-            # Stop the server.
+            # Ask the server to stop cleanly so model buffers are released before the next run.
+            if lm is not None:
+                try:
+                    lm.zmq_socket.send_multipart(["stop".encode("utf-8")])
+                    if not config.board.wait_for_server_stop(timeout=30):
+                        logger.warning("Timed out waiting for benchmark server to stop cleanly")
+                except Exception as exc:
+                    logger.warning("Failed to stop benchmark server cleanly: {}", exc)
             config.board.stop_server()
         if need_exit:
             exit(int(detected_error))
@@ -276,4 +284,6 @@ def perf_bench(config: Config):
     if config.do_start_server:
         # Stop the server.
         lm.zmq_socket.send_multipart(["stop".encode('utf-8')])
+        if not config.board.wait_for_server_stop(timeout=30):
+            logger.warning("Timed out waiting for benchmark server to stop cleanly")
         config.board.stop_server()
