@@ -8,9 +8,10 @@ VisionLanguageModel::VisionLanguageModel(
     std::filesystem::path model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
-    bool do_parallel_load
+    bool do_parallel_load,
+    bool enable_thinking
 ) : BaseModel(model_path),
-    _vlm_helper(_cfg, _devkit_dir, system_prompt, chat_template),
+    _vlm_helper(_cfg, _devkit_dir, system_prompt, chat_template, enable_thinking),
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
 {
     if (_cfg.support_image()) {

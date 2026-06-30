@@ -26,7 +26,8 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,
             std::optional<std::string> chat_template = std::nullopt,
-            bool do_parallel_load = true
+            bool do_parallel_load = true,
+            bool enable_thinking = false
         );
         ~VisionLanguageModel() {}
 
@@ -68,6 +69,12 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
              _language_model_ptr->set_reloc(reloc_name);
         }
         void unset_reloc() { _language_model_ptr->unset_reloc(); }
+        void set_enable_thinking(bool enable_thinking) {
+            _vlm_helper.set_enable_thinking(enable_thinking);
+        }
+        bool get_enable_thinking() const {
+            return _vlm_helper.get_enable_thinking();
+        }
 
     private:
         VlmHelper _vlm_helper;

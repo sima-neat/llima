@@ -24,11 +24,12 @@ WEB::WEB(
     std::optional<std::filesystem::path> whisper_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
-    bool do_parallel_load
+    bool do_parallel_load,
+    bool enable_thinking
 ) : _vision_language_model_ptr(
         std::make_unique<VisionLanguageModel>(
             vlm_model_path, system_prompt, chat_template,
-            do_parallel_load
+            do_parallel_load, enable_thinking
         )
     )
 {

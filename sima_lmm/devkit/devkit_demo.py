@@ -124,6 +124,7 @@ def run_model(args: argparse.Namespace) -> int:
                 system_prompt,
                 chat_template,
                 args.parallel_load,
+                args.enable_thinking,
             )
         else:
             demo = WEB(
@@ -132,6 +133,7 @@ def run_model(args: argparse.Namespace) -> int:
                 system_prompt,
                 chat_template,
                 args.parallel_load,
+                args.enable_thinking,
             )
     except Exception:
         msg = "Failed to create VLM or STT model"
@@ -270,6 +272,12 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         default=True,
         action=argparse.BooleanOptionalAction,
         help="Load multiple models in parallel.",
+    )
+    run_parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help="Enable model thinking mode in chat templates that support it.",
     )
     run_parser.add_argument("--log_level", type=str, default=None, help="Logging level")
     run_parser.set_defaults(func=run_model)

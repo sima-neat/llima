@@ -21,6 +21,8 @@ set audio <fn>     : set the audio file to be transcribed as query.
 set language <lang>: set the language string to be used for transcription.
 set lora           : set the model to use LoRA weights from a npy_files folder.
 unset lora         : revert LoRA model to baseline model.
+enable-thinking    : enable thinking mode and clear chat history.
+disable-thinking   : disable thinking mode and clear chat history.
 quit               : quit.
 list command       : print this page.
 help               : print this page.
@@ -32,10 +34,12 @@ CLI::CLI(
     std::optional<std::filesystem::path> whisper_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
-    bool do_parallel_load
+    bool do_parallel_load,
+    bool enable_thinking
 ) : _vision_language_model_ptr(
         std::make_unique<VisionLanguageModel>(
-            vlm_model_path, system_prompt, chat_template, do_parallel_load
+            vlm_model_path, system_prompt, chat_template, do_parallel_load,
+            enable_thinking
         )
     )
 {
@@ -113,6 +117,16 @@ void CLI::run() {
             _vision_language_model_ptr->unset_reloc();
             chat.clear_history();
             std::cout << "Un-set LoRA and cleared chat history" << std::endl;
+            continue;
+        } else if (command == "enable-thinking") {
+            _vision_language_model_ptr->set_enable_thinking(true);
+            chat.clear_history();
+            std::cout << "Enabled thinking and cleared chat history." << std::endl;
+            continue;
+        } else if (command == "disable-thinking") {
+            _vision_language_model_ptr->set_enable_thinking(false);
+            chat.clear_history();
+            std::cout << "Disabled thinking and cleared chat history." << std::endl;
             continue;
         } else if (command == "set language") {
             language = "en";

@@ -28,7 +28,8 @@ class EXPORT WEB {
             std::optional<std::filesystem::path> whisper_model_path,
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template,
-            bool do_parallel_load
+            bool do_parallel_load,
+            bool enable_thinking = false
         );
         ~WEB();
 
