@@ -24,7 +24,9 @@ class EXPORT CLI {
             std::optional<std::filesystem::path> whisper_model_path,
             std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
-            std::optional<std::string> chat_template
+            std::optional<std::string> chat_template,
+            bool do_parallel_load = true,
+            bool enable_thinking = false
         );
         ~CLI();
 

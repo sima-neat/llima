@@ -22,11 +22,13 @@ static std::string get_iso_timestamp() {
 WEB::WEB(
     std::filesystem::path vlm_model_path,
     std::optional<std::filesystem::path> whisper_model_path,
-    std::optional<std::filesystem::path> draft_model_path,
-    std::optional<std::string> system_prompt,
-    std::optional<std::string> chat_template
+    std::optional<std::string> chat_template,
+    bool do_parallel_load,
+    bool enable_thinking
 ) : _vision_language_model_ptr(
-        std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
+        std::make_unique<VisionLanguageModel>(
+            vlm_model_path, system_prompt, chat_template, do_parallel_load, enable_thinking
+        )
     )
 {
     if (_singleton_ptr)
@@ -39,7 +41,7 @@ WEB::WEB(
 
     if (draft_model_path.has_value()) {
         _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
-            draft_model_path.value(), system_prompt, chat_template
+            draft_model_path.value(), system_prompt, chat_template, do_parallel_load, enable_thinking
         );
         _vision_language_model_ptr->set_draft_vlm(_vision_language_draft_model_ptr.get());
     }
