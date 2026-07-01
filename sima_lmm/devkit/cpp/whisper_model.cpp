@@ -302,12 +302,14 @@ std::string WhisperModel::_run_model(
 
     // Update language token id.
     if (_is_auto_language(language)) {
-        auto detected_language_token = _detect_language_token();
+        auto detected_language_index = _detect_language_index();
+        auto detected_language_token = _language_token_from_index(detected_language_index);
         _set_language_token(detected_language_token);
         _logger->info(
-            "Detected language: {} token={}",
+            "Detected language: {} token={} index={}",
             _language_code_from_token(detected_language_token),
-            detected_language_token
+            detected_language_token,
+            detected_language_index
         );
     } else {
         _update_language(language);
@@ -769,7 +771,7 @@ bool WhisperModel::_is_auto_language(const std::string& language) const {
 }
 
 
-uint32_t WhisperModel::_detect_language_token() {
+uint32_t WhisperModel::_detect_language_index() {
     if (!_decoder_language_detect_model_ptr) {
         throw std::runtime_error(
             "Whisper model was compiled without language detection; pass an explicit language."
@@ -781,6 +783,16 @@ uint32_t WhisperModel::_detect_language_token() {
     new_token_buf.invalidate_cache();
     auto* token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());
     return token_ptr[0];
+}
+
+
+uint32_t WhisperModel::_language_token_from_index(uint32_t language_idx) const {
+    if (language_idx >= _cfg.language_token_ids.size()) {
+        throw std::runtime_error(
+            fmt::format("Invalid detected language index: {}", language_idx)
+        );
+    }
+    return _cfg.language_token_ids[language_idx];
 }
 
 

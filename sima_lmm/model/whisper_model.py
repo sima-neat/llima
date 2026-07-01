@@ -303,13 +303,14 @@ class WhisperModel(BaseModel):
         if detect_language:
             language_detect_model = self._get_part_model("language_detect")
             language_detect_ofms = language_detect_model.run_model(eval_mode, [encoder_ofms[0]])
-            detected_language_token = int(language_detect_ofms[0].item())
-            self._validate_language_token(detected_language_token)
+            detected_language_index = int(language_detect_ofms[0].item())
+            detected_language_token = self._language_token_from_index(detected_language_index)
             input_token_ids[0, 1] = detected_language_token
             sima_log_info(
-                "Detected language: %s token=%d",
+                "Detected language: %s token=%d index=%d",
                 self._language_code_from_token(detected_language_token),
-                detected_language_token
+                detected_language_token,
+                detected_language_index
             )
 
         # Decoder init.
@@ -431,9 +432,11 @@ class WhisperModel(BaseModel):
             hf_tokenizer_json_file=hf_tokenizer_json_file
         )
 
-    def _validate_language_token(self, token_id: int):
-        if token_id not in self.tokenizer.all_language_tokens:
-            raise RuntimeError(f"Invalid detected language token: {token_id}")
+    def _language_token_from_index(self, language_idx: int) -> int:
+        language_tokens = self.tokenizer.all_language_tokens
+        if language_idx < 0 or language_idx >= len(language_tokens):
+            raise RuntimeError(f"Invalid detected language index: {language_idx}")
+        return language_tokens[language_idx]
 
     def _language_code_from_token(self, token_id: int) -> str:
         language_tokens = self.tokenizer.all_language_tokens
