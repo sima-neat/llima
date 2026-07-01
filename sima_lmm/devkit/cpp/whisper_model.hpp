@@ -128,9 +128,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         WhisperDecoderModelMap _decoder_post_model_map;
         std::vector<uint32_t> _input_token_ids;
         uint32_t _stop_token_id;
-        bool _language_detect_available = false;
 
-        static const std::vector<std::string> _LANGUAGE_CODES;
         static const std::map<std::string, std::string> _TO_LANGUAGE_CODE;
 };
 
