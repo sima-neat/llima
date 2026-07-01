@@ -109,7 +109,6 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         uint32_t _detect_language_index();
         uint32_t _language_token_from_index(uint32_t language_idx) const;
         void _set_language_token(uint32_t token_id);
-        bool _is_language_token(uint32_t token_id) const;
         std::string _language_code_from_token(uint32_t token_id) const;
         void _update_language(const std::string& language);
         

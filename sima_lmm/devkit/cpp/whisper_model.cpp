@@ -564,15 +564,13 @@ void WhisperModel::_define_models() {
         std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}}
     );
 
-    if (_cfg.language_detect_enabled) {
-        _define_model(
-            "decoder_language_detect",
-            {},
-            _get_elf_path_decoder_language_detect(),
-            std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}},
-            std::vector<MLABufferSlice>{{&get_buffer("new_token")}}
-        );
-    }
+    _define_model(
+        "decoder_language_detect",
+        {},
+        _get_elf_path_decoder_language_detect(),
+        std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}},
+        std::vector<MLABufferSlice>{{&get_buffer("new_token")}}
+    );
 
     // Decoder init model.
     uint32_t num_input_tokens = _input_token_ids.size();
@@ -775,12 +773,6 @@ bool WhisperModel::_is_auto_language(const std::string& language) const {
 
 
 uint32_t WhisperModel::_detect_language_index() {
-    if (!_decoder_language_detect_model_ptr) {
-        throw std::runtime_error(
-            "Whisper model was compiled without language detection; pass an explicit language."
-        );
-    }
-
     _decoder_language_detect_model_ptr->run();
     auto& new_token_buf = get_buffer("new_token");
     new_token_buf.invalidate_cache();
@@ -800,17 +792,7 @@ uint32_t WhisperModel::_language_token_from_index(uint32_t language_idx) const {
 
 
 void WhisperModel::_set_language_token(uint32_t token_id) {
-    if (!_is_language_token(token_id)) {
-        throw std::runtime_error(fmt::format("Invalid language token: {}", token_id));
-    }
     _input_token_ids[1] = token_id;
-}
-
-
-bool WhisperModel::_is_language_token(uint32_t token_id) const {
-    return std::find(
-        _cfg.language_token_ids.begin(), _cfg.language_token_ids.end(), token_id
-    ) != _cfg.language_token_ids.end();
 }
 
 
@@ -818,12 +800,11 @@ std::string WhisperModel::_language_code_from_token(uint32_t token_id) const {
     auto it = std::find(
         _cfg.language_token_ids.begin(), _cfg.language_token_ids.end(), token_id
     );
-    if (it != _cfg.language_token_ids.end()) {
-        auto idx = static_cast<size_t>(std::distance(_cfg.language_token_ids.begin(), it));
-        if (idx < _cfg.language_codes.size())
-            return _cfg.language_codes[idx];
-    }
-    return "unknown";
+    if (it == _cfg.language_token_ids.end())
+        return "unknown";
+
+    auto idx = static_cast<size_t>(std::distance(_cfg.language_token_ids.begin(), it));
+    return _cfg.language_codes[idx];
 }
 
 
@@ -833,12 +814,6 @@ void WhisperModel::_update_language(const std::string& language) {
         language_code = it->second;
     else
         language_code = language;
-    if (_cfg.language_codes.size() != _cfg.language_token_ids.size()) {
-        throw std::runtime_error(
-            "Invalid Whisper language metadata; regenerate whisper_config.json."
-        );
-    }
-
     if (
         auto it = std::find(_cfg.language_codes.begin(), _cfg.language_codes.end(), language_code);
         it != _cfg.language_codes.end()
