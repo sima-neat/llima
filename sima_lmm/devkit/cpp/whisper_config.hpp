@@ -24,7 +24,6 @@ struct WhisperConfig{
     // Fields added by sima-lmm during whisper_config.json file generation.
     std::string model_name;
     bool decoder_use_future_token_mask;
-    bool language_detect_enabled;
     std::vector<uint32_t> language_token_ids;
     std::vector<std::string> language_codes;
 
@@ -46,7 +45,6 @@ inline void from_json(const nlohmann::json& j, WhisperConfig& v) {
     j.at("vocab_size").get_to(v.vocab_size);
     j.at("decoder_use_future_token_mask").get_to(v.decoder_use_future_token_mask);
 
-    j.at("language_detect_enabled").get_to(v.language_detect_enabled);
     j.at("language_token_ids").get_to(v.language_token_ids);
     j.at("language_codes").get_to(v.language_codes);
 }
