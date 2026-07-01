@@ -33,6 +33,7 @@ class WhisperModel(BaseModel):
         onnx_path: Path | str,
         sima_path: Path | str,
         use_future_token_mask: bool,
+        enable_filter_sharing: bool = False,
     ) -> "WhisperModel":
         """Creates a WhisperModel object from cached Hugging Face model.
 
@@ -55,6 +56,7 @@ class WhisperModel(BaseModel):
             onnx_path=Path(onnx_path),
             sima_path=Path(sima_path),
             use_future_token_mask=use_future_token_mask,
+            use_filter_sharing=enable_filter_sharing,
         )
 
     def gen_files(
@@ -438,31 +440,35 @@ class WhisperModel(BaseModel):
                 model_name = f"{self.model_name}_encoder"
                 return WhisperEncoderModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-                    hf_model=self.hf_model
+                    hf_model=self.hf_model, use_filter_sharing=self.use_filter_sharing
                 )
             case "init":
                 model_name = f"{self.model_name}_decoder_init_layer{layer_idx}"
                 return WhisperDecoderInitModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-                    hf_model=self.hf_model, layer_idx=layer_idx
+                    hf_model=self.hf_model, layer_idx=layer_idx,
+                    use_filter_sharing=self.use_filter_sharing
                 )
             case "pre":
                 model_name = f"{self.model_name}_decoder_n1_pre_layer{layer_idx}"
                 return WhisperDecoderPreModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-                    hf_model=self.hf_model, num_tokens=1, layer_idx=layer_idx
+                    hf_model=self.hf_model, num_tokens=1, layer_idx=layer_idx,
+                    use_filter_sharing=self.use_filter_sharing
                 )
             case "post":
                 model_name = f"{self.model_name}_decoder_n1_post_layer{layer_idx}"
                 return WhisperDecoderPostModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=1, layer_idx=layer_idx,
-                    skip_encoder_kv_proj=True, output_encoder_kv_cache=False
+                    skip_encoder_kv_proj=True, output_encoder_kv_cache=False,
+                    use_filter_sharing=self.use_filter_sharing
                 )
             case "cache":
                 model_name = f"{self.model_name}_decoder_n1_cache_token{token_idx}"
                 return WhisperDecoderCacheModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=1, token_idx=token_idx,
-                    use_future_token_mask=self.use_future_token_mask
+                    use_future_token_mask=self.use_future_token_mask,
+                    use_filter_sharing=self.use_filter_sharing
                 )

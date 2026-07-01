@@ -27,10 +27,10 @@ WhisperPreprocessor::WhisperPreprocessor(const std::filesystem::path& devkit_dir
         );
     }
 
-    // Precompute the hann window.
+    // Precompute the periodic Hann window used by Transformers/OpenAI Whisper.
     _hanning_window.resize(N_FFT);
     for (uint32_t i = 0; i < N_FFT; ++i)
-        _hanning_window[i] = 0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * i / (N_FFT - 1));
+        _hanning_window[i] = 0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * i / N_FFT);
 
     _padded_audio_tensor.resize(N_SAMPLES + N_FFT);
 
