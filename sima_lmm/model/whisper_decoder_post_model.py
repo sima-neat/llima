@@ -103,7 +103,7 @@ class WhisperDecoderPostModel(BaseModel):
             # 220: blank
             # 50363: <|notimestamps|>
             # 50364: <|0.00|>
-            suppress_tokens = self.cfg.suppress_tokens + [220, 50363, 30364]
+            suppress_tokens = self.cfg.suppress_tokens + [220, 50363, 50364]
             logit_mask = np.zeros((1, self.cfg.vocab_size, 1, 1), dtype=np.float32)
             logit_mask[:, suppress_tokens, :, :] = np.finfo(np.float32).min
             filtered_lm_head = self._onnx_builder.build_op(

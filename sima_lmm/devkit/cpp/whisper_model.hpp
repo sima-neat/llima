@@ -104,6 +104,12 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::filesystem::path _get_elf_path_decoder_pre(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_cache(uint16_t token_idx) const;
         std::filesystem::path _get_elf_path_decoder_post(uint8_t layer_idx) const;
+        std::filesystem::path _get_elf_path_decoder_language_detect() const;
+        bool _is_auto_language(const std::string& language) const;
+        uint32_t _detect_language_token();
+        void _set_language_token(uint32_t token_id);
+        bool _is_language_token(uint32_t token_id) const;
+        std::string _language_code_from_token(uint32_t token_id) const;
         void _update_language(const std::string& language);
         
         std::mutex _mutex;
@@ -115,12 +121,14 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::atomic<bool> _is_running;
 
         std::unique_ptr<MLAModelWithBuffer> _encoder_model_ptr;
+        std::unique_ptr<MLAModelWithBuffer> _decoder_language_detect_model_ptr;
         std::map<uint8_t, MLAModelWithBuffer> _decoder_init_model_map;
         WhisperDecoderModelMap _decoder_pre_model_map;
         WhisperDecoderModelMap _decoder_cache_model_map;
         WhisperDecoderModelMap _decoder_post_model_map;
         std::vector<uint32_t> _input_token_ids;
         uint32_t _stop_token_id;
+        bool _language_detect_available = false;
 
         static const std::vector<std::string> _LANGUAGE_CODES;
         static const std::map<std::string, std::string> _TO_LANGUAGE_CODE;

@@ -2,6 +2,7 @@
 #define _SIMA_LLIMA_WHISPER_CONFIG_
 
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -23,15 +24,34 @@ struct WhisperConfig{
     // Fields added by sima-lmm during whisper_config.json file generation.
     std::string model_name;
     bool decoder_use_future_token_mask;
+    bool language_detect_enabled = false;
+    uint32_t num_languages = 99;
+    std::vector<uint32_t> language_token_ids;
+    std::vector<std::string> language_codes;
 
     uint32_t get_encoder_head_dim() const { return d_model / encoder_attention_heads; };
     uint32_t get_decoder_head_dim() const { return d_model / decoder_attention_heads; };
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
-    WhisperConfig, model_name, model_type, d_model, encoder_attention_heads, encoder_layers,
-    decoder_attention_heads, decoder_layers, max_source_positions, max_target_positions,
-    num_mel_bins, vocab_size, decoder_use_future_token_mask
-)
+
+inline void from_json(const nlohmann::json& j, WhisperConfig& v) {
+    j.at("model_name").get_to(v.model_name);
+    j.at("model_type").get_to(v.model_type);
+    j.at("d_model").get_to(v.d_model);
+    j.at("encoder_attention_heads").get_to(v.encoder_attention_heads);
+    j.at("encoder_layers").get_to(v.encoder_layers);
+    j.at("decoder_attention_heads").get_to(v.decoder_attention_heads);
+    j.at("decoder_layers").get_to(v.decoder_layers);
+    j.at("max_source_positions").get_to(v.max_source_positions);
+    j.at("max_target_positions").get_to(v.max_target_positions);
+    j.at("num_mel_bins").get_to(v.num_mel_bins);
+    j.at("vocab_size").get_to(v.vocab_size);
+    j.at("decoder_use_future_token_mask").get_to(v.decoder_use_future_token_mask);
+
+    v.language_detect_enabled = j.value("language_detect_enabled", false);
+    v.num_languages = j.value("num_languages", 99);
+    v.language_token_ids = j.value("language_token_ids", std::vector<uint32_t>{});
+    v.language_codes = j.value("language_codes", std::vector<std::string>{});
+}
 
 
 }

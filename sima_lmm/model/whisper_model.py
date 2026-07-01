@@ -10,9 +10,12 @@ from pathlib import Path
 
 from sima_utils.logging.sima_logger import ScopedLogLevel, sima_log_info
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel, find_file
-from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, FileGenPrecision
+from sima_lmm.model.base import (
+    BaseModel, EvalMode, FileGenMode, FileGenPrecision, LayerConfiguration
+)
 from sima_lmm.model.whisper_decoder_cache_model import WhisperDecoderCacheModel
 from sima_lmm.model.whisper_decoder_init_model import WhisperDecoderInitModel
+from sima_lmm.model.whisper_decoder_language_detect_model import WhisperDecoderLanguageDetectModel
 from sima_lmm.model.whisper_decoder_post_model import WhisperDecoderPostModel
 from sima_lmm.model.whisper_decoder_pre_model import WhisperDecoderPreModel
 from sima_lmm.model.whisper_encoder_model import WhisperEncoderModel
@@ -63,7 +66,7 @@ class WhisperModel(BaseModel):
         self,
         gen_mode: FileGenMode,
         *,
-        precision: FileGenPrecision | dict[str, FileGenPrecision] | None = None,
+        precision: dict[str, LayerConfiguration] | None = None,
         log_level: int = logging.NOTSET,
         num_processes: int = 1,
         part: str | None = None,
@@ -75,7 +78,7 @@ class WhisperModel(BaseModel):
 
         Args:
             gen_mode: File generation mode.
-            Precision: The precision to be used for Model SDK quantization mode.
+            precision: Layer configuration to be used for Model SDK quantization mode.
             log_level: Logging level.
             part: Name of the part to be generated.
             part_idx: Specific index of the part to be generated. For pre/post model, the index is
@@ -100,6 +103,7 @@ class WhisperModel(BaseModel):
             return
 
         encoder = False
+        language_detect = False
         init_layer_idx_list = list()
         single_pre_layer_idx_list = list()
         single_post_layer_idx_list = list()
@@ -109,6 +113,8 @@ class WhisperModel(BaseModel):
                 part = None
             if part in ("encoder", None):
                 encoder = True
+            if part in ("language_detect", None):
+                language_detect = True
             if part in ("init", None):
                 init_layer_idx_list = list(range(self.cfg.decoder_layers))
             if part in ("single_pre", None):
@@ -150,13 +156,17 @@ class WhisperModel(BaseModel):
         # Determine the precision for each part.
         if precision is None:
             precision = dict()
-        elif isinstance(precision, FileGenPrecision):
-            precision = {"all", precision}
-        assert isinstance(precision, dict)
-        all_precision = precision.get("all", FileGenPrecision.A_BF16_W_INT8)
-        stt_precision = precision.get("stt", all_precision)
-        encoder_precision = precision.get("encoder", stt_precision)
-        decoder_precision = precision.get("decoder", stt_precision)
+        if not isinstance(precision, dict):
+            raise TypeError(
+                "precision must be a dict of layer configurations like "
+                "{'all': {'precision': FileGenPrecision.A_BF16_W_INT8}}"
+            )
+
+        default_precision = {"precision": FileGenPrecision.A_BF16_W_INT8}
+        all_precision = precision.get("all", default_precision)
+        encoder_precision = precision.get("encoder", all_precision)
+        decoder_precision = precision.get("decoder", all_precision)
+        language_detect_precision = precision.get("language_detect", decoder_precision)
         init_precision = precision.get("init", decoder_precision)
         single_precision = precision.get("single", decoder_precision)
         single_pre_precision = precision.get("single_pre", single_precision)
@@ -167,6 +177,7 @@ class WhisperModel(BaseModel):
             with ScopedLogLevel(log_level):
                 sima_log_info("Quantization precision:")
                 sima_log_info("  Encoder      = %s", encoder_precision)
+                sima_log_info("  Language det = %s", language_detect_precision)
                 sima_log_info("  Init         = %s", init_precision)
                 sima_log_info("  Single pre   = %s", single_pre_precision)
                 sima_log_info("  Single cache = %s", single_cache_precision)
@@ -175,6 +186,10 @@ class WhisperModel(BaseModel):
         model_list = list()
         if encoder:
             model_list.append((self._get_part_model("encoder"), encoder_precision))
+        if language_detect:
+            model_list.append(
+                (self._get_part_model("language_detect"), language_detect_precision)
+            )
 
         for layer_idx in init_layer_idx_list:
             model_list.append((self._get_part_model("init", layer_idx=layer_idx), init_precision))
@@ -224,8 +239,10 @@ class WhisperModel(BaseModel):
         audio_tensor = load_and_preprocess_numpy(
             audio, hf_preprocessor_config_json_file=hf_preprocessor_config_json_file
         )
+        detect_language = self._is_auto_language(language)
+        tokenizer_language = "en" if detect_language else language
         self.tokenizer = get_tokenizer(
-            multilingual=True, language=language, task="transcribe",
+            multilingual=True, language=tokenizer_language, task="transcribe",
             hf_tokenizer_json_file=hf_tokenizer_json_file
         )
 
@@ -236,15 +253,18 @@ class WhisperModel(BaseModel):
                 [self.tokenizer.sot_sequence_including_notimestamps], dtype=np.int32
             )
             ifms = [input_idxs, audio_tensor]
-            output_tokens = self.run_model(eval_mode, ifms)
+            output_tokens = self.run_model(eval_mode, ifms, detect_language=detect_language)
             assert output_tokens.ndim == 2 and output_tokens.shape[0] == 1
             output_text = self.tokenizer.decode_without_special_tokens(output_tokens[0].tolist())
         sima_log_info("output text=%s", output_text)
         return output_text
 
-    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+    def run_model(
+        self, eval_mode: EvalMode, ifms: list[np.ndarray], detect_language: bool = False
+    ) -> list[np.ndarray]:
         assert len(ifms) == 2
-        assert ifms[0].shape == (1, WhisperDecoderInitModel.num_tokens)
+        input_token_ids = np.array(ifms[0], copy=True)
+        assert input_token_ids.shape == (1, WhisperDecoderInitModel.num_tokens)
         assert ifms[1].shape == (1, 1, self.cfg.max_source_positions * 2, self.cfg.num_mel_bins)
 
         # Initialize caches.
@@ -286,14 +306,23 @@ class WhisperModel(BaseModel):
         encoder_model = self._get_part_model("encoder")
         encoder_ofms = encoder_model.run_model(eval_mode, encoder_ifms)
 
+        if detect_language:
+            language_detect_model = self._get_part_model("language_detect")
+            language_detect_ofms = language_detect_model.run_model(eval_mode, [encoder_ofms[0]])
+            detected_language_token = int(language_detect_ofms[0].item())
+            self._validate_language_token(detected_language_token)
+            input_token_ids[0, 1] = detected_language_token
+            sima_log_info(
+                "Detected language: %s token=%d",
+                self._language_code_from_token(detected_language_token),
+                detected_language_token
+            )
+
         # Decoder init.
         perf_cnt_begin = time.perf_counter_ns()
         token_embeddings_tensor = self.get_token_embeddings_tensor()
-        positions_embeddings_tensor = np.expand_dims(
-            self.get_position_embeddings_tensor(), axis=(0, 1)
-        )
         decoder_input_embeds = np.array(
-            [[[token_embeddings_tensor[x] for x in ifms[0][0]]]],
+            [[[token_embeddings_tensor[x] for x in input_token_ids[0]]]],
             dtype=token_embeddings_tensor.dtype
         )
         num_tokens = WhisperDecoderInitModel.num_tokens
@@ -302,7 +331,6 @@ class WhisperModel(BaseModel):
             if layer_idx == 0:
                 decoder_init_ifms = [
                     decoder_input_embeds,
-                    positions_embeddings_tensor[..., :num_tokens, :],
                     encoder_ofms[0]
                 ]
             else:
@@ -321,6 +349,9 @@ class WhisperModel(BaseModel):
         sima_log_info("Got token: %d in %fs", new_token, perf_cnt_delta)
 
         # Decoder generation.
+        generation_position_embeddings = np.expand_dims(
+            self.get_position_embeddings_tensor(), axis=(0, 1)
+        )
         post_ofms = None
         for token_idx in range(WhisperDecoderInitModel.num_tokens, self.cfg.max_target_positions):
             next_token_idx = token_idx + 1
@@ -331,7 +362,7 @@ class WhisperModel(BaseModel):
                 if layer_idx == 0:
                     pre_ifms = [
                         np.expand_dims(token_embeddings_tensor[new_token], axis=(0, 1, 2)),
-                        positions_embeddings_tensor[..., token_idx:next_token_idx, :]
+                        generation_position_embeddings[..., token_idx:next_token_idx, :]
                     ]
                 else:
                     pre_ifms = [post_ofms[0]]
@@ -393,6 +424,19 @@ class WhisperModel(BaseModel):
         embeddings_tensor = self.hf_model.load_np_param(embeddings_name)
         return embeddings_tensor.astype(bfloat16).astype(np.float32)
 
+    @staticmethod
+    def _is_auto_language(language: str | None) -> bool:
+        return language is None or language == "" or language == "auto"
+
+    def _validate_language_token(self, token_id: int):
+        if token_id not in self.tokenizer.all_language_tokens:
+            raise RuntimeError(f"Invalid detected language token: {token_id}")
+
+    def _language_code_from_token(self, token_id: int) -> str:
+        language_tokens = self.tokenizer.all_language_tokens
+        language_codes = self.tokenizer.all_language_codes
+        return language_codes[language_tokens.index(token_id)]
+
     def gen_devkit_files(self, resume: bool = False):
         """Generates files for devkit."""
         assert isinstance(self.cfg, WhisperConfig)
@@ -404,6 +448,17 @@ class WhisperModel(BaseModel):
             cfg_dict = asdict(self.cfg)
             cfg_dict["model_name"] = self.model_name
             cfg_dict["decoder_use_future_token_mask"] = self.use_future_token_mask
+            hf_tokenizer_json_file = find_file(
+                directory=self.hf_model.hf_cache, filename="tokenizer.json"
+            )
+            tokenizer = get_tokenizer(
+                multilingual=True, language="en", task="transcribe",
+                hf_tokenizer_json_file=hf_tokenizer_json_file
+            )
+            cfg_dict["language_detect_enabled"] = True
+            cfg_dict["num_languages"] = tokenizer.num_languages
+            cfg_dict["language_token_ids"] = list(tokenizer.all_language_tokens)
+            cfg_dict["language_codes"] = list(tokenizer.all_language_codes)
             with open(self.sima_devkit_path / "whisper_config.json", "w") as f:
                 json.dump(cfg_dict, f, indent=4)
 
@@ -439,6 +494,12 @@ class WhisperModel(BaseModel):
             case "encoder":
                 model_name = f"{self.model_name}_encoder"
                 return WhisperEncoderModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, use_filter_sharing=self.use_filter_sharing
+                )
+            case "language_detect":
+                model_name = f"{self.model_name}_decoder_language_detect"
+                return WhisperDecoderLanguageDetectModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, use_filter_sharing=self.use_filter_sharing
                 )

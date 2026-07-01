@@ -317,7 +317,17 @@ std::string WhisperModel::_run_model(
     _encoder_model_ptr->run();
 
     // Update language token id.
-    _update_language(language);
+    if (_is_auto_language(language)) {
+        auto detected_language_token = _detect_language_token();
+        _set_language_token(detected_language_token);
+        _logger->info(
+            "Detected language: {} token={}",
+            _language_code_from_token(detected_language_token),
+            detected_language_token
+        );
+    } else {
+        _update_language(language);
+    }
 
     // Upload the decoder input embeds.
     const uint8_t* token_embeddings_ptr = reinterpret_cast<const uint8_t*>(
@@ -521,6 +531,10 @@ void WhisperModel::_define_model(
 ) {
     if (model_type == "encoder") {
         _encoder_model_ptr = std::make_unique<MLAModelWithBuffer>(model_path, ifms, ofms);
+    } else if (model_type == "decoder_language_detect") {
+        _decoder_language_detect_model_ptr = std::make_unique<MLAModelWithBuffer>(
+            model_path, ifms, ofms
+        );
     } else if (model_type == "decoder_init") {
         _decoder_init_model_map.emplace(
             std::piecewise_construct,
@@ -561,17 +575,29 @@ void WhisperModel::_define_models() {
         std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}}
     );
 
+    auto language_detect_elf_path = _get_elf_path_decoder_language_detect();
+    _language_detect_available = (
+        _cfg.language_detect_enabled && std::filesystem::is_regular_file(language_detect_elf_path)
+    );
+    if (_language_detect_available) {
+        _define_model(
+            "decoder_language_detect",
+            {},
+            language_detect_elf_path,
+            std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}},
+            std::vector<MLABufferSlice>{{&get_buffer("new_token")}}
+        );
+    } else if (_cfg.language_detect_enabled) {
+        _logger->warn(
+            "Language detection is enabled in config but ELF is missing: {}",
+            language_detect_elf_path
+        );
+    }
+
     // Decoder init model.
     uint32_t num_input_tokens = _input_token_ids.size();
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
         std::vector<MLABufferSlice> ifms = {&get_buffer("decoder_init")};
-        if (layer_idx == 0) {
-            ifms.emplace_back(
-                &get_buffer("position_embeddings"),
-                std::vector<uint32_t>{0, 0},
-                std::vector<uint32_t>{num_input_tokens, _cfg.d_model}
-            );
-        }
         ifms.emplace_back(&get_buffer("encoder_ofm"));
 
         std::vector<MLABufferSlice> ofms;
@@ -756,20 +782,107 @@ std::filesystem::path WhisperModel::_get_elf_path_decoder_post(uint8_t layer_idx
 }
 
 
+std::filesystem::path WhisperModel::_get_elf_path_decoder_language_detect() const {
+    return _elf_dir / fmt::format(
+        "{}_decoder_language_detect_stage1_mla.elf", _cfg.model_name
+    );
+}
+
+
+bool WhisperModel::_is_auto_language(const std::string& language) const {
+    return language.empty() || language == "auto";
+}
+
+
+uint32_t WhisperModel::_detect_language_token() {
+    if (!_language_detect_available || !_decoder_language_detect_model_ptr) {
+        throw std::runtime_error(
+            "Whisper model was compiled without language detection; pass an explicit language."
+        );
+    }
+
+    _decoder_language_detect_model_ptr->run();
+    auto& new_token_buf = get_buffer("new_token");
+    new_token_buf.invalidate_cache();
+    auto* token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());
+    return token_ptr[0];
+}
+
+
+void WhisperModel::_set_language_token(uint32_t token_id) {
+    if (!_is_language_token(token_id)) {
+        throw std::runtime_error(fmt::format("Invalid language token: {}", token_id));
+    }
+    _input_token_ids[1] = token_id;
+}
+
+
+bool WhisperModel::_is_language_token(uint32_t token_id) const {
+    if (!_cfg.language_token_ids.empty()) {
+        return std::find(
+            _cfg.language_token_ids.begin(), _cfg.language_token_ids.end(), token_id
+        ) != _cfg.language_token_ids.end();
+    }
+
+    auto sot_token_id = _tokenizer_ptr->token_to_id("<|startoftranscript|>");
+    return (
+        token_id >= sot_token_id + 1
+        && token_id < sot_token_id + 1 + _cfg.num_languages
+    );
+}
+
+
+std::string WhisperModel::_language_code_from_token(uint32_t token_id) const {
+    if (!_cfg.language_token_ids.empty()) {
+        auto it = std::find(
+            _cfg.language_token_ids.begin(), _cfg.language_token_ids.end(), token_id
+        );
+        if (it != _cfg.language_token_ids.end()) {
+            auto idx = std::distance(_cfg.language_token_ids.begin(), it);
+            if (idx < static_cast<int64_t>(_cfg.language_codes.size()))
+                return _cfg.language_codes[idx];
+        }
+    }
+
+    auto sot_token_id = _tokenizer_ptr->token_to_id("<|startoftranscript|>");
+    if (token_id > sot_token_id) {
+        auto language_idx = token_id - sot_token_id - 1;
+        if (language_idx < _LANGUAGE_CODES.size() && language_idx < _cfg.num_languages)
+            return _LANGUAGE_CODES[language_idx];
+    }
+    return "unknown";
+}
+
+
 void WhisperModel::_update_language(const std::string& language) {
-    auto it = _TO_LANGUAGE_CODE.find(language);
     std::string language_code;
     if (auto it = _TO_LANGUAGE_CODE.find(language); it != _TO_LANGUAGE_CODE.end())
         language_code = it->second;
     else
         language_code = language;
+    if (!_cfg.language_codes.empty() && !_cfg.language_token_ids.empty()) {
+        if (
+            auto it = std::find(_cfg.language_codes.begin(), _cfg.language_codes.end(), language_code);
+            it != _cfg.language_codes.end()
+        ) {
+            auto idx = std::distance(_cfg.language_codes.begin(), it);
+            if (idx < static_cast<int64_t>(_cfg.language_token_ids.size())) {
+                _set_language_token(_cfg.language_token_ids[idx]);
+                return;
+            }
+        }
+        throw std::runtime_error("Invalid language: " + language);
+    }
+
     if (
         auto it = std::find(_LANGUAGE_CODES.begin(), _LANGUAGE_CODES.end(), language_code);
         it != _LANGUAGE_CODES.end()
     ) {
+        auto language_idx = std::distance(_LANGUAGE_CODES.begin(), it);
+        if (language_idx >= _cfg.num_languages)
+            throw std::runtime_error("Invalid language: " + language);
         auto sot_token_id = _tokenizer_ptr->token_to_id("<|startoftranscript|>");
-        auto language_token_id = sot_token_id + 1 + std::distance(_LANGUAGE_CODES.begin(), it);
-        _input_token_ids[1] = language_token_id;
+        _set_language_token(sot_token_id + 1 + language_idx);
     } else {
         throw std::runtime_error("Invalid language: " + language);
     }

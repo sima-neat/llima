@@ -33,10 +33,6 @@ class WhisperDecoderInitModel(BaseModel):
         base_name = f"model.decoder.layers.{self.layer_idx}"
         self.create_onnx_builder()
         self._onnx_builder.create_input_node("input", (1, self.cfg.d_model, 1, self.num_tokens))
-        if self.layer_idx == 0:
-            self._onnx_builder.create_input_node(
-                "embed_positions", (1, self.cfg.d_model, 1, self.num_tokens)
-            )
         self._onnx_builder.create_input_node(
             "audio_features", (1, self.cfg.d_model, 1, self.cfg.max_source_positions)
         )
@@ -111,7 +107,7 @@ class WhisperDecoderInitModel(BaseModel):
         post_model._onnx_builder = self._onnx_builder
 
         if self.layer_idx == 0:
-            pre_input_nodes = [input_nodes[0], input_nodes[1]]
+            pre_input_nodes = [input_nodes[0], self._build_position_embeddings()]
         else:
             pre_input_nodes = [input_nodes[0]]
         pre_output_nodes = pre_model._build_onnx_nodes(base_name, pre_input_nodes)
@@ -165,6 +161,15 @@ class WhisperDecoderInitModel(BaseModel):
             # Cross-attention value projections.
             post_output_nodes[2],
         ]
+
+    def _build_position_embeddings(self) -> OnnxNode:
+        position_embeddings = self.get_hf_param("model.decoder.embed_positions.weight")
+        assert isinstance(position_embeddings, np.ndarray)
+        position_embeddings = position_embeddings[:self.num_tokens]
+        position_embeddings = position_embeddings.T.reshape(1, self.cfg.d_model, 1, self.num_tokens)
+        return self._onnx_builder.create_initializer(
+            "model.decoder.init_embed_positions", position_embeddings
+        )
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """

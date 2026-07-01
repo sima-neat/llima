@@ -237,7 +237,7 @@ class Tokenizer:
         for token, token_id in self.special_tokens.items():
             if token.strip("<|>") in LANGUAGES:
                 result.append(token_id)
-        return tuple(result)[: self.num_languages]
+        return tuple(sorted(result))[: self.num_languages]
 
     @cached_property
     def all_language_codes(self) -> tuple[str]:
