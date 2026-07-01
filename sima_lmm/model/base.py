@@ -425,7 +425,7 @@ class BaseModel(ABC):
 
     @property
     def enable_filter_sharing(self) -> bool:
-        return self.use_filter_sharing
+        return False
 
     def gen_mpk_files(self, log_level: int) -> SDKModel:
         """Generates MPK files.
