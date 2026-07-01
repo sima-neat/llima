@@ -265,6 +265,14 @@ std::string WhisperModel::run_model(
     const std::filesystem::path& audio_file_name,
     const std::string& language
 ) {
+    return run_model_with_metadata(audio_file_name, language).text;
+}
+
+
+WhisperModel::TranscriptionResult WhisperModel::run_model_with_metadata(
+    const std::filesystem::path& audio_file_name,
+    const std::string& language
+) {
     std::lock_guard<std::mutex> lock(_mutex);
     _logger->info("Audio file: {}", audio_file_name);
 
@@ -280,11 +288,11 @@ std::string WhisperModel::run_model_from_pcm(
 ) {
     std::lock_guard<std::mutex> lock(_mutex);
     ArrayXXbf mel = _preprocessor.preprocess_pcm(pcm, sample_rate);
-    return _run_model(mel, language);
+    return _run_model(mel, language).text;
 }
 
 
-std::string WhisperModel::_run_model(
+WhisperModel::TranscriptionResult WhisperModel::_run_model(
     const ArrayXXbf& mel,
     const std::string& language
 ) {
@@ -304,18 +312,20 @@ std::string WhisperModel::_run_model(
     _encoder_model_ptr->run();
 
     // Update language token id.
+    std::string resolved_language;
     if (_is_auto_language(language)) {
         auto detected_language_index = _detect_language_index();
         auto detected_language_token = _language_token_from_index(detected_language_index);
         _set_language_token(detected_language_token);
+        resolved_language = _language_code_from_token(detected_language_token);
         _logger->info(
             "Detected language: {} token={} index={}",
-            _language_code_from_token(detected_language_token),
+            resolved_language,
             detected_language_token,
             detected_language_index
         );
     } else {
-        _update_language(language);
+        resolved_language = _update_language(language);
     }
 
     // Upload the decoder input embeds.
@@ -350,7 +360,7 @@ std::string WhisperModel::_run_model(
     if (new_tokens.back() == _stop_token_id) {
         _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
         _text_streamer->wait_streaming();
-        return _tokenizer_ptr->decode(new_tokens, true);
+        return {_tokenizer_ptr->decode(new_tokens, true), resolved_language};
     }
 
     // Run decoder pre/cache/post models to generate other tokens.
@@ -396,7 +406,7 @@ std::string WhisperModel::_run_model(
     }
     _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
     _text_streamer->wait_streaming();
-    return _tokenizer_ptr->decode(new_tokens, true);
+    return {_tokenizer_ptr->decode(new_tokens, true), resolved_language};
 }
 
 
@@ -808,7 +818,7 @@ std::string WhisperModel::_language_code_from_token(uint32_t token_id) const {
 }
 
 
-void WhisperModel::_update_language(const std::string& language) {
+std::string WhisperModel::_update_language(const std::string& language) {
     std::string language_code;
     if (auto it = _TO_LANGUAGE_CODE.find(language); it != _TO_LANGUAGE_CODE.end())
         language_code = it->second;
@@ -820,6 +830,7 @@ void WhisperModel::_update_language(const std::string& language) {
     ) {
         auto idx = static_cast<size_t>(std::distance(_cfg.language_codes.begin(), it));
         _set_language_token(_cfg.language_token_ids[idx]);
+        return language_code;
     } else {
         throw std::runtime_error("Invalid language: " + language);
     }

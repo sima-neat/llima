@@ -73,7 +73,8 @@ class EXPORT WEB {
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
-            std::optional<double> tps = std::nullopt
+            std::optional<double> tps = std::nullopt,
+            std::optional<std::string> language = std::nullopt
         );
 
         // Helpers for chat completion
@@ -101,7 +102,6 @@ class EXPORT WEB {
             httplib::Response& res,
             const std::string& language
         );
-
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
         std::jthread _vlm_thread;
