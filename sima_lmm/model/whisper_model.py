@@ -230,9 +230,6 @@ class WhisperModel(BaseModel):
         Returns:
             Generated output text.
         """
-        hf_tokenizer_json_file = find_file(
-            directory=self.hf_model.hf_cache, filename="tokenizer.json"
-        )
         hf_preprocessor_config_json_file = find_file(
             directory=self.hf_model.hf_cache, filename="preprocessor_config.json"
         )
@@ -241,10 +238,7 @@ class WhisperModel(BaseModel):
         )
         detect_language = self._is_auto_language(language)
         tokenizer_language = "en" if detect_language else language
-        self.tokenizer = get_tokenizer(
-            multilingual=True, language=tokenizer_language, task="transcribe",
-            hf_tokenizer_json_file=hf_tokenizer_json_file
-        )
+        self.tokenizer = self._get_tokenizer(language=tokenizer_language, task="transcribe")
 
         if eval_mode == EvalMode.HF:
             raise NotImplementedError("Evaluating Whisper using HuggingFace is not supported yet.")
@@ -428,6 +422,15 @@ class WhisperModel(BaseModel):
     def _is_auto_language(language: str | None) -> bool:
         return language is None or language == "" or language == "auto"
 
+    def _get_tokenizer(self, language: str | None = None, task: str | None = None):
+        hf_tokenizer_json_file = find_file(
+            directory=self.hf_model.hf_cache, filename="tokenizer.json"
+        )
+        return get_tokenizer(
+            multilingual=True, language=language, task=task,
+            hf_tokenizer_json_file=hf_tokenizer_json_file
+        )
+
     def _validate_language_token(self, token_id: int):
         if token_id not in self.tokenizer.all_language_tokens:
             raise RuntimeError(f"Invalid detected language token: {token_id}")
@@ -448,15 +451,8 @@ class WhisperModel(BaseModel):
             cfg_dict = asdict(self.cfg)
             cfg_dict["model_name"] = self.model_name
             cfg_dict["decoder_use_future_token_mask"] = self.use_future_token_mask
-            hf_tokenizer_json_file = find_file(
-                directory=self.hf_model.hf_cache, filename="tokenizer.json"
-            )
-            tokenizer = get_tokenizer(
-                multilingual=True, language="en", task="transcribe",
-                hf_tokenizer_json_file=hf_tokenizer_json_file
-            )
+            tokenizer = self._get_tokenizer()
             cfg_dict["language_detect_enabled"] = True
-            cfg_dict["num_languages"] = tokenizer.num_languages
             cfg_dict["language_token_ids"] = list(tokenizer.all_language_tokens)
             cfg_dict["language_codes"] = list(tokenizer.all_language_codes)
             with open(self.sima_devkit_path / "whisper_config.json", "w") as f:

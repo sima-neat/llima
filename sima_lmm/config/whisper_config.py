@@ -19,7 +19,6 @@ class WhisperConfig(BaseConfig):
     vocab_size: int = 51865
     activation_function: str = "gelu"
     language_detect_enabled: bool = False
-    num_languages: int = 99
     language_token_ids: list[int] = field(default_factory=list)
     language_codes: list[str] = field(default_factory=list)
 

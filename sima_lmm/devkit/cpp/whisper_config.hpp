@@ -25,7 +25,6 @@ struct WhisperConfig{
     std::string model_name;
     bool decoder_use_future_token_mask;
     bool language_detect_enabled = false;
-    uint32_t num_languages = 99;
     std::vector<uint32_t> language_token_ids;
     std::vector<std::string> language_codes;
 
@@ -48,7 +47,6 @@ inline void from_json(const nlohmann::json& j, WhisperConfig& v) {
     j.at("decoder_use_future_token_mask").get_to(v.decoder_use_future_token_mask);
 
     v.language_detect_enabled = j.value("language_detect_enabled", false);
-    v.num_languages = j.value("num_languages", 99);
     v.language_token_ids = j.value("language_token_ids", std::vector<uint32_t>{});
     v.language_codes = j.value("language_codes", std::vector<std::string>{});
 }

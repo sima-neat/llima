@@ -35,11 +35,20 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             "audio_features", (1, self.cfg.d_model, 1, self.cfg.max_source_positions)
         )
 
-        tokenizer = self._get_tokenizer()
+        hf_tokenizer_json_file = find_file(
+            directory=self.hf_model.hf_cache, filename="tokenizer.json"
+        )
+        tokenizer = get_tokenizer(
+            multilingual=True, language=None, task=None,
+            hf_tokenizer_json_file=hf_tokenizer_json_file
+        )
+        language_token_ids = tokenizer.all_language_tokens
         audio_features = self._onnx_builder.input_nodes[0]
-        hidden = self._build_sot_hidden(tokenizer)
+        hidden = self._build_sot_hidden(tokenizer.sot)
         for layer_idx in range(self.cfg.decoder_layers):
-            hidden = self._build_decoder_layer(layer_idx, hidden, audio_features, tokenizer)
+            hidden = self._build_decoder_layer(
+                layer_idx, hidden, audio_features, language_token_ids
+            )
 
         self._onnx_builder.create_output_node(
             self._onnx_builder.get_node_output_name(hidden), (1, 1, 1, 1), np.int64
@@ -49,13 +58,13 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
         # Set to None to deallocate the memory.
         self._onnx_builder = None
 
-    def _build_sot_hidden(self, tokenizer) -> list[OnnxNode]:
+    def _build_sot_hidden(self, sot_token_id: int) -> list[OnnxNode]:
         token_embeddings = self.get_hf_param("model.decoder.embed_tokens.weight")
         position_embeddings = self.get_hf_param("model.decoder.embed_positions.weight")
         assert isinstance(token_embeddings, np.ndarray)
         assert isinstance(position_embeddings, np.ndarray)
 
-        sot_embedding = token_embeddings[tokenizer.sot].reshape(1, self.cfg.d_model, 1, 1)
+        sot_embedding = token_embeddings[sot_token_id].reshape(1, self.cfg.d_model, 1, 1)
         sot_position_embedding = position_embeddings[0].reshape(1, self.cfg.d_model, 1, 1)
         sot_embedding_node = self._onnx_builder.create_initializer(
             "language_detect.sot_embedding", sot_embedding
@@ -67,7 +76,7 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
 
     def _build_decoder_layer(
         self, layer_idx: int, hidden: OnnxNode | list[OnnxNode], audio_features: OnnxNode,
-        tokenizer
+        language_token_ids: tuple[int, ...]
     ) -> OnnxNode:
         base_name = f"model.decoder.layers.{layer_idx}"
 
@@ -100,11 +109,12 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             return post_output_nodes[0]
 
         return self._build_final_post_nodes(
-            base_name, [pre_input_nodes[0], cache_output_nodes[0], audio_features], tokenizer
+            base_name, [pre_input_nodes[0], cache_output_nodes[0], audio_features],
+            language_token_ids
         )
 
     def _build_final_post_nodes(
-        self, base_name: str, input_nodes: list[OnnxNode], tokenizer
+        self, base_name: str, input_nodes: list[OnnxNode], language_token_ids: tuple[int, ...]
     ) -> OnnxNode:
         o_proj = self._onnx_builder.build_conv(f"{base_name}.self_attn.out_proj", input_nodes[1])
         add1 = self._onnx_builder.build_op(f"{base_name}.add1", [input_nodes[0], o_proj], "Add")
@@ -130,7 +140,7 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
         layer_norm2 = self._onnx_builder.build_layer_norm("model.decoder.layer_norm", add3)
         lm_head = self._onnx_builder.build_conv("model.decoder.embed_tokens", layer_norm2)
 
-        language_mask = self._build_language_mask(tokenizer)
+        language_mask = self._build_language_mask(language_token_ids)
         filtered_lm_head = self._onnx_builder.build_op(
             "language_filtered_lm_head", [lm_head, language_mask], "Add"
         )
@@ -139,21 +149,11 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             output_names=["detected_language_token"]
         )
 
-    def _build_language_mask(self, tokenizer) -> OnnxNode:
-        language_token_ids = tokenizer.all_language_tokens
+    def _build_language_mask(self, language_token_ids: tuple[int, ...]) -> OnnxNode:
         logit_mask = np.full((1, self.cfg.vocab_size, 1, 1), np.finfo(np.float32).min,
                              dtype=np.float32)
         logit_mask[:, language_token_ids, :, :] = 0
         return self._onnx_builder.create_initializer("language_detect.language_mask", logit_mask)
-
-    def _get_tokenizer(self):
-        hf_tokenizer_json_file = find_file(
-            directory=self.hf_model.hf_cache, filename="tokenizer.json"
-        )
-        return get_tokenizer(
-            multilingual=True, language=None, task=None,
-            hf_tokenizer_json_file=hf_tokenizer_json_file
-        )
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """
