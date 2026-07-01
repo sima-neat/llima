@@ -18,7 +18,6 @@ class WhisperConfig(BaseConfig):
     suppress_tokens: list[int] = field(default_factory=list)
     vocab_size: int = 51865
     activation_function: str = "gelu"
-    language_detect_enabled: bool = False
     language_token_ids: list[int] = field(default_factory=list)
     language_codes: list[str] = field(default_factory=list)
 

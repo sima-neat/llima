@@ -455,7 +455,6 @@ class WhisperModel(BaseModel):
             cfg_dict["model_name"] = self.model_name
             cfg_dict["decoder_use_future_token_mask"] = self.use_future_token_mask
             tokenizer = self._get_tokenizer()
-            cfg_dict["language_detect_enabled"] = True
             cfg_dict["language_token_ids"] = list(tokenizer.all_language_tokens)
             cfg_dict["language_codes"] = list(tokenizer.all_language_codes)
             with open(self.sima_devkit_path / "whisper_config.json", "w") as f:
