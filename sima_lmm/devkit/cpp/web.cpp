@@ -433,7 +433,7 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
         output_file.close();
 
         // Get language from form data
-        std::string language = "en";
+        std::string language = "auto";
         // Older cpp-httplib stores plain multipart fields in params.
         if (req.has_param("language")) {
             language = req.get_param_value("language");

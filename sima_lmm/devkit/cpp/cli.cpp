@@ -18,7 +18,7 @@ clear system       : clear system prompt, chat history and images.
 clear history      : clear chat history and images.
 print history      : print chat history.
 set audio <fn>     : set the audio file to be transcribed as query.
-set language <lang>: set the language string to be used for transcription.
+set language <lang>: set transcription language; omit <lang> or use auto to detect it.
 set lora           : set the model to use LoRA weights from a npy_files folder.
 unset lora         : revert LoRA model to baseline model.
 quit               : quit.
@@ -119,7 +119,7 @@ void CLI::run() {
             std::cout << "Un-set LoRA and cleared chat history" << std::endl;
             continue;
         } else if (command == "set language") {
-            language = "en";
+            language.clear();
             continue;
         } else if (command.starts_with("set language ")) {
             constexpr auto pos = std::string("set language ").length();
