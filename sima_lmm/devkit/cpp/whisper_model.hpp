@@ -67,6 +67,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         struct TranscriptionResult {
             std::string text;
             std::string language;
+            std::string task;
         };
 
         WhisperModel(std::filesystem::path model_path);
@@ -76,7 +77,9 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             const std::filesystem::path& audio_file_name, const std::string& language
         );
         TranscriptionResult run_model_with_metadata(
-            const std::filesystem::path& audio_file_name, const std::string& language
+            const std::filesystem::path& audio_file_name,
+            const std::string& language,
+            const std::string& task = "transcribe"
         );
         std::string run_model_from_pcm(
             std::span<const float> pcm, uint32_t sample_rate, const std::string& language
@@ -95,7 +98,11 @@ class WhisperModel : public BaseModel<WhisperConfig> {
     private:
         virtual void _initialize() override;
         virtual void _finalize() override;
-        TranscriptionResult _run_model(const ArrayXXbf& mel, const std::string& language);
+        TranscriptionResult _run_model(
+            const ArrayXXbf& mel,
+            const std::string& language,
+            const std::string& task
+        );
 
         virtual void _define_buffers() override;
         void _define_model(
@@ -119,6 +126,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         void _set_language_token(uint32_t token_id);
         std::string _language_code_from_token(uint32_t token_id) const;
         std::string _update_language(const std::string& language);
+        std::string _update_task(const std::string& task);
         
         std::mutex _mutex;
 
