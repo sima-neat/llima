@@ -178,6 +178,7 @@ class BaseModel(ABC):
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
+    use_filter_sharing: bool = field(default=False, kw_only=True)
 
     _onnx_builder: OnnxBuilder | None = field(init=False)
 
@@ -424,7 +425,7 @@ class BaseModel(ABC):
 
     @property
     def enable_filter_sharing(self) -> bool:
-        return False
+        return self.use_filter_sharing
 
     def gen_mpk_files(self, log_level: int) -> SDKModel:
         """Generates MPK files.
