@@ -357,13 +357,17 @@ std::string WEB::_format_audio_sse_chunk(
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
-    std::optional<double> tps
+    std::optional<double> tps,
+    std::optional<std::string> language
 ) {
     nlohmann::json chunk;
     chunk["object"] = finished ? "audio.transcription.done" : "audio.transcription.chunk";
     chunk["text"] = text;
     if (finished) {
         chunk["finish_reason"] = finish_reason.value_or("stop");
+        if (language.has_value()) {
+            chunk["language"] = language.value();
+        }
     }
     if (ttft.has_value()) {
         chunk["ttft"] = ttft.value();
@@ -464,8 +468,8 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
             return;
         }
 
-        auto text = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
-        nlohmann::json response = {{"text", text}};
+        auto result = _whisper_model_ptr->run_model_with_metadata(_AUDIO_FILE_NAME, language);
+        nlohmann::json response = {{"text", result.text}, {"language", result.language}};
         res.set_content(response.dump(), "application/json");
 
     } catch (const std::exception& e) {
@@ -489,6 +493,7 @@ void WEB::_execute_streaming_audio_transcription(
             (void)offset;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
+            std::optional<std::string> finish_reason;
 
             struct WhisperCallbackGuard {
                 WhisperModel* model;
@@ -508,11 +513,7 @@ void WEB::_execute_streaming_audio_transcription(
                     return;
                 }
                 if (metric_type == "END" || metric_type == "FULL") {
-                    const std::string finish_reason = metric_type == "FULL" ? "length" : "stop";
-                    std::string chunk = _format_audio_sse_chunk(
-                        "", true, finish_reason, ttft_value, tps_value
-                    ) + "data: [DONE]\n\n";
-                    sink.write(chunk.data(), chunk.size());
+                    finish_reason = metric_type == "FULL" ? "length" : "stop";
                 }
             };
 
@@ -526,7 +527,12 @@ void WEB::_execute_streaming_audio_transcription(
             try {
                 _whisper_model_ptr->set_info_callback(info_callback);
                 _whisper_model_ptr->set_text_callback(text_callback);
-                _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
+                auto result = _whisper_model_ptr->run_model_with_metadata(_AUDIO_FILE_NAME, language);
+                std::string chunk = _format_audio_sse_chunk(
+                    "", true, finish_reason.value_or("stop"), ttft_value, tps_value,
+                    result.language
+                ) + "data: [DONE]\n\n";
+                sink.write(chunk.data(), chunk.size());
             } catch (const std::exception& e) {
                 nlohmann::json error;
                 error["object"] = "audio.transcription.error";

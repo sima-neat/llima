@@ -64,10 +64,18 @@ using WhisperDecoderModelMap = std::map<WhisperDecoderModelMapKey, MLAModelWithB
 
 class WhisperModel : public BaseModel<WhisperConfig> {
     public:
+        struct TranscriptionResult {
+            std::string text;
+            std::string language;
+        };
+
         WhisperModel(std::filesystem::path model_path);
         virtual ~WhisperModel() { _finalize(); };
 
         std::string run_model(
+            const std::filesystem::path& audio_file_name, const std::string& language
+        );
+        TranscriptionResult run_model_with_metadata(
             const std::filesystem::path& audio_file_name, const std::string& language
         );
         std::string run_model_from_pcm(
@@ -87,7 +95,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
     private:
         virtual void _initialize() override;
         virtual void _finalize() override;
-        std::string _run_model(const ArrayXXbf& mel, const std::string& language);
+        TranscriptionResult _run_model(const ArrayXXbf& mel, const std::string& language);
 
         virtual void _define_buffers() override;
         void _define_model(
@@ -110,7 +118,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         uint32_t _language_token_from_index(uint32_t language_idx) const;
         void _set_language_token(uint32_t token_id);
         std::string _language_code_from_token(uint32_t token_id) const;
-        void _update_language(const std::string& language);
+        std::string _update_language(const std::string& language);
         
         std::mutex _mutex;
 
