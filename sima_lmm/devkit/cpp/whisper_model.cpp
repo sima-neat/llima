@@ -271,13 +271,14 @@ std::string WhisperModel::run_model(
 
 WhisperModel::TranscriptionResult WhisperModel::run_model_with_metadata(
     const std::filesystem::path& audio_file_name,
-    const std::string& language
+    const std::string& language,
+    const std::string& task
 ) {
     std::lock_guard<std::mutex> lock(_mutex);
     _logger->info("Audio file: {}", audio_file_name);
 
     ArrayXXbf audio_tensor = _preprocessor.preprocess(audio_file_name);
-    return _run_model(audio_tensor, language);
+    return _run_model(audio_tensor, language, task);
 }
 
 
@@ -288,13 +289,14 @@ std::string WhisperModel::run_model_from_pcm(
 ) {
     std::lock_guard<std::mutex> lock(_mutex);
     ArrayXXbf mel = _preprocessor.preprocess_pcm(pcm, sample_rate);
-    return _run_model(mel, language).text;
+    return _run_model(mel, language, "transcribe").text;
 }
 
 
 WhisperModel::TranscriptionResult WhisperModel::_run_model(
     const ArrayXXbf& mel,
-    const std::string& language
+    const std::string& language,
+    const std::string& task
 ) {
     _is_running.store(true, std::memory_order_relaxed);
     struct RunningGuard {
@@ -327,6 +329,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     } else {
         resolved_language = _update_language(language);
     }
+    auto resolved_task = _update_task(task);
 
     // Upload the decoder input embeds.
     const uint8_t* token_embeddings_ptr = reinterpret_cast<const uint8_t*>(
@@ -360,7 +363,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     if (new_tokens.back() == _stop_token_id) {
         _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
         _text_streamer->wait_streaming();
-        return {_tokenizer_ptr->decode(new_tokens, true), resolved_language};
+        return {_tokenizer_ptr->decode(new_tokens, true), resolved_language, resolved_task};
     }
 
     // Run decoder pre/cache/post models to generate other tokens.
@@ -406,7 +409,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     }
     _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
     _text_streamer->wait_streaming();
-    return {_tokenizer_ptr->decode(new_tokens, true), resolved_language};
+    return {_tokenizer_ptr->decode(new_tokens, true), resolved_language, resolved_task};
 }
 
 
@@ -834,6 +837,19 @@ std::string WhisperModel::_update_language(const std::string& language) {
     } else {
         throw std::runtime_error("Invalid language: " + language);
     }
+}
+
+
+std::string WhisperModel::_update_task(const std::string& task) {
+    if (task == "transcribe") {
+        _input_token_ids[2] = _tokenizer_ptr->token_to_id("<|transcribe|>");
+        return task;
+    }
+    if (task == "translate") {
+        _input_token_ids[2] = _tokenizer_ptr->token_to_id("<|translate|>");
+        return task;
+    }
+    throw std::runtime_error("Invalid Whisper task: " + task);
 }
 
 

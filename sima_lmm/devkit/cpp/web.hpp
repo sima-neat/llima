@@ -47,7 +47,11 @@ class EXPORT WEB {
             httplib::Response& res,
             bool is_openai
         );
-        void _handle_audio_transcriptions(const httplib::Request& req, httplib::Response& res);
+        void _handle_audio_transcriptions(
+            const httplib::Request& req,
+            httplib::Response& res,
+            const std::string& task
+        );
 
         // Helpers
         void _set_cors_headers(httplib::Response& res);
@@ -74,7 +78,8 @@ class EXPORT WEB {
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
-            std::optional<std::string> language = std::nullopt
+            std::optional<std::string> language = std::nullopt,
+            std::optional<std::string> task = std::nullopt
         );
 
         // Helpers for chat completion
@@ -100,7 +105,8 @@ class EXPORT WEB {
         );
         void _execute_streaming_audio_transcription(
             httplib::Response& res,
-            const std::string& language
+            const std::string& language,
+            const std::string& task
         );
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
