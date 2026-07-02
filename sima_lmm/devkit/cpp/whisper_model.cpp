@@ -261,15 +261,7 @@ WhisperModel::WhisperModel(
 }
 
 
-std::string WhisperModel::run_model(
-    const std::filesystem::path& audio_file_name,
-    const std::string& language
-) {
-    return run_model_with_metadata(audio_file_name, language).text;
-}
-
-
-WhisperModel::TranscriptionResult WhisperModel::run_model_with_metadata(
+WhisperModel::TranscriptionResult WhisperModel::run_model(
     const std::filesystem::path& audio_file_name,
     const std::string& language,
     const std::string& task
@@ -282,14 +274,15 @@ WhisperModel::TranscriptionResult WhisperModel::run_model_with_metadata(
 }
 
 
-std::string WhisperModel::run_model_from_pcm(
+WhisperModel::TranscriptionResult WhisperModel::run_model_from_pcm(
     std::span<const float> pcm,
     uint32_t sample_rate,
-    const std::string& language
+    const std::string& language,
+    const std::string& task
 ) {
     std::lock_guard<std::mutex> lock(_mutex);
     ArrayXXbf mel = _preprocessor.preprocess_pcm(pcm, sample_rate);
-    return _run_model(mel, language, "transcribe").text;
+    return _run_model(mel, language, task);
 }
 
 

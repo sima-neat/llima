@@ -172,8 +172,8 @@ void CLI::run() {
                     model->set_text_callback([](const std::string&, bool) {});
                 }
             } callback_guard{_whisper_model_ptr.get()};
-            auto query = _whisper_model_ptr->run_model(audio_file_name, language);
-            chat.add_query(query);
+            auto result = _whisper_model_ptr->run_model(audio_file_name, language);
+            chat.add_query(result.text);
         } else {
             std::cout << "Query: " << command << std::endl;
             chat.add_query(command);
