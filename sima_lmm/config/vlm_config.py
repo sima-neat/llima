@@ -376,20 +376,23 @@ class RoPEConfig(BaseConfig):
             self.rope_scaling.set_config(text_cfg)
             if "rope_scaling" in text_cfg:
                 self.rope_scaling.set_config(text_cfg["rope_scaling"])
-            # HF Phi LongRoPE omits attention_factor; GGUF may provide it explicitly.
-            if self.rope_scaling.rope_type == "longrope" and self.rope_scaling.attention_factor is None:
-                factor = text_cfg["max_position_embeddings"] / self.rope_scaling.original_max_position_embeddings
-                self.rope_scaling.attention_factor = (
-                    1.0
-                    if factor <= 1.0
-                    else math.sqrt(
-                        1 + math.log(factor) / math.log(self.rope_scaling.original_max_position_embeddings)
-                    )
-                )
             self.rope_dimension_count = text_cfg.get("rope_dimension_count", 0)
             if not self.rope_dimension_count and "partial_rotary_factor" in text_cfg:
                 self.rope_dimension_count = int(head_dim * text_cfg["partial_rotary_factor"])
             self.sliding_rope_dimension_count = text_cfg.get("sliding_rope_dimension_count")
+
+        # HF Phi LongRoPE omits attention_factor; GGUF may provide it explicitly.
+        if self.rope_scaling.rope_type == "longrope" and self.rope_scaling.attention_factor is None:
+            if not self.rope_scaling.original_max_position_embeddings:
+                self.rope_scaling.original_max_position_embeddings = text_cfg["original_max_position_embeddings"]
+            factor = text_cfg["max_position_embeddings"] / self.rope_scaling.original_max_position_embeddings
+            self.rope_scaling.attention_factor = (
+                1.0
+                if factor <= 1.0
+                else math.sqrt(
+                    1 + math.log(factor) / math.log(self.rope_scaling.original_max_position_embeddings)
+                )
+            )
 
         if not self.rope_dimension_count:
             self.rope_dimension_count = head_dim
