@@ -313,7 +313,7 @@ class RopeScalingConfig(BaseConfig):
     low_freq_factor: float = 0
     high_freq_factor: float = 0
     original_max_position_embeddings: int = 0
-    attention_factor: float = 1.0
+    attention_factor: float | None = None
     long_factor: list[float] | None = None
     short_factor: list[float] | None = None
     rope_type: str = "default"
@@ -377,7 +377,7 @@ class RoPEConfig(BaseConfig):
             if "rope_scaling" in text_cfg:
                 self.rope_scaling.set_config(text_cfg["rope_scaling"])
             # HF Phi LongRoPE omits attention_factor; GGUF may provide it explicitly.
-            if self.rope_scaling.rope_type == "longrope" and self.rope_scaling.attention_factor == 1.0:
+            if self.rope_scaling.rope_type == "longrope" and self.rope_scaling.attention_factor is None:
                 factor = text_cfg["max_position_embeddings"] / self.rope_scaling.original_max_position_embeddings
                 self.rope_scaling.attention_factor = (
                     1.0
