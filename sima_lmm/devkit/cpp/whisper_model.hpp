@@ -73,16 +73,16 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         WhisperModel(std::filesystem::path model_path);
         virtual ~WhisperModel() { _finalize(); };
 
-        std::string run_model(
-            const std::filesystem::path& audio_file_name, const std::string& language
-        );
-        TranscriptionResult run_model_with_metadata(
+        TranscriptionResult run_model(
             const std::filesystem::path& audio_file_name,
             const std::string& language,
             const std::string& task = "transcribe"
         );
-        std::string run_model_from_pcm(
-            std::span<const float> pcm, uint32_t sample_rate, const std::string& language
+        TranscriptionResult run_model_from_pcm(
+            std::span<const float> pcm,
+            uint32_t sample_rate,
+            const std::string& language,
+            const std::string& task = "transcribe"
         );
         void set_info_callback(TextStreamer::InfoCallback callback) {
             _text_streamer->set_info_callback(callback);

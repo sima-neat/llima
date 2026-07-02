@@ -2,8 +2,10 @@ import numpy as np
 
 from dataclasses import dataclass
 
+from sima_lmm.hf.hf_transformer import find_file
 from sima_lmm.model.base import BaseModel, TensorTessellateParameters
 from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.tokenizer.whisper_tokenizer import get_tokenizer
 
 
 @dataclass
@@ -104,10 +106,7 @@ class WhisperDecoderPostModel(BaseModel):
             layer_norm2 = self._onnx_builder.build_layer_norm("model.decoder.layer_norm", add3)
             lm_head = self._onnx_builder.build_conv("model.decoder.embed_tokens", layer_norm2)
 
-            # 220: blank
-            # 50363: <|notimestamps|>
-            # 50364: <|0.00|>
-            suppress_tokens = self.cfg.suppress_tokens + [220, 50363, 50364]
+            suppress_tokens = self.cfg.suppress_tokens + self._get_extra_suppress_tokens()
             logit_mask = np.zeros((1, self.cfg.vocab_size, 1, 1), dtype=np.float32)
             logit_mask[:, suppress_tokens, :, :] = np.finfo(np.float32).min
             filtered_lm_head = self._onnx_builder.build_op(
@@ -121,6 +120,20 @@ class WhisperDecoderPostModel(BaseModel):
             output_nodes.append(encoder_k_proj)
             output_nodes.append(encoder_v_proj)
         return output_nodes
+
+    def _get_extra_suppress_tokens(self) -> list[int]:
+        hf_tokenizer_json_file = find_file(
+            directory=self.hf_model.hf_cache, filename="tokenizer.json"
+        )
+        tokenizer = get_tokenizer(
+            multilingual=True, num_languages=self.cfg.num_languages, language=None, task=None,
+            hf_tokenizer_json_file=hf_tokenizer_json_file
+        )
+        return [
+            220,  # standalone space
+            tokenizer.no_timestamps,
+            tokenizer.timestamp_begin,
+        ]
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """

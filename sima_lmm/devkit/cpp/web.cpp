@@ -483,7 +483,7 @@ void WEB::_handle_audio_transcriptions(
             return;
         }
 
-        auto result = _whisper_model_ptr->run_model_with_metadata(_AUDIO_FILE_NAME, language, task);
+        auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
         nlohmann::json response = {
             {"text", result.text},
             {"language", result.language},
@@ -547,9 +547,7 @@ void WEB::_execute_streaming_audio_transcription(
             try {
                 _whisper_model_ptr->set_info_callback(info_callback);
                 _whisper_model_ptr->set_text_callback(text_callback);
-                auto result = _whisper_model_ptr->run_model_with_metadata(
-                    _AUDIO_FILE_NAME, language, task
-                );
+                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
                 std::string chunk = _format_audio_sse_chunk(
                     "", true, finish_reason.value_or("stop"), ttft_value, tps_value,
                     result.language, result.task

@@ -43,7 +43,7 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             directory=self.hf_model.hf_cache, filename="tokenizer.json"
         )
         tokenizer = get_tokenizer(
-            multilingual=True, language=None, task=None,
+            multilingual=True, num_languages=self.cfg.num_languages, language=None, task=None,
             hf_tokenizer_json_file=hf_tokenizer_json_file
         )
         language_token_ids = tokenizer.all_language_tokens

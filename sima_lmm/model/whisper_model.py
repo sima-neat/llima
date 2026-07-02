@@ -9,6 +9,8 @@ from ml_dtypes import bfloat16
 from pathlib import Path
 
 from sima_utils.logging.sima_logger import ScopedLogLevel, sima_log_info
+from transformers.audio_utils import mel_filter_bank
+
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel, find_file
 from sima_lmm.model.base import (
     BaseModel, EvalMode, FileGenMode, FileGenPrecision, LayerConfiguration
@@ -428,7 +430,7 @@ class WhisperModel(BaseModel):
             directory=self.hf_model.hf_cache, filename="tokenizer.json"
         )
         return get_tokenizer(
-            multilingual=True, language=language, task=task,
+            multilingual=True, num_languages=self.cfg.num_languages, language=language, task=task,
             hf_tokenizer_json_file=hf_tokenizer_json_file
         )
 
@@ -477,13 +479,43 @@ class WhisperModel(BaseModel):
             )
 
         # Copy the tokenizer model.
-        copy_hf_file_names = ["tokenizer.json", "preprocessor_config.json"]
-        for file_name in copy_hf_file_names:
-            dst_file_name = self.sima_devkit_path / file_name
-            if not (resume and dst_file_name.is_file()):
-                src_file_name = find_file(directory=self.hf_model.hf_cache, filename=file_name)
-                assert isinstance(src_file_name, Path) and src_file_name.is_file()
-                shutil.copy(src_file_name, dst_file_name)
+        tokenizer_dst_file_name = self.sima_devkit_path / "tokenizer.json"
+        if not (resume and tokenizer_dst_file_name.is_file()):
+            tokenizer_src_file_name = find_file(
+                directory=self.hf_model.hf_cache, filename="tokenizer.json"
+            )
+            assert isinstance(tokenizer_src_file_name, Path) and tokenizer_src_file_name.is_file()
+            shutil.copy(tokenizer_src_file_name, tokenizer_dst_file_name)
+
+        # Copy the preprocessor config and embed the mel filters needed by the C++ runtime.
+        preprocessor_dst_file_name = self.sima_devkit_path / "preprocessor_config.json"
+        if not (resume and preprocessor_dst_file_name.is_file()):
+            preprocessor_src_file_name = find_file(
+                directory=self.hf_model.hf_cache, filename="preprocessor_config.json"
+            )
+            assert (
+                isinstance(preprocessor_src_file_name, Path)
+                and preprocessor_src_file_name.is_file()
+            )
+            with open(preprocessor_src_file_name, "r") as f:
+                preprocessor_cfg = json.load(f)
+
+            if "mel_filters" not in preprocessor_cfg:
+                feature_size = preprocessor_cfg["feature_size"]
+                n_fft = preprocessor_cfg.get("n_fft", 400)
+                sampling_rate = preprocessor_cfg.get("sampling_rate", 16000)
+                preprocessor_cfg["mel_filters"] = mel_filter_bank(
+                    num_frequency_bins=1 + n_fft // 2,
+                    num_mel_filters=feature_size,
+                    min_frequency=0.0,
+                    max_frequency=sampling_rate / 2,
+                    sampling_rate=sampling_rate,
+                    norm="slaney",
+                    mel_scale="slaney",
+                ).T.tolist()
+
+            with open(preprocessor_dst_file_name, "w") as f:
+                json.dump(preprocessor_cfg, f, indent=4)
 
     def _get_part_model(
         self, part: str, layer_idx: int | None = None, token_idx: int | None = None
@@ -493,7 +525,7 @@ class WhisperModel(BaseModel):
                 model_name = f"{self.model_name}_encoder"
                 return WhisperEncoderModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-                    hf_model=self.hf_model, use_filter_sharing=self.use_filter_sharing
+                    hf_model=self.hf_model
                 )
             case "language_detect":
                 model_name = f"{self.model_name}_decoder_language_detect"
