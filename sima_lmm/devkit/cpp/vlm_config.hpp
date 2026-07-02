@@ -91,7 +91,7 @@ struct RopeScalingConfig {
     double low_freq_factor;
     double high_freq_factor;
     uint32_t original_max_position_embeddings;
-    double attention_factor = 1.0;
+    std::optional<double> attention_factor;
     std::optional<std::vector<double>> long_factor;
     std::optional<std::vector<double>> short_factor;
     std::string rope_type;

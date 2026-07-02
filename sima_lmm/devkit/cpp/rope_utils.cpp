@@ -111,8 +111,9 @@ RopeTable calc_freq_real_imag(
     MatrixXXf re_float = scaled_inv_freq_span.array().cos().matrix();
     MatrixXXf im_float = scaled_inv_freq_span.array().sin().matrix();
     if (rope_type == "longrope") {
-        re_float *= rope_scaling_cfg.attention_factor;
-        im_float *= rope_scaling_cfg.attention_factor;
+        double attention_factor = rope_scaling_cfg.attention_factor.value_or(1.0);
+        re_float *= attention_factor;
+        im_float *= attention_factor;
     }
     MatrixXXbf re = re_float.cast<Eigen::bfloat16>();
     MatrixXXbf im = im_float.cast<Eigen::bfloat16>();
