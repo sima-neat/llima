@@ -69,21 +69,25 @@ static Eigen::ArrayXf calc_rope_scaling_longrope(
     }
 }
 
-// rope_dimension_count controls the width of the rotary table
-// head_dim_for_frequency controls the inverse-frequency spacing.
+// rope_dimension_count controls the active width of the rotary table.
+// Proportional RoPE spaces the active frequencies over the full layer head dim;
+// other RoPE variants space them over the active rotary dim itself.
 RopeTable calc_freq_real_imag(
     uint16_t max_num_tokens,
     const std::string& rope_type,
     double theta,
     uint16_t rope_dimension_count,
-    uint16_t head_dim_for_frequency,
+    uint16_t layer_head_dim,
     RopeScalingConfig& rope_scaling_cfg
 ) {
     assert(rope_dimension_count % 2 == 0);
-    assert(head_dim_for_frequency % 2 == 0);
+    assert(layer_head_dim % 2 == 0);
     uint16_t freq_dim = rope_dimension_count / 2;
+    uint16_t frequency_denominator = (
+        rope_type == "proportional" ? layer_head_dim : rope_dimension_count
+    );
     auto inv_freq_seq = Eigen::ArrayXd::LinSpaced(freq_dim, 0, rope_dimension_count - 2);
-    Eigen::ArrayXf inv_freq = Eigen::pow(theta, inv_freq_seq / head_dim_for_frequency).inverse().cast<float>();
+    Eigen::ArrayXf inv_freq = Eigen::pow(theta, inv_freq_seq / frequency_denominator).inverse().cast<float>();
     Eigen::ArrayXf scaled_inv_freq;
     if (rope_type == "" || rope_type == "default" || rope_type == "mrope" || rope_type == "proportional") {
         scaled_inv_freq = inv_freq;
