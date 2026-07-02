@@ -91,6 +91,7 @@ struct RopeScalingConfig {
     double low_freq_factor;
     double high_freq_factor;
     uint32_t original_max_position_embeddings;
+    double attention_factor = 1.0;
     std::optional<std::vector<double>> long_factor;
     std::optional<std::vector<double>> short_factor;
     std::string rope_type;
@@ -99,7 +100,7 @@ struct RopeScalingConfig {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     RopeScalingConfig, factor, low_freq_factor, high_freq_factor, original_max_position_embeddings,
-    long_factor, short_factor, rope_type, mrope_section, mrope_interleaved
+    attention_factor, long_factor, short_factor, rope_type, mrope_section, mrope_interleaved
 )
 
 

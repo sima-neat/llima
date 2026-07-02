@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from dataclasses import dataclass, asdict, field, InitVar
 from typing import Any
@@ -300,6 +301,7 @@ class RopeScalingConfig(BaseConfig):
         high_freq_factor: The high frequency factor (llama3).
         original_max_position_embeddings: The original context length used in model training with
             the given RoPS settings.
+        attention_factor: The post-processing scale applied to LongRoPE cos/sin tables.
         long_factor: List of scaling factors for long context (longrope).
         short_factor: List of scaling factors for short context (longrope).
         rope_type: The type of RoPE scaling method. Supported types are "linear" or "default",
@@ -311,6 +313,7 @@ class RopeScalingConfig(BaseConfig):
     low_freq_factor: float = 0
     high_freq_factor: float = 0
     original_max_position_embeddings: int = 0
+    attention_factor: float = 1.0
     long_factor: list[float] | None = None
     short_factor: list[float] | None = None
     rope_type: str = "default"
@@ -322,7 +325,6 @@ class RopeScalingConfig(BaseConfig):
         # Some models have type instead of rope_type
         if "type" in cfg and "rope_type" not in cfg:
             self.rope_type = cfg["type"]
-        
 
 
 @dataclass
@@ -374,6 +376,16 @@ class RoPEConfig(BaseConfig):
             self.rope_scaling.set_config(text_cfg)
             if "rope_scaling" in text_cfg:
                 self.rope_scaling.set_config(text_cfg["rope_scaling"])
+            # HF Phi LongRoPE omits attention_factor; GGUF may provide it explicitly.
+            if self.rope_scaling.rope_type == "longrope" and self.rope_scaling.attention_factor == 1.0:
+                factor = text_cfg["max_position_embeddings"] / self.rope_scaling.original_max_position_embeddings
+                self.rope_scaling.attention_factor = (
+                    1.0
+                    if factor <= 1.0
+                    else math.sqrt(
+                        1 + math.log(factor) / math.log(self.rope_scaling.original_max_position_embeddings)
+                    )
+                )
             self.rope_dimension_count = text_cfg.get("rope_dimension_count", 0)
             if not self.rope_dimension_count and "partial_rotary_factor" in text_cfg:
                 self.rope_dimension_count = int(head_dim * text_cfg["partial_rotary_factor"])
