@@ -649,6 +649,7 @@ class BaseModel(ABC):
         resume: bool
     ):
         if num_processes != 1 and len(model_list) > 1:
+            os.environ["SIMA_MLA_SIM_PARALLEL"] = "1"
             def _stop_processes(futures, msg = None):
                 if msg is not None:
                     print(msg, file=sys.stderr, flush=True)

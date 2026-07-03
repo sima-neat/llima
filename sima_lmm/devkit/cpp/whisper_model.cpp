@@ -409,10 +409,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
             }
             _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
             _decoder_cache_model_map.at(model_key).add_to_queue();
-            if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1)
-                _decoder_post_log_probe_model_map.at(model_key).add_to_queue(&ifm_map);
-            else
-                _decoder_post_model_map.at(model_key).add_to_queue(&ifm_map);
+            _decoder_post_model_map.at(model_key).add_to_queue(&ifm_map);
         }
 
         MLAModelWithBuffer::run_queue();
@@ -601,12 +598,6 @@ void WhisperModel::_define_model(
         );
     } else if (model_type == "decoder_post") {
         _decoder_post_model_map.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
-            std::forward_as_tuple(model_path, ifms, ofms)
-        );
-    } else if (model_type == "decoder_post_log_probe") {
-        _decoder_post_log_probe_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
@@ -817,6 +808,8 @@ void WhisperModel::_define_models() {
                 post_ofms.emplace_back(&get_buffer("decoder_n1_buffer1"));
             } else {
                 post_ofms.emplace_back(&get_buffer("new_token"));
+                if (_cfg.log_probe_enabled)
+                    post_ofms.emplace_back(&get_buffer("decoder_logits"));
             }
             _define_model(
                 "decoder_post",
@@ -825,19 +818,6 @@ void WhisperModel::_define_models() {
                 post_ifms,
                 post_ofms
             );
-            if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1) {
-                std::vector<MLABufferSlice> log_probe_post_ofms{
-                    {&get_buffer("new_token")},
-                    {&get_buffer("decoder_logits")}
-                };
-                _define_model(
-                    "decoder_post_log_probe",
-                    model_key,
-                    _get_elf_path_decoder_post_log_probe(layer_idx),
-                    post_ifms,
-                    log_probe_post_ofms
-                );
-            }
         }
     }
 }
@@ -883,14 +863,6 @@ std::filesystem::path WhisperModel::_get_elf_path_decoder_cache(uint16_t token_i
 std::filesystem::path WhisperModel::_get_elf_path_decoder_post(uint8_t layer_idx) const {
     auto elf_file_name = fmt::format(
         "{}_decoder_n1_post_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
-    );
-    return _elf_dir / elf_file_name;
-}
-
-
-std::filesystem::path WhisperModel::_get_elf_path_decoder_post_log_probe(uint8_t layer_idx) const {
-    auto elf_file_name = fmt::format(
-        "{}_decoder_n1_post_log_probe_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
     );
     return _elf_dir / elf_file_name;
 }
