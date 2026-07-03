@@ -21,7 +21,7 @@ RopeTable calc_freq_real_imag(
     const std::string& rope_type,
     double theta,
     uint16_t rope_dimension_count,
-    uint16_t head_dim_for_frequency,
+    uint16_t layer_head_dim,
     RopeScalingConfig& rope_scaling_cfg
 );
 
