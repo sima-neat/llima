@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <atomic>
 #include <mutex>
@@ -68,6 +69,8 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             std::string text;
             std::string language;
             std::string task;
+            float no_speech_prob;
+            std::optional<float> avg_logprob;
         };
 
         WhisperModel(std::filesystem::path model_path, bool do_parallel_load);
@@ -116,12 +119,20 @@ class WhisperModel : public BaseModel<WhisperConfig> {
 
         std::filesystem::path _get_elf_path_encoder() const;
         std::filesystem::path _get_elf_path_decoder_init(uint8_t layer_idx) const;
+        std::filesystem::path _get_elf_path_decoder_init_log_probe(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_pre(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_cache(uint16_t token_idx) const;
         std::filesystem::path _get_elf_path_decoder_post(uint8_t layer_idx) const;
+        std::filesystem::path _get_elf_path_decoder_post_log_probe(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_language_detect() const;
         bool _is_auto_language(const std::string& language) const;
-        uint32_t _detect_language_index();
+        struct LanguageDetectResult {
+            uint32_t language_index;
+            float no_speech_prob;
+        };
+        LanguageDetectResult _run_language_detect();
+        float _compute_token_logprob(MLABuffer& logits_buf, uint32_t token_id);
+        float _compute_token_prob(MLABuffer& logits_buf, uint32_t token_id);
         uint32_t _language_token_from_index(uint32_t language_idx) const;
         void _set_language_token(uint32_t token_id);
         std::string _language_code_from_token(uint32_t token_id) const;
@@ -139,9 +150,11 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::unique_ptr<MLAModelWithBuffer> _encoder_model_ptr;
         std::unique_ptr<MLAModelWithBuffer> _decoder_language_detect_model_ptr;
         std::map<uint8_t, MLAModelWithBuffer> _decoder_init_model_map;
+        std::map<uint8_t, MLAModelWithBuffer> _decoder_init_log_probe_model_map;
         WhisperDecoderModelMap _decoder_pre_model_map;
         WhisperDecoderModelMap _decoder_cache_model_map;
         WhisperDecoderModelMap _decoder_post_model_map;
+        WhisperDecoderModelMap _decoder_post_log_probe_model_map;
         std::vector<uint32_t> _input_token_ids;
         uint32_t _stop_token_id;
 

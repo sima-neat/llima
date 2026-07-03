@@ -39,6 +39,7 @@ class WhisperModel(BaseModel):
         sima_path: Path | str,
         use_future_token_mask: bool,
         enable_filter_sharing: bool = False,
+        enable_log_probe: bool = False,
     ) -> "WhisperModel":
         """Creates a WhisperModel object from cached Hugging Face model.
 
@@ -53,6 +54,7 @@ class WhisperModel(BaseModel):
         """
         hf_model = LocalHuggingFaceModel.create_from_directory(directory=hf_cache_path)
         whisper_cfg = WhisperConfig.from_hf_config(hf_cache_path, hf_model.config)
+        whisper_cfg.log_probe_enabled = enable_log_probe
 
         return WhisperModel(
             cfg=whisper_cfg,
@@ -107,8 +109,10 @@ class WhisperModel(BaseModel):
         encoder = False
         language_detect = False
         init_layer_idx_list = list()
+        init_log_probe_layer_idx_list = list()
         single_pre_layer_idx_list = list()
         single_post_layer_idx_list = list()
+        single_post_log_probe_layer_idx_list = list()
         single_cache_token_idx_list = list()
         if part_idx is None:
             if part == "all":
@@ -119,10 +123,14 @@ class WhisperModel(BaseModel):
                 language_detect = True
             if part in ("init", None):
                 init_layer_idx_list = list(range(self.cfg.decoder_layers))
+            if self.cfg.log_probe_enabled and part in ("init_log_probe", None):
+                init_log_probe_layer_idx_list = [self.cfg.decoder_layers - 1]
             if part in ("single_pre", None):
                 single_pre_layer_idx_list = list(range(self.cfg.decoder_layers))
             if part in ("single_post", None):
                 single_post_layer_idx_list = list(range(self.cfg.decoder_layers))
+            if self.cfg.log_probe_enabled and part in ("single_post_log_probe", None):
+                single_post_log_probe_layer_idx_list = [self.cfg.decoder_layers - 1]
             if part in ("single_cache", None):
                 if self.use_future_token_mask:
                     single_cache_token_idx_list = [self.cfg.max_target_positions - 1]
@@ -135,6 +143,10 @@ class WhisperModel(BaseModel):
                 case "init":
                     assert 0 <= part_idx < self.cfg.decoder_layers
                     init_layer_idx_list.append(part_idx)
+                case "init_log_probe":
+                    assert self.cfg.log_probe_enabled
+                    assert part_idx == self.cfg.decoder_layers - 1
+                    init_log_probe_layer_idx_list.append(part_idx)
                 case "single_pre":
                     assert 0 <= part_idx < self.cfg.decoder_layers
                     single_pre_layer_idx_list.append(part_idx)
@@ -150,6 +162,10 @@ class WhisperModel(BaseModel):
                 case "single_post":
                     assert 0 <= part_idx < self.cfg.decoder_layers
                     single_post_layer_idx_list.append(part_idx)
+                case "single_post_log_probe":
+                    assert self.cfg.log_probe_enabled
+                    assert part_idx == self.cfg.decoder_layers - 1
+                    single_post_log_probe_layer_idx_list.append(part_idx)
                 case _:
                     raise RuntimeError(
                         f"Generating files for part={part} and part_idx={part_idx} is not supported"
@@ -195,6 +211,10 @@ class WhisperModel(BaseModel):
 
         for layer_idx in init_layer_idx_list:
             model_list.append((self._get_part_model("init", layer_idx=layer_idx), init_precision))
+        for layer_idx in init_log_probe_layer_idx_list:
+            model_list.append((
+                self._get_part_model("init_log_probe", layer_idx=layer_idx), init_precision
+            ))
 
         for layer_idx in single_pre_layer_idx_list:
             model_list.append(
@@ -205,6 +225,11 @@ class WhisperModel(BaseModel):
             model_list.append(
                 (self._get_part_model("post", layer_idx=layer_idx), single_post_precision)
             )
+        for layer_idx in single_post_log_probe_layer_idx_list:
+            model_list.append((
+                self._get_part_model("post_log_probe", layer_idx=layer_idx),
+                single_post_precision
+            ))
 
         for token_idx in single_cache_token_idx_list:
             model_list.append(
@@ -456,6 +481,7 @@ class WhisperModel(BaseModel):
             cfg_dict = asdict(self.cfg)
             cfg_dict["model_name"] = self.model_name
             cfg_dict["decoder_use_future_token_mask"] = self.use_future_token_mask
+            cfg_dict["log_probe_enabled"] = self.cfg.log_probe_enabled
             tokenizer = self._get_tokenizer()
             cfg_dict["language_token_ids"] = list(tokenizer.all_language_tokens)
             cfg_dict["language_codes"] = list(tokenizer.all_language_codes)
@@ -540,6 +566,13 @@ class WhisperModel(BaseModel):
                     hf_model=self.hf_model, layer_idx=layer_idx,
                     use_filter_sharing=self.use_filter_sharing
                 )
+            case "init_log_probe":
+                model_name = f"{self.model_name}_decoder_init_log_probe_layer{layer_idx}"
+                return WhisperDecoderInitModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, layer_idx=layer_idx, enable_log_probe=True,
+                    use_filter_sharing=self.use_filter_sharing
+                )
             case "pre":
                 model_name = f"{self.model_name}_decoder_n1_pre_layer{layer_idx}"
                 return WhisperDecoderPreModel(
@@ -554,6 +587,14 @@ class WhisperModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=1, layer_idx=layer_idx,
                     skip_encoder_kv_proj=True, output_encoder_kv_cache=False,
                     use_filter_sharing=self.use_filter_sharing
+                )
+            case "post_log_probe":
+                model_name = f"{self.model_name}_decoder_n1_post_log_probe_layer{layer_idx}"
+                return WhisperDecoderPostModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=1, layer_idx=layer_idx,
+                    skip_encoder_kv_proj=True, output_encoder_kv_cache=False,
+                    enable_log_probe=True, use_filter_sharing=self.use_filter_sharing
                 )
             case "cache":
                 model_name = f"{self.model_name}_decoder_n1_cache_token{token_idx}"

@@ -61,8 +61,15 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
                 layer_idx, hidden, audio_features, language_start_token_id, num_languages
             )
 
+        detected_language_index, full_lm_head_logits = hidden
         self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(hidden), (1, 1, 1, 1), np.int64
+            self._onnx_builder.get_node_output_name(detected_language_index),
+            (1, 1, 1, 1),
+            np.int64
+        )
+        self._onnx_builder.create_output_node(
+            self._onnx_builder.get_node_output_name(full_lm_head_logits),
+            (1, self.cfg.vocab_size, 1, 1)
         )
         self._onnx_builder.create_and_save_model()
 
@@ -88,7 +95,7 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
     def _build_decoder_layer(
         self, layer_idx: int, hidden: OnnxNode | list[OnnxNode], audio_features: OnnxNode,
         language_start_token_id: int, num_languages: int
-    ) -> OnnxNode:
+    ) -> OnnxNode | list[OnnxNode]:
         base_name = f"model.decoder.layers.{layer_idx}"
 
         pre_model = WhisperDecoderPreModel(
@@ -127,7 +134,7 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
     def _build_final_post_nodes(
         self, base_name: str, input_nodes: list[OnnxNode],
         language_start_token_id: int, num_languages: int
-    ) -> OnnxNode:
+    ) -> list[OnnxNode]:
         o_proj = self._onnx_builder.build_conv(f"{base_name}.self_attn.out_proj", input_nodes[1])
         add1 = self._onnx_builder.build_op(f"{base_name}.add1", [input_nodes[0], o_proj], "Add")
         encoder_attn_layer_norm = self._onnx_builder.build_layer_norm(
@@ -150,15 +157,25 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
         )
         add3 = self._onnx_builder.build_op(f"{base_name}.add3", [add2, mlp], "Add")
         layer_norm2 = self._onnx_builder.build_layer_norm("model.decoder.layer_norm", add3)
-        lm_head = self._onnx_builder.build_conv(
-            "model.decoder.embed_tokens",
-            layer_norm2,
-            weight_slice=(language_start_token_id, num_languages, 0, 0)
+        full_lm_head_logits = self._onnx_builder.build_conv(
+            "model.decoder.embed_tokens", layer_norm2
         )
-        return self._onnx_builder.build_op(
-            "language_argmax", [lm_head], "ArgMax", axis=1, keepdims=1,
+        language_logits = self._onnx_builder.build_op(
+            "language_logits",
+            [
+                full_lm_head_logits,
+                np.array([language_start_token_id], dtype=np.int32),
+                np.array([language_start_token_id + num_languages], dtype=np.int32),
+                np.array([1], dtype=np.int32),
+            ],
+            "Slice",
+            output_names=["language_logits"]
+        )
+        detected_language_index = self._onnx_builder.build_op(
+            "language_argmax", [language_logits], "ArgMax", axis=1, keepdims=1,
             output_names=["detected_language_index"]
         )
+        return [detected_language_index, full_lm_head_logits]
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """

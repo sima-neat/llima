@@ -21,11 +21,13 @@ class WhisperDecoderPostModel(BaseModel):
         layer_idx: Transformer layer index.
         skip_encoder_kv_proj: Whether to skip the key/value projections in cross attention.
         output_encoder_kv_cache: Whether to output the key/value projections from cross attention.
+        enable_log_probe: Whether to also output filtered logits from the final layer.
     """
     num_tokens: int
     layer_idx: int
     skip_encoder_kv_proj: bool
     output_encoder_kv_cache: bool
+    enable_log_probe: bool = False
 
     def __post_init__(self):
         assert 0 <= self.layer_idx < self.cfg.decoder_layers
@@ -65,6 +67,11 @@ class WhisperDecoderPostModel(BaseModel):
             )
         else:
             self._onnx_builder.create_output_node(output_name, (1, 1, 1, self.num_tokens), np.int64)
+            if self.enable_log_probe:
+                self._onnx_builder.create_output_node(
+                    self._onnx_builder.get_node_output_name(output_nodes[1]),
+                    (1, self.cfg.vocab_size, 1, self.num_tokens)
+                )
         assert not self.output_encoder_kv_cache
         self._onnx_builder.create_and_save_model()
 
@@ -116,6 +123,8 @@ class WhisperDecoderPostModel(BaseModel):
                 "argmax", [filtered_lm_head], "ArgMax", axis=1, keepdims=1
             )
             output_nodes.append(argmax)
+            if self.enable_log_probe:
+                output_nodes.append(filtered_lm_head)
         if self.output_encoder_kv_cache:
             output_nodes.append(encoder_k_proj)
             output_nodes.append(encoder_v_proj)

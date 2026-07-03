@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <cmath>
 #include <iterator>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #include <cnpy.h>
@@ -306,10 +308,12 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     get_buffer("encoder_ifm").upload(mel.data());
     _encoder_model_ptr->run();
 
+    auto language_detect_result = _run_language_detect();
+
     // Update language token id.
     std::string resolved_language;
     if (_is_auto_language(language)) {
-        auto detected_language_index = _detect_language_index();
+        auto detected_language_index = language_detect_result.language_index;
         auto detected_language_token = _language_token_from_index(detected_language_index);
         _set_language_token(detected_language_token);
         resolved_language = _language_code_from_token(detected_language_token);
@@ -342,21 +346,40 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     auto& new_token_buf = get_buffer("new_token");
     uint32_t* new_token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());
     std::vector<uint32_t> new_tokens;
+    float logprob_sum = 0.0f;
+    uint32_t logprob_count = 0;
 
     // Run decoder init model to generate the first token.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
-        _decoder_init_model_map.at(layer_idx).add_to_queue();
+        if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1)
+            _decoder_init_log_probe_model_map.at(layer_idx).add_to_queue();
+        else
+            _decoder_init_model_map.at(layer_idx).add_to_queue();
     }
     MLAModelWithBuffer::run_queue();
     new_token_buf.invalidate_cache();
     new_tokens.emplace_back(new_token_ptr[0]);
+    if (_cfg.log_probe_enabled) {
+        auto& logits_buf = get_buffer("decoder_logits");
+        logits_buf.invalidate_cache();
+        if (new_tokens.back() != _stop_token_id) {
+            logprob_sum += _compute_token_logprob(logits_buf, new_tokens.back());
+            ++logprob_count;
+        }
+    }
     const double ttft = timer_ttft.stop();
     _logger->info("Time to the first token: {:d} in {:.5f}s", new_tokens.back(), ttft);
     _text_streamer->push(DecodeCallbackType::TTFT, new_tokens.back(), ttft);
     if (new_tokens.back() == _stop_token_id) {
         _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
         _text_streamer->wait_streaming();
-        return {_tokenizer_ptr->decode(new_tokens, true), resolved_language, resolved_task};
+        return {
+            _tokenizer_ptr->decode(new_tokens, true),
+            resolved_language,
+            resolved_task,
+            language_detect_result.no_speech_prob,
+            _cfg.log_probe_enabled ? std::optional<float>{0.0f} : std::optional<float>{}
+        };
     }
 
     // Run decoder pre/cache/post models to generate other tokens.
@@ -386,12 +409,23 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
             }
             _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
             _decoder_cache_model_map.at(model_key).add_to_queue();
-            _decoder_post_model_map.at(model_key).add_to_queue(&ifm_map);
+            if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1)
+                _decoder_post_log_probe_model_map.at(model_key).add_to_queue(&ifm_map);
+            else
+                _decoder_post_model_map.at(model_key).add_to_queue(&ifm_map);
         }
 
         MLAModelWithBuffer::run_queue();
         new_token_buf.invalidate_cache();
         new_tokens.emplace_back(new_token_ptr[0]);
+        if (_cfg.log_probe_enabled) {
+            auto& logits_buf = get_buffer("decoder_logits");
+            logits_buf.invalidate_cache();
+            if (new_tokens.back() != _stop_token_id) {
+                logprob_sum += _compute_token_logprob(logits_buf, new_tokens.back());
+                ++logprob_count;
+            }
+        }
         const double ttnt = timer_tps.stop(true);
         _logger->info("Got token {:d} in {:.5f}s", new_tokens.back(), ttnt);
 
@@ -402,7 +436,16 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     }
     _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
     _text_streamer->wait_streaming();
-    return {_tokenizer_ptr->decode(new_tokens, true), resolved_language, resolved_task};
+    std::optional<float> avg_logprob = std::nullopt;
+    if (_cfg.log_probe_enabled)
+        avg_logprob = logprob_count > 0 ? logprob_sum / logprob_count : 0.0f;
+    return {
+        _tokenizer_ptr->decode(new_tokens, true),
+        resolved_language,
+        resolved_task,
+        language_detect_result.no_speech_prob,
+        avg_logprob
+    };
 }
 
 
@@ -514,6 +557,8 @@ void WhisperModel::_define_buffers() {
     define_buffer("decoder_n1_buffer3", {1, _cfg.d_model});
     // Post output for last layer.
     define_buffer("new_token", {1}, "int32");
+    define_buffer("language_detect_logits", {1, _cfg.vocab_size});
+    define_buffer("decoder_logits", {1, _cfg.vocab_size});
 }
 
 
@@ -536,6 +581,12 @@ void WhisperModel::_define_model(
             std::forward_as_tuple(std::get<uint8_t>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
         );
+    } else if (model_type == "decoder_init_log_probe") {
+        _decoder_init_log_probe_model_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(std::get<uint8_t>(key)),
+            std::forward_as_tuple(model_path, ifms, ofms)
+        );
     } else if (model_type == "decoder_pre") {
         _decoder_pre_model_map.emplace(
             std::piecewise_construct,
@@ -550,6 +601,12 @@ void WhisperModel::_define_model(
         );
     } else if (model_type == "decoder_post") {
         _decoder_post_model_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
+            std::forward_as_tuple(model_path, ifms, ofms)
+        );
+    } else if (model_type == "decoder_post_log_probe") {
+        _decoder_post_log_probe_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
@@ -575,7 +632,10 @@ void WhisperModel::_define_models() {
         {},
         _get_elf_path_decoder_language_detect(),
         std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}},
-        std::vector<MLABufferSlice>{{&get_buffer("new_token")}}
+        std::vector<MLABufferSlice>{
+            {&get_buffer("new_token")},
+            {&get_buffer("language_detect_logits")}
+        }
     );
 
     // Decoder init model.
@@ -618,6 +678,47 @@ void WhisperModel::_define_models() {
             }
         );
         _define_model("decoder_init", layer_idx, _get_elf_path_decoder_init(layer_idx), ifms, ofms);
+
+        if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1) {
+            std::vector<MLABufferSlice> log_probe_ofms;
+            log_probe_ofms.emplace_back(&get_buffer("new_token"));
+            log_probe_ofms.emplace_back(&get_buffer("decoder_logits"));
+            log_probe_ofms.emplace_back(
+                &get_buffer(fmt::format("decoder_cache_key{}", layer_idx)),
+                std::vector<uint32_t>{0, 0},
+                std::vector<uint32_t>{num_input_tokens, _cfg.d_model}
+            );
+            log_probe_ofms.emplace_back(
+                &get_buffer(fmt::format("decoder_cache_val{}", layer_idx)),
+                std::vector<uint32_t>{0, 0},
+                std::vector<uint32_t>{num_input_tokens, _cfg.d_model}
+            );
+            log_probe_ofms.emplace_back(
+                &get_buffer(fmt::format("encoder_cache_key{}", layer_idx)),
+                std::vector<uint32_t>{0, 0, 0},
+                std::vector<uint32_t>{
+                    _cfg.decoder_attention_heads,
+                    _cfg.max_source_positions,
+                    _cfg.get_decoder_head_dim()
+                }
+            );
+            log_probe_ofms.emplace_back(
+                &get_buffer(fmt::format("encoder_cache_val{}", layer_idx)),
+                std::vector<uint32_t>{0, 0, 0},
+                std::vector<uint32_t>{
+                    _cfg.decoder_attention_heads,
+                    _cfg.max_source_positions,
+                    _cfg.get_decoder_head_dim()
+                }
+            );
+            _define_model(
+                "decoder_init_log_probe",
+                layer_idx,
+                _get_elf_path_decoder_init_log_probe(layer_idx),
+                ifms,
+                log_probe_ofms
+            );
+        }
     }
 
     // Decoder pre/cache/post.
@@ -724,6 +825,19 @@ void WhisperModel::_define_models() {
                 post_ifms,
                 post_ofms
             );
+            if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1) {
+                std::vector<MLABufferSlice> log_probe_post_ofms{
+                    {&get_buffer("new_token")},
+                    {&get_buffer("decoder_logits")}
+                };
+                _define_model(
+                    "decoder_post_log_probe",
+                    model_key,
+                    _get_elf_path_decoder_post_log_probe(layer_idx),
+                    post_ifms,
+                    log_probe_post_ofms
+                );
+            }
         }
     }
 }
@@ -737,6 +851,14 @@ std::filesystem::path WhisperModel::_get_elf_path_encoder() const {
 std::filesystem::path WhisperModel::_get_elf_path_decoder_init(uint8_t layer_idx) const {
     auto elf_file_name = fmt::format(
         "{}_decoder_init_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
+    );
+    return _elf_dir / elf_file_name;
+}
+
+
+std::filesystem::path WhisperModel::_get_elf_path_decoder_init_log_probe(uint8_t layer_idx) const {
+    auto elf_file_name = fmt::format(
+        "{}_decoder_init_log_probe_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
     );
     return _elf_dir / elf_file_name;
 }
@@ -766,6 +888,14 @@ std::filesystem::path WhisperModel::_get_elf_path_decoder_post(uint8_t layer_idx
 }
 
 
+std::filesystem::path WhisperModel::_get_elf_path_decoder_post_log_probe(uint8_t layer_idx) const {
+    auto elf_file_name = fmt::format(
+        "{}_decoder_n1_post_log_probe_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
+    );
+    return _elf_dir / elf_file_name;
+}
+
+
 std::filesystem::path WhisperModel::_get_elf_path_decoder_language_detect() const {
     return _elf_dir / fmt::format(
         "{}_decoder_language_detect_stage1_mla.elf", _cfg.model_name
@@ -778,12 +908,42 @@ bool WhisperModel::_is_auto_language(const std::string& language) const {
 }
 
 
-uint32_t WhisperModel::_detect_language_index() {
+WhisperModel::LanguageDetectResult WhisperModel::_run_language_detect() {
     _decoder_language_detect_model_ptr->run();
     auto& new_token_buf = get_buffer("new_token");
     new_token_buf.invalidate_cache();
     auto* token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());
-    return token_ptr[0];
+    auto no_speech_token_id = _tokenizer_ptr->token_to_id("<|nospeech|>");
+    auto& logits_buf = get_buffer("language_detect_logits");
+    logits_buf.invalidate_cache();
+    return {
+        token_ptr[0],
+        _compute_token_prob(logits_buf, no_speech_token_id)
+    };
+}
+
+
+float WhisperModel::_compute_token_logprob(MLABuffer& logits_buf, uint32_t token_id) {
+    if (token_id >= _cfg.vocab_size)
+        throw std::runtime_error(fmt::format("Invalid token id for logprob: {}", token_id));
+
+    auto* logits_ptr = reinterpret_cast<Eigen::bfloat16*>(logits_buf.get_virtual_addr());
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (uint32_t i = 0; i < _cfg.vocab_size; ++i) {
+        max_logit = std::max(max_logit, static_cast<float>(logits_ptr[i]));
+    }
+
+    float exp_sum = 0.0f;
+    for (uint32_t i = 0; i < _cfg.vocab_size; ++i) {
+        exp_sum += expf(static_cast<float>(logits_ptr[i]) - max_logit);
+    }
+    return static_cast<float>(logits_ptr[token_id]) - (max_logit + logf(exp_sum));
+}
+
+
+float WhisperModel::_compute_token_prob(MLABuffer& logits_buf, uint32_t token_id) {
+    return expf(_compute_token_logprob(logits_buf, token_id));
 }
 
 
