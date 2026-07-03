@@ -81,7 +81,9 @@ class EXPORT WEB {
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
             std::optional<std::string> language = std::nullopt,
-            std::optional<std::string> task = std::nullopt
+            std::optional<std::string> task = std::nullopt,
+            std::optional<float> no_speech_prob = std::nullopt,
+            std::optional<float> avg_logprob = std::nullopt
         );
 
         // Helpers for chat completion

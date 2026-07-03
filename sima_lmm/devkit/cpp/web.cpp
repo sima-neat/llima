@@ -366,7 +366,9 @@ std::string WEB::_format_audio_sse_chunk(
     std::optional<double> ttft,
     std::optional<double> tps,
     std::optional<std::string> language,
-    std::optional<std::string> task
+    std::optional<std::string> task,
+    std::optional<float> no_speech_prob,
+    std::optional<float> avg_logprob
 ) {
     nlohmann::json chunk;
     chunk["object"] = finished ? "audio.transcription.done" : "audio.transcription.chunk";
@@ -378,6 +380,12 @@ std::string WEB::_format_audio_sse_chunk(
         }
         if (task.has_value()) {
             chunk["task"] = task.value();
+        }
+        if (no_speech_prob.has_value()) {
+            chunk["no_speech_prob"] = no_speech_prob.value();
+        }
+        if (avg_logprob.has_value()) {
+            chunk["avg_logprob"] = avg_logprob.value();
         }
     }
     if (ttft.has_value()) {
@@ -487,8 +495,11 @@ void WEB::_handle_audio_transcriptions(
         nlohmann::json response = {
             {"text", result.text},
             {"language", result.language},
-            {"task", result.task}
+            {"task", result.task},
+            {"no_speech_prob", result.no_speech_prob}
         };
+        if (result.avg_logprob.has_value())
+            response["avg_logprob"] = result.avg_logprob.value();
         res.set_content(response.dump(), "application/json");
 
     } catch (const std::exception& e) {
@@ -550,7 +561,7 @@ void WEB::_execute_streaming_audio_transcription(
                 auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
                 std::string chunk = _format_audio_sse_chunk(
                     "", true, finish_reason.value_or("stop"), ttft_value, tps_value,
-                    result.language, result.task
+                    result.language, result.task, result.no_speech_prob, result.avg_logprob
                 ) + "data: [DONE]\n\n";
                 sink.write(chunk.data(), chunk.size());
             } catch (const std::exception& e) {

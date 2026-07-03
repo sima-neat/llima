@@ -23,6 +23,7 @@ class WhisperConfig(BaseConfig):
     num_languages: int = 99
     language_token_ids: list[int] = field(default_factory=list)
     language_codes: list[str] = field(default_factory=list)
+    log_probe_enabled: bool = False
 
     @staticmethod
     def from_hf_config(model_path: Path, model_cfg: dict) -> "WhisperConfig":
