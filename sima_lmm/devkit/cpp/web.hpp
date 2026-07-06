@@ -74,6 +74,7 @@ class EXPORT WEB {
         );
         std::string _format_audio_sse_chunk(
             const std::string& text,
+            const std::string& event_task,
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,

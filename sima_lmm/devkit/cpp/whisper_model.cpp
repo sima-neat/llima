@@ -885,7 +885,9 @@ WhisperModel::LanguageDetectResult WhisperModel::_run_language_detect() {
     auto& new_token_buf = get_buffer("new_token");
     new_token_buf.invalidate_cache();
     auto* token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());
-    auto no_speech_token_id = _tokenizer_ptr->token_to_id("<|nospeech|>");
+    // HF tokenizers name this token <|nocaptions|>; Whisper generation treats it as
+    // the no-speech token at the id immediately before <|notimestamps|>.
+    auto no_speech_token_id = _tokenizer_ptr->token_to_id("<|notimestamps|>") - 1;
     auto& logits_buf = get_buffer("language_detect_logits");
     logits_buf.invalidate_cache();
     return {
