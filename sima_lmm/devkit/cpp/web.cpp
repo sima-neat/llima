@@ -361,6 +361,7 @@ std::string WEB::_format_ollama_ndjson_chunk(
 
 std::string WEB::_format_audio_sse_chunk(
     const std::string& text,
+    const std::string& event_task,
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
@@ -371,7 +372,10 @@ std::string WEB::_format_audio_sse_chunk(
     std::optional<float> avg_logprob
 ) {
     nlohmann::json chunk;
-    chunk["object"] = finished ? "audio.transcription.done" : "audio.transcription.chunk";
+    const auto object_prefix = event_task == "translate"
+        ? "audio.translation"
+        : "audio.transcription";
+    chunk["object"] = object_prefix + std::string(finished ? ".done" : ".chunk");
     chunk["text"] = text;
     if (finished) {
         chunk["finish_reason"] = finish_reason.value_or("stop");
@@ -551,7 +555,7 @@ void WEB::_execute_streaming_audio_transcription(
             auto text_callback = [&](const std::string& text, bool stream_end, bool) {
                 if (text.empty())
                     return;
-                std::string chunk = _format_audio_sse_chunk(text, false);
+                std::string chunk = _format_audio_sse_chunk(text, task, false);
                 sink.write(chunk.data(), chunk.size());
             };
 
@@ -560,13 +564,15 @@ void WEB::_execute_streaming_audio_transcription(
                 _whisper_model_ptr->set_text_callback(text_callback);
                 auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
                 std::string chunk = _format_audio_sse_chunk(
-                    "", true, finish_reason.value_or("stop"), ttft_value, tps_value,
+                    "", task, true, finish_reason.value_or("stop"), ttft_value, tps_value,
                     result.language, result.task, result.no_speech_prob, result.avg_logprob
                 ) + "data: [DONE]\n\n";
                 sink.write(chunk.data(), chunk.size());
             } catch (const std::exception& e) {
                 nlohmann::json error;
-                error["object"] = "audio.transcription.error";
+                error["object"] = task == "translate"
+                    ? "audio.translation.error"
+                    : "audio.transcription.error";
                 error["error"] = e.what();
                 std::string chunk = "data: " + error.dump() + "\n\ndata: [DONE]\n\n";
                 sink.write(chunk.data(), chunk.size());
