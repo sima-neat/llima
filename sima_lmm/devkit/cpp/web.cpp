@@ -587,6 +587,42 @@ void WEB::_execute_streaming_audio_transcription(
 }
 
 
+namespace {
+
+bool json_bool_or_default(
+    const nlohmann::json& json_data, const char* key, bool default_value
+) {
+    if (!json_data.contains(key))
+        return default_value;
+    const auto& value = json_data.at(key);
+    if (value.is_boolean())
+        return value.get<bool>();
+    if (value.is_string()) {
+        auto text = value.get<std::string>();
+        return text == "true" || text == "1" || text == "True";
+    }
+    return default_value;
+}
+
+bool request_enable_thinking(const nlohmann::json& json_data) {
+    bool enable_thinking = json_bool_or_default(json_data, "enable_thinking", false);
+    if (
+        json_data.contains("chat_template_kwargs")
+        && json_data.at("chat_template_kwargs").is_object()
+    ) {
+        enable_thinking = json_bool_or_default(
+            json_data.at("chat_template_kwargs"), "enable_thinking", enable_thinking
+        );
+    }
+    if (json_data.contains("options") && json_data.at("options").is_object()) {
+        enable_thinking = json_bool_or_default(
+            json_data.at("options"), "enable_thinking", enable_thinking
+        );
+    }
+    return enable_thinking;
+}
+
+}
 
 std::optional<Chat> WEB::_prepare_chat_context(
     const httplib::Request& req,
@@ -599,6 +635,7 @@ std::optional<Chat> WEB::_prepare_chat_context(
     stream = json_data.value("stream", false);
 
     Chat chat = _vision_language_model_ptr->create_chat();
+    chat.set_enable_thinking(request_enable_thinking(json_data));
     if (json_data.contains("tools") && json_data["tools"].is_array()) {
         chat.set_tools(nlohmann::ordered_json(json_data["tools"]));
     }

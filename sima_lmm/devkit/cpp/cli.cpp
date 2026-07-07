@@ -124,11 +124,13 @@ void CLI::run() {
             continue;
         } else if (command == "enable-thinking") {
             _vision_language_model_ptr->set_enable_thinking(true);
+            chat.set_enable_thinking(true);
             chat.clear_history();
             std::cout << "Enabled thinking and cleared chat history." << std::endl;
             continue;
         } else if (command == "disable-thinking") {
             _vision_language_model_ptr->set_enable_thinking(false);
+            chat.set_enable_thinking(false);
             chat.clear_history();
             std::cout << "Disabled thinking and cleared chat history." << std::endl;
             continue;
