@@ -37,6 +37,9 @@ class Chat {
         const nlohmann::ordered_json& get_tools() const { return _tools; }
         bool has_tools() const { return _tools.is_array() && !_tools.empty(); }
 
+        void set_enable_thinking(bool enable_thinking) { _enable_thinking = enable_thinking; }
+        bool get_enable_thinking() const { return _enable_thinking; }
+
         void add_image(std::filesystem::path image_path);
         void clear_images();
         const std::vector<std::filesystem::path>& get_images() const { return _images; }
@@ -49,6 +52,7 @@ class Chat {
         nlohmann::ordered_json _messages;
         nlohmann::ordered_json _tools;
         std::vector<std::filesystem::path> _images;
+        bool _enable_thinking = false;
 };
 
 

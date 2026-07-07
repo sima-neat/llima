@@ -75,7 +75,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     minja::chat_template_inputs inputs;
     inputs.messages = chat.get_messages();
     inputs.tools = chat.get_tools();
-    inputs.extra_context["enable_thinking"] = _enable_thinking;
+    inputs.extra_context["enable_thinking"] = chat.get_enable_thinking();
     auto formatted_prompt = _chat_template_ptr->apply(inputs);
 
     // Construct the actual prompt with full image tokens. Manually process the prompt because there
