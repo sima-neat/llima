@@ -22,7 +22,6 @@ set language <lang>: set the language string to be used for transcription.
 set lora           : set the model to use LoRA weights from a npy_files folder.
 unset lora         : revert LoRA model to baseline model.
 quit               : quit.
-list command       : print this page.
 help               : print this page.
 )";
 
