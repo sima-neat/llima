@@ -283,7 +283,9 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         # First multiply (input * key)
         # BatchMatMul repeats the smaller H dimension for GQA.
-        bmm1 = builder.create_batch_matmul_node(mla_input_input, mla_input_cached_keys, True)
+        bmm1 = builder.create_batch_matmul_node(
+            mla_input_input, mla_input_cached_keys, transpose_a=False, transpose_b=True
+        )
         assert get_expected_tensor_value(bmm1.get_type().output).shape == key_shape
 
         if self.logit_softcapping is not None:
@@ -325,7 +327,9 @@ class LanguageCacheModel(LanguagePartBaseModel):
         softmax = builder.create_softmax_node(bmm1, 3)
 
         # Second multiply ((input * key) * value)
-        bmm2 = builder.create_batch_matmul_node(softmax, mla_input_cached_values, False)
+        bmm2 = builder.create_batch_matmul_node(
+            softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
+        )
         assert get_expected_tensor_value(bmm2.get_type().output).shape == value_shape
         output = builder.create_slice_concat_node(
             bmm2, axis=3, split_axis=1,
