@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import numpy as np
 
+from afe.backends.backends import Backend
 from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
@@ -208,13 +209,15 @@ class LanguagePartBaseModel(BaseModel):
         match mla_node.get_type().output:
             case TensorValue(value=t):
                 if t.scalar == ScalarType.bfloat16:
-                    _ = builder.create_cast_node(mla_node, ScalarType.float32)
+                    _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
             case TupleValue():
                 tuple_items = []
                 for node in builder.create_tuple_get_item_nodes(mla_node):
                     if (get_expected_tensor_value(node.get_type().output).scalar
                             == ScalarType.bfloat16):
-                        tuple_items.append(builder.create_cast_node(node, ScalarType.float32))
+                        tuple_items.append(
+                            builder.create_cast_node(node, ScalarType.float32, backend=Backend.EV)
+                        )
                     else:
                         tuple_items.append(node)
                 builder.create_tuple_node(tuple_items)

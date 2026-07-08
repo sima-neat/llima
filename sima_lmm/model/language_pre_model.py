@@ -445,10 +445,13 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         if activation_type(quantizable) != ScalarType.float32:
             if len(output_nodes) == 1:
-                builder.create_cast_node(mla_node, ScalarType.float32)
+                builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
             else:
                 tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-                builder.create_tuple_node([builder.create_cast_node(x, ScalarType.float32) for x in tuple_items])
+                builder.create_tuple_node([
+                    builder.create_cast_node(x, ScalarType.float32, backend=Backend.EV)
+                    for x in tuple_items
+                ])
 
         net = builder.finish(self.model_name)
         return net

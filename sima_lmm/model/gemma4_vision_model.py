@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from afe.apis.defines import TensorDRAMLayout, gen2_target
+from afe.backends.backends import Backend
 from afe.ir.attributes import ClipAttrs
 from afe.ir.build_node import NodeOrHandle
 from afe.ir.defines import Status, get_expected_tensor_value
@@ -389,7 +390,7 @@ class Gemma4VisionLayerModel(BaseModel):
         self._build_sima_vision_model(builder, base_name, mla_input, quantizable)
         mla_node = builder.finish_subnet("MLA_0")
         if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32)
+            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         return builder.finish(self.model_name)
 
     def _build_sima_vision_model(

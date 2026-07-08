@@ -337,7 +337,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         # Ensure that output type is float32
         if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32)
+            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         net = builder.finish(self.model_name)
         return net
 

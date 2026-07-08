@@ -6,6 +6,7 @@ import numpy as np
 from scipy.ndimage import zoom
 
 from afe.apis.defines import gen2_target, TensorDRAMLayout
+from afe.backends.backends import Backend
 from afe.ir.serializer import save_awesomenet
 from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
@@ -521,7 +522,7 @@ class StandardVisionLayerModel(BaseModel):
 
         # Ensure that output type is float32
         if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32)
+            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         net = builder.finish(self.model_name)
         return net
 

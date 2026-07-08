@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from afe.apis.defines import gen2_target
+from afe.backends.backends import Backend
 from afe.ir.serializer import save_awesomenet
 from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
@@ -75,7 +76,7 @@ class LanguageDraftFCModel(LanguagePartBaseModel):
 
         mla_node = builder.finish_subnet("MLA_0")
         if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32)
+            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         return builder.finish(self.model_name)
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:

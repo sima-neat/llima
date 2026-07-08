@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from afe.apis.defines import TensorDRAMLayout, gen2_target
+from afe.backends.backends import Backend
 from afe.ir.serializer import save_awesomenet
 from afe.ir.defines import Status, TensorValue, TupleValue
 from afe.ir.tensor_type import TensorType, ScalarType
@@ -748,11 +749,14 @@ class QwenVisionLayerModel(BaseModel):
         match mla_node.get_type().output:
             case TensorValue(value=t):
                 if t.scalar == ScalarType.bfloat16:
-                    _ = builder.create_cast_node(mla_node, ScalarType.float32)
+                    _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
             case TupleValue():
                 tuple_items = builder.create_tuple_get_item_nodes(mla_node)
                 builder.create_tuple_node(
-                    [builder.create_cast_node(item, ScalarType.float32) for item in tuple_items]
+                    [
+                        builder.create_cast_node(item, ScalarType.float32, backend=Backend.EV)
+                        for item in tuple_items
+                    ]
                 )
 
     def _build_sima_qwen3_vision_model(
