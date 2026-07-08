@@ -628,9 +628,10 @@ class LanguageModelConfig(BaseConfig):
 
         layer_types = text_cfg.get("layer_types") or []
         sliding_window = text_cfg.get("sliding_window", 0) or 0
+        use_sliding_window = text_cfg.get("use_sliding_window", True)
         num_hidden_layers = text_cfg.get("num_hidden_layers", 0)
         if not layer_types:
-            if sliding_window > 0:
+            if sliding_window > 0 and use_sliding_window:
                 layer_types = ["sliding_attention"] * num_hidden_layers
             else:
                 layer_types = ["full_attention"] * num_hidden_layers
