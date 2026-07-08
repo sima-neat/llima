@@ -401,13 +401,15 @@ class RoPEConfig(BaseConfig):
             if not self.rope_scaling.original_max_position_embeddings:
                 self.rope_scaling.original_max_position_embeddings = text_cfg["original_max_position_embeddings"]
             factor = text_cfg["max_position_embeddings"] / self.rope_scaling.original_max_position_embeddings
-            self.rope_scaling.attention_factor = (
+            attention_factor = (
                 1.0
                 if factor <= 1.0
                 else math.sqrt(
                     1 + math.log(factor) / math.log(self.rope_scaling.original_max_position_embeddings)
                 )
             )
+            # Cast to match gguf fp32 attention factor
+            self.rope_scaling.attention_factor = float(np.float32(attention_factor))
 
         if not self.rope_dimension_count:
             self.rope_dimension_count = head_dim
