@@ -1,0 +1,135 @@
+name: Cache Hugging Face Safetensors
+
+run-name: Cache Hugging Face safetensors (${{ inputs.vulcan_env || vars.VULCAN_ENV || 'production' }})
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/cache-hf-safetensors.yml
+      - tools/hf-safetensors/**
+  workflow_dispatch:
+    inputs:
+      repo_id:
+        description: Optional single Hugging Face model repo id. Empty uses tools/hf-safetensors/manifest.txt.
+        required: false
+        type: string
+        default: ""
+      revision:
+        description: Revision for repo_id override. Manifest lines can also specify a revision.
+        required: false
+        type: string
+        default: main
+      manifest_path:
+        description: Path to the repo manifest used when repo_id is empty.
+        required: false
+        type: string
+        default: tools/hf-safetensors/manifest.txt
+      huggingface_token:
+        description: Optional Hugging Face token for guarded models. Prefer the HF_TOKEN secret when available.
+        required: false
+        type: string
+        default: ""
+      vulcan_env:
+        description: Vulcan environment to publish to.
+        required: false
+        type: choice
+        default: production
+        options:
+          - dev
+          - staging
+          - production
+      force:
+        description: Force resync from Hugging Face even when the cached revision is current.
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: Resolve revisions and cache status without publishing to Vulcan.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  resolve-vulcan-config:
+    name: Resolve Vulcan Config
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
+    with:
+      vulcan_env: ${{ inputs.vulcan_env || vars.VULCAN_ENV || 'production' }}
+
+  cache-safetensors:
+    name: Cache latest safetensors
+    needs: resolve-vulcan-config
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+    env:
+      AWS_REGION: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
+      ARTIFACT_BUCKET: ${{ needs.resolve-vulcan-config.outputs.artifact_bucket }}
+      ARTIFACT_KMS_KEY_ID: ${{ needs.resolve-vulcan-config.outputs.artifact_kms_key_id }}
+      ARTIFACT_BASE_URL: ${{ needs.resolve-vulcan-config.outputs.artifact_base_url }}
+      ARTIFACT_CLOUDFRONT_DISTRIBUTION_ID: ${{ needs.resolve-vulcan-config.outputs.artifact_cloudfront_distribution_id }}
+      HF_TOKEN: ${{ inputs.huggingface_token || secrets.HF_TOKEN || secrets.HUGGINGFACE_TOKEN }}
+      HUGGINGFACE_TOKEN: ${{ inputs.huggingface_token || secrets.HF_TOKEN || secrets.HUGGINGFACE_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Hugging Face tooling
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install huggingface_hub
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
+          role-to-assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
+          role-session-name: llima-safetensors-${{ github.run_id }}
+
+      - name: Resolve and publish safetensors cache
+        env:
+          HF_REPO_ID: ${{ inputs.repo_id }}
+          HF_REVISION: ${{ inputs.revision || 'main' }}
+          HF_MANIFEST_PATH: ${{ inputs.manifest_path || 'tools/hf-safetensors/manifest.txt' }}
+          FORCE_SYNC: ${{ inputs.force }}
+          DRY_RUN: ${{ github.event_name == 'push' && 'true' || inputs.dry_run }}
+          RESOLVE_ONLY: ${{ github.event_name == 'push' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            --bucket "${ARTIFACT_BUCKET}"
+            --base-url "${ARTIFACT_BASE_URL}"
+            --cache-root llima-safetensors
+            --manifest "${HF_MANIFEST_PATH}"
+          )
+
+          if [[ -n "${HF_REPO_ID}" ]]; then
+            args+=(--repo-id "${HF_REPO_ID}" --revision "${HF_REVISION}")
+          fi
+          if [[ "${FORCE_SYNC}" == "true" ]]; then
+            args+=(--force)
+          fi
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            args+=(--dry-run)
+            args+=(--publish-probe)
+            args+=(--kms-key-id "${ARTIFACT_KMS_KEY_ID}")
+          else
+            args+=(--kms-key-id "${ARTIFACT_KMS_KEY_ID}")
+            args+=(--cloudfront-distribution-id "${ARTIFACT_CLOUDFRONT_DISTRIBUTION_ID}")
+          fi
+          if [[ "${RESOLVE_ONLY}" == "true" ]]; then
+            args+=(--resolve-only)
+          fi
+
+          python3 tools/hf-safetensors/cache.py "${args[@]}"

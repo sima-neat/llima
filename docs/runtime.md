@@ -36,6 +36,9 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 
 Use `llima run` as a simple runtime for initial model validation on Modalix.
 
+In CLI mode, chat history is enabled by default. Each prompt and response is
+kept as context for the next turn until you clear it with `clear history`.
+
 ``` console
 modalix:~$ llima run <model> [options]
 ```
@@ -70,5 +73,4 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `set lora <name>` | Use LoRA weights from a `npy_files` folder. |
 | `unset lora` | Revert the LoRA model to the baseline model. |
 | `quit` | Quit. |
-| `list command` | Print available commands. |
 | `help` | Print available commands. |

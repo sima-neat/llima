@@ -41,7 +41,6 @@ public:
                         {"audio",    {}, true}}},
             {"unset",  {{"lora",     {}}}},
             {"print",  {{"history",  {}}}},
-            {"list",   {{"command",  {}}}},
             {"help",   {}},
             {"quit",   {}},
         };

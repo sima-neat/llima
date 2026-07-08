@@ -38,6 +38,7 @@ GGUF_CONFIG_MAP : dict = {
         "rope.dimension_count_swa": "sliding_rope_dimension_count",
         "rope.scaling.type": "rope_type",
         "rope.scaling.factor": "factor",
+        "rope.scaling.attn_factor": "attention_factor",
         "rope.scaling.original_context_length": "original_max_position_embeddings",
         "shortconv.l_cache": "conv_L_cache",
         "final_logit_softcapping": "final_logit_softcapping",
