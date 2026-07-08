@@ -26,6 +26,7 @@ class EXPORT WEB {
         WEB(
             std::filesystem::path vlm_model_path,
             std::optional<std::filesystem::path> whisper_model_path,
+            std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template,
             bool do_parallel_load
@@ -58,7 +59,8 @@ class EXPORT WEB {
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
-            std::optional<double> tps = std::nullopt
+            std::optional<double> tps = std::nullopt,
+            bool from_draft = false
         );
         std::string _format_ollama_ndjson_chunk(
             const std::string& content,
@@ -66,7 +68,8 @@ class EXPORT WEB {
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
-            std::optional<double> tps = std::nullopt
+            std::optional<double> tps = std::nullopt,
+            bool from_draft = false
         );
         std::string _format_audio_sse_chunk(
             const std::string& text,
@@ -103,6 +106,7 @@ class EXPORT WEB {
         );
 
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
+        std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
         std::jthread _vlm_thread;
 

@@ -1,3 +1,5 @@
+#include <spdlog/spdlog.h>
+
 #include "utils.hpp"
 #include "vision_language_model.hpp"
 
@@ -24,17 +26,23 @@ VisionLanguageModel::VisionLanguageModel(
         _text_streamer, do_parallel_load
     );
 
-    // Run one dummy query to cache the system prompt and warm up other libraries.
-    Chat chat = create_chat();
-    if (_cfg.support_image() && sample_image_file_name.has_value()) {
-        chat.add_image(sample_image_file_name.value());
-        chat.add_query("Describe what's in the image");
-    } else {
-        chat.add_query("Hi");
+    // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
+    // run_model path.
+    if (!_cfg.lm_cfg.is_spec_decode()) {
+        Chat chat = create_chat();
+        if (_cfg.support_image() && sample_image_file_name.has_value()) {
+            chat.add_image(sample_image_file_name.value());
+            chat.add_query("Describe what's in the image");
+        } else {
+            chat.add_query("Hi");
+        }
+        _text_streamer.disable();
+        run_model(chat, 2);
+        _text_streamer.enable();
     }
-    _text_streamer.disable();
-    run_model(chat, 2);
-    _text_streamer.enable();
+
+    // Pre-warm OMP thread pool to avoid libgomp first-call cost.
+    warmup_omp();
 }
 
 
@@ -67,17 +75,29 @@ std::optional<std::string> VisionLanguageModel::run_model(
     }
     _logger->info("Image encode time: {:.2f}s", timer_image_encode.stop());
 
-    // Decode the text and image embeddings.
+    // Decode the text and image embeddings. When a draft VLM is configured
+    // (set_draft_vlm), dispatch to speculative decoding; otherwise run the
+    // normal language-model decode loop.
     std::optional<uint16_t> max_num_tokens{};
     if (max_new_tokens.has_value())
         max_num_tokens = preprocessed_data.input_token_ids.size() + max_new_tokens.value();
-    auto output_token_ids = _language_model_ptr->run_model(
-        preprocessed_data.input_token_ids, timer_ttft, max_num_tokens
-    );
+
+    std::optional<std::vector<uint32_t>> output_token_ids;
+    if (_draft_vlm_ptr != nullptr) {
+        output_token_ids = _language_model_ptr->run_model_speculative_decoding(
+            *_draft_vlm_ptr->_language_model_ptr,
+            preprocessed_data.input_token_ids,
+            max_num_tokens
+        );
+    } else {
+        output_token_ids = _language_model_ptr->run_model(
+            preprocessed_data.input_token_ids, timer_ttft, max_num_tokens
+        );
+    }
+
     if (output_token_ids.has_value())
         return _vlm_helper.get_tokenizer()->decode(output_token_ids.value(), true);
-    else
-        return std::nullopt;
+    return std::nullopt;
 }
 
 

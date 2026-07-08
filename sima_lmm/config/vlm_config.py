@@ -149,6 +149,14 @@ MLA_CONSTRAINTS: dict = {
     "max_position_embeddings": 2048,  # k-v cache size
 }
 
+# Number of tokens processed in parallel per speculative-decoding step.
+# "draft": the number of candidate tokens the draft model proposes per step (topk).
+# "target": the number of tokens the target model verifies in parallel per step.
+SPECULATIVE_BUDGET: dict = {
+    "draft": 5,
+    "target": 16,
+}
+
 
 class BaseConfig(object):
     """Base configuration with a set_config method.
@@ -375,7 +383,14 @@ class RoPEConfig(BaseConfig):
             self.rope_scaling = RopeScalingConfig()
             self.rope_scaling.set_config(text_cfg)
             if "rope_scaling" in text_cfg:
-                self.rope_scaling.set_config(text_cfg["rope_scaling"])
+                if text_cfg["rope_scaling"] is None:
+                    # Some configs (e.g. EAGLE3 drafts) explicity set rope_scaling
+                    # to null. Defaults to RopeScalingConfig;
+                    # for drafts the actual values are inherited from the target
+                    # model in VisionLanguageModel.from_hf_cache()
+                    self.rope_scaling = RopeScalingConfig()
+                else:
+                    self.rope_scaling.set_config(text_cfg["rope_scaling"])
             self.rope_dimension_count = text_cfg.get("rope_dimension_count", 0)
             if not self.rope_dimension_count and "partial_rotary_factor" in text_cfg:
                 self.rope_dimension_count = int(head_dim * text_cfg["partial_rotary_factor"])
@@ -386,13 +401,15 @@ class RoPEConfig(BaseConfig):
             if not self.rope_scaling.original_max_position_embeddings:
                 self.rope_scaling.original_max_position_embeddings = text_cfg["original_max_position_embeddings"]
             factor = text_cfg["max_position_embeddings"] / self.rope_scaling.original_max_position_embeddings
-            self.rope_scaling.attention_factor = (
+            attention_factor = (
                 1.0
                 if factor <= 1.0
                 else math.sqrt(
                     1 + math.log(factor) / math.log(self.rope_scaling.original_max_position_embeddings)
                 )
             )
+            # Cast to match gguf fp32 attention factor
+            self.rope_scaling.attention_factor = float(np.float32(attention_factor))
 
         if not self.rope_dimension_count:
             self.rope_dimension_count = head_dim
@@ -509,18 +526,15 @@ class LoraConfig(BaseConfig):
 
 
 @dataclass
-class DraftConfig(BaseConfig):
-    """Configuration of a speculative decoding draft model.
+class SpeculativeDecodingConfig(BaseConfig):
+    """Configuration of a model in a speculative decoding setup.
 
     Attributes:
-        draft_vocab_size: The vocabulary size used by the draft model's lm_head. Smaller than the
-            target model's vocab_size.
-        num_hidden_layers: Number of transformer layers in the draft model. Always 1 for EAGLE.
-        hidden_size: Hidden dimension of the draft model. Must match the target model's hidden_size.
+        is_draft: True if the model is a draft model in a speculative decoding setup.
+        speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
+            16 for target, 5 for draft model.
     """
-    draft_vocab_size: int = 0
-    num_hidden_layers: int = 0
-    hidden_size: int = 0
+    is_draft: bool = False
     speculative_budget: int = 16
 
 
@@ -554,6 +568,10 @@ class LanguageModelConfig(BaseConfig):
         conv_L_cache: LFM2 short conv cache length; number of tokens used by conv.
         conv_bias: Whether conv layers use bias (LFM2).
         lora_cfg: The configuration of LoRA for the base model.
+        draft_vocab_size: Output dimension of the draft model's lm_head over a
+            reduced token subset. Not an input embedding size. 0 for non-draft.
+        speculative_decoding_cfg: Speculative-decoding settings; None unless this
+            model is part of a speculative-decoding pair.
     """
     model_type: str = ""
     data_type: LlmDataType = LlmDataType.BF16
@@ -575,13 +593,17 @@ class LanguageModelConfig(BaseConfig):
     final_logit_softcapping: float | None = None
     lm_head_num_splits: int = 1
     lm_head_split_dim: int = 0
+    draft_vocab_size: int = 0
     conv_L_cache: int = 3
     conv_bias: bool = False
     lora_cfg: LoraConfig | None  = None
-    draft_cfg: DraftConfig | None = None
+    speculative_decoding_cfg: SpeculativeDecodingConfig | None = None
 
     def __post_init__(self):
-        self.lm_head_split_dim = self.token_cfg.vocab_size
+        self.lm_head_split_dim = (
+            self.draft_vocab_size if self.draft_vocab_size > 0
+            else self.token_cfg.vocab_size
+        )
 
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
@@ -595,8 +617,8 @@ class LanguageModelConfig(BaseConfig):
         cfg["arch"] = LlmArchType(cfg["arch"])
         if cfg.get("lora_cfg") is not None:
             cfg["lora_cfg"] = LoraConfig(**cfg["lora_cfg"])
-        if cfg.get("draft_cfg") is not None:
-            cfg["draft_cfg"] = DraftConfig(**cfg["draft_cfg"])
+        if cfg.get("speculative_decoding_cfg") is not None:
+            cfg["speculative_decoding_cfg"] = SpeculativeDecodingConfig(**cfg["speculative_decoding_cfg"])
         lmc = LanguageModelConfig(**cfg)
         lmc._calc_lm_head_splits()
         return lmc
@@ -608,9 +630,10 @@ class LanguageModelConfig(BaseConfig):
 
         layer_types = text_cfg.get("layer_types") or []
         sliding_window = text_cfg.get("sliding_window", 0) or 0
+        use_sliding_window = text_cfg.get("use_sliding_window", True)
         num_hidden_layers = text_cfg.get("num_hidden_layers", 0)
         if not layer_types:
-            if sliding_window > 0:
+            if sliding_window > 0 and use_sliding_window:
                 layer_types = ["sliding_attention"] * num_hidden_layers
             else:
                 layer_types = ["full_attention"] * num_hidden_layers
@@ -630,6 +653,7 @@ class LanguageModelConfig(BaseConfig):
             and not self.model_type.startswith("gemma4")
         )
         self.layer_types = layer_types
+        self.draft_vocab_size = text_cfg.get("draft_vocab_size", 0)
 
         for key in (
             "attn_logit_softcapping",
@@ -678,17 +702,12 @@ class LanguageModelConfig(BaseConfig):
             self.lora_cfg = LoraConfig()
             self.lora_cfg.set_config(cfg)
 
-    def set_draft_model(self, cfg: dict | None):
+    def set_speculative_decoding_config(self, cfg: dict | None):
         if cfg is None:
-            self.draft_cfg = None
+            self.speculative_decoding_cfg = None
         else:
-            self.draft_cfg = DraftConfig()
-            self.draft_cfg.set_config(cfg)
-            if self.draft_cfg.hidden_size != self.hidden_size:
-                raise ValueError(
-                    f"Draft model hidden_size ({self.draft_cfg.hidden_size}) "
-                    f"does not match target model hidden_size ({self.hidden_size})."
-                )
+            self.speculative_decoding_cfg = SpeculativeDecodingConfig()
+            self.speculative_decoding_cfg.set_config(cfg)
 
     def is_lora_target_module(self, base_name: str, module_name: str) -> bool:
         """
@@ -758,7 +777,10 @@ class LanguageModelConfig(BaseConfig):
         max_num_channels_per_split = (
             mla_instr_max_num_channels * compiler_max_num_channel_splits // num_bytes_per_element
         )
-        num_channels = self.token_cfg.vocab_size
+        num_channels = (
+            self.draft_vocab_size if self.draft_vocab_size > 0
+            else self.token_cfg.vocab_size
+        )
 
         max_num_channel_blocks_per_split = ceil_div(
             max_num_channels_per_split, num_channels_per_block
@@ -787,10 +809,9 @@ class PipelineConfig(BaseConfig):
         input_token_group_size: The group size of input token.
         input_token_group_offsets: The group offsets of input token.
         return_logits: Return logits at the last layer.
-        use_strided_kv_cache: Enables strided access to the KV cache stored in DRAM, affecting both
-            read and write operations.
         enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
+        quantize_kv_cache: Enables KV cache quantization to reduce memory consumption.
         split_mlp: Split the MLP into multiple stages in order to reduce TTFT.
     """
     system_prompt: str | None = None
@@ -800,9 +821,9 @@ class PipelineConfig(BaseConfig):
     input_token_group_offsets: list[int] | None = None
     future_token_mask_size: int = 1
     return_logits: bool = False
-    use_strided_kv_cache: bool = False
     enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
+    quantize_kv_cache: bool = False
     split_mlp: bool = False
 
     def set_system_prompt(self, prompt: str | None):
@@ -827,14 +848,14 @@ class PipelineConfig(BaseConfig):
     def set_return_logits(self, return_logits: bool):
         self.return_logits = return_logits
 
-    def set_strided_kv_cache(self, use_strided_kv_cache: bool):
-        self.use_strided_kv_cache = use_strided_kv_cache
-
     def set_enable_filter_sharing(self, enable_filter_sharing: bool):
         self.enable_filter_sharing = enable_filter_sharing
 
     def set_quantize_embeddings(self, quantize_embeddings: bool):
         self.quantize_embeddings = quantize_embeddings
+
+    def set_quantize_kv_cache(self, quantize_kv_cache: bool):
+        self.quantize_kv_cache = quantize_kv_cache
 
     def set_split_mlp(self, split_mlp: bool):
         self.split_mlp = split_mlp
@@ -1079,7 +1100,7 @@ class VlmConfig(BaseConfig):
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
                     layers.append(LayerID("group_pre", i))
-                    if i < lm_cfg.num_hidden_layers - 1 or lm_cfg.draft_cfg is not None:
+                    if i < lm_cfg.num_hidden_layers - 1 or lm_cfg.speculative_decoding_cfg is not None:
                         layers.append(LayerID("group_post", i))
                     layers.append(LayerID("single_pre", i))
                     layers.append(LayerID("single_post", i))
@@ -1100,7 +1121,7 @@ class VlmConfig(BaseConfig):
             layers.extend(LayerID("group_pre", n) for n in range(lm_cfg.num_hidden_layers))
             layers.extend(
                 LayerID("group_post", n) 
-                for n in range(lm_cfg.num_hidden_layers - (lm_cfg.draft_cfg is None))
+                for n in range(lm_cfg.num_hidden_layers - (lm_cfg.speculative_decoding_cfg is None))
             )
             layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
             layers.extend(LayerID("single_pre", n) for n in range(lm_cfg.num_hidden_layers))
@@ -1108,6 +1129,9 @@ class VlmConfig(BaseConfig):
             layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
         if self.vm_cfg is not None and self.is_supported_multimodal:
             layers.extend(LayerID("vision", n) for n in range(vision_model_layer_count(self.vm_cfg)))
+        if lm_cfg.speculative_decoding_cfg is not None and lm_cfg.speculative_decoding_cfg.is_draft:
+            layers.append(LayerID("group_draft_fc", 0))
+            layers.append(LayerID("single_draft_fc", 0))
 
         if (
             self.model_type == VlmArchType.VLM_GEMMA4

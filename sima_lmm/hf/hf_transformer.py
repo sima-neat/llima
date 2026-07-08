@@ -1,20 +1,20 @@
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Self
 
 import numpy as np
-import safetensors.numpy
 import torch
 import transformers
+from safetensors import safe_open
 from PIL import Image
 from ml_dtypes import bfloat16, int4
 from transformers import AutoConfig, MistralConfig
 from transformers.image_utils import load_images
 from sima_utils.logging.sima_logger import sima_log_info
-import os
 
 
 HF_SINGLE_MODEL_FILENAME = 'model.safetensors'
@@ -286,12 +286,9 @@ class LocalHuggingFaceModel:
             # This means there is no .index.json, so the weight-map needs to be build manually.
             # Weight-map structure {'model_param_name': 'safetensors_file_name'}
             weight_files = {HF_SINGLE_MODEL_FILENAME: weight_file}
-            index_data = {
-                'weight_map': {
-                    k: HF_SINGLE_MODEL_FILENAME
-                    for k in safetensors.numpy.load_file(weight_file).keys()
-                }
-            }
+            with safe_open(weight_file, framework="numpy") as f:
+                tensor_names = list(f.keys())
+            index_data = {'weight_map': dict.fromkeys(tensor_names, HF_SINGLE_MODEL_FILENAME)}
         else:
             # There is no `model.safetensors`, so we use the `model.safetensors.index.json`.
             index_file = find_file(
@@ -347,24 +344,6 @@ class LocalHuggingFaceModel:
         with adapter_path.open('r') as f:
             lora_config = json.load(f)
         return lora_config
-
-    @staticmethod
-    def load_draft_model(draft_model_path: Path | str) -> dict:
-        directory = Path(draft_model_path) if isinstance(draft_model_path, str) else draft_model_path
-        draft_path = find_file(directory, HF_DRAFT_MODEL_CONFIG_FILE)
-        assert draft_path, f"No draft model found in draft_path: {draft_path}"
-        with draft_path.open('r') as f:
-            draft_model_config = json.load(f)
-
-        # check if draft model is valid
-        is_single_layer = draft_model_config.get("num_hidden_layers") == 1
-        has_draft_vocab = "draft_vocab_size" in draft_model_config
-        if not(is_single_layer and has_draft_vocab):
-            raise ValueError(
-                f"Model at {draft_model_path} does not appear to be a valid draft model. "
-                f"Expected num_hidden_layers=1 and a draft_vocab_size field in config.json."
-            )
-        return draft_model_config
 
     def param_exists(self, param_name: str) -> bool:
         """Check if a parameter exists in the model.
@@ -426,13 +405,6 @@ class LocalHuggingFaceModel:
                 )
             scale = scale.astype(np.float32)
 
-            if np.any(scale < 0):
-                raise ValueError(
-                f"Negative scales found in {param_name}. "
-                "The compiler requires all quantization scales to be positive. "
-                "Please re-quantize the model with positive scales."
-                )
-
             return (scale, unpacked)
 
         # shard -> the safetensors symlink file, usually called 'model-00001-of-00002.safetensors'
@@ -440,7 +412,7 @@ class LocalHuggingFaceModel:
         assert model_shard, f'Could not find {param_name} in the model cache.'
 
         safetensors_file = self.weights[model_shard]
-        return safetensors.numpy.load_file(filename=safetensors_file)[param_name]
+        return self._load_safetensors_tensor(safetensors_file, param_name)
 
     def _load_raw_tensor(self, tensor_name: str) -> np.ndarray:
         """Load a raw tensor from safetensors files by exact name."""
@@ -452,13 +424,21 @@ class LocalHuggingFaceModel:
             raise KeyError(f'Could not find {tensor_name} in the model cache.')
 
         safetensors_file = self.weights[model_shard]
-        return safetensors.numpy.load_file(filename=safetensors_file)[tensor_name]
+        return self._load_safetensors_tensor(safetensors_file, tensor_name)
+
+    def _load_safetensors_tensor(self, safetensors_file: Path, tensor_name: str) -> np.ndarray:
+        """Load one tensor without materializing every tensor in the safetensors file."""
+        with safe_open(safetensors_file, framework="numpy") as f:
+            return f.get_tensor(tensor_name)
 
 
     def load_all_params(self):
         self.params = dict()
-        for safetensors_filename in self.weights.values():
-            self.params.update(safetensors.numpy.load_file(filename=safetensors_filename))
+        for safetensors_filename in set(self.weights.values()):
+            with safe_open(safetensors_filename, framework="numpy") as f:
+                self.params.update(
+                    {tensor_name: f.get_tensor(tensor_name) for tensor_name in f.keys()}
+                )
 
     def unload_all_params(self):
         self.params = None
@@ -503,7 +483,7 @@ class LocalHuggingFaceModel:
             if "lm_head" in name:
                 continue
             for part_name in name.split("."):
-                if part_name in ("language_model", "model"):
+                if part_name in ("language_model", "model", "midlayer"):
                     base_names.append(part_name)
                 elif base_names:
                     return ".".join(base_names)

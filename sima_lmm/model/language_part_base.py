@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import numpy as np
 
+from afe.backends.backends import Backend
 from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
@@ -61,7 +62,7 @@ class LanguagePartBaseModel(BaseModel):
         if (
             self.split_mlp
             and (self.num_tokens != 1 or self.enable_filter_sharing)
-            and (self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1 or self.cfg.lm_cfg.draft_cfg is not None)
+            and (self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1 or self.cfg.lm_cfg.speculative_decoding_cfg is not None)
         ):
             # Split MLP into multiple parts if intermediate_size is larger than max ch number
             # in order to prevent Large Tensor Helper activation in n2a compiler.
@@ -208,16 +209,23 @@ class LanguagePartBaseModel(BaseModel):
         match mla_node.get_type().output:
             case TensorValue(value=t):
                 if t.scalar == ScalarType.bfloat16:
-                    _ = builder.create_cast_node(mla_node, ScalarType.float32)
+                    _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
             case TupleValue():
                 tuple_items = []
                 for node in builder.create_tuple_get_item_nodes(mla_node):
                     if (get_expected_tensor_value(node.get_type().output).scalar
                             == ScalarType.bfloat16):
-                        tuple_items.append(builder.create_cast_node(node, ScalarType.float32))
+                        tuple_items.append(
+                            builder.create_cast_node(node, ScalarType.float32, backend=Backend.EV)
+                        )
                     else:
                         tuple_items.append(node)
                 builder.create_tuple_node(tuple_items)
+
+    @property
+    def is_draft(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return cfg is not None and cfg.is_draft
 
 
 @dataclass
@@ -242,13 +250,16 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
 
     def _create_final_layer_output_nodes(self, output_nodes: list[OnnxNode]):
         """Create output nodes for the final transformer layer."""
-        if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
+        if not self.is_draft and self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
             self._onnx_builder.create_output_node(output_name, (1, 1, 1, self.num_tokens), np.int64)
         else:
             # Find the last layer's size based on the weight tensor shape.
             output_vocab_size = self.get_hf_param(self._get_output_embed_name()).shape[0]
-            assert 1 < output_vocab_size <= self.cfg.lm_cfg.token_cfg.vocab_size
+            assert 1 < output_vocab_size <= (
+                self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
+                else self.cfg.lm_cfg.token_cfg.vocab_size
+            )
 
             for i in range(self.cfg.lm_cfg.lm_head_num_splits):
                 split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
@@ -260,6 +271,12 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 self._onnx_builder.create_output_node(
                     output_name, (1, split_size, 1, self.num_tokens)
                 )
+            if self.is_draft:
+                # EAGLE3 draft model also returns hidden_states as the last output
+                hidden_states_name = self._onnx_builder.get_node_output_name(output_nodes[-1])
+                self._onnx_builder.create_output_node(
+                    hidden_states_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+                )
 
     def _build_onnx_post_transformer(self, base_name: str, input_node: OnnxNode) -> list[OnnxNode]:
         """
@@ -270,12 +287,18 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         final_norm_name = (
             "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
         )
-        rms_norm2 = self._build_rms_norm(f"{base_prefix}.{final_norm_name}", input_node)
+        final_norm_full_name = f"{base_prefix}.{final_norm_name}"
+        if self.is_draft:
+            final_norm_full_name = final_norm_name
+        rms_norm2 = self._build_rms_norm(final_norm_full_name, input_node)
 
         # Find the last layer's size based on the weight tensor shape.
         output_embed_name = self._get_output_embed_name()
         output_vocab_size = self.get_hf_param(output_embed_name).shape[0]
-        assert 1 < output_vocab_size <= self.cfg.lm_cfg.token_cfg.vocab_size
+        assert 1 < output_vocab_size <= (
+            self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
+            else self.cfg.lm_cfg.token_cfg.vocab_size
+        )
 
         lm_heads = list()
         kwargs = dict()
@@ -300,6 +323,9 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 )
             lm_heads.append(lm_head)
 
+        if self.is_draft:
+            lm_heads.append(input_node)
+            return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             argmax = self._onnx_builder.build_op(
                 "argmax", lm_heads, "ArgMax", axis=1, keepdims=1
@@ -316,6 +342,8 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         base_prefix = self.hf_model.language_model_param_base_name
         final_norm_name = "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
+        if self.is_draft:
+            final_norm_full_name = final_norm_name
         rms_norm = self._build_sima_rms_norm(builder,
             final_norm_full_name, input_node
         )
@@ -328,7 +356,10 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             else output_embed_param
         )
         output_vocab_size = output_embed_weight.shape[0]
-        assert 1 < output_vocab_size <= self.cfg.lm_cfg.token_cfg.vocab_size
+        assert 1 < output_vocab_size <= (
+            self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
+            else self.cfg.lm_cfg.token_cfg.vocab_size
+        )
 
         lm_heads = []
         kwargs = {}
@@ -355,6 +386,9 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 )
             lm_heads.append(lm_head)
 
+        if self.is_draft:
+            lm_heads.append(input_node)
+            return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             argmax = builder.create_argmax_node(lm_heads[0], ScalarType.int32)
             return [argmax]
@@ -379,6 +413,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             ordered_candidates = [
                 "lm_head.weight",
                 "model.embed_tokens.weight",
+                "model.lm_head.weight",
             ]
 
         for name in ordered_candidates:

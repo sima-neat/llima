@@ -1,0 +1,97 @@
+{
+    "model_name": "models--LiquidAI--LFM2-1.2B",
+    "model_type": "llm-lfm2",
+    "vm_cfg": null,
+    "mm_cfg": null,
+    "lm_cfg": {
+        "model_type": "lfm2",
+        "data_type": "bfloat16",
+        "arch": "lfm",
+        "token_cfg": {
+            "vocab_size": 65536
+        },
+        "rope_cfg": {
+            "rope_theta": 1000000.0,
+            "rope_local_base_freq": 1000000.0,
+            "rope_dimension_count": 64,
+            "sliding_rope_dimension_count": null,
+            "rope_scaling": {
+                "factor": 1.0,
+                "low_freq_factor": 0,
+                "high_freq_factor": 0,
+                "original_max_position_embeddings": 0,
+                "attention_factor": null,
+                "long_factor": null,
+                "short_factor": null,
+                "rope_type": "default",
+                "mrope_section": null,
+                "mrope_interleaved": false
+            }
+        },
+        "attn_cfg": {
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 64,
+            "sliding_head_dim": null,
+            "swa_enable": false,
+            "sliding_window": 0,
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "query_pre_attn_scalar": 0
+        },
+        "mlp_cfg": {
+            "intermediate_size": 8192,
+            "act": "silu",
+            "num_layers": 3,
+            "mlp_bias": false
+        },
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "max_position_embeddings": 2048,
+        "rms_norm_eps": 1e-05,
+        "rms_norm_unit_offset": false,
+        "layer_types": [
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv"
+        ],
+        "hidden_size_per_layer_input": 0,
+        "num_kv_shared_layers": 0,
+        "use_double_wide_mlp": false,
+        "attn_logit_softcapping": null,
+        "final_logit_softcapping": null,
+        "lm_head_num_splits": 1,
+        "lm_head_split_dim": 65536,
+        "draft_vocab_size": 0,
+        "conv_L_cache": 3,
+        "conv_bias": false,
+        "lora_cfg": null,
+        "speculative_decoding_cfg": null
+    },
+    "pipeline_cfg": {
+        "system_prompt": null,
+        "chat_template": null,
+        "max_num_tokens": 1024,
+        "input_token_group_size": 1,
+        "input_token_group_offsets": null,
+        "future_token_mask_size": 1,
+        "return_logits": false,
+        "enable_filter_sharing": false,
+        "quantize_embeddings": false,
+        "quantize_kv_cache": false,
+        "split_mlp": false
+    }
+}
