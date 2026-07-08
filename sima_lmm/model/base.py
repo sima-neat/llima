@@ -25,6 +25,7 @@ from afe.apis.defines import (
     bfloat16_scheme, default_quantization, gen2_target, quantization_scheme,
     SkipCalibration
 )
+from afe.backends.backends import Backend
 from afe.apis.error_handling_variables import enable_verbose_error_messages
 from afe.apis.loaded_net import load_model, onnx_source
 from afe.apis.model import Model as SDKModel
@@ -351,7 +352,7 @@ class BaseModel(ABC):
             quant_params
         )
         calibrate_and_quantize_net = afe.driver.passes.calibration_quantization(
-            optimization_configs
+            optimization_configs, system_backend=Backend.EV
         )
         net = calibrate_and_quantize_net(net, None).run()
         afe.ir.serializer.save_awesomenet(

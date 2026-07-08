@@ -780,6 +780,10 @@ void LanguageModel::_initialize() {
         } else if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
             get_buffer(fmt::format("cache_key_l{}", layer_idx)).clear();
             get_buffer(fmt::format("cache_val_l{}", layer_idx)).clear();
+            if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)).clear();
+                get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)).clear();
+            }
         }
     }
 
@@ -941,8 +945,22 @@ void LanguageModel::_define_buffers() {
                 };
             }
             if (!_cfg.lm_cfg.is_kv_shared_layer(i)) {
-                define_buffer(fmt::format("cache_key_l{}", i), cache_shape);
-                define_buffer(fmt::format("cache_val_l{}", i), cache_shape);
+                std::string kv_dtype = _cfg.pipeline_cfg.quantize_kv_cache ? "int8" : "bfloat16";
+                define_buffer(fmt::format("cache_key_l{}", i), cache_shape, kv_dtype);
+                define_buffer(fmt::format("cache_val_l{}", i), cache_shape, kv_dtype);
+                if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                    // Scale tensors use HWC16 layout like KV cache:
+                    // logical (1, num_kv_heads, max_tokens, 1) bf16
+                    // HWC16 pads C=1 bf16 -> C=8 bf16 (C=2 int8 padded to C=16 int8)
+                    // 3D strided: {num_kv_heads, max_tokens, 8}
+                    std::vector<size_t> scale_shape = {
+                        _cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                        _cfg.pipeline_cfg.max_num_tokens,
+                        8
+                    };
+                    define_buffer(fmt::format("cache_key_scale_l{}", i), scale_shape);
+                    define_buffer(fmt::format("cache_val_scale_l{}", i), scale_shape);
+                }
             }
         }
     }
@@ -1177,6 +1195,15 @@ void LanguageModel::_define_attn_models_iter(
                 pre_kv_cache_shape
             )
         );
+        if (_cfg.pipeline_cfg.quantize_kv_cache) {
+            pre_ofms.emplace_back(
+                MLABufferSlice(
+                    &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
+                    {0, token_idx, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+                )
+            );
+        }
         pre_ofms.emplace_back(
             MLABufferSlice(
                 &get_buffer(fmt::format("cache_val_l{}", layer_idx)),
@@ -1184,6 +1211,15 @@ void LanguageModel::_define_attn_models_iter(
                 pre_kv_cache_shape
             )
         );
+        if (_cfg.pipeline_cfg.quantize_kv_cache) {
+            pre_ofms.emplace_back(
+                MLABufferSlice(
+                    &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
+                    {0, token_idx, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+                )
+            );
+        }
     }
     _define_model(
         "pre",
@@ -1248,6 +1284,15 @@ void LanguageModel::_define_attn_models_iter(
             cache_kv_cache_shape
         },
     };
+    if (_cfg.pipeline_cfg.quantize_kv_cache) {
+        cache_ifms.emplace_back(
+            MLABufferSlice{
+                &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
+                {0, cache_token_idx_begin, 0},
+                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+            }
+        );
+    }
 
     if (num_tokens == single_num_tokens && _cfg.pipeline_cfg.future_token_mask_size > 1) {
         if (_cfg.lm_cfg.is_spec_decode()) {
@@ -1281,6 +1326,15 @@ void LanguageModel::_define_attn_models_iter(
             cache_kv_cache_shape
         }
     );
+    if (_cfg.pipeline_cfg.quantize_kv_cache) {
+        cache_ifms.emplace_back(
+            MLABufferSlice{
+                &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
+                {0, cache_token_idx_begin, 0},
+                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+            }
+        );
+    }
     std::vector<MLABufferSlice> cache_ofms{
         MLABufferSlice{
             &get_buffer(fmt::format("n{}_buffer3", num_tokens)),

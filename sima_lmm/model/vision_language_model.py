@@ -71,6 +71,7 @@ class VisionLanguageModel(BaseModel):
         return_logits: bool = False,
         enable_filter_sharing: bool = False,
         quantize_embeddings: bool = False,
+        quantize_kv_cache: bool = False,
         split_mlp: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
@@ -89,6 +90,7 @@ class VisionLanguageModel(BaseModel):
             enable_filter_sharing: True if sharing filters between group and single models is
                 enabled.
             quantize_embeddings: True if embedding table is quantized.
+            quantize_kv_cache: True if KV cache is quantized.
             split_mlp: True if mlp is being split into multiple parts.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Copies tokenizer and embeddings (if missing) from it. None for non-draft models.
@@ -123,6 +125,7 @@ class VisionLanguageModel(BaseModel):
                 f"Embeddings quantization is only supported for LLMs."
             )
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
+        vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
         if target_model is not None:
             # Some draft models use target model's tokenization scheme.

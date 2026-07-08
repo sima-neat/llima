@@ -50,9 +50,10 @@ def gen_files(
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
     language_group_size: int, language_group_offsets: list[int] | None,
-    future_token_mask_size: int, enable_filter_sharing: bool, quantize_embeddings: bool,
-    split_mlp: bool, return_logits: bool, log_level: int, image_resolution: list[int] | None,
-    draft_model_path: Path | None, draft_output_path: Path | None
+    future_token_mask_size: int, enable_filter_sharing: bool,
+    quantize_embeddings: bool, quantize_kv_cache: bool, split_mlp: bool, return_logits: bool,
+    log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
+    draft_output_path: Path | None
 ):
     enable_verbose_error_messages()
     models = list()
@@ -71,6 +72,7 @@ def gen_files(
         return_logits=return_logits,
         enable_filter_sharing=enable_filter_sharing,
         quantize_embeddings=quantize_embeddings,
+        quantize_kv_cache=quantize_kv_cache,
         split_mlp=split_mlp,
         image_resolution=image_resolution
     )
@@ -97,6 +99,7 @@ def gen_files(
             return_logits=return_logits,
             enable_filter_sharing=enable_filter_sharing,
             quantize_embeddings=quantize_embeddings,
+            quantize_kv_cache=quantize_kv_cache,
             split_mlp=split_mlp,
             image_resolution=image_resolution,
             target_model=base_model
@@ -119,7 +122,7 @@ def gen_files(
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
-                elif lora_path is not None or quantize_embeddings:
+                elif lora_path is not None or quantize_embeddings or quantize_kv_cache:
                     # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
                     modes = [
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
@@ -282,6 +285,13 @@ def main():
             " of accuracy."
         )
     )
+    group.add_argument(
+        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "Enables kv_cache quantization to reduce memory consumption. This may result in a loss"
+            " of accuracy."
+        )
+    )
     egroup = group.add_mutually_exclusive_group()
     egroup.add_argument(
         "--system_prompt", type=str, help="System prompt that is passed to the model"
@@ -416,6 +426,15 @@ def main():
         _abort(
             "Embedding quantization is not supported for ONNX file generation mode."
         )
+    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_kv_cache:
+        _abort(
+            "KV cache quantization is not supported for ONNX file generation mode."
+        )
+    if args.draft_model_path is not None and args.quantize_kv_cache:
+        _abort(
+            "KV cache quantization with speculative decoding is not currently supported. "
+            "Please disable either --quantize_kv_cache or --draft_model_path."
+        )
 
     lora_path_for_base_model = None
     if args.lora_names is not None and args.lora_paths is not None:
@@ -432,8 +451,9 @@ def main():
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
         args.language_group_size, language_group_offsets, args.future_token_mask_size,
-        args.enable_filter_sharing, args.quantize_embeddings, split_mlp, args.return_logits,
-        log_level, image_resolution, args.draft_model_path, draft_output_path
+        args.enable_filter_sharing, args.quantize_embeddings,
+        args.quantize_kv_cache, split_mlp, args.return_logits, log_level, image_resolution,
+        args.draft_model_path, draft_output_path
     )
 
     # Compile LoRA weights if requested.

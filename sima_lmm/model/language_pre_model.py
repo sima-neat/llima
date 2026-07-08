@@ -429,15 +429,23 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
         output_nodes = [mla_q_out]
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
-            output_nodes.extend([
-                self._build_sima_attn_key(
-                    builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real,
-                    mla_input_freq_imag, merged_lora
-                ),
-                self._build_sima_attn_value(
-                    builder, f"{base_name}.self_attn", attn_input, merged_lora
-                )
-            ])
+            mla_k_out = self._build_sima_attn_key(
+                builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real,
+                mla_input_freq_imag, merged_lora
+            )
+            mla_v_out = self._build_sima_attn_value(
+                builder, f"{base_name}.self_attn", attn_input, merged_lora
+            )
+
+            if self.cfg.pipeline_cfg.quantize_kv_cache:
+                k_scale = builder.create_dynamic_quant_scale_node(mla_k_out, per_token_quant=True)
+                k_quant = builder.create_dynamic_quant_node(mla_k_out, k_scale)
+                v_scale = builder.create_dynamic_quant_scale_node(mla_v_out, per_token_quant=True)
+                v_quant = builder.create_dynamic_quant_node(mla_v_out, v_scale)
+                output_nodes.extend([k_quant, k_scale, v_quant, v_scale])
+            else:
+                output_nodes.extend([mla_k_out, mla_v_out])
+
         if len(output_nodes) > 1:
             _ = builder.create_tuple_node(output_nodes)
 
@@ -448,11 +456,21 @@ class LanguagePreModel(LanguagePartBaseModel):
                 builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
             else:
                 tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-                builder.create_tuple_node([
-                    builder.create_cast_node(x, ScalarType.float32, backend=Backend.EV)
-                    for x in tuple_items
-                ])
-
+                if self.cfg.pipeline_cfg.quantize_kv_cache:
+                    # Cast query output and scale outputs (k_scale, v_scale), but not quantized values (k_quant, v_quant)
+                    cast_items = [
+                        builder.create_cast_node(tuple_items[0], ScalarType.float32, backend=Backend.EV),  # mla_q_out
+                        tuple_items[1],  # k_quant (int8)
+                        builder.create_cast_node(tuple_items[2], ScalarType.float32, backend=Backend.EV),  # k_scale
+                        tuple_items[3],  # v_quant (int8)
+                        builder.create_cast_node(tuple_items[4], ScalarType.float32, backend=Backend.EV),  # v_scale
+                    ]
+                    builder.create_tuple_node(cast_items)
+                else:
+                    builder.create_tuple_node([
+                        builder.create_cast_node(x, ScalarType.float32, backend=Backend.EV)
+                        for x in tuple_items
+                    ])
         net = builder.finish(self.model_name)
         return net
 
@@ -617,7 +635,7 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
+        Get the DRAM layouts to use for this model's outputs on the MLA.
         """
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
@@ -627,23 +645,48 @@ class LanguagePreModel(LanguagePartBaseModel):
             self._head_dim
         )
 
-        k_cache_tessellate_params = TensorTessellateParameters(
+        k_cache_params = TensorTessellateParameters(
             tile_shape=(0, 0, 0, 0),
             enable_mla=True,
             dram_layout=TensorDRAMLayout.HWC16,
-            persistent_mem_name="cached_keys",
             dram_shape=dram_shape
         )
 
-        v_cache_tessellate_params = TensorTessellateParameters(
+        v_cache_params = TensorTessellateParameters(
             tile_shape=(0, 0, 0, 0),
             enable_mla=True,
             dram_layout=TensorDRAMLayout.HWC16,
-            persistent_mem_name="cached_values",
             dram_shape=dram_shape
         )
 
-        # 1st and 2nd output are kv cache outputs.
-        tessellate_params =  {1: k_cache_tessellate_params, 2: v_cache_tessellate_params}
+        if self.cfg.pipeline_cfg.quantize_kv_cache:
+            scale_dram_shape = (
+                1,
+                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                self.cfg.pipeline_cfg.max_num_tokens,
+                1
+            )
+            k_scale_params = TensorTessellateParameters(
+                tile_shape=(0, 0, 0, 0),
+                enable_mla=True,
+                dram_layout=TensorDRAMLayout.HWC16,
+                dram_shape=scale_dram_shape
+            )
+            v_scale_params = TensorTessellateParameters(
+                tile_shape=(0, 0, 0, 0),
+                enable_mla=True,
+                dram_layout=TensorDRAMLayout.HWC16,
+                dram_shape=scale_dram_shape
+            )
+            # Output order: [q, k_quant, k_scale, v_quant, v_scale]
+            tessellate_params = {
+                1: k_cache_params,
+                2: k_scale_params,   # k_scale
+                3: v_cache_params,
+                4: v_scale_params,   # v_scale
+            }
+        else:
+            # Output order: [q, k, v]
+            tessellate_params = {1: k_cache_params, 2: v_cache_params}
 
         return tessellate_params
