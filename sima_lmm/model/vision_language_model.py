@@ -140,21 +140,6 @@ class VisionLanguageModel(BaseModel):
                 dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
             )
 
-            # If the draft's HF config has rope_scaling=null, inherit from the target's HF config.
-            # The draft's source config.json typically omits rope_scaling and rope_theta entirely;
-            # transformers then fills rope_scaling=None and rope_theta=10000 (LlamaConfig defaults).
-            # Inherit both from the target so the draft uses the same rotary base as the target.
-            text_cfg = model_config.get("text_config", model_config)
-            if "rope_scaling" in text_cfg and text_cfg["rope_scaling"] is None:
-                vlm_cfg.lm_cfg.rope_cfg.rope_scaling = copy.deepcopy(
-                    target_model.cfg.lm_cfg.rope_cfg.rope_scaling
-                )
-                vlm_cfg.lm_cfg.rope_cfg.rope_theta = (
-                    target_model.cfg.lm_cfg.rope_cfg.rope_theta
-                )
-                vlm_cfg.lm_cfg.rope_cfg.rope_local_base_freq = (
-                    target_model.cfg.lm_cfg.rope_cfg.rope_local_base_freq
-                )
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
 

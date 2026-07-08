@@ -29,6 +29,7 @@ help               : print this page.
 CLI::CLI(
     std::filesystem::path vlm_model_path,
     std::optional<std::filesystem::path> whisper_model_path,
+    std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
     bool do_parallel_load
@@ -46,6 +47,15 @@ CLI::CLI(
         _whisper_model_ptr = std::make_unique<WhisperModel>(
             whisper_model_path.value(), do_parallel_load
         );
+    }
+
+    if (draft_model_path.has_value()) {
+        _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
+            draft_model_path.value(), system_prompt, chat_template, do_parallel_load
+        );
+        // Hand the draft to the target so VLM::run_model dispatches to
+        // speculative decoding automatically.
+        _vision_language_model_ptr->set_draft_vlm(_vision_language_draft_model_ptr.get());
     }
 
     auto llima_logger = spdlog::get("llima");
@@ -159,7 +169,7 @@ void CLI::run() {
             }
             std::cout << "Transcribed query: " << std::flush;
             _whisper_model_ptr->set_text_callback(
-                [](const std::string& text, bool stream_end) {
+                [](const std::string& text, bool stream_end, bool) {
                     std::cout << text << std::flush;
                     if (stream_end)
                         std::cout << std::endl;
@@ -168,7 +178,7 @@ void CLI::run() {
             struct WhisperTextCallbackGuard {
                 WhisperModel* model;
                 ~WhisperTextCallbackGuard() {
-                    model->set_text_callback([](const std::string&, bool) {});
+                    model->set_text_callback([](const std::string&, bool, bool) {});
                 }
             } callback_guard{_whisper_model_ptr.get()};
             auto query = _whisper_model_ptr->run_model(audio_file_name, language);
@@ -181,6 +191,8 @@ void CLI::run() {
 
         last_ttft.reset();
         last_tps.reset();
+        // run_model dispatches to speculative decoding internally when a
+        // draft VLM was registered at construction time.
         auto response = _vision_language_model_ptr->run_model(chat);
         if (response.has_value()) {
             chat.add_response(trim(std::move(response.value())));

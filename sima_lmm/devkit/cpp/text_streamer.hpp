@@ -37,6 +37,7 @@ struct DecodeCallbackData {
     DecodeCallbackType type;
     uint32_t token_id;
     double duration;
+    bool from_draft = false;
 };
 
 
@@ -46,8 +47,12 @@ class TextStreamer {
         // Parameters: metric_type ("ttft", "tps", "FULL", "END"), metric_value (duration or rate)
         using InfoCallback = std::function<void(const std::string&, double)>;
         
-        // Callback for finalized text chunks
-        using TextCallback = std::function<void(const std::string&, bool)>;
+        // Callback for finalized text chunks.
+        // Parameters: text, stream_end, from_draft (true when the chunk came
+        // from draft-accepted tokens during speculative decoding). Lets the
+        // sink decide how to render — ANSI for terminal, HTML/metadata for
+        // web, ignored for plain output.
+        using TextCallback = std::function<void(const std::string&, bool, bool)>;
 
         TextStreamer(
             Tokenizer* tokenizer_ptr,
@@ -58,7 +63,12 @@ class TextStreamer {
 
         void push(DecodeCallbackData data);
         void push(DecodeCallbackType type, uint32_t token_id, double duration) {
-            push({type, token_id, duration});
+            push({type, token_id, duration, false});
+        }
+        void push(
+            DecodeCallbackType type, uint32_t token_id, double duration, bool from_draft
+        ) {
+            push({type, token_id, duration, from_draft});
         }
         void pop_forever(std::stop_token thread_stop_token);
         
@@ -72,7 +82,7 @@ class TextStreamer {
             _callback_finalize_text = callback;
         }
 
-        void put(uint32_t token_id);
+        void put(uint32_t token_id, bool from_draft = false);
         void end();
 
         void enable() { _is_enabled = true; }
@@ -89,6 +99,18 @@ class TextStreamer {
         std::vector<uint32_t> _cached_token_ids;
         uint32_t _print_len;
         bool _is_enabled;
+        // from_draft flag for the tokens currently buffered in
+        // _cached_token_ids. Set when the buffer transitions from empty to
+        // non-empty; used to color the next emit. put() force-flushes the
+        // buffer when an incoming token's from_draft differs, so a single
+        // emitted chunk is always all-draft or all-target.
+        bool _chunk_from_draft = false;
+        // Gate for ANSI green wrap on draft-accepted text. Read once at
+        // construction from SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT; default off.
+        bool _highlight_draft_tokens = false;
+        // Count of tokens accepted from the draft model this generation;
+        // reported in end()'s stats and reset there.
+        uint32_t _draft_token_count = 0;
 
         double _time_to_first_token;
         std::vector<double> _time_to_next_token_vec;

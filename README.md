@@ -107,6 +107,11 @@ Run the web server:
 llima run <model_dir> --mode web
 ```
 
+For EAGLE3 speculative decoding, pass the parent compiled-model directory that
+contains both the target and draft model subdirectories. `llima run` reads each
+subdirectory's `sima_files/devkit/vlm_config.json` and automatically selects the
+target and draft.
+
 Model resolution order:
 
 1. Use the provided path if it exists.
@@ -137,6 +142,9 @@ Inside `llima run --mode cli`:
 - `set lora <name>`: load LoRA weights if present in the model package.
 - `unset lora`: clear LoRA weights.
 - `help`: print available commands.
+
+Set `SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT=1` to highlight tokens accepted from the
+draft model when running EAGLE3 speculative decoding in CLI mode.
 
 ## Python Wheel
 
