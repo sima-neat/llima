@@ -405,13 +405,6 @@ class LocalHuggingFaceModel:
                 )
             scale = scale.astype(np.float32)
 
-            if np.any(scale < 0):
-                raise ValueError(
-                f"Negative scales found in {param_name}. "
-                "The compiler requires all quantization scales to be positive. "
-                "Please re-quantize the model with positive scales."
-                )
-
             return (scale, unpacked)
 
         # shard -> the safetensors symlink file, usually called 'model-00001-of-00002.safetensors'
