@@ -446,11 +446,18 @@ class BaseModel(ABC):
             retained_temporary_directory_name = (
                     Path(retained_temporary_directory_name) / self.model_name
             )
+        # For speculative decoding, use higher effort for compilation for better results.
+        is_speculative = (
+            isinstance(self.cfg, VlmConfig)
+            and self.cfg.lm_cfg.speculative_decoding_cfg is not None
+        )
+        layout_search_effort_level = 1 if is_speculative else 0
         model.compile(
             self.sima_mpk_path, compress=True, log_level=log_level, preserve=False,
             tessellate_parameters=tessellate_parameters,
             retained_temporary_directory_name=retained_temporary_directory_name,
-            enable_filter_sharing=self.enable_filter_sharing, deployable=False
+            enable_filter_sharing=self.enable_filter_sharing,
+            layout_search_effort_level=layout_search_effort_level, deployable=False
         )
         return model
 
