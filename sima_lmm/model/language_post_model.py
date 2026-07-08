@@ -202,7 +202,9 @@ class LanguagePostModel(LanguagePostBaseModel):
         norm = self._build_sima_rms_norm(builder, f"{base_name}.post_per_layer_input_norm", proj)
         add = builder.create_add_node(residual, norm)
         layer_scalar = builder.create_constant_node(
-            self.get_hf_param(f"{base_name}.layer_scalar").astype(np.float32).reshape(1)
+            self.get_hf_param(f"{base_name}.layer_scalar")
+            .astype(activation_dtype(quantizable))
+            .reshape(1)
         )
         return builder.create_mul_node(add, layer_scalar)
 

@@ -11,7 +11,9 @@ from afe.ir.tensor_type import TensorType, ScalarType
 from sima_lmm.model.base import TensorTessellateParameters, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, build_conv_from_dense_with_lora, activation_type
+from sima_lmm.model.sima_builder import (
+    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype
+)
 
 
 @dataclass
@@ -147,7 +149,10 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         proj = builder.create_mul_node(
             proj,
             builder.create_constant_node(
-                np.array([self.cfg.lm_cfg.hidden_size ** -0.5], dtype=np.float32)
+                np.array(
+                    [self.cfg.lm_cfg.hidden_size ** -0.5],
+                    dtype=activation_dtype(quantizable),
+                )
             ),
         )
         proj = builder.create_slice_concat_node(
@@ -173,7 +178,9 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         combined = builder.create_add_node(emb, proj_normed)
         _ = builder.create_mul_node(
             combined,
-            builder.create_constant_node(np.array([2.0 ** -0.5], dtype=np.float32)),
+            builder.create_constant_node(
+                np.array([2.0 ** -0.5], dtype=activation_dtype(quantizable))
+            ),
         )
 
         mla_node = builder.finish_subnet("MLA_0")
