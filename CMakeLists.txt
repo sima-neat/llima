@@ -450,6 +450,7 @@ set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/setup.hpp
     sima_lmm/devkit/cpp/text_streamer.hpp
     sima_lmm/devkit/cpp/tokenizer.hpp
+    sima_lmm/devkit/cpp/tool_call_parser.hpp
     sima_lmm/devkit/cpp/utils.hpp
     sima_lmm/devkit/cpp/vision_language_model.hpp
     sima_lmm/devkit/cpp/vision_model.hpp
