@@ -23,6 +23,8 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_post": (False, "POST"),
     "group_conv": (True, "POST"),
     "single_conv": (False, "POST"),
+    "group_linear": (True, "LINEAR"),
+    "single_linear": (False, "LINEAR"),
     "conv_post_final": (False, "POST"),
     "vision": (False, "VISION"),
     "group_draft_fc": (True, "DRAFT_FC"),
@@ -105,7 +107,10 @@ def _decode_layer_configuration(c: dict) -> LayerConfiguration | None:
     if not compile_flag:
         return None
 
-    return {"precision": precision_value, "lora": lora_value}
+    return {
+        "precision": precision_value,
+        "lora": lora_value,
+    }
 
 
 def _fetch_configuration(

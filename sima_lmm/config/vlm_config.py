@@ -76,6 +76,7 @@ class VlmArchType(str, ExtensibleEnum):
     VLM_PALIGEMMA = "vlm-paligemma"
     VLM_QWEN2_5_VL = "vlm-qwen2_5_vl"
     VLM_QWEN3_VL = "vlm-qwen3_vl"
+    VLM_QWEN3_5_VL = "vlm-qwen3_5"
 
 class VisionArchType(str, ExtensibleEnum):
     """Vision architecture type.
@@ -86,6 +87,7 @@ class VisionArchType(str, ExtensibleEnum):
     QWEN2_VISION_ENCODER = "qwen2_5_vl"
     QWEN3_VISION_ENCODER = "qwen3_vl"
     GEMMA4_VISION_ENCODER = "gemma4_vision"
+    QWEN3_5_VISION_ENCODER = "qwen3_5"
 
 
 class LlmArchType(str, ExtensibleEnum):
@@ -444,6 +446,7 @@ class AttentionBlockConfig(BaseConfig):
     attention_bias: bool = False
     attention_dropout: float = 0.0
     query_pre_attn_scalar: int = 0
+    attn_output_gate: bool = False  # Qwen3.5: per-head sigmoid gate on attention output.
 
     def set_config(self, text_cfg: dict, layer_types: list[str]):
         super().set_config(text_cfg)
@@ -492,6 +495,32 @@ class MlpBlockConfig(BaseConfig):
             text_cfg.get("hidden_act") or text_cfg.get("hidden_activation")
             or ("gelu_pytorch_tanh" if lm_arch == LlmArchType.GEMMA else "silu")
         )
+
+
+@dataclass
+class LinearAttentionConfig(BaseConfig):
+    """Configuration of Gated DeltaNet linear-attention layers (Qwen3.5)."""
+    conv_kernel_dim: int = 0
+    key_head_dim: int = 0
+    value_head_dim: int = 0
+    num_key_heads: int = 0
+    num_value_heads: int = 0
+
+    @property
+    def key_dim(self) -> int:
+        return self.num_key_heads * self.key_head_dim
+
+    @property
+    def value_dim(self) -> int:
+        return self.num_value_heads * self.value_head_dim
+
+    @property
+    def conv_dim(self) -> int:
+        return 2 * self.key_dim + self.value_dim
+
+    @property
+    def recurrent_state_size(self) -> int:
+        return self.num_value_heads * self.key_head_dim * self.value_head_dim
 
 
 @dataclass
@@ -598,6 +627,7 @@ class LanguageModelConfig(BaseConfig):
     conv_bias: bool = False
     lora_cfg: LoraConfig | None  = None
     speculative_decoding_cfg: SpeculativeDecodingConfig | None = None
+    linear_attn_cfg: LinearAttentionConfig | None = None
 
     def __post_init__(self):
         self.lm_head_split_dim = (
@@ -619,6 +649,8 @@ class LanguageModelConfig(BaseConfig):
             cfg["lora_cfg"] = LoraConfig(**cfg["lora_cfg"])
         if cfg.get("speculative_decoding_cfg") is not None:
             cfg["speculative_decoding_cfg"] = SpeculativeDecodingConfig(**cfg["speculative_decoding_cfg"])
+        if cfg.get("linear_attn_cfg") is not None:
+            cfg["linear_attn_cfg"] = LinearAttentionConfig(**cfg["linear_attn_cfg"])
         lmc = LanguageModelConfig(**cfg)
         lmc._calc_lm_head_splits()
         return lmc
@@ -649,8 +681,10 @@ class LanguageModelConfig(BaseConfig):
         self.rms_norm_eps = text_cfg.get("rms_norm_eps", text_cfg.get("norm_eps", 1e-05))
         self.rms_norm_unit_offset = (
             model_format == ModelFormat.FORMAT_HF
-            and lm_arch == LlmArchType.GEMMA
-            and not self.model_type.startswith("gemma4")
+            and (
+                (lm_arch == LlmArchType.GEMMA and not self.model_type.startswith("gemma4"))
+                or text_cfg.get("model_type") == "qwen3_5_text"
+            )
         )
         self.layer_types = layer_types
         self.draft_vocab_size = text_cfg.get("draft_vocab_size", 0)
@@ -684,6 +718,15 @@ class LanguageModelConfig(BaseConfig):
         rope_scaling_cfg = getattr(self.rope_cfg, "rope_scaling", None)
         if rope_scaling_cfg and getattr(rope_scaling_cfg, "mrope_section", None):
             rope_scaling_cfg.rope_type = "mrope"
+
+        if any(t == "linear_attention" for t in layer_types):
+            self.linear_attn_cfg = LinearAttentionConfig(
+                conv_kernel_dim=text_cfg.get("linear_conv_kernel_dim", 0),
+                key_head_dim=text_cfg.get("linear_key_head_dim", 0),
+                value_head_dim=text_cfg.get("linear_value_head_dim", 0),
+                num_key_heads=text_cfg.get("linear_num_key_heads", 0),
+                num_value_heads=text_cfg.get("linear_num_value_heads", 0),
+            )
         self._calc_lm_head_splits()
 
     def is_kv_shared_layer(self, layer_idx: int) -> bool:
@@ -972,6 +1015,7 @@ class VlmConfig(BaseConfig):
                     VisionArchType.QWEN2_VISION_ENCODER,
                     VisionArchType.QWEN3_VISION_ENCODER,
                     VisionArchType.GEMMA4_VISION_ENCODER,
+                    VisionArchType.QWEN3_5_VISION_ENCODER,
                 ):
                 raise RuntimeError(
                     f"{vlm_cfg.vm_cfg.arch} models require --input_height and --input_width arguments"
@@ -984,7 +1028,12 @@ class VlmConfig(BaseConfig):
                     if height % 32 != 0 or width % 32 != 0:
                         raise RuntimeError(f"Input image dimensions ({height}x{width}) must be divisible by 32 for Siglip2 based models.")
                     vlm_cfg.vm_cfg.image_size = image_resolution
-                elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER, VisionArchType.GEMMA4_VISION_ENCODER):
+                elif vlm_cfg.vm_cfg.arch in (
+                    VisionArchType.QWEN2_VISION_ENCODER,
+                    VisionArchType.QWEN3_VISION_ENCODER,
+                    VisionArchType.GEMMA4_VISION_ENCODER,
+                    VisionArchType.QWEN3_5_VISION_ENCODER,
+                ):
                     height, width = image_resolution
                     divisor = vlm_cfg.vm_cfg.patch_size * vlm_cfg.vm_cfg.spatial_merge_size
                     if height % divisor != 0 or width % divisor != 0:
@@ -1013,7 +1062,12 @@ class VlmConfig(BaseConfig):
                         f"patch_size * downsample_factor ({ps * df})."
                     )
                 vlm_cfg.mm_cfg.mm_tokens_per_image = (h // ps // df) * (w // ps // df)
-            elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER, VisionArchType.GEMMA4_VISION_ENCODER):
+            elif vlm_cfg.vm_cfg.arch in (
+                VisionArchType.QWEN2_VISION_ENCODER,
+                VisionArchType.QWEN3_VISION_ENCODER,
+                VisionArchType.GEMMA4_VISION_ENCODER,
+                VisionArchType.QWEN3_5_VISION_ENCODER,
+            ):
                 if isinstance(vlm_cfg.vm_cfg.image_size, list):
                     h, w = vlm_cfg.vm_cfg.image_size
                 else:
@@ -1104,6 +1158,9 @@ class VlmConfig(BaseConfig):
                         layers.append(LayerID("group_post", i))
                     layers.append(LayerID("single_pre", i))
                     layers.append(LayerID("single_post", i))
+                elif t == "linear_attention":
+                    layers.append(LayerID("group_linear", i))
+                    layers.append(LayerID("single_linear", i))
                 else:
                     raise ValueError(f"Unsupported layer type: {t}")
             # Cache models are shared across layers; include only for kinds that exist

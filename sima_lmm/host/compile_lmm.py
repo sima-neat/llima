@@ -122,17 +122,12 @@ def gen_files(
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
-                elif lora_path is not None or quantize_embeddings or quantize_kv_cache:
-                    # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
+                else:
+                    # Use staged direct Model SDK generation for LoRA weights, quantized
+                    # embeddings, and dynamic quantized KV cache nodes.
                     modes = [
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
                         FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
-                    ]
-                else:
-                    # Use ONNX mode, no need to track LoRA weights
-                    modes = [
-                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                        FileGenMode.MODEL_SDK_COMPILE
                     ]
             else:
                 assert isinstance(model.hf_model, GgufModel)

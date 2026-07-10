@@ -72,7 +72,12 @@ class VlmHelper:
                     self.hf_processor = AutoProcessor.from_pretrained(hf_path, **kwargs)
                     self.hf_tokenizer = self.hf_processor.tokenizer
                     assert isinstance(self.hf_processor, ProcessorMixin)
-                    if vlm_cfg.vm_cfg.arch in (VisionArchType.SIGLIP2, VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER):
+                    if vlm_cfg.vm_cfg.arch in (
+                        VisionArchType.SIGLIP2,
+                        VisionArchType.QWEN2_VISION_ENCODER,
+                        VisionArchType.QWEN3_VISION_ENCODER,
+                        VisionArchType.QWEN3_5_VISION_ENCODER,
+                    ):
                         self.input_res = vlm_cfg.vm_cfg.image_size # lfm2,qwen vl needs to be statically resized before hf preprocessor.
                 else:
                     self.hf_processor = None

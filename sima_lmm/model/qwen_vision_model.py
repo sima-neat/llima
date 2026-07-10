@@ -61,7 +61,7 @@ class QwenVisionLayerModel(BaseModel):
         self._onnx_builder = None
 
     def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        if self.cfg.model_type == VlmArchType.VLM_QWEN3_VL:
+        if self.cfg.model_type in (VlmArchType.VLM_QWEN3_VL, VlmArchType.VLM_QWEN3_5_VL):
             vision_output = self._build_qwen3_vision_model(
                 self.hf_model.vision_model_param_base_name, input_nodes
             )
@@ -732,9 +732,10 @@ class QwenVisionLayerModel(BaseModel):
             "MLA_0/input", TensorType(activation_type(quantizable), input_shape)
         )
 
-        if self.cfg.model_type == VlmArchType.VLM_QWEN3_VL:
+        if self.cfg.model_type in (VlmArchType.VLM_QWEN3_VL, VlmArchType.VLM_QWEN3_5_VL):
             output_nodes = self._build_sima_qwen3_vision_model(builder, base_name, mla_input, quantizable)
-            builder.create_tuple_node(output_nodes)
+            if len(output_nodes) > 1:
+                builder.create_tuple_node(output_nodes)
         else:
             self._build_sima_qwen2_vision_model(builder, base_name, mla_input, quantizable)
 
@@ -972,6 +973,7 @@ class QwenVisionLayerModel(BaseModel):
             f"{base_name}.linear_fc1", norm,
             is_fc=False, stride=(1, factor),
             weight_process_func=self._reshape_merger_kernel,
+            scale_process_func=lambda x: x,
             src_bias_name=f"{base_name}.linear_fc1.bias",
         )
         act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)
@@ -993,6 +995,7 @@ class QwenVisionLayerModel(BaseModel):
             f"{base_name}.merger.mlp.0", norm,
             is_fc=False, stride=(1, factor),
             weight_process_func=self._reshape_merger_kernel,
+            scale_process_func=lambda x: x,
             src_bias_name=f"{base_name}.merger.mlp.0.bias",
         )
         act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)

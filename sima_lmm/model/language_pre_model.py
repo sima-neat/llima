@@ -116,6 +116,12 @@ class LanguagePreModel(LanguagePartBaseModel):
                 self._onnx_builder.get_node_output_name(output_nodes[2]), kv_cache_shape
             )
 
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            self._onnx_builder.create_output_node(
+                self._onnx_builder.get_node_output_name(output_nodes[-1]),
+                (1, self._q_size, 1, self.num_tokens)
+            )
+
         self._onnx_builder.create_and_save_model()
 
         # Set to None to deallocate the memory.
@@ -144,12 +150,24 @@ class LanguagePreModel(LanguagePartBaseModel):
         else:
             attn_input = rms_norm
             freq_start = 1
-        q_out = self._build_onnx_attn_query(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
+        q_result = self._build_onnx_attn_query(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
+        gate_out = None
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            q_out, gate_out = q_result
+        else:
+            q_out = q_result
+
+        output_nodes = [q_out]
         if self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
-            return [q_out]
+            if gate_out is not None:
+                output_nodes.append(gate_out)
+            return output_nodes
         k_out = self._build_onnx_attn_key(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
         v_out = self._build_onnx_attn_value(f"{base_name}.self_attn", attn_input)
-        return [q_out, k_out, v_out]
+        output_nodes.extend([k_out, v_out])
+        if gate_out is not None:
+            output_nodes.append(gate_out)
+        return output_nodes
 
     def _build_onnx_rotary_emb(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
         layer_head_dim = self._head_dim
@@ -248,7 +266,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             f"{base_name}.concat_full", [rotary_out, tail], "Concat", axis=1
         )
 
-    def _build_onnx_attn_query(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
+    def _build_onnx_attn_query(self, base_name: str, input_nodes: list[OnnxNode]):
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "q_proj")
@@ -257,10 +275,47 @@ class LanguagePreModel(LanguagePartBaseModel):
             q_size=self._q_size,
             kv_size=self._kv_size
         )
-        reshape = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.q_proj.reshape", q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-            split_axis=1, concat_axis=2
-        )
+        gate_out = None
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            q_fused = self._onnx_builder.build_split_and_concat(
+                f"{base_name}.q_proj.reshape_q_gate",
+                q_proj,
+                self.cfg.lm_cfg.attn_cfg.num_attention_heads,
+                split_axis=1,
+                concat_axis=2,
+            )
+            reshape = self._onnx_builder.build_op(
+                f"{base_name}.q_proj.q",
+                [
+                    q_fused,
+                    np.array([0], dtype=np.int64),
+                    np.array([self.cfg.lm_cfg.attn_cfg.head_dim], dtype=np.int64),
+                    np.array([1], dtype=np.int64),
+                ],
+                "Slice",
+            )
+            gate_out = self._onnx_builder.build_op(
+                f"{base_name}.q_proj.gate",
+                [
+                    q_fused,
+                    np.array([self.cfg.lm_cfg.attn_cfg.head_dim], dtype=np.int64),
+                    np.array([2 * self.cfg.lm_cfg.attn_cfg.head_dim], dtype=np.int64),
+                    np.array([1], dtype=np.int64),
+                ],
+                "Slice",
+            )
+            gate_out = self._onnx_builder.build_split_and_concat(
+                f"{base_name}.q_proj.gate.reshape",
+                gate_out,
+                self.cfg.lm_cfg.attn_cfg.num_attention_heads,
+                split_axis=2,
+                concat_axis=1,
+            )
+        else:
+            reshape = self._onnx_builder.build_split_and_concat(
+                f"{base_name}.q_proj.reshape", q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads,
+                split_axis=1, concat_axis=2
+            )
 
         q_norm_name = None
         for suffix in ("q_layernorm", "q_norm"):
@@ -280,6 +335,8 @@ class LanguagePreModel(LanguagePartBaseModel):
                 [rotary_emb, self._head_dim**-0.5],
                 "Mul"
             )
+        if gate_out is not None:
+            return rotary_emb, gate_out
         return rotary_emb
 
     def _build_onnx_attn_key(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
@@ -423,10 +480,15 @@ class LanguagePreModel(LanguagePartBaseModel):
             attn_input = builder.create_concat_node([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
-        mla_q_out = self._build_sima_attn_query(
+        mla_q_result = self._build_sima_attn_query(
             builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real, mla_input_freq_imag,
             quantizable, merged_lora
         )
+        gate_out = None
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            mla_q_out, gate_out = mla_q_result
+        else:
+            mla_q_out = mla_q_result
         output_nodes = [mla_q_out]
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
             mla_k_out = self._build_sima_attn_key(
@@ -446,6 +508,8 @@ class LanguagePreModel(LanguagePartBaseModel):
             else:
                 output_nodes.extend([mla_k_out, mla_v_out])
 
+        if gate_out is not None:
+            output_nodes.append(gate_out)
         if len(output_nodes) > 1:
             _ = builder.create_tuple_node(output_nodes)
 
@@ -456,8 +520,11 @@ class LanguagePreModel(LanguagePartBaseModel):
                 builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
             else:
                 tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-                if self.cfg.pipeline_cfg.quantize_kv_cache:
-                    # Cast query output and scale outputs (k_scale, v_scale), but not quantized values (k_quant, v_quant)
+                if (
+                    self.cfg.pipeline_cfg.quantize_kv_cache
+                    and not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx)
+                ):
+                    # Cast query and scale outputs, but not quantized K/V values.
                     cast_items = [
                         builder.create_cast_node(tuple_items[0], ScalarType.float32, backend=Backend.EV),  # mla_q_out
                         tuple_items[1],  # k_quant (int8)
@@ -465,6 +532,10 @@ class LanguagePreModel(LanguagePartBaseModel):
                         tuple_items[3],  # v_quant (int8)
                         builder.create_cast_node(tuple_items[4], ScalarType.float32, backend=Backend.EV),  # v_scale
                     ]
+                    if gate_out is not None:
+                        cast_items.append(
+                            builder.create_cast_node(tuple_items[5], ScalarType.float32, backend=Backend.EV)
+                        )
                     builder.create_tuple_node(cast_items)
                 else:
                     builder.create_tuple_node([
@@ -477,7 +548,7 @@ class LanguagePreModel(LanguagePartBaseModel):
     def _build_sima_rotary_emb(
             self, builder: SimaBuilder,
             data: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle
-    ) -> AwesomeNode:
+    ):
         """
         Create nodes that compute rotary embedding.
         """
@@ -524,7 +595,21 @@ class LanguagePreModel(LanguagePartBaseModel):
             kv_size=self._kv_size
          )
 
-        if self.cfg.lm_cfg.attn_cfg.num_attention_heads > 1:
+        gate_out = None
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            q_fused = builder.create_slice_concat_node(
+                q_proj, axis=1, split_axis=3,
+                split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
+            )
+            head_dim = self.cfg.lm_cfg.attn_cfg.head_dim
+            gate_out = builder.create_slice_node(q_fused, [head_dim], [2 * head_dim], [1], [3])
+            q_proj = builder.create_slice_node(q_fused, [0], [head_dim], [1], [3])
+            gate_out = builder.create_slice_concat_node(
+                gate_out, axis=3, split_axis=1,
+                split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
+            )
+            reshape1 = q_proj
+        elif self.cfg.lm_cfg.attn_cfg.num_attention_heads > 1:
             reshape1 = builder.create_slice_concat_node(
                 q_proj, axis=1, split_axis=3,
                 split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
@@ -545,15 +630,16 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder, reshape1, freq_real, freq_imag
         )
 
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
-            return rotary_emb
-
-        return builder.create_mul_node(
-            rotary_emb,
-            builder.create_constant_node(
-                np.array([self._head_dim**-0.5], dtype=activation_dtype(quantizable))
+        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
+            rotary_emb = builder.create_mul_node(
+                rotary_emb,
+                builder.create_constant_node(
+                    np.array([self._head_dim**-0.5], dtype=activation_dtype(quantizable))
+                )
             )
-        )
+        if gate_out is not None:
+            return rotary_emb, gate_out
+        return rotary_emb
 
     def _build_sima_attn_key(
             self, builder: SimaBuilder, base_name: str,

@@ -107,7 +107,11 @@ class VisionModel(BaseModel):
         }
 
         # Dispatch based on model type
-        if self.cfg.model_type in (VlmArchType.VLM_QWEN2_5_VL, VlmArchType.VLM_QWEN3_VL):
+        if self.cfg.model_type in (
+            VlmArchType.VLM_QWEN2_5_VL,
+            VlmArchType.VLM_QWEN3_VL,
+            VlmArchType.VLM_QWEN3_5_VL,
+        ):
             return QwenVisionLayerModel(**kwargs)
         elif self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             return Gemma4VisionLayerModel(**kwargs)

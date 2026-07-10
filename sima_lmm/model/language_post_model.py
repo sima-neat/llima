@@ -58,6 +58,11 @@ class LanguagePostModel(LanguagePostBaseModel):
                 (1, self.cfg.lm_cfg.hidden_size_per_layer_input, 1, self.num_tokens),
             )
 
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            self._onnx_builder.create_input_node(
+                "gate", (1, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type), 1, self.num_tokens)
+            )
+
         llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
         if self.cfg.vm_cfg and self.layer_idx in llm_injection_layers and self.num_tokens > 1:
             self._onnx_builder.create_input_node(
@@ -85,8 +90,24 @@ class LanguagePostModel(LanguagePostBaseModel):
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, attn_out_name)
 
+        input_idx = 2
+        per_layer_input = None
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+            per_layer_input = input_nodes[input_idx]
+            input_idx += 1
+
+        attn_in = input_nodes[1]
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            gate = input_nodes[input_idx]
+            sig = self._onnx_builder.build_op(
+                f"{base_name}.self_attn.gate_sigmoid", [gate], "Sigmoid"
+            )
+            attn_in = self._onnx_builder.build_op(
+                f"{base_name}.self_attn.gate_mul", [input_nodes[1], sig], "Mul"
+            )
+
         o_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.self_attn.{attn_out_name}", input_nodes[1], lora_rank
+            f"{base_name}.self_attn.{attn_out_name}", attn_in, lora_rank
         )
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
@@ -125,14 +146,14 @@ class LanguagePostModel(LanguagePostBaseModel):
         final_output = add2
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             final_output = self._build_onnx_per_layer_input_branch(
-                base_name, final_output, input_nodes[2]
+                base_name, final_output, per_layer_input
             )
         llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
         if self.layer_idx in llm_injection_layers and self.num_tokens > 1:
-            deepstack_features_input = input_nodes[2]
+            deepstack_features_input = input_nodes[-1]
             final_output = self._onnx_builder.build_op(
                 f"{base_name}.deepstack_add",
-                [add2, deepstack_features_input],
+                [final_output, deepstack_features_input],
                 "Add"
             )
         if self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1:
@@ -249,11 +270,18 @@ class LanguagePostModel(LanguagePostBaseModel):
             "self_attn", TensorType(activation_type(quantizable), self_attn_shape)
         )
         subnet_inputs = [model_input_input, model_input_self_attn]
+        model_input_per_layer = None
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             model_input_per_layer = builder.create_placeholder_node(
                 "per_layer_input", TensorType(activation_type(quantizable), per_layer_shape)
             )
             subnet_inputs.append(model_input_per_layer)
+        model_input_gate = None
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            model_input_gate = builder.create_placeholder_node(
+                "gate", TensorType(activation_type(quantizable), self_attn_shape)
+            )
+            subnet_inputs.append(model_input_gate)
         if needs_deepstack:
             model_input_deepstack = builder.create_placeholder_node(
                 "deepstack_features", TensorType(activation_type(quantizable), input_shape)
@@ -268,10 +296,16 @@ class LanguagePostModel(LanguagePostBaseModel):
         mla_input_self_attn = builder.create_placeholder_node(
             "MLA_0/self_attn", TensorType(activation_type(quantizable), self_attn_shape)
         )
+        mla_input_per_layer = None
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             mla_input_per_layer = builder.create_placeholder_node(
                 "MLA_0/per_layer_input",
                 TensorType(activation_type(quantizable), per_layer_shape),
+            )
+        mla_input_gate = None
+        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
+            mla_input_gate = builder.create_placeholder_node(
+                "MLA_0/gate", TensorType(activation_type(quantizable), self_attn_shape)
             )
         mla_input_deepstack = None
         if needs_deepstack:
@@ -285,9 +319,14 @@ class LanguagePostModel(LanguagePostBaseModel):
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, attn_out_name)
+
+        attn_in = mla_input_self_attn
+        if mla_input_gate is not None:
+            sig = builder.create_sigmoid_node(mla_input_gate)
+            attn_in = builder.create_mul_node(mla_input_self_attn, sig)
         o_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, attn_out_full_name,
-            mla_input_self_attn, lora_rank, merged_lora=merged_lora
+            attn_in, lora_rank, merged_lora=merged_lora
         )
 
         # De-quantize embeddings table if needed.
