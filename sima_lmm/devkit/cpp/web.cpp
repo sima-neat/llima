@@ -560,7 +560,34 @@ std::optional<Chat> WEB::_prepare_chat_context(
     stream = json_data.value("stream", false);
 
     Chat chat = _vision_language_model_ptr->create_chat();
-    if (json_data.contains("tools") && json_data["tools"].is_array()) {
+    bool tools_enabled = true;
+    if (json_data.contains("tool_choice") && !json_data["tool_choice"].is_null()) {
+        if (!json_data["tool_choice"].is_string()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error": "Only tool_choice 'auto' or 'none' is supported"})",
+                "application/json"
+            );
+            return std::nullopt;
+        }
+        const auto tool_choice = json_data["tool_choice"].get<std::string>();
+        if (tool_choice == "none") {
+            tools_enabled = false;
+        } else if (tool_choice != "auto") {
+            res.status = 400;
+            res.set_content(
+                R"({"error": "Only tool_choice 'auto' or 'none' is supported"})",
+                "application/json"
+            );
+            return std::nullopt;
+        }
+    }
+    if (json_data.contains("tools") && !json_data["tools"].is_array()) {
+        res.status = 400;
+        res.set_content(R"({"error": "tools must be an array"})", "application/json");
+        return std::nullopt;
+    }
+    if (tools_enabled && json_data.contains("tools")) {
         chat.set_tools(nlohmann::ordered_json(json_data["tools"]));
     }
 
@@ -578,6 +605,21 @@ std::optional<Chat> WEB::_prepare_chat_context(
 }
 
 static nlohmann::json openai_tool_calls_to_ollama(const nlohmann::json& openai_tool_calls);
+
+static std::vector<std::string> tool_names_from_definitions(
+    const nlohmann::ordered_json& tools
+) {
+    std::vector<std::string> names;
+    if (!tools.is_array()) return names;
+
+    for (const auto& tool : tools) {
+        if (tool.is_object() && tool.contains("function") && tool["function"].is_object() &&
+            tool["function"].contains("name") && tool["function"]["name"].is_string()) {
+            names.push_back(tool["function"]["name"].get<std::string>());
+        }
+    }
+    return names;
+}
 
 void WEB::_execute_streaming_chat(
     httplib::Response& res,
@@ -597,7 +639,7 @@ void WEB::_execute_streaming_chat(
             bool ttft_sent = false;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
-            ToolCallStreamParser tool_parser;
+            ToolCallStreamParser tool_parser(tool_names_from_definitions(chat.get_tools()));
             nlohmann::json pending_ollama_tool_calls = nullptr;
 
             auto send_openai_initial = [&]() {
@@ -908,9 +950,16 @@ void WEB::_execute_normal_chat(
 
     // No need to reset callbacks - they'll be overwritten on next request
 
+    nlohmann::json tool_calls = nullptr;
+    if (chat.has_tools()) {
+        tool_calls = try_parse_tool_calls(
+            full_response,
+            tool_names_from_definitions(chat.get_tools())
+        );
+    }
+
     nlohmann::json response;
     if (is_openai) {
-        auto tool_calls = try_parse_tool_calls(full_response);
         nlohmann::json message = {{"role", "assistant"}};
         std::string finish_reason;
         if (!tool_calls.is_null()) {
@@ -933,7 +982,6 @@ void WEB::_execute_normal_chat(
             }}}
         };
     } else {
-        auto tool_calls = try_parse_tool_calls(full_response);
         nlohmann::json message = {{"role", "assistant"}};
         if (!tool_calls.is_null()) {
             message["content"] = "";
