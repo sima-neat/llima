@@ -1,9 +1,12 @@
 #include "tool_call_parser.hpp"
 
+#include "tokenizer.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <ctime>
 #include <regex>
+#include <stdexcept>
 
 namespace simaai {
 namespace llima {
@@ -27,6 +30,15 @@ std::string_view trim_view(std::string_view text) {
 bool is_prefix_of(std::string_view prefix, std::string_view text) {
     return prefix.size() <= text.size() && text.substr(0, prefix.size()) == prefix;
 }
+
+constexpr std::string_view lfm_open = "<|tool_call_start|>";
+constexpr std::string_view lfm_close = "<|tool_call_end|>";
+constexpr std::string_view gemma_open = "<|tool_call>";
+constexpr std::string_view gemma_close = "<tool_call|>";
+constexpr std::string_view gemma_call = "call:";
+constexpr std::string_view mistral_prefix = "[TOOL_CALLS]";
+constexpr std::string_view qwen_open = "<tool_call>";
+constexpr std::string_view qwen_close = "</tool_call>";
 
 nlohmann::json build_tool_call_entry(
     const nlohmann::json& parsed,
@@ -166,7 +178,207 @@ nlohmann::json parse_plain_json_tool_calls(
     return result.empty() ? nullptr : result;
 }
 
+std::vector<std::string_view> split_top_level(std::string_view text, char separator) {
+    std::vector<std::string_view> parts;
+    size_t part_start = 0;
+    int paren_depth = 0;
+    int square_depth = 0;
+    int curly_depth = 0;
+    char quote = '\0';
+    bool escaped = false;
+    for (size_t idx = 0; idx < text.size(); ++idx) {
+        const char current = text[idx];
+        if (quote != '\0') {
+            if (escaped) {
+                escaped = false;
+            } else if (current == '\\') {
+                escaped = true;
+            } else if (current == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (current == '\'' || current == '"') {
+            quote = current;
+        } else if (current == '(') {
+            ++paren_depth;
+        } else if (current == ')') {
+            --paren_depth;
+        } else if (current == '[') {
+            ++square_depth;
+        } else if (current == ']') {
+            --square_depth;
+        } else if (current == '{') {
+            ++curly_depth;
+        } else if (current == '}') {
+            --curly_depth;
+        } else if (current == separator && paren_depth == 0 && square_depth == 0 &&
+                   curly_depth == 0) {
+            parts.push_back(text.substr(part_start, idx - part_start));
+            part_start = idx + 1;
+        }
+        if (paren_depth < 0 || square_depth < 0 || curly_depth < 0) return {};
+    }
+    if (quote != '\0' || paren_depth != 0 || square_depth != 0 || curly_depth != 0) {
+        return {};
+    }
+    parts.push_back(text.substr(part_start));
+    return parts;
+}
+
+std::optional<nlohmann::json> parse_python_value(std::string_view value) {
+    value = trim_view(value);
+    if (value.size() >= 2 && ((value.front() == '\'' && value.back() == '\'') ||
+                              (value.front() == '"' && value.back() == '"'))) {
+        std::string result;
+        for (size_t idx = 1; idx + 1 < value.size(); ++idx) {
+            if (value[idx] == '\\' && idx + 2 < value.size()) {
+                ++idx;
+            }
+            result.push_back(value[idx]);
+        }
+        return result;
+    }
+    if (value == "True") return true;
+    if (value == "False") return false;
+    if (value == "None") return nlohmann::json(nullptr);
+    try {
+        return nlohmann::json::parse(std::string(value));
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
+}
+
+nlohmann::json parse_lfm_tool_calls(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    text = trim_view(text);
+    if (text.starts_with('[') && text.ends_with(']')) {
+        text.remove_prefix(1);
+        text.remove_suffix(1);
+    }
+    const auto calls = split_top_level(text, ',');
+    if (calls.empty()) return nullptr;
+
+    nlohmann::json result = nlohmann::json::array();
+    for (auto call : calls) {
+        call = trim_view(call);
+        const auto open = call.find('(');
+        if (open == std::string_view::npos || call.empty() || call.back() != ')') {
+            return nullptr;
+        }
+        const auto name = trim_view(call.substr(0, open));
+        if (name.empty()) return nullptr;
+
+        nlohmann::json arguments = nlohmann::json::object();
+        const auto raw_args = call.substr(open + 1, call.size() - open - 2);
+        if (!trim_view(raw_args).empty()) {
+            const auto entries = split_top_level(raw_args, ',');
+            if (entries.empty()) return nullptr;
+            for (auto entry : entries) {
+                const auto equal = entry.find('=');
+                if (equal == std::string_view::npos) return nullptr;
+                const auto key = trim_view(entry.substr(0, equal));
+                const auto value = parse_python_value(entry.substr(equal + 1));
+                if (key.empty() || !value.has_value()) return nullptr;
+                arguments[std::string(key)] = *value;
+            }
+        }
+        auto parsed = build_tool_call_entry(
+            {{"name", std::string(name)}, {"arguments", arguments}}, id_counter,
+            allowed_tool_names
+        );
+        if (parsed.is_null()) return nullptr;
+        result.push_back(std::move(parsed));
+    }
+    return result.empty() ? nullptr : result;
+}
+
+nlohmann::json parse_gemma_tool_calls(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    if (text.starts_with(gemma_open)) {
+        if (!text.ends_with(gemma_close)) return nullptr;
+        text.remove_prefix(gemma_open.size());
+        text.remove_suffix(gemma_close.size());
+        text = trim_view(text);
+    }
+    if (!text.starts_with(gemma_call)) return nullptr;
+
+    nlohmann::json result = nlohmann::json::array();
+    size_t pos = 0;
+    while (pos < text.size()) {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+            ++pos;
+        }
+        if (pos == text.size()) break;
+        if (!text.substr(pos).starts_with(gemma_call)) return nullptr;
+
+        pos += gemma_call.size();
+        const auto brace = text.find('{', pos);
+        if (brace == std::string_view::npos) return nullptr;
+        const auto name = trim_view(text.substr(pos, brace - pos));
+        const auto close = find_matching_brace(text, brace);
+        if (close == std::string_view::npos) return nullptr;
+        const auto arguments = gemma4_bare_to_json(
+            std::string(text.substr(brace, close - brace + 1)));
+        auto entry = build_tool_call_entry(
+            {{"name", std::string(name)}, {"arguments", arguments}}, id_counter,
+            allowed_tool_names);
+        if (entry.is_null()) return nullptr;
+        result.push_back(std::move(entry));
+        pos = close + 1;
+    }
+    return result.empty() ? nullptr : result;
+}
+
+nlohmann::json parse_mistral_tool_calls(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    if (!text.starts_with(mistral_prefix)) return nullptr;
+    text = trim_left_view(text.substr(mistral_prefix.size()));
+    if (text.empty()) return nullptr;
+    return parse_json_array_tool_calls(
+        nlohmann::json::parse(std::string(text)), id_counter, allowed_tool_names);
+}
+
+nlohmann::json parse_qwen_tool_calls(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    if (!text.starts_with(qwen_open)) return nullptr;
+
+    nlohmann::json result = nlohmann::json::array();
+    size_t pos = 0;
+    while (pos < text.size()) {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+            ++pos;
+        }
+        if (pos == text.size()) break;
+        if (!text.substr(pos).starts_with(qwen_open)) return nullptr;
+
+        const auto content_start = pos + qwen_open.size();
+        const auto tag_end = text.find(qwen_close, content_start);
+        if (tag_end == std::string_view::npos) return nullptr;
+        auto entry = build_tool_call_entry(
+            nlohmann::json::parse(std::string(text.substr(content_start, tag_end - content_start))),
+            id_counter, allowed_tool_names);
+        if (entry.is_null()) return nullptr;
+        result.push_back(std::move(entry));
+        pos = tag_end + qwen_close.size();
+    }
+    return result.empty() ? nullptr : result;
+}
+
 nlohmann::json try_parse_tool_calls_impl(
+    ToolCallFormat format,
     std::string_view text,
     const std::vector<std::string>* allowed_tool_names
 ) {
@@ -175,99 +387,130 @@ nlohmann::json try_parse_tool_calls_impl(
 
     int id_counter = 0;
     try {
-        if (text.starts_with("call:")) {
-            nlohmann::json result = nlohmann::json::array();
-            size_t pos = 0;
-            while (pos < text.size()) {
-                while (pos < text.size() &&
-                       std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
-                    ++pos;
+        switch (format) {
+            case ToolCallFormat::Lfm:
+                if (!text.starts_with(lfm_open) || !text.ends_with(lfm_close)) return nullptr;
+                return parse_lfm_tool_calls(
+                    text.substr(lfm_open.size(), text.size() - lfm_open.size() - lfm_close.size()),
+                    id_counter, allowed_tool_names);
+            case ToolCallFormat::Gemma:
+                return parse_gemma_tool_calls(text, id_counter, allowed_tool_names);
+            case ToolCallFormat::Mistral:
+                return parse_mistral_tool_calls(text, id_counter, allowed_tool_names);
+            case ToolCallFormat::Qwen:
+                return parse_qwen_tool_calls(text, id_counter, allowed_tool_names);
+            case ToolCallFormat::Llama:
+                return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names);
+            case ToolCallFormat::GenericJson:
+                if (text.starts_with('[')) {
+                    return parse_json_array_tool_calls(
+                        nlohmann::json::parse(std::string(text)), id_counter, allowed_tool_names);
                 }
-                if (pos == text.size()) break;
-                if (!text.substr(pos).starts_with("call:")) return nullptr;
-
-                pos += 5;
-                auto brace = text.find('{', pos);
-                if (brace == std::string_view::npos) return nullptr;
-                const auto name = trim_view(text.substr(pos, brace - pos));
-                auto close = find_matching_brace(text, brace);
-                if (close == std::string_view::npos) return nullptr;
-                std::string args =
-                    gemma4_bare_to_json(std::string(text.substr(brace, close - brace + 1)));
-                auto entry = build_tool_call_entry(
-                    {{"name", std::string(name)}, {"arguments", args}},
-                    id_counter,
-                    allowed_tool_names
-                );
-                if (entry.is_null()) return nullptr;
-                result.push_back(std::move(entry));
-                pos = close + 1;
-            }
-            return result.empty() ? nullptr : result;
+                return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names);
         }
-
-        constexpr std::string_view mistral_prefix = "[TOOL_CALLS]";
-        if (text.starts_with(mistral_prefix)) {
-            text.remove_prefix(mistral_prefix.size());
-            text = trim_left_view(text);
-            if (text.empty()) return nullptr;
-            auto parsed = nlohmann::json::parse(std::string(text));
-            return parse_json_array_tool_calls(parsed, id_counter, allowed_tool_names);
-        }
-
-        if (text.starts_with('[')) {
-            auto parsed = nlohmann::json::parse(std::string(text));
-            return parse_json_array_tool_calls(parsed, id_counter, allowed_tool_names);
-        }
-
-        constexpr std::string_view open_tag = "<tool_call>";
-        constexpr std::string_view close_tag = "</tool_call>";
-        if (text.starts_with(open_tag)) {
-            nlohmann::json result = nlohmann::json::array();
-            std::size_t pos = 0;
-            while (pos < text.size()) {
-                while (pos < text.size() &&
-                       std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
-                    ++pos;
-                }
-                if (pos == text.size()) break;
-                if (!text.substr(pos).starts_with(open_tag)) return nullptr;
-
-                const auto content_start = pos + open_tag.size();
-                const auto tag_end = text.find(close_tag, content_start);
-                if (tag_end == std::string_view::npos) return nullptr;
-                auto parsed = nlohmann::json::parse(
-                    std::string(text.substr(content_start, tag_end - content_start))
-                );
-                auto entry = build_tool_call_entry(parsed, id_counter, allowed_tool_names);
-                if (entry.is_null()) return nullptr;
-                result.push_back(std::move(entry));
-                pos = tag_end + close_tag.size();
-            }
-            return result.empty() ? nullptr : result;
-        }
-
-        return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names);
     } catch (const nlohmann::json::exception&) {
         return nullptr;
     }
+    return nullptr;
 }
 
 } // namespace
 
-nlohmann::json try_parse_tool_calls(std::string_view text) {
-    return try_parse_tool_calls_impl(text, nullptr);
-}
-
 nlohmann::json try_parse_tool_calls(
+    ToolCallFormat format,
     std::string_view text,
     const std::vector<std::string>& allowed_tool_names
 ) {
-    return try_parse_tool_calls_impl(text, &allowed_tool_names);
+    return try_parse_tool_calls_impl(format, text, &allowed_tool_names);
 }
 
-ToolCallStreamParser::ToolCallStreamParser(std::vector<std::string> allowed_tool_names)
-    : _allowed_tool_names(std::move(allowed_tool_names)) {
+ToolCallFormat tool_call_format_for_model(std::string_view model_type) {
+    if (model_type == "llm-lfm2" || model_type == "vlm-lfm2_vl") {
+        return ToolCallFormat::Lfm;
+    }
+    if (model_type == "vlm-gemma4") {
+        return ToolCallFormat::Gemma;
+    }
+    if (model_type == "llm-mistral") {
+        return ToolCallFormat::Mistral;
+    }
+    if (model_type == "llm-qwen2" || model_type == "llm-qwen3" ||
+        model_type == "vlm-qwen3_vl") {
+        return ToolCallFormat::Qwen;
+    }
+    if (model_type == "llm-llama") {
+        return ToolCallFormat::Llama;
+    }
+    return ToolCallFormat::GenericJson;
+}
+
+std::vector<std::string> tool_call_special_tokens(ToolCallFormat format) {
+    switch (format) {
+        case ToolCallFormat::Lfm:
+            return {std::string(lfm_open), std::string(lfm_close)};
+        case ToolCallFormat::Gemma:
+            return {std::string(gemma_open), std::string(gemma_close), R"(<|"|>)"};
+        case ToolCallFormat::Mistral:
+            return {std::string(mistral_prefix)};
+        default:
+            return {};
+    }
+}
+
+PreservedToolCallTokens resolve_tool_call_special_tokens(
+    ToolCallFormat format,
+    const Tokenizer& tokenizer
+) {
+    PreservedToolCallTokens resolved;
+    for (const auto& token : tool_call_special_tokens(format)) {
+        try {
+            resolved.emplace_back(tokenizer.token_to_id(token), token);
+        } catch (const std::exception&) {
+            throw std::runtime_error(
+                "Tool calling protocol token '" + token + "' is missing from the loaded tokenizer"
+            );
+        }
+    }
+    return resolved;
+}
+
+std::string decode_tool_call_output(
+    const Tokenizer& tokenizer,
+    const std::vector<uint32_t>& token_ids,
+    const PreservedToolCallTokens& preserved_tokens
+) {
+    std::string result;
+    std::vector<uint32_t> normal_tokens;
+    const auto flush_normal = [&]() {
+        if (!normal_tokens.empty()) {
+            result += tokenizer.decode(normal_tokens, true);
+            normal_tokens.clear();
+        }
+    };
+
+    for (const auto token_id : token_ids) {
+        const auto marker = std::find_if(
+            preserved_tokens.begin(), preserved_tokens.end(),
+            [token_id](const auto& entry) { return entry.first == token_id; }
+        );
+        if (marker == preserved_tokens.end()) {
+            normal_tokens.push_back(token_id);
+            continue;
+        }
+        flush_normal();
+        result += marker->second;
+    }
+    flush_normal();
+    return result;
+}
+
+ToolCallStreamParser::ToolCallStreamParser(ToolCallFormat format) : _format(format) {
+}
+
+ToolCallStreamParser::ToolCallStreamParser(
+    ToolCallFormat format,
+    std::vector<std::string> allowed_tool_names
+) : _format(format), _allowed_tool_names(std::move(allowed_tool_names)) {
 }
 
 std::vector<ToolCallStreamParser::Event> ToolCallStreamParser::add(
@@ -301,9 +544,8 @@ std::vector<ToolCallStreamParser::Event> ToolCallStreamParser::add(
 
     if (!done) return {};
 
-    auto parsed = _allowed_tool_names.has_value()
-        ? try_parse_tool_calls(_buffer, *_allowed_tool_names)
-        : try_parse_tool_calls(_buffer);
+    const auto parsed = try_parse_tool_calls_impl(
+        _format, _buffer, _allowed_tool_names.has_value() ? &*_allowed_tool_names : nullptr);
     if (!parsed.is_null()) {
         _mode = Mode::Done;
         _buffer.clear();
@@ -323,27 +565,31 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
         return done ? Mode::Content : Mode::Undecided;
     }
 
-    constexpr std::string_view gemma_marker = "call:";
-    constexpr std::string_view qwen_marker = "<tool_call>";
+    const auto marker_mode = [&](std::string_view marker) {
+        if (is_prefix_of(stripped, marker)) {
+            return stripped.size() == marker.size() ? Mode::ToolCall
+                : done ? Mode::Content : Mode::Undecided;
+        }
+        return is_prefix_of(marker, stripped) ? Mode::ToolCall : Mode::Content;
+    };
 
-    if (is_prefix_of(stripped, gemma_marker)) {
-        return stripped.size() == gemma_marker.size() ? Mode::Gemma : Mode::Undecided;
+    switch (_format) {
+        case ToolCallFormat::Lfm:
+            return marker_mode(lfm_open);
+        case ToolCallFormat::Gemma: {
+            const auto wrapper_mode = marker_mode(gemma_open);
+            return wrapper_mode == Mode::Content ? marker_mode(gemma_call) : wrapper_mode;
+        }
+        case ToolCallFormat::Mistral:
+            return marker_mode(mistral_prefix);
+        case ToolCallFormat::Qwen:
+            return marker_mode(qwen_open);
+        case ToolCallFormat::Llama:
+            return stripped.front() == '{' ? Mode::ToolCall : Mode::Content;
+        case ToolCallFormat::GenericJson:
+            return stripped.front() == '{' || stripped.front() == '[' ? Mode::ToolCall
+                                                                       : Mode::Content;
     }
-    if (is_prefix_of(gemma_marker, stripped)) {
-        return Mode::Gemma;
-    }
-
-    if (is_prefix_of(stripped, qwen_marker)) {
-        return stripped.size() == qwen_marker.size() ? Mode::Qwen : Mode::Undecided;
-    }
-    if (is_prefix_of(qwen_marker, stripped)) {
-        return Mode::Qwen;
-    }
-
-    if (stripped.front() == '{' || stripped.front() == '[') {
-        return Mode::Json;
-    }
-
     return Mode::Content;
 }
 

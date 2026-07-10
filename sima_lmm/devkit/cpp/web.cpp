@@ -639,7 +639,9 @@ void WEB::_execute_streaming_chat(
             bool ttft_sent = false;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
-            ToolCallStreamParser tool_parser(tool_names_from_definitions(chat.get_tools()));
+            ToolCallStreamParser tool_parser(
+                _vision_language_model_ptr->tool_call_format(),
+                tool_names_from_definitions(chat.get_tools()));
             nlohmann::json pending_ollama_tool_calls = nullptr;
 
             auto send_openai_initial = [&]() {
@@ -953,9 +955,9 @@ void WEB::_execute_normal_chat(
     nlohmann::json tool_calls = nullptr;
     if (chat.has_tools()) {
         tool_calls = try_parse_tool_calls(
-            full_response,
-            tool_names_from_definitions(chat.get_tools())
-        );
+            _vision_language_model_ptr->tool_call_format(), full_response,
+            tool_names_from_definitions(chat.get_tools()));
+        if (!tool_calls.is_null()) full_response.clear();
     }
 
     nlohmann::json response;
