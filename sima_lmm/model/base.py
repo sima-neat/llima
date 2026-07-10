@@ -7,7 +7,7 @@ import onnxruntime as ort
 import os
 import shutil
 import sys
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from abc import ABC
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait
@@ -30,7 +30,7 @@ from afe.apis.error_handling_variables import enable_verbose_error_messages
 from afe.apis.loaded_net import load_model, onnx_source
 from afe.apis.model import Model as SDKModel
 from afe.core.configs import (
-    QuantizationConfigs, OptimizationConfigs, QuantizationPrecision,
+    QuantizationConfigs, OptimizationConfigs,
     create_quantization_configs, api_calibration_configs
 )
 from afe.ir.operations import PlaceholderOp
@@ -107,14 +107,16 @@ class LoraGenMode(str, Enum):
 
 GenConfiguration = TypedDict(
     "GenConfiguration", {
-        "precision": dict[LayerID, FileGenPrecision], "lora": dict[LayerID, LoraGenMode]
+        "precision": dict[LayerID, FileGenPrecision],
+        "lora": NotRequired[dict[LayerID, LoraGenMode]],
     }
 )
 
 
 LayerConfiguration = TypedDict(
     "LayerConfiguration", {
-        "precision": FileGenPrecision, "lora": LoraGenMode
+        "precision": FileGenPrecision,
+        "lora": NotRequired[LoraGenMode],
     }
 )
 
@@ -220,7 +222,7 @@ class BaseModel(ABC):
                     self.gen_model_sdk_files_directly(layer_cfg, log_level=log_level, quantizable=True)
                 case FileGenMode.FP_TO_QUANT:
                     self.sima_path.mkdir(parents=True, exist_ok=True)
-                    self.quantize_model_sdk(layer_cfg["precision"], log_level=log_level)
+                    self.quantize_model_sdk(layer_cfg, log_level=log_level)
                 case FileGenMode.SOURCE_TO_QUANT:
                     self.sima_model_sdk_path.mkdir(parents=True, exist_ok=True)
                     self.gen_model_sdk_files_directly(layer_cfg, log_level=log_level, quantizable=False)
@@ -334,11 +336,11 @@ class BaseModel(ABC):
         """
         raise NotImplementedError("gen_model_sdk_files_directly method is not implemented")
 
-    def quantize_model_sdk(self, precision: FileGenPrecision, log_level: int):
+    def quantize_model_sdk(self, layer_cfg: LayerConfiguration, log_level: int):
         """Quantizes a floating-point Model SDK file, producing a quantized Model SDK file.
 
         Args:
-            precision: Precision used for quantization.
+            layer_cfg: The configuration including precision used for quantization.
             log_level: Logging level.
         """
 
@@ -347,7 +349,7 @@ class BaseModel(ABC):
             str(sima_model_sdk_path.name), str(sima_model_sdk_path.parent)
         )
 
-        quant_params = _quantization_params(precision)
+        quant_params = _quantization_params(layer_cfg["precision"])
         quant_params.calibration_method = SkipCalibration()
         optimization_configs = afe.apis.loaded_net._update_optimization_configs_with_quant_config(
             quant_params

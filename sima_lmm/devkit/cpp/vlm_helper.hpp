@@ -55,7 +55,10 @@ class VlmHelper {
             const nlohmann::json& tokenizer_config_json,
             std::optional<std::string> override_chat_template
         );
-        void _init_stop_token_ids(const std::filesystem::path& devkit_dir);
+        void _init_stop_token_ids(
+            const std::filesystem::path& devkit_dir,
+            const nlohmann::json* tokenizer_config_json = nullptr
+        );
         void _init_image_token_id(const nlohmann::json& tokenizer_config_json);
         void _init_pad_token_id(const nlohmann::json& tokenizer_config_json);
         void _init_image_processor(const std::filesystem::path& devkit_dir);

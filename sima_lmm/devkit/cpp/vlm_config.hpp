@@ -137,6 +137,7 @@ struct AttentionBlockConfig {
     bool swa_enable;
     uint8_t swa_ratio = 0;  // Deprecated in 2.1.
     std::optional<uint32_t> sliding_window;
+    bool attn_output_gate = false;  // Qwen3.5: per-head sigmoid gate on attention output.
 
 
     uint32_t get_head_dim(const std::string& layer_type) const {
@@ -154,7 +155,26 @@ struct AttentionBlockConfig {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AttentionBlockConfig, num_attention_heads, num_key_value_heads, head_dim, sliding_head_dim,
-    swa_enable, swa_ratio, sliding_window
+    swa_enable, swa_ratio, sliding_window, attn_output_gate
+)
+
+struct LinearAttentionConfig {
+    uint32_t conv_kernel_dim = 0;
+    uint32_t key_head_dim = 0;
+    uint32_t value_head_dim = 0;
+    uint32_t num_key_heads = 0;
+    uint32_t num_value_heads = 0;
+
+    uint32_t get_key_dim() const { return num_key_heads * key_head_dim; }
+    uint32_t get_value_dim() const { return num_value_heads * value_head_dim; }
+    uint32_t get_conv_dim() const { return 2 * get_key_dim() + get_value_dim(); }
+    uint32_t get_recurrent_state_size() const {
+        return num_value_heads * key_head_dim * value_head_dim;
+    }
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    LinearAttentionConfig, conv_kernel_dim, key_head_dim, value_head_dim, num_key_heads,
+    num_value_heads
 )
 
 struct SpeculativeDecodingConfig {
@@ -171,6 +191,7 @@ struct LanguageModelConfig {
     TokenEmbedConfig token_cfg;
     RoPEConfig rope_cfg;
     AttentionBlockConfig attn_cfg;
+    std::optional<LinearAttentionConfig> linear_attn_cfg;
     uint32_t hidden_size;
     uint8_t num_hidden_layers;
     uint16_t lm_head_num_splits;
@@ -224,6 +245,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache,
     hidden_size_per_layer_input, num_kv_shared_layers,
     rms_norm_eps, rms_norm_unit_offset,
+    linear_attn_cfg,
     draft_vocab_size, speculative_decoding_cfg
 )
 

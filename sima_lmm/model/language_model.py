@@ -20,6 +20,7 @@ from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
 from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
+from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.layer_id import LayerID
@@ -122,6 +123,14 @@ class LanguageModel(BaseModel):
                 case "single_conv":
                     part_model = self._get_part_model(
                         "conv_fused", 1, layer_idx=layer_id.part_idx
+                    )
+                case "group_linear":
+                    part_model = self._get_part_model(
+                        "linear_fused", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_linear":
+                    part_model = self._get_part_model(
+                        "linear_fused", 1, layer_idx=layer_id.part_idx
                     )
                 case "conv_post_final":
                     part_model = self._get_part_model(
@@ -531,6 +540,13 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
+                )
+            case "linear_fused":
+                model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_linear"
+                assert layer_idx is not None
+                return LanguageLinearModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx
                 )
             case "conv_post_final":
                 model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}_conv_final"

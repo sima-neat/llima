@@ -51,7 +51,7 @@ VlmHelper::VlmHelper(
             std::ifstream(devkit_dir / "tokenizer_config.json")
         );
         _init_chat_template(devkit_dir, tokenizer_config_json, chat_template);
-        _init_stop_token_ids(devkit_dir);
+        _init_stop_token_ids(devkit_dir, &tokenizer_config_json);
         if (_vlm_cfg.is_multimodal()) {
             _init_image_token_id(tokenizer_config_json);
             _init_pad_token_id(tokenizer_config_json);
@@ -247,7 +247,10 @@ void VlmHelper::_init_chat_template(
 }
 
 
-void VlmHelper::_init_stop_token_ids(const std::filesystem::path& devkit_dir) {
+void VlmHelper::_init_stop_token_ids(
+    const std::filesystem::path& devkit_dir,
+    const nlohmann::json* tokenizer_config_json
+) {
     // Draft models use the target's tokenization scheme; stop tokens come from
     // the target model, not the draft.
     if (_vlm_cfg.lm_cfg.speculative_decoding_cfg.has_value()
@@ -259,11 +262,22 @@ void VlmHelper::_init_stop_token_ids(const std::filesystem::path& devkit_dir) {
     if (std::filesystem::is_regular_file(generation_config_file_name)) {
         auto json = nlohmann::json::parse(std::ifstream(generation_config_file_name));
         auto eos_token_id = json.at("eos_token_id");
-        if (eos_token_id.is_number_unsigned()) {
+        if (eos_token_id.is_number_integer() || eos_token_id.is_number_unsigned()) {
             _stop_token_ids.emplace(eos_token_id.get<uint32_t>());
         } else {
             eos_token_id.get_to(_stop_token_ids);
         }
+    } else if (tokenizer_config_json != nullptr) {
+        auto eos_token_json = tokenizer_config_json->at("eos_token");
+        std::string eos_token;
+        if (eos_token_json.is_string()) {
+            eos_token = eos_token_json.get<std::string>();
+        } else if (eos_token_json.contains("content")) {
+            eos_token = eos_token_json["content"].get<std::string>();
+        } else {
+            throw std::runtime_error("Failed to determine the eos token from tokenizer_config.json");
+        }
+        _stop_token_ids.emplace(_tokenizer_ptr->token_to_id(eos_token));
     } else if (!_vlm_cfg.gguf_file_name.empty()) {
         auto eos_token_id = _tokenizer_ptr->get_eos_token_id();
         _stop_token_ids.emplace(eos_token_id);

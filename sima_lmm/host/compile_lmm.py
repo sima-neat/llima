@@ -120,7 +120,8 @@ def gen_files(
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
                 else:
-                    # Use direct SiMa Builder graph generation for ordinary HF models.
+                    # Use staged direct Model SDK generation for LoRA weights, quantized
+                    # embeddings, and dynamic quantized KV cache nodes.
                     modes = [
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
                         FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
