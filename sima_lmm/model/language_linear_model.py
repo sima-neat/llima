@@ -3,6 +3,7 @@ import numpy as np
 from dataclasses import dataclass
 
 from afe.apis.defines import gen2_target
+from afe.backends.backends import Backend
 from afe.ir.defines import Status
 from afe.ir.serializer import save_awesomenet
 from afe.ir.tensor_type import TensorType, ScalarType
@@ -856,7 +857,10 @@ class LanguageLinearModel(LanguagePartBaseModel):
             builder.create_tuple_node(tuple_items)
         else:
             builder.create_tuple_node(
-                [builder.create_cast_node(item, ScalarType.float32) for item in tuple_items]
+                [
+                    builder.create_cast_node(item, ScalarType.float32, backend=Backend.EV)
+                    for item in tuple_items
+                ]
             )
         return builder.finish(self.model_name)
 
