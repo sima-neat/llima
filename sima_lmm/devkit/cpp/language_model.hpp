@@ -49,14 +49,19 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
+            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt,
+            std::vector<Eigen::bfloat16>* generation_logits_ptr = nullptr
         );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
             uint16_t num_cached_tokens,
             std::optional<ChronoTimer> = std::nullopt
         );
-        void run_model_decode(uint16_t num_input_tokens, uint32_t token_id);
+        void run_model_decode(
+            uint16_t num_input_tokens,
+            uint32_t token_id,
+            std::vector<Eigen::bfloat16>* generation_logits_ptr = nullptr
+        );
         uint32_t run_model_once(
             uint16_t num_tokens,
             uint16_t token_idx,
@@ -150,6 +155,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
+        void _append_current_logits(std::vector<Eigen::bfloat16>& logits);
 
         void _notify_first_token(uint32_t token_id, double duration);
         void _notify_new_token(uint32_t token_id, double duration);

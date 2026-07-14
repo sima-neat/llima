@@ -238,13 +238,28 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::span<const uint32_t> input_token_ids,
     std::optional<ChronoTimer> timer_ttft,
     std::optional<uint16_t> override_max_num_tokens,
-    std::optional<std::set<uint32_t>> override_stop_token_ids
+    std::optional<std::set<uint32_t>> override_stop_token_ids,
+    std::vector<Eigen::bfloat16>* generation_logits_ptr
 ) {
+    if (generation_logits_ptr && !_cfg.pipeline_cfg.return_logits) {
+        throw std::runtime_error(
+            "model not compiled with --return_logits; generation logits are unavailable"
+        );
+    }
+    if (generation_logits_ptr) {
+        generation_logits_ptr->clear();
+    }
+
     // Update the state.
     _is_running = true;
 
     auto original_max_num_tokens = set_max_num_tokens(override_max_num_tokens);
     auto original_stop_token_ids = set_stop_token_ids(override_stop_token_ids);
+    if (generation_logits_ptr && input_token_ids.size() < _max_num_tokens) {
+        generation_logits_ptr->reserve(
+            (_max_num_tokens - input_token_ids.size()) * _cfg.lm_cfg.token_cfg.vocab_size
+        );
+    }
 
     std::optional<std::vector<uint32_t>> output_token_ids{};
 
@@ -258,7 +273,11 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
 
         // Prefill.
         auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
+        if (generation_logits_ptr) {
+            _append_current_logits(*generation_logits_ptr);
+        }
         auto output_token_id_begin = _cached_token_ids.size() - 1;
+        bool output_includes_cached_prompt_token = false;
         if (_stop_token_ids.contains(token_id)) {
             _notify_stop();
             output_token_ids = std::vector<uint32_t>{token_id};
@@ -266,9 +285,25 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
             // Do nothing.
         } else {
             // Decode.
-            run_model_decode(input_token_ids.size(), token_id);
+            run_model_decode(input_token_ids.size(), token_id, generation_logits_ptr);
             output_token_ids = std::vector<uint32_t>(
                 _cached_token_ids.begin() + output_token_id_begin, _cached_token_ids.end()
+            );
+            output_includes_cached_prompt_token = true;
+        }
+
+        if (generation_logits_ptr && output_token_ids.has_value()) {
+            // Normal generation returns the final cached prompt token followed by generated
+            // tokens. Immediate EOS returns only that generated EOS token. Decode computes one
+            // look-ahead token when the context becomes full, so retain exactly one logit row
+            // per generated token actually returned to the client.
+            const size_t returned_generated_tokens = (
+                output_includes_cached_prompt_token
+                ? output_token_ids.value().size() - 1
+                : output_token_ids.value().size()
+            );
+            generation_logits_ptr->resize(
+                returned_generated_tokens * _cfg.lm_cfg.token_cfg.vocab_size
             );
         }
     }
@@ -391,13 +426,18 @@ uint32_t LanguageModel::run_model_prefill(
 
 
 void LanguageModel::run_model_decode(
-    uint16_t num_input_tokens, uint32_t token_id
+    uint16_t num_input_tokens,
+    uint32_t token_id,
+    std::vector<Eigen::bfloat16>* generation_logits_ptr
 ) {
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
         _upload_per_layer_embedding_rows(std::span<const uint32_t>(&token_id, 1), 1);
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
+        if (generation_logits_ptr) {
+            _append_current_logits(*generation_logits_ptr);
+        }
         _cached_token_ids.emplace_back(token_id);
         token_id = next_token_id;
 
@@ -1900,6 +1940,14 @@ uint32_t LanguageModel::_calc_next_token_id(MLABuffer* buf_ptr) {
         }
     }
     return max_index;
+}
+
+
+void LanguageModel::_append_current_logits(std::vector<Eigen::bfloat16>& logits) {
+    MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
+    buf_ptr->invalidate_cache();
+    const auto* ptr = reinterpret_cast<const Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
+    logits.insert(logits.end(), ptr, ptr + _cfg.lm_cfg.token_cfg.vocab_size);
 }
 
 

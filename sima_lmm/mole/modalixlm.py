@@ -324,6 +324,86 @@ class ModalixLM(HFLM):
         self.profile_data.append(profile_entry)
         return out_tensor
 
+    def generate_with_logits(
+        self,
+        tensor: torch.Tensor,
+        max_num_tokens: int,
+        stop_token_ids: list[int] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate with the board KV cache and return token IDs plus exact selection logits.
+
+        The token tensor follows the existing ``generate`` protocol and may begin with the final
+        prompt token. The logits tensor contains one row for each newly generated token and has
+        shape ``[1, generated_tokens, vocabulary_size]``.
+        """
+        assert tensor.size(0) == 1, f"ZMQ does not support batched inference, got {tensor.size()}"
+
+        device = tensor.device
+        np_tensor = tensor.detach().cpu().numpy().astype(np.uint32)
+        request_metadata = {
+            "type": "generate_with_logits",
+            "tensor_dtype": np_tensor.dtype.name,
+            "tensor_shape": np_tensor.shape,
+            "max_num_tokens": max_num_tokens,
+            "stop_token_ids": stop_token_ids or [],
+        }
+        request_messages = [
+            msgpack.packb(request_metadata, use_bin_type=True),
+            np_tensor.tobytes(),
+        ]
+
+        zmq_t0 = time.perf_counter_ns()
+        self.zmq_socket.send_multipart(request_messages)
+        response_messages = self.zmq_socket.recv_multipart(track=True)
+        zmq_t1 = time.perf_counter_ns()
+        if len(response_messages) not in {2, 3}:
+            raise RuntimeError(
+                f"Expected 3 ZMQ response frames (or 2 for an error), "
+                f"got {len(response_messages)}"
+            )
+
+        response_metadata = msgpack.unpackb(response_messages[0], raw=False)
+        if response_metadata.get("error"):
+            raise RuntimeError(response_metadata["error"])
+        if len(response_messages) != 3:
+            raise RuntimeError("generate_with_logits response is missing a tensor frame")
+        if response_metadata.get("result_type") != "generation_with_logits":
+            raise RuntimeError(f"Unexpected response metadata: {response_metadata}")
+
+        token_shape = response_metadata.get("token_ids_shape")
+        logits_shape = response_metadata.get("logits_shape")
+        if not token_shape or not logits_shape:
+            raise RuntimeError(f"Response is missing token/logits shapes: {response_metadata}")
+
+        token_ids = torch.frombuffer(
+            bytearray(response_messages[1]), dtype=torch.uint32
+        ).view(*token_shape).to(device=device)
+        logits = torch.frombuffer(
+            bytearray(response_messages[2]), dtype=torch.bfloat16
+        ).view(*logits_shape).to(device=device)
+
+        roundtrip_time_ns = zmq_t1 - zmq_t0
+        board_infer_time_ns = response_metadata.get("infer_time_ns")
+        network_time_ns = (
+            max(0, roundtrip_time_ns - board_infer_time_ns)
+            if isinstance(board_infer_time_ns, int) else None
+        )
+        profile_entry = {
+            "request_type": "generate_with_logits",
+            "in_tokens": int(tensor.size(1)),
+            "out_tokens": int(logits.size(1)),
+            "request_bytes": len(request_messages[1]),
+            "token_response_bytes": len(response_messages[1]),
+            "logits_response_bytes": len(response_messages[2]),
+            "zmq_roundtrip_time_ns": roundtrip_time_ns,
+            "board_infer_time_ns": board_infer_time_ns,
+            "network_time_ns": network_time_ns,
+            **{key: value for key, value in response_metadata.items() if key != "error"},
+        }
+        self.last_profile_data = profile_entry
+        self.profile_data.append(profile_entry)
+        return token_ids, logits
+
     def _zmq_loglikelihood(
         self,
         input_tokens: list[int],

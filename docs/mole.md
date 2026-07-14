@@ -31,6 +31,18 @@ host:~$ source ~/sima-mole-venv/bin/activate
 
 MoLE is then invoked via the `llima-benchmark` CLI with two subcommands. The `<model_id>` argument is always the HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). In `-b modalix` mode this is not just a display label: it must match the tokenizer and config used to compile the deployed board model, because the board returns token scores only and does not provide tokenizer metadata.
 
+### Generate with exact logits (experimental protocol)
+
+Models compiled with `--return_logits` support the ZMQ request type
+`generate_with_logits`. It uses the normal KV-cached generation path and returns three frames:
+
+1. MessagePack response metadata with `token_ids_shape` and `logits_shape`.
+2. Generated token IDs as `uint32`.
+3. The exact per-generated-token logits used by greedy decoding as `bfloat16`.
+
+The Python `ModalixLM.generate_with_logits()` helper returns the token and logits tensors. Full
+logits require `generated_tokens * vocabulary_size * 2` bytes and can be expensive to transfer.
+
 ### Accuracy Benchmarking
 
 Evaluates model quality against standard tasks:

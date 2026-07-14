@@ -20,6 +20,13 @@
 namespace simaai {
 namespace llima {
 
+struct GenerationWithLogitsResult {
+    std::vector<uint32_t> token_ids;
+    std::vector<Eigen::bfloat16> logits;
+    size_t logits_token_count;
+    size_t vocab_size;
+};
+
 class VisionLanguageModel : public BaseModel<VlmConfig> {
     public:
         VisionLanguageModel(
@@ -35,6 +42,11 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint16_t> max_new_tokens = std::nullopt
         );
         std::vector<uint32_t> run_model(
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
+            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
+        );
+        GenerationWithLogitsResult run_model_with_logits(
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt

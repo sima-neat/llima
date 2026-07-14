@@ -71,7 +71,7 @@ void ZMQServer::run() {
             _logger->info("Received a request");
 
             ZMQResponseMetadata response_metadata;
-            std::array<zmq::message_t, 2> response_messages;
+            std::vector<zmq::message_t> response_messages(2);
             ChronoTimer inference_timer(true);
             try {
                 // Unpack the metadata and check the values.
@@ -120,6 +120,26 @@ void ZMQServer::run() {
                     response_metadata.tensor_dtype = "uint32";
                     response_metadata.tensor_shape = {1, result.size()};
                     response_messages[1] = {result.data(), result.size() * sizeof(uint32_t)};
+                } else if (request_metadata.type == "generate_with_logits") {
+                    // Return generated token IDs and the exact logits used to select them.
+                    auto result = _vision_language_model_ptr->run_model_with_logits(
+                        input_token_ids, request_metadata.max_num_tokens,
+                        request_metadata.stop_token_ids
+                    );
+                    response_metadata.tensor_dtype = "";
+                    response_metadata.tensor_shape = {};
+                    response_metadata.result_type = "generation_with_logits";
+                    response_metadata.token_ids_shape = {1, result.token_ids.size()};
+                    response_metadata.logits_shape = {
+                        1, result.logits_token_count, result.vocab_size
+                    };
+                    response_messages.resize(3);
+                    response_messages[1] = {
+                        result.token_ids.data(), result.token_ids.size() * sizeof(uint32_t)
+                    };
+                    response_messages[2] = {
+                        result.logits.data(), result.logits.size() * sizeof(Eigen::bfloat16)
+                    };
                 } else if (request_metadata.type == "model_call") {
                     if (request_metadata.continuation_token_ids.has_value()) {
                         const auto& continuation_token_ids = (
@@ -182,6 +202,7 @@ void ZMQServer::run() {
                     );
                 }
             } catch (const std::exception& e) {
+                response_messages.resize(2);
                 response_metadata.tensor_dtype = "";
                 response_metadata.tensor_shape = {};
                 response_metadata.error = e.what();

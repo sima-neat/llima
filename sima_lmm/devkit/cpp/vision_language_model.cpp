@@ -99,6 +99,46 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
 }
 
 
+GenerationWithLogitsResult VisionLanguageModel::run_model_with_logits(
+    std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<std::set<uint32_t>> override_stop_token_ids
+) {
+    // Generate with the normal KV-cache path while retaining the exact logits used by argmax.
+    _text_streamer.disable();
+    try {
+        // Cached token IDs can reproduce a prior first token without refreshing n1_buffer4.
+        // Force this request to compute every returned logit while retaining KV-cache decoding
+        // within the request itself.
+        _language_model_ptr->clear_cached_token_ids();
+        _language_model_ptr->create_input_buffers(input_token_ids);
+        std::vector<Eigen::bfloat16> logits;
+        auto output_token_ids = _language_model_ptr->run_model(
+            input_token_ids,
+            std::nullopt,
+            override_max_num_tokens,
+            override_stop_token_ids,
+            &logits
+        );
+        const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
+        if (logits.size() % vocab_size != 0) {
+            throw std::runtime_error("Generation logits are not divisible by vocabulary size");
+        }
+        const size_t logits_token_count = logits.size() / vocab_size;
+        _text_streamer.enable();
+        return {
+            output_token_ids.value_or(std::vector<uint32_t>()),
+            std::move(logits),
+            logits_token_count,
+            vocab_size
+        };
+    } catch (...) {
+        _text_streamer.enable();
+        throw;
+    }
+}
+
+
 std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
     std::span<const uint32_t> input_token_ids
 ) {

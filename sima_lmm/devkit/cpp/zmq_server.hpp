@@ -44,8 +44,13 @@ struct ZMQResponseMetadata {
     size_t infer_time_ns = 0;
     std::optional<std::string> result_type;
     std::optional<std::string> error;
+    std::optional<std::vector<size_t>> token_ids_shape;
+    std::optional<std::vector<size_t>> logits_shape;
 
-    MSGPACK_DEFINE_MAP(tensor_dtype, tensor_shape, infer_time_ns, result_type, error);
+    MSGPACK_DEFINE_MAP(
+        tensor_dtype, tensor_shape, infer_time_ns, result_type, error,
+        token_ids_shape, logits_shape
+    );
 };
 
 
