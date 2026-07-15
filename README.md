@@ -28,25 +28,24 @@ The Model Compiler tooling is delivered as a Python wheel:
 - `sima-lmm[sdk]`: compiler SDK dependencies, including internal SiMa packages.
 - `sima-lmm[sdk_ext]`: external MoLE, benchmark, and evaluation dependencies.
 
-## Install
+## Download Runtime Packages
 
-Install the latest LLiMa runtime packages on the DevKit with `sima-cli`:
+Download the latest LLiMa Debian packages with `sima-cli`:
 
 ```bash
 sima-cli neat install llima
 ```
 
-To install a specific release, branch, or artifact reference, include it in the
+To download a specific release, branch, or artifact reference, include it in the
 target:
 
 ```bash
 sima-cli neat install llima@<version-or-ref>
 ```
 
-This installs the LLiMa Debian packages required by the Modalix runtime,
-including the CLI, C++ runtime, and development components. Use
-`sima-cli neat install --help` for the full target syntax and environment
-options.
+Despite the command name, this downloads the CLI, C++ runtime, and development
+packages to the current directory; it does not install them. Use `sima-cli neat
+install --help` for the full target syntax and environment options.
 
 ## Build LLiMa
 
