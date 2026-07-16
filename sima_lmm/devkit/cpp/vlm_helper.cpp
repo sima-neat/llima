@@ -36,6 +36,14 @@ VlmHelper::VlmHelper(
     else
         _system_prompt = _vlm_cfg.pipeline_cfg.system_prompt;
 
+    // Spec drafts ship no tokenization files and reuse the target's tokenizer;
+    // skip init entirely (the draft's vlm_helper is never used for preprocess).
+    const bool is_spec_decode_draft = _vlm_cfg.lm_cfg.is_spec_decode()
+        && _vlm_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    if (is_spec_decode_draft) {
+        return;
+    }
+
     if (_vlm_cfg.gguf_file_name.empty()) {
         _tokenizer_ptr = Tokenizer::from_hf_json(devkit_dir / "tokenizer.json");
         // Huggingface format.
@@ -240,6 +248,13 @@ void VlmHelper::_init_chat_template(
 
 
 void VlmHelper::_init_stop_token_ids(const std::filesystem::path& devkit_dir) {
+    // Draft models use the target's tokenization scheme; stop tokens come from
+    // the target model, not the draft.
+    if (_vlm_cfg.lm_cfg.speculative_decoding_cfg.has_value()
+        && _vlm_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft) {
+        return;
+    }
+
     auto generation_config_file_name = devkit_dir / "generation_config.json";
     if (std::filesystem::is_regular_file(generation_config_file_name)) {
         auto json = nlohmann::json::parse(std::ifstream(generation_config_file_name));

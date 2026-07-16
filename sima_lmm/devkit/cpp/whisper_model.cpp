@@ -263,7 +263,7 @@ WhisperModel::WhisperModel(
     _text_streamer = std::make_unique<TextStreamer>(
         _tokenizer_ptr.get(),
         [](const std::string&, double) {},
-        [](const std::string&, bool) {}
+        [](const std::string&, bool, bool) {}
     );
     _initialize();
 

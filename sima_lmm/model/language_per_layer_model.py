@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from afe.apis.defines import gen2_target
+from afe.backends.backends import Backend
 from afe.ir.defines import Status
 from afe.ir.serializer import save_awesomenet
 from afe.ir.tensor_type import TensorType, ScalarType
@@ -10,7 +11,9 @@ from afe.ir.tensor_type import TensorType, ScalarType
 from sima_lmm.model.base import TensorTessellateParameters, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, build_conv_from_dense_with_lora, activation_type
+from sima_lmm.model.sima_builder import (
+    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype
+)
 
 
 @dataclass
@@ -107,6 +110,7 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
 
     def _build_sima_nodes(self, lm_base: str, quantizable: bool):
         L = self.cfg.lm_cfg.num_hidden_layers
+        H = self.cfg.lm_cfg.hidden_size_per_layer_input
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
 
         model_input_staging = builder.create_placeholder_node(
@@ -145,7 +149,10 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         proj = builder.create_mul_node(
             proj,
             builder.create_constant_node(
-                np.array([self.cfg.lm_cfg.hidden_size ** -0.5], dtype=np.float32)
+                np.array(
+                    [self.cfg.lm_cfg.hidden_size ** -0.5],
+                    dtype=activation_dtype(quantizable),
+                )
             ),
         )
         proj = builder.create_slice_concat_node(
@@ -171,12 +178,14 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         combined = builder.create_add_node(emb, proj_normed)
         _ = builder.create_mul_node(
             combined,
-            builder.create_constant_node(np.array([2.0 ** -0.5], dtype=np.float32)),
+            builder.create_constant_node(
+                np.array([2.0 ** -0.5], dtype=activation_dtype(quantizable))
+            ),
         )
 
         mla_node = builder.finish_subnet("MLA_0")
         if activation_type(quantizable) != ScalarType.float32:
-            builder.create_cast_node(mla_node, ScalarType.float32)
+            builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         return builder.finish(self.model_name)
 
     def get_mla_input_tessellate_params(self) -> dict:

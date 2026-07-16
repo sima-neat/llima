@@ -22,6 +22,7 @@ static std::string get_iso_timestamp() {
 WEB::WEB(
     std::filesystem::path vlm_model_path,
     std::optional<std::filesystem::path> whisper_model_path,
+    std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
     bool do_parallel_load
@@ -40,6 +41,13 @@ WEB::WEB(
         _whisper_model_ptr = std::make_unique<WhisperModel>(
             whisper_model_path.value(), do_parallel_load
         );
+    }
+
+    if (draft_model_path.has_value()) {
+        _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
+            draft_model_path.value(), system_prompt, chat_template, do_parallel_load
+        );
+        _vision_language_model_ptr->set_draft_vlm(_vision_language_draft_model_ptr.get());
     }
 
     auto llima_logger = spdlog::get("llima");
@@ -278,7 +286,8 @@ std::string WEB::_format_openai_sse_chunk(
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
-    std::optional<double> tps
+    std::optional<double> tps,
+    bool from_draft
 ) {
     nlohmann::json chunk;
     chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
@@ -302,7 +311,10 @@ std::string WEB::_format_openai_sse_chunk(
         choice["delta"] = nlohmann::json::object();
         choice["finish_reason"] = finish_reason.value_or("stop");
     } else {
-        choice["delta"] = {{"content", content}};
+        // Custom extension: mark chunks whose tokens were accepted from the
+        // draft model during speculative decoding so the client can render
+        // them differently.
+        choice["delta"] = {{"content", content}, {"from_draft", from_draft}};
         choice["finish_reason"] = nullptr;
     }
 
@@ -316,7 +328,8 @@ std::string WEB::_format_ollama_ndjson_chunk(
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
-    std::optional<double> tps
+    std::optional<double> tps,
+    bool from_draft
 ) {
     nlohmann::json chunk;
     chunk["model"] = model;
@@ -338,6 +351,8 @@ std::string WEB::_format_ollama_ndjson_chunk(
     if (!finished) {
         chunk["message"] = {{"role", "assistant"}, {"content", content}};
         chunk["response"] = content;
+        // Custom extension: flag draft-accepted chunks for client rendering.
+        chunk["from_draft"] = from_draft;
     }
 
     return chunk.dump() + "\n";
@@ -485,7 +500,7 @@ void WEB::_execute_streaming_audio_transcription(
                 WhisperModel* model;
                 ~WhisperCallbackGuard() {
                     model->set_info_callback([](const std::string&, double) {});
-                    model->set_text_callback([](const std::string&, bool) {});
+                    model->set_text_callback([](const std::string&, bool, bool) {});
                 }
             } callback_guard{_whisper_model_ptr.get()};
 
@@ -507,7 +522,7 @@ void WEB::_execute_streaming_audio_transcription(
                 }
             };
 
-            auto text_callback = [&](const std::string& text, bool stream_end) {
+            auto text_callback = [&](const std::string& text, bool stream_end, bool) {
                 if (text.empty())
                     return;
                 std::string chunk = _format_audio_sse_chunk(text, false);
@@ -717,8 +732,12 @@ void WEB::_execute_streaming_chat(
                 }
             };
 
-            // Text callback handles generated text chunks
-            auto text_callback = [&](const std::string& text, bool stream_end) {
+            // Text callback handles generated text chunks. from_draft is
+            // attached to each streamed chunk as a JSON field so the client
+            // can render draft-accepted text differently from target-only.
+            auto text_callback = [&](
+                const std::string& text, bool stream_end, bool from_draft
+            ) {
                 if (has_tools) {
                     buffered_text.append(text);
                     return;
@@ -757,7 +776,8 @@ void WEB::_execute_streaming_chat(
                     formatted_chunk = _format_openai_sse_chunk(
                         text, model, false, std::nullopt,
                         ttft_for_chunk,
-                        tps_value
+                        tps_value,
+                        from_draft
                     );
                 } else {
                     std::optional<double> ttft_for_chunk = std::nullopt;
@@ -768,7 +788,8 @@ void WEB::_execute_streaming_chat(
                     formatted_chunk = _format_ollama_ndjson_chunk(
                         text, model, false, std::nullopt,
                         ttft_for_chunk,
-                        tps_value
+                        tps_value,
+                        from_draft
                     );
                 }
 
@@ -1001,8 +1022,9 @@ void WEB::_execute_normal_chat(
         // Do nothing - we don't need timing info in non-streaming mode
     };
 
-    // Text callback: accumulate all text
-    auto text_callback = [&](const std::string& text, bool stream_end) {
+    // Text callback: accumulate all text. from_draft is ignored in
+    // non-streaming mode -- the whole response is returned as a single string.
+    auto text_callback = [&](const std::string& text, bool stream_end, bool) {
         full_response += text;
     };
 

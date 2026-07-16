@@ -40,8 +40,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
     @property
     def _is_speculative_decoding(self) -> bool:
-        return (self.cfg.lm_cfg.draft_cfg is not None
-                and self.num_tokens == self.cfg.lm_cfg.draft_cfg.speculative_budget)
+        return (self.cfg.lm_cfg.speculative_decoding_cfg is not None
+                and self.num_tokens == self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget)
 
     @property
     def context_length(self) -> int:
@@ -76,15 +76,12 @@ class LanguageCacheModel(LanguagePartBaseModel):
             )
         )
 
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            kv_cache_shape =  (
-                1,
-                self._head_dim,
-                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                self.context_length
-            )
-        else:
-            kv_cache_shape = (1, self._kv_size, 1, self.context_length)
+        kv_cache_shape =  (
+            1,
+            self._head_dim,
+            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            self.context_length
+        )
         self._onnx_builder.create_input_node(f"cached_keys", kv_cache_shape)
         if (
             (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
@@ -118,12 +115,6 @@ class LanguageCacheModel(LanguagePartBaseModel):
         assert attn_heads % kv_heads == 0
         expansion_factor = attn_heads // kv_heads
 
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            split_axis = 2
-        else:
-            split_axis = 1
-        concat_axis = 2
-
         assert len(input_nodes) == 1
         kv_concat_shape = (
             1,
@@ -133,7 +124,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         )
         reshape_kv = self._onnx_builder.build_split_expand_concat(
             f"{base_name}.reshape", input_nodes[0], kv_heads, expansion_factor,
-            split_axis=split_axis, concat_axis=concat_axis, concat_shape=kv_concat_shape
+            split_axis=2, concat_axis=2, concat_shape=kv_concat_shape
         )
 
         return [reshape_kv]
@@ -204,23 +195,21 @@ class LanguageCacheModel(LanguagePartBaseModel):
             self.cfg.lm_cfg.attn_cfg.num_attention_heads
             % self.cfg.lm_cfg.attn_cfg.num_key_value_heads == 0
         )
-        expansion_factor = (
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads
-            // self.cfg.lm_cfg.attn_cfg.num_key_value_heads
-        )
-        kv_size = self._kv_size
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            raise RuntimeError("Strided KV cache is not implemented in SiMa IR code generation")
+        quantize_kv_cache = self.cfg.pipeline_cfg.quantize_kv_cache
 
-        # Shape of input key and value tensors
-        kv_tensor_shape = (1, 1, self.context_length, kv_size)
-
-        # Shape of key and value after reshaping for batch matrix multiply 
-        kv_expand_shape = (
+        # Shape of input key and value tensors.
+        kv_tensor_shape = (
             1,
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads,
+            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             self.context_length,
             self._head_dim
+        )
+        # Shape of scale tensors for quantized KV cache (per-token)
+        kv_scale_shape = (
+            1,
+            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            self.context_length,
+            1
         )
         input_shape = (
             1,
@@ -262,9 +251,16 @@ class LanguageCacheModel(LanguagePartBaseModel):
         model_input_input = builder.create_placeholder_node(
             "input", TensorType(activation_type(quantizable), input_shape)
         )
+        kv_dtype = ScalarType.int8 if quantize_kv_cache else activation_type(quantizable)
         model_input_cached_keys = builder.create_placeholder_node(
-            "cached_keys", TensorType(activation_type(quantizable), kv_tensor_shape)
+            "cached_keys", TensorType(kv_dtype, kv_tensor_shape)
         )
+        if quantize_kv_cache:
+            model_input_cached_keys_scale = builder.create_placeholder_node(
+                "cached_keys_scale", TensorType(activation_type(quantizable), kv_scale_shape)
+            )
+        else:
+            model_input_cached_keys_scale = None
         if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1 or
             self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1 or
             self._is_speculative_decoding):
@@ -277,10 +273,23 @@ class LanguageCacheModel(LanguagePartBaseModel):
         else:
             model_input_attn_mask = None
         model_input_cached_values = builder.create_placeholder_node(
-            "cached_values", TensorType(activation_type(quantizable), kv_tensor_shape)
+            "cached_values", TensorType(kv_dtype, kv_tensor_shape)
         )
+        if quantize_kv_cache:
+            model_input_cached_values_scale = builder.create_placeholder_node(
+                "cached_values_scale", TensorType(activation_type(quantizable), kv_scale_shape)
+            )
+        else:
+            model_input_cached_values_scale = None
 
-        model_inputs = list(filter(None, [model_input_input, model_input_cached_keys, model_input_attn_mask, model_input_cached_values]))
+        model_inputs = list(filter(None, [
+            model_input_input,
+            model_input_cached_keys,
+            model_input_cached_keys_scale,
+            model_input_attn_mask,
+            model_input_cached_values,
+            model_input_cached_values_scale
+        ]))
 
         builder.begin_subnet(model_inputs)
 
@@ -289,8 +298,12 @@ class LanguageCacheModel(LanguagePartBaseModel):
             "MLA_0/input", TensorType(activation_type(quantizable), input_shape)
         )
         mla_input_cached_keys = builder.create_placeholder_node(
-            "MLA_0/cached_keys", TensorType(activation_type(quantizable), kv_tensor_shape)
+            "MLA_0/cached_keys", TensorType(kv_dtype, kv_tensor_shape)
         )
+        if quantize_kv_cache:
+            mla_input_cached_keys_scale = builder.create_placeholder_node(
+                "MLA_0/cached_keys_scale", TensorType(activation_type(quantizable), kv_scale_shape)
+            )
         if model_input_attn_mask is not None:
             mla_input_attn_mask = builder.create_placeholder_node(
                 "MLA_0/attn_mask", TensorType(activation_type(quantizable), attn_shape)
@@ -298,33 +311,28 @@ class LanguageCacheModel(LanguagePartBaseModel):
         else:
             mla_input_attn_mask = None
         mla_input_cached_values = builder.create_placeholder_node(
-            "MLA_0/cached_values", TensorType(activation_type(quantizable), kv_tensor_shape)
+            "MLA_0/cached_values", TensorType(kv_dtype, kv_tensor_shape)
         )
+        if quantize_kv_cache:
+            mla_input_cached_values_scale = builder.create_placeholder_node(
+                "MLA_0/cached_values_scale",
+                TensorType(activation_type(quantizable), kv_scale_shape)
+            )
 
-        # Reshape and replicate keys and values.
-        if kv_tensor_shape[-1] == 1 or kv_tensor_shape[-1] == kv_expand_shape[-1]:
-            # Use broadcast to replicate array elements
-            reshape_keys = builder.create_broadcast_to_node(
-                mla_input_cached_keys, kv_expand_shape
+        # Dequantize KV cache if needed.
+        if quantize_kv_cache:
+            mla_input_cached_keys = builder.create_dynamic_dequant_node(
+                mla_input_cached_keys, mla_input_cached_keys_scale
             )
-            reshape_values = builder.create_broadcast_to_node(
-                mla_input_cached_values, kv_expand_shape
-            )
-        else:
-            # Cannot use broadcast
-            reshape_keys = builder.create_slice_concat_node(
-                mla_input_cached_keys, axis=1, split_axis=3,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                split_repeat=expansion_factor
-            )
-            reshape_values = builder.create_slice_concat_node(
-                mla_input_cached_values, axis=1, split_axis=3,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                split_repeat=expansion_factor
+            mla_input_cached_values = builder.create_dynamic_dequant_node(
+                mla_input_cached_values, mla_input_cached_values_scale
             )
 
         # First multiply (input * key)
-        bmm1 = builder.create_batch_matmul_node(mla_input_input, reshape_keys, True)
+        # BatchMatMul repeats the smaller H dimension for GQA.
+        bmm1 = builder.create_batch_matmul_node(
+            mla_input_input, mla_input_cached_keys, transpose_a=False, transpose_b=True
+        )
         assert get_expected_tensor_value(bmm1.get_type().output).shape == key_shape
 
         if self.logit_softcapping is not None:
@@ -366,7 +374,9 @@ class LanguageCacheModel(LanguagePartBaseModel):
         softmax = builder.create_softmax_node(bmm1, 3)
 
         # Second multiply ((input * key) * value)
-        bmm2 = builder.create_batch_matmul_node(softmax, reshape_values, False)
+        bmm2 = builder.create_batch_matmul_node(
+            softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
+        )
         assert get_expected_tensor_value(bmm2.get_type().output).shape == value_shape
         output = builder.create_slice_concat_node(
             bmm2, axis=3, split_axis=1,
@@ -378,7 +388,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         # Ensure that output type is float32
         if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32)
+            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         net = builder.finish(self.model_name)
         return net
 
@@ -388,20 +398,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
         """
         tessellate_params = {}
 
-        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or \
-                (self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1) or \
-                    self._is_speculative_decoding:
-            # The network has an attention mask input at index 2
-            attn_mask_tessellate_params = TensorTessellateParameters(
-                tile_shape=(0, 0, 0, 0),
-                enable_mla=True,
-                dram_layout=TensorDRAMLayout.HWC
-            )
-            tessellate_params = {2:attn_mask_tessellate_params}
+        # Input order: [input, cached_keys, (cached_keys_scale), (attn_mask), cached_values,
+        # (cached_values_scale)]
 
-        if not self.cfg.pipeline_cfg.use_strided_kv_cache:
-            return tessellate_params
-
+        # cached_keys
+        idx = 1
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
             1,
@@ -409,24 +410,64 @@ class LanguageCacheModel(LanguagePartBaseModel):
             max(self.context_length, self.cfg.pipeline_cfg.max_num_tokens),
             self._head_dim
         )
-
         k_cache_tessellate_params = TensorTessellateParameters(
             tile_shape=(0, 0, 0, 0),
             enable_mla=True,
             dram_layout=TensorDRAMLayout.HWC16,
             dram_shape=dram_shape
         )
+        tessellate_params[idx] = k_cache_tessellate_params
+        idx += 1
 
+        # cached_keys_scale
+        quantize_kv_cache = self.cfg.pipeline_cfg.quantize_kv_cache
+        if quantize_kv_cache:
+            scale_dram_shape = (
+                1,
+                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                max(self.context_length, self.cfg.pipeline_cfg.max_num_tokens),
+                1
+            )
+            k_scale_params = TensorTessellateParameters(
+                tile_shape=(0, 0, 0, 0),
+                enable_mla=True,
+                dram_layout=TensorDRAMLayout.HWC16,
+                dram_shape=scale_dram_shape
+            )
+            tessellate_params[idx] = k_scale_params
+            idx += 1
+
+        # attn_mask
+        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or \
+                (self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1) or \
+                self._is_speculative_decoding:
+            attn_mask_tessellate_params = TensorTessellateParameters(
+                tile_shape=(0, 0, 0, 0),
+                enable_mla=True,
+                dram_layout=TensorDRAMLayout.HWC
+            )
+            tessellate_params[idx] = attn_mask_tessellate_params
+            idx += 1
+
+        # cached_values
         v_cache_tessellate_params = TensorTessellateParameters(
             tile_shape=(0, 0, 0, 0),
             enable_mla=True,
             dram_layout=TensorDRAMLayout.HWC16,
             dram_shape=dram_shape
         )
+        tessellate_params[idx] = v_cache_tessellate_params
+        idx += 1
 
-        # 2nd and last output are K and V cache outputs.
-        tessellate_params[1] = k_cache_tessellate_params
-        tessellate_params[-1] = v_cache_tessellate_params
+        # cached_values_scale
+        if quantize_kv_cache:
+            v_scale_params = TensorTessellateParameters(
+                tile_shape=(0, 0, 0, 0),
+                enable_mla=True,
+                dram_layout=TensorDRAMLayout.HWC16,
+                dram_shape=scale_dram_shape
+            )
+            tessellate_params[idx] = v_scale_params
 
         return tessellate_params
 
@@ -434,35 +475,5 @@ class LanguageCacheModel(LanguagePartBaseModel):
         """
         Get the custom tessellate params for model's output on the MLA.
         """
-        if not self.cfg.pipeline_cfg.use_strided_kv_cache:
-            # Use default tessellate params.
-            return {}
-
-        # Define DRAM shape to enable strided KV cache access for kv cache outputs.
-        dram_shape = (
-            1,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            self.cfg.pipeline_cfg.max_num_tokens,
-            self._head_dim
-        )
-
-        k_cache_tessellate_params = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=TensorDRAMLayout.HWC16,
-            persistent_mem_name="cached_keys",
-            dram_shape=dram_shape
-        )
-
-        v_cache_tessellate_params = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=TensorDRAMLayout.HWC16,
-            persistent_mem_name="cached_values",
-            dram_shape=dram_shape
-        )
-
-        # 1st and 2nd output are kv cache outputs.
-        tessellate_params =  {1: k_cache_tessellate_params, 2: v_cache_tessellate_params}
-
-        return tessellate_params
+        # Use default tessellate params.
+        return {}

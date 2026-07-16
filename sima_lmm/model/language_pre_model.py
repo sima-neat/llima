@@ -13,7 +13,8 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype
+    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype,
+    create_channel_slice
 )
 from sima_lmm.config.vlm_config import VlmArchType
 
@@ -44,6 +45,11 @@ class LanguagePreModel(LanguagePartBaseModel):
         return self.cfg.pipeline_cfg.enable_filter_sharing
 
     @property
+    def _layer_base_name(self) -> str:
+        base = self.hf_model.language_model_param_base_name
+        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+
+    @property
     def layer_type(self) -> str:
         return self.cfg.lm_cfg.layer_types[self.layer_idx]
 
@@ -67,11 +73,15 @@ class LanguagePreModel(LanguagePartBaseModel):
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
     def gen_onnx_files(self):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         self.create_onnx_builder()
         self._onnx_builder.create_input_node(
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
         )
+        if self.is_draft:
+            self._onnx_builder.create_input_node(
+                "hidden_states", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+            )
         self._onnx_builder.create_input_node(
             "freq_real", (1, self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2, 1, self.num_tokens)
         )
@@ -93,17 +103,12 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
             # RoPE embedded k_proj and v_proj (1, Head_Dim, n_kv, n_tokens).
-            if self.cfg.pipeline_cfg.use_strided_kv_cache:
-                # saved in cache as (1, Head_Dim, n_kv, n_tokens).
-                kv_cache_shape = (
-                        1,
-                        self._head_dim,
-                        self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                        self.num_tokens
-                     )
-            else:
-                # saved in cache as (1, Head_Dim * n_kv, 1, n_tokens).
-                kv_cache_shape = (1, self._kv_size, 1, self.num_tokens)
+            kv_cache_shape = (
+                1,
+                self._head_dim,
+                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                self.num_tokens
+            )
             self._onnx_builder.create_output_node(
                 self._onnx_builder.get_node_output_name(output_nodes[1]), kv_cache_shape
             )
@@ -124,11 +129,26 @@ class LanguagePreModel(LanguagePartBaseModel):
             else f"{base_name}.input_layernorm"
         )
         rms_norm = self._build_rms_norm(norm_name, input_nodes[0])
-        q_out = self._build_onnx_attn_query(f"{base_name}.self_attn", [rms_norm, *input_nodes[1:]])
+        if self.is_draft:
+            # EAGLE3 draft model also normalizes the target hidden_states.
+            hidden_states_norm = self._build_rms_norm(
+                f"{base_name}.hidden_norm", input_nodes[1]
+            )
+            attn_input = self._onnx_builder.build_op(
+                base_name=f"{base_name}.concat",
+                input_nodes=[rms_norm, hidden_states_norm],
+                op_type="Concat",
+                axis=1,
+            )
+            freq_start = 2
+        else:
+            attn_input = rms_norm
+            freq_start = 1
+        q_out = self._build_onnx_attn_query(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
         if self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
             return [q_out]
-        k_out = self._build_onnx_attn_key(f"{base_name}.self_attn", [rms_norm, *input_nodes[1:]])
-        v_out = self._build_onnx_attn_value(f"{base_name}.self_attn", rms_norm)
+        k_out = self._build_onnx_attn_key(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
+        v_out = self._build_onnx_attn_value(f"{base_name}.self_attn", attn_input)
         return [q_out, k_out, v_out]
 
     def _build_onnx_rotary_emb(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
@@ -288,15 +308,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         rotary_emb = self._build_onnx_rotary_emb(
             f"{base_name}.k_proj", [reshape1, input_nodes[1], input_nodes[2]]
         )
-
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            return rotary_emb
-
-        reshape2 = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.k_proj.reshape2", rotary_emb,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads, split_axis=2, concat_axis=1
-        )
-        return reshape2
+        return rotary_emb
 
     def _build_onnx_attn_value(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
         lora_rank = None
@@ -309,12 +321,10 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
 
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
-            if self.cfg.pipeline_cfg.use_strided_kv_cache:
-                return self._onnx_builder.build_split_and_concat(
-                    f"{base_name}.v_proj", v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                    split_axis=1, concat_axis=2,
-                )
-            return v_proj
+            return self._onnx_builder.build_split_and_concat(
+                f"{base_name}.v_proj", v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                split_axis=1, concat_axis=2,
+            )
 
         split = self._onnx_builder.build_split_and_concat(
             f"{base_name}.v_proj", v_proj,  self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
@@ -324,19 +334,14 @@ class LanguagePreModel(LanguagePartBaseModel):
             f"{base_name}.v_norm", split, float(self.cfg.lm_cfg.rms_norm_eps),
             weightless=True, num_channels=self._head_dim,
         )
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            return split
-        return self._onnx_builder.build_split_and_concat(
-            f"{base_name}.v_proj.flatten", split, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            split_axis=2, concat_axis=1
-        )
+        return split
 
     def gen_model_sdk_files_directly(
         self,
         layer_cfg: LayerConfiguration,
         log_level: int, quantizable: bool
     ):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         g = self._build_sima_nodes(base_name, quantizable, merged_lora)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
@@ -349,9 +354,6 @@ class LanguagePreModel(LanguagePartBaseModel):
             self.num_tokens,
             self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2
         )
-        if self.cfg.pipeline_cfg.use_strided_kv_cache:
-            raise RuntimeError("Strided KV cache is not implemented in SiMa IR code generation")
-
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
 
         if self.cfg.pipeline_cfg.quantize_embeddings and self.layer_idx == 0:
@@ -361,6 +363,11 @@ class LanguagePreModel(LanguagePartBaseModel):
         model_input_input = builder.create_placeholder_node(
             "input", TensorType(input_dtype, input_shape)
         )
+        # EAGLE3 draft model has an extra hidden_states input
+        if self.is_draft:
+            model_input_hidden_states = builder.create_placeholder_node(
+                "hidden_states", TensorType(activation_type(quantizable), input_shape)
+            )
         model_input_freq_real = builder.create_placeholder_node(
             "freq_real", TensorType(activation_type(quantizable), freq_shape)
         )
@@ -369,10 +376,18 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
 
         # MLA subgraph inputs are the same as the model inputs, except the node names are different
-        builder.begin_subnet([model_input_input, model_input_freq_real, model_input_freq_imag])
+        subnet_inputs = [model_input_input, model_input_freq_real, model_input_freq_imag]
+        if self.is_draft:
+            subnet_inputs.insert(1, model_input_hidden_states)
+        builder.begin_subnet(subnet_inputs)
         mla_input_input = builder.create_placeholder_node(
             "MLA_0/input", TensorType(input_dtype, input_shape)
         )
+        # EAGLE3 draft model has an extra hidden_states input
+        if self.is_draft:
+            mla_input_hidden_states = builder.create_placeholder_node(
+                "MLA_0/hidden_states", TensorType(activation_type(quantizable), input_shape)
+            )
         mla_input_freq_real = builder.create_placeholder_node(
             "MLA_0/freq_real", TensorType(activation_type(quantizable), freq_shape)
         )
@@ -400,23 +415,62 @@ class LanguagePreModel(LanguagePartBaseModel):
         rms_norm = self._build_sima_rms_norm(
             builder, norm_name, rms_norm_in
         )
+        # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
+        if self.is_draft:
+            hidden_states_norm = self._build_sima_rms_norm(
+                builder, f"{base_name}.hidden_norm", mla_input_hidden_states
+            )
+            attn_input = builder.create_concat_node([rms_norm, hidden_states_norm], 3)
+        else:
+            attn_input = rms_norm
         mla_q_out = self._build_sima_attn_query(
-            builder, f"{base_name}.self_attn", rms_norm, mla_input_freq_real, mla_input_freq_imag,
+            builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real, mla_input_freq_imag,
             quantizable, merged_lora
         )
-        mla_k_out = self._build_sima_attn_key(
-            builder, f"{base_name}.self_attn", rms_norm, mla_input_freq_real, mla_input_freq_imag, merged_lora
-        )
-        mla_v_out = self._build_sima_attn_value(builder, f"{base_name}.self_attn", rms_norm, merged_lora)
-        _ = builder.create_tuple_node([mla_q_out, mla_k_out, mla_v_out])
+        output_nodes = [mla_q_out]
+        if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
+            mla_k_out = self._build_sima_attn_key(
+                builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real,
+                mla_input_freq_imag, merged_lora
+            )
+            mla_v_out = self._build_sima_attn_value(
+                builder, f"{base_name}.self_attn", attn_input, merged_lora
+            )
+
+            if self.cfg.pipeline_cfg.quantize_kv_cache:
+                k_scale = builder.create_dynamic_quant_scale_node(mla_k_out, per_token_quant=True)
+                k_quant = builder.create_dynamic_quant_node(mla_k_out, k_scale)
+                v_scale = builder.create_dynamic_quant_scale_node(mla_v_out, per_token_quant=True)
+                v_quant = builder.create_dynamic_quant_node(mla_v_out, v_scale)
+                output_nodes.extend([k_quant, k_scale, v_quant, v_scale])
+            else:
+                output_nodes.extend([mla_k_out, mla_v_out])
+
+        if len(output_nodes) > 1:
+            _ = builder.create_tuple_node(output_nodes)
 
         mla_node = builder.finish_subnet("MLA_0")
 
         if activation_type(quantizable) != ScalarType.float32:
-            # Cast each output to float32
-            tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-            builder.create_tuple_node([builder.create_cast_node(x, ScalarType.float32) for x in tuple_items])
-
+            if len(output_nodes) == 1:
+                builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
+            else:
+                tuple_items = builder.create_tuple_get_item_nodes(mla_node)
+                if self.cfg.pipeline_cfg.quantize_kv_cache:
+                    # Cast query output and scale outputs (k_scale, v_scale), but not quantized values (k_quant, v_quant)
+                    cast_items = [
+                        builder.create_cast_node(tuple_items[0], ScalarType.float32, backend=Backend.EV),  # mla_q_out
+                        tuple_items[1],  # k_quant (int8)
+                        builder.create_cast_node(tuple_items[2], ScalarType.float32, backend=Backend.EV),  # k_scale
+                        tuple_items[3],  # v_quant (int8)
+                        builder.create_cast_node(tuple_items[4], ScalarType.float32, backend=Backend.EV),  # v_scale
+                    ]
+                    builder.create_tuple_node(cast_items)
+                else:
+                    builder.create_tuple_node([
+                        builder.create_cast_node(x, ScalarType.float32, backend=Backend.EV)
+                        for x in tuple_items
+                    ])
         net = builder.finish(self.model_name)
         return net
 
@@ -433,10 +487,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         imag_start = layer_head_dim // 2 if self._is_proportional_rope_layer else half_rope_dim
         imag_end = imag_start + half_rope_dim
 
-        real_in = builder.create_slice_node(data, [0], [half_rope_dim], [1], [3])
-        imag_in = builder.create_slice_node(
-            data, [imag_start], [imag_end], [1], [3]
-        )
+        real_in = create_channel_slice(builder, data, 0, half_rope_dim)
+        imag_in = create_channel_slice(builder, data, imag_start, imag_end)
         real_out = builder.create_subtract_node(
             builder.create_mul_node(real_in, freq_real),
             builder.create_mul_node(imag_in, freq_imag)
@@ -446,21 +498,15 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder.create_mul_node(imag_in, freq_real)
         )
         if self._is_proportional_rope_layer:
-            mid1 = builder.create_slice_node(data, [half_rope_dim], [layer_head_dim // 2], [1], [3])
-            mid2 = builder.create_slice_node(data, [imag_end], [layer_head_dim], [1], [3])
+            mid1 = create_channel_slice(builder, data, half_rope_dim, layer_head_dim // 2)
+            mid2 = create_channel_slice(builder, data, imag_end, layer_head_dim)
             return builder.create_concat_node([real_out, mid1, imag_out, mid2], 3)
 
         rotary_out = builder.create_concat_node([real_out, imag_out], 3)
         if layer_rope_dimension_count == layer_head_dim:
             return rotary_out
 
-        tail = builder.create_slice_node(
-            data,
-            [layer_rope_dimension_count],
-            [layer_head_dim],
-            [1],
-            [3],
-        )
+        tail = create_channel_slice(builder, data, layer_rope_dimension_count, layer_head_dim)
         return builder.create_concat_node([rotary_out, tail], 3)
 
     def _build_sima_attn_query(
@@ -541,12 +587,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         rotary_emb = self._build_sima_rotary_emb(
             builder, reshape1, freq_real, freq_imag
         )
-
-        reshape2 = builder.create_slice_concat_node(
-            rotary_emb, axis=3, split_axis=1,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads, split_repeat=1
-        )
-        return reshape2
+        return rotary_emb
 
 
     def _build_sima_attn_value(
@@ -562,8 +603,14 @@ class LanguagePreModel(LanguagePartBaseModel):
             kv_size=self._kv_size
         )
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
-            return v_proj
+            # Strided cache stores KV heads explicitly instead of flattened into kv_size.
+            return builder.create_slice_concat_node(
+                v_proj, axis=1, split_axis=3,
+                split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                split_repeat=1
+            )
 
+        # Gemma4 applies value RMS norm per KV head before writing V to cache.
         split = builder.create_slice_concat_node(
             v_proj,
             axis=1,
@@ -578,13 +625,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             weightless=True,
             num_channels=self._head_dim,
         )
-        return builder.create_slice_concat_node(
-            split,
-            axis=3,
-            split_axis=1,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            split_repeat=1,
-        )
+        return split
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """
@@ -594,37 +635,58 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
+        Get the DRAM layouts to use for this model's outputs on the MLA.
         """
-        if not self.cfg.pipeline_cfg.use_strided_kv_cache:
-            # Use default tessellate params.
-            return {}
-
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
             1,
             self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             self.cfg.pipeline_cfg.max_num_tokens,
-            self.cfg.lm_cfg.attn_cfg.head_dim
+            self._head_dim
         )
 
-        k_cache_tessellate_params = TensorTessellateParameters(
+        k_cache_params = TensorTessellateParameters(
             tile_shape=(0, 0, 0, 0),
             enable_mla=True,
             dram_layout=TensorDRAMLayout.HWC16,
-            persistent_mem_name="cached_keys",
             dram_shape=dram_shape
         )
 
-        v_cache_tessellate_params = TensorTessellateParameters(
+        v_cache_params = TensorTessellateParameters(
             tile_shape=(0, 0, 0, 0),
             enable_mla=True,
             dram_layout=TensorDRAMLayout.HWC16,
-            persistent_mem_name="cached_values",
             dram_shape=dram_shape
         )
 
-        # 1st and 2nd output are kv cache outputs.
-        tessellate_params =  {1: k_cache_tessellate_params, 2: v_cache_tessellate_params}
+        if self.cfg.pipeline_cfg.quantize_kv_cache:
+            scale_dram_shape = (
+                1,
+                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                self.cfg.pipeline_cfg.max_num_tokens,
+                1
+            )
+            k_scale_params = TensorTessellateParameters(
+                tile_shape=(0, 0, 0, 0),
+                enable_mla=True,
+                dram_layout=TensorDRAMLayout.HWC16,
+                dram_shape=scale_dram_shape
+            )
+            v_scale_params = TensorTessellateParameters(
+                tile_shape=(0, 0, 0, 0),
+                enable_mla=True,
+                dram_layout=TensorDRAMLayout.HWC16,
+                dram_shape=scale_dram_shape
+            )
+            # Output order: [q, k_quant, k_scale, v_quant, v_scale]
+            tessellate_params = {
+                1: k_cache_params,
+                2: k_scale_params,   # k_scale
+                3: v_cache_params,
+                4: v_scale_params,   # v_scale
+            }
+        else:
+            # Output order: [q, k, v]
+            tessellate_params = {1: k_cache_params, 2: v_cache_params}
 
         return tessellate_params
