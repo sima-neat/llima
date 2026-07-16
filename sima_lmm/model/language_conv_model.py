@@ -1,6 +1,7 @@
 import numpy as np
 from dataclasses import dataclass
 
+from afe.backends.backends import Backend
 from afe.ir.serializer import save_awesomenet
 from afe.ir.defines import Status
 from afe.apis.defines import gen2_target, TensorDRAMLayout
@@ -11,7 +12,7 @@ from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
     SimaBuilder, build_conv, build_conv_from_dense_with_lora,
-    build_activation, activation_type, activation_dtype,
+    build_activation, activation_type, activation_dtype, create_channel_slice,
 )
 
 
@@ -207,9 +208,9 @@ class LanguageConvModel(LanguagePartBaseModel):
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.in_proj", norm_input, lora_rank=lora_rank, merged_lora=merged_lora
         )
 
-        b = builder.create_slice_node(in_proj, [0], [hidden_size], [1], [3])
-        c = builder.create_slice_node(in_proj, [hidden_size], [2 * hidden_size], [1], [3])
-        x = builder.create_slice_node(in_proj, [2 * hidden_size], [3 * hidden_size], [1], [3])
+        b = create_channel_slice(builder, in_proj, 0, hidden_size)
+        c = create_channel_slice(builder, in_proj, hidden_size, 2 * hidden_size)
+        x = create_channel_slice(builder, in_proj, 2 * hidden_size, 3 * hidden_size)
         bx = builder.create_mul_node(b, x)
 
         tail = builder.create_concat_node([mla_input_conv_cache, bx], 2)
@@ -253,7 +254,10 @@ class LanguageConvModel(LanguagePartBaseModel):
             builder.create_tuple_node(tuple_items)
         else:
             builder.create_tuple_node(
-                [builder.create_cast_node(item, ScalarType.float32) for item in tuple_items]
+                [
+                    builder.create_cast_node(item, ScalarType.float32, backend=Backend.EV)
+                    for item in tuple_items
+                ]
             )
 
         net = builder.finish(self.model_name)
