@@ -600,7 +600,7 @@ uint32_t LanguageModel::run_model_once(
     if (!_cached_states.empty()) {
         for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
             if (_checkpoint_boundaries[i] == next_token_idx) {
-                // With custom group offsets, a partial prefill group can land on a boundary;
+                // A partial prefill group can land exactly on a checkpoint boundary.
                 const uint16_t valid_tokens = next_token_idx - token_idx;
                 _save_state_checkpoint(i, num_tokens, valid_tokens);
                 break;

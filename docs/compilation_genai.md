@@ -116,6 +116,12 @@ LLM inference consists of two distinct phases, and the compiler generates optimi
 
 Because these phases have different performance characteristics, you can apply different quantization strategies to each using the `is_group` flag in the configuration function.
 
+Group execution offsets are derived automatically from `max_num_tokens` and
+`language_group_size`; they are not a compile argument. For models that mix full
+and sliding attention, such as Gemma 3, the compiler also selects the cache model
+at the sliding-window transition automatically. The selected execution offsets
+are stored in `vlm_config.json`.
+
 **Input Parameters**
 
 The `get_layer_configuration` function is called for each layer and receives:
