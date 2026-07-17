@@ -23,15 +23,13 @@ LanguageModel::LanguageModel(
     std::set<uint32_t> stop_token_ids,
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
-    TextStreamer& text_streamer,
-    bool do_parallel_load
+    TextStreamer& text_streamer
 ) : BaseModel(model_path),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id),
     _max_num_tokens(_cfg.pipeline_cfg.max_num_tokens),
     _text_streamer(text_streamer),
-    _do_parallel_load(do_parallel_load),
     _has_image_token(false),
     _is_running(false),
     _reloc_name(std::nullopt)
@@ -689,7 +687,7 @@ void LanguageModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_do_parallel_load, _elf_dir / _cfg.language_model_name);
+    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()

@@ -34,8 +34,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::set<uint32_t> stop_token_ids,
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
-            TextStreamer& text_streamer,
-            bool do_parallel_load
+            TextStreamer& text_streamer
         );
         virtual ~LanguageModel() override { _finalize(); }
 
@@ -296,7 +295,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::optional<uint32_t> _pad_token_id;
         uint16_t _max_num_tokens;
         TextStreamer& _text_streamer;
-        bool _do_parallel_load;
         bool _use_group_token_models;
         bool _need_argmax;
 

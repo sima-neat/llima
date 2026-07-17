@@ -9,8 +9,7 @@ namespace llima {
 VisionLanguageModel::VisionLanguageModel(
     std::filesystem::path model_path,
     std::optional<std::string> system_prompt,
-    std::optional<std::string> chat_template,
-    bool do_parallel_load
+    std::optional<std::string> chat_template
 ) : BaseModel(model_path),
     _vlm_helper(_cfg, _devkit_dir, system_prompt, chat_template),
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
@@ -23,7 +22,7 @@ VisionLanguageModel::VisionLanguageModel(
         _vlm_helper.get_stop_token_ids(),
         _vlm_helper.get_image_token_id(),
         _vlm_helper.get_pad_token_id(),
-        _text_streamer, do_parallel_load
+        _text_streamer
     );
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone

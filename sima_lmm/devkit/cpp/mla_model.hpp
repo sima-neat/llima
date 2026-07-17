@@ -52,7 +52,7 @@ class MLAModelWithBuffer {
         static void initialize();
         static void run_queue();
         static void load_all_models(
-            bool do_parallel_load, std::optional<std::filesystem::path> relative_dir = std::nullopt
+            std::optional<std::filesystem::path> relative_dir = std::nullopt
         );
         static void free_all_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt
@@ -66,6 +66,9 @@ class MLAModelWithBuffer {
             if (_save_inouts)
                 _save_inout_dir = get_env_var("SIMA_LLIMA_RUN_SAVE_INOUT_DIR", _save_inout_dir);
             _enable_queue = !get_env_var("SIMA_LLIMA_RUN_DISABLE_QUEUE", !_enable_queue);
+            _disable_parallel_load = get_env_var(
+                "SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD", _disable_parallel_load
+            );
         }
 
     private:
@@ -92,6 +95,7 @@ class MLAModelWithBuffer {
         static inline bool _save_inouts = false;
         static inline std::string _save_inout_dir = "debug/model_io";
         static inline bool _enable_queue = true;
+        static inline bool _disable_parallel_load = false;
 };
 
 
