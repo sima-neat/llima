@@ -25,8 +25,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         VisionLanguageModel(
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,
-            std::optional<std::string> chat_template = std::nullopt,
-            bool do_parallel_load = true
+            std::optional<std::string> chat_template = std::nullopt
         );
         ~VisionLanguageModel() {}
 
