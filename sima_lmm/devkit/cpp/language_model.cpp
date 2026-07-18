@@ -1926,8 +1926,10 @@ void LanguageModel::_dequantize_embedding_row(
         + dst_row * hidden_size * dst.get_elem_size()
     );
     const float scale = _cfg.pipeline_cfg.embeddings_scale;
-    for (size_t i = 0; i < hidden_size; ++i)
-        dst_row_ptr[i] = static_cast<float>(src[i]) * scale;
+    using Int8Row = Eigen::Array<int8_t, 1, Eigen::Dynamic>;
+    Eigen::Map<const Int8Row> src_row(src, static_cast<Eigen::Index>(hidden_size));
+    Eigen::Map<ArrayXbf> dst_row_map(dst_row_ptr, static_cast<Eigen::Index>(hidden_size));
+    dst_row_map = (src_row.cast<float>() * scale).cast<Eigen::bfloat16>();
 }
 
 
