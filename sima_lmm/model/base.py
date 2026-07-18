@@ -467,9 +467,27 @@ class BaseModel(ABC):
         assert isinstance(self.cfg, VlmConfig)
         self.sima_devkit_path.mkdir(parents=True, exist_ok=True)
 
-        # Write the config json file.
         cfg_json_file_name = self.sima_devkit_path / "vlm_config.json"
-        if not (resume and cfg_json_file_name.is_file()):
+        embeddings_file_name = self.sima_devkit_path / f"{self.language_model_name}_embeddings.bin"
+        write_embeddings = not (resume and embeddings_file_name.is_file())
+        write_cfg = (
+            not (resume and cfg_json_file_name.is_file())
+            or (write_embeddings and self.cfg.pipeline_cfg.quantize_embeddings)
+        )
+        if write_embeddings or (write_cfg and self.cfg.pipeline_cfg.quantize_embeddings):
+            embeddings, embeddings_scale = self.get_language_embeddings_tensor()
+            if embeddings_scale is not None:
+                self.cfg.pipeline_cfg.embeddings_scale = embeddings_scale
+
+            # Preserve the table dtype exactly; runtime falls back to legacy .npy packages.
+            if write_embeddings and embeddings is not None:
+                if not self.cfg.pipeline_cfg.quantize_embeddings:
+                    embeddings = embeddings.astype(bfloat16)
+                embeddings.tofile(embeddings_file_name)
+            del embeddings
+
+        # Scales must be populated before serializing the runtime config.
+        if write_cfg:
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name
             if self.cfg.vm_cfg is not None:
@@ -479,24 +497,20 @@ class BaseModel(ABC):
             with open(self.sima_devkit_path / "vlm_config.json", "w") as f:
                 json.dump(cfg_dict, f, indent=4)
 
-        # Obtain the embeddings tensor from the hf model.
-        # Skipped when the model doesn't include embed_tokens (e.g. EAGLE3 draft).
-        embeddings_file_name = self.sima_devkit_path / f"{self.language_model_name}_embeddings.npy"
-        if not (resume and embeddings_file_name.is_file()):
-            embeddings = self.get_language_embeddings_tensor()
-            if embeddings is not None:
-                if not self.cfg.pipeline_cfg.quantize_embeddings:
-                    embeddings = embeddings.astype(bfloat16)
-                np.save(embeddings_file_name, embeddings)
-
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
-            per_layer_embeddings_file_name = (
-                self.sima_devkit_path / f"{self.language_model_name}_per_layer_embeddings.bin"
-            )
-            if not (resume and per_layer_embeddings_file_name.is_file()):
-                per_layer_embeddings = self.get_language_per_layer_embeddings_tensor()
-                per_layer_embeddings.astype(bfloat16).tofile(per_layer_embeddings_file_name)
-
+        per_layer_embeddings_file_name = (
+            self.sima_devkit_path / f"{self.language_model_name}_per_layer_embeddings.bin"
+        )
+        write_per_layer_embeddings = (
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and not (resume and per_layer_embeddings_file_name.is_file())
+        )
+        if write_per_layer_embeddings:
+            per_layer_embeddings, _ = self.get_language_per_layer_embeddings_tensor()
+            assert per_layer_embeddings is not None
+            if not self.cfg.pipeline_cfg.quantize_embeddings:
+                per_layer_embeddings = per_layer_embeddings.astype(bfloat16)
+            per_layer_embeddings.tofile(per_layer_embeddings_file_name)
+            del per_layer_embeddings
 
         if isinstance(self.hf_model, LocalHuggingFaceModel):
             # Copy the HF files.

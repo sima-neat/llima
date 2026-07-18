@@ -281,8 +281,8 @@ def main():
     group.add_argument(
         "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=False,
         help=(
-            "Enables embedding quantization to reduce memory consumption. This may result in a loss"
-            " of accuracy."
+            "Quantizes embedding tables for LLMs and Gemma4 VLMs to reduce memory "
+            "consumption. This may result in a loss of accuracy."
         )
     )
     group.add_argument(

@@ -107,6 +107,7 @@
         "return_logits": false,
         "enable_filter_sharing": false,
         "quantize_embeddings": false,
+        "embeddings_scale": 1.0,
         "quantize_kv_cache": false,
         "split_mlp": false
     }
