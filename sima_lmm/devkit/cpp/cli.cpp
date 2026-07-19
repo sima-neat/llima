@@ -31,6 +31,8 @@ help               : print this page.
 CLI::CLI(
     std::filesystem::path vlm_model_path,
     std::optional<std::filesystem::path> whisper_model_path,
+    std::optional<std::filesystem::path> draft_model_path,
+    std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
     bool do_parallel_load,
     bool enable_thinking
