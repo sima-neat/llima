@@ -47,7 +47,7 @@ void VisionModel::_initialize() {
     _logger->info("Vision model initialize starting ...");
     BaseModel::_initialize();
     _define_models();
-    MLAModelWithBuffer::load_all_models(false, _elf_dir / _cfg.vision_model_name);
+    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.vision_model_name);
     _logger->info("Vision model initialize completed");
 }
 
