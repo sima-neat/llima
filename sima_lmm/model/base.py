@@ -25,6 +25,7 @@ from afe.apis.defines import (
     bfloat16_scheme, default_quantization, gen2_target, quantization_scheme,
     SkipCalibration
 )
+from afe.backends.backends import Backend
 from afe.apis.error_handling_variables import enable_verbose_error_messages
 from afe.apis.loaded_net import load_model, onnx_source
 from afe.apis.model import Model as SDKModel
@@ -352,7 +353,7 @@ class BaseModel(ABC):
             quant_params
         )
         calibrate_and_quantize_net = afe.driver.passes.calibration_quantization(
-            optimization_configs
+            optimization_configs, system_backend=Backend.EV
         )
         net = calibrate_and_quantize_net(net, None).run()
         afe.ir.serializer.save_awesomenet(
@@ -447,11 +448,18 @@ class BaseModel(ABC):
             retained_temporary_directory_name = (
                     Path(retained_temporary_directory_name) / self.model_name
             )
+        # For speculative decoding, use higher effort for compilation for better results.
+        is_speculative = (
+            isinstance(self.cfg, VlmConfig)
+            and self.cfg.lm_cfg.speculative_decoding_cfg is not None
+        )
+        layout_search_effort_level = 1 if is_speculative else 0
         model.compile(
             self.sima_mpk_path, compress=True, log_level=log_level, preserve=False,
             tessellate_parameters=tessellate_parameters,
             retained_temporary_directory_name=retained_temporary_directory_name,
-            enable_filter_sharing=self.enable_filter_sharing, deployable=False
+            enable_filter_sharing=self.enable_filter_sharing,
+            layout_search_effort_level=layout_search_effort_level, deployable=False
         )
         return model
 
@@ -473,12 +481,14 @@ class BaseModel(ABC):
                 json.dump(cfg_dict, f, indent=4)
 
         # Obtain the embeddings tensor from the hf model.
+        # Skipped when the model doesn't include embed_tokens (e.g. EAGLE3 draft).
         embeddings_file_name = self.sima_devkit_path / f"{self.language_model_name}_embeddings.npy"
         if not (resume and embeddings_file_name.is_file()):
             embeddings = self.get_language_embeddings_tensor()
-            if not self.cfg.pipeline_cfg.quantize_embeddings:
-                embeddings = embeddings.astype(bfloat16)
-            np.save(embeddings_file_name, embeddings)
+            if embeddings is not None:
+                if not self.cfg.pipeline_cfg.quantize_embeddings:
+                    embeddings = embeddings.astype(bfloat16)
+                np.save(embeddings_file_name, embeddings)
 
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             per_layer_embeddings_file_name = (
@@ -518,6 +528,15 @@ class BaseModel(ABC):
                     )
                 with open(precision_file_name, "w") as f:
                     json.dump(precision_list, f, indent=4)
+
+            # Save the EAGLE3 draft model's d2t/t2d mapping tensors if present
+            for tensor_name in ("d2t", "t2d"):
+                out_path = self.sima_devkit_path / f"{tensor_name}.npy"
+                if resume and out_path.is_file():
+                    continue
+                if tensor_name in self.hf_model.weight_map:
+                    tensor = self.hf_model.load_np_param(tensor_name)
+                    np.save(out_path, tensor)
         else:
             assert isinstance(self.hf_model, GgufModel)
             # Copy the GGUF file to construct the VlmHelper.

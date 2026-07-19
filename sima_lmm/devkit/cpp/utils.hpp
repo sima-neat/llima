@@ -4,13 +4,18 @@
 
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <omp.h>
 #include <optional>
 #include <ranges>
 #include <ratio>
+#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -125,6 +130,101 @@ extern std::optional<std::filesystem::path> sample_audio_file_name;
 
 void set_sample_image_file_name(std::filesystem::path file_name);
 void set_sample_audio_file_name(std::filesystem::path file_name);
+
+
+template <typename T>
+struct TopKResult {
+    std::vector<std::vector<T>> values;
+    std::vector<std::vector<int32_t>> indices;
+};
+
+// Portable batched top-K. Heap-based single-row body + OMP across rows. Returns
+// (indices, values) per row, sorted descending. k must be in [1, 32].
+template <typename T>
+TopKResult<T> topk(const T* input, size_t rows, size_t cols, int k) {
+    if (k < 1 || k > 32) {
+        throw std::runtime_error(
+            "topk: k out of supported range [1, 32]"
+        );
+    }
+    TopKResult<T> result;
+    result.values.resize(rows);
+    result.indices.resize(rows);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < rows; ++i) {
+        const T* row = input + i * cols;
+
+        T heap_vals[32];
+        int32_t heap_idx[32];
+
+        for (int j = 0; j < k; ++j) {
+            heap_vals[j] = row[j];
+            heap_idx[j] = j;
+        }
+
+        auto sift_down = [&](int root) {
+            while (2 * root + 1 < k) {
+                int child = 2 * root + 1;
+                if (child + 1 < k && heap_vals[child] > heap_vals[child + 1]) child++;
+                if (!(heap_vals[root] > heap_vals[child])) return;
+                T tv = heap_vals[root]; heap_vals[root] = heap_vals[child]; heap_vals[child] = tv;
+                int32_t ti = heap_idx[root]; heap_idx[root] = heap_idx[child]; heap_idx[child] = ti;
+                root = child;
+            }
+        };
+        for (int j = k / 2 - 1; j >= 0; --j) sift_down(j);
+
+        for (size_t j = static_cast<size_t>(k); j < cols; ++j) {
+            if (row[j] > heap_vals[0]) {
+                heap_vals[0] = row[j];
+                heap_idx[0] = static_cast<int32_t>(j);
+                sift_down(0);
+            }
+        }
+
+        result.values[i].resize(k);
+        result.indices[i].resize(k);
+        for (int a = 0; a < k; ++a) {
+            int max_i = a;
+            for (int b = a + 1; b < k; ++b) {
+                if (heap_vals[b] > heap_vals[max_i]) max_i = b;
+            }
+            result.values[i][a] = heap_vals[max_i];
+            result.indices[i][a] = heap_idx[max_i];
+            heap_vals[max_i] = heap_vals[a];
+            heap_idx[max_i] = heap_idx[a];
+        }
+    }
+    return result;
+}
+
+// Log-softmax over `n` values (converted to float). Returns a fresh vector of length n.
+// Numerically stable via the standard max-subtraction trick.
+template <typename T>
+inline std::vector<float> logsoftmax(const T* values, size_t n) {
+    float max_v = -std::numeric_limits<float>::infinity();
+    for (size_t i = 0; i < n; ++i) {
+        max_v = std::max(max_v, static_cast<float>(values[i]));
+    }
+    float sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        sum += std::exp(static_cast<float>(values[i]) - max_v);
+    }
+    const float log_sum = std::log(sum) + max_v;
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = static_cast<float>(values[i]) - log_sum;
+    }
+    return out;
+}
+
+// Pre-warm OMP + heap paths by running topk on tiny dummy data. Safe to call multiple
+// times — only the first call pays the libgomp init cost.
+inline void warmup_omp() {
+    float dummy[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    (void)topk<float>(dummy, 1, 8, 1);
+}
 
 
 }

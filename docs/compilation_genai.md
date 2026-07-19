@@ -73,6 +73,8 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--log_level` | Logging level (DEBUG, INFO, WARNING, ERROR). Default: WARNING. |
 | `--input_height` | Input image height in pixels. Required for Siglip2 and Qwen-VL based models. |
 | `--input_width` | Input image width in pixels. Required for Siglip2 and Qwen-VL based models. |
+| `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
+| `--system_prompt_file` | Path to a text file containing the system prompt. |
 
 | Advanced Argument | Description |
 |----|----|
@@ -83,6 +85,25 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
+
+## System Prompts
+
+Use `--system_prompt` or `--system_prompt_file` to store a system prompt in the
+compiled model configuration. The arguments are mutually exclusive.
+
+``` console
+sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
+    --system_prompt "You are a concise technical assistant." \
+    -o Llama-3.2-3B-Instruct_out
+```
+
+In CLI mode, this becomes the default system prompt. It can be replaced with
+`set system <prompt>` or removed with `clear system` during the session.
+
+In web mode/GenAIServer, the stored prompt is used during model warm-up and can
+be cached for the first request. It is not automatically added to
+API requests. The client must include the system prompt in the `messages` array
+of the first request and every follow-up request.
 
 ## Configuration File
 

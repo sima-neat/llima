@@ -73,7 +73,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             std::optional<float> avg_logprob;
         };
 
-        WhisperModel(std::filesystem::path model_path, bool do_parallel_load);
+        WhisperModel(std::filesystem::path model_path);
         virtual ~WhisperModel() { _finalize(); };
 
         TranscriptionResult run_model(
@@ -141,7 +141,6 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::mutex _mutex;
 
         WhisperPreprocessor _preprocessor;
-        bool _do_parallel_load;
         std::unique_ptr<Tokenizer> _tokenizer_ptr;
         std::unique_ptr<TextStreamer> _text_streamer;
         std::atomic<bool> _is_running;

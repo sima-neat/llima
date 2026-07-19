@@ -241,18 +241,15 @@ const std::map<std::string, std::string> WhisperModel::_TO_LANGUAGE_CODE = {
 };
 
 
-WhisperModel::WhisperModel(
-    std::filesystem::path model_path, bool do_parallel_load
-) : BaseModel(model_path),
+WhisperModel::WhisperModel(std::filesystem::path model_path) : BaseModel(model_path),
     _preprocessor(_devkit_dir),
-    _do_parallel_load(do_parallel_load),
     _is_running(false)
 {
     _tokenizer_ptr = Tokenizer::from_hf_json(_devkit_dir / "tokenizer.json");
     _text_streamer = std::make_unique<TextStreamer>(
         _tokenizer_ptr.get(),
         [](const std::string&, double) {},
-        [](const std::string&, bool) {}
+        [](const std::string&, bool, bool) {}
     );
     _initialize();
 
@@ -468,7 +465,7 @@ void WhisperModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_do_parallel_load, _elf_dir);
+    MLAModelWithBuffer::load_all_models(_elf_dir);
 
     // Upload token and position embeddings.
     auto token_embeddings_file_name = (

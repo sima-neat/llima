@@ -1,10 +1,13 @@
+import copy
 import logging
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import LlmArchType, ModelFormat, VlmConfig, VisionArchType, model_file_type
+from sima_lmm.config.vlm_config import (
+    LlmArchType, ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
+)
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import (
@@ -50,7 +53,7 @@ class VisionLanguageModel(BaseModel):
     def __post_init__(self):
         self.language_model = LanguageModel(
             self.cfg, self.language_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-            hf_model=self.hf_model, vlm_helper=self.vlm_helper
+            hf_model=self.hf_model, vlm_helper=self.vlm_helper,
         )
 
     @staticmethod
@@ -63,14 +66,14 @@ class VisionLanguageModel(BaseModel):
         system_prompt: str | None = None,
         chat_template: str | None = None,
         override_language_group_size: int | None = None,
-        override_language_group_offsets: list[int] | None = None,
         override_language_future_token_mask_size: int = 1,
         return_logits: bool = False,
-        use_strided_kv_cache: bool = False,
         enable_filter_sharing: bool = False,
         quantize_embeddings: bool = False,
+        quantize_kv_cache: bool = False,
         split_mlp: bool = False,
-        image_resolution: list[int] | None = None
+        image_resolution: list[int] | None = None,
+        target_model: "VisionLanguageModel | None" = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -83,11 +86,13 @@ class VisionLanguageModel(BaseModel):
             max_num_tokens: Maximum number of tokens, including both input and output tokens.
             system_prompt: System prompt.
             return_logits: Return logits at the last layer output instead of argmax token IDs.
-            use_strided_kv_cache: True if strided access to kv cache is enabled.
             enable_filter_sharing: True if sharing filters between group and single models is
                 enabled.
             quantize_embeddings: True if embedding table is quantized.
+            quantize_kv_cache: True if KV cache is quantized.
             split_mlp: True if mlp is being split into multiple parts.
+            target_model: Target VisionLanguageModel when constructing a draft model.
+                Copies tokenizer and embeddings (if missing) from it. None for non-draft models.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -106,10 +111,9 @@ class VisionLanguageModel(BaseModel):
         # Set the token size and offsets for group processing.
         vlm_cfg.config_pipeline(
             system_prompt, chat_template, max_num_tokens, override_language_group_size,
-            override_language_group_offsets, override_language_future_token_mask_size
+            override_language_future_token_mask_size
         )
 
-        vlm_cfg.pipeline_cfg.set_strided_kv_cache(use_strided_kv_cache)
         vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)
         vlm_cfg.pipeline_cfg.set_split_mlp(split_mlp)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)
@@ -120,8 +124,26 @@ class VisionLanguageModel(BaseModel):
                 f"Embeddings quantization is only supported for LLMs."
             )
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
+        vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
-        vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
+        if target_model is not None:
+            # Some draft models use target model's tokenization scheme.
+            tokenizer_files = ("tokenizer_config.json", "tokenizer.json", "tokenizer.model")
+            has_tokenizer = any(
+                list(Path(hf_cache_path).rglob(f)) for f in tokenizer_files
+            )
+            if has_tokenizer:
+                vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
+            else:
+                vlm_helper = target_model.vlm_helper
+
+            # Set speculative decoding configs for the draft model
+            vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
+            )
+
+        else:
+            vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
 
         return VisionLanguageModel(
             cfg=vlm_cfg,
@@ -129,16 +151,18 @@ class VisionLanguageModel(BaseModel):
             model_name=model_name,
             onnx_path=Path(onnx_path),
             sima_path=Path(sima_path),
-            vlm_helper=vlm_helper
+            vlm_helper=vlm_helper,
         )
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
         self.cfg.lm_cfg.set_lora_adapter(lora_config)
 
-    def set_draft_model(self, draft_model_path: Path):
-        draft_model_config = LocalHuggingFaceModel.load_draft_model(draft_model_path)
-        self.cfg.lm_cfg.set_draft_model(draft_model_config)
+    def configure_speculative_decoding(self, is_draft: bool = False):
+        speculative_budget = SPECULATIVE_BUDGET["draft"] if is_draft else SPECULATIVE_BUDGET["target"]
+        self.cfg.lm_cfg.set_speculative_decoding_config(
+            dict(is_draft=is_draft, speculative_budget=speculative_budget)
+        )
 
     def gen_files(
         self,

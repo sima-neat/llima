@@ -25,8 +25,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         VisionLanguageModel(
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,
-            std::optional<std::string> chat_template = std::nullopt,
-            bool do_parallel_load = true
+            std::optional<std::string> chat_template = std::nullopt
         );
         ~VisionLanguageModel() {}
 
@@ -48,6 +47,10 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
         );
         void stop_model();
+
+        // Configure a non-owning draft VLM for speculative decoding. When set,
+        // run_model dispatches through the spec path automatically.
+        void set_draft_vlm(VisionLanguageModel* draft_vlm) { _draft_vlm_ptr = draft_vlm; }
 
         Chat create_chat() { return Chat(_vlm_helper); }
         bool support_image() const { return _cfg.support_image(); }
@@ -75,6 +78,9 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         std::unique_ptr<VisionModel> _vision_model_ptr;
         std::unique_ptr<LanguageModel> _language_model_ptr;
         std::mutex _run_mutex;  // Protects run_model from concurrent access
+        // Non-owning pointer to the draft VLM for speculative decoding;
+        // nullptr in non-spec mode. The owner (CLI) outlives this target VLM.
+        VisionLanguageModel* _draft_vlm_ptr = nullptr;
 };
 
 }

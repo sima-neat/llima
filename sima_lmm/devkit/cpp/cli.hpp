@@ -22,9 +22,9 @@ class EXPORT CLI {
         CLI(
             std::filesystem::path vlm_model_path,
             std::optional<std::filesystem::path> whisper_model_path,
+            std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
-            std::optional<std::string> chat_template,
-            bool do_parallel_load
+            std::optional<std::string> chat_template
         );
         ~CLI();
 
@@ -34,6 +34,7 @@ class EXPORT CLI {
     private:
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
+        std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
 
         // Logging.
         std::shared_ptr<spdlog::logger> _logger;

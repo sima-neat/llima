@@ -28,25 +28,24 @@ The Model Compiler tooling is delivered as a Python wheel:
 - `sima-lmm[sdk]`: compiler SDK dependencies, including internal SiMa packages.
 - `sima-lmm[sdk_ext]`: external MoLE, benchmark, and evaluation dependencies.
 
-## Install
+## Download Runtime Packages
 
-Install the latest LLiMa runtime packages on the DevKit with `sima-cli`:
+Download the latest LLiMa Debian packages with `sima-cli`:
 
 ```bash
 sima-cli neat install llima
 ```
 
-To install a specific release, branch, or artifact reference, include it in the
+To download a specific release, branch, or artifact reference, include it in the
 target:
 
 ```bash
 sima-cli neat install llima@<version-or-ref>
 ```
 
-This installs the LLiMa Debian packages required by the Modalix runtime,
-including the CLI, C++ runtime, and development components. Use
-`sima-cli neat install --help` for the full target syntax and environment
-options.
+Despite the command name, this downloads the CLI, C++ runtime, and development
+packages to the current directory; it does not install them. Use `sima-cli neat
+install --help` for the full target syntax and environment options.
 
 ## Build LLiMa
 
@@ -107,6 +106,15 @@ Run the web server:
 llima run <model_dir> --mode web
 ```
 
+Model files load in parallel by default. When starting LLiMa alongside an
+active MLA workload, set `SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD=1` to load models
+one at a time so other inference requests can run between model loads.
+
+For EAGLE3 speculative decoding, pass the parent compiled-model directory that
+contains both the target and draft model subdirectories. `llima run` reads each
+subdirectory's `sima_files/devkit/vlm_config.json` and automatically selects the
+target and draft.
+
 Model resolution order:
 
 1. Use the provided path if it exists.
@@ -137,6 +145,9 @@ Inside `llima run --mode cli`:
 - `set lora <name>`: load LoRA weights if present in the model package.
 - `unset lora`: clear LoRA weights.
 - `help`: print available commands.
+
+Set `SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT=1` to highlight tokens accepted from the
+draft model when running EAGLE3 speculative decoding in CLI mode.
 
 ## Python Wheel
 
