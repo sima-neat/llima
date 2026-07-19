@@ -84,7 +84,7 @@ if __name__ == "__main__":
         dest="output_path",
         type=Path,
         default=None,
-        help="Directory to write model output folder into (default: current directory)",
+        help="Directory to write model output into (default: ./<model_name>)",
     )
     parser.add_argument("--num_processes", type=int, default=1)
     parser.add_argument("--resume", action="store_true", default=False)
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--enable_log_probe", action="store_true", default=False)
     args = parser.parse_args()
-    args.output_path = (args.output_path or Path(".")) / args.model_path.name
+    args.output_path = args.output_path or Path(".") / args.model_path.name
     print("Arguments:", args, flush=True)
     gen_files(
         args.model_path,
