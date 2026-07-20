@@ -1,13 +1,3 @@
-#########################################################
-# Copyright (C) 2026 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
 """
 ONNX regression tests for the EAGLE3 speculative decoding draft model: generate a fresh
 ONNX for each draft model type and compare its numerical outputs against the stored

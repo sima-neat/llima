@@ -16,8 +16,10 @@ class WhisperDecoderInitModel(BaseModel):
 
     Attributes:
         layer_idx: Transformer layer index.
+        enable_log_probe: Whether to also output filtered logits from the final layer.
     """
     layer_idx: int
+    enable_log_probe: bool = False
     # 4 init tokens used in the init model:
     #   1. <|startoftranscript|>,
     #   2. `language`,
@@ -29,14 +31,14 @@ class WhisperDecoderInitModel(BaseModel):
     def __post_init__(self):
         assert 0 <= self.layer_idx < self.cfg.decoder_layers
 
+    @property
+    def enable_filter_sharing(self) -> bool:
+        return self.use_filter_sharing
+
     def gen_onnx_files(self):
         base_name = f"model.decoder.layers.{self.layer_idx}"
         self.create_onnx_builder()
         self._onnx_builder.create_input_node("input", (1, self.cfg.d_model, 1, self.num_tokens))
-        if self.layer_idx == 0:
-            self._onnx_builder.create_input_node(
-                "embed_positions", (1, self.cfg.d_model, 1, self.num_tokens)
-            )
         self._onnx_builder.create_input_node(
             "audio_features", (1, self.cfg.d_model, 1, self.cfg.max_source_positions)
         )
@@ -53,19 +55,25 @@ class WhisperDecoderInitModel(BaseModel):
             self._onnx_builder.create_output_node(
                 self._onnx_builder.get_node_output_name(output_nodes[0]), (1, 1, 1, 1), np.int64
             )
+            if self.enable_log_probe:
+                self._onnx_builder.create_output_node(
+                    self._onnx_builder.get_node_output_name(output_nodes[1]),
+                    (1, self.cfg.vocab_size, 1, 1)
+                )
+        cache_output_idx = 2 if self.layer_idx == self.cfg.decoder_layers - 1 and self.enable_log_probe else 1
         # Self-attention key projections.
         self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[1]),
+            self._onnx_builder.get_node_output_name(output_nodes[cache_output_idx]),
             (1, self.cfg.d_model, 1, self.num_tokens)
         )
         # Self-attention value projections.
         self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[2]),
+            self._onnx_builder.get_node_output_name(output_nodes[cache_output_idx + 1]),
             (1, self.cfg.d_model, 1, self.num_tokens)
         )
         # Cross-attention key projections.
         self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[3]),
+            self._onnx_builder.get_node_output_name(output_nodes[cache_output_idx + 2]),
             (
                 1, self.cfg.decoder_head_dim, self.cfg.decoder_attention_heads,
                 self.cfg.max_source_positions
@@ -73,7 +81,7 @@ class WhisperDecoderInitModel(BaseModel):
         )
         # Cross-attention value projections.
         self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[4]),
+            self._onnx_builder.get_node_output_name(output_nodes[cache_output_idx + 3]),
             (
                 1, self.cfg.decoder_head_dim, self.cfg.decoder_attention_heads,
                 self.cfg.max_source_positions
@@ -106,12 +114,13 @@ class WhisperDecoderInitModel(BaseModel):
         post_model = WhisperDecoderPostModel(
             self.cfg, self.model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
             hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=self.layer_idx,
-            skip_encoder_kv_proj=False, output_encoder_kv_cache=True
+            skip_encoder_kv_proj=False, output_encoder_kv_cache=True,
+            enable_log_probe=self.enable_log_probe
         )
         post_model._onnx_builder = self._onnx_builder
 
         if self.layer_idx == 0:
-            pre_input_nodes = [input_nodes[0], input_nodes[1]]
+            pre_input_nodes = [input_nodes[0], self._build_position_embeddings()]
         else:
             pre_input_nodes = [input_nodes[0]]
         pre_output_nodes = pre_model._build_onnx_nodes(base_name, pre_input_nodes)
@@ -153,18 +162,35 @@ class WhisperDecoderInitModel(BaseModel):
             )
             post_input_nodes = [last_token_input_embed, cache_output_nodes[0], input_nodes[-1]]
         post_output_nodes = post_model._build_onnx_nodes(base_name, post_input_nodes)
-        return [
+        output_nodes = [
             # Decoder layer output or argmax output.
             post_output_nodes[0],
+        ]
+        if self.layer_idx == self.cfg.decoder_layers - 1 and self.enable_log_probe:
+            output_nodes.append(post_output_nodes[1])
+            encoder_kv_output_idx = 2
+        else:
+            encoder_kv_output_idx = 1
+        output_nodes.extend([
             # Self-attention key projections.
             pre_output_nodes[1],
             # Self-attention value projections.
             pre_output_nodes[2],
             # Cross-attention key projections.
-            post_output_nodes[1],
+            post_output_nodes[encoder_kv_output_idx],
             # Cross-attention value projections.
-            post_output_nodes[2],
-        ]
+            post_output_nodes[encoder_kv_output_idx + 1],
+        ])
+        return output_nodes
+
+    def _build_position_embeddings(self) -> OnnxNode:
+        position_embeddings = self.get_hf_param("model.decoder.embed_positions.weight")
+        assert isinstance(position_embeddings, np.ndarray)
+        position_embeddings = position_embeddings[:self.num_tokens]
+        position_embeddings = position_embeddings.T.reshape(1, self.cfg.d_model, 1, self.num_tokens)
+        return self._onnx_builder.create_initializer(
+            "model.decoder.init_embed_positions", position_embeddings
+        )
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """
