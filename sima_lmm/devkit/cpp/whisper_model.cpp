@@ -359,10 +359,8 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     if (_cfg.log_probe_enabled) {
         auto& logits_buf = get_buffer("decoder_logits");
         logits_buf.invalidate_cache();
-        if (new_tokens.back() != _stop_token_id) {
-            logprob_sum += _compute_token_logprob(logits_buf, new_tokens.back());
-            ++logprob_count;
-        }
+        logprob_sum += _compute_token_logprob(logits_buf, new_tokens.back());
+        ++logprob_count;
     }
     const double ttft = timer_ttft.stop();
     _logger->info("Time to the first token: {:d} in {:.5f}s", new_tokens.back(), ttft);
@@ -370,13 +368,11 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     if (new_tokens.back() == _stop_token_id) {
         _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
         _text_streamer->wait_streaming();
-        return {
-            _tokenizer_ptr->decode(new_tokens, true),
-            resolved_language,
-            resolved_task,
-            language_detect_result.no_speech_prob,
-            _cfg.log_probe_enabled ? std::optional<float>{0.0f} : std::optional<float>{}
-        };
+        return {_tokenizer_ptr->decode(new_tokens, true), resolved_language,
+                resolved_task, language_detect_result.no_speech_prob,
+                _cfg.log_probe_enabled
+                    ? std::optional<float>{logprob_sum / logprob_count}
+                    : std::optional<float>{}};
     }
 
     // Run decoder pre/cache/post models to generate other tokens.
@@ -415,10 +411,9 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
         if (_cfg.log_probe_enabled) {
             auto& logits_buf = get_buffer("decoder_logits");
             logits_buf.invalidate_cache();
-            if (new_tokens.back() != _stop_token_id) {
-                logprob_sum += _compute_token_logprob(logits_buf, new_tokens.back());
-                ++logprob_count;
-            }
+            logprob_sum +=
+                _compute_token_logprob(logits_buf, new_tokens.back());
+            ++logprob_count;
         }
         const double ttnt = timer_tps.stop(true);
         _logger->info("Got token {:d} in {:.5f}s", new_tokens.back(), ttnt);
