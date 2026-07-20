@@ -385,7 +385,6 @@ void LanguageModel::run_model_decode(
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
-        _upload_per_layer_embedding_rows(std::span<const uint32_t>(&token_id, 1), 1);
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
         _cached_token_ids.emplace_back(token_id);
         token_id = next_token_id;
@@ -445,10 +444,34 @@ uint32_t LanguageModel::run_model_once(
     }
 
     // Run the standalone per-layer projection model before the transformer stack (Gemma4 only).
-    // IFM0 (per-layer staging) is filled before this call. IFM1 is the normal embedding input.
+    // IFM0 uses the staging buffer for prefill; decode overrides it with one shard row.
+    // IFM1 is the normal embedding input.
     if (_uses_per_layer_inputs()) {
         LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
         std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
+        if (!use_input_tokens) {
+            // Decode has one generated token, so use its contiguous shard row directly and
+            // avoid copying it through the per-layer staging buffer.
+            const uint32_t per_layer_token_id = (
+                _image_token_id.has_value() && token_id == _image_token_id.value()
+            ) ? _pad_token_id.value() : token_id;
+            const size_t shard_idx = (
+                per_layer_token_id / _per_layer_embedding_rows_per_shard
+            );
+            const size_t row_in_shard = (
+                per_layer_token_id % _per_layer_embedding_rows_per_shard
+            );
+            auto* shard = _per_layer_embedding_shards[shard_idx];
+            per_layer_ifm_map.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(0),
+                std::forward_as_tuple(
+                    shard,
+                    std::vector<uint32_t>{static_cast<uint32_t>(row_in_shard), 0},
+                    std::vector<uint32_t>{1, static_cast<uint32_t>(shard->get_shape().back())}
+                )
+            );
+        }
         per_layer_ifm_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(1),
