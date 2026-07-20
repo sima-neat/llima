@@ -253,7 +253,7 @@ struct PipelineConfig {
     bool use_strided_kv_cache = true;
     bool enable_filter_sharing;
     bool quantize_embeddings = false;
-    double embeddings_scale = 1.0;
+    std::optional<double> embeddings_scale = std::nullopt;
     bool quantize_kv_cache = false;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(

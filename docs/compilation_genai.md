@@ -81,14 +81,10 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--language_group_size` | Batch size for parallel token processing during prefill. Larger values (e.g., 256) can improve TTFT for large input prompts, but can decrease TTFT for smaller input prompts. Default: 128. |
 | `--future_token_mask_size` | Mask size for reusing compiled models across token positions. Larger values reduce number of compiled binary files, but may reduce TPS. Default: 128. |
 | `--enable_filter_sharing` | Reduces DRAM usage by sharing weights between group and single models. Useful for 16GB Modalix boards. Note: only effective when both group and single models use the same precision. **Required when compiling with LoRA.** |
-| `--quantize_embeddings` | Quantizes embedding tables for LLMs and Gemma4 VLMs. May result in a loss of accuracy. |
+| `--quantize_embeddings` | Quantizes embedding tables for LLMs and VLMs. May result in a loss of accuracy. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
-
-For Gemma4, `--quantize_embeddings` applies to both the normal and per-layer embedding tables.
-Both tables are stored as raw `.bin` files in newly compiled packages; the runtime still accepts
-the legacy `.npy` format for normal embedding tables.
 
 ## System Prompts
 

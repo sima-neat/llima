@@ -3,6 +3,7 @@
 #include <fstream>
 #include <regex>
 #include <set>
+#include <stdexcept>
 
 #include <Eigen/Dense>
 #include <cnpy.h>
@@ -43,6 +44,12 @@ LanguageModel::LanguageModel(
         && _cfg.pipeline_cfg.input_token_group_offsets.value().size() > 0
     );
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
+
+    if (_uses_cpu_dequantized_embeddings() && !_cfg.pipeline_cfg.embeddings_scale.has_value()) {
+        throw std::runtime_error(
+            "Quantized multimodal embeddings require pipeline_cfg.embeddings_scale"
+        );
+    }
     
     // Backwards compatible for models without rope_dimension_count in config
     if (_cfg.lm_cfg.rope_cfg.rope_dimension_count == 0)
@@ -1925,7 +1932,7 @@ void LanguageModel::_dequantize_embedding_row(
         reinterpret_cast<uint8_t*>(dst.get_virtual_addr())
         + dst_row * hidden_size * dst.get_elem_size()
     );
-    const float scale = _cfg.pipeline_cfg.embeddings_scale;
+    const float scale = _cfg.pipeline_cfg.embeddings_scale.value();
     using Int8Row = Eigen::Array<int8_t, 1, Eigen::Dynamic>;
     Eigen::Map<const Int8Row> src_row(src, static_cast<Eigen::Index>(hidden_size));
     Eigen::Map<ArrayXbf> dst_row_map(dst_row_ptr, static_cast<Eigen::Index>(hidden_size));
@@ -2038,6 +2045,7 @@ void LanguageModel::_load_per_layer_embeddings() {
         ));
     }
 
+    // Stream contiguous token rows directly into MLA shards to avoid a full host copy.
     std::ifstream stream(file_name, std::ios::binary);
     for (auto* shard : _per_layer_embedding_shards) {
         if (shard->get_buf_len() != shard->get_shape()[0] * token_row_size) {

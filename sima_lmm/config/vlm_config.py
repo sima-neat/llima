@@ -824,7 +824,7 @@ class PipelineConfig(BaseConfig):
     return_logits: bool = False
     enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
-    embeddings_scale: float = 1.0
+    embeddings_scale: float | None = None
     quantize_kv_cache: bool = False
     split_mlp: bool = False
 
