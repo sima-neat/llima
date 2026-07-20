@@ -23,7 +23,7 @@ from afe.ir.sima_ir import SiMaIR
 from afe.ir.tensor_type import ScalarType
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.model import FileGenMode, FileGenPrecision, VisionLanguageModel
+from sima_lmm.model import EvalMode, FileGenMode, FileGenPrecision, VisionLanguageModel
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from tests.conftest import require_readable_path
@@ -116,6 +116,31 @@ def test_embedding_tensor_quantization(
         quantized.astype(np.float32) * scale,
         weights * embed_scale,
         atol=scale / 2,
+    )
+
+
+@pytest.mark.premerge
+def test_vlm_passes_dequantized_embeddings_to_decode(
+    gemma4_model: VisionLanguageModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    quantized_embeddings = np.array([[4, -8], [12, -16]], dtype=np.int8)
+    captured = {}
+    monkeypatch.setattr(
+        gemma4_model.language_model,
+        "get_embeddings_tensor",
+        lambda: (quantized_embeddings, 0.25),
+    )
+
+    def capture_decode_embeddings(_eval_mode, _ifms, *, embeddings_tensor):
+        captured["embeddings"] = embeddings_tensor
+        return []
+
+    monkeypatch.setattr(gemma4_model.language_model, "run_model", capture_decode_embeddings)
+
+    gemma4_model.run_model(EvalMode.SDK, [np.array([[0]], dtype=np.int32)])
+
+    np.testing.assert_allclose(
+        captured["embeddings"], quantized_embeddings.astype(np.float32) * 0.25
     )
 
 

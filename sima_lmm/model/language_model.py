@@ -186,11 +186,17 @@ class LanguageModel(BaseModel):
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
 
-    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+    def run_model(
+        self,
+        eval_mode: EvalMode,
+        ifms: list[np.ndarray],
+        embeddings_tensor: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
         assert self.vlm_helper is not None
         assert len(ifms) == 1
         input_embeds = ifms[0]
-        embeddings_tensor, _ = self.get_embeddings_tensor()
+        if embeddings_tensor is None:
+            embeddings_tensor, _ = self.get_embeddings_tensor()
 
         # Obtain sliding window config.
         swa_enable = self.cfg.lm_cfg.attn_cfg.swa_enable

@@ -305,7 +305,9 @@ class VisionLanguageModel(BaseModel):
             )
             input_embeds = np.expand_dims(input_embeds, axis=(0, 1))
 
-        return self.language_model.run_model(eval_mode, [input_embeds])
+        return self.language_model.run_model(
+            eval_mode, [input_embeds], embeddings_tensor=embeddings_tensor
+        )
 
     def get_language_embeddings_tensor(self) -> tuple[np.ndarray | None, float | None]:
         return self.language_model.get_input_embeddings_tensor()
