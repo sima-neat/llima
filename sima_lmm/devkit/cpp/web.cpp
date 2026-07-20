@@ -107,10 +107,15 @@ void WEB::run() {
 
     // Audio transcription endpoints (OpenAI compatible)
     auto audio_handler = [this](const httplib::Request& req, httplib::Response& res) {
-        this->_handle_audio_transcriptions(req, res);
+        this->_handle_audio_transcriptions(req, res, "transcribe");
+    };
+    auto audio_translation_handler = [this](const httplib::Request& req, httplib::Response& res) {
+        this->_handle_audio_transcriptions(req, res, "translate");
     };
     _http_server.Post("/v1/audio/transcriptions", audio_handler);
     _http_server.Post("/audio/transcriptions", audio_handler);  // Alternative route without /v1
+    _http_server.Post("/v1/audio/translations", audio_translation_handler);
+    _http_server.Post("/audio/translations", audio_translation_handler);
 
     auto cors_handler = [this](const httplib::Request& req, httplib::Response& res) {
         this->_set_cors_headers(res);
@@ -123,6 +128,8 @@ void WEB::run() {
     _http_server.Options("/v1/chat", cors_handler);
     _http_server.Options("/v1/audio/transcriptions", cors_handler);
     _http_server.Options("/audio/transcriptions", cors_handler);
+    _http_server.Options("/v1/audio/translations", cors_handler);
+    _http_server.Options("/audio/translations", cors_handler);
     _http_server.Options("/stop", cors_handler);
 
     auto msg = fmt::format("Starting the HTTP server and listening on port {}", _SERVER_PORT);
@@ -354,16 +361,36 @@ std::string WEB::_format_ollama_ndjson_chunk(
 
 std::string WEB::_format_audio_sse_chunk(
     const std::string& text,
+    const std::string& event_task,
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
-    std::optional<double> tps
+    std::optional<double> tps,
+    std::optional<std::string> language,
+    std::optional<std::string> task,
+    std::optional<float> no_speech_prob,
+    std::optional<float> avg_logprob
 ) {
     nlohmann::json chunk;
-    chunk["object"] = finished ? "audio.transcription.done" : "audio.transcription.chunk";
+    const auto object_prefix = event_task == "translate"
+        ? "audio.translation"
+        : "audio.transcription";
+    chunk["object"] = object_prefix + std::string(finished ? ".done" : ".chunk");
     chunk["text"] = text;
     if (finished) {
         chunk["finish_reason"] = finish_reason.value_or("stop");
+        if (language.has_value()) {
+            chunk["language"] = language.value();
+        }
+        if (task.has_value()) {
+            chunk["task"] = task.value();
+        }
+        if (no_speech_prob.has_value()) {
+            chunk["no_speech_prob"] = no_speech_prob.value();
+        }
+        if (avg_logprob.has_value()) {
+            chunk["avg_logprob"] = avg_logprob.value();
+        }
     }
     if (ttft.has_value()) {
         chunk["ttft"] = ttft.value();
@@ -414,7 +441,11 @@ void WEB::_handle_chat_completions(
     }
 }
 
-void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Response& res) {
+void WEB::_handle_audio_transcriptions(
+    const httplib::Request& req,
+    httplib::Response& res,
+    const std::string& task
+) {
     _set_cors_headers(res);
     try {
         if (!req.has_file("file")) {
@@ -433,7 +464,7 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
         output_file.close();
 
         // Get language from form data
-        std::string language = "en";
+        std::string language = "auto";
         // Older cpp-httplib stores plain multipart fields in params.
         if (req.has_param("language")) {
             language = req.get_param_value("language");
@@ -460,12 +491,19 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
         }
 
         if (stream) {
-            _execute_streaming_audio_transcription(res, language);
+            _execute_streaming_audio_transcription(res, language, task);
             return;
         }
 
-        auto text = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
-        nlohmann::json response = {{"text", text}};
+        auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+        nlohmann::json response = {
+            {"text", result.text},
+            {"language", result.language},
+            {"task", result.task},
+            {"no_speech_prob", result.no_speech_prob}
+        };
+        if (result.avg_logprob.has_value())
+            response["avg_logprob"] = result.avg_logprob.value();
         res.set_content(response.dump(), "application/json");
 
     } catch (const std::exception& e) {
@@ -477,7 +515,8 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
 
 void WEB::_execute_streaming_audio_transcription(
     httplib::Response& res,
-    const std::string& language
+    const std::string& language,
+    const std::string& task
 ) {
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
@@ -485,10 +524,11 @@ void WEB::_execute_streaming_audio_transcription(
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, language](size_t offset, httplib::DataSink &sink) {
+        [this, language, task](size_t offset, httplib::DataSink &sink) {
             (void)offset;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
+            std::optional<std::string> finish_reason;
 
             struct WhisperCallbackGuard {
                 WhisperModel* model;
@@ -508,28 +548,31 @@ void WEB::_execute_streaming_audio_transcription(
                     return;
                 }
                 if (metric_type == "END" || metric_type == "FULL") {
-                    const std::string finish_reason = metric_type == "FULL" ? "length" : "stop";
-                    std::string chunk = _format_audio_sse_chunk(
-                        "", true, finish_reason, ttft_value, tps_value
-                    ) + "data: [DONE]\n\n";
-                    sink.write(chunk.data(), chunk.size());
+                    finish_reason = metric_type == "FULL" ? "length" : "stop";
                 }
             };
 
             auto text_callback = [&](const std::string& text, bool stream_end, bool) {
                 if (text.empty())
                     return;
-                std::string chunk = _format_audio_sse_chunk(text, false);
+                std::string chunk = _format_audio_sse_chunk(text, task, false);
                 sink.write(chunk.data(), chunk.size());
             };
 
             try {
                 _whisper_model_ptr->set_info_callback(info_callback);
                 _whisper_model_ptr->set_text_callback(text_callback);
-                _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
+                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+                std::string chunk = _format_audio_sse_chunk(
+                    "", task, true, finish_reason.value_or("stop"), ttft_value, tps_value,
+                    result.language, result.task, result.no_speech_prob, result.avg_logprob
+                ) + "data: [DONE]\n\n";
+                sink.write(chunk.data(), chunk.size());
             } catch (const std::exception& e) {
                 nlohmann::json error;
-                error["object"] = "audio.transcription.error";
+                error["object"] = task == "translate"
+                    ? "audio.translation.error"
+                    : "audio.transcription.error";
                 error["error"] = e.what();
                 std::string chunk = "data: " + error.dump() + "\n\ndata: [DONE]\n\n";
                 sink.write(chunk.data(), chunk.size());

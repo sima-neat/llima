@@ -1,13 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
 """
 End-to-end compilation test: randomly selects one model architecture per run,
 compiles layer 0 single models (pre + cache + post for LLMs, conv for LFM2)
