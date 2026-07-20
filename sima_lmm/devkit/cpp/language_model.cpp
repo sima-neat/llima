@@ -421,7 +421,7 @@ uint32_t LanguageModel::run_model_once(
         auto upload_group_mask = [&](const std::string& name, uint16_t cache_token_idx_begin) {
             const uint16_t effective_token_idx = token_idx - cache_token_idx_begin;
             const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
-            const uint16_t aligned_context = std::min(
+            const uint16_t aligned_context = std::min<uint16_t>(
                 round_up_to(effective_context, _cfg.pipeline_cfg.future_token_mask_size),
                 _cfg.pipeline_cfg.max_num_tokens
             );
@@ -1039,7 +1039,7 @@ void LanguageModel::_define_buffers() {
         define_buffer(
             "group_future_token_mask",
             {
-                _cfg.pipeline_cfg.input_token_group_size
+                static_cast<size_t>(_cfg.pipeline_cfg.input_token_group_size)
                     * _cfg.pipeline_cfg.max_num_tokens
             },
             "bfloat16",
@@ -1049,7 +1049,7 @@ void LanguageModel::_define_buffers() {
             define_buffer(
                 "group_sliding_future_token_mask",
                 {
-                    _cfg.pipeline_cfg.input_token_group_size
+                    static_cast<size_t>(_cfg.pipeline_cfg.input_token_group_size)
                         * _cfg.pipeline_cfg.max_num_tokens
                 },
                 "bfloat16",
@@ -1315,7 +1315,7 @@ void LanguageModel::_define_attn_models_iter(
         );
         aligned_eff_num_cached_tokens = aligned_eff_token_idx + 1;
     } else if (use_group_future_token_mask) {
-        aligned_eff_num_cached_tokens = std::min(
+        aligned_eff_num_cached_tokens = std::min<uint16_t>(
             round_up_to(eff_num_cached_tokens, _cfg.pipeline_cfg.future_token_mask_size),
             _cfg.pipeline_cfg.max_num_tokens
         );
@@ -1376,7 +1376,7 @@ void LanguageModel::_define_attn_models_iter(
                         : "group_future_token_mask"
                 ),
                 {0},
-                {num_tokens * aligned_eff_num_cached_tokens}
+                {static_cast<uint32_t>(num_tokens) * aligned_eff_num_cached_tokens}
             }
         );
     } else if (use_single_future_token_mask) {
