@@ -66,7 +66,6 @@ class VisionLanguageModel(BaseModel):
         system_prompt: str | None = None,
         chat_template: str | None = None,
         override_language_group_size: int | None = None,
-        override_language_group_offsets: list[int] | None = None,
         override_language_future_token_mask_size: int = 1,
         return_logits: bool = False,
         enable_filter_sharing: bool = False,
@@ -112,7 +111,7 @@ class VisionLanguageModel(BaseModel):
         # Set the token size and offsets for group processing.
         vlm_cfg.config_pipeline(
             system_prompt, chat_template, max_num_tokens, override_language_group_size,
-            override_language_group_offsets, override_language_future_token_mask_size
+            override_language_future_token_mask_size
         )
 
         vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)

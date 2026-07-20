@@ -75,6 +75,69 @@ def test_embedding_scale_is_absent_without_embedding_quantization():
     assert PipelineConfig().embeddings_scale is None
 
 
+def _load_reference_config(filename: str) -> VlmConfig:
+    config = json.loads((REFERENCE_CONFIGS_PATH / filename).read_text())
+    return VlmConfig.load(config)
+
+
+def _layer_indices(config: VlmConfig, part: str) -> list[int]:
+    return [layer.part_idx for layer in config.get_layer_ids() if layer.part == part]
+
+
+@pytest.mark.parametrize(
+    ("sliding_window", "expected_transition"),
+    [(512, 384), (1024, 896)],
+)
+@pytest.mark.premerge
+def test_gemma3_automatic_sliding_cache_transition(
+    sliding_window: int, expected_transition: int
+):
+    config = _load_reference_config("gemma3_vlm_config.json")
+    config.lm_cfg.attn_cfg.sliding_window = sliding_window
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    assert expected_transition in _layer_indices(config, "group_cache")
+    assert _layer_indices(config, "group_sliding_cache") == []
+
+
+@pytest.mark.premerge
+def test_shared_sliding_cache_transition_does_not_add_execution_offset():
+    config = _load_reference_config("gemma3_vlm_config.json")
+    config.lm_cfg.attn_cfg.sliding_window = 1000
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    transition = 872
+    assert transition not in config.pipeline_cfg.input_token_group_offsets
+    assert transition in _layer_indices(config, "group_cache")
+
+
+@pytest.mark.premerge
+def test_gemma4_keeps_separate_sliding_cache_models():
+    config = _load_reference_config("gemma4_e4b_it_vlm_config.json")
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    assert _layer_indices(config, "group_cache") == list(range(0, 1921, 128))
+    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384]
+
+
+@pytest.mark.premerge
+def test_group_configuration_is_automatic_and_serializable():
+    config = _load_reference_config("gemma3_vlm_config.json")
+    config.config_pipeline(None, None, 512, 128, 128)
+
+    restored = VlmConfig.load(json.loads(json.dumps(asdict(config))))
+    assert restored.pipeline_cfg.input_token_group_size == 128
+    assert restored.pipeline_cfg.input_token_group_offsets == [0, 128, 256, 384]
+
+
+@pytest.mark.premerge
+def test_sliding_attention_rejects_group_at_least_as_large_as_window():
+    config = _load_reference_config("gemma3_vlm_config.json")
+
+    with pytest.raises(ValueError, match="smaller than sliding_window"):
+        config.config_pipeline(None, None, 2048, 1024, 128)
+
+
 def _find_gguf_file(hf_models_path: Path, folder: str) -> Path:
     """Find Q4_0 gguf file in folder, fall back to Q8_0."""
     base = require_readable_path(hf_models_path / folder)

@@ -838,11 +838,18 @@ class PipelineConfig(BaseConfig):
         assert max_num_tokens > 0
         self.max_num_tokens = max_num_tokens
 
-    def set_group_size(self, size: int):
-        self.input_token_group_size = size
+    def set_group_size(self, size: int | None):
+        if size is None:
+            self.input_token_group_size = 1
+            self.input_token_group_offsets = None
+            return
+        if size <= 0:
+            raise ValueError("language_group_size must be greater than zero")
 
-    def set_group_offsets(self, offsets: list[int]):
-        self.input_token_group_offsets = offsets
+        self.input_token_group_size = size
+        self.input_token_group_offsets = list(
+            range(0, self.max_num_tokens - size + 1, size)
+        )
 
     def set_future_token_mask_size(self, mask_size: int):
         self.future_token_mask_size = mask_size
@@ -1063,16 +1070,25 @@ class VlmConfig(BaseConfig):
         system_prompt: str | None,
         chat_template: str | None,
         max_num_tokens: int,
-        language_group_size: int,
-        language_group_offsets: list[int],
+        language_group_size: int | None,
         future_token_mask_size: int,
     ):
         self.pipeline_cfg.set_system_prompt(system_prompt)
         self.pipeline_cfg.set_chat_template(chat_template)
         self.pipeline_cfg.set_max_num_tokens(max_num_tokens)
         self.pipeline_cfg.set_group_size(language_group_size)
-        self.pipeline_cfg.set_group_offsets(language_group_offsets)
         self.pipeline_cfg.set_future_token_mask_size(future_token_mask_size)
+
+        if (
+            self.lm_cfg.attn_cfg.swa_enable
+            and self.pipeline_cfg.input_token_group_offsets
+            and self.pipeline_cfg.input_token_group_size
+            >= self.lm_cfg.attn_cfg.sliding_window
+        ):
+            raise ValueError(
+                "language_group_size must be smaller than sliding_window "
+                "for models with sliding attention"
+            )
 
     def get_layer_ids(self) -> list[LayerID]:
         """
@@ -1110,12 +1126,31 @@ class VlmConfig(BaseConfig):
                     raise ValueError(f"Unsupported layer type: {t}")
             # Cache models are shared across layers; include only for kinds that exist
             if has_attn:
-                layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
+                group_cache_indices = group_cache_model_indices(pipeline_cfg)
+                has_sliding_attn = "sliding_attention" in layer_types
+                separate_sliding_cache = (
+                    lm_cfg.attn_cfg.sliding_head_dim is not None
+                    and lm_cfg.attn_cfg.sliding_head_dim != lm_cfg.attn_cfg.head_dim
+                )
+                if has_sliding_attn and not separate_sliding_cache:
+                    group_cache_indices = group_shared_sliding_cache_model_indices(
+                        pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                    )
+                layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
                 layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
-                if (lm_cfg.attn_cfg.sliding_head_dim is not None
-                        and lm_cfg.attn_cfg.sliding_head_dim != lm_cfg.attn_cfg.head_dim):
-                    layers.extend(LayerID("group_sliding_cache", n) for n in group_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
-                    layers.extend(LayerID("single_sliding_cache", n) for n in single_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
+                if separate_sliding_cache:
+                    layers.extend(
+                        LayerID("group_sliding_cache", n)
+                        for n in group_sliding_cache_model_indices(
+                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                        )
+                    )
+                    layers.extend(
+                        LayerID("single_sliding_cache", n)
+                        for n in single_sliding_cache_model_indices(
+                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                        )
+                    )
             if has_conv and layer_types[-1] == "conv":
                 layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
         else:
@@ -1310,6 +1345,18 @@ def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) 
     if transition > 0:
         indices.append(transition)
     return indices
+
+
+def group_shared_sliding_cache_model_indices(
+    cfg: PipelineConfig, sliding_window: int
+) -> list[int]:
+    """Get cache indices needed by sliding attention sharing the full cache."""
+    indices = group_cache_model_indices(cfg)
+    transition = sliding_window - cfg.input_token_group_size
+    last_reachable_offset = cfg.max_num_tokens - cfg.input_token_group_size
+    if 0 < transition <= last_reachable_offset:
+        indices.append(transition)
+    return sorted(set(indices))
 
 
 def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:

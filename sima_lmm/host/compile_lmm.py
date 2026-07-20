@@ -49,8 +49,7 @@ def gen_files(
     num_processes: int, resume: bool, model_path: Path, lora_path: Path | None,
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
-    language_group_size: int, language_group_offsets: list[int] | None,
-    future_token_mask_size: int, enable_filter_sharing: bool,
+    language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
     quantize_embeddings: bool, quantize_kv_cache: bool, split_mlp: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None
@@ -67,7 +66,6 @@ def gen_files(
         system_prompt=system_prompt,
         chat_template=chat_template,
         override_language_group_size=language_group_size,
-        override_language_group_offsets=language_group_offsets,
         override_language_future_token_mask_size=future_token_mask_size,
         return_logits=return_logits,
         enable_filter_sharing=enable_filter_sharing,
@@ -94,7 +92,6 @@ def gen_files(
             system_prompt=system_prompt,
             chat_template=chat_template,
             override_language_group_size=language_group_size,
-            override_language_group_offsets=language_group_offsets,
             override_language_future_token_mask_size=future_token_mask_size,
             return_logits=return_logits,
             enable_filter_sharing=enable_filter_sharing,
@@ -254,12 +251,6 @@ def main():
              "(default: 128)"
     )
     group.add_argument(
-        "--language_group_offsets", metavar="LIST",
-        help="Comma-separated list of positive integers.  "
-             "Grouped token processing will use groups starting at these indices.  "
-             "(default: derived from language_group_size)"
-    )
-    group.add_argument(
         "--future_token_mask_size", type=int, metavar="N", default=128,
         help="Size of token mask.  "
              "Token masks reduce compiled code size at the cost of redundant computation by "
@@ -396,18 +387,6 @@ def main():
     else:
         chat_template = None
 
-    if args.language_group_offsets is not None:
-        try:
-            language_group_offsets = list(map(int, args.language_group_offsets.split(",")))
-        except:
-            _abort(
-                "Cannot parse argument value as a comma-separated list of integers: "
-                + args.language_group_offsets
-            )
-    else:
-        lgs = args.language_group_size
-        language_group_offsets = list(range(0, args.max_num_tokens - lgs + 1, lgs))
-
     # Select a compile mode.  At most one of these flags can be used on the command line.
     for compile_mode_option, mode_flag in _FILE_GEN_MODE_OPTIONS:
         if getattr(args, compile_mode_option, None):
@@ -450,7 +429,7 @@ def main():
     gen_files(
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
-        args.language_group_size, language_group_offsets, args.future_token_mask_size,
+        args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
         args.quantize_kv_cache, split_mlp, args.return_logits, log_level, image_resolution,
         args.draft_model_path, draft_output_path
