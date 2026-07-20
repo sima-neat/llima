@@ -44,6 +44,14 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 and self.num_tokens == self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget)
 
     @property
+    def _uses_group_future_token_mask(self) -> bool:
+        return (
+            not self._is_speculative_decoding
+            and self.num_tokens == self.cfg.pipeline_cfg.input_token_group_size
+            and self.cfg.pipeline_cfg.use_group_future_token_mask
+        )
+
+    @property
     def context_length(self) -> int:
         if self._is_speculative_decoding:
             return self.token_idx + 1
@@ -86,6 +94,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         if (
             (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
             or self._is_speculative_decoding
+            or self._uses_group_future_token_mask
         ):
             # For paligemma, the attention mask is dynamically determined.
             # For speculative decoding, the attention mask is dynamically determined during decode time.
@@ -149,7 +158,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
             )
 
         if self.num_tokens > 1:
-            if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA or self._is_speculative_decoding:
+            if (
+                self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+                or self._is_speculative_decoding
+                or self._uses_group_future_token_mask
+            ):
                 # For paligemma, the attention mask is dynamically determined.
                 # Speculative decoding uses num_tokens > 1 during decoding.
                 bmm1 = self._onnx_builder.build_op(
@@ -236,7 +249,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
         )
 
         # Shape of the attention mask
-        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or self._is_speculative_decoding:
+        if (
+            (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
+            or self._is_speculative_decoding
+            or self._uses_group_future_token_mask
+        ):
             # Paligemma uses a special attention mask
             # Speculative decoding uses num_tokens > 1 for the target model during decoding.
             attn_shape = (1, 1, self.num_tokens, self.context_length)
@@ -263,7 +280,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             model_input_cached_keys_scale = None
         if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1 or
             self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1 or
-            self._is_speculative_decoding):
+            self._is_speculative_decoding or self._uses_group_future_token_mask):
             # Dynamically computed attention mask for paligemma
             # Dynamically computed attention mask for speculative decoding
             # or the model runner's mask to remove the influence of future tokens
@@ -352,7 +369,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
             bmm1 = last
 
         if self.num_tokens > 1:
-            if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA or self._is_speculative_decoding:
+            if (
+                self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+                or self._is_speculative_decoding
+                or self._uses_group_future_token_mask
+            ):
                 # For paligemma, the attention mask is dynamically determined.
                 # Speculative decoding uses num_tokens > 1 during decode time.
                 assert mla_input_attn_mask is not None
@@ -440,7 +461,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         # attn_mask
         if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or \
                 (self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1) or \
-                self._is_speculative_decoding:
+                self._is_speculative_decoding or self._uses_group_future_token_mask:
             attn_mask_tessellate_params = TensorTessellateParameters(
                 tile_shape=(0, 0, 0, 0),
                 enable_mla=True,

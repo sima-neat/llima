@@ -255,6 +255,7 @@ def main():
         help="Size of token mask.  "
              "Token masks reduce compiled code size at the cost of redundant computation by "
              "reusing models for generating multiple tokens.  "
+             "Applies below 2048 tokens; larger contexts use 1024.  "
              "(default: 128)"
     )
     group.add_argument(

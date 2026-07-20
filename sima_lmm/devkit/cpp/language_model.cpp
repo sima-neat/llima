@@ -413,6 +413,43 @@ uint32_t LanguageModel::run_model_once(
     auto use_input_tokens = token_idx < num_input_tokens;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
+    if (
+        num_tokens == _cfg.pipeline_cfg.input_token_group_size
+        && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
+        && _cfg.pipeline_cfg.future_token_mask_size > num_tokens
+    ) {
+        auto upload_group_mask = [&](const std::string& name, uint16_t cache_token_idx_begin) {
+            const uint16_t effective_token_idx = token_idx - cache_token_idx_begin;
+            const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
+            const uint16_t aligned_context = std::min(
+                round_up_to(effective_context, _cfg.pipeline_cfg.future_token_mask_size),
+                _cfg.pipeline_cfg.max_num_tokens
+            );
+            std::vector<Eigen::bfloat16> mask(
+                num_tokens * aligned_context,
+                std::numeric_limits<Eigen::bfloat16>::lowest()
+            );
+            for (uint16_t row = 0; row < num_tokens; ++row) {
+                std::fill_n(
+                    mask.begin() + row * aligned_context,
+                    effective_token_idx + row + 1,
+                    Eigen::bfloat16{0.0f}
+                );
+            }
+            get_buffer(name).upload(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
+        };
+
+        upload_group_mask("group_future_token_mask", 0);
+        if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+            const uint16_t cache_token_idx_begin = std::max(
+                0,
+                token_idx + num_tokens
+                    - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+            );
+            upload_group_mask("group_sliding_future_token_mask", cache_token_idx_begin);
+        }
+    }
+
     // Run the standalone per-layer projection model before the transformer stack (Gemma4 only).
     // IFM1 (staging) is already filled by _compute_and_upload_per_layer_inputs_prefill or
     // the decode gather.  Only IFM0 (input embeds) is dynamic and passed here.
@@ -770,7 +807,6 @@ void LanguageModel::_initialize() {
             true
         );
     }
-
     // Clear the KV caches and caches states.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
@@ -992,6 +1028,32 @@ void LanguageModel::_define_buffers() {
             define_buffer(
                 "future_token_mask",
                 {full_token_mask_size}
+            );
+        }
+    }
+    if (
+        _use_group_token_models
+        && _cfg.pipeline_cfg.future_token_mask_size
+            > _cfg.pipeline_cfg.input_token_group_size
+    ) {
+        define_buffer(
+            "group_future_token_mask",
+            {
+                _cfg.pipeline_cfg.input_token_group_size
+                    * _cfg.pipeline_cfg.max_num_tokens
+            },
+            "bfloat16",
+            false
+        );
+        if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+            define_buffer(
+                "group_sliding_future_token_mask",
+                {
+                    _cfg.pipeline_cfg.input_token_group_size
+                        * _cfg.pipeline_cfg.max_num_tokens
+                },
+                "bfloat16",
+                false
             );
         }
     }
@@ -1233,7 +1295,14 @@ void LanguageModel::_define_attn_models_iter(
     uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     uint16_t aligned_eff_token_idx;
     uint16_t aligned_eff_num_cached_tokens;
-    if (num_tokens == single_num_tokens && _cfg.pipeline_cfg.future_token_mask_size > 1) {
+    const bool use_single_future_token_mask = (
+        num_tokens == single_num_tokens && _cfg.pipeline_cfg.future_token_mask_size > 1
+    );
+    const bool use_group_future_token_mask = (
+        num_tokens != single_num_tokens
+        && _cfg.pipeline_cfg.future_token_mask_size > num_tokens
+    );
+    if (use_single_future_token_mask) {
         // Round up by total context (eff_num_cached_tokens = past_kv + num_tokens),
         // not by past_kv alone. For spec mode num_tokens=16: past_kv=114 ->
         // total=130 -> bucket=256 (cache_token_255). The old formula used
@@ -1245,6 +1314,12 @@ void LanguageModel::_define_attn_models_iter(
             _cfg.pipeline_cfg.max_num_tokens - 1
         );
         aligned_eff_num_cached_tokens = aligned_eff_token_idx + 1;
+    } else if (use_group_future_token_mask) {
+        aligned_eff_num_cached_tokens = std::min(
+            round_up_to(eff_num_cached_tokens, _cfg.pipeline_cfg.future_token_mask_size),
+            _cfg.pipeline_cfg.max_num_tokens
+        );
+        aligned_eff_token_idx = aligned_eff_num_cached_tokens - num_tokens;
     } else {
         aligned_eff_token_idx = eff_token_idx;
         aligned_eff_num_cached_tokens = eff_num_cached_tokens;
@@ -1292,7 +1367,19 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
 
-    if (num_tokens == single_num_tokens && _cfg.pipeline_cfg.future_token_mask_size > 1) {
+    if (use_group_future_token_mask) {
+        cache_ifms.emplace_back(
+            MLABufferSlice{
+                &get_buffer(
+                    layer_type == "sliding_attention"
+                        ? "group_sliding_future_token_mask"
+                        : "group_future_token_mask"
+                ),
+                {0},
+                {num_tokens * aligned_eff_num_cached_tokens}
+            }
+        );
+    } else if (use_single_future_token_mask) {
         if (_cfg.lm_cfg.is_spec_decode()) {
             // Shift the col begin to cache_token_idx_begin so that buffer col
             // p ↔ K-row p for any layer type: full (cache_token_idx_begin = 0)

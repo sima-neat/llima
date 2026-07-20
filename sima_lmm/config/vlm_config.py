@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows
+from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows, round_up_to
 from sima_utils.logging.sima_logger import sima_log_warning
 
 
@@ -850,7 +850,18 @@ class PipelineConfig(BaseConfig):
         )
 
     def set_future_token_mask_size(self, mask_size: int):
+        if self.max_num_tokens >= 2048:
+            mask_size = 1024
+        if mask_size <= 0:
+            raise ValueError("future_token_mask_size must be greater than zero")
         self.future_token_mask_size = mask_size
+
+    @property
+    def use_group_future_token_mask(self) -> bool:
+        return (
+            bool(self.input_token_group_offsets)
+            and self.future_token_mask_size > self.input_token_group_size
+        )
 
     def set_return_logits(self, return_logits: bool):
         self.return_logits = return_logits
@@ -1323,7 +1334,16 @@ def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     if cfg.input_token_group_offsets is None:
         raise RuntimeError("Group token offsets have not been computed")
 
-    return list(cfg.input_token_group_offsets)
+    if not cfg.use_group_future_token_mask:
+        return list(cfg.input_token_group_offsets)
+
+    return sorted({
+        min(
+            round_up_to(offset + cfg.input_token_group_size, cfg.future_token_mask_size),
+            cfg.max_num_tokens,
+        ) - cfg.input_token_group_size
+        for offset in cfg.input_token_group_offsets
+    })
 
 
 def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
