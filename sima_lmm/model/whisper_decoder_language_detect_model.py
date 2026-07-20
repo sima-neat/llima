@@ -105,6 +105,11 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
         pre_model._onnx_builder = self._onnx_builder
         pre_input_nodes = hidden if layer_idx == 0 else [hidden]
         pre_output_nodes = pre_model._build_onnx_nodes(base_name, pre_input_nodes)
+        residual_input = pre_input_nodes[0]
+        if layer_idx == 0:
+            residual_input = self._onnx_builder.build_op(
+                f"{base_name}.residual_add_embed", pre_input_nodes, "Add"
+            )
 
         cache_model = WhisperDecoderCacheModel(
             self.cfg, self.model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
@@ -122,12 +127,12 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             )
             post_model._onnx_builder = self._onnx_builder
             post_output_nodes = post_model._build_onnx_nodes(
-                base_name, [pre_input_nodes[0], cache_output_nodes[0], audio_features]
+                base_name, [residual_input, cache_output_nodes[0], audio_features]
             )
             return post_output_nodes[0]
 
         return self._build_final_post_nodes(
-            base_name, [pre_input_nodes[0], cache_output_nodes[0], audio_features],
+            base_name, [residual_input, cache_output_nodes[0], audio_features],
             language_start_token_id, num_languages
         )
 
