@@ -1427,38 +1427,46 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             td.vocab_size
         );
         const size_t accepted_count = static_cast<size_t>(post.accept_length) + 1;
-        if (input_ids.size() + accepted_count + spec_budget > max_length) {
+        const bool final_batch = input_ids.size() + accepted_count + spec_budget > max_length;
+        if (final_batch) {
             _logger->info(
-                "[iter {}] stop (pre-update): accepted path leaves no room for next tree", idx
+                "[iter {}] commit accepted path and stop: no room for next tree", idx
             );
             cache_full = true;
-            break;
         }
         total_generated_tokens.push_back(static_cast<uint16_t>(accepted_count));
 
-        auto upd = update_inference_inputs(
-            draft_lm,
-            input_ids,
-            candidates_2d,
-            post.best_candidate,
-            post.accept_length,
-            retrieve_indices,
-            new_token,
-            td.hidden_states,
-            post.sample_p
-        );
-
-        // Sync target's stable_kv with draft's — same pattern as after
-        // initialize_tree.
-        _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
-
         const size_t prev_size = input_ids.size();
-        input_ids          = std::move(upd.input_ids);
-        draft_tokens       = std::move(upd.draft_tokens);
-        retrieve_indices   = std::move(upd.retrieve_indices);
-        tree_mask          = std::move(upd.tree_mask);
-        tree_position_ids  = std::move(upd.tree_position_ids);
-        new_token          = upd.new_token;
+        if (final_batch) {
+            for (size_t i = 0; i < accepted_count; ++i) {
+                input_ids.push_back(
+                    static_cast<uint32_t>(candidates_2d[post.best_candidate][i])
+                );
+            }
+        } else {
+            auto upd = update_inference_inputs(
+                draft_lm,
+                input_ids,
+                candidates_2d,
+                post.best_candidate,
+                post.accept_length,
+                retrieve_indices,
+                new_token,
+                td.hidden_states,
+                post.sample_p
+            );
+
+            // Sync target's stable_kv with draft's — same pattern as after
+            // initialize_tree.
+            _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+
+            input_ids          = std::move(upd.input_ids);
+            draft_tokens       = std::move(upd.draft_tokens);
+            retrieve_indices   = std::move(upd.retrieve_indices);
+            tree_mask          = std::move(upd.tree_mask);
+            tree_position_ids  = std::move(upd.tree_position_ids);
+            new_token          = upd.new_token;
+        }
 
         // Stream the newly-accepted tokens. The first round's root was already
         // emitted by initialize_tree, so skip it here.
@@ -1482,6 +1490,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         if (streamed > 0)
             iter_begin = iter_end;
         first_round = false;
+
+        if (final_batch)
+            break;
 
         // Stop when any configured stop token appears in the generated tail.
         // Cache-overflow is checked at the top of the next iteration.
