@@ -227,6 +227,10 @@ class LanguagePartBaseModel(BaseModel):
         cfg = self.cfg.lm_cfg.speculative_decoding_cfg
         return cfg is not None and cfg.is_draft
 
+    @property
+    def uses_quantized_input_embeddings(self) -> bool:
+        return self.cfg.pipeline_cfg.quantize_embeddings and not self.cfg.is_multimodal
+
 
 @dataclass
 class LanguagePostBaseModel(LanguagePartBaseModel):
