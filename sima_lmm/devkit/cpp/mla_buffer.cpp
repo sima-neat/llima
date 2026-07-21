@@ -121,6 +121,40 @@ void MLABuffer::clear(bool flush) {
 }
 
 
+void MLABuffer::load_file(const std::filesystem::path& file_name) {
+    const size_t file_size = std::filesystem::file_size(file_name);
+    if (file_size != _size) {
+        throw std::runtime_error(fmt::format(
+            "Invalid size for {}: expected {} bytes, got {}",
+            file_name.string(), _size, file_size
+        ));
+    }
+    std::ifstream stream(file_name, std::ios::binary);
+    load_stream(stream);
+}
+
+
+void MLABuffer::load_stream(std::istream& stream) {
+    const size_t row_size = _shape.back() * _elem_size;
+    const size_t padded_row_size = round_up_to_row(row_size);
+    if (_align_last_dim && row_size != padded_row_size) {
+        const size_t num_rows = _size / row_size;
+        for (size_t i = 0; i < num_rows; ++i) {
+            stream.read(
+                reinterpret_cast<char*>(_virtual_addr) + i * padded_row_size,
+                row_size
+            );
+        }
+    } else {
+        stream.read(reinterpret_cast<char*>(_virtual_addr), _size);
+    }
+    if (!stream) {
+        throw std::runtime_error(fmt::format("Failed to load buffer {}", _name));
+    }
+    flush_cache();
+}
+
+
 void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bool flush) {
     if (_align_last_dim && (_shape.back() % MLA_ROW_SIZE != 0)) {
         assert(data_begin == 0);

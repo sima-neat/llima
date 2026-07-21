@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <atomic>
 #include <mutex>
@@ -64,14 +65,27 @@ using WhisperDecoderModelMap = std::map<WhisperDecoderModelMapKey, MLAModelWithB
 
 class WhisperModel : public BaseModel<WhisperConfig> {
     public:
+        struct TranscriptionResult {
+            std::string text;
+            std::string language;
+            std::string task;
+            float no_speech_prob;
+            std::optional<float> avg_logprob;
+        };
+
         WhisperModel(std::filesystem::path model_path);
         virtual ~WhisperModel() { _finalize(); };
 
-        std::string run_model(
-            const std::filesystem::path& audio_file_name, const std::string& language
+        TranscriptionResult run_model(
+            const std::filesystem::path& audio_file_name,
+            const std::string& language,
+            const std::string& task = "transcribe"
         );
-        std::string run_model_from_pcm(
-            std::span<const float> pcm, uint32_t sample_rate, const std::string& language
+        TranscriptionResult run_model_from_pcm(
+            std::span<const float> pcm,
+            uint32_t sample_rate,
+            const std::string& language,
+            const std::string& task = "transcribe"
         );
         void set_info_callback(TextStreamer::InfoCallback callback) {
             _text_streamer->set_info_callback(callback);
@@ -87,7 +101,11 @@ class WhisperModel : public BaseModel<WhisperConfig> {
     private:
         virtual void _initialize() override;
         virtual void _finalize() override;
-        std::string _run_model(const ArrayXXbf& mel, const std::string& language);
+        TranscriptionResult _run_model(
+            const ArrayXXbf& mel,
+            const std::string& language,
+            const std::string& task
+        );
 
         virtual void _define_buffers() override;
         void _define_model(
@@ -101,10 +119,24 @@ class WhisperModel : public BaseModel<WhisperConfig> {
 
         std::filesystem::path _get_elf_path_encoder() const;
         std::filesystem::path _get_elf_path_decoder_init(uint8_t layer_idx) const;
+        std::filesystem::path _get_elf_path_decoder_init_log_probe(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_pre(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_cache(uint16_t token_idx) const;
         std::filesystem::path _get_elf_path_decoder_post(uint8_t layer_idx) const;
-        void _update_language(const std::string& language);
+        std::filesystem::path _get_elf_path_decoder_language_detect() const;
+        bool _is_auto_language(const std::string& language) const;
+        struct LanguageDetectResult {
+            uint32_t language_index;
+            float no_speech_prob;
+        };
+        LanguageDetectResult _run_language_detect();
+        float _compute_token_logprob(MLABuffer& logits_buf, uint32_t token_id);
+        float _compute_token_prob(MLABuffer& logits_buf, uint32_t token_id);
+        uint32_t _language_token_from_index(uint32_t language_idx) const;
+        void _set_language_token(uint32_t token_id);
+        std::string _language_code_from_token(uint32_t token_id) const;
+        std::string _update_language(const std::string& language);
+        std::string _update_task(const std::string& task);
         
         std::mutex _mutex;
 
@@ -114,14 +146,15 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::atomic<bool> _is_running;
 
         std::unique_ptr<MLAModelWithBuffer> _encoder_model_ptr;
+        std::unique_ptr<MLAModelWithBuffer> _decoder_language_detect_model_ptr;
         std::map<uint8_t, MLAModelWithBuffer> _decoder_init_model_map;
+        std::map<uint8_t, MLAModelWithBuffer> _decoder_init_log_probe_model_map;
         WhisperDecoderModelMap _decoder_pre_model_map;
         WhisperDecoderModelMap _decoder_cache_model_map;
         WhisperDecoderModelMap _decoder_post_model_map;
         std::vector<uint32_t> _input_token_ids;
         uint32_t _stop_token_id;
 
-        static const std::vector<std::string> _LANGUAGE_CODES;
         static const std::map<std::string, std::string> _TO_LANGUAGE_CODE;
 };
 

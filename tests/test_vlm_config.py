@@ -1,20 +1,10 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
 from dataclasses import asdict
 from pathlib import Path
 import json
 
 import pytest
 
-from sima_lmm.config.vlm_config import VlmConfig, ModelFormat
+from sima_lmm.config.vlm_config import PipelineConfig, VlmConfig, ModelFormat
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from transformers import AutoConfig
 from tests.conftest import require_readable_path
@@ -68,6 +58,11 @@ _GGUF_CONFIGS = [
     # LiquidAI
      ("models--LiquidAI--LFM2-1.2B-GGUF",                         "lfm2_vlm_config.json"),
 ]
+
+
+@pytest.mark.premerge
+def test_embedding_scale_is_absent_without_embedding_quantization():
+    assert PipelineConfig().embeddings_scale is None
 
 
 def _load_reference_config(filename: str) -> VlmConfig:
