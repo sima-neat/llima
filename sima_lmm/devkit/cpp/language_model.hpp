@@ -2,6 +2,7 @@
 #define _SIMA_LLIMA_LANGUAGE_MODEL_
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -67,7 +68,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
             LanguageModel& draft_lm,
             std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt
+            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
+            std::optional<ChronoTimer> timer_ttft = std::nullopt
         );
         void stop_model() { _is_running = false; }
 
@@ -95,6 +97,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::vector<int32_t> tree_position_ids;
             std::vector<std::vector<Eigen::bfloat16>> hidden_states;  // 3 captured layers
             uint32_t token;                                            // root token
+            std::chrono::steady_clock::time_point root_ready_time;
         };
 
         // Result of topk_generate.
@@ -167,7 +170,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         InitTreeResult initialize_tree(
             LanguageModel& draft_lm,
             std::vector<uint32_t> input_ids,
-            int num_cached_tokens
+            int num_cached_tokens,
+            ChronoTimer timer_ttft
         );
 
         // Gather the accepted path's scattered KVs (at select_indices) and move
@@ -327,12 +331,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<uint32_t> _prompt_per_layer_token_ids;
         std::vector<uint32_t> _cached_token_ids;
         uint32_t _cached_first_generated_token;
-        // Full-match cache: prior turn's tree state. Restored when
-        // prefix_cached == input_ids.size() to skip prefill + topk_generate entirely.
+        // Full-match cache: prior turn's tree state. Restored only when the
+        // matching token prefix also has the same prompt length.
         std::vector<uint32_t> _cached_draft_tokens;
         std::vector<std::vector<int32_t>> _cached_retrieve_indices;
         eagle_helpers::EagleTreeMask _cached_tree_mask;
         std::vector<int32_t> _cached_tree_position_ids;
+        uint16_t _cached_eagle3_prompt_len = 0;
         size_t _cached_eagle3_stable_kv = 0;
         uint16_t _kv_cache_len = 0;  // tokens in KV cache; set by prefill, advanced by decode
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
