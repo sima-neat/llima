@@ -32,6 +32,8 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
     """
 
     num_tokens: int
+    embeddings_scale: float | np.ndarray | None = None
+    per_layer_embeddings_scale: float | np.ndarray | None = None
 
     def __post_init__(self):
         assert self.num_tokens >= 1
@@ -111,39 +113,55 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
     def _build_sima_nodes(self, lm_base: str, quantizable: bool):
         L = self.cfg.lm_cfg.num_hidden_layers
         H = self.cfg.lm_cfg.hidden_size_per_layer_input
+        staging_shape = (1, 1, self.num_tokens, L * H)
+        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
+        staging_dtype = (
+            ScalarType.int8
+            if self.cfg.pipeline_cfg.quantize_embeddings
+            else activation_type(quantizable)
+        )
+        input_dtype = (
+            ScalarType.int8
+            if self.uses_quantized_input_embeddings
+            else activation_type(quantizable)
+        )
 
         model_input_staging = builder.create_placeholder_node(
             "per_layer_emb_staging",
-            TensorType(activation_type(quantizable), (1, 1, self.num_tokens, L * H)),
+            TensorType(staging_dtype, staging_shape),
         )
         model_input_input = builder.create_placeholder_node(
             "input",
-            TensorType(
-                activation_type(quantizable),
-                (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size),
-            ),
+            TensorType(input_dtype, input_shape),
         )
 
         builder.begin_subnet([model_input_staging, model_input_input])
         mla_input_staging = builder.create_placeholder_node(
             "MLA_0/per_layer_emb_staging",
-            TensorType(activation_type(quantizable), (1, 1, self.num_tokens, L * H)),
+            TensorType(staging_dtype, staging_shape),
         )
         mla_input_input = builder.create_placeholder_node(
             "MLA_0/input",
-            TensorType(
-                activation_type(quantizable),
-                (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size),
-            ),
+            TensorType(input_dtype, input_shape),
         )
 
+        if self.uses_quantized_input_embeddings:
+            assert self.embeddings_scale is not None
+            projection_input = builder.create_dequantization_node(
+                mla_input_input.name,
+                input_shape,
+                1 / self.embeddings_scale,
+                output_dtype=activation_dtype(quantizable),
+            )
+        else:
+            projection_input = mla_input_input
         proj = build_conv_from_dense_with_lora(
             builder,
             self.get_hf_param,
             self.check_hf_param,
             f"{lm_base}.per_layer_model_projection",
-            mla_input_input,
+            projection_input,
             None,
         )
         proj = builder.create_mul_node(
@@ -168,8 +186,18 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             proj,
         )
 
+        if self.cfg.pipeline_cfg.quantize_embeddings:
+            assert self.per_layer_embeddings_scale is not None
+            staging = builder.create_dequantization_node(
+                mla_input_staging.name,
+                staging_shape,
+                1 / self.per_layer_embeddings_scale,
+                output_dtype=activation_dtype(quantizable),
+            )
+        else:
+            staging = mla_input_staging
         emb = builder.create_slice_concat_node(
-            mla_input_staging,
+            staging,
             axis=2,
             split_axis=3,
             split_block=L,

@@ -3,6 +3,7 @@
 #define _SIMA_LLIMA_MLA_BUFFER_
 
 #include <filesystem>
+#include <istream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,6 +31,11 @@ class MLABuffer {
         void try_allocate() { if (!_simaai_mem_ptr) allocate(); }
         void free();
         void clear(bool flush = true);
+        // Load exactly one raw, unpadded tensor payload from a file.
+        void load_file(const std::filesystem::path& file_name);
+        // Load the next raw, unpadded tensor payload from a stream.
+        // MLA row padding is inserted when this buffer requires it.
+        void load_stream(std::istream& stream);
         void upload(
             const void* data, size_t data_begin = 0, size_t data_size = 0, bool flush = true
         );
