@@ -91,7 +91,8 @@ std::optional<std::string> VisionLanguageModel::run_model(
         output_token_ids = _language_model_ptr->run_model_speculative_decoding(
             *_draft_vlm_ptr->_language_model_ptr,
             preprocessed_data.input_token_ids,
-            max_num_tokens
+            max_num_tokens,
+            timer_ttft
         );
     } else {
         output_token_ids = _language_model_ptr->run_model(
