@@ -178,6 +178,7 @@ class BaseModel(ABC):
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
+    use_filter_sharing: bool = field(default=False, kw_only=True)
 
     _onnx_builder: OnnxBuilder | None = field(init=False)
 
@@ -668,7 +669,6 @@ class BaseModel(ABC):
     ):
         if num_processes != 1 and len(model_list) > 1:
             os.environ["SIMA_MLA_SIM_PARALLEL"] = "1"
-
             def _stop_processes(futures, msg = None):
                 if msg is not None:
                     print(msg, file=sys.stderr, flush=True)
