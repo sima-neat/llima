@@ -288,7 +288,11 @@ class LanguageModel(BaseModel):
                 perf_cnt_begin = time.perf_counter_ns()
 
             for layer_idx in range(self.cfg.lm_cfg.num_hidden_layers):
-                is_global = (layer_types[layer_idx] == "full_attention")
+                layer_type = layer_types[layer_idx]
+                is_global = layer_type == "full_attention"
+                future_token_mask_size = (
+                    self.cfg.pipeline_cfg.get_future_token_mask_size(layer_type)
+                )
                 pre_ifms = list()
                 if layer_idx == 0:
                     if use_input_tokens:
@@ -341,18 +345,18 @@ class LanguageModel(BaseModel):
                 use_group_future_token_mask = (
                     num_tokens == self.cfg.pipeline_cfg.input_token_group_size
                     and num_tokens != self._single_model_num_tokens
-                    and self.cfg.pipeline_cfg.use_group_future_token_mask
+                    and self.cfg.pipeline_cfg.uses_group_future_token_mask(layer_type)
                 )
-                if self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
+                if future_token_mask_size > 1 and num_tokens == 1:
                     aligned_token_idx = min(
-                        round_up_to(token_idx+1, self.cfg.pipeline_cfg.future_token_mask_size) - 1,
+                        round_up_to(token_idx + 1, future_token_mask_size) - 1,
                         self.cfg.pipeline_cfg.max_num_tokens - 1
                     )
                 elif use_group_future_token_mask:
                     aligned_context = min(
                         round_up_to(
                             token_idx + num_tokens - token_idx_begin,
-                            self.cfg.pipeline_cfg.future_token_mask_size,
+                            future_token_mask_size,
                         ),
                         self.cfg.pipeline_cfg.max_num_tokens,
                     )
@@ -384,7 +388,7 @@ class LanguageModel(BaseModel):
                     for row in range(num_tokens):
                         mask[..., row, :token_idx - token_idx_begin + row + 1] = 0
                     cache_ifms.append(mask)
-                elif self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
+                elif future_token_mask_size > 1 and num_tokens == 1:
                     mask = np.full(
                         (1, 1, 1, aligned_token_idx + 1 - token_idx_begin),
                         np.finfo(np.float32).min,

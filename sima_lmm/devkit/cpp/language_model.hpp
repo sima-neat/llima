@@ -1,6 +1,7 @@
 #ifndef _SIMA_LLIMA_LANGUAGE_MODEL_
 #define _SIMA_LLIMA_LANGUAGE_MODEL_
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -263,6 +264,21 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
+        uint16_t _get_future_token_mask_size(const std::string& layer_type) const {
+            if (
+                layer_type != "sliding_attention"
+                && _cfg.pipeline_cfg.long_context_future_token_mask_size.has_value()
+            ) {
+                return _cfg.pipeline_cfg.long_context_future_token_mask_size.value();
+            }
+            return _cfg.pipeline_cfg.future_token_mask_size;
+        }
+        uint16_t _get_max_future_token_mask_size() const {
+            return std::max(
+                _cfg.pipeline_cfg.future_token_mask_size,
+                _cfg.pipeline_cfg.long_context_future_token_mask_size.value_or(0)
+            );
+        }
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }

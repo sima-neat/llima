@@ -255,7 +255,8 @@ def main():
         help="Size of token mask.  "
              "Token masks reduce compiled code size at the cost of redundant computation by "
              "reusing models for generating multiple tokens.  "
-             "Applies below 2048 tokens; larger contexts use 1024.  "
+             "Full attention uses 1024 at context lengths of 2048 or greater; sliding attention "
+             "continues to use this value.  "
              "(default: 128)"
     )
     group.add_argument(

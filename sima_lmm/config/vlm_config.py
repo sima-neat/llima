@@ -10,6 +10,9 @@ from sima_lmm.config.layer_id import LayerID
 from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows, round_up_to
 from sima_utils.logging.sima_logger import sima_log_warning
 
+LONG_CONTEXT_MIN_TOKENS = 2048
+LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE = 1024
+
 
 class ExtensibleEnum:
     """
@@ -808,6 +811,8 @@ class PipelineConfig(BaseConfig):
         max_num_tokens: The max number of tokens including the input and generated tokens.
         input_token_group_size: The group size of input token.
         input_token_group_offsets: The group offsets of input token.
+        future_token_mask_size: The normal cache-model mask bucket size.
+        long_context_future_token_mask_size: Optional full-attention override for long contexts.
         return_logits: Return logits at the last layer.
         enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
@@ -821,6 +826,7 @@ class PipelineConfig(BaseConfig):
     input_token_group_size: int = 1
     input_token_group_offsets: list[int] | None = None
     future_token_mask_size: int = 1
+    long_context_future_token_mask_size: int | None = None
     return_logits: bool = False
     enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
@@ -837,6 +843,7 @@ class PipelineConfig(BaseConfig):
     def set_max_num_tokens(self, max_num_tokens: int):
         assert max_num_tokens > 0
         self.max_num_tokens = max_num_tokens
+        self._set_long_context_future_token_mask_size()
 
     def set_group_size(self, size: int | None):
         if size is None:
@@ -852,17 +859,31 @@ class PipelineConfig(BaseConfig):
         )
 
     def set_future_token_mask_size(self, mask_size: int):
-        if self.max_num_tokens >= 2048:
-            mask_size = 1024
         if mask_size <= 0:
             raise ValueError("future_token_mask_size must be greater than zero")
         self.future_token_mask_size = mask_size
+        self._set_long_context_future_token_mask_size()
 
-    @property
-    def use_group_future_token_mask(self) -> bool:
+    def _set_long_context_future_token_mask_size(self) -> None:
+        self.long_context_future_token_mask_size = (
+            LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE
+            if self.max_num_tokens >= LONG_CONTEXT_MIN_TOKENS
+            else None
+        )
+
+    def get_future_token_mask_size(self, layer_type: str) -> int:
+        """Return the mask bucket for full or sliding attention."""
+        if (
+            layer_type != "sliding_attention"
+            and self.long_context_future_token_mask_size is not None
+        ):
+            return self.long_context_future_token_mask_size
+        return self.future_token_mask_size
+
+    def uses_group_future_token_mask(self, layer_type: str) -> bool:
         return (
             bool(self.input_token_group_offsets)
-            and self.future_token_mask_size > self.input_token_group_size
+            and self.get_future_token_mask_size(layer_type) > self.input_token_group_size
         )
 
     def set_return_logits(self, return_logits: bool):
@@ -1138,6 +1159,7 @@ class VlmConfig(BaseConfig):
             # Cache models are shared across layers; include only for kinds that exist
             if has_attn:
                 group_cache_indices = group_cache_model_indices(pipeline_cfg)
+                single_cache_indices = single_cache_model_indices(pipeline_cfg)
                 has_sliding_attn = "sliding_attention" in layer_types
                 separate_sliding_cache = (
                     lm_cfg.attn_cfg.sliding_head_dim is not None
@@ -1147,8 +1169,11 @@ class VlmConfig(BaseConfig):
                     group_cache_indices = group_shared_sliding_cache_model_indices(
                         pipeline_cfg, lm_cfg.attn_cfg.sliding_window
                     )
+                    single_cache_indices = single_shared_sliding_cache_model_indices(
+                        pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                    )
                 layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
-                layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
+                layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
                 if separate_sliding_cache:
                     layers.extend(
                         LayerID("group_sliding_cache", n)
@@ -1326,6 +1351,22 @@ def apply_mla_constraint(vlm_cfg: VlmConfig) -> None:
                 setattr(cfg, key, value)
 
 
+def _group_cache_model_indices(cfg: PipelineConfig, mask_size: int) -> list[int]:
+    if cfg.input_token_group_offsets is None:
+        raise RuntimeError("Group token offsets have not been computed")
+
+    if mask_size <= cfg.input_token_group_size:
+        return list(cfg.input_token_group_offsets)
+
+    return sorted({
+        min(
+            round_up_to(offset + cfg.input_token_group_size, mask_size),
+            cfg.max_num_tokens,
+        ) - cfg.input_token_group_size
+        for offset in cfg.input_token_group_offsets
+    })
+
+
 def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     """
     Get the indices of all group cache models for the pipeline configuration.
@@ -1333,19 +1374,9 @@ def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     Returns:
         Indices of group cache models in ascending order.
     """
-    if cfg.input_token_group_offsets is None:
-        raise RuntimeError("Group token offsets have not been computed")
-
-    if not cfg.use_group_future_token_mask:
-        return list(cfg.input_token_group_offsets)
-
-    return sorted({
-        min(
-            round_up_to(offset + cfg.input_token_group_size, cfg.future_token_mask_size),
-            cfg.max_num_tokens,
-        ) - cfg.input_token_group_size
-        for offset in cfg.input_token_group_offsets
-    })
+    return _group_cache_model_indices(
+        cfg, cfg.get_future_token_mask_size("full_attention")
+    )
 
 
 def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
@@ -1361,7 +1392,11 @@ def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) 
         Indices of group sliding cache models in ascending order.
     """
     transition = sliding_window - cfg.input_token_group_size
-    indices = [n for n in group_cache_model_indices(cfg) if n < transition]
+    mask_size = cfg.get_future_token_mask_size("sliding_attention")
+    indices = [
+        n for n in _group_cache_model_indices(cfg, mask_size)
+        if n < transition
+    ]
     if transition > 0:
         indices.append(transition)
     return indices
@@ -1371,12 +1406,20 @@ def group_shared_sliding_cache_model_indices(
     cfg: PipelineConfig, sliding_window: int
 ) -> list[int]:
     """Get cache indices needed by sliding attention sharing the full cache."""
-    indices = group_cache_model_indices(cfg)
-    transition = sliding_window - cfg.input_token_group_size
-    last_reachable_offset = cfg.max_num_tokens - cfg.input_token_group_size
-    if 0 < transition <= last_reachable_offset:
-        indices.append(transition)
-    return sorted(set(indices))
+    return sorted(set(group_cache_model_indices(cfg)) | set(
+        group_sliding_cache_model_indices(cfg, sliding_window)
+    ))
+
+
+def _single_cache_model_indices(cfg: PipelineConfig, mask_size: int) -> list[int]:
+    single_cache_token_idx_list = list(
+        range(mask_size - 1, cfg.max_num_tokens, mask_size)
+    )
+
+    if cfg.max_num_tokens - 1 not in single_cache_token_idx_list:
+        single_cache_token_idx_list.append(cfg.max_num_tokens - 1)
+
+    return single_cache_token_idx_list
 
 
 def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
@@ -1391,15 +1434,9 @@ def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     # batch's index is the last token's index, even if it is not evenly
     # spaced.  For example, given future_token_mask_size=5 and
     # max_num_tokens=24, the indices will be 4, 9, 14, 19, 23.
-    incr = cfg.future_token_mask_size
-    single_cache_token_idx_list = list(
-        range(incr - 1, cfg.max_num_tokens, incr)
+    return _single_cache_model_indices(
+        cfg, cfg.get_future_token_mask_size("full_attention")
     )
-
-    if cfg.max_num_tokens - 1 not in single_cache_token_idx_list:
-        single_cache_token_idx_list.append(cfg.max_num_tokens - 1)
-
-    return single_cache_token_idx_list
 
 
 def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
@@ -1414,7 +1451,20 @@ def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int)
     Returns:
         Indices of single sliding cache models in ascending order.
     """
-    return [n for n in single_cache_model_indices(cfg) if n < sliding_window]
+    mask_size = cfg.get_future_token_mask_size("sliding_attention")
+    return [
+        n for n in _single_cache_model_indices(cfg, mask_size)
+        if n < sliding_window
+    ]
+
+
+def single_shared_sliding_cache_model_indices(
+    cfg: PipelineConfig, sliding_window: int
+) -> list[int]:
+    """Get cache indices needed by single-token full and sliding attention."""
+    return sorted(set(single_cache_model_indices(cfg)) | set(
+        single_sliding_cache_model_indices(cfg, sliding_window)
+    ))
 
 
 def vision_model_layer_count(cfg: VisionModelConfig) -> int:

@@ -102,7 +102,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     // stride misaligns rows >= 1 and collapses the tree. Prefill mask is baked
     // into the ELF, so this local buffer is unused.
     const uint16_t num_tokens = is_prefill ? 128 : 5;
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    const uint16_t mask_bucket = _get_future_token_mask_size("full_attention");
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = is_prefill
         ? static_cast<size_t>(num_tokens)
@@ -370,7 +370,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
 
     // pad_cols must match the cache ELF's compiled stride: rounding up
     // seq_len_with_past to mask_bucket. Wider strides misalign rows >= 1.
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    const uint16_t mask_bucket = _get_future_token_mask_size("full_attention");
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = static_cast<size_t>(
         round_up_to(static_cast<uint32_t>(seq_len_with_past), mask_bucket)

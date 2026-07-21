@@ -44,11 +44,15 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 and self.num_tokens == self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget)
 
     @property
+    def _future_token_mask_size(self) -> int:
+        return self.cfg.pipeline_cfg.get_future_token_mask_size(self.layer_type)
+
+    @property
     def _uses_group_future_token_mask(self) -> bool:
         return (
             not self._is_speculative_decoding
             and self.num_tokens == self.cfg.pipeline_cfg.input_token_group_size
-            and self.cfg.pipeline_cfg.use_group_future_token_mask
+            and self.cfg.pipeline_cfg.uses_group_future_token_mask(self.layer_type)
         )
 
     @property
@@ -101,7 +105,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             self._onnx_builder.create_input_node(
                 "attn_mask", (1, self.context_length, 1, self.num_tokens)
             )
-        elif self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1:
+        elif self._future_token_mask_size > 1 and self.num_tokens == 1:
             # Enable the future attention mask to reduce the total number of cache models.
             self._onnx_builder.create_input_node("attn_mask", (1, self.token_idx + 1, 1, 1))
         self._onnx_builder.create_input_node(f"cached_values", kv_cache_shape)
@@ -174,7 +178,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
                     for j in range(self.token_idx + i + 1, self.context_length):
                         mask[0, j, 0, i] = np.finfo(np.float32).min
                 bmm1 = self._onnx_builder.build_op(f"{base_name}.masked_bmm1", [bmm1, mask], "Add")
-        elif self.cfg.pipeline_cfg.future_token_mask_size > 1:
+        elif self._future_token_mask_size > 1:
             bmm1 = self._onnx_builder.build_op(
                 f"{base_name}.masked_bmm1", [bmm1, input_nodes[2]], "Add"
             )
@@ -279,7 +283,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         else:
             model_input_cached_keys_scale = None
         if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1 or
-            self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1 or
+            self._future_token_mask_size > 1 and self.num_tokens == 1 or
             self._is_speculative_decoding or self._uses_group_future_token_mask):
             # Dynamically computed attention mask for paligemma
             # Dynamically computed attention mask for speculative decoding
@@ -388,7 +392,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
                     mask.astype(ScalarType.numpy_type(activation_type(quantizable)))
                 )
                 bmm1 = builder.create_add_node(bmm1, mask_const)
-        elif self.cfg.pipeline_cfg.future_token_mask_size > 1:
+        elif self._future_token_mask_size > 1:
             assert mla_input_attn_mask is not None
             bmm1 = builder.create_add_node(bmm1, mla_input_attn_mask)
 
@@ -460,7 +464,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         # attn_mask
         if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or \
-                (self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1) or \
+                (self._future_token_mask_size > 1 and self.num_tokens == 1) or \
                 self._is_speculative_decoding or self._uses_group_future_token_mask:
             attn_mask_tessellate_params = TensorTessellateParameters(
                 tile_shape=(0, 0, 0, 0),
