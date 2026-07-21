@@ -579,15 +579,46 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
 
     // Loglikelihood only needs the single-token decode path to refresh n1_buffer4.
     // Keep this separate from run_model_once(), which is shared by normal generation.
+    MLABuffer* normal_input_buf;
+    uint32_t normal_input_row;
+    if (_uses_cpu_dequantized_embeddings()) {
+        normal_input_buf = &get_buffer("decode_embedding");
+        normal_input_row = 0;
+        _dequantize_embedding_row(input_token_id, *normal_input_buf);
+        normal_input_buf->flush_cache();
+    } else {
+        normal_input_buf = &get_buffer("embeddings");
+        normal_input_row = input_token_id;
+    }
+
     if (_uses_per_layer_inputs()) {
         LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
         std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
+        const uint32_t per_layer_token_id = (
+            _image_token_id.has_value() && input_token_id == _image_token_id.value()
+        ) ? _pad_token_id.value() : input_token_id;
+        const size_t shard_idx = (
+            per_layer_token_id / _per_layer_embedding_rows_per_shard
+        );
+        const size_t row_in_shard = (
+            per_layer_token_id % _per_layer_embedding_rows_per_shard
+        );
+        auto* shard = _per_layer_embedding_shards[shard_idx];
+        per_layer_ifm_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(0),
+            std::forward_as_tuple(
+                shard,
+                std::vector<uint32_t>{static_cast<uint32_t>(row_in_shard), 0},
+                std::vector<uint32_t>{1, static_cast<uint32_t>(shard->get_shape().back())}
+            )
+        );
         per_layer_ifm_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(1),
             std::forward_as_tuple(
-                &get_buffer("embeddings"),
-                std::vector<uint32_t>{input_token_id, 0},
+                normal_input_buf,
+                std::vector<uint32_t>{normal_input_row, 0},
                 std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
             )
         );
@@ -603,8 +634,8 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
                 std::piecewise_construct,
                 std::forward_as_tuple(0),
                 std::forward_as_tuple(
-                    &get_buffer("embeddings"),
-                    std::vector<uint32_t>{input_token_id, 0},
+                    normal_input_buf,
+                    std::vector<uint32_t>{normal_input_row, 0},
                     std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
                 )
             );
