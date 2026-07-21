@@ -145,7 +145,6 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     const size_t hidden_cols = hidden_states.size() / seq_length;
     if (hidden_cols != embed_size) {
         const size_t fc_in_elems  = static_cast<size_t>(num_tokens) * 3 * embed_size;
-        const size_t fc_out_elems = static_cast<size_t>(num_tokens) * embed_size;
         // Copy only what hidden_states holds — cross-round has fewer rows than
         // input_ids (trailing bonus_token's FC input row stays zero-padded).
         const size_t valid_bytes = hidden_states.size() * sizeof(Eigen::bfloat16);
@@ -175,17 +174,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
             )
         );
 
-        // add_to_queue runs synchronously when SIMA_LLIMA_RUN_DISABLE_QUEUE=1.
         it->second.add_to_queue(&ifm_map);
-
-        auto& fc_output = get_buffer(fmt::format("fc_n{}_output", num_tokens));
-        fc_output.invalidate_cache();
-        std::vector<Eigen::bfloat16> fc_out_full(fc_out_elems);
-        fc_output.download(fc_out_full.data());
-        hidden_states.assign(
-            fc_out_full.begin(),
-            fc_out_full.begin() + seq_length * embed_size
-        );
     } else {
         // FC skipped, but pre_model IFM[1] is statically wired to
         // fc_n{N}_output — upload hidden_states there to overwrite stale data.
@@ -276,6 +265,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
 
     // Download both outputs: hidden_states (n{N}_buffer5) and logits
     // (n{N}_buffer4, lm_head fused into post_model; single split for draft).
+    MLAModelWithBuffer::run_queue();
     const uint32_t draft_vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
     DraftForwardResult result;
     {
@@ -479,6 +469,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         // reading it here yields this layer's output.
         auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
         if (it != capture_layers.end()) {
+            MLAModelWithBuffer::run_queue();
             const size_t cap_idx = std::distance(capture_layers.begin(), it);
             auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
             buf.invalidate_cache();
@@ -499,6 +490,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
     result.logits.resize(static_cast<size_t>(num_tokens) * lm_head_output_size);
 
+    MLAModelWithBuffer::run_queue();
     for (uint32_t s = 0; s < num_splits; ++s) {
         const std::string buf_name = (num_splits == 1)
             ? fmt::format("n{}_buffer4", num_tokens)
@@ -1188,7 +1180,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
 LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     LanguageModel& draft_lm,
     std::vector<uint32_t> input_ids,
-    int num_cached_tokens
+    int num_cached_tokens,
+    ChronoTimer timer_ttft
 ) {
     InitTreeResult result;
 
@@ -1200,11 +1193,13 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 
     // Uploads token embeds and returns the prefix-match length against
     // _cached_token_ids.
-    const uint16_t prefix_cached = _set_input_text_embeds(input_ids);
+    uint16_t prefix_cached = _set_input_text_embeds(input_ids);
 
-    // Full-match early-out: every input token is already cached on both target
-    // and draft sides — restore the tree state saved last turn.
-    if (prefix_cached == num_input_tokens && !_cached_draft_tokens.empty()) {
+    // Full-match early-out: every input token and the prompt length match the
+    // tree state saved last turn.
+    if (prefix_cached == num_input_tokens
+        && _cached_eagle3_prompt_len == num_input_tokens
+        && !_cached_draft_tokens.empty()) {
         result.token              = _cached_first_generated_token;
         result.draft_tokens       = _cached_draft_tokens;
         result.retrieve_indices   = _cached_retrieve_indices;
@@ -1212,12 +1207,19 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         result.tree_position_ids  = _cached_tree_position_ids;
         _eagle3_stable_kv          = _cached_eagle3_stable_kv;
         draft_lm._eagle3_stable_kv = draft_lm._cached_eagle3_stable_kv;
+        result.root_ready_time = std::chrono::steady_clock::now();
+        _notify_first_token(result.token, timer_ttft.stop());
         return result;
     }
 
+    // A token-prefix match alone does not validate the cached EAGLE tree.
+    // Back up one token so the final prefill group rebuilds the root and tree.
+    if (prefix_cached == num_input_tokens && prefix_cached > 0)
+        --prefix_cached;
+
     // Multi-group target prefill. Per-group capture of intermediate hidden
     // states (layers 2, N/2, N-3) must be copied out before the next dispatch
-    // overwrites the buffer — queue disabled for synchronous per-layer download.
+    // overwrites the buffer.
     const uint32_t hidden_size = _cfg.lm_cfg.hidden_size;
     const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
 
@@ -1255,6 +1257,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     }
 
     _logger->info("root token: {}", result.token);
+    result.root_ready_time = std::chrono::steady_clock::now();
+    _notify_first_token(result.token, timer_ttft.stop());
 
     // Cache for next-turn prefix matching. Must run BEFORE push_back so
     // input_ids still matches the pre-root-token prefill length.
@@ -1296,6 +1300,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     _cached_retrieve_indices   = result.retrieve_indices;
     _cached_tree_mask          = result.tree_mask;
     _cached_tree_position_ids  = result.tree_position_ids;
+    _cached_eagle3_prompt_len  = num_input_tokens;
     _cached_eagle3_stable_kv          = _eagle3_stable_kv;
     draft_lm._cached_eagle3_stable_kv = draft_lm._eagle3_stable_kv;
 
@@ -1309,8 +1314,12 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
     LanguageModel& draft_lm,
     std::span<const uint32_t> input_token_ids,
-    std::optional<uint16_t> override_max_num_tokens
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<ChronoTimer> timer_ttft
 ) {
+    if (!timer_ttft.has_value())
+        timer_ttft = ChronoTimer{true};
+
     std::vector<uint32_t> input_ids(input_token_ids.begin(), input_token_ids.end());
     const size_t input_len = input_ids.size();
     const int num_cached_tokens = 0;
@@ -1330,6 +1339,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             "stop (pre-init): input_len {} + spec_budget {} > max_length {}",
             input_len, spec_budget, max_length
         );
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_eagle3_prompt_len = 0;
         _text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
         _text_streamer.wait_streaming();
         return std::nullopt;
@@ -1344,7 +1356,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
 
     std::vector<uint16_t> total_generated_tokens;
 
-    auto init = initialize_tree(draft_lm, input_ids, num_cached_tokens);
+    auto init = initialize_tree(
+        draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
+    );
 
     // Sync target's _eagle3_stable_kv with draft's — the draft incremented it
     // inside initialize_tree's first topk_generate, and tree_decoding reads it.
@@ -1358,10 +1372,11 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     auto tree_mask          = std::move(init.tree_mask);
     int32_t new_token       = 0;
 
-    // TPS timer starts here, after all prefill work.
-    const auto run_model_begin = std::chrono::steady_clock::now();
+    // The root was already streamed by initialize_tree. Include the initial
+    // draft-tree construction in the time to the next streamed token.
+    const auto run_model_begin = init.root_ready_time;
     auto iter_begin = run_model_begin;
-    bool first_token = true;
+    bool first_round = true;
     bool cache_full = false;
 
     size_t idx = 0;
@@ -1411,7 +1426,15 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             max_depth,
             td.vocab_size
         );
-        total_generated_tokens.push_back(static_cast<uint16_t>(post.accept_length + 1));
+        const size_t accepted_count = static_cast<size_t>(post.accept_length) + 1;
+        if (input_ids.size() + accepted_count + spec_budget > max_length) {
+            _logger->info(
+                "[iter {}] stop (pre-update): accepted path leaves no room for next tree", idx
+            );
+            cache_full = true;
+            break;
+        }
+        total_generated_tokens.push_back(static_cast<uint16_t>(accepted_count));
 
         auto upd = update_inference_inputs(
             draft_lm,
@@ -1437,30 +1460,28 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         tree_position_ids  = std::move(upd.tree_position_ids);
         new_token          = upd.new_token;
 
-        // Stream the newly-accepted tokens. Per-token duration = iter time /
-        // accepted count; first emitted token gets TTFT, rest get TPS.
+        // Stream the newly-accepted tokens. The first round's root was already
+        // emitted by initialize_tree, so skip it here.
         const auto iter_end = std::chrono::steady_clock::now();
         const double iter_duration = std::chrono::duration<double>(
             iter_end - iter_begin
         ).count();
-        const size_t accepted = input_ids.size() - prev_size;
-        const double per_token = accepted > 0
-            ? iter_duration / static_cast<double>(accepted)
+        const size_t stream_begin = prev_size + (first_round ? 1 : 0);
+        const size_t streamed = input_ids.size() - stream_begin;
+        const double per_token = streamed > 0
+            ? iter_duration / static_cast<double>(streamed)
             : 0.0;
-        for (size_t i = prev_size; i < input_ids.size(); ++i) {
-            const auto type = first_token
-                ? DecodeCallbackType::TTFT
-                : DecodeCallbackType::TPS;
-            // The first emitted token per round (offset 0) is the tree's seed
-            // — initialize_tree's root in round 1, or the previous round's
-            // bonus in later rounds — and is target-generated, not from draft.
-            // Offsets 1..accept_length are the draft-accepted path.
+        for (size_t i = stream_begin; i < input_ids.size(); ++i) {
+            // Offset 0 is the target-generated tree seed. It is skipped in
+            // round 1 because initialize_tree already emitted that root;
+            // offsets 1..accept_length are draft-accepted tokens.
             const size_t offset = i - prev_size;
             const bool from_draft = (offset > 0) && (offset <= post.accept_length);
-            _text_streamer.push(type, input_ids[i], per_token, from_draft);
-            first_token = false;
+            _text_streamer.push(DecodeCallbackType::TPS, input_ids[i], per_token, from_draft);
         }
-        iter_begin = iter_end;
+        if (streamed > 0)
+            iter_begin = iter_end;
+        first_round = false;
 
         // Stop when any configured stop token appears in the generated tail.
         // Cache-overflow is checked at the top of the next iteration.
@@ -1499,6 +1520,11 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     // Signal end-of-stream and wait for the streamer thread to flush.
     // Use CACHE_FULL when generation stopped because the K-cache was exhausted,
     // mirroring non-spec; the streamer prints the "Cache full" notice.
+    if (cache_full) {
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_eagle3_prompt_len = 0;
+    }
     _text_streamer.push(
         cache_full ? DecodeCallbackType::CACHE_FULL : DecodeCallbackType::STOP, 0, 0
     );
