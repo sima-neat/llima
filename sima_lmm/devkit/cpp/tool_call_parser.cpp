@@ -179,7 +179,8 @@ nlohmann::json parse_json_array_tool_calls(
 nlohmann::json parse_plain_json_tool_calls(
     std::string_view text,
     int& id_counter,
-    const std::vector<std::string>* allowed_tool_names
+    const std::vector<std::string>* allowed_tool_names,
+    bool allow_function_wrapper
 ) {
     nlohmann::json result = nlohmann::json::array();
     size_t pos = 0;
@@ -203,6 +204,10 @@ nlohmann::json parse_plain_json_tool_calls(
         auto close = find_matching_brace(text, pos);
         if (close == std::string_view::npos) return nullptr;
         auto parsed = nlohmann::json::parse(std::string(text.substr(pos, close - pos + 1)));
+        if (allow_function_wrapper && parsed.is_object() && parsed.size() == 1 &&
+            parsed.contains("function") && parsed["function"].is_object()) {
+            parsed = parsed["function"];
+        }
         auto entry = build_tool_call_entry(parsed, id_counter, allowed_tool_names);
         if (entry.is_null()) return nullptr;
         result.push_back(std::move(entry));
@@ -447,13 +452,13 @@ nlohmann::json try_parse_tool_calls_impl(
             case ToolCallFormat::Qwen:
                 return parse_qwen_tool_calls(text, id_counter, allowed_tool_names);
             case ToolCallFormat::Llama:
-                return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names);
+                return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names, true);
             case ToolCallFormat::GenericJson:
                 if (text.starts_with('[')) {
                     return parse_json_array_tool_calls(
                         nlohmann::json::parse(std::string(text)), id_counter, allowed_tool_names);
                 }
-                return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names);
+                return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names, false);
         }
     } catch (const nlohmann::json::exception&) {
         return nullptr;
