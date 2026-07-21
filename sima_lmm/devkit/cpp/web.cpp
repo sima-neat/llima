@@ -284,6 +284,8 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
 std::string WEB::_format_openai_sse_chunk(
     const std::string& content,
     const std::string& model,
+    const std::string& completion_id,
+    std::time_t created,
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
@@ -291,9 +293,9 @@ std::string WEB::_format_openai_sse_chunk(
     bool from_draft
 ) {
     nlohmann::json chunk;
-    chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+    chunk["id"] = completion_id;
     chunk["object"] = "chat.completion.chunk";
-    chunk["created"] = std::time(nullptr);
+    chunk["created"] = created;
     chunk["model"] = model;
     chunk["system_fingerprint"] = "fp_sima_vlm";
 
@@ -671,6 +673,8 @@ void WEB::_execute_streaming_chat(
     res.set_chunked_content_provider(
         is_openai ? "text/event-stream" : "application/x-ndjson",
         [this, chat, model, is_openai](size_t offset, httplib::DataSink &sink) {
+            const auto created = std::time(nullptr);
+            const auto completion_id = "chatcmpl-" + std::to_string(created);
             const bool has_tools = chat.has_tools();
             bool sent_initial_chunk = false;
             bool ttft_sent = false;
@@ -684,9 +688,9 @@ void WEB::_execute_streaming_chat(
             auto send_openai_initial = [&]() {
                 if (sent_initial_chunk) return;
                 nlohmann::json initial_chunk;
-                initial_chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+                initial_chunk["id"] = completion_id;
                 initial_chunk["object"] = "chat.completion.chunk";
-                initial_chunk["created"] = std::time(nullptr);
+                initial_chunk["created"] = created;
                 initial_chunk["model"] = model;
                 initial_chunk["system_fingerprint"] = "fp_sima_vlm";
                 initial_chunk["choices"] = nlohmann::json::array({{
@@ -712,7 +716,8 @@ void WEB::_execute_streaming_chat(
                 if (is_openai) {
                     send_openai_initial();
                     auto chunk = _format_openai_sse_chunk(
-                        text, model, false, std::nullopt, take_ttft_once(), tps_value
+                        text, model, completion_id, created, false, std::nullopt,
+                        take_ttft_once(), tps_value
                     );
                     sink.write(chunk.data(), chunk.size());
                 } else {
@@ -733,9 +738,9 @@ void WEB::_execute_streaming_chat(
                 }
 
                 nlohmann::json tool_chunk;
-                tool_chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+                tool_chunk["id"] = completion_id;
                 tool_chunk["object"] = "chat.completion.chunk";
-                tool_chunk["created"] = std::time(nullptr);
+                tool_chunk["created"] = created;
                 tool_chunk["model"] = model;
                 tool_chunk["system_fingerprint"] = "fp_sima_vlm";
                 if (auto ttft_for_chunk = take_ttft_once(); ttft_for_chunk.has_value())
@@ -796,7 +801,9 @@ void WEB::_execute_streaming_chat(
                                 saw_tool_calls ? "tool_calls" : default_finish_reason;
 
                             std::string final_chunk =
-                                _format_openai_sse_chunk("", model, true, finish_reason)
+                                _format_openai_sse_chunk(
+                                    "", model, completion_id, created, true, finish_reason
+                                )
                                 + "data: [DONE]\n\n";
                             sink.write(final_chunk.data(), final_chunk.size());
                         } else {
@@ -832,7 +839,7 @@ void WEB::_execute_streaming_chat(
 
                     if (is_openai) {
                         formatted_chunk = _format_openai_sse_chunk(
-                            "", model, true, finish_reason
+                            "", model, completion_id, created, true, finish_reason
                         ) + "data: [DONE]\n\n";
                     } else {
                         formatted_chunk = _format_ollama_ndjson_chunk(
@@ -857,9 +864,9 @@ void WEB::_execute_streaming_chat(
                 // Send initial role chunk for OpenAI (first time only)
                 if (is_openai && !sent_initial_chunk) {
                     nlohmann::json initial_chunk;
-                    initial_chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+                    initial_chunk["id"] = completion_id;
                     initial_chunk["object"] = "chat.completion.chunk";
-                    initial_chunk["created"] = std::time(nullptr);
+                    initial_chunk["created"] = created;
                     initial_chunk["model"] = model;
                     initial_chunk["system_fingerprint"] = "fp_sima_vlm";
 
@@ -885,7 +892,7 @@ void WEB::_execute_streaming_chat(
                         ttft_sent = true;
                     }
                     formatted_chunk = _format_openai_sse_chunk(
-                        text, model, false, std::nullopt,
+                        text, model, completion_id, created, false, std::nullopt,
                         ttft_for_chunk,
                         tps_value,
                         from_draft

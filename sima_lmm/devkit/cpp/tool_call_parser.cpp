@@ -366,6 +366,19 @@ nlohmann::json parse_gemma_tool_calls(
         if (entry.is_null()) return nullptr;
         result.push_back(std::move(entry));
         pos = close + 1;
+
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+            ++pos;
+        }
+        if (text.substr(pos).starts_with(gemma_close)) {
+            pos += gemma_close.size();
+            while (pos < text.size() &&
+                   std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+                ++pos;
+            }
+            if (!text.substr(pos).starts_with(gemma_open)) return nullptr;
+            pos += gemma_open.size();
+        }
     }
     return result.empty() ? nullptr : result;
 }

@@ -3,6 +3,7 @@
 #define _SIMA_LLIMA_WEB_
 
 #include <csignal>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -59,6 +60,8 @@ class EXPORT WEB {
         std::string _format_openai_sse_chunk(
             const std::string& content,
             const std::string& model,
+            const std::string& completion_id,
+            std::time_t created,
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
