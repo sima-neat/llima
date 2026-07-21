@@ -520,6 +520,11 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
         const bool should_group_prefill = (
             use_group_prefill && _use_group_token_models && group_size > 1
         );
+        if (!should_group_prefill) {
+            // Single-token scoring rewrites the model cache from token zero without going
+            // through run_model_prefill(), so the cached-token metadata is no longer valid.
+            _cached_token_ids.clear();
+        }
         if (should_group_prefill) {
             create_input_buffers(input_token_ids);
 
