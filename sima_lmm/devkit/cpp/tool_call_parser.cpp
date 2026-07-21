@@ -134,7 +134,20 @@ std::string gemma4_bare_to_json(const std::string& text) {
     static const std::regex quote_marker(R"(<\|"\|>)");
     static const std::regex unquoted_key(R"((\w+)\s*:)");
     static const std::regex unquoted_val(R"(:\s*([^{}\[\]",\s][^{}\[\]",]*))");
-    std::string normalized_quotes = std::regex_replace(text, quote_marker, "\"");
+    std::string protected_text;
+    bool in_marker_string = false;
+    for (size_t pos = 0; pos < text.size();) {
+        if (text.substr(pos).starts_with(gemma_quote)) {
+            in_marker_string = !in_marker_string;
+            protected_text.append(gemma_quote.data(), gemma_quote.size());
+            pos += gemma_quote.size();
+        } else {
+            protected_text += in_marker_string && text[pos] == ':' ? "\\u003a" :
+                std::string(1, text[pos]);
+            ++pos;
+        }
+    }
+    std::string normalized_quotes = std::regex_replace(protected_text, quote_marker, "\"");
     std::string with_quoted_keys = std::regex_replace(normalized_quotes, unquoted_key, "\"$1\":");
 
     std::string result;
@@ -272,9 +285,37 @@ std::optional<nlohmann::json> parse_python_value(std::string_view value) {
         std::string result;
         for (size_t idx = 1; idx + 1 < value.size(); ++idx) {
             if (value[idx] == '\\' && idx + 2 < value.size()) {
-                ++idx;
+                const char escaped = value[++idx];
+                switch (escaped) {
+                    case '\\': case '\'': case '"': result += escaped; break;
+                    case 'n': result += '\n'; break;
+                    case 'r': result += '\r'; break;
+                    case 't': result += '\t'; break;
+                    case 'b': result += '\b'; break;
+                    case 'f': result += '\f'; break;
+                    case 'u':
+                        if (idx + 4 < value.size() &&
+                            std::all_of(value.begin() + idx + 1, value.begin() + idx + 5,
+                                        [](char c) { return std::isxdigit(
+                                            static_cast<unsigned char>(c)) != 0; })) {
+                            const auto decoded = nlohmann::json::parse(
+                                "\"\\u" + std::string(value.substr(idx + 1, 4)) + "\"",
+                                nullptr, false);
+                            if (decoded.is_string()) {
+                                result += decoded.get<std::string>();
+                                idx += 4;
+                                break;
+                            }
+                        }
+                        [[fallthrough]];
+                    default:
+                        result += '\\';
+                        result += escaped;
+                        break;
+                }
+                continue;
             }
-            result.push_back(value[idx]);
+            result += value[idx];
         }
         return result;
     }
