@@ -36,6 +36,7 @@ constexpr std::string_view lfm_close = "<|tool_call_end|>";
 constexpr std::string_view gemma_open = "<|tool_call>";
 constexpr std::string_view gemma_close = "<tool_call|>";
 constexpr std::string_view gemma_call = "call:";
+constexpr std::string_view gemma_quote = R"(<|"|>)";
 constexpr std::string_view mistral_prefix = "[TOOL_CALLS]";
 constexpr std::string_view qwen_open = "<tool_call>";
 constexpr std::string_view qwen_close = "</tool_call>";
@@ -85,13 +86,25 @@ nlohmann::json build_tool_call_entry(
     };
 }
 
-size_t find_matching_brace(std::string_view text, size_t start) {
+size_t find_matching_brace(
+    std::string_view text,
+    size_t start,
+    std::string_view quote_marker = {}
+) {
     if (start >= text.size() || text[start] != '{') return std::string_view::npos;
 
     int depth = 0;
     bool in_string = false;
+    bool in_marker_string = false;
     bool escaped = false;
     for (size_t idx = start; idx < text.size(); ++idx) {
+        if (!in_string && !quote_marker.empty() && text.substr(idx).starts_with(quote_marker)) {
+            in_marker_string = !in_marker_string;
+            idx += quote_marker.size() - 1;
+            continue;
+        }
+        if (in_marker_string) continue;
+
         const char current = text[idx];
         if (in_string) {
             if (escaped) {
@@ -123,7 +136,28 @@ std::string gemma4_bare_to_json(const std::string& text) {
     static const std::regex unquoted_val(R"(:\s*([^{}\[\]",\s][^{}\[\]",]*))");
     std::string normalized_quotes = std::regex_replace(text, quote_marker, "\"");
     std::string with_quoted_keys = std::regex_replace(normalized_quotes, unquoted_key, "\"$1\":");
-    return std::regex_replace(with_quoted_keys, unquoted_val, ":\"$1\"");
+
+    std::string result;
+    size_t previous = 0;
+    for (std::sregex_iterator it(with_quoted_keys.begin(), with_quoted_keys.end(), unquoted_val), end;
+         it != end; ++it) {
+        const auto& match = *it;
+        const auto match_pos = static_cast<size_t>(match.position());
+        const auto value_pos = static_cast<size_t>(match.position(1) - match.position());
+        const auto raw_value = match.str(1);
+        const auto value = trim_view(raw_value);
+
+        result.append(with_quoted_keys, previous, match_pos - previous);
+        result.append(match.str(), 0, value_pos);
+        const auto parsed = nlohmann::json::parse(std::string(value), nullptr, false);
+        result += parsed.is_discarded()
+            ? nlohmann::json(std::string(value)).dump()
+            : std::string(value);
+        result += raw_value.substr(value.size());
+        previous = match_pos + static_cast<size_t>(match.length());
+    }
+    result.append(with_quoted_keys, previous, std::string::npos);
+    return result;
 }
 
 nlohmann::json parse_json_array_tool_calls(
@@ -322,7 +356,7 @@ nlohmann::json parse_gemma_tool_calls(
         const auto brace = text.find('{', pos);
         if (brace == std::string_view::npos) return nullptr;
         const auto name = trim_view(text.substr(pos, brace - pos));
-        const auto close = find_matching_brace(text, brace);
+        const auto close = find_matching_brace(text, brace, gemma_quote);
         if (close == std::string_view::npos) return nullptr;
         const auto arguments = gemma4_bare_to_json(
             std::string(text.substr(brace, close - brace + 1)));
