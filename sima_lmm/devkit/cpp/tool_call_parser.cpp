@@ -487,7 +487,7 @@ ToolCallFormat tool_call_format_for_model(std::string_view model_type) {
         return ToolCallFormat::Mistral;
     }
     if (model_type == "llm-qwen2" || model_type == "llm-qwen3" ||
-        model_type == "vlm-qwen3_vl") {
+        model_type == "vlm-qwen2_5_vl" || model_type == "vlm-qwen3_vl") {
         return ToolCallFormat::Qwen;
     }
     if (model_type == "llm-llama") {
