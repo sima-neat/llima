@@ -266,6 +266,10 @@ class LanguageModel : public BaseModel<VlmConfig> {
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }
+        bool _uses_cpu_dequantized_embeddings() const {
+            return _cfg.pipeline_cfg.quantize_embeddings
+                && _cfg.vm_cfg.has_value() && _cfg.mm_cfg.has_value();
+        }
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
         void _save_state_checkpoint(
             size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
@@ -273,12 +277,16 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
+        void _dequantize_embedding_row(
+            uint32_t token_id, MLABuffer& dst, size_t dst_row = 0
+        );
         std::vector<uint32_t> _get_per_layer_token_ids(
             std::span<const uint32_t> input_token_ids
         ) const;
         void _upload_per_layer_embedding_rows(
             std::span<const uint32_t> token_ids, uint16_t num_tokens
         );
+        void _load_per_layer_embeddings();
         void _compute_and_upload_per_layer_inputs_prefill(
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
@@ -314,7 +322,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         bool _has_image_token;
 
         Eigen::bfloat16* _embeddings_tensor_ptr;
-        std::vector<Eigen::bfloat16> _per_layer_embeddings_tensor;
+        size_t _per_layer_embedding_rows_per_shard = 0;
+        std::vector<MLABuffer*> _per_layer_embedding_shards;
         std::vector<uint32_t> _prompt_per_layer_token_ids;
         std::vector<uint32_t> _cached_token_ids;
         uint32_t _cached_first_generated_token;
