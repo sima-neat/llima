@@ -203,8 +203,7 @@ SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
   --version "${WHEEL_VERSION}" \
   --description "Pure-Python LLiMa compiler wheel" \
   --install-script 'bash ./install_compiler.sh' \
-  --download-compatible-files-only \
-  --host-platform linux
+  --download-compatible-files-only
 
 "${PYTHON_BIN}" - \
   "${OUTPUT_DIR}/metadata.json" \

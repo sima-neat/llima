@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${SIMA_LLIMA_COMPILER_PYTHON:-python}"
+PYTHON_BIN="${SIMA_LLIMA_COMPILER_PYTHON:-python3}"
 
 usage() {
   cat <<EOF
@@ -13,7 +13,7 @@ verified wheel packaged beside this installer. Existing Model Compiler
 dependencies are preserved.
 
 Environment:
-  SIMA_LLIMA_COMPILER_PYTHON  Active Model Compiler Python (default: python)
+  SIMA_LLIMA_COMPILER_PYTHON  Active Model Compiler Python (default: python3)
 EOF
 }
 

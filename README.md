@@ -154,7 +154,25 @@ draft model when running EAGLE3 speculative decoding in CLI mode.
 The Python wheel path is used for SDK/build-facing workflows and optional
 dependency sets.
 
-Build and validate a pure Python SDK/compiler wheel:
+### Install the Model Compiler tooling in editable mode
+
+For active compiler development, create a Python 3.12 environment and install
+LLiMa with the `sdk` dependencies. Disabling the CMake portion keeps this a
+pure-Python compiler installation:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[sdk]" \
+  -Cwheel.cmake=false \
+  -Cbuild-dir="build/compiler-editable/{wheel_tag}"
+llima-compile --help
+```
+
+### Build wheel artifacts
+
+Build and validate the pure-Python compiler wheel and stage its MoLE profile:
 
 ```bash
 ./build_compiler_wheel.sh
@@ -189,21 +207,41 @@ dist/
     └── metadata.json
 ```
 
-To replace `sima_lmm` in an existing Model Compiler environment, activate that
-environment and run the packaged installer. It verifies the wheel checksum,
-requires the Model Compiler `afe` package, uninstalls the old `sima_lmm`, and
-installs the new wheel without changing the compiler environment's proprietary
-dependencies:
+### Install a published Model Compiler artifact
+
+Activate an existing Model Compiler environment, then install the latest
+published compiler artifact from the default branch:
+
+```bash
+source <model-compiler-venv>/bin/activate
+sima-cli neat install llima/compiler
+```
+
+To install the latest artifact published for a specific branch:
+
+```bash
+source <model-compiler-venv>/bin/activate
+sima-cli neat install llima/compiler@<branch>
+```
+
+The compiler installer verifies the wheel checksum, requires the Model
+Compiler `afe` package, replaces the old `sima_lmm`, and preserves the
+environment's existing proprietary dependencies.
+
+To install a compiler wheel built locally instead, activate the Model Compiler
+environment and run the installer staged beside the wheel:
 
 ```bash
 source <model-compiler-venv>/bin/activate
 ./dist/compiler/install_compiler.sh
 ```
 
+### Install MoLE
+
 For a persistent MoLE installation with a dedicated virtual environment, run:
 
 ```bash
-./dist/mole/install_mole.sh
+sima-cli neat install llima/mole
 ```
 
 ## Documentation
