@@ -517,6 +517,9 @@ uint32_t LanguageModel::run_model_once(
             const bool is_draft = _cfg.lm_cfg.is_spec_decode()
                 && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
             const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+            // Using the single post for the target's final layer is valid only when the
+            // draft does not require that layer's hidden states. If it does, use the
+            // group post for the final layer so all group hidden states remain available.
             const bool use_single_post_for_target_group = (
                 _cfg.lm_cfg.is_spec_decode()
                 && !is_draft
