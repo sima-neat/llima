@@ -81,8 +81,7 @@ else:
     print(f"[compiler-install] Replacing {dist.metadata['Name']} {dist.version}")
 PY
 
-"${PYTHON_BIN}" -m pip uninstall -y sima_lmm
-"${PYTHON_BIN}" -m pip install --no-deps "${WHEEL_PATH}"
+"${PYTHON_BIN}" -m pip install --force-reinstall --no-deps "${WHEEL_PATH}"
 
 "${PYTHON_BIN}" - "${VIRTUAL_ENV}" <<'PY'
 import importlib.metadata as metadata
