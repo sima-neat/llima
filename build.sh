@@ -823,6 +823,12 @@ stage_package_artifacts() {
     return
   fi
 
+  if [[ -n "${NEAT_INTERNALS_PACKAGE_DIR}" &&
+        ! "${NEAT_INTERNALS_RESOLVED_REF}" =~ ^[^:[:space:]]+:[^:[:space:]]+$ ]]; then
+    echo "ERROR: NEAT_INTERNALS_RESOLVED_REF must be an exact branch:spec reference when NEAT_INTERNALS_PACKAGE_DIR is used for a publishable artifact." >&2
+    return 1
+  fi
+
   local version="$1"
   local deb
   local -a internals_debs=()
@@ -886,7 +892,8 @@ package_dist_archive() {
 
 read_package_compatibility_args() {
   local -n out_ref="$1"
-  mapfile -t out_ref < <(python3 - "${NEAT_INTERNALS_MANIFEST}" <<'PY'
+  local compatibility_args
+  if ! compatibility_args="$(python3 - "${NEAT_INTERNALS_MANIFEST}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -905,7 +912,11 @@ for argument in (
 ):
     print(argument)
 PY
-  )
+  )"; then
+    echo "ERROR: Failed to read package compatibility from ${NEAT_INTERNALS_MANIFEST}." >&2
+    return 1
+  fi
+  mapfile -t out_ref <<< "${compatibility_args}"
 }
 
 add_package_source_metadata() {
