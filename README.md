@@ -154,17 +154,58 @@ draft model when running EAGLE3 speculative decoding in CLI mode.
 The Python wheel path is used for SDK/build-facing workflows and optional
 dependency sets.
 
-Build a pure Python SDK wheel:
+Build and validate a pure Python SDK/compiler wheel:
 
 ```bash
-python3 -m build --wheel -Cbuild-dir="build/{wheel_tag}" -Cwheel.cmake=false
+./build_compiler_wheel.sh
+./build_mole_package.sh
 ```
 
-Install the wheel with an optional dependency set:
+Both packaging scripts create or reuse the shared
+`build/wheel-tools-venv` Python 3.12 environment. The helper installs the
+`build` package there when needed and does not modify the system Python.
+
+Wheel versions follow the Debian package policy. Exact release tags produce the
+tag version; branch builds use the base version from `deps/manifest.json` plus
+the normalized branch and 12-character commit, for example
+`0.3.0+develop.0123456789ab`. Set `LLIMA_WHEEL_VERSION` only when an explicit
+version override is required.
+
+The compiler wheel, checksum, guarded Model Compiler installer, provenance
+manifest, and package metadata are written to `dist/compiler/`. The same
+verified wheel is staged with the MoLE installer and package metadata in
+`dist/mole/`.
+
+```text
+dist/
+├── compiler/
+│   ├── sima_lmm-<version>-py3-none-any.whl
+│   ├── sima_lmm-<version>-py3-none-any.whl.sha256
+│   ├── install_compiler.sh
+│   ├── manifest.json
+│   └── metadata.json
+└── mole/
+    ├── sima_lmm-<version>-py3-none-any.whl
+    ├── sima_lmm-<version>-py3-none-any.whl.sha256
+    ├── install_mole.sh
+    └── metadata.json
+```
+
+To replace `sima_lmm` in an existing Model Compiler environment, activate that
+environment and run the packaged installer. It verifies the wheel checksum,
+requires the Model Compiler `afe` package, uninstalls the old `sima_lmm`, and
+installs the new wheel without changing the compiler environment's proprietary
+dependencies:
 
 ```bash
-python3 -m pip install "dist/sima_lmm-*.whl[sdk]"
-python3 -m pip install "dist/sima_lmm-*.whl[sdk_ext]"
+source <model-compiler-venv>/bin/activate
+./dist/compiler/install_compiler.sh
+```
+
+For a persistent MoLE installation with a dedicated virtual environment, run:
+
+```bash
+./dist/mole/install_mole.sh
 ```
 
 ## Documentation
