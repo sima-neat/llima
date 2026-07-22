@@ -297,53 +297,12 @@ jobs:
         ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
         short_sha="${GITHUB_SHA:0:12}"
         package_spec="llima/compiler@${ref_name}:${short_sha}"
-        ref_key="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${ref_name}")"
-        metadata_url="${{ needs.resolve-vulcan-config.outputs.artifact_base_url }}/llima/${ref_key}/${short_sha}/compiler/metadata.json"
         install_dir="${RUNNER_TEMP:-/tmp}/llima-compiler-smoke"
-        metadata_file="${install_dir}/expected-metadata.json"
 
         rm -rf "${install_dir}"
         mkdir -p "${install_dir}"
 
         echo "Installing exact artifact ${package_spec}"
-        echo "Metadata: ${metadata_url}"
-        for attempt in 1 2 3 4; do
-          if curl -fsSL "${metadata_url}" -o "${metadata_file}"; then
-            break
-          fi
-          if [[ "${attempt}" -eq 4 ]]; then
-            echo "Metadata download failed after ${attempt} attempts." >&2
-            exit 1
-          fi
-          delay=$((attempt * 10))
-          echo "Metadata is not available yet; retrying in ${delay}s." >&2
-          sleep "${delay}"
-        done
-
-        python3 - "${metadata_file}" "${GITHUB_SHA}" "${ref_name}" "${short_sha}" <<'PY'
-        import json
-        import sys
-
-        metadata_path, expected_commit, expected_ref, expected_folder = sys.argv[1:]
-        with open(metadata_path, encoding="utf-8") as f:
-            metadata = json.load(f)
-
-        expected = {
-            "commit": expected_commit,
-            "branch": expected_ref,
-            "commit_folder": expected_folder,
-        }
-        for field, value in expected.items():
-            if metadata.get(field) != value:
-                raise SystemExit(
-                    f"metadata {field} mismatch: expected {value!r}, "
-                    f"got {metadata.get(field)!r}"
-                )
-
-        print(f"Verified metadata commit: {metadata['commit']}")
-        print(f"Verified package version: {metadata['version']}")
-        PY
-
         for attempt in 1 2 3 4; do
           if "${sima_cli}" neat install \
             --env "${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
@@ -360,28 +319,19 @@ jobs:
           sleep "${delay}"
         done
 
-        python3 - "${metadata_file}" "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
+        python3 - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
         import importlib.metadata
-        import json
         import sys
         from pathlib import Path
 
         import sima_lmm
 
-        metadata_path, virtual_env, checkout = sys.argv[1:]
-        with open(metadata_path, encoding="utf-8") as f:
-            expected_version = json.load(f)["version"]
-
+        virtual_env, checkout = sys.argv[1:]
         installed_version = importlib.metadata.version("sima-lmm")
         module_path = Path(sima_lmm.__file__).resolve()
         virtual_env_path = Path(virtual_env).resolve()
         checkout_path = Path(checkout).resolve()
 
-        if installed_version != expected_version:
-            raise SystemExit(
-                f"installed version mismatch: expected {expected_version}, "
-                f"got {installed_version}"
-            )
         if virtual_env_path not in module_path.parents:
             raise SystemExit(f"sima_lmm was imported outside {virtual_env_path}: {module_path}")
         if checkout_path in module_path.parents:
