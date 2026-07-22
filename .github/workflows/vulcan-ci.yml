@@ -30,6 +30,10 @@ jobs:
     with:
       vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
 
+  resolve-test-runner:
+    name: Resolve Test Runner
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-modalix-runner.yml@main
+
   build:
     name: Build all LLiMa packages on one Vulcan instance
     needs: resolve-vulcan-config
@@ -120,8 +124,8 @@ jobs:
       post_build_command: |
         set -euo pipefail
 
-        mapfile -t ARCHIVES < <(find dist -maxdepth 1 -type f -name 'sima-llima-*.tar.gz' | sort)
-        mapfile -t SHA_FILES < <(find dist -maxdepth 1 -type f -name 'sima-llima-*.tar.gz.sha256' | sort)
+        mapfile -t ARCHIVES < <(find dist/debs -maxdepth 1 -type f -name 'sima-llima-*.tar.gz' | sort)
+        mapfile -t SHA_FILES < <(find dist/debs -maxdepth 1 -type f -name 'sima-llima-*.tar.gz.sha256' | sort)
 
         if [[ "${#ARCHIVES[@]}" -ne 1 || "${#SHA_FILES[@]}" -ne 1 ]]; then
           echo "Expected exactly one commit-addressed LLiMa dist archive and sha256 file." >&2
@@ -139,7 +143,10 @@ jobs:
         fi
 
         test -f "${primary_archive}.sha256"
-        sha256sum -c <(awk -v file="$(basename "${primary_archive}")" '{print $1 "  dist/" file}' "${primary_archive}.sha256")
+        (
+          cd dist/debs
+          sha256sum -c <(awk -v file="$(basename "${primary_archive}")" '{print $1 "  " file}' "$(basename "${primary_archive}").sha256")
+        )
         llima_version="$(bash tools/compute_package_version.sh)"
         if [[ -z "${llima_version}" ]]; then
           echo "Unable to compute LLiMa package version." >&2
@@ -148,11 +155,107 @@ jobs:
         test -f "dist/sima-lmm-${llima_version}-Linux-core.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-dev.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-cli.deb"
+        test -f "dist/debs/sima-lmm-${llima_version}-Linux-core.deb"
+        test -f "dist/debs/sima-lmm-${llima_version}-Linux-dev.deb"
+        test -f "dist/debs/sima-lmm-${llima_version}-Linux-cli.deb"
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-core.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-dev.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-cli.deb" >/dev/null
         test -f dist/metadata.json
+        test -f dist/debs/metadata.json
+        test -x dist/install_llima.sh
+        test -f dist/llima-install-manifest.txt
+        test -f dist/resolved-deps-manifest.json
         python3 -m json.tool dist/metadata.json >/dev/null
+        python3 -m json.tool dist/debs/metadata.json >/dev/null
+
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+
+        dist = Path("dist")
+        llima_debs = sorted(path.name for path in dist.glob("sima-lmm-*.deb"))
+        internals_debs = sorted(
+            path.name for path in dist.glob("*.deb")
+            if not path.name.startswith("sima-lmm-")
+        )
+        if len(llima_debs) != 3:
+            raise SystemExit(f"expected three root LLiMa DEBs, got {llima_debs!r}")
+        if not internals_debs:
+            raise SystemExit("root bundle does not contain Internals DEBs")
+
+        manifest_entries = [
+            line.strip()
+            for line in (dist / "llima-install-manifest.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        expected_debs = sorted(llima_debs + internals_debs)
+        if sorted(manifest_entries) != expected_debs:
+            raise SystemExit(
+                "install manifest does not match root DEBs:\n"
+                f"  manifest={sorted(manifest_entries)!r}\n"
+                f"  expected={expected_debs!r}"
+            )
+
+        resolved = json.loads(
+            (dist / "resolved-deps-manifest.json").read_text(encoding="utf-8")
+        )
+        internals_ref = resolved.get("internals")
+        if not isinstance(internals_ref, str) or ":" not in internals_ref:
+            raise SystemExit(f"Internals ref is not exact: {internals_ref!r}")
+        source_manifest = json.loads(Path("deps/manifest.json").read_text(encoding="utf-8"))
+        platform_version = source_manifest.get("platform-version")
+
+        root_metadata = json.loads((dist / "metadata.json").read_text(encoding="utf-8"))
+        root_resources = set(root_metadata.get("resources", []))
+        expected_root_resources = {
+            path.name for path in dist.iterdir()
+            if path.is_file() and path.name != "metadata.json"
+        }
+        if root_resources != expected_root_resources:
+            raise SystemExit(
+                f"unexpected root metadata resources: {sorted(root_resources)!r}; "
+                f"expected {sorted(expected_root_resources)!r}"
+            )
+
+        debs_metadata = json.loads(
+            (dist / "debs" / "metadata.json").read_text(encoding="utf-8")
+        )
+        if set(debs_metadata.get("resources", [])) != set(llima_debs):
+            raise SystemExit("llima/debs metadata must contain only the three LLiMa DEBs")
+
+        expected_ref = os.environ.get("GITHUB_HEAD_REF") or os.environ["GITHUB_REF_NAME"]
+        for label, metadata in (("root", root_metadata), ("debs", debs_metadata)):
+            if metadata.get("commit") != os.environ["GITHUB_SHA"]:
+                raise SystemExit(f"{label} metadata commit mismatch")
+            if metadata.get("branch") != expected_ref:
+                raise SystemExit(f"{label} metadata ref mismatch")
+            if metadata.get("artifact", {}).get("internals_ref") != internals_ref:
+                raise SystemExit(f"{label} metadata Internals ref mismatch")
+            expected_platforms = {
+                ("board", platform_version, ("modalix",)),
+                ("palette", platform_version, ()),
+            }
+            actual_platforms = {
+                (
+                    platform.get("type"),
+                    platform.get("version"),
+                    tuple(platform.get("compatible_with", [])),
+                )
+                for platform in metadata.get("platforms", [])
+            }
+            if actual_platforms != expected_platforms:
+                raise SystemExit(f"{label} metadata platform compatibility mismatch")
+            for resource, checksum in metadata.get("resources-checksum", {}).items():
+                resource_path = dist / resource if label == "root" else dist / "debs" / resource
+                actual = hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                if actual != checksum:
+                    raise SystemExit(f"checksum mismatch: {label}/{resource}")
+
+        print(f"Verified {len(internals_debs)} exact Internals DEBs in root bundle")
+        PY
 
         python3 - <<'PY'
         import hashlib
@@ -240,8 +343,8 @@ jobs:
         PY
 
         dist_file_count="$(find dist -type f | wc -l)"
-        if [[ "${dist_file_count}" -lt 12 ]]; then
-          echo "Expected at least 12 files across Debian, compiler, and MoLE artifacts; found ${dist_file_count}." >&2
+        if [[ "${dist_file_count}" -lt 20 ]]; then
+          echo "Expected at least 20 files across root, Debian, compiler, and MoLE artifacts; found ${dist_file_count}." >&2
           find dist -type f -printf '  %p\n' | sort >&2
           exit 1
         fi
@@ -264,15 +367,77 @@ jobs:
       artifact_folder: "."
       artifact_pattern: sima-llima-dist
       artifact_glob: "**/*"
-      min_artifact_count: 12
+      min_artifact_count: 20
       publish_manifest: true
+
+  test-devkit:
+    name: Test LLiMa root artifact on DevKit
+    needs:
+      - resolve-vulcan-config
+      - resolve-test-runner
+      - publish-vulcan-artifacts
+    runs-on:
+      group: ${{ needs.resolve-test-runner.outputs.modalix_runner_group }}
+      labels: [self-hosted, Linux, ARM64, modalix, "vulcan-${{ needs.resolve-vulcan-config.outputs.vulcan_env }}"]
+    env:
+      VULCAN_ENV: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      SIMA_CLI_CHECK_FOR_UPDATE: "0"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Install exact root artifact
+        env:
+          DEVKIT_PASSWORD: ${{ secrets.DEVKIT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if ! command -v sima-cli >/dev/null 2>&1; then
+            echo "sima-cli not found on the Modalix test runner." >&2
+            exit 1
+          fi
+
+          rm -rf _work/llima-install
+          mkdir -p _work/llima-install
+          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          short_sha="${GITHUB_SHA:0:12}"
+          package_spec="llima@${ref_name}:${short_sha}"
+          echo "Installing ${package_spec} from Vulcan env ${VULCAN_ENV}"
+
+          for attempt in 1 2 3 4; do
+            if sima-cli neat install \
+              --env "${VULCAN_ENV}" \
+              -d _work/llima-install \
+              "${package_spec}"; then
+              break
+            fi
+            if [[ "${attempt}" -eq 4 ]]; then
+              echo "Artifact installation failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            delay=$((attempt * 10))
+            echo "Artifact installation attempt ${attempt} failed; retrying in ${delay}s." >&2
+            sleep "${delay}"
+          done
+
+      - name: Verify installed LLiMa runtime
+        run: |
+          set -euo pipefail
+          test -f _work/llima-install/resolved-deps-manifest.json
+          python3 -m json.tool _work/llima-install/resolved-deps-manifest.json >/dev/null
+          dpkg-query -W sima-lmm-core sima-lmm-cli sima-lmm-dev
+          llima --help >/dev/null
+          python3 -c 'import sima_lmm'
 
   promote-latest-tag:
     name: Promote Vulcan latest tag
-    if: ${{ github.ref_type == 'branch' || github.ref_type == 'tag' }}
+    if: ${{ always() && (github.ref_type == 'branch' || github.ref_type == 'tag') && needs.test-devkit.result == 'success' }}
     needs:
       - resolve-vulcan-config
-      - publish-vulcan-artifacts
+      - test-devkit
     uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
     with:
       aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}

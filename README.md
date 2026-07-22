@@ -28,24 +28,36 @@ The Model Compiler tooling is delivered as a Python wheel:
 - `sima-lmm[sdk]`: compiler SDK dependencies, including internal SiMa packages.
 - `sima-lmm[sdk_ext]`: external MoLE, benchmark, and evaluation dependencies.
 
-## Download Runtime Packages
+## Install Runtime Packages
 
-Download the latest LLiMa Debian packages with `sima-cli`:
+Install the latest LLiMa runtime and its exact Internals dependencies on a
+Modalix DevKit with `sima-cli`:
 
 ```bash
 sima-cli neat install llima
 ```
 
-To download a specific release, branch, or artifact reference, include it in the
+To install a specific release, branch, or artifact reference, include it in the
 target:
 
 ```bash
 sima-cli neat install llima@<version-or-ref>
 ```
 
-Despite the command name, this downloads the CLI, C++ runtime, and development
-packages to the current directory; it does not install them. Use `sima-cli neat
-install --help` for the full target syntax and environment options.
+The root artifact contains `install_llima.sh`, an explicit install manifest, the
+three LLiMa Debian packages, and every Debian package from the exact resolved
+Internals artifact used for the build.
+
+Build consumers that only need to download the three LLiMa Debian packages can
+use the download-only subpackage:
+
+```bash
+sima-cli neat install llima/debs@<version-or-ref>
+```
+
+This preserves the previous LLiMa artifact behavior and does not install the
+downloaded packages. Use `sima-cli neat install --help` for the full target
+syntax and environment options.
 
 ## Build LLiMa
 
@@ -59,14 +71,15 @@ Common build modes:
 
 ```bash
 ./build.sh --install-deps-only   # install host build dependencies
-./build.sh --all --clean         # build all runtime debs and dist archive
+./build.sh --all --clean         # build all runtime debs and artifact layouts
 ./build.sh --clean --core        # package only sima-lmm-core
 ./build.sh --clean --core --dev  # package core and development files
-./build.sh --no-dist             # build debs without a dist tarball
+./build.sh --no-dist             # build debs without publication layouts
 ```
 
-Build output is generated under `build-deb/`. Debian packages are written to the
-repository root, and the release archive is written to `dist/`.
+Build output is generated under `build-deb/`. The installable bundle is written
+to `dist/`; its download-only three-package profile and archive are written to
+`dist/debs/`.
 
 On a fresh DevKit, install the native build requirements first:
 
@@ -189,14 +202,26 @@ the normalized branch and 12-character commit, for example
 `0.3.0+develop.0123456789ab`. Set `LLIMA_WHEEL_VERSION` only when an explicit
 version override is required.
 
-The compiler wheel, guarded Model Compiler installer, and package metadata are
-written to `dist/compiler/`. The same verified wheel is staged with the MoLE
-installer and package metadata in `dist/mole/`. As in Core packages, artifact
-checksums are recorded in each profile's `metadata.json` rather than published
-as separate checksum files.
+The root of `dist/` is the installable DevKit bundle. The compiler wheel,
+guarded Model Compiler installer, and package metadata are written to
+`dist/compiler/`. The same verified wheel is staged with the MoLE installer and
+package metadata in `dist/mole/`. As in Core packages, artifact checksums are
+recorded in each profile's `metadata.json`; the legacy Debian archive keeps its
+separate checksum file under `dist/debs/`.
 
 ```text
 dist/
+├── sima-lmm-<version>-Linux-{core,dev,cli}.deb
+├── <resolved Internals packages>.deb
+├── install_llima.sh
+├── llima-install-manifest.txt
+├── resolved-deps-manifest.json
+├── metadata.json
+├── debs/
+│   ├── sima-lmm-<version>-Linux-{core,dev,cli}.deb
+│   ├── sima-llima-<ref>.tar.gz
+│   ├── sima-llima-<ref>.tar.gz.sha256
+│   └── metadata.json
 ├── compiler/
 │   ├── sima_lmm-<version>-py3-none-any.whl
 │   ├── install_compiler.sh
