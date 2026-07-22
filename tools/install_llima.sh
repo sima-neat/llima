@@ -133,10 +133,16 @@ if ! apt-get install --simulate --reinstall --allow-downgrades "${debs[@]}" >"${
   echo "APT cannot satisfy the bundled LLiMa package transaction." >&2
   exit 1
 fi
-if grep -q '^Remv ' "${simulate_output}"; then
-  cat "${simulate_output}" >&2
-  echo "Refusing to install because APT would remove installed packages." >&2
-  exit 1
+mapfile -t removed_packages < <(awk '$1 == "Remv" {print $2}' "${simulate_output}")
+if [[ "${#removed_packages[@]}" -gt 0 ]]; then
+  for package in "${removed_packages[@]}"; do
+    if [[ "${package%%:*}" != "sima-neat" && "${package%%:*}" != "sima-neat-dev" ]]; then
+      cat "${simulate_output}" >&2
+      echo "Refusing to install because APT would remove ${package}." >&2
+      exit 1
+    fi
+  done
+  log "Removing incompatible Neat packages: ${removed_packages[*]}"
 fi
 
 log "Installing bundled Internals and LLiMa packages."
@@ -160,3 +166,6 @@ if ! command -v llima >/dev/null 2>&1; then
 fi
 llima --help >/dev/null
 log "LLiMa ${expected_version} installed successfully."
+if [[ "${#removed_packages[@]}" -gt 0 ]]; then
+  echo "WARNING: Removed incompatible Neat packages: ${removed_packages[*]}. Reinstall a Core package compatible with the bundled Internals before using Neat." >&2
+fi
