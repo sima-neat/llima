@@ -70,7 +70,20 @@ fi
 
 echo "[compiler-wheel] Version: ${WHEEL_VERSION}"
 
-LLIMA_WHEEL_VERSION="${WHEEL_VERSION}" "${PYTHON_BIN}" -m build \
+WHEEL_GIT_HASH="${GIT_HASH:-}"
+if [[ -z "${WHEEL_GIT_HASH}" && -n "${GITHUB_SHA:-}" ]]; then
+  WHEEL_GIT_HASH="${GITHUB_SHA:0:7}"
+fi
+if [[ -z "${WHEEL_GIT_HASH}" ]]; then
+  WHEEL_GIT_HASH="$(git -C "${ROOT_DIR}" rev-parse --short=7 HEAD 2>/dev/null || true)"
+fi
+if [[ -z "${WHEEL_GIT_HASH}" ]]; then
+  echo "ERROR: Unable to resolve the source commit for wheel metadata." >&2
+  exit 1
+fi
+
+GIT_HASH="${WHEEL_GIT_HASH}" LLIMA_WHEEL_VERSION="${WHEEL_VERSION}" \
+  "${PYTHON_BIN}" -m build \
   --wheel \
   --outdir "${OUTPUT_DIR}" \
   -Cbuild-dir="${BUILD_DIR}" \
@@ -183,92 +196,44 @@ fi
 SOURCE_REF="${SOURCE_REF:-detached}"
 SOURCE_SHA="${GITHUB_SHA:-$(git -C "${ROOT_DIR}" rev-parse HEAD)}"
 
+install -m 0755 "${INSTALLER_SOURCE}" "${OUTPUT_DIR}/install_compiler.sh"
+
+SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
+  --name "gh:sima-neat/llima/compiler" \
+  --version "${WHEEL_VERSION}" \
+  --description "Pure-Python LLiMa compiler wheel" \
+  --install-script 'bash ./install_compiler.sh' \
+  --download-compatible-files-only \
+  --host-platform linux
+
 "${PYTHON_BIN}" - \
-  "${OUTPUT_DIR}/manifest.json" \
+  "${OUTPUT_DIR}/metadata.json" \
   "${WHEEL_NAME}" \
-  "${WHEEL_VERSION}" \
   "${SOURCE_REPOSITORY}" \
   "${SOURCE_REF}" \
-  "${SOURCE_SHA}" \
-  "${GITHUB_RUN_ID:-}" \
-  "${GITHUB_RUN_ATTEMPT:-}" <<'PY'
-import hashlib
+  "${SOURCE_SHA}" <<'PY'
 import json
-import platform
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-(
-    manifest_path,
-    wheel_name,
-    wheel_version,
-    repository,
-    ref,
-    commit,
-    workflow_run_id,
-    workflow_run_attempt,
-) = sys.argv[1:]
-
-wheel_path = Path(manifest_path).parent / wheel_name
-manifest = {
-    "schema-version": 1,
-    "artifact": "llima-compiler-wheel",
-    "package": "sima-lmm",
-    "version": wheel_version,
-    "wheel": {
-        "filename": wheel_name,
-        "sha256": hashlib.sha256(wheel_path.read_bytes()).hexdigest(),
-        "size-bytes": wheel_path.stat().st_size,
-        "tag": "py3-none-any",
-    },
-    "source": {
-        "repository": repository,
-        "ref": ref,
-        "commit": commit,
-    },
-    "build": {
-        "python": platform.python_version(),
-        "architecture": platform.machine(),
-        "built-at-utc": datetime.now(timezone.utc).isoformat(),
-        "workflow-run-id": workflow_run_id,
-        "workflow-run-attempt": workflow_run_attempt,
-    },
-}
-Path(manifest_path).write_text(
-    json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-)
-PY
-
-install -m 0755 "${INSTALLER_SOURCE}" "${OUTPUT_DIR}/install_compiler.sh"
-
-SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
-  --name "gh:sima-neat/llima" \
-  --version "${WHEEL_VERSION}" \
-  --description "Pure-Python LLiMa compiler wheel" \
-  --install-script install_compiler.sh \
-  --download-compatible-files-only \
-  --host-platform linux
-
-"${PYTHON_BIN}" - "${OUTPUT_DIR}/metadata.json" "${OUTPUT_DIR}/manifest.json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
 metadata_path = Path(sys.argv[1])
-manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+wheel_name, repository, ref, commit = sys.argv[2:]
 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 metadata.update(
     {
         "artifact": {
             "type": "python-wheel",
+            "repository": "llima",
+            "package_path": "compiler",
             "profile": "compiler",
-            "wheel": manifest["wheel"]["filename"],
+            "wheel": wheel_name,
         },
-        "repository": manifest["source"]["repository"],
-        "branch": manifest["source"]["ref"],
-        "commit": manifest["source"]["commit"],
-        "published-artifact": "compiler",
+        "repository": repository,
+        "branch": ref,
+        "commit": commit,
+        "commit_folder": commit[:12],
+        "published_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 )
 metadata.setdefault("installation", {})["post-message"] = (
@@ -280,5 +245,4 @@ PY
 echo "[compiler-wheel] Built: ${WHEEL_PATH}"
 echo "[compiler-wheel] Checksum: ${WHEEL_PATH}.sha256"
 echo "[compiler-wheel] Installer: ${OUTPUT_DIR}/install_compiler.sh"
-echo "[compiler-wheel] Manifest: ${OUTPUT_DIR}/manifest.json"
 echo "[compiler-wheel] Metadata: ${OUTPUT_DIR}/metadata.json"

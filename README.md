@@ -171,10 +171,9 @@ the normalized branch and 12-character commit, for example
 `0.3.0+develop.0123456789ab`. Set `LLIMA_WHEEL_VERSION` only when an explicit
 version override is required.
 
-The compiler wheel, checksum, guarded Model Compiler installer, provenance
-manifest, and package metadata are written to `dist/compiler/`. The same
-verified wheel is staged with the MoLE installer and package metadata in
-`dist/mole/`.
+The compiler wheel, checksum, guarded Model Compiler installer, and package
+metadata are written to `dist/compiler/`. The same verified wheel is staged
+with the MoLE installer and package metadata in `dist/mole/`.
 
 ```text
 dist/
@@ -182,7 +181,6 @@ dist/
 │   ├── sima_lmm-<version>-py3-none-any.whl
 │   ├── sima_lmm-<version>-py3-none-any.whl.sha256
 │   ├── install_compiler.sh
-│   ├── manifest.json
 │   └── metadata.json
 └── mole/
     ├── sima_lmm-<version>-py3-none-any.whl

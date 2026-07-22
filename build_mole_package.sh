@@ -98,10 +98,10 @@ cp "${SOURCE_CHECKSUM}" "${OUTPUT_DIR}/${WHEEL_NAME}.sha256"
 install -m 0755 "${INSTALLER_SOURCE}" "${OUTPUT_DIR}/install_mole.sh"
 
 SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
-  --name "gh:sima-neat/llima-mole" \
+  --name "gh:sima-neat/llima/mole" \
   --version "${WHEEL_VERSION}" \
   --description "MoLE - Modalix Language Model Evaluator" \
-  --install-script install_mole.sh \
+  --install-script 'bash ./install_mole.sh' \
   --download-compatible-files-only \
   --host-platform linux
 
@@ -121,6 +121,7 @@ SOURCE_SHA="${GITHUB_SHA:-$(git -C "${ROOT_DIR}" rev-parse HEAD)}"
   "${SOURCE_SHA}" <<'PY'
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 metadata_path = Path(sys.argv[1])
@@ -130,13 +131,16 @@ metadata.update(
     {
         "artifact": {
             "type": "python-wheel",
+            "repository": "llima",
+            "package_path": "mole",
             "profile": "mole-sdk-ext",
             "wheel": wheel_name,
         },
         "repository": repository,
         "branch": ref,
         "commit": commit,
-        "published-artifact": "mole",
+        "commit_folder": commit[:12],
+        "published_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 )
 metadata.setdefault("installation", {})["post-message"] = (
