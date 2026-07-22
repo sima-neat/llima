@@ -102,8 +102,7 @@ SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
   --version "${WHEEL_VERSION}" \
   --description "MoLE - Modalix Language Model Evaluator" \
   --install-script 'bash ./install_mole.sh' \
-  --download-compatible-files-only \
-  --host-platform linux
+  --download-compatible-files-only
 
 SOURCE_REPOSITORY="${GITHUB_REPOSITORY:-sima-neat/llima}"
 SOURCE_REF="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
