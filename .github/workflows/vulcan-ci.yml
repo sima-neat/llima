@@ -285,7 +285,8 @@ jobs:
 
         export SIMA_CLI_CHECK_FOR_UPDATE=0
         ./scripts/ci/install_sima_cli_main.sh
-        export PATH="${HOME}/.sima-cli/.venv/bin:${PATH}"
+        sima_cli="${HOME}/.sima-cli/.venv/bin/sima-cli"
+        test -x "${sima_cli}"
 
         test "$(uname -m)" = "aarch64"
         test "${VULCAN_RUNNER_PROFILE}" = "model-compiler"
@@ -344,7 +345,7 @@ jobs:
         PY
 
         for attempt in 1 2 3 4; do
-          if sima-cli neat install \
+          if "${sima_cli}" neat install \
             --env "${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
             --install-dir "${install_dir}" \
             "${package_spec}"; then
