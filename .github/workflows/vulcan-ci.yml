@@ -267,12 +267,140 @@ jobs:
       min_artifact_count: 12
       publish_manifest: true
 
+  test-model-compiler:
+    name: Smoke test LLiMa on Model Compiler
+    needs:
+      - resolve-vulcan-config
+      - publish-vulcan-artifacts
+    uses: sima-neat/.github/.github/workflows/vulcan-build.yml@main
+    with:
+      vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      runner_profile: model-compiler
+      architecture: arm64
+      capacity: ${{ needs.resolve-vulcan-config.outputs.capacity }}
+      ensure_sdk_container: false
+      checkout_submodules: "false"
+      build_command: |
+        set -euo pipefail
+
+        export SIMA_CLI_CHECK_FOR_UPDATE=0
+        ./scripts/ci/install_sima_cli_main.sh
+        export PATH="${HOME}/.sima-cli/.venv/bin:${PATH}"
+
+        test "$(uname -m)" = "aarch64"
+        test "${VULCAN_RUNNER_PROFILE}" = "model-compiler"
+        test "${VIRTUAL_ENV}" = "/mnt/model-compiler"
+        test -x "${VIRTUAL_ENV}/bin/python3"
+        python3 -c 'import afe; print(f"Model Compiler afe: {afe.__file__}")'
+
+        ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+        short_sha="${GITHUB_SHA:0:12}"
+        package_spec="llima/compiler@${ref_name}:${short_sha}"
+        ref_key="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${ref_name}")"
+        metadata_url="${{ needs.resolve-vulcan-config.outputs.artifact_base_url }}/llima/${ref_key}/${short_sha}/compiler/metadata.json"
+        install_dir="${RUNNER_TEMP:-/tmp}/llima-compiler-smoke"
+        metadata_file="${install_dir}/expected-metadata.json"
+
+        rm -rf "${install_dir}"
+        mkdir -p "${install_dir}"
+
+        echo "Installing exact artifact ${package_spec}"
+        echo "Metadata: ${metadata_url}"
+        for attempt in 1 2 3 4; do
+          if curl -fsSL "${metadata_url}" -o "${metadata_file}"; then
+            break
+          fi
+          if [[ "${attempt}" -eq 4 ]]; then
+            echo "Metadata download failed after ${attempt} attempts." >&2
+            exit 1
+          fi
+          delay=$((attempt * 10))
+          echo "Metadata is not available yet; retrying in ${delay}s." >&2
+          sleep "${delay}"
+        done
+
+        python3 - "${metadata_file}" "${GITHUB_SHA}" "${ref_name}" "${short_sha}" <<'PY'
+        import json
+        import sys
+
+        metadata_path, expected_commit, expected_ref, expected_folder = sys.argv[1:]
+        with open(metadata_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+
+        expected = {
+            "commit": expected_commit,
+            "branch": expected_ref,
+            "commit_folder": expected_folder,
+        }
+        for field, value in expected.items():
+            if metadata.get(field) != value:
+                raise SystemExit(
+                    f"metadata {field} mismatch: expected {value!r}, "
+                    f"got {metadata.get(field)!r}"
+                )
+
+        print(f"Verified metadata commit: {metadata['commit']}")
+        print(f"Verified package version: {metadata['version']}")
+        PY
+
+        for attempt in 1 2 3 4; do
+          if sima-cli neat install \
+            --env "${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
+            --install-dir "${install_dir}" \
+            "${package_spec}"; then
+            break
+          fi
+          if [[ "${attempt}" -eq 4 ]]; then
+            echo "Compiler installation failed after ${attempt} attempts." >&2
+            exit 1
+          fi
+          delay=$((attempt * 10))
+          echo "Compiler installation attempt ${attempt} failed; retrying in ${delay}s." >&2
+          sleep "${delay}"
+        done
+
+        python3 - "${metadata_file}" "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
+        import importlib.metadata
+        import json
+        import sys
+        from pathlib import Path
+
+        import sima_lmm
+
+        metadata_path, virtual_env, checkout = sys.argv[1:]
+        with open(metadata_path, encoding="utf-8") as f:
+            expected_version = json.load(f)["version"]
+
+        installed_version = importlib.metadata.version("sima-lmm")
+        module_path = Path(sima_lmm.__file__).resolve()
+        virtual_env_path = Path(virtual_env).resolve()
+        checkout_path = Path(checkout).resolve()
+
+        if installed_version != expected_version:
+            raise SystemExit(
+                f"installed version mismatch: expected {expected_version}, "
+                f"got {installed_version}"
+            )
+        if virtual_env_path not in module_path.parents:
+            raise SystemExit(f"sima_lmm was imported outside {virtual_env_path}: {module_path}")
+        if checkout_path in module_path.parents:
+            raise SystemExit(f"sima_lmm was imported from the checkout: {module_path}")
+
+        print(f"Installed sima-lmm: {installed_version}")
+        print(f"Import provenance: {module_path}")
+        PY
+
+        command -v llima-compile
+        llima-compile --help >/dev/null
+        echo "LLiMa Model Compiler smoke test passed."
+
   promote-latest-tag:
     name: Promote Vulcan latest tag
     if: ${{ github.ref_type == 'branch' || github.ref_type == 'tag' }}
     needs:
       - resolve-vulcan-config
       - publish-vulcan-artifacts
+      - test-model-compiler
     uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
     with:
       aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}
