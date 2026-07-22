@@ -7,7 +7,10 @@ from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.model import EvalMode, FileGenMode, FileGenPrecision
-from sima_lmm.model.language_cache_model import LanguageCacheModel
+from sima_lmm.model.language_cache_model import (
+    LanguageCacheModel,
+    _get_bmm2_reduction_ranges,
+)
 
 from tests.model.model_setup import load_hf_test_model
 
@@ -15,6 +18,23 @@ MODEL_NAME = "models--google--gemma-3-1b-it"
 GGUF_MODEL_Q8_0 = "models--unsloth--gemma-3-1b-it-GGUF/gemma-3-1b-it-Q8_0.gguf"
 
 ifm_shapes = [(1, 4, 1, 256), (1, 1, 3, 256), (1, 1, 3, 256)]
+
+
+@pytest.mark.premerge
+@pytest.mark.parametrize("context_length", [1, 1024, 2048])
+def test_bmm2_reduction_is_not_split_at_or_below_threshold(context_length: int):
+    assert _get_bmm2_reduction_ranges(context_length) == [(0, context_length)]
+
+
+@pytest.mark.premerge
+@pytest.mark.parametrize("context_length", [2049, 4096, 6144, 8192])
+def test_bmm2_reduction_uses_contiguous_1k_chunks(context_length: int):
+    ranges = _get_bmm2_reduction_ranges(context_length)
+
+    assert ranges[0][0] == 0
+    assert ranges[-1][1] == context_length
+    assert all(end == next_start for (_, end), (next_start, _) in zip(ranges, ranges[1:]))
+    assert all(0 < end - start <= 1024 for start, end in ranges)
 
 
 @pytest.mark.premerge

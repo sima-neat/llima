@@ -15,6 +15,21 @@ from sima_lmm.model.sima_builder import SimaBuilder, activation_type
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
+_BMM2_REDUCTION_SPLIT_THRESHOLD = 2048
+_BMM2_REDUCTION_CHUNK_SIZE = 1024
+
+
+def _get_bmm2_reduction_ranges(context_length: int) -> list[tuple[int, int]]:
+    """Return contiguous cache ranges for the second attention BMM."""
+    assert context_length > 0
+    if context_length <= _BMM2_REDUCTION_SPLIT_THRESHOLD:
+        return [(0, context_length)]
+    return [
+        (start, min(start + _BMM2_REDUCTION_CHUNK_SIZE, context_length))
+        for start in range(0, context_length, _BMM2_REDUCTION_CHUNK_SIZE)
+    ]
+
+
 @dataclass
 class LanguageCacheModel(LanguagePartBaseModel):
     """Base implementation for the cache model of the language model.
@@ -183,10 +198,55 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 f"{base_name}.masked_bmm1", [bmm1, input_nodes[2]], "Add"
             )
         softmax = self._onnx_builder.build_op(f"{base_name}.softmax", [bmm1], "Softmax", axis=1)
-        bmm2 = self._onnx_builder.build_op(
-            f"{base_name}.bmm2", [softmax, values[0]], "Einsum",
-            equation="nchw,nqhc->nqhw"
-        )
+        reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
+        if len(reduction_ranges) == 1:
+            bmm2 = self._onnx_builder.build_op(
+                f"{base_name}.bmm2", [softmax, values[0]], "Einsum",
+                equation="nchw,nqhc->nqhw"
+            )
+        else:
+            partial_bmm2 = []
+            for range_idx, (start, end) in enumerate(reduction_ranges):
+                slice_args = [
+                    np.array([start], dtype=np.int64),
+                    np.array([end], dtype=np.int64),
+                ]
+                softmax_slice = self._onnx_builder.build_op(
+                    f"{base_name}.bmm2.softmax_slice{range_idx}",
+                    [softmax, *slice_args, np.array([1], dtype=np.int64)],
+                    "Slice",
+                )
+                values_slice = self._onnx_builder.build_op(
+                    f"{base_name}.bmm2.values_slice{range_idx}",
+                    [values[0], *slice_args, np.array([3], dtype=np.int64)],
+                    "Slice",
+                )
+                partial_bmm2.append(
+                    self._onnx_builder.build_op(
+                        f"{base_name}.bmm2.partial{range_idx}",
+                        [softmax_slice, values_slice],
+                        "Einsum",
+                        equation="nchw,nqhc->nqhw",
+                    )
+                )
+
+            add_level = 0
+            while len(partial_bmm2) > 1:
+                next_level = [
+                    self._onnx_builder.build_op(
+                        f"{base_name}.bmm2.add_level{add_level}_pair{pair_idx}",
+                        [lhs, rhs],
+                        "Add",
+                    )
+                    for pair_idx, (lhs, rhs) in enumerate(
+                        zip(partial_bmm2[::2], partial_bmm2[1::2])
+                    )
+                ]
+                if len(partial_bmm2) % 2:
+                    next_level.append(partial_bmm2[-1])
+                partial_bmm2 = next_level
+                add_level += 1
+            bmm2 = partial_bmm2[0]
 
         reshape_bmm2 = self._onnx_builder.build_split_and_concat(
             f"{base_name}.bmm2.reshape", bmm2,
@@ -399,9 +459,33 @@ class LanguageCacheModel(LanguagePartBaseModel):
         softmax = builder.create_softmax_node(bmm1, 3)
 
         # Second multiply ((input * key) * value)
-        bmm2 = builder.create_batch_matmul_node(
-            softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
-        )
+        reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
+        if len(reduction_ranges) == 1:
+            bmm2 = builder.create_batch_matmul_node(
+                softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
+            )
+        else:
+            partial_bmm2 = []
+            for start, end in reduction_ranges:
+                softmax_slice = builder.create_slice_node(softmax, [start], [end], [1], [3])
+                values_slice = builder.create_slice_node(
+                    mla_input_cached_values, [start], [end], [1], [2]
+                )
+                partial_bmm2.append(
+                    builder.create_batch_matmul_node(
+                        softmax_slice, values_slice, transpose_a=False, transpose_b=False
+                    )
+                )
+
+            while len(partial_bmm2) > 1:
+                next_level = [
+                    builder.create_add_node(lhs, rhs)
+                    for lhs, rhs in zip(partial_bmm2[::2], partial_bmm2[1::2])
+                ]
+                if len(partial_bmm2) % 2:
+                    next_level.append(partial_bmm2[-1])
+                partial_bmm2 = next_level
+            bmm2 = partial_bmm2[0]
         assert get_expected_tensor_value(bmm2.get_type().output).shape == value_shape
         output = builder.create_slice_concat_node(
             bmm2, axis=3, split_axis=1,

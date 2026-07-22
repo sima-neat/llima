@@ -822,7 +822,7 @@ class PipelineConfig(BaseConfig):
     """
     system_prompt: str | None = None
     chat_template: str | None = None
-    max_num_tokens: int = 1024
+    max_num_tokens: int = 8192
     input_token_group_size: int = 1
     input_token_group_offsets: list[int] | None = None
     future_token_mask_size: int = 1
