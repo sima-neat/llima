@@ -9,8 +9,9 @@ usage() {
 Usage: $(basename "$0")
 
 Replace sima_lmm in the active Model Compiler virtual environment with the
-verified wheel packaged beside this installer. Existing Model Compiler
-dependencies are preserved.
+verified wheel packaged beside this installer. Missing or incompatible SDK
+dependencies are installed while compatible Model Compiler dependencies are
+preserved.
 
 Environment:
   SIMA_LLIMA_COMPILER_PYTHON  Active Model Compiler Python (default: python3)
@@ -81,6 +82,10 @@ else:
     print(f"[compiler-install] Replacing {dist.metadata['Name']} {dist.version}")
 PY
 
+"${PYTHON_BIN}" -m pip install \
+  --upgrade \
+  --upgrade-strategy only-if-needed \
+  "${WHEEL_PATH}[sdk]"
 "${PYTHON_BIN}" -m pip install --force-reinstall --no-deps "${WHEEL_PATH}"
 
 "${PYTHON_BIN}" - "${VIRTUAL_ENV}" <<'PY'

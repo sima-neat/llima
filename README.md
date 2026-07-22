@@ -224,19 +224,6 @@ source <model-compiler-venv>/bin/activate
 sima-cli neat install llima/compiler@<branch>
 ```
 
-Before invoking the compiler installer, `sima-cli` verifies the wheel against
-the checksum in package metadata. The installer requires the Model Compiler
-`afe` package, replaces the old `sima_lmm`, and preserves the environment's
-existing proprietary dependencies.
-
-To install a compiler wheel built locally instead, activate the Model Compiler
-environment and run the installer staged beside the wheel:
-
-```bash
-source <model-compiler-venv>/bin/activate
-./dist/compiler/install_compiler.sh
-```
-
 ### Install MoLE
 
 For a persistent MoLE installation with a dedicated virtual environment, run:
