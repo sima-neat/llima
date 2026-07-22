@@ -413,7 +413,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
 
-        if self.cfg.pipeline_cfg.quantize_embeddings and self.layer_idx == 0:
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             input_dtype = ScalarType.int8
         else:
             input_dtype = activation_type(quantizable)
@@ -453,7 +453,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
 
         # De-quantize embeddings table if needed.
-        if self.cfg.pipeline_cfg.quantize_embeddings and self.layer_idx == 0:
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             assert self.embeddings_scale is not None
             rms_norm_in = builder.create_dequantization_node(
                 "MLA_0/input",

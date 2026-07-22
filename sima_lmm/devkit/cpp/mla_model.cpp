@@ -358,7 +358,7 @@ void MLAModelWithBuffer::update_reloc(const std::map<std::string, uint64_t>& rel
 
 
 void MLAModelWithBuffer::load_all_models(
-    bool do_parallel_load, std::optional<std::filesystem::path> relative_dir
+    std::optional<std::filesystem::path> relative_dir
 ) {
     auto* dispatcher = _get_dispatcher();
     std::vector<std::filesystem::path> file_names;
@@ -378,7 +378,7 @@ void MLAModelWithBuffer::load_all_models(
         return;
     }
 
-    if (do_parallel_load) {
+    if (!_disable_parallel_load) {
         std::vector<std::string> paths;
         paths.reserve(file_names.size());
         for (const auto& file_name: file_names) {

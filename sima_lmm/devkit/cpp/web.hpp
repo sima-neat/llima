@@ -28,8 +28,7 @@ class EXPORT WEB {
             std::optional<std::filesystem::path> whisper_model_path,
             std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
-            std::optional<std::string> chat_template,
-            bool do_parallel_load
+            std::optional<std::string> chat_template
         );
         ~WEB();
 
@@ -48,7 +47,11 @@ class EXPORT WEB {
             httplib::Response& res,
             bool is_openai
         );
-        void _handle_audio_transcriptions(const httplib::Request& req, httplib::Response& res);
+        void _handle_audio_transcriptions(
+            const httplib::Request& req,
+            httplib::Response& res,
+            const std::string& task
+        );
 
         // Helpers
         void _set_cors_headers(httplib::Response& res);
@@ -73,10 +76,15 @@ class EXPORT WEB {
         );
         std::string _format_audio_sse_chunk(
             const std::string& text,
+            const std::string& event_task,
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
-            std::optional<double> tps = std::nullopt
+            std::optional<double> tps = std::nullopt,
+            std::optional<std::string> language = std::nullopt,
+            std::optional<std::string> task = std::nullopt,
+            std::optional<float> no_speech_prob = std::nullopt,
+            std::optional<float> avg_logprob = std::nullopt
         );
 
         // Helpers for chat completion
@@ -102,9 +110,9 @@ class EXPORT WEB {
         );
         void _execute_streaming_audio_transcription(
             httplib::Response& res,
-            const std::string& language
+            const std::string& language,
+            const std::string& task
         );
-
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;

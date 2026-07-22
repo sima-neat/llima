@@ -1,14 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
-
 import argparse
 import logging
 from pathlib import Path
@@ -24,7 +13,6 @@ def llm_evaluate(
     max_num_tokens: int = 1024,
     system_prompt: str | None = None,
     language_group_size: int | None = None,
-    language_group_offsets: list[int] | None = None,
     language_future_token_mask_size: int = 1,
     enable_chat_history: bool = False,
     quantize_kv_cache: bool = False,
@@ -38,7 +26,6 @@ def llm_evaluate(
         max_num_tokens=max_num_tokens,
         system_prompt=system_prompt,
         override_language_group_size=language_group_size,
-        override_language_group_offsets=language_group_offsets,
         override_language_future_token_mask_size=language_future_token_mask_size,
         quantize_kv_cache=quantize_kv_cache,
     )
@@ -99,7 +86,6 @@ if __name__ == "__main__":
     parser.add_argument("--system_prompt", type=str, default=None)
     parser.add_argument("--system_prompt_file", type=Path, default=None)
     parser.add_argument("--language_group_size", type=int, default=None)
-    parser.add_argument("--language_group_offsets", type=str, default=None)
     parser.add_argument("--language_future_token_mask_size", type=int, default=1)
     parser.add_argument(
         "--chat_history", type=bool, default=False, action=argparse.BooleanOptionalAction,
@@ -117,14 +103,9 @@ if __name__ == "__main__":
         system_prompt = open(args.system_prompt_file, "r").read()
     else:
         system_prompt = None
-    if args.language_group_offsets is not None:
-        language_group_offsets = list(map(int, args.language_group_offsets.split(",")))
-    else:
-        language_group_offsets = None
-
     with ScopedLogLevel(logging.DEBUG):
         llm_evaluate(
             args.model_path, EvalMode(args.mode), args.max_num_tokens, system_prompt,
-            args.language_group_size, language_group_offsets, args.language_future_token_mask_size,
+            args.language_group_size, args.language_future_token_mask_size,
             args.enable_chat_history, args.quantize_kv_cache
         )

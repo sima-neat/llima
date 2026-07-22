@@ -1,13 +1,3 @@
-#########################################################
-# Copyright (C) 2025 SiMa Technologies, Inc.
-#
-# This material is SiMa proprietary and confidential.
-#
-# This material may not be copied or distributed without
-# the express prior written permission of SiMa.
-#
-# All rights reserved.
-#########################################################
 from pathlib import Path
 from dataclasses import asdict
 import json
@@ -187,15 +177,13 @@ def test_vlm_config(gguf_models_path: Path, ggml_type: str):
 
     max_num_tokens = 512
     language_group_size = 128
-    language_group_offsets = list(
-        range(0, max_num_tokens - language_group_size + 1, language_group_size)
-    )
     future_token_mask_size = 128
 
     vlm_cfg.config_pipeline(
         "Be helpful and polite.", None, max_num_tokens,
-        language_group_size, language_group_offsets, future_token_mask_size
+        language_group_size, future_token_mask_size
     )
+    assert vlm_cfg.pipeline_cfg.input_token_group_offsets == [0, 128, 256, 384]
 
     tempfilename = (
         f"sima-{vlm_cfg.model_type}-{vlm_cfg.lm_cfg.arch}.json"

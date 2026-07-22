@@ -1,10 +1,13 @@
+import hashlib
 import json
 import os
 import shutil
+import tempfile
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
+from pathlib import Path, PurePosixPath
+from typing import Iterable, Literal, Protocol
 
 
 HF_ORG = "simaai"
@@ -18,6 +21,15 @@ HF_COLLECTIONS = (
 
 NVME_MODELS_ROOT = Path("/media/nvme/llima/models")
 ENV_MODELS_VAR = "LLIMA_MODELS_PATH"
+INCOMPLETE_MARKER = ".llima-incomplete"
+DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+ChecksumType = Literal["sha256", "git-sha1"]
+
+
+class _Hasher(Protocol):
+    def update(self, data: bytes) -> None: ...
+
+    def hexdigest(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -25,6 +37,14 @@ class ModelInfo:
     model_id: str
     downloads: int | None = None
     likes: int | None = None
+
+
+@dataclass(frozen=True)
+class ArtifactInfo:
+    filename: str
+    size: int
+    checksum: str
+    checksum_type: ChecksumType
 
 
 def _env_models_root() -> Path | None:
@@ -45,20 +65,24 @@ def _safe_model_dir(root: Path, model_id: str) -> Path:
     return root / model_id
 
 
+def _is_incomplete_model_dir(path: Path) -> bool:
+    return path.is_dir() and (path / INCOMPLETE_MARKER).exists()
+
+
 def resolve_model_path(model: str) -> Path | None:
     candidate = Path(model)
-    if candidate.exists():
+    if candidate.exists() and not _is_incomplete_model_dir(candidate):
         return candidate.resolve()
 
     stripped = _strip_org(model)
 
     for root in _iter_model_roots():
         candidate = _safe_model_dir(root, model)
-        if candidate.exists():
+        if candidate.exists() and not _is_incomplete_model_dir(candidate):
             return candidate.resolve()
         if stripped != model:
             candidate = _safe_model_dir(root, stripped)
-            if candidate.exists():
+            if candidate.exists() and not _is_incomplete_model_dir(candidate):
                 return candidate.resolve()
 
     return None
@@ -157,30 +181,126 @@ def search_models(term: str) -> list[ModelInfo]:
     return [info for info in results if info.model_id in allowed_ids]
 
 
-def _download_file(url: str, dest: Path, label: str) -> None:
+def _new_hasher(checksum_type: ChecksumType, size: int) -> _Hasher:
+    if checksum_type == "sha256":
+        return hashlib.sha256()
+    if checksum_type == "git-sha1":
+        try:
+            hasher = hashlib.sha1(usedforsecurity=False)
+        except TypeError:
+            hasher = hashlib.sha1()
+        hasher.update(f"blob {size}\0".encode())
+        return hasher
+    raise ValueError(f"Unsupported checksum type: {checksum_type}")
+
+
+def _artifact_checksum(path: Path, artifact: ArtifactInfo) -> str:
+    with open(path, "rb") as f:
+        hasher = hashlib.file_digest(
+            f, lambda: _new_hasher(artifact.checksum_type, artifact.size)
+        )
+    return hasher.hexdigest()
+
+
+def _artifact_matches(path: Path, artifact: ArtifactInfo) -> bool:
+    try:
+        if not path.is_file() or path.is_symlink():
+            return False
+        if path.stat().st_size != artifact.size:
+            return False
+        return _artifact_checksum(path, artifact) == artifact.checksum
+    except OSError:
+        return False
+
+
+def _download_file(url: str, dest: Path, artifact: ArtifactInfo) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as response:
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status} for {url}")
         total = response.headers.get("Content-Length")
         total_bytes = int(total) if total and total.isdigit() else None
+        if total_bytes is not None and total_bytes != artifact.size:
+            raise RuntimeError(
+                f"Invalid size for '{artifact.filename}': expected {artifact.size} bytes, "
+                f"server reported {total_bytes} bytes"
+            )
         downloaded = 0
+        hasher = _new_hasher(artifact.checksum_type, artifact.size)
         with open(dest, "wb") as f:
             while True:
-                chunk = response.read(1024 * 1024)
+                chunk = response.read(DOWNLOAD_CHUNK_SIZE)
                 if not chunk:
                     break
                 f.write(chunk)
+                hasher.update(chunk)
                 downloaded += len(chunk)
                 if total_bytes:
                     pct = (downloaded / total_bytes) * 100
-                    print(f"\rDownloading {label}: {pct:5.1f}%", end="", flush=True)
+                    print(
+                        f"\rDownloading {artifact.filename}: {pct:5.1f}%", end="", flush=True
+                    )
                 else:
-                    print(f"\rDownloading {label}: {downloaded} bytes", end="", flush=True)
+                    print(
+                        f"\rDownloading {artifact.filename}: {downloaded} bytes",
+                        end="",
+                        flush=True,
+                    )
+        if downloaded != artifact.size:
+            raise RuntimeError(
+                f"Invalid size for '{artifact.filename}': expected {artifact.size} bytes, "
+                f"downloaded {downloaded} bytes"
+            )
+        checksum = hasher.hexdigest()
+        if checksum != artifact.checksum:
+            raise RuntimeError(
+                f"Checksum mismatch for '{artifact.filename}': expected {artifact.checksum}, "
+                f"got {checksum}"
+            )
         if total_bytes:
-            print(f"\rDownloading {label}: 100.0%", flush=True)
+            print(f"\rDownloading {artifact.filename}: 100.0%", flush=True)
         else:
-            print(f"\rDownloading {label}: done", flush=True)
+            print(f"\rDownloading {artifact.filename}: done", flush=True)
+
+
+def _artifact_info(entry: dict[str, object]) -> ArtifactInfo:
+    filename = entry.get("rfilename")
+    size = entry.get("size")
+    if not isinstance(filename, str) or not filename:
+        raise RuntimeError("Model metadata contains an artifact without a filename.")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise RuntimeError(f"Model metadata is missing a valid size for '{filename}'.")
+
+    lfs = entry.get("lfs")
+    if isinstance(lfs, dict) and isinstance(lfs.get("sha256"), str):
+        checksum = lfs["sha256"].lower()
+        checksum_type: ChecksumType = "sha256"
+        checksum_length = 64
+    else:
+        checksum = str(entry.get("blobId", "")).lower()
+        checksum_type = "git-sha1"
+        checksum_length = 40
+
+    if len(checksum) != checksum_length or any(c not in "0123456789abcdef" for c in checksum):
+        raise RuntimeError(f"Model metadata is missing a valid checksum for '{filename}'.")
+    return ArtifactInfo(filename, size, checksum, checksum_type)
+
+
+def _safe_artifact_path(root: Path, filename: str) -> Path:
+    relative = PurePosixPath(filename)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in (".", "..") for part in relative.parts)
+        or relative.parts[0] == INCOMPLETE_MARKER
+    ):
+        raise RuntimeError(f"Unsafe artifact path in model metadata: '{filename}'")
+
+    root = root.resolve()
+    path = root.joinpath(*relative.parts)
+    if not path.resolve(strict=False).is_relative_to(root):
+        raise RuntimeError(f"Unsafe artifact path in model metadata: '{filename}'")
+    return path
 
 
 def _ensure_writable_models_root(path: Path) -> Path | None:
@@ -215,31 +335,82 @@ def pull_model(model_id: str) -> Path:
     model_id = model_id.strip()
     if not model_id:
         raise ValueError("model_id must not be empty")
-    if "/" in model_id:
+    if "/" in model_id or "\\" in model_id or model_id in (".", ".."):
         raise ValueError("model_id should be a model name without org prefix")
     model_name = model_id
 
-    url = f"{HF_API_BASE}/models/{HF_ORG}/{model_name}"
+    encoded_model_name = urllib.parse.quote(model_name, safe="")
+    url = f"{HF_API_BASE}/models/{HF_ORG}/{encoded_model_name}?blobs=true"
     data = _fetch_json(url)
-    siblings = data.get("siblings", [])
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Invalid model metadata for '{model_name}'.")
+    revision = data.get("sha")
+    siblings = data.get("siblings")
+    if not isinstance(revision, str) or not revision:
+        raise RuntimeError(f"Model metadata is missing a revision for '{model_name}'.")
+    if not isinstance(siblings, list):
+        raise RuntimeError(f"Model metadata is missing artifacts for '{model_name}'.")
+
+    artifacts: list[ArtifactInfo] = []
+    filenames: set[str] = set()
+    for entry in siblings:
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Invalid artifact metadata for '{model_name}'.")
+        artifact = _artifact_info(entry)
+        if artifact.filename in filenames:
+            raise RuntimeError(f"Duplicate artifact in model metadata: '{artifact.filename}'")
+        filenames.add(artifact.filename)
+        artifacts.append(artifact)
 
     root = _select_download_root()
     model_dir = _safe_model_dir(root, model_name)
+    local_artifacts = [
+        (artifact, _safe_artifact_path(model_dir, artifact.filename))
+        for artifact in artifacts
+    ]
+    missing_or_invalid = [
+        (artifact, path)
+        for artifact, path in local_artifacts
+        if not _artifact_matches(path, artifact)
+    ]
 
-    for entry in siblings:
-        filename = entry.get("rfilename")
-        if not filename:
-            continue
-        file_url = f"{HF_RESOLVE_BASE}/{HF_ORG}/{model_name}/resolve/main/{filename}"
-        dest = model_dir / filename
-        if dest.exists():
-            continue
-        tmp = dest.with_suffix(dest.suffix + ".tmp")
-        _download_file(file_url, tmp, filename)
-        tmp.replace(dest)
+    marker = model_dir / INCOMPLETE_MARKER
+    if not missing_or_invalid:
+        _validate_model_dir(model_dir)
+        marker.unlink(missing_ok=True)
+        return model_dir
 
-    _validate_model_dir(model_dir)
-    return model_dir
+    model_dir.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+    encoded_revision = urllib.parse.quote(revision, safe="")
+
+    try:
+        with tempfile.TemporaryDirectory(prefix=f".{model_name}.download-", dir=root) as tmp:
+            download_dir = Path(tmp)
+            (download_dir / INCOMPLETE_MARKER).touch()
+            downloaded: list[tuple[Path, Path]] = []
+            for artifact, dest in missing_or_invalid:
+                staged = _safe_artifact_path(download_dir, artifact.filename)
+                encoded_filename = urllib.parse.quote(artifact.filename, safe="/")
+                file_url = (
+                    f"{HF_RESOLVE_BASE}/{HF_ORG}/{encoded_model_name}/resolve/"
+                    f"{encoded_revision}/{encoded_filename}"
+                )
+                _download_file(file_url, staged, artifact)
+                downloaded.append((staged, dest))
+
+            for staged, dest in downloaded:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                staged.replace(dest)
+
+        _validate_model_dir(model_dir)
+        marker.unlink(missing_ok=True)
+        return model_dir
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"Failed to pull model '{model_name}': {exc}. The model remains incomplete; "
+            f"retry with `llima pull {model_name}`."
+        ) from exc
 
 
 def _validate_model_dir(model_dir: Path) -> None:
@@ -259,7 +430,11 @@ def list_models() -> list[Path]:
         for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
             if not child.is_dir():
                 continue
-            if (child / "devkit").is_dir() and (child / "elf_files").is_dir():
+            if (
+                not _is_incomplete_model_dir(child)
+                and (child / "devkit").is_dir()
+                and (child / "elf_files").is_dir()
+            ):
                 models.append(child)
     return models
 
