@@ -38,11 +38,16 @@ def _tag_version_override():
 
 
 def get_version(pkg_dir):
-    vinfo, version = _version_info_from_manifest()
-    tag_version = _tag_version_override()
-    if tag_version:
-        version = tag_version
-        vinfo = _version_info(version)
+    version_override = os.environ.get("LLIMA_WHEEL_VERSION", "").strip()
+    if version_override:
+        version = version_override
+        vinfo = _version_info(version.split("+", 1)[0])
+    else:
+        vinfo, version = _version_info_from_manifest()
+        tag_version = _tag_version_override()
+        if tag_version:
+            version = tag_version
+            vinfo = _version_info(version)
 
     if "GIT_HASH" in os.environ:
         # In tox the .git directory is not available so do this instead

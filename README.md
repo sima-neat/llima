@@ -154,17 +154,82 @@ draft model when running EAGLE3 speculative decoding in CLI mode.
 The Python wheel path is used for SDK/build-facing workflows and optional
 dependency sets.
 
-Build a pure Python SDK wheel:
+### Install the Model Compiler tooling in editable mode
+
+For active compiler development, create a Python 3.12 environment and install
+LLiMa with the `sdk` dependencies. Disabling the CMake portion keeps this a
+pure-Python compiler installation:
 
 ```bash
-python3 -m build --wheel -Cbuild-dir="build/{wheel_tag}" -Cwheel.cmake=false
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[sdk]" \
+  -Cwheel.cmake=false \
+  -Cbuild-dir="build/compiler-editable/{wheel_tag}"
+llima-compile --help
 ```
 
-Install the wheel with an optional dependency set:
+### Build wheel artifacts
+
+Build and validate the pure-Python compiler wheel and stage its MoLE profile:
 
 ```bash
-python3 -m pip install "dist/sima_lmm-*.whl[sdk]"
-python3 -m pip install "dist/sima_lmm-*.whl[sdk_ext]"
+./build_compiler_wheel.sh
+./build_mole_package.sh
+```
+
+Both packaging scripts create or reuse the shared
+`build/wheel-tools-venv` Python 3.12 environment. The helper installs the
+`build` package there when needed and does not modify the system Python.
+
+Wheel versions follow the Debian package policy. Exact release tags produce the
+tag version; branch builds use the base version from `deps/manifest.json` plus
+the normalized branch and 12-character commit, for example
+`0.3.0+develop.0123456789ab`. Set `LLIMA_WHEEL_VERSION` only when an explicit
+version override is required.
+
+The compiler wheel, guarded Model Compiler installer, and package metadata are
+written to `dist/compiler/`. The same verified wheel is staged with the MoLE
+installer and package metadata in `dist/mole/`. As in Core packages, artifact
+checksums are recorded in each profile's `metadata.json` rather than published
+as separate checksum files.
+
+```text
+dist/
+├── compiler/
+│   ├── sima_lmm-<version>-py3-none-any.whl
+│   ├── install_compiler.sh
+│   └── metadata.json
+└── mole/
+    ├── sima_lmm-<version>-py3-none-any.whl
+    ├── install_mole.sh
+    └── metadata.json
+```
+
+### Install a published Model Compiler artifact
+
+Activate an existing Model Compiler environment, then install the latest
+published compiler artifact from the default branch:
+
+```bash
+source <model-compiler-venv>/bin/activate
+sima-cli neat install llima/compiler
+```
+
+To install the latest artifact published for a specific branch:
+
+```bash
+source <model-compiler-venv>/bin/activate
+sima-cli neat install llima/compiler@<branch>
+```
+
+### Install MoLE
+
+For a persistent MoLE installation with a dedicated virtual environment, run:
+
+```bash
+sima-cli neat install llima/mole
 ```
 
 ## Documentation
