@@ -14,12 +14,10 @@ source "${ROOT_DIR}/tools/ensure_wheel_build_env.sh"
 ensure_wheel_build_env "${PYTHON_BIN}" "${BUILD_TOOLS_VENV}"
 PYTHON_BIN="${WHEEL_BUILD_PYTHON}"
 
-for command in "${SIMA_CLI_BIN}" sha256sum; do
-  if ! command -v "${command}" >/dev/null 2>&1; then
-    echo "ERROR: Required command not found: ${command}" >&2
-    exit 1
-  fi
-done
+if ! command -v "${SIMA_CLI_BIN}" >/dev/null 2>&1; then
+  echo "ERROR: Required command not found: ${SIMA_CLI_BIN}" >&2
+  exit 1
+fi
 
 mapfile -t SOURCE_WHEELS < <(
   find "${COMPILER_DIR}" -maxdepth 1 -type f -name 'sima_lmm-*.whl' -print | sort
@@ -32,15 +30,6 @@ fi
 
 SOURCE_WHEEL="${SOURCE_WHEELS[0]}"
 WHEEL_NAME="$(basename "${SOURCE_WHEEL}")"
-SOURCE_CHECKSUM="${SOURCE_WHEEL}.sha256"
-if [[ ! -f "${SOURCE_CHECKSUM}" ]]; then
-  echo "ERROR: Missing compiler wheel checksum: ${SOURCE_CHECKSUM}" >&2
-  exit 1
-fi
-(
-  cd "${COMPILER_DIR}"
-  sha256sum -c "${WHEEL_NAME}.sha256"
-)
 
 "${PYTHON_BIN}" - "${SOURCE_WHEEL}" <<'PY'
 import configparser
@@ -94,7 +83,6 @@ find "${OUTPUT_DIR}" -maxdepth 1 -type f \
   -delete
 
 cp "${SOURCE_WHEEL}" "${OUTPUT_DIR}/${WHEEL_NAME}"
-cp "${SOURCE_CHECKSUM}" "${OUTPUT_DIR}/${WHEEL_NAME}.sha256"
 install -m 0755 "${INSTALLER_SOURCE}" "${OUTPUT_DIR}/install_mole.sh"
 
 SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
@@ -149,6 +137,5 @@ metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
 PY
 
 echo "[mole-package] Wheel: ${OUTPUT_DIR}/${WHEEL_NAME}"
-echo "[mole-package] Checksum: ${OUTPUT_DIR}/${WHEEL_NAME}.sha256"
 echo "[mole-package] Installer: ${OUTPUT_DIR}/install_mole.sh"
 echo "[mole-package] Metadata: ${OUTPUT_DIR}/metadata.json"

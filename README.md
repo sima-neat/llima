@@ -189,20 +189,20 @@ the normalized branch and 12-character commit, for example
 `0.3.0+develop.0123456789ab`. Set `LLIMA_WHEEL_VERSION` only when an explicit
 version override is required.
 
-The compiler wheel, checksum, guarded Model Compiler installer, and package
-metadata are written to `dist/compiler/`. The same verified wheel is staged
-with the MoLE installer and package metadata in `dist/mole/`.
+The compiler wheel, guarded Model Compiler installer, and package metadata are
+written to `dist/compiler/`. The same verified wheel is staged with the MoLE
+installer and package metadata in `dist/mole/`. As in Core packages, artifact
+checksums are recorded in each profile's `metadata.json` rather than published
+as separate checksum files.
 
 ```text
 dist/
 ├── compiler/
 │   ├── sima_lmm-<version>-py3-none-any.whl
-│   ├── sima_lmm-<version>-py3-none-any.whl.sha256
 │   ├── install_compiler.sh
 │   └── metadata.json
 └── mole/
     ├── sima_lmm-<version>-py3-none-any.whl
-    ├── sima_lmm-<version>-py3-none-any.whl.sha256
     ├── install_mole.sh
     └── metadata.json
 ```
@@ -224,9 +224,10 @@ source <model-compiler-venv>/bin/activate
 sima-cli neat install llima/compiler@<branch>
 ```
 
-The compiler installer verifies the wheel checksum, requires the Model
-Compiler `afe` package, replaces the old `sima_lmm`, and preserves the
-environment's existing proprietary dependencies.
+Before invoking the compiler installer, `sima-cli` verifies the wheel against
+the checksum in package metadata. The installer requires the Model Compiler
+`afe` package, replaces the old `sima_lmm`, and preserves the environment's
+existing proprietary dependencies.
 
 To install a compiler wheel built locally instead, activate the Model Compiler
 environment and run the installer staged beside the wheel:

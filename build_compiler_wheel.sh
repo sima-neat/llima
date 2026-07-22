@@ -14,11 +14,6 @@ source "${ROOT_DIR}/tools/ensure_wheel_build_env.sh"
 ensure_wheel_build_env "${PYTHON_BIN}" "${BUILD_TOOLS_VENV}"
 PYTHON_BIN="${WHEEL_BUILD_PYTHON}"
 
-if ! command -v sha256sum >/dev/null 2>&1; then
-  echo "ERROR: sha256sum is required." >&2
-  exit 1
-fi
-
 if ! command -v "${SIMA_CLI_BIN}" >/dev/null 2>&1; then
   echo "ERROR: sima-cli is required to generate dist/compiler/metadata.json." >&2
   exit 1
@@ -183,11 +178,6 @@ if [[ "${BUILT_WHEEL_VERSION}" != "${WHEEL_VERSION}" ]]; then
   exit 1
 fi
 
-(
-  cd "${OUTPUT_DIR}"
-  sha256sum "${WHEEL_NAME}" > "${WHEEL_NAME}.sha256"
-)
-
 SOURCE_REPOSITORY="${GITHUB_REPOSITORY:-sima-neat/llima}"
 SOURCE_REF="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
 if [[ -z "${SOURCE_REF}" ]]; then
@@ -242,6 +232,5 @@ metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
 PY
 
 echo "[compiler-wheel] Built: ${WHEEL_PATH}"
-echo "[compiler-wheel] Checksum: ${WHEEL_PATH}.sha256"
 echo "[compiler-wheel] Installer: ${OUTPUT_DIR}/install_compiler.sh"
 echo "[compiler-wheel] Metadata: ${OUTPUT_DIR}/metadata.json"

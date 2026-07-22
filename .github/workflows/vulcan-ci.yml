@@ -186,19 +186,12 @@ jobs:
             wheel = profile_wheels[0]
             wheels[profile] = wheel
             required_names = set(required_names)
-            required_names.update({wheel.name, f"{wheel.name}.sha256"})
+            required_names.add(wheel.name)
             actual_names = {path.name for path in directory.iterdir() if path.is_file()}
             if actual_names != required_names:
                 raise SystemExit(
                     f"unexpected {profile} layout: {sorted(actual_names)!r}"
                 )
-
-            expected_checksum = (directory / f"{wheel.name}.sha256").read_text(
-                encoding="utf-8"
-            ).split()[0]
-            actual_checksum = hashlib.sha256(wheel.read_bytes()).hexdigest()
-            if actual_checksum != expected_checksum:
-                raise SystemExit(f"wheel checksum mismatch for {profile}")
 
             with zipfile.ZipFile(wheel) as archive:
                 metadata_name = next(
@@ -247,8 +240,8 @@ jobs:
         PY
 
         dist_file_count="$(find dist -type f | wc -l)"
-        if [[ "${dist_file_count}" -lt 14 ]]; then
-          echo "Expected at least 14 files across Debian, compiler, and MoLE artifacts; found ${dist_file_count}." >&2
+        if [[ "${dist_file_count}" -lt 12 ]]; then
+          echo "Expected at least 12 files across Debian, compiler, and MoLE artifacts; found ${dist_file_count}." >&2
           find dist -type f -printf '  %p\n' | sort >&2
           exit 1
         fi
@@ -271,7 +264,7 @@ jobs:
       artifact_folder: "."
       artifact_pattern: sima-llima-dist
       artifact_glob: "**/*"
-      min_artifact_count: 14
+      min_artifact_count: 12
       publish_manifest: true
 
   promote-latest-tag:

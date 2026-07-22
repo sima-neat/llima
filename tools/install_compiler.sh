@@ -36,11 +36,6 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v sha256sum >/dev/null 2>&1; then
-  echo "ERROR: sha256sum is required." >&2
-  exit 1
-fi
-
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
   echo "ERROR: Activate the Model Compiler virtual environment before installing LLiMa." >&2
   exit 1
@@ -74,16 +69,6 @@ if [[ "${#WHEELS[@]}" -ne 1 ]]; then
 fi
 
 WHEEL_PATH="${WHEELS[0]}"
-WHEEL_NAME="$(basename "${WHEEL_PATH}")"
-CHECKSUM_PATH="${WHEEL_PATH}.sha256"
-if [[ ! -f "${CHECKSUM_PATH}" ]]; then
-  echo "ERROR: Missing wheel checksum: ${CHECKSUM_PATH}" >&2
-  exit 1
-fi
-(
-  cd "${SCRIPT_DIR}"
-  sha256sum -c "${WHEEL_NAME}.sha256"
-)
 
 "${PYTHON_BIN}" - <<'PY'
 import importlib.metadata as metadata
