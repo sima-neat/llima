@@ -998,8 +998,7 @@ generate_package_metadata() {
     --name "gh:sima-neat/llima/debs" \
     --version "${version}" \
     --description "Download-only SiMa.ai LLiMa Debian packages" \
-    --install-script 'echo "LLiMa Debian packages downloaded."' \
-    "${package_compatibility_args[@]}"
+    --install-script 'echo "LLiMa Debian packages downloaded."'
 
   cp -f "${debs_package_dir}/metadata.json" "${ROOT_DIR}/dist/debs/metadata.json"
   add_package_source_metadata "${ROOT_DIR}/dist/debs/metadata.json" "debs" "download-only"

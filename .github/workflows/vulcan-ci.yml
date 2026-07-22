@@ -234,10 +234,14 @@ jobs:
                 raise SystemExit(f"{label} metadata ref mismatch")
             if metadata.get("artifact", {}).get("internals_ref") != internals_ref:
                 raise SystemExit(f"{label} metadata Internals ref mismatch")
-            expected_platforms = {
-                ("board", platform_version, ("modalix",)),
-                ("palette", platform_version, ()),
-            }
+            expected_platforms = (
+                {
+                    ("board", platform_version, ("modalix",)),
+                    ("palette", platform_version, ()),
+                }
+                if label == "root"
+                else set()
+            )
             actual_platforms = {
                 (
                     platform.get("type"),
