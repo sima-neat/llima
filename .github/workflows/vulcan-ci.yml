@@ -237,7 +237,6 @@ jobs:
             expected_platforms = (
                 {
                     ("board", platform_version, ("modalix",)),
-                    ("palette", platform_version, ()),
                 }
                 if label == "root"
                 else set()
@@ -414,18 +413,23 @@ jobs:
           for attempt in 1 2 3 4; do
             if sima-cli neat install \
               --env "${VULCAN_ENV}" \
-              -d _work/llima-install \
-              "${package_spec}"; then
+              "${package_spec}" \
+              --json >/dev/null; then
               break
             fi
             if [[ "${attempt}" -eq 4 ]]; then
-              echo "Artifact installation failed after ${attempt} attempts." >&2
+              echo "Artifact metadata resolution failed after ${attempt} attempts." >&2
               exit 1
             fi
             delay=$((attempt * 10))
-            echo "Artifact installation attempt ${attempt} failed; retrying in ${delay}s." >&2
+            echo "Artifact metadata resolution attempt ${attempt} failed; retrying in ${delay}s." >&2
             sleep "${delay}"
           done
+
+          sima-cli neat install \
+            --env "${VULCAN_ENV}" \
+            -d _work/llima-install \
+            "${package_spec}"
 
       - name: Verify installed LLiMa runtime
         run: |

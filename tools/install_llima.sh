@@ -128,7 +128,7 @@ log "Validated ${#debs[@]} Debian package(s); LLiMa version ${expected_version}.
 
 simulate_output="$(mktemp /tmp/install-llima-apt-simulate.XXXXXX)"
 trap 'rm -f "${simulate_output}"' EXIT
-if ! apt-get install --simulate --allow-downgrades "${debs[@]}" >"${simulate_output}" 2>&1; then
+if ! apt-get install --simulate --reinstall --allow-downgrades "${debs[@]}" >"${simulate_output}" 2>&1; then
   cat "${simulate_output}" >&2
   echo "APT cannot satisfy the bundled LLiMa package transaction." >&2
   exit 1
@@ -140,14 +140,16 @@ if grep -q '^Remv ' "${simulate_output}"; then
 fi
 
 log "Installing bundled Internals and LLiMa packages."
-run_sudo apt-get install -y --allow-downgrades \
+run_sudo apt-get install -y --reinstall --allow-downgrades \
   -o Dpkg::Options::=--force-overwrite \
   "${debs[@]}"
 
-for package in sima-lmm-core sima-lmm-cli sima-lmm-dev; do
+for deb_path in "${debs[@]}"; do
+  package="$(dpkg-deb -f "${deb_path}" Package)"
+  bundled_version="$(dpkg-deb -f "${deb_path}" Version)"
   installed_version="$(dpkg-query -W -f='${Version}' "${package}" 2>/dev/null || true)"
-  if [[ "${installed_version}" != "${expected_version}" ]]; then
-    echo "Installed ${package} version ${installed_version:-<missing>} does not match ${expected_version}." >&2
+  if [[ "${installed_version}" != "${bundled_version}" ]]; then
+    echo "Installed ${package} version ${installed_version:-<missing>} does not match bundled version ${bundled_version}." >&2
     exit 1
   fi
 done

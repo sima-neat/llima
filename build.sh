@@ -904,12 +904,7 @@ platform_version = str(manifest.get("platform-version", "")).strip()
 if not platform_version:
     raise SystemExit(f"Missing or empty platform-version in {manifest_path}")
 
-for argument in (
-    "--board-platform",
-    f"modalix@{platform_version}",
-    "--palette-platform",
-    platform_version,
-):
+for argument in ("--board-platform", f"modalix@{platform_version}"):
     print(argument)
 PY
   )"; then
