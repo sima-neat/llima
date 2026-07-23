@@ -1,8 +1,6 @@
 ## Summary
 
-Describe what changed and why. Link related issues with `Fixes #<issue>` or
-`Addresses #<issue>`.
-
+Describe what changed and why. Link related issues with `Fixes #<issue>` .
 ## Change Type
 
 - [ ] Bug fix
