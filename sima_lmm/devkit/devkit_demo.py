@@ -68,11 +68,29 @@ def _is_draft_vlm(sima_files_dir: Path) -> bool:
     return bool(spec_cfg and spec_cfg.get("is_draft", False))
 
 
+def _is_spec_decode_vlm(devkit_dir: Path) -> bool:
+    """Return whether a devkit directory belongs to a speculative-decoding pair."""
+    config_file = devkit_dir / "vlm_config.json"
+    if not config_file.is_file():
+        return False
+    with config_file.open() as f:
+        cfg = json.load(f)
+    return bool(cfg.get("lm_cfg", {}).get("speculative_decoding_cfg"))
+
+
 def _resolve_target_and_draft_paths(model_path: Path) -> tuple[Path, Path | None]:
     """Resolve a normal model path or a speculative-decoding parent directory."""
-    if (model_path / "devkit").is_dir() and (model_path / "elf_files").is_dir():
+    if _is_spec_decode_vlm(devkit := model_path / "devkit") or _is_spec_decode_vlm(
+        sima_devkit := model_path / "sima_files" / "devkit"
+    ):
+        raise RuntimeError(
+            f"{model_path} is part of a speculative-decoding pair. "
+            f"Pass the parent directory ({model_path.parent}) so both the "
+            f"target and draft models are loaded together."
+        )
+    if devkit.is_dir() and (model_path / "elf_files").is_dir():
         return model_path, None
-    if (model_path / "sima_files" / "devkit").is_dir():
+    if sima_devkit.is_dir():
         return model_path / "sima_files", None
 
     target: Path | None = None
