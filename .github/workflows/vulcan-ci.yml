@@ -382,9 +382,9 @@ jobs:
     uses: sima-neat/.github/.github/workflows/vulcan-build.yml@main
     with:
       vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
-      runner_profile: model-compiler
+      runner_profile: ubuntu
       architecture: arm64
-      capacity: ${{ needs.resolve-vulcan-config.outputs.capacity }}
+      capacity: default
       ensure_sdk_container: false
       checkout_submodules: "false"
       build_command: |
@@ -396,10 +396,33 @@ jobs:
         test -x "${sima_cli}"
 
         test "$(uname -m)" = "aarch64"
-        test "${VULCAN_RUNNER_PROFILE}" = "model-compiler"
-        test "${VIRTUAL_ENV}" = "/mnt/model-compiler"
-        test -x "${VIRTUAL_ENV}/bin/python3"
-        python3 -c 'import afe; print(f"Model Compiler afe: {afe.__file__}")'
+        test "${VULCAN_RUNNER_PROFILE}" = "ubuntu"
+
+        model_compiler_spec="model-compiler/arm64@develop"
+        echo "Installing ${model_compiler_spec}"
+        "${sima_cli}" neat install \
+          --env "${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
+          "${model_compiler_spec}"
+
+        model_compiler_dir="${HOME}/sdk-extensions/model-compiler"
+        if [[ ! -f "${model_compiler_dir}/bin/activate" ]]; then
+          echo "Model Compiler venv was not installed at ${model_compiler_dir}" >&2
+          exit 1
+        fi
+
+        source "${model_compiler_dir}/bin/activate"
+        export PATH="${model_compiler_dir}/bin:${PATH}"
+
+        site_packages="$(
+          find "${model_compiler_dir}/lib" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1
+        )"
+        export LD_LIBRARY_PATH="${model_compiler_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        if [[ -n "${site_packages}" ]]; then
+          export LD_LIBRARY_PATH="${site_packages}:${site_packages}/tvm:${LD_LIBRARY_PATH}"
+        fi
+
+        test "${VIRTUAL_ENV}" = "${model_compiler_dir}"
+        python -c 'import afe; print(f"Model Compiler afe: {afe.__file__}")'
 
         ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
         short_sha="${GITHUB_SHA:0:12}"
@@ -426,7 +449,7 @@ jobs:
           sleep "${delay}"
         done
 
-        python3 - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
+        python - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
         import importlib.metadata
         import sys
         from pathlib import Path
