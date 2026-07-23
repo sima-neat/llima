@@ -430,13 +430,18 @@ uint32_t LanguageModel::run_model_once(
         && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
     ) {
         auto upload_group_mask = [&](
-            const std::string& name, uint16_t cache_token_idx_begin, uint16_t mask_size
+            const std::string& name,
+            const std::string& layer_type,
+            uint16_t cache_token_idx_begin
         ) {
+            const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
+            const uint16_t mask_size = _get_cache_mask_size(
+                layer_type, effective_context, true
+            );
             if (mask_size <= num_tokens) {
                 return;
             }
             const uint16_t effective_token_idx = token_idx - cache_token_idx_begin;
-            const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
             const uint16_t aligned_context = std::min<uint16_t>(
                 round_up_to(effective_context, mask_size),
                 _cfg.pipeline_cfg.max_num_tokens
@@ -456,8 +461,7 @@ uint32_t LanguageModel::run_model_once(
         };
 
         upload_group_mask(
-            "group_future_token_mask", 0,
-            _get_future_token_mask_size("full_attention")
+            "group_future_token_mask", "full_attention", 0
         );
         if (_cfg.lm_cfg.attn_cfg.swa_enable) {
             const uint16_t cache_token_idx_begin = std::max(
@@ -466,8 +470,7 @@ uint32_t LanguageModel::run_model_once(
                     - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
             );
             upload_group_mask(
-                "group_sliding_future_token_mask", cache_token_idx_begin,
-                _get_future_token_mask_size("sliding_attention")
+                "group_sliding_future_token_mask", "sliding_attention", cache_token_idx_begin
             );
         }
     }
@@ -1076,7 +1079,9 @@ void LanguageModel::_define_buffers() {
     const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
     if (
         _use_group_token_models
-        && _get_future_token_mask_size("full_attention") > group_size
+        && _get_cache_mask_size(
+            "full_attention", _cfg.pipeline_cfg.max_num_tokens, true
+        ) > group_size
     ) {
         define_buffer(
             "group_future_token_mask",
@@ -1090,7 +1095,9 @@ void LanguageModel::_define_buffers() {
     if (
         _use_group_token_models
         && _cfg.lm_cfg.attn_cfg.swa_enable
-        && _get_future_token_mask_size("sliding_attention") > group_size
+        && _get_cache_mask_size(
+            "sliding_attention", _cfg.pipeline_cfg.max_num_tokens, true
+        ) > group_size
     ) {
         define_buffer(
             "group_sliding_future_token_mask",
@@ -1365,13 +1372,16 @@ void LanguageModel::_define_attn_models_iter(
     uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     uint16_t aligned_eff_token_idx;
     uint16_t aligned_eff_num_cached_tokens;
-    const uint16_t future_token_mask_size = _get_future_token_mask_size(layer_type);
+    const bool is_single_model = num_tokens == single_num_tokens;
+    const uint16_t cache_mask_size = _get_cache_mask_size(
+        layer_type, eff_num_cached_tokens, !is_single_model
+    );
     const bool use_single_future_token_mask = (
-        num_tokens == single_num_tokens && future_token_mask_size > 1
+        is_single_model && cache_mask_size > 1
     );
     const bool use_group_future_token_mask = (
-        num_tokens != single_num_tokens
-        && future_token_mask_size > num_tokens
+        !is_single_model
+        && cache_mask_size > num_tokens
     );
     if (use_single_future_token_mask) {
         // Round up by total context (eff_num_cached_tokens = past_kv + num_tokens),
@@ -1381,13 +1391,13 @@ void LanguageModel::_define_attn_models_iter(
         // For spec mode it picked cache_token_127 even when the 16 new tokens
         // wouldn't fit, dropping mask data for the tail tree positions.
         aligned_eff_token_idx = std::min(
-            round_up_to(eff_num_cached_tokens, future_token_mask_size) - 1,
+            round_up_to(eff_num_cached_tokens, cache_mask_size) - 1,
             _cfg.pipeline_cfg.max_num_tokens - 1
         );
         aligned_eff_num_cached_tokens = aligned_eff_token_idx + 1;
     } else if (use_group_future_token_mask) {
         aligned_eff_num_cached_tokens = std::min<uint16_t>(
-            round_up_to(eff_num_cached_tokens, future_token_mask_size),
+            round_up_to(eff_num_cached_tokens, cache_mask_size),
             _cfg.pipeline_cfg.max_num_tokens
         );
         aligned_eff_token_idx = aligned_eff_num_cached_tokens - num_tokens;

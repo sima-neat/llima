@@ -264,14 +264,20 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
-        uint16_t _get_future_token_mask_size(const std::string& layer_type) const {
+        static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
+        uint16_t _get_cache_mask_size(
+            const std::string& layer_type, uint16_t context_length, bool is_group
+        ) const {
             if (
                 layer_type != "sliding_attention"
                 && _cfg.pipeline_cfg.long_context_future_token_mask_size.has_value()
+                && context_length > LONG_CONTEXT_MIN_TOKENS
             ) {
                 return _cfg.pipeline_cfg.long_context_future_token_mask_size.value();
             }
-            return _cfg.pipeline_cfg.future_token_mask_size;
+            return is_group
+                ? _cfg.pipeline_cfg.input_token_group_size
+                : _cfg.pipeline_cfg.future_token_mask_size;
         }
         uint16_t _get_max_future_token_mask_size() const {
             return std::max(

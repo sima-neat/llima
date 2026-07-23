@@ -78,7 +78,7 @@ def test_default_max_num_tokens():
 
 @pytest.mark.parametrize(
     ("max_num_tokens", "expected_long_context_mask"),
-    [(2047, None), (2048, 1024), (4096, 1024)],
+    [(2047, None), (2048, None), (2049, 1024), (4096, 1024)],
 )
 @pytest.mark.premerge
 def test_long_context_future_token_mask_resolution(
@@ -90,10 +90,13 @@ def test_long_context_future_token_mask_resolution(
 
     assert config.future_token_mask_size == 128
     assert config.long_context_future_token_mask_size == expected_long_context_mask
-    assert config.get_future_token_mask_size("full_attention") == (
+    assert config.get_cache_mask_size("full_attention", 2048, is_group=False) == 128
+    assert config.get_cache_mask_size("full_attention", 2049, is_group=False) == (
         expected_long_context_mask or 128
     )
-    assert config.get_future_token_mask_size("sliding_attention") == 128
+    assert config.get_cache_mask_size(
+        "sliding_attention", max_num_tokens, is_group=False
+    ) == 128
 
 
 @pytest.mark.premerge
@@ -109,8 +112,8 @@ def test_legacy_pipeline_config_uses_stored_mask_for_all_attention_types():
     config = PipelineConfig(max_num_tokens=2048, future_token_mask_size=128)
 
     assert config.long_context_future_token_mask_size is None
-    assert config.get_future_token_mask_size("full_attention") == 128
-    assert config.get_future_token_mask_size("sliding_attention") == 128
+    assert config.get_cache_mask_size("full_attention", 2048, is_group=False) == 128
+    assert config.get_cache_mask_size("sliding_attention", 2048, is_group=False) == 128
 
 
 def _load_reference_config(filename: str) -> VlmConfig:
@@ -144,8 +147,8 @@ def test_shared_sliding_cache_includes_full_and_sliding_mask_buckets():
     config.lm_cfg.attn_cfg.sliding_window = 512
     config.config_pipeline(None, None, 2048, 128, 128)
 
-    assert _layer_indices(config, "group_cache") == [0, 128, 256, 384, 896, 1920]
-    assert _layer_indices(config, "single_cache") == [127, 255, 383, 511, 1023, 2047]
+    assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
+    assert _layer_indices(config, "single_cache") == list(range(127, 2048, 128))
 
 
 @pytest.mark.premerge
@@ -164,20 +167,20 @@ def test_gemma4_keeps_separate_sliding_cache_models():
     config = _load_reference_config("gemma4_e4b_it_vlm_config.json")
     config.config_pipeline(None, None, 2048, 128, 128)
 
-    assert _layer_indices(config, "group_cache") == [896, 1920]
-    assert _layer_indices(config, "single_cache") == [1023, 2047]
+    assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
+    assert _layer_indices(config, "single_cache") == list(range(127, 2048, 128))
     assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384]
     assert _layer_indices(config, "single_sliding_cache") == [127, 255, 383, 511]
 
 
 @pytest.mark.premerge
-def test_sliding_cache_uses_non_default_base_mask_at_long_context():
+def test_non_default_mask_only_buckets_single_cache_models_through_2k():
     config = _load_reference_config("gemma4_e4b_it_vlm_config.json")
     config.config_pipeline(None, None, 2048, 128, 256)
 
-    assert _layer_indices(config, "group_cache") == [896, 1920]
-    assert _layer_indices(config, "single_cache") == [1023, 2047]
-    assert _layer_indices(config, "group_sliding_cache") == [128, 384]
+    assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
+    assert _layer_indices(config, "single_cache") == list(range(255, 2048, 256))
+    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384]
     assert _layer_indices(config, "single_sliding_cache") == [255, 511]
 
 
@@ -190,6 +193,31 @@ def test_long_context_mask_covers_partial_final_bucket():
 
     assert group_cache_model_indices(config)[-1] == 2372
     assert single_cache_model_indices(config)[-1] == 2499
+
+
+@pytest.mark.premerge
+def test_long_context_mask_starts_after_2k():
+    config = PipelineConfig()
+    config.set_max_num_tokens(8192)
+    config.set_group_size(128)
+    config.set_future_token_mask_size(256)
+
+    expected_group_indices = [*range(0, 2048, 128), *range(2944, 8065, 1024)]
+    expected_single_indices = [*range(255, 2048, 256), *range(3071, 8192, 1024)]
+    assert group_cache_model_indices(config) == expected_group_indices
+    assert single_cache_model_indices(config) == expected_single_indices
+
+
+@pytest.mark.premerge
+def test_long_context_mask_supports_groups_larger_than_base_mask():
+    config = PipelineConfig()
+    config.set_max_num_tokens(8192)
+    config.set_group_size(320)
+    config.set_future_token_mask_size(128)
+
+    assert group_cache_model_indices(config) == [
+        0, 320, 640, 960, 1280, 1600, 2752, 3776, 4800, 5824, 6848, 7872
+    ]
 
 
 @pytest.mark.premerge

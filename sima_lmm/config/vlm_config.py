@@ -867,24 +867,21 @@ class PipelineConfig(BaseConfig):
     def _set_long_context_future_token_mask_size(self) -> None:
         self.long_context_future_token_mask_size = (
             LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE
-            if self.max_num_tokens >= LONG_CONTEXT_MIN_TOKENS
+            if self.max_num_tokens > LONG_CONTEXT_MIN_TOKENS
             else None
         )
 
-    def get_future_token_mask_size(self, layer_type: str) -> int:
-        """Return the mask bucket for full or sliding attention."""
+    def get_cache_mask_size(
+        self, layer_type: str, context_length: int, *, is_group: bool
+    ) -> int:
+        """Return the cache bucket size for the model type and context."""
         if (
             layer_type != "sliding_attention"
             and self.long_context_future_token_mask_size is not None
+            and context_length > LONG_CONTEXT_MIN_TOKENS
         ):
             return self.long_context_future_token_mask_size
-        return self.future_token_mask_size
-
-    def uses_group_future_token_mask(self, layer_type: str) -> bool:
-        return (
-            bool(self.input_token_group_offsets)
-            and self.get_future_token_mask_size(layer_type) > self.input_token_group_size
-        )
+        return self.input_token_group_size if is_group else self.future_token_mask_size
 
     def set_return_logits(self, return_logits: bool):
         self.return_logits = return_logits
@@ -1351,18 +1348,34 @@ def apply_mla_constraint(vlm_cfg: VlmConfig) -> None:
                 setattr(cfg, key, value)
 
 
-def _group_cache_model_indices(cfg: PipelineConfig, mask_size: int) -> list[int]:
+def _cache_model_index(
+    cfg: PipelineConfig,
+    layer_type: str,
+    context_length: int,
+    num_tokens: int,
+    *,
+    is_group: bool,
+) -> int:
+    mask_size = cfg.get_cache_mask_size(
+        layer_type, context_length, is_group=is_group
+    )
+    if mask_size <= num_tokens:
+        return context_length - num_tokens
+    return min(round_up_to(context_length, mask_size), cfg.max_num_tokens) - num_tokens
+
+
+def _group_cache_model_indices(cfg: PipelineConfig, layer_type: str) -> list[int]:
     if cfg.input_token_group_offsets is None:
         raise RuntimeError("Group token offsets have not been computed")
 
-    if mask_size <= cfg.input_token_group_size:
-        return list(cfg.input_token_group_offsets)
-
     return sorted({
-        min(
-            round_up_to(offset + cfg.input_token_group_size, mask_size),
-            cfg.max_num_tokens,
-        ) - cfg.input_token_group_size
+        _cache_model_index(
+            cfg,
+            layer_type,
+            offset + cfg.input_token_group_size,
+            cfg.input_token_group_size,
+            is_group=True,
+        )
         for offset in cfg.input_token_group_offsets
     })
 
@@ -1374,9 +1387,7 @@ def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     Returns:
         Indices of group cache models in ascending order.
     """
-    return _group_cache_model_indices(
-        cfg, cfg.get_future_token_mask_size("full_attention")
-    )
+    return _group_cache_model_indices(cfg, "full_attention")
 
 
 def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
@@ -1392,9 +1403,8 @@ def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) 
         Indices of group sliding cache models in ascending order.
     """
     transition = sliding_window - cfg.input_token_group_size
-    mask_size = cfg.get_future_token_mask_size("sliding_attention")
     indices = [
-        n for n in _group_cache_model_indices(cfg, mask_size)
+        n for n in _group_cache_model_indices(cfg, "sliding_attention")
         if n < transition
     ]
     if transition > 0:
@@ -1411,15 +1421,13 @@ def group_shared_sliding_cache_model_indices(
     ))
 
 
-def _single_cache_model_indices(cfg: PipelineConfig, mask_size: int) -> list[int]:
-    single_cache_token_idx_list = list(
-        range(mask_size - 1, cfg.max_num_tokens, mask_size)
-    )
-
-    if cfg.max_num_tokens - 1 not in single_cache_token_idx_list:
-        single_cache_token_idx_list.append(cfg.max_num_tokens - 1)
-
-    return single_cache_token_idx_list
+def _single_cache_model_indices(cfg: PipelineConfig, layer_type: str) -> list[int]:
+    return sorted({
+        _cache_model_index(
+            cfg, layer_type, context_length, 1, is_group=False
+        )
+        for context_length in range(1, cfg.max_num_tokens + 1)
+    })
 
 
 def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
@@ -1434,9 +1442,7 @@ def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     # batch's index is the last token's index, even if it is not evenly
     # spaced.  For example, given future_token_mask_size=5 and
     # max_num_tokens=24, the indices will be 4, 9, 14, 19, 23.
-    return _single_cache_model_indices(
-        cfg, cfg.get_future_token_mask_size("full_attention")
-    )
+    return _single_cache_model_indices(cfg, "full_attention")
 
 
 def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
@@ -1451,9 +1457,8 @@ def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int)
     Returns:
         Indices of single sliding cache models in ascending order.
     """
-    mask_size = cfg.get_future_token_mask_size("sliding_attention")
     return [
-        n for n in _single_cache_model_indices(cfg, mask_size)
+        n for n in _single_cache_model_indices(cfg, "sliding_attention")
         if n < sliding_window
     ]
 
