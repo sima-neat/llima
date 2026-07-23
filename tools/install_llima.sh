@@ -62,6 +62,7 @@ declare -A seen_files=()
 declare -A llima_debs=()
 declare -A llima_versions=()
 debs=()
+skipped_native_debs=()
 
 while IFS= read -r line || [[ -n "${line}" ]]; do
   line="${line%%#*}"
@@ -84,10 +85,25 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
     exit 1
   fi
   seen_files["${line}"]=1
-  debs+=("${deb_path}")
 
   package="$(dpkg-deb -f "${deb_path}" Package 2>/dev/null || true)"
   version="$(dpkg-deb -f "${deb_path}" Version 2>/dev/null || true)"
+  case "${package}" in
+    libcamera|libcamera-dev|libcamera-tools)
+      # Internals publishes its build-time libcamera payload in the root
+      # artifact, but a Modalix image already owns a matching native camera
+      # stack. Replacing that stack with the bundled upstream version can
+      # violate simaai-palette-modalix's exact dependencies and make APT remove
+      # the board's palette/OTA packages. Keep the native package when present;
+      # the bundled DEB remains a fallback for an image that lacks it.
+      if dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null |
+          grep -q '^ii '; then
+        skipped_native_debs+=("${package}=${version}")
+        continue
+      fi
+      ;;
+  esac
+  debs+=("${deb_path}")
   case "${package}" in
     sima-lmm-core|sima-lmm-cli|sima-lmm-dev)
       if [[ -n "${llima_debs["${package}"]+x}" ]]; then
@@ -125,6 +141,9 @@ for package in sima-lmm-core sima-lmm-cli sima-lmm-dev; do
 done
 
 log "Validated ${#debs[@]} Debian package(s); LLiMa version ${expected_version}."
+if [[ "${#skipped_native_debs[@]}" -gt 0 ]]; then
+  log "Retaining installed native Modalix packages instead of bundled build-time payloads: ${skipped_native_debs[*]}"
+fi
 
 simulate_output="$(mktemp /tmp/install-llima-apt-simulate.XXXXXX)"
 trap 'rm -f "${simulate_output}"' EXIT
