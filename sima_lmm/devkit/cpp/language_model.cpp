@@ -565,8 +565,21 @@ uint32_t LanguageModel::run_model_once(
 
             _cache_model_map.at(model_key).add_to_queue();
 
-            // Non-spec: last-layer post is n1, remap inputs to only the last input token's row.
-            // Spec: last-layer post is n{num_tokens}, keep full inputs.
+            const bool is_draft = _cfg.lm_cfg.is_spec_decode()
+                && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+            const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+            // Using the single post for the target's final layer is valid only when the
+            // draft does not require that layer's hidden states. If it does, use the
+            // group post for the final layer so all group hidden states remain available.
+            const bool use_single_post_for_target_group = (
+                _cfg.lm_cfg.is_spec_decode()
+                && !is_draft
+                && num_tokens != single_num_tokens
+                && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
+            );
+
+            // Non-spec uses n1 for the final row. Target speculative prefill
+            // reuses n16 and binds a contiguous window containing the final row.
             if (num_tokens > 1 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
                 && !_cfg.lm_cfg.is_spec_decode()) {
                 ifm_map.clear();
@@ -596,6 +609,70 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
+            if (use_single_post_for_target_group) {
+                const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
+                const uint32_t slice_start = last_valid_row >= single_num_tokens - 1
+                    ? last_valid_row - (single_num_tokens - 1)
+                    : 0;
+
+                ifm_map.clear();
+                ifm_map.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(0),
+                    std::forward_as_tuple(
+                        nullptr,
+                        std::vector<uint32_t>{slice_start, 0},
+                        std::vector<uint32_t>{single_num_tokens, _cfg.lm_cfg.hidden_size}
+                    )
+                );
+                ifm_map.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(1),
+                    std::forward_as_tuple(
+                        nullptr,
+                        std::vector<uint32_t>{slice_start, 0},
+                        std::vector<uint32_t>{
+                            single_num_tokens,
+                            _cfg.lm_cfg.attn_cfg.get_q_size(_cfg.lm_cfg.layer_types[layer_idx])
+                        }
+                    )
+                );
+                uint8_t post_ifm_idx = 2;
+                if (_uses_per_layer_inputs()) {
+                    const uint32_t layer_row_offset =
+                        static_cast<uint32_t>(layer_idx) * num_tokens;
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx++),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{layer_row_offset + slice_start, 0},
+                            std::vector<uint32_t>{
+                                single_num_tokens,
+                                _cfg.lm_cfg.hidden_size_per_layer_input
+                            }
+                        )
+                    );
+                }
+                if (
+                    _cfg.vm_cfg.has_value()
+                    && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
+                ) {
+                    const auto buf_name = fmt::format("deepstack_feature_l{}_cache", layer_idx);
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{token_idx + slice_start, 0},
+                            std::vector<uint32_t>{
+                                single_num_tokens,
+                                static_cast<uint32_t>(get_buffer(buf_name).get_shape().back())
+                            }
+                        )
+                    );
+                }
+            }
             if (_uses_per_layer_inputs() && num_tokens > 1
                 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
                 && !_cfg.lm_cfg.is_spec_decode()) {
@@ -616,8 +693,7 @@ uint32_t LanguageModel::run_model_once(
 
             // Spec-decoding capture: download n128_buffer1 (this layer's hidden
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
-            // into FC fusion. Spec mode requires SIMA_LLIMA_RUN_DISABLE_QUEUE=1
-            // so post has already run synchronously by the time we get here.
+            // into FC fusion.
             if (
                 _cfg.lm_cfg.is_spec_decode()
                 && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
@@ -630,6 +706,7 @@ uint32_t LanguageModel::run_model_once(
                 };
                 auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
                 if (it != capture_layers.end()) {
+                    MLAModelWithBuffer::run_queue();
                     if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
                         _eagle3_intermediate_hidden_states.resize(capture_layers.size());
                     }
@@ -705,13 +782,26 @@ uint32_t LanguageModel::run_model_once(
     uint32_t next_token_id;
     if (num_input_tokens <= next_token_idx) {
         if (_cfg.lm_cfg.is_spec_decode()) {
-            // Spec: read from n{num_tokens}_lm_split{i} (or n{num_tokens}_buffer4 if no splits).
-            // Last input token's row is (num_input_tokens - 1 - token_idx).
-            const uint32_t row = num_input_tokens - 1 - token_idx;
+            const bool is_draft = _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+            const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+            const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
+            const bool used_single_post_for_target_group = (
+                !is_draft && num_tokens != single_num_tokens
+            );
+            const uint32_t slice_start = (
+                used_single_post_for_target_group
+                && last_valid_row >= single_num_tokens - 1
+            ) ? last_valid_row - (single_num_tokens - 1) : 0;
+            const uint32_t row = last_valid_row - slice_start;
+            const uint16_t logits_num_tokens = used_single_post_for_target_group
+                ? single_num_tokens
+                : num_tokens;
             const uint32_t vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
 
             if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-                MLABuffer* buf_ptr = &get_buffer(fmt::format("n{}_buffer4", num_tokens));
+                MLABuffer* buf_ptr = &get_buffer(
+                    fmt::format("n{}_buffer4", logits_num_tokens)
+                );
                 buf_ptr->invalidate_cache();
                 auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
                 uint32_t best_idx = 0;
@@ -731,7 +821,9 @@ uint32_t LanguageModel::run_model_once(
                 uint32_t i = 0;
                 for (uint32_t split_begin = 0; split_begin < vocab_size; split_begin += split_dim, ++i) {
                     uint32_t split_size = std::min(vocab_size, split_begin + split_dim) - split_begin;
-                    MLABuffer* buf_ptr = &get_buffer(fmt::format("n{}_lm_split{}", num_tokens, i));
+                    MLABuffer* buf_ptr = &get_buffer(
+                        fmt::format("n{}_lm_split{}", logits_num_tokens, i)
+                    );
                     buf_ptr->invalidate_cache();
                     auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
                     for (uint32_t j = 0; j < split_size; ++j) {
@@ -1205,6 +1297,11 @@ void LanguageModel::_define_buffers() {
         const auto lm_head_output_size = _cfg.lm_cfg.get_lm_head_output_size();
         const auto& split_dim = _cfg.lm_cfg.lm_head_split_dim;
         for (const auto& num_tokens: num_tokens_vec) {
+            // Target prefill reuses the single-token-group final post model
+            // (n16 for EAGLE3). Only drafts need group-width final-post outputs.
+            if (!is_draft && num_tokens != _cfg.lm_cfg.get_single_num_tokens()) {
+                continue;
+            }
             if (_cfg.lm_cfg.lm_head_num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
                 define_buffer(
                     fmt::format("n{}_buffer4", num_tokens), {num_tokens, 1}, "int32"
@@ -1519,12 +1616,33 @@ void LanguageModel::_define_attn_models_iter(
     // Post model. For draft, post IFM 0 is the FC fusion output (pre IFM 1), not the
     // token embeddings (pre IFM 0). For target, pre IFM 0 is the hidden state directly.
     std::vector<MLABufferSlice> post_ifms{is_draft ? pre_ifms[1] : pre_ifms[0], cache_ofms[0]};
+    const bool use_single_post_for_target_group = (
+        _cfg.lm_cfg.is_spec_decode()
+        && !is_draft
+        && num_tokens != single_num_tokens
+        && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
+    );
+    if (use_single_post_for_target_group) {
+        post_ifms[0] = MLABufferSlice{
+            post_ifms[0].get_buf_ptr(),
+            {0, 0},
+            {single_num_tokens, _cfg.lm_cfg.hidden_size}
+        };
+        post_ifms[1] = MLABufferSlice{
+            post_ifms[1].get_buf_ptr(),
+            {0, 0},
+            {single_num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}
+        };
+    }
     if (_uses_per_layer_inputs()) {
         post_ifms.emplace_back(
             MLABufferSlice{
                 &get_buffer(fmt::format("n{}_per_layer_input", num_tokens)),
                 std::vector<uint32_t>{static_cast<uint32_t>(layer_idx) * num_tokens, 0},
-                std::vector<uint32_t>{num_tokens, _cfg.lm_cfg.hidden_size_per_layer_input}
+                std::vector<uint32_t>{
+                    use_single_post_for_target_group ? single_num_tokens : num_tokens,
+                    _cfg.lm_cfg.hidden_size_per_layer_input
+                }
             }
         );
     }
@@ -1538,7 +1656,10 @@ void LanguageModel::_define_attn_models_iter(
             MLABufferSlice{
                 &get_buffer(buf_name),
                 {token_idx, 0},
-                {num_tokens, (uint32_t)get_buffer(buf_name).get_shape().back()}
+                {
+                    use_single_post_for_target_group ? single_num_tokens : num_tokens,
+                    (uint32_t)get_buffer(buf_name).get_shape().back()
+                }
             }
         );
     }
@@ -1550,13 +1671,16 @@ void LanguageModel::_define_attn_models_iter(
         );
         post_elf_path = _get_elf_path_post(num_tokens, layer_idx);
     } else {
-        // Last-layer post. ELF and output buffer differ in spec vs non-spec mode.
-        const uint16_t post_num_tokens = _cfg.lm_cfg.is_spec_decode() ? num_tokens : 1;
+        // Target speculative prefill only needs the final valid prompt row's
+        // logits, so reuse the n16 verification post instead of loading n128.
+        const uint16_t post_num_tokens = use_single_post_for_target_group
+            ? single_num_tokens
+            : (_cfg.lm_cfg.is_spec_decode() ? num_tokens : 1);
         post_elf_path = _get_elf_path_post(post_num_tokens, layer_idx);
 
         if (_cfg.lm_cfg.lm_head_num_splits == 1) {
             const std::string buf_name = _cfg.lm_cfg.is_spec_decode()
-                ? fmt::format("n{}_buffer4", num_tokens)
+                ? fmt::format("n{}_buffer4", post_num_tokens)
                 : std::string("n1_buffer4");
             post_ofms.emplace_back(MLABufferSlice{&get_buffer(buf_name)});
         } else {
@@ -1570,7 +1694,9 @@ void LanguageModel::_define_attn_models_iter(
                      split_begin += split_dim, ++i)
                 {
                     post_ofms.emplace_back(
-                        MLABufferSlice{&get_buffer(fmt::format("n{}_lm_split{}", num_tokens, i))}
+                        MLABufferSlice{
+                            &get_buffer(fmt::format("n{}_lm_split{}", post_num_tokens, i))
+                        }
                     );
                 }
             } else {

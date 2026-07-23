@@ -168,8 +168,7 @@ void TextStreamer::end() {
     }
     _on_finalized_text(printable_text, true);
 
-    // Emit generation stats through the logger. Callers that need structured metrics receive
-    // them through the info callback.
+    // Print generation stats.
     std::vector<std::string> messages;
     messages.emplace_back("");
     if (_time_to_first_token < 0) {
@@ -218,7 +217,9 @@ void TextStreamer::end() {
 
     for (const auto& message: messages) {
         _logger->info(message);
+        std::cout << message << std::endl;
     }
+    std::cout << std::flush;
 
     // Reset the stats.
     _time_to_first_token = -1;

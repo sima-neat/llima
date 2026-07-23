@@ -1128,6 +1128,10 @@ class VlmConfig(BaseConfig):
 
         layers = []
         layer_types = getattr(lm_cfg, "layer_types", [])
+        is_speculative_draft = (
+            lm_cfg.speculative_decoding_cfg is not None
+            and lm_cfg.speculative_decoding_cfg.is_draft
+        )
 
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
@@ -1147,7 +1151,7 @@ class VlmConfig(BaseConfig):
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
                     layers.append(LayerID("group_pre", i))
-                    if i < lm_cfg.num_hidden_layers - 1 or lm_cfg.speculative_decoding_cfg is not None:
+                    if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
                         layers.append(LayerID("group_post", i))
                     layers.append(LayerID("single_pre", i))
                     layers.append(LayerID("single_post", i))
@@ -1189,9 +1193,13 @@ class VlmConfig(BaseConfig):
         else:
             # Fallback: attention-only if no layer_types
             layers.extend(LayerID("group_pre", n) for n in range(lm_cfg.num_hidden_layers))
+            num_group_post_layers = (
+                lm_cfg.num_hidden_layers
+                if is_speculative_draft
+                else lm_cfg.num_hidden_layers - 1
+            )
             layers.extend(
-                LayerID("group_post", n) 
-                for n in range(lm_cfg.num_hidden_layers - (lm_cfg.speculative_decoding_cfg is None))
+                LayerID("group_post", n) for n in range(num_group_post_layers)
             )
             layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
             layers.extend(LayerID("single_pre", n) for n in range(lm_cfg.num_hidden_layers))
@@ -1199,7 +1207,7 @@ class VlmConfig(BaseConfig):
             layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
         if self.vm_cfg is not None and self.is_supported_multimodal:
             layers.extend(LayerID("vision", n) for n in range(vision_model_layer_count(self.vm_cfg)))
-        if lm_cfg.speculative_decoding_cfg is not None and lm_cfg.speculative_decoding_cfg.is_draft:
+        if is_speculative_draft:
             layers.append(LayerID("group_draft_fc", 0))
             layers.append(LayerID("single_draft_fc", 0))
 
