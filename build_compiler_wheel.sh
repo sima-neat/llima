@@ -5,7 +5,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${LLIMA_COMPILER_WHEEL_PYTHON:-python3.12}"
 BUILD_TOOLS_VENV="${LLIMA_WHEEL_BUILD_TOOLS_VENV:-${ROOT_DIR}/build/wheel-tools-venv}"
 OUTPUT_DIR="${LLIMA_COMPILER_WHEEL_OUTPUT_DIR:-${ROOT_DIR}/dist/compiler}"
-BUILD_DIR="${LLIMA_COMPILER_WHEEL_BUILD_DIR:-${ROOT_DIR}/build/compiler-wheel/{wheel_tag}}"
 SIMA_CLI_BIN="${SIMA_CLI_BIN:-sima-cli}"
 INSTALLER_SOURCE="${ROOT_DIR}/tools/install_compiler.sh"
 
@@ -81,8 +80,6 @@ GIT_HASH="${WHEEL_GIT_HASH}" LLIMA_WHEEL_VERSION="${WHEEL_VERSION}" \
   "${PYTHON_BIN}" -m build \
   --wheel \
   --outdir "${OUTPUT_DIR}" \
-  -Cbuild-dir="${BUILD_DIR}" \
-  -Cwheel.cmake=false \
   "${ROOT_DIR}"
 
 mapfile -t WHEELS < <(
