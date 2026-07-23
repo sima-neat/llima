@@ -60,7 +60,7 @@ set(
     SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR
     "devkit"
     CACHE STRING
-    "Install destination for the cpp_ext Python extension. Wheels install relative to sima_lmm."
+    "Install destination for the cpp_ext Python extension."
 )
 option(SIMA_LMM_INSTALL_PYTHON_PACKAGE "Install the lean sima_lmm Python runtime package." OFF)
 set(

@@ -38,11 +38,16 @@ def _tag_version_override():
 
 
 def get_version(pkg_dir):
-    vinfo, version = _version_info_from_manifest()
-    tag_version = _tag_version_override()
-    if tag_version:
-        version = tag_version
-        vinfo = _version_info(version)
+    version_override = os.environ.get("LLIMA_WHEEL_VERSION", "").strip()
+    if version_override:
+        version = version_override
+        vinfo = _version_info(version.split("+", 1)[0])
+    else:
+        vinfo, version = _version_info_from_manifest()
+        tag_version = _tag_version_override()
+        if tag_version:
+            version = tag_version
+            vinfo = _version_info(version)
 
     if "GIT_HASH" in os.environ:
         # In tox the .git directory is not available so do this instead
@@ -103,7 +108,7 @@ sdk_ext_require = [
     "onnxruntime==1.21.1",
     "onnxsim-prebuilt",  # Required for graph surgery
     "safetensors",  # Required for HF LLM models
-    "torch==2.3.1",  # Required to load GGUF file to transformers.
+    "torch==2.8.0",  # Required to load GGUF file to transformers.
     "av",  # Required for audio preprocessing
     "ml_dtypes==0.3.1",  # Required for bfloat16 datatype
     "sentencepiece==0.2.0",  # Required for LLM tokenizer
@@ -111,8 +116,8 @@ sdk_ext_require = [
     "blobfile",  # Required by tiktoken
     "pillow",  # Required for VLM image preprocessing
     "protobuf==4.25.7",  # Required for SentencePiece with extended vocabulary.
-    "transformers==4.57.1",  # Required for load/verify HF models and use HF processor.
-    "huggingface-hub>=0.34.0,<1.0", # Required to work with current transformers version.
+    "transformers==5.5.4",  # Required for load/verify HF models and use HF processor.
+    "huggingface-hub>=1.5.0", # Required to work with current transformers version.
     "gguf==0.17.1",  # Required for GGUF weights dequantization
     "llama_cpp_python==0.3.16",  # Required to run GGUF inference
 
