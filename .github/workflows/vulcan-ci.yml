@@ -272,6 +272,7 @@ jobs:
             "compiler": {
                 "install_compiler.sh",
                 "metadata.json",
+                "metadata-wheel.json",
             },
             "mole": {
                 "install_mole.sh",

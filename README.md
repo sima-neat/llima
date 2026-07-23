@@ -215,6 +215,15 @@ package metadata in `dist/mole/`. As in Core packages, artifact checksums are
 recorded in each profile's `metadata.json`; the legacy Debian archive keeps its
 separate checksum file under `dist/debs/`.
 
+`dist/compiler/metadata-wheel.json` is a download-only profile for consumers
+that need the compiler wheel as an input to another package bundle. It contains
+only the wheel and its checksum. Its installation command is the POSIX no-op
+`:`—the same download-only convention as Core. For example:
+
+```bash
+sima-cli neat install --type wheel --install-dir <wheel-dir> llima/compiler@develop
+```
+
 ```text
 dist/
 ├── sima-lmm-<version>-Linux-{core,dev,cli}.deb
@@ -231,7 +240,8 @@ dist/
 ├── compiler/
 │   ├── sima_lmm-<version>-py3-none-any.whl
 │   ├── install_compiler.sh
-│   └── metadata.json
+│   ├── metadata.json
+│   └── metadata-wheel.json
 └── mole/
     ├── sima_lmm-<version>-py3-none-any.whl
     ├── install_mole.sh
