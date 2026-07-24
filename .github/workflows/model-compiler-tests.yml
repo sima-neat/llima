@@ -1,0 +1,232 @@
+name: LLiMa Model Compiler Tests
+
+on:
+  workflow_call:
+    inputs:
+      vulcan_env:
+        description: Vulcan environment used for runner allocation and artifact resolution.
+        required: true
+        type: string
+      artifact_base_url:
+        description: Base URL for internally cached model inputs.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  SIMA_CLI_CHECK_FOR_UPDATE: "0"
+  VULCAN_ENV: ${{ inputs.vulcan_env }}
+  VULCAN_RUNNER_PROFILE: ubuntu
+  VULCAN_ARCHITECTURE: arm64
+  VULCAN_CAPACITY: default
+  VULCAN_WORKSPACE: /mnt/vulcan/workspace
+  ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+
+jobs:
+  test:
+    name: Test LLiMa on Model Compiler
+    environment: ${{ inputs.vulcan_env }}
+    runs-on:
+      - self-hosted
+      - linux
+      - arm64
+      - vulcan-${{ inputs.vulcan_env }}
+      - ubuntu
+      - default
+
+    steps:
+      - name: Prepare Vulcan workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0775 "${VULCAN_WORKSPACE}"
+          find "${VULCAN_WORKSPACE}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          submodules: "false"
+
+      - name: Stage checkout into Vulcan workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "${VULCAN_WORKSPACE}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          tar -C "${GITHUB_WORKSPACE}" --exclude .git -cf - . |
+            tar -C "${VULCAN_WORKSPACE}" -xf -
+          test -f "${VULCAN_WORKSPACE}/README.md"
+
+      - name: Inspect Vulcan runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "VULCAN_ENV=${VULCAN_ENV}"
+          echo "VULCAN_RUNNER_PROFILE=${VULCAN_RUNNER_PROFILE}"
+          echo "VULCAN_ARCHITECTURE=${VULCAN_ARCHITECTURE}"
+          echo "VULCAN_CAPACITY=${VULCAN_CAPACITY}"
+          uname -a
+          id
+          df -h
+          test "$(uname -m)" = "aarch64"
+          test "${VULCAN_RUNNER_PROFILE}" = "ubuntu"
+
+      - name: Install sima-cli
+        shell: bash
+        working-directory: ${{ env.VULCAN_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/install_sima_cli_main.sh
+          sima_cli="${HOME}/.sima-cli/.venv/bin/sima-cli"
+          test -x "${sima_cli}"
+          echo "SIMA_CLI=${sima_cli}" >> "${GITHUB_ENV}"
+          echo "$(dirname "${sima_cli}")" >> "${GITHUB_PATH}"
+
+      - name: Install Model Compiler
+        shell: bash
+        working-directory: ${{ env.VULCAN_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          model_compiler_spec="model-compiler/arm64@develop"
+          echo "Installing ${model_compiler_spec}"
+          "${SIMA_CLI}" neat install \
+            --env "${VULCAN_ENV}" \
+            "${model_compiler_spec}"
+
+      - name: Configure Model Compiler environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          model_compiler_dir=""
+          for candidate in \
+            "/sdk-extensions/model-compiler" \
+            "/sdk-add-on/model-compiler" \
+            "${HOME}/sdk-extensions/model-compiler"; do
+            if [[ -f "${candidate}/bin/activate" ]]; then
+              model_compiler_dir="${candidate}"
+              break
+            fi
+          done
+          if [[ -z "${model_compiler_dir}" ]]; then
+            echo "Model Compiler venv was not found in a supported install location." >&2
+            exit 1
+          fi
+
+          site_packages="$(
+            find "${model_compiler_dir}/lib" -maxdepth 3 -type d -name site-packages 2>/dev/null |
+              head -n 1
+          )"
+          library_path="${model_compiler_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          if [[ -n "${site_packages}" ]]; then
+            library_path="${site_packages}:${site_packages}/tvm:${library_path}"
+          fi
+
+          {
+            echo "MODEL_COMPILER_DIR=${model_compiler_dir}"
+            echo "VIRTUAL_ENV=${model_compiler_dir}"
+            echo "LD_LIBRARY_PATH=${library_path}"
+          } >> "${GITHUB_ENV}"
+          echo "${model_compiler_dir}/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify Model Compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${VIRTUAL_ENV}" = "${MODEL_COMPILER_DIR}"
+          python -c 'import afe; print(f"Model Compiler afe: {afe.__file__}")'
+
+      - name: Install exact LLiMa compiler artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          short_sha="${GITHUB_SHA:0:12}"
+          package_spec="llima/compiler@${ref_name}:${short_sha}"
+          install_dir="${RUNNER_TEMP}/llima-compiler-smoke"
+
+          rm -rf "${install_dir}"
+          mkdir -p "${install_dir}"
+
+          echo "Installing exact artifact ${package_spec}"
+          for attempt in 1 2 3 4; do
+            if "${SIMA_CLI}" neat install \
+              --env "${VULCAN_ENV}" \
+              --install-dir "${install_dir}" \
+              "${package_spec}"; then
+              break
+            fi
+            if [[ "${attempt}" -eq 4 ]]; then
+              echo "Compiler installation failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            delay=$((attempt * 10))
+            echo "Compiler installation attempt ${attempt} failed; retrying in ${delay}s." >&2
+            sleep "${delay}"
+          done
+
+      - name: Verify LLiMa installation and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -P - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
+          import importlib.metadata
+          import sys
+          from pathlib import Path
+
+          import sima_lmm
+
+          virtual_env, checkout = sys.argv[1:]
+          installed_version = importlib.metadata.version("sima-lmm")
+          module_path = Path(sima_lmm.__file__).resolve()
+          virtual_env_path = Path(virtual_env).resolve()
+          checkout_path = Path(checkout).resolve()
+
+          if virtual_env_path not in module_path.parents:
+              raise SystemExit(f"sima_lmm was imported outside {virtual_env_path}: {module_path}")
+          if checkout_path in module_path.parents:
+              raise SystemExit(f"sima_lmm was imported from the checkout: {module_path}")
+
+          print(f"Installed sima-lmm: {installed_version}")
+          print(f"Import provenance: {module_path}")
+          PY
+
+      - name: Download and verify cached models
+        shell: bash
+        working-directory: ${{ env.VULCAN_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          model_root="${VULCAN_WORKSPACE}/_work/model-inputs"
+          provenance="${RUNNER_TEMP}/llima-model-input-provenance.json"
+          python3 tools/ci/prepare_model_inputs.py \
+            --base-url "${ARTIFACT_BASE_URL}" \
+            --output-dir "${model_root}" \
+            --provenance-output "${provenance}" \
+            --jobs 4
+          {
+            echo "LLIMA_HF_MODELS_PATH=${model_root}"
+            echo "LLIMA_MODEL_INPUT_PROVENANCE=${provenance}"
+            echo "HF_HUB_OFFLINE=1"
+            echo "TRANSFORMERS_OFFLINE=1"
+          } >> "${GITHUB_ENV}"
+
+      - name: Run compiler smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "${LLIMA_HF_MODELS_PATH}"
+          command -v llima-compile
+          llima-compile --help >/dev/null
+          echo "LLiMa Model Compiler smoke test passed."
+
+      - name: Upload model-input provenance
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: llima-model-input-provenance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llima-model-input-provenance.json
+          if-no-files-found: warn
+          retention-days: 7
