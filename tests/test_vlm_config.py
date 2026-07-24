@@ -32,6 +32,7 @@ _EXAMPLE_CONFIGS = [
     # LiquidAI
     ("models--LiquidAI--LFM2-350M",                       "lfm2_vlm_config.json",                 None),
     # VLMs
+    ("models--stribomon--gemma3-siglip448",                "gemma3_siglip448_vlm_config.json",     None),
     ("models--Qwen--Qwen2.5-VL-3B-Instruct",              "qwen2.5_vl_vlm_config.json",           [448, 448]),
     ("models--Qwen--Qwen3-VL-2B-Instruct",                "qwen3_vl_vlm_config.json",             [448, 448]),
     ("models--LiquidAI--LFM2-VL-450M",                    "lfm2_vl_vlm_config.json",              None),

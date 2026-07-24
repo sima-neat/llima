@@ -53,6 +53,7 @@ _ONNX_REGRESSION_CONFIGS = [
     ("models--Qwen--Qwen3-0.6B",                    "cache",  None),
     ("models--Qwen--Qwen3-0.6B",                    "post",   None),
     ("models--LiquidAI--LFM2-350M",                 "conv",   None),
+    ("models--stribomon--gemma3-siglip448",         "vision", None),
     ("models--Qwen--Qwen2.5-VL-3B-Instruct",        "vision", [224, 224]),
     ("models--Qwen--Qwen3-VL-2B-Instruct",          "vision", [224, 224]),
     ("models--LiquidAI--LFM2-VL-450M",              "vision", None),
