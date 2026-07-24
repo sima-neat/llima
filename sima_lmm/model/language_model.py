@@ -288,8 +288,7 @@ class LanguageModel(BaseModel):
                 perf_cnt_begin = time.perf_counter_ns()
 
             for layer_idx in range(self.cfg.lm_cfg.num_hidden_layers):
-                layer_type = layer_types[layer_idx]
-                is_global = layer_type == "full_attention"
+                is_global = (layer_types[layer_idx] == "full_attention")
                 pre_ifms = list()
                 if layer_idx == 0:
                     if use_input_tokens:
@@ -339,32 +338,11 @@ class LanguageModel(BaseModel):
                     token_idx_begin = 0
                 else:
                     token_idx_begin = max(0, token_idx + num_tokens - sliding_window)
-                effective_context = token_idx + num_tokens - token_idx_begin
-                is_group_model = (
-                    num_tokens == self.cfg.pipeline_cfg.input_token_group_size
-                    and num_tokens != self._single_model_num_tokens
-                )
-                cache_mask_size = self.cfg.pipeline_cfg.get_cache_mask_size(
-                    layer_type, effective_context, is_group=is_group_model
-                )
-                use_group_future_token_mask = (
-                    is_group_model
-                    and cache_mask_size > self.cfg.pipeline_cfg.input_token_group_size
-                )
-                if cache_mask_size > 1 and num_tokens == 1:
+                if self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
                     aligned_token_idx = min(
-                        round_up_to(token_idx + 1, cache_mask_size) - 1,
+                        round_up_to(token_idx+1, self.cfg.pipeline_cfg.future_token_mask_size) - 1,
                         self.cfg.pipeline_cfg.max_num_tokens - 1
                     )
-                elif use_group_future_token_mask:
-                    aligned_context = min(
-                        round_up_to(
-                            token_idx + num_tokens - token_idx_begin,
-                            cache_mask_size,
-                        ),
-                        self.cfg.pipeline_cfg.max_num_tokens,
-                    )
-                    aligned_token_idx = token_idx_begin + aligned_context - num_tokens
                 else:
                     aligned_token_idx = token_idx
                 cache_ifms = [
@@ -377,22 +355,10 @@ class LanguageModel(BaseModel):
                     )
                 if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and num_tokens > 1:
                     assert is_global
-                    mask = np.zeros(
-                        (1, 1, num_tokens, aligned_token_idx + num_tokens), dtype=np.float32
-                    )
+                    mask = np.zeros((1, 1, num_tokens, token_idx + num_tokens), dtype=np.float32)
                     mask[0, 0, :, num_input_tokens - token_idx:] = np.finfo(np.float32).min
                     cache_ifms.append(mask)
-                elif use_group_future_token_mask:
-                    context_length = aligned_token_idx + num_tokens - token_idx_begin
-                    mask = np.full(
-                        (1, 1, num_tokens, context_length),
-                        np.finfo(np.float32).min,
-                        dtype=np.float32,
-                    )
-                    for row in range(num_tokens):
-                        mask[..., row, :token_idx - token_idx_begin + row + 1] = 0
-                    cache_ifms.append(mask)
-                elif cache_mask_size > 1 and num_tokens == 1:
+                elif self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
                     mask = np.full(
                         (1, 1, 1, aligned_token_idx + 1 - token_idx_begin),
                         np.finfo(np.float32).min,

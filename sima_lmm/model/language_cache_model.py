@@ -61,7 +61,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
     @property
     def _is_group_model(self) -> bool:
         return (
-            not self._is_speculative_decoding
+            bool(self.cfg.pipeline_cfg.input_token_group_offsets)
+            and not self._is_speculative_decoding
             and self.num_tokens == self.cfg.pipeline_cfg.input_token_group_size
         )
 
