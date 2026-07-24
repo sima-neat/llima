@@ -40,6 +40,15 @@ LanguageModel::LanguageModel(
     _is_running(false),
     _reloc_name(std::nullopt)
 {
+    if (
+        _cfg.pipeline_cfg.max_num_tokens == 0
+        || _cfg.pipeline_cfg.max_num_tokens % MAX_NUM_TOKENS_ALIGNMENT
+    ) {
+        throw std::runtime_error(
+            "max_num_tokens must be a positive multiple of 1024"
+        );
+    }
+
     _use_group_token_models = (
         _cfg.pipeline_cfg.input_token_group_offsets.has_value()
         && _cfg.pipeline_cfg.input_token_group_offsets.value().size() > 0

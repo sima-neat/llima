@@ -67,7 +67,7 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `model_path` | Input model path (HuggingFace directory, GGUF file, or pre-quantized compressed tensor directory). |
 | `-o, --output` | Output directory for compiled files. Defaults to the model name. |
 | `-c, --configuration_file` | Python script to configure precision per layer (e.g., for mixed-precision). |
-| `--max_num_tokens` | Max context length. Default: 4096. |
+| `--max_num_tokens` | Max context length. Must be a multiple of 1024. Default: 4096. |
 | `--resume` | Resume interrupted builds by skipping existing files. |
 | `-j, --jobs` | Number of parallel compilation jobs. Default: Number of physical CPU cores. |
 | `--log_level` | Logging level (DEBUG, INFO, WARNING, ERROR). Default: WARNING. |

@@ -242,7 +242,8 @@ def main():
     group = parser.add_argument_group("Model compilation parameters")
     group.add_argument(
         "--max_num_tokens", type=int, metavar="N", default=4096,
-        help="Maximum number of input tokens that the model will support (default: 4096)"
+        help="Maximum number of input tokens that the model will support; "
+             "must be a multiple of 1024 (default: 4096)"
     )
     group.add_argument(
         "--language_group_size", type=int, metavar="N", default=128,

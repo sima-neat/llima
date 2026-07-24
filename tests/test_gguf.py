@@ -175,7 +175,7 @@ def test_vlm_config(gguf_models_path: Path, ggml_type: str):
 
     vlm_cfg = VlmConfig.from_hf_config(ModelFormat.FORMAT_GGUF, model_path, model_cfg)
 
-    max_num_tokens = 512
+    max_num_tokens = 1024
     language_group_size = 128
     future_token_mask_size = 128
 
@@ -183,7 +183,7 @@ def test_vlm_config(gguf_models_path: Path, ggml_type: str):
         "Be helpful and polite.", None, max_num_tokens,
         language_group_size, future_token_mask_size
     )
-    assert vlm_cfg.pipeline_cfg.input_token_group_offsets == [0, 128, 256, 384]
+    assert vlm_cfg.pipeline_cfg.input_token_group_offsets == list(range(0, 1024, 128))
 
     tempfilename = (
         f"sima-{vlm_cfg.model_type}-{vlm_cfg.lm_cfg.arch}.json"

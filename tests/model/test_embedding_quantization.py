@@ -43,7 +43,7 @@ def gemma4_model(hf_models_path: Path, tmp_path_factory) -> VisionLanguageModel:
         model_name=model_path.name,
         onnx_path=output_path / "onnx",
         sima_path=output_path / "sima",
-        max_num_tokens=128,
+        max_num_tokens=1024,
         image_resolution=[240, 240],
         quantize_embeddings=True,
     )

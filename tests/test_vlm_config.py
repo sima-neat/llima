@@ -78,7 +78,7 @@ def test_default_max_num_tokens():
 
 @pytest.mark.parametrize(
     ("max_num_tokens", "expected_long_context_mask"),
-    [(2047, None), (2048, None), (2049, 1024), (4096, 1024)],
+    [(1024, None), (2048, None), (3072, 1024), (4096, 1024)],
 )
 @pytest.mark.premerge
 def test_long_context_future_token_mask_resolution(
@@ -185,14 +185,12 @@ def test_non_default_mask_only_buckets_single_cache_models_through_2k():
 
 
 @pytest.mark.premerge
-def test_long_context_mask_covers_partial_final_bucket():
+@pytest.mark.parametrize("max_num_tokens", [128, 512, 2049, 2500])
+def test_unaligned_max_num_tokens_is_rejected(max_num_tokens: int):
     config = PipelineConfig()
-    config.set_max_num_tokens(2500)
-    config.set_group_size(128)
-    config.set_future_token_mask_size(128)
 
-    assert group_cache_model_indices(config)[-1] == 2372
-    assert single_cache_model_indices(config)[-1] == 2499
+    with pytest.raises(ValueError, match="multiple of 1024"):
+        config.set_max_num_tokens(max_num_tokens)
 
 
 @pytest.mark.premerge
@@ -223,11 +221,11 @@ def test_long_context_mask_supports_groups_larger_than_base_mask():
 @pytest.mark.premerge
 def test_group_configuration_is_automatic_and_serializable():
     config = _load_reference_config("gemma3_vlm_config.json")
-    config.config_pipeline(None, None, 512, 128, 128)
+    config.config_pipeline(None, None, 1024, 128, 128)
 
     restored = VlmConfig.load(json.loads(json.dumps(asdict(config))))
     assert restored.pipeline_cfg.input_token_group_size == 128
-    assert restored.pipeline_cfg.input_token_group_offsets == [0, 128, 256, 384]
+    assert restored.pipeline_cfg.input_token_group_offsets == list(range(0, 1024, 128))
 
 
 @pytest.mark.premerge

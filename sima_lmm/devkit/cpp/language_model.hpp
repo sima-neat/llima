@@ -271,6 +271,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
         static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
+        static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
         uint16_t _get_cache_mask_size(
             const std::string& layer_type, uint16_t context_length, bool is_group
         ) const {

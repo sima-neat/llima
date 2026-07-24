@@ -841,7 +841,10 @@ class PipelineConfig(BaseConfig):
         self.chat_template = chat_template
 
     def set_max_num_tokens(self, max_num_tokens: int):
-        assert max_num_tokens > 0
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be greater than zero")
+        if max_num_tokens % LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE:
+            raise ValueError("max_num_tokens must be a multiple of 1024")
         self.max_num_tokens = max_num_tokens
         self._set_long_context_future_token_mask_size()
 
@@ -1486,8 +1489,8 @@ def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     # A model is used for each batch of future_token_mask_size tokens.
     # The model's index is the last token's index in the batch.  The last
     # batch's index is the last token's index, even if it is not evenly
-    # spaced.  For example, given future_token_mask_size=5 and
-    # max_num_tokens=24, the indices will be 4, 9, 14, 19, 23.
+    # spaced.  For example, given future_token_mask_size=192 and
+    # max_num_tokens=1024, the indices will be 191, 383, 575, 767, 959, 1023.
     return _single_cache_model_indices(cfg, "full_attention")
 
 
