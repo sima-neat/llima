@@ -449,7 +449,7 @@ jobs:
           sleep "${delay}"
         done
 
-        python - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
+        python -P - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
         import importlib.metadata
         import sys
         from pathlib import Path
