@@ -30,6 +30,12 @@ jobs:
     with:
       vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
 
+  resolve-model-cache-config:
+    name: Resolve Model Cache Config
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
+    with:
+      vulcan_env: production
+
   resolve-test-runner:
     name: Resolve Test Runner
     uses: sima-neat/.github/.github/workflows/vulcan-resolve-modalix-runner.yml@main
@@ -378,11 +384,12 @@ jobs:
     name: Smoke test LLiMa on Model Compiler
     needs:
       - resolve-vulcan-config
+      - resolve-model-cache-config
       - publish-vulcan-artifacts
     uses: ./.github/workflows/model-compiler-tests.yml
     with:
       vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
-      artifact_base_url: ${{ needs.resolve-vulcan-config.outputs.artifact_base_url }}
+      artifact_base_url: ${{ needs.resolve-model-cache-config.outputs.artifact_base_url }}
 
   test-devkit:
     name: Test LLiMa root artifact on DevKit

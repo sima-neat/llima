@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -38,6 +39,7 @@ class SourceSpec:
     revision: str
     payload_format: str
     cache_root: str
+    file_patterns: tuple[str, ...] = ()
 
     @property
     def model_folder(self) -> str:
@@ -137,6 +139,11 @@ def parse_source_manifest(
             )
         repo_id = validate_repo_id(parts[0])
         revision = parts[1] if len(parts) >= 2 else "main"
+        file_patterns = tuple(parts[2:]) if allow_filenames else ()
+        if any(not pattern.lower().endswith(".gguf") for pattern in file_patterns):
+            raise PreparationError(
+                f"{path}:{line_number}: explicit GGUF filenames must end in .gguf"
+            )
         key = f"{repo_id}@{revision}"
         if key in seen:
             raise PreparationError(f"{path}:{line_number}: duplicate entry {key}")
@@ -147,6 +154,7 @@ def parse_source_manifest(
                 revision=revision,
                 payload_format=payload_format,
                 cache_root=validate_cache_root(cache_root),
+                file_patterns=file_patterns,
             )
         )
 
@@ -175,6 +183,15 @@ def normalize_base_url(raw_url: str) -> str:
 
 def build_url(base_url: str, key: str) -> str:
     return f"{base_url}/{urllib.parse.quote(key, safe='/')}"
+
+
+def selection_fingerprint(payload_format: str, file_patterns: tuple[str, ...]) -> str:
+    selection = {
+        "format": payload_format,
+        "allow_patterns": sorted(file_patterns),
+    }
+    payload = json.dumps(selection, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def open_internal_url(url: str, *, timeout: int):
@@ -246,6 +263,12 @@ def resolve_model_plan(base_url: str, source: SourceSpec) -> ModelPlan:
     ).lower()
     if not SHA256_PATTERN.fullmatch(selection_sha256):
         raise PreparationError(f"{context}: invalid selection SHA-256")
+    if source.file_patterns and selection_sha256 != selection_fingerprint(
+        source.payload_format, source.file_patterns
+    ):
+        raise PreparationError(
+            f"{context}: cached file selection does not match source manifest"
+        )
 
     raw_files = manifest.get("files")
     if not isinstance(raw_files, list) or not raw_files:
@@ -347,7 +370,7 @@ def download_file(cached_file: CachedFile, destination: Path) -> None:
                         handle.write(chunk)
                         digest.update(chunk)
                         byte_count += len(chunk)
-            except (OSError, urllib.error.URLError) as exc:
+            except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
                 if attempt == DOWNLOAD_ATTEMPTS:
                     raise PreparationError(
                         f"Unable to download {cached_file.download_url} after "
@@ -500,8 +523,13 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 executor.submit(download_file, cached_file, destination)
                 for cached_file, destination in download_tasks
             ]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
 
         os.replace(staging_dir, output_dir)
     finally:

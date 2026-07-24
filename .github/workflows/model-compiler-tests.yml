@@ -76,7 +76,7 @@ jobs:
           test "$(uname -m)" = "aarch64"
           test "${VULCAN_RUNNER_PROFILE}" = "ubuntu"
 
-      - name: Install sima-cli
+      - name: Install and verify compiler toolchain
         shell: bash
         working-directory: ${{ env.VULCAN_WORKSPACE }}
         run: |
@@ -84,24 +84,13 @@ jobs:
           ./scripts/ci/install_sima_cli_main.sh
           sima_cli="${HOME}/.sima-cli/.venv/bin/sima-cli"
           test -x "${sima_cli}"
-          echo "SIMA_CLI=${sima_cli}" >> "${GITHUB_ENV}"
-          echo "$(dirname "${sima_cli}")" >> "${GITHUB_PATH}"
 
-      - name: Install Model Compiler
-        shell: bash
-        working-directory: ${{ env.VULCAN_WORKSPACE }}
-        run: |
-          set -euo pipefail
           model_compiler_spec="model-compiler/arm64@develop"
           echo "Installing ${model_compiler_spec}"
-          "${SIMA_CLI}" neat install \
+          "${sima_cli}" neat install \
             --env "${VULCAN_ENV}" \
             "${model_compiler_spec}"
 
-      - name: Configure Model Compiler environment
-        shell: bash
-        run: |
-          set -euo pipefail
           model_compiler_dir=""
           for candidate in \
             "/sdk-extensions/model-compiler" \
@@ -126,21 +115,24 @@ jobs:
             library_path="${site_packages}:${site_packages}/tvm:${library_path}"
           fi
 
+          export MODEL_COMPILER_DIR="${model_compiler_dir}"
+          export VIRTUAL_ENV="${model_compiler_dir}"
+          export LD_LIBRARY_PATH="${library_path}"
+          export PATH="${model_compiler_dir}/bin:$(dirname "${sima_cli}"):${PATH}"
+
           {
+            echo "SIMA_CLI=${sima_cli}"
             echo "MODEL_COMPILER_DIR=${model_compiler_dir}"
             echo "VIRTUAL_ENV=${model_compiler_dir}"
             echo "LD_LIBRARY_PATH=${library_path}"
           } >> "${GITHUB_ENV}"
+          echo "$(dirname "${sima_cli}")" >> "${GITHUB_PATH}"
           echo "${model_compiler_dir}/bin" >> "${GITHUB_PATH}"
 
-      - name: Verify Model Compiler
-        shell: bash
-        run: |
-          set -euo pipefail
           test "${VIRTUAL_ENV}" = "${MODEL_COMPILER_DIR}"
           python -c 'import afe; print(f"Model Compiler afe: {afe.__file__}")'
 
-      - name: Install exact LLiMa compiler artifact
+      - name: Install and verify LLiMa compiler artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -169,10 +161,6 @@ jobs:
             sleep "${delay}"
           done
 
-      - name: Verify LLiMa installation and provenance
-        shell: bash
-        run: |
-          set -euo pipefail
           python -P - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
           import importlib.metadata
           import sys
