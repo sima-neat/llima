@@ -822,7 +822,7 @@ class PipelineConfig(BaseConfig):
     """
     system_prompt: str | None = None
     chat_template: str | None = None
-    max_num_tokens: int = 8192
+    max_num_tokens: int = 4096
     input_token_group_size: int = 1
     input_token_group_offsets: list[int] | None = None
     future_token_mask_size: int = 1
@@ -1166,13 +1166,30 @@ class VlmConfig(BaseConfig):
                     lm_cfg.attn_cfg.sliding_head_dim is not None
                     and lm_cfg.attn_cfg.sliding_head_dim != lm_cfg.attn_cfg.head_dim
                 )
+                terminal_sliding_cache = False
                 if has_sliding_attn and not separate_sliding_cache:
-                    group_cache_indices = group_shared_sliding_cache_model_indices(
-                        pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                    sliding_window = lm_cfg.attn_cfg.sliding_window
+                    mask_context = min(sliding_window, pipeline_cfg.max_num_tokens)
+                    sliding_cache_mask_differs = any(
+                        pipeline_cfg.get_cache_mask_size(
+                            "full_attention", mask_context, is_group=is_group
+                        )
+                        != pipeline_cfg.get_cache_mask_size(
+                            "sliding_attention", mask_context, is_group=is_group
+                        )
+                        for is_group in (False, True)
                     )
-                    single_cache_indices = single_shared_sliding_cache_model_indices(
-                        pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                    terminal_sliding_cache = (
+                        sliding_cache_mask_differs
+                        and sliding_window <= pipeline_cfg.max_num_tokens
                     )
+                    if not sliding_cache_mask_differs:
+                        group_cache_indices = group_shared_sliding_cache_model_indices(
+                            pipeline_cfg, sliding_window
+                        )
+                        single_cache_indices = single_shared_sliding_cache_model_indices(
+                            pipeline_cfg, sliding_window
+                        )
                 layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
                 layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
                 if separate_sliding_cache:
@@ -1188,6 +1205,27 @@ class VlmConfig(BaseConfig):
                             pipeline_cfg, lm_cfg.attn_cfg.sliding_window
                         )
                     )
+                elif terminal_sliding_cache:
+                    layers.append(LayerID(
+                        "group_sliding_cache",
+                        _cache_model_index(
+                            pipeline_cfg,
+                            "sliding_attention",
+                            sliding_window,
+                            pipeline_cfg.input_token_group_size,
+                            is_group=True,
+                        ),
+                    ))
+                    layers.append(LayerID(
+                        "single_sliding_cache",
+                        _cache_model_index(
+                            pipeline_cfg,
+                            "sliding_attention",
+                            sliding_window,
+                            1,
+                            is_group=False,
+                        ),
+                    ))
             if has_conv and layer_types[-1] == "conv":
                 layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
         else:

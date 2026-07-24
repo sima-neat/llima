@@ -73,7 +73,7 @@ def test_embedding_scale_is_absent_without_embedding_quantization():
 
 @pytest.mark.premerge
 def test_default_max_num_tokens():
-    assert PipelineConfig().max_num_tokens == 8192
+    assert PipelineConfig().max_num_tokens == 4096
 
 
 @pytest.mark.parametrize(

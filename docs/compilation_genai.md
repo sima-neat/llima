@@ -67,7 +67,7 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `model_path` | Input model path (HuggingFace directory, GGUF file, or pre-quantized compressed tensor directory). |
 | `-o, --output` | Output directory for compiled files. Defaults to the model name. |
 | `-c, --configuration_file` | Python script to configure precision per layer (e.g., for mixed-precision). |
-| `--max_num_tokens` | Max context length. Default: 1024. |
+| `--max_num_tokens` | Max context length. Default: 4096. |
 | `--resume` | Resume interrupted builds by skipping existing files. |
 | `-j, --jobs` | Number of parallel compilation jobs. Default: Number of physical CPU cores. |
 | `--log_level` | Logging level (DEBUG, INFO, WARNING, ERROR). Default: WARNING. |
@@ -75,6 +75,10 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--input_width` | Input image width in pixels. Required for Siglip2 and Qwen-VL based models. |
 | `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
 | `--system_prompt_file` | Path to a text file containing the system prompt. |
+
+:::note
+Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 8192` to enable an 8K context length.
+:::
 
 | Advanced Argument | Description |
 |----|----|
@@ -161,7 +165,7 @@ sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct -o L
 This will:
 
 - Use default BF16 precision for all layers
-- Set context length to 1024 tokens
+- Set context length to 4096 tokens
 - Output to `Llama-3.2-3B-Instruct_out` directory
 
 **Example 2: Compiling with Custom Context Length**

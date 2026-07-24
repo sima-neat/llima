@@ -1470,8 +1470,34 @@ void LanguageModel::_define_attn_models_iter(
     uint16_t aligned_eff_token_idx;
     uint16_t aligned_eff_num_cached_tokens;
     const bool is_single_model = num_tokens == single_num_tokens;
+    const uint16_t sliding_window = _cfg.lm_cfg.attn_cfg.sliding_window.value_or(0);
+    const bool separate_sliding_cache = (
+        layer_type == "sliding_attention"
+        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.has_value()
+        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.value() != _cfg.lm_cfg.attn_cfg.head_dim
+    );
+    const bool sliding_cache_mask_differs = (
+        layer_type == "sliding_attention"
+        && !separate_sliding_cache
+        && (
+            _get_cache_mask_size("full_attention", sliding_window, true)
+                != _get_cache_mask_size("sliding_attention", sliding_window, true)
+            || _get_cache_mask_size("full_attention", sliding_window, false)
+                != _get_cache_mask_size("sliding_attention", sliding_window, false)
+        )
+    );
+    const bool use_sliding_cache = (
+        separate_sliding_cache
+        || (
+            sliding_cache_mask_differs
+            && eff_num_cached_tokens >= sliding_window
+        )
+    );
+    const std::string cache_layer_type = (
+        use_sliding_cache ? "sliding_attention" : "full_attention"
+    );
     const uint16_t cache_mask_size = _get_cache_mask_size(
-        layer_type, eff_num_cached_tokens, !is_single_model
+        cache_layer_type, eff_num_cached_tokens, !is_single_model
     );
     const bool use_single_future_token_mask = (
         is_single_model && cache_mask_size > 1
@@ -1549,7 +1575,7 @@ void LanguageModel::_define_attn_models_iter(
         cache_ifms.emplace_back(
             MLABufferSlice{
                 &get_buffer(
-                    layer_type == "sliding_attention"
+                    cache_layer_type == "sliding_attention"
                         ? "group_sliding_future_token_mask"
                         : "group_future_token_mask"
                 ),
@@ -1608,7 +1634,7 @@ void LanguageModel::_define_attn_models_iter(
     _define_model(
         "cache",
         model_key,
-        _get_elf_path_cache(num_tokens, aligned_eff_token_idx, layer_idx),
+        _get_elf_path_cache(num_tokens, aligned_eff_token_idx, use_sliding_cache),
         cache_ifms,
         cache_ofms
     );
@@ -2128,16 +2154,11 @@ std::filesystem::path LanguageModel::_get_elf_path_pre(uint16_t num_tokens, uint
 
 
 std::filesystem::path LanguageModel::_get_elf_path_cache(
-    uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+    uint16_t num_tokens,
+    uint16_t token_idx,
+    bool use_sliding_cache
 ) {
-    std::string cache_name = "cache";
-    if (
-        _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.has_value()
-        && _cfg.lm_cfg.attn_cfg.sliding_head_dim.value() != _cfg.lm_cfg.attn_cfg.head_dim
-    ) {
-        cache_name = "sliding_cache";
-    }
+    const std::string cache_name = use_sliding_cache ? "sliding_cache" : "cache";
     auto elf_file_name = fmt::format(
         "{}_n{}_{}_token{}_stage1_mla.elf",
         _cfg.language_model_name,

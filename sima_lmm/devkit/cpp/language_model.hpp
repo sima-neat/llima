@@ -262,7 +262,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _define_per_layer_models();
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
-            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+            uint16_t num_tokens,
+            uint16_t token_idx,
+            bool use_sliding_cache
         );
         std::filesystem::path _get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
