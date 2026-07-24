@@ -13,13 +13,13 @@ import pytest
 from tests.conftest import require_readable_path
 
 _COMPILE_CONFIGS = [
-    "models--meta-llama--Llama-3.2-3B-Instruct",
-    "models--google--gemma-3-4b-it",
+    "models--meta-llama--Llama-3.2-1B-Instruct",
+    "models--google--gemma-3-1b-it",
     "models--mistralai--Mistral-7B-Instruct-v0.3",
     "models--microsoft--Phi-3.5-mini-instruct",
-    "models--Qwen--Qwen2.5-3B-Instruct",
-    "models--Qwen--Qwen3-4B",
-    "models--LiquidAI--LFM2-1.2B",
+    "models--Qwen--Qwen2.5-0.5B-Instruct",
+    "models--Qwen--Qwen3-0.6B",
+    "models--LiquidAI--LFM2-350M",
 ]
 
 # Compile only single (non-group) models at layer index 0.

@@ -38,21 +38,20 @@ MAX_NUM_TOKENS = 1024
 # model_types: list of "pre", "cache", "post", "per_layer", "conv", "vision"
 _ONNX_CONFIGS = [
     # Transformer LLMs — pre, cache, post
-    ("models--meta-llama--Llama-3.2-3B-Instruct",   ["pre", "cache", "post"], None),
-    ("models--google--gemma-3-4b-it",               ["pre", "cache", "post"], None),
+    ("models--meta-llama--Llama-3.2-1B-Instruct",   ["pre", "cache", "post"], None),
+    ("models--google--gemma-3-1b-it",               ["pre", "cache", "post"], None),
     ("models--google--gemma-4-E2B-it",              ["pre", "cache", "post", "per_layer", "vision"], [240, 240]),
     ("models--mistralai--Mistral-7B-Instruct-v0.3", ["pre", "cache", "post"], None),
     ("models--microsoft--Phi-3.5-mini-instruct",    ["pre", "cache", "post"], None),
-    ("models--Qwen--Qwen2.5-3B-Instruct",           ["pre", "cache", "post"], None),
-    ("models--Qwen--Qwen3-4B",                      ["pre", "cache", "post"], None),
+    ("models--Qwen--Qwen2.5-0.5B-Instruct",         ["pre", "cache", "post"], None),
+    ("models--Qwen--Qwen3-0.6B",                    ["pre", "cache", "post"], None),
     # LFM2 — conv only
-    ("models--LiquidAI--LFM2-1.2B",                 ["conv"],                 None),
+    ("models--LiquidAI--LFM2-350M",                 ["conv"],                 None),
     # VLMs — vision encoder only
     ("models--stribomon--gemma3-siglip448",          ["vision"],               None),
     ("models--Qwen--Qwen2.5-VL-3B-Instruct",        ["vision"],               [224, 224]),
-    ("models--Qwen--Qwen3-VL-4B-Instruct",          ["vision"],               [224, 224]),
-    ("models--LiquidAI--LFM2-VL-1.6B",              ["vision"],               None),
-    ("models--llava-hf--llava-1.5-7b-hf",           ["vision"],               None),
+    ("models--Qwen--Qwen3-VL-2B-Instruct",          ["vision"],               [224, 224]),
+    ("models--LiquidAI--LFM2-VL-450M",              ["vision"],               None),
 ]
 
 
