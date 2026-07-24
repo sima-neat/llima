@@ -404,9 +404,18 @@ jobs:
           --env "${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
           "${model_compiler_spec}"
 
-        model_compiler_dir="${HOME}/sdk-extensions/model-compiler"
-        if [[ ! -f "${model_compiler_dir}/bin/activate" ]]; then
-          echo "Model Compiler venv was not installed at ${model_compiler_dir}" >&2
+        model_compiler_dir=""
+        for candidate in \
+          "/sdk-extensions/model-compiler" \
+          "/sdk-add-on/model-compiler" \
+          "${HOME}/sdk-extensions/model-compiler"; do
+          if [[ -f "${candidate}/bin/activate" ]]; then
+            model_compiler_dir="${candidate}"
+            break
+          fi
+        done
+        if [[ -z "${model_compiler_dir}" ]]; then
+          echo "Model Compiler venv was not found in a supported install location." >&2
           exit 1
         fi
 
