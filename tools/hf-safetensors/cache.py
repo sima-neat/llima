@@ -243,6 +243,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def selection_fingerprint(payload_format: str, allow_patterns: list[str]) -> str:
+    selection = {
+        "format": payload_format,
+        "allow_patterns": sorted(allow_patterns),
+    }
+    payload = json.dumps(selection, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def cloudfront_url(base_url: str, s3_key: str) -> str:
     return f"{base_url.rstrip('/')}/{s3_key}"
 
@@ -342,6 +351,7 @@ def build_manifest(
     snapshot_path: Path,
     base_url: str,
     payload_format: str,
+    selection_sha256: str,
 ) -> dict:
     entries = []
     for path in files:
@@ -361,6 +371,7 @@ def build_manifest(
     return {
         "source": "hf",
         "format": payload_format,
+        "selection_sha256": selection_sha256,
         "repo_id": spec.repo_id,
         "requested_revision": spec.revision,
         "resolved_revision": resolved_revision,
@@ -506,6 +517,9 @@ def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
         allow_patterns = CONFIG_ALLOW_PATTERNS
     else:
         allow_patterns = SAFETENSORS_ALLOW_PATTERNS
+    desired_selection_sha256 = selection_fingerprint(
+        spec.payload_format, allow_patterns
+    )
     if args.resolve_only:
         detail = (
             f" ({', '.join(allow_patterns)})"
@@ -517,17 +531,31 @@ def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
 
     cached_manifest = None if args.dry_run else fetch_cached_manifest(args.bucket, prefix)
     cached_revision = ""
+    cached_selection_sha256 = ""
     if cached_manifest:
         cached_revision = str(cached_manifest.get("resolved_revision", ""))
+        cached_selection_sha256 = str(
+            cached_manifest.get("selection_sha256", "")
+        )
 
-    if cached_revision == resolved_revision and not args.force:
+    if (
+        cached_revision == resolved_revision
+        and cached_selection_sha256 == desired_selection_sha256
+        and not args.force
+    ):
         print(f"Cache current for {spec.repo_id}: {resolved_revision}")
         return "current"
 
-    if cached_revision:
-        print(f"Cache stale for {spec.repo_id}: cached={cached_revision}, hf={resolved_revision}")
-    elif args.force:
+    if args.force:
         print(f"Force sync requested for {spec.repo_id}: hf={resolved_revision}")
+    elif cached_revision == resolved_revision:
+        print(
+            f"Cache selection stale for {spec.repo_id}: "
+            f"cached={cached_selection_sha256 or '<missing>'}, "
+            f"desired={desired_selection_sha256}"
+        )
+    elif cached_revision:
+        print(f"Cache stale for {spec.repo_id}: cached={cached_revision}, hf={resolved_revision}")
     else:
         print(f"Cache missing for {spec.repo_id}: hf={resolved_revision}")
 
@@ -573,6 +601,7 @@ def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
         snapshot_path=snapshot_path,
         base_url=args.base_url,
         payload_format=spec.payload_format,
+        selection_sha256=desired_selection_sha256,
     )
     publish_model(
         args=args,
