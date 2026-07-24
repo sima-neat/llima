@@ -7,19 +7,23 @@
 # the current Hugging Face commit SHA and publishes the latest payload to:
 #   llima-safetensors/<repo_id>/latest/
 #
-# Keep the active set intentionally small. The cache exists to provide stable
-# inputs for continuous LLiMa model-compilation regression tests, not to mirror
-# every supported Hugging Face model. Uncomment additional entries only when a
-# workflow needs explicit coverage for that architecture or model family.
+# The active set contains checkpoints whose weights are required by the model,
+# compilation, and regression tests. Additional configuration-only inputs for
+# tests/test_vlm_config.py are in config-manifest.txt.
 #
 # Active regression set:
-# - Qwen/Qwen3-0.6B: small modern LLM path, Qwen3 language architecture.
-# - LiquidAI/LFM2-350M: small LFM2 LLM path, exercises LFM-specific language layers.
-# - LiquidAI/LFM2-VL-450M: smallest listed LFM2 VLM path, exercises standard VLM/LFM2 vision handling.
-# - Qwen/Qwen3-VL-2B-Instruct: Qwen3-VL path, exercises Qwen vision encoder, 3D RoPE, and deepstack handling.
 
+meta-llama/Llama-3.2-1B-Instruct
+meta-llama/Llama-3.1-8B-Instruct
+google/gemma-3-1b-it
+google/gemma-4-E2B-it
+lmsys/SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge
+mistralai/Mistral-7B-Instruct-v0.3
+microsoft/Phi-3.5-mini-instruct
+Qwen/Qwen2.5-0.5B-Instruct
 Qwen/Qwen3-0.6B
 LiquidAI/LFM2-350M
+Qwen/Qwen2.5-VL-3B-Instruct
 LiquidAI/LFM2-VL-450M
 Qwen/Qwen3-VL-2B-Instruct
 
@@ -27,28 +31,14 @@ Qwen/Qwen3-VL-2B-Instruct
 # Enable when we need broader architecture coverage or release qualification.
 #
 # google/codegemma-7b
-# google/gemma-2-2b-it
-# google/gemma-3-1b-it
-# google/gemma-3-4b-it
-# LiquidAI/LFM2-1.2B
 # LiquidAI/LFM2-2.6B
 # LiquidAI/LFM2.5-350M
 # LiquidAI/LFM2.5-1.2B-Instruct
-# meta-llama/Llama-2-7b-chat-hf
-# meta-llama/Llama-3.1-8B-Instruct
-# meta-llama/Llama-3.2-1B-Instruct
-# meta-llama/Llama-3.2-3B-Instruct
-# microsoft/Phi-3.5-mini-instruct
-# microsoft/Phi-4-mini-instruct
 # mistralai/Ministral-3-3B-Instruct-2512-BF16
 # mistralai/Ministral-3-8B-Instruct-2512-BF16
-# mistralai/Mistral-7B-Instruct-v0.3
 # Qwen/Qwen2.5-1.5B-Instruct
-# Qwen/Qwen2.5-3B-Instruct
 # Qwen/Qwen2.5-7B-Instruct
 # Qwen/Qwen3-1.7B
-# Qwen/Qwen3-4B
-# Qwen/Qwen3-4B-Instruct-2507
 # Qwen/Qwen3-8B
 # yuhuili/EAGLE-LLaMA3.1-Instruct-8B
 
@@ -56,22 +46,13 @@ Qwen/Qwen3-VL-2B-Instruct
 # Enable selectively; these are larger and should be cached only when the
 # matching compiler path needs release or regression coverage.
 #
-# bczhou/tiny-llava-v1-hf
-# google/gemma-4-E2B-it
-# google/gemma-4-E4B-it
 # google/paligemma-3b-ft-nlvr2-448
 # google/paligemma-3b-pt-224
 # google/paligemma2-3b-mix-448
-# LiquidAI/LFM2-VL-1.6B
 # LiquidAI/LFM2-VL-3B
-# LiquidAI/LFM2.5-VL-450M
 # LiquidAI/LFM2.5-VL-1.6B
-# llava-hf/llava-1.5-7b-hf
-# Qwen/Qwen2.5-VL-3B-Instruct
 # Qwen/Qwen2.5-VL-7B-Instruct
-# Qwen/Qwen3-VL-4B-Instruct
 # Qwen/Qwen3-VL-8B-Instruct
-# stribomon/gemma3-siglip448
 
 # The legacy script listed these without a Hugging Face namespace. Keep them
 # disabled until the canonical public repo ids are confirmed.

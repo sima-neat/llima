@@ -1,5 +1,5 @@
 {
-    "model_name": "models--Qwen--Qwen3-VL-4B-Instruct",
+    "model_name": "models--Qwen--Qwen3-VL-2B-Instruct",
     "model_type": "vlm-qwen3_vl",
     "vm_cfg": {
         "model_type": "qwen3_vl",
@@ -32,7 +32,7 @@
         "num_layers": 2,
         "hidden_act": "gelu",
         "mm_tokens_per_image": 196,
-        "proj_dim": 2560,
+        "proj_dim": 2048,
         "downsample_factor": 1,
         "projector_use_layernorm": true
     },
@@ -66,7 +66,7 @@
             }
         },
         "attn_cfg": {
-            "num_attention_heads": 32,
+            "num_attention_heads": 16,
             "num_key_value_heads": 8,
             "head_dim": 128,
             "sliding_head_dim": null,
@@ -77,25 +77,17 @@
             "query_pre_attn_scalar": 0
         },
         "mlp_cfg": {
-            "intermediate_size": 9728,
+            "intermediate_size": 6144,
             "act": "silu",
             "num_layers": 3,
             "mlp_bias": false
         },
-        "hidden_size": 2560,
-        "num_hidden_layers": 36,
+        "hidden_size": 2048,
+        "num_hidden_layers": 28,
         "max_position_embeddings": 2048,
         "rms_norm_eps": 1e-06,
         "rms_norm_unit_offset": false,
         "layer_types": [
-            "full_attention",
-            "full_attention",
-            "full_attention",
-            "full_attention",
-            "full_attention",
-            "full_attention",
-            "full_attention",
-            "full_attention",
             "full_attention",
             "full_attention",
             "full_attention",

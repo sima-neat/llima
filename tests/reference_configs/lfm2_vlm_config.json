@@ -1,5 +1,5 @@
 {
-    "model_name": "models--LiquidAI--LFM2-1.2B",
+    "model_name": "models--LiquidAI--LFM2-350M",
     "model_type": "llm-lfm2",
     "vm_cfg": null,
     "mm_cfg": null,
@@ -29,7 +29,7 @@
             }
         },
         "attn_cfg": {
-            "num_attention_heads": 32,
+            "num_attention_heads": 16,
             "num_key_value_heads": 8,
             "head_dim": 64,
             "sliding_head_dim": null,
@@ -40,12 +40,12 @@
             "query_pre_attn_scalar": 0
         },
         "mlp_cfg": {
-            "intermediate_size": 8192,
+            "intermediate_size": 4608,
             "act": "silu",
             "num_layers": 3,
             "mlp_bias": false
         },
-        "hidden_size": 2048,
+        "hidden_size": 1024,
         "num_hidden_layers": 16,
         "max_position_embeddings": 2048,
         "rms_norm_eps": 1e-05,

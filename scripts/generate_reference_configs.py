@@ -37,28 +37,26 @@ _EXAMPLE_CONFIGS = [
     # Llama
     ("models--meta-llama--Llama-2-7b-chat-hf",            "llama2_vlm_config.json",               None),
     ("models--meta-llama--Llama-3.1-8B-Instruct",         "llama3.1_vlm_config.json",             None),
-    ("models--meta-llama--Llama-3.2-3B-Instruct",         "llama3.2_vlm_config.json",             None),
+    ("models--meta-llama--Llama-3.2-1B-Instruct",         "llama3.2_vlm_config.json",             None),
     # Gemma
     ("models--google--gemma-2-2b-it",                     "gemma2_vlm_config.json",               None),
-    ("models--google--gemma-3-4b-it",                     "gemma3_vlm_config.json",               None),
-    ("models--google--gemma-4-E4B-it",                    "gemma4_e4b_it_vlm_config.json",        [480, 480]),
+    ("models--google--gemma-3-1b-it",                     "gemma3_vlm_config.json",               None),
+    ("models--google--gemma-4-E2B-it",                    "gemma4_e2b_it_vlm_config.json",        [480, 480]),
     # Mistral
     ("models--mistralai--Mistral-7B-Instruct-v0.3",       "mistral_vlm_config.json",              None),
     # Phi
     ("models--microsoft--Phi-3.5-mini-instruct",          "phi3.5_vlm_config.json",               None),
     ("models--microsoft--Phi-4-mini-instruct",            "phi4_vlm_config.json",                 None),
     # Qwen
-    ("models--Qwen--Qwen2.5-3B-Instruct",                 "qwen2.5_vlm_config.json",              None),
-    ("models--Qwen--Qwen3-4B",                            "qwen3_vlm_config.json",                None),
+    ("models--Qwen--Qwen2.5-0.5B-Instruct",               "qwen2.5_vlm_config.json",              None),
+    ("models--Qwen--Qwen3-0.6B",                          "qwen3_vlm_config.json",                None),
     # LiquidAI
-    ("models--LiquidAI--LFM2-1.2B",                       "lfm2_vlm_config.json",                 None),
+    ("models--LiquidAI--LFM2-350M",                       "lfm2_vlm_config.json",                 None),
     # VLMs
-    ("models--stribomon--gemma3-siglip448",                "gemma3_siglip448_vlm_config.json",     None),
     ("models--Qwen--Qwen2.5-VL-3B-Instruct",              "qwen2.5_vl_vlm_config.json",           [448, 448]),
-    ("models--Qwen--Qwen3-VL-4B-Instruct",                "qwen3_vl_vlm_config.json",             [448, 448]),
-    ("models--LiquidAI--LFM2-VL-1.6B",                    "lfm2_vl_vlm_config.json",              None),
+    ("models--Qwen--Qwen3-VL-2B-Instruct",                "qwen3_vl_vlm_config.json",             [448, 448]),
+    ("models--LiquidAI--LFM2-VL-450M",                    "lfm2_vl_vlm_config.json",              None),
     ("models--LiquidAI--LFM2.5-VL-450M",                  "lfm2.5_vl_450m_vlm_config.json",       None),
-    ("models--llava-hf--llava-1.5-7b-hf",                 "llava1.5_vlm_config.json",             None),
 ]
 
 
