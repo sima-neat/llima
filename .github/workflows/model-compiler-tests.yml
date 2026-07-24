@@ -37,6 +37,7 @@ jobs:
       - vulcan-${{ inputs.vulcan_env }}
       - ubuntu
       - default
+      - disk-200
 
     steps:
       - name: Prepare Vulcan workspace
