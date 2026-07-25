@@ -37,7 +37,6 @@ jobs:
       - vulcan-${{ inputs.vulcan_env }}
       - ubuntu
       - default
-      - disk-200
 
     steps:
       - name: Prepare Vulcan workspace
@@ -72,9 +71,15 @@ jobs:
           echo "VULCAN_CAPACITY=${VULCAN_CAPACITY}"
           uname -a
           id
-          df -h
+          df -h / /mnt/nvme "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}"
+          findmnt --target /mnt/nvme
+          findmnt --target "${GITHUB_WORKSPACE}"
+          findmnt --target "${RUNNER_TEMP}"
           test "$(uname -m)" = "aarch64"
           test "${VULCAN_RUNNER_PROFILE}" = "ubuntu"
+          nvme_filesystem_id="$(stat -c '%d' /mnt/nvme)"
+          test "${nvme_filesystem_id}" = "$(stat -c '%d' "${GITHUB_WORKSPACE}")"
+          test "${nvme_filesystem_id}" = "$(stat -c '%d' "${RUNNER_TEMP}")"
 
       - name: Install and verify compiler toolchain
         shell: bash
@@ -188,7 +193,7 @@ jobs:
         working-directory: ${{ env.VULCAN_WORKSPACE }}
         run: |
           set -euo pipefail
-          model_root="${VULCAN_WORKSPACE}/_work/model-inputs"
+          model_root="${RUNNER_TEMP}/llima-model-inputs"
           provenance="${RUNNER_TEMP}/llima-model-input-provenance.json"
           python3 tools/ci/prepare_model_inputs.py \
             --base-url "${ARTIFACT_BASE_URL}" \
