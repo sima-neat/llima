@@ -434,17 +434,33 @@ if(SIMA_LMM_BUILD_DVT_DIRECT_TESTS)
         llima_direct_resnet_depth2
         tests/dvt/llima_direct_resnet_depth2.cpp
     )
+    add_executable(
+        llima_direct_text_model
+        tests/dvt/llima_direct_text_model.cpp
+    )
+    add_executable(
+        llima_direct_whisper
+        tests/dvt/llima_direct_whisper.cpp
+    )
     foreach(_SIMA_LMM_DVT_TARGET IN ITEMS
             llima_direct_session_smoke
-            llima_direct_resnet_depth2)
+            llima_direct_resnet_depth2
+            llima_direct_text_model
+            llima_direct_whisper)
         target_compile_features(${_SIMA_LMM_DVT_TARGET} PRIVATE cxx_std_20)
         target_compile_options(
             ${_SIMA_LMM_DVT_TARGET} PRIVATE
-            -Wall -Wextra -Werror -Wno-error=ignored-qualifiers
+            -Wall -Wextra -Werror
         )
         target_link_libraries(
             ${_SIMA_LMM_DVT_TARGET} PRIVATE
             ${TARGET_RUNTIME} OpenMP::OpenMP_CXX
+        )
+        # DVT qualification binaries are copied beside the exact runtime under
+        # test.  Prefer that sibling over an older system-installed LLiMa so a
+        # passing result always describes the source tree being qualified.
+        set_target_properties(
+            ${_SIMA_LMM_DVT_TARGET} PROPERTIES BUILD_RPATH "$ORIGIN"
         )
     endforeach()
 endif()

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include <fftw3.h>

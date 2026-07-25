@@ -305,7 +305,22 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     get_buffer("encoder_ifm").upload(mel.data());
     _encoder_model_ptr->run();
 
-    auto language_detect_result = _run_language_detect();
+    /*
+     * Older compiled Whisper drops do not contain the optional language-
+     * detection ELF.  Explicit-language transcription never needs that model,
+     * so keep it usable and report a neutral no-speech probability.  Auto
+     * language remains fail-closed below instead of silently claiming a
+     * language that the package could not detect.
+     */
+    LanguageDetectResult language_detect_result{0, 0.0F};
+    if (_decoder_language_detect_model_ptr) {
+        language_detect_result = _run_language_detect();
+    } else if (_is_auto_language(language)) {
+        throw std::runtime_error(
+            "This Whisper package does not support automatic language "
+            "detection; pass an explicit language code"
+        );
+    }
 
     // Update language token id.
     std::string resolved_language;
@@ -610,21 +625,52 @@ void WhisperModel::_define_models() {
         std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}}
     );
 
-    _define_model(
-        "decoder_language_detect",
-        {},
-        _get_elf_path_decoder_language_detect(),
-        std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}},
-        std::vector<MLABufferSlice>{
-            {&get_buffer("new_token")},
-            {&get_buffer("language_detect_logits")}
-        }
-    );
+    const auto language_detect_path = _get_elf_path_decoder_language_detect();
+    if (std::filesystem::is_regular_file(language_detect_path)) {
+        _define_model(
+            "decoder_language_detect",
+            {},
+            language_detect_path,
+            std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}},
+            std::vector<MLABufferSlice>{
+                {&get_buffer("new_token")},
+                {&get_buffer("language_detect_logits")}
+            }
+        );
+    } else {
+        /*
+         * This is a supported package capability difference, not a missing
+         * required model.  _run_model() rejects only the `auto` language mode;
+         * explicit language tokens continue through the same decoder path.
+         */
+        _logger->warn(
+            "Whisper package has no language-detection model: {}",
+            language_detect_path
+        );
+    }
 
     // Decoder init model.
     uint32_t num_input_tokens = _input_token_ids.size();
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
         std::vector<MLABufferSlice> ifms = {&get_buffer("decoder_init")};
+        if (layer_idx == 0) {
+            /*
+             * Preserve the published Whisper 2.0.0 artifact contract until
+             * that package is regenerated from current LLiMa. Its layer-0
+             * decoder-init ELF has three physical inputs in compiler order:
+             * token embeddings, the first four position embeddings, and
+             * encoder features. The two embedding tensors happen to have the
+             * same 6,144-byte extent, but they contain different data and are
+             * not aliases. This is intentionally package-specific; remove it
+             * only after the regenerated package's port inventory and numeric
+             * output have both been qualified.
+             */
+            ifms.emplace_back(
+                &get_buffer("position_embeddings"),
+                std::vector<uint32_t>{0, 0},
+                std::vector<uint32_t>{num_input_tokens, _cfg.d_model}
+            );
+        }
         ifms.emplace_back(&get_buffer("encoder_ofm"));
 
         std::vector<MLABufferSlice> ofms;
@@ -873,6 +919,11 @@ bool WhisperModel::_is_auto_language(const std::string& language) const {
 
 
 WhisperModel::LanguageDetectResult WhisperModel::_run_language_detect() {
+    if (!_decoder_language_detect_model_ptr) {
+        throw std::runtime_error(
+            "Whisper language detection is unavailable in this package"
+        );
+    }
     _decoder_language_detect_model_ptr->run();
     auto& new_token_buf = get_buffer("new_token");
     new_token_buf.invalidate_cache();
@@ -952,6 +1003,18 @@ std::string WhisperModel::_update_language(const std::string& language) {
     ) {
         auto idx = static_cast<size_t>(std::distance(_cfg.language_codes.begin(), it));
         _set_language_token(_cfg.language_token_ids[idx]);
+        return language_code;
+    } else if (_cfg.language_codes.empty() && _cfg.language_token_ids.empty()) {
+        /*
+         * Public packages produced before language metadata was embedded in
+         * whisper_config.json still carry the canonical special tokens in the
+         * tokenizer.  Resolve an explicitly requested code from that source
+         * of truth; this does not enable auto detection because there is no
+         * index-to-code table to interpret a detector output.
+         */
+        _set_language_token(
+            _tokenizer_ptr->token_to_id(fmt::format("<|{}|>", language_code))
+        );
         return language_code;
     } else {
         throw std::runtime_error("Invalid language: " + language);
