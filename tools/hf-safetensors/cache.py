@@ -20,24 +20,12 @@ from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 
 
-CONFIG_ALLOW_PATTERNS = [
-    "config.json",
-    "generation_config.json",
-    "tokenizer.json",
-    "tokenizer.model",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "added_tokens.json",
-    "chat_template.json",
-    "preprocessor_config.json",
-    "processor_config.json",
-    "image_processor_config.json",
-]
-
+SELECTION_POLICY = json.loads(
+    Path(__file__).with_name("selection-policy.json").read_text(encoding="utf-8")
+)
+CONFIG_ALLOW_PATTERNS = SELECTION_POLICY["config"]
 SAFETENSORS_ALLOW_PATTERNS = [
-    "model.safetensors",
-    "model-*.safetensors",
-    "model.safetensors.index.json",
+    *SELECTION_POLICY["safetensors"],
     *CONFIG_ALLOW_PATTERNS,
 ]
 

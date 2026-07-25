@@ -27,6 +27,18 @@ DOWNLOAD_ATTEMPTS = 3
 MIN_DISK_HEADROOM = 2 * 1024**3
 RESOLVED_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+SELECTION_POLICY = json.loads(
+    (
+        Path(__file__).parents[1]
+        / "hf-safetensors"
+        / "selection-policy.json"
+    ).read_text(encoding="utf-8")
+)
+CONFIG_PATTERNS = tuple(SELECTION_POLICY["config"])
+SELECTION_PATTERNS = {
+    "config": CONFIG_PATTERNS,
+    "safetensors": (*SELECTION_POLICY["safetensors"], *CONFIG_PATTERNS),
+}
 
 
 class PreparationError(RuntimeError):
@@ -279,8 +291,11 @@ def resolve_model_plan(base_url: str, source: SourceSpec) -> ModelPlan:
     ).lower()
     if not SHA256_PATTERN.fullmatch(selection_sha256):
         raise PreparationError(f"{context}: invalid selection SHA-256")
-    if source.file_patterns and selection_sha256 != selection_fingerprint(
-        source.payload_format, source.file_patterns
+    expected_patterns = source.file_patterns or SELECTION_PATTERNS.get(
+        source.payload_format, ()
+    )
+    if expected_patterns and selection_sha256 != selection_fingerprint(
+        source.payload_format, expected_patterns
     ):
         raise PreparationError(
             f"{context}: cached file selection does not match source manifest"
