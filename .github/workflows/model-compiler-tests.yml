@@ -144,10 +144,6 @@ jobs:
           print(f"Model Compiler sima-frontend {version}: {afe.__file__}")
           PY
 
-      - name: Install and verify LLiMa compiler artifact
-        shell: bash
-        run: |
-          set -euo pipefail
           ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           short_sha="${GITHUB_SHA:0:12}"
           package_spec="llima/compiler@${ref_name}:${short_sha}"
@@ -158,7 +154,7 @@ jobs:
 
           echo "Installing exact artifact ${package_spec}"
           for attempt in 1 2 3 4; do
-            if "${SIMA_CLI}" neat install \
+            if "${sima_cli}" neat install \
               --env "${VULCAN_ENV}" \
               --install-dir "${install_dir}" \
               "${package_spec}"; then
@@ -210,7 +206,6 @@ jobs:
           set -euo pipefail
           test_stage="${RUNNER_TEMP}/llima-compiler-tests"
           junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
-          coverage_report="${RUNNER_TEMP}/compiler-unit-coverage.xml"
           expected_test_count=23
 
           rm -rf "${test_stage}"
@@ -233,11 +228,10 @@ jobs:
               tests/compilation/unit \
               -m compiler_unit \
               --strict-markers \
+              -vv \
               -ra \
-              --junitxml="${junit_report}" \
-              --cov=sima_lmm \
-              --cov-report="xml:${coverage_report}" \
-              --cov-report=term-missing
+              --durations=20 \
+              --junitxml="${junit_report}"
           )
 
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
@@ -250,7 +244,7 @@ jobs:
             echo
             echo "- Required tests executed with no external model cache"
             echo "- Unexpected skips: 0"
-            echo "- JUnit and coverage reports are attached"
+            echo "- Detailed test results and slowest cases are in the job log"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Download and verify cached models
@@ -277,7 +271,6 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-config-junit.xml"
-          coverage_report="${RUNNER_TEMP}/compiler-config-coverage.xml"
           expected_test_count=25
 
           (
@@ -288,11 +281,10 @@ jobs:
               tests/compilation/configuration \
               -m compiler_config \
               --strict-markers \
+              -vv \
               -ra \
-              --junitxml="${junit_report}" \
-              --cov=sima_lmm \
-              --cov-report="xml:${coverage_report}" \
-              --cov-report=term-missing
+              --durations=20 \
+              --junitxml="${junit_report}"
           )
 
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
@@ -313,7 +305,6 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-source-junit.xml"
-          coverage_report="${RUNNER_TEMP}/compiler-source-coverage.xml"
           expected_test_count=15
 
           (
@@ -324,11 +315,10 @@ jobs:
               tests/compilation/source_ingestion \
               -m compiler_source \
               --strict-markers \
+              -vv \
               -ra \
-              --junitxml="${junit_report}" \
-              --cov=sima_lmm \
-              --cov-report="xml:${coverage_report}" \
-              --cov-report=term-missing
+              --durations=20 \
+              --junitxml="${junit_report}"
           )
 
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
@@ -344,11 +334,32 @@ jobs:
             echo "- Stored NumPy reference fixtures: none"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Prepare baseline and candidate ONNX environments
+      - name: Run ONNX branch regression
         if: ${{ github.event_name == 'push' }}
         shell: bash
         run: |
           set -euo pipefail
+          junit_report="${RUNNER_TEMP}/compiler-onnx-regression-junit.xml"
+          expected_test_count=32
+          base_wheel_dir="${RUNNER_TEMP}/llima-base-wheel"
+          base_package_root="${RUNNER_TEMP}/llima-base-package"
+          candidate_package_root="${RUNNER_TEMP}/llima-candidate-package"
+          base_onnx_root="${RUNNER_TEMP}/llima-base-onnx"
+          base_onnx_manifest="${RUNNER_TEMP}/llima-base-onnx-manifest.json"
+          candidate_onnx_root="${RUNNER_TEMP}/llima-candidate-onnx"
+          candidate_onnx_manifest="${RUNNER_TEMP}/llima-candidate-onnx-manifest.json"
+
+          cleanup_onnx() {
+            rm -rf \
+              "${base_wheel_dir}" \
+              "${base_package_root}" \
+              "${candidate_package_root}" \
+              "${base_onnx_root}" \
+              "${candidate_onnx_root}"
+            rm -f "${base_onnx_manifest}" "${candidate_onnx_manifest}"
+          }
+          trap cleanup_onnx EXIT
+          cleanup_onnx
 
           base_ref=""
           base_revision=""
@@ -375,16 +386,7 @@ jobs:
             base_revision="${base_ref}@latest"
           fi
 
-          base_wheel_dir="${RUNNER_TEMP}/llima-base-wheel"
-          base_package_root="${RUNNER_TEMP}/llima-base-package"
-          candidate_package_root="${RUNNER_TEMP}/llima-candidate-package"
-
-          rm -rf \
-            "${base_wheel_dir}" \
-            "${base_package_root}" \
-            "${candidate_package_root}"
           mkdir -p "${base_wheel_dir}"
-
           echo "Downloading baseline artifact ${package_spec}"
           for attempt in 1 2 3 4; do
             if "${SIMA_CLI}" neat install \
@@ -426,54 +428,23 @@ jobs:
             PYTHONPATH="${base_package_root}" python -P -c \
               'import importlib.metadata; print(importlib.metadata.version("sima-lmm"))'
           )"
-
-          {
-            echo "LLIMA_BASE_REF=${base_ref}"
-            echo "LLIMA_BASE_REVISION=${base_revision}"
-            echo "LLIMA_BASE_PACKAGE_SPEC=${package_spec}"
-            echo "LLIMA_BASE_PACKAGE_VERSION=${base_package_version}"
-            echo "LLIMA_BASE_PACKAGE_ROOT=${base_package_root}"
-            echo "LLIMA_CANDIDATE_PACKAGE_ROOT=${candidate_package_root}"
-            echo "LLIMA_BASE_ONNX_ROOT=${RUNNER_TEMP}/llima-base-onnx"
-            echo "LLIMA_BASE_ONNX_MANIFEST=${RUNNER_TEMP}/llima-base-onnx-manifest.json"
-            echo "LLIMA_CANDIDATE_ONNX_ROOT=${RUNNER_TEMP}/llima-candidate-onnx"
-            echo "LLIMA_CANDIDATE_ONNX_MANIFEST=${RUNNER_TEMP}/llima-candidate-onnx-manifest.json"
-          } >> "${GITHUB_ENV}"
-
-      - name: Generate base and candidate ONNX
-        if: ${{ github.event_name == 'push' }}
-        shell: bash
-        run: |
-          set -euo pipefail
           generator="${LLIMA_TEST_STAGE}/tests/compilation/onnx_regression/generate.py"
 
-          rm -rf "${LLIMA_BASE_ONNX_ROOT}" "${LLIMA_CANDIDATE_ONNX_ROOT}"
-          rm -f "${LLIMA_BASE_ONNX_MANIFEST}" "${LLIMA_CANDIDATE_ONNX_MANIFEST}"
-
-          PYTHONPATH="${LLIMA_BASE_PACKAGE_ROOT}:${LLIMA_TEST_STAGE}" \
+          PYTHONPATH="${base_package_root}:${LLIMA_TEST_STAGE}" \
             python -P "${generator}" \
               --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
-              --output-dir "${LLIMA_BASE_ONNX_ROOT}" \
-              --manifest-output "${LLIMA_BASE_ONNX_MANIFEST}" \
-              --expected-package-root "${LLIMA_BASE_PACKAGE_ROOT}" \
-              --revision "${LLIMA_BASE_REVISION}"
+              --output-dir "${base_onnx_root}" \
+              --manifest-output "${base_onnx_manifest}" \
+              --expected-package-root "${base_package_root}" \
+              --revision "${base_revision}"
 
-          PYTHONPATH="${LLIMA_CANDIDATE_PACKAGE_ROOT}:${LLIMA_TEST_STAGE}" \
+          PYTHONPATH="${candidate_package_root}:${LLIMA_TEST_STAGE}" \
             python -P "${generator}" \
               --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
-              --output-dir "${LLIMA_CANDIDATE_ONNX_ROOT}" \
-              --manifest-output "${LLIMA_CANDIDATE_ONNX_MANIFEST}" \
-              --expected-package-root "${LLIMA_CANDIDATE_PACKAGE_ROOT}" \
+              --output-dir "${candidate_onnx_root}" \
+              --manifest-output "${candidate_onnx_manifest}" \
+              --expected-package-root "${candidate_package_root}" \
               --revision "${GITHUB_SHA}"
-
-      - name: Run ONNX branch regression
-        if: ${{ github.event_name == 'push' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          junit_report="${RUNNER_TEMP}/compiler-onnx-regression-junit.xml"
-          coverage_report="${RUNNER_TEMP}/compiler-onnx-regression-coverage.xml"
-          expected_test_count=32
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -483,11 +454,14 @@ jobs:
               tests/compilation/onnx_regression \
               -m compiler_onnx_regression \
               --strict-markers \
+              -vv \
               -ra \
-              --junitxml="${junit_report}" \
-              --cov=sima_lmm \
-              --cov-report="xml:${coverage_report}" \
-              --cov-report=term-missing
+              --durations=20 \
+              --candidate-onnx-root "${candidate_onnx_root}" \
+              --candidate-onnx-manifest "${candidate_onnx_manifest}" \
+              --base-onnx-root "${base_onnx_root}" \
+              --base-onnx-manifest "${base_onnx_manifest}" \
+              --junitxml="${junit_report}"
           )
 
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
@@ -498,35 +472,19 @@ jobs:
           {
             echo "### ONNX generation and branch regression"
             echo
-            echo "- Baseline ref: ${LLIMA_BASE_REF}"
-            echo "- Baseline artifact: ${LLIMA_BASE_PACKAGE_SPEC}"
-            echo "- Baseline package version: ${LLIMA_BASE_PACKAGE_VERSION}"
+            echo "- Baseline ref: ${base_ref}"
+            echo "- Baseline artifact: ${package_spec}"
+            echo "- Baseline package version: ${base_package_version}"
             echo "- Candidate SHA: ${GITHUB_SHA}"
             echo "- Required/informative cases executed: ${expected_test_count}"
             echo "- Stored ONNX references: none"
           } >> "${GITHUB_STEP_SUMMARY}"
-
-      - name: Remove generated ONNX payloads
-        if: ${{ always() && github.event_name == 'push' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf \
-            "${RUNNER_TEMP}/llima-base-onnx" \
-            "${RUNNER_TEMP}/llima-candidate-onnx" \
-            "${RUNNER_TEMP}/llima-base-package" \
-            "${RUNNER_TEMP}/llima-candidate-package" \
-            "${RUNNER_TEMP}/llima-base-wheel"
-          rm -f \
-            "${RUNNER_TEMP}/llima-base-onnx-manifest.json" \
-            "${RUNNER_TEMP}/llima-candidate-onnx-manifest.json"
 
       - name: Run generated-graph and quantization integration
         shell: bash
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-graph-integration-junit.xml"
-          coverage_report="${RUNNER_TEMP}/compiler-graph-integration-coverage.xml"
           expected_test_count=22
 
           (
@@ -537,11 +495,10 @@ jobs:
               tests/compilation/graph_integration \
               -m "compiler_graph_integration and not high_memory" \
               --strict-markers \
+              -vv \
               -ra \
-              --junitxml="${junit_report}" \
-              --cov=sima_lmm \
-              --cov-report="xml:${coverage_report}" \
-              --cov-report=term-missing
+              --durations=20 \
+              --junitxml="${junit_report}"
           )
 
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
@@ -549,12 +506,7 @@ jobs:
             --expected "${expected_test_count}" \
             --label "Graph integration"
 
-      - name: Run speculative-decoding graph integration
-        shell: bash
-        run: |
-          set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-speculative-integration-junit.xml"
-          coverage_report="${RUNNER_TEMP}/compiler-speculative-integration-coverage.xml"
           expected_test_count=4
 
           (
@@ -565,11 +517,10 @@ jobs:
               tests/compilation/graph_integration \
               -m "compiler_graph_integration and high_memory" \
               --strict-markers \
+              -vv \
               -ra \
-              --junitxml="${junit_report}" \
-              --cov=sima_lmm \
-              --cov-report="xml:${coverage_report}" \
-              --cov-report=term-missing
+              --durations=20 \
+              --junitxml="${junit_report}"
           )
 
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
@@ -590,9 +541,13 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-e2e-junit.xml"
-          coverage_report="${RUNNER_TEMP}/compiler-e2e-coverage.xml"
           e2e_report="${RUNNER_TEMP}/compiler-e2e-report.json"
           e2e_temp="${RUNNER_TEMP}/llima-e2e-temp"
+          cleanup_e2e() {
+            rm -rf "${e2e_temp}"
+          }
+          trap cleanup_e2e EXIT
+          cleanup_e2e
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -604,12 +559,11 @@ jobs:
               --candidate-sha "${GITHUB_SHA}" \
               --e2e-report "${e2e_report}" \
               --strict-markers \
+              -vv \
               -ra \
+              --durations=20 \
               --basetemp="${e2e_temp}" \
-              --junitxml="${junit_report}" \
-              --cov=sima_lmm \
-              --cov-report="xml:${coverage_report}" \
-              --cov-report=term-missing
+              --junitxml="${junit_report}"
           )
 
           python - "${junit_report}" "${e2e_report}" "${GITHUB_STEP_SUMMARY}" <<'PY'
@@ -652,34 +606,3 @@ jobs:
                   f"- Validated MPK archives: {len(report['artifacts'])}\n"
               )
           PY
-
-      - name: Upload compiler test reports
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: compiler-test-reports-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/compiler-unit-junit.xml
-            ${{ runner.temp }}/compiler-unit-coverage.xml
-            ${{ runner.temp }}/compiler-config-junit.xml
-            ${{ runner.temp }}/compiler-config-coverage.xml
-            ${{ runner.temp }}/compiler-source-junit.xml
-            ${{ runner.temp }}/compiler-source-coverage.xml
-            ${{ runner.temp }}/compiler-onnx-regression-junit.xml
-            ${{ runner.temp }}/compiler-onnx-regression-coverage.xml
-            ${{ runner.temp }}/compiler-graph-integration-junit.xml
-            ${{ runner.temp }}/compiler-graph-integration-coverage.xml
-            ${{ runner.temp }}/compiler-speculative-integration-junit.xml
-            ${{ runner.temp }}/compiler-speculative-integration-coverage.xml
-            ${{ runner.temp }}/compiler-e2e-junit.xml
-            ${{ runner.temp }}/compiler-e2e-coverage.xml
-            ${{ runner.temp }}/compiler-e2e-report.json
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Remove compiler E2E payloads
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "${RUNNER_TEMP}/llima-e2e-temp"
