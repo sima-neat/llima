@@ -423,6 +423,14 @@ target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
 )
 
 if(SIMA_LMM_BUILD_DVT_DIRECT_TESTS)
+    # Compile a private qualification-only queue-depth seam into this runtime.
+    # Normal product builds do not contain the environment override, and no
+    # queue-depth control is added to a public header or stable ABI.
+    target_compile_definitions(
+        ${TARGET_RUNTIME} PRIVATE
+        SIMA_LLIMA_ENABLE_DVT_QUEUE_DEPTH_OVERRIDE=1
+    )
+
     # These executables deliberately link the same runtime library as the CLI
     # and exercise the production MlaExecutionSession.  They must be run on an
     # AArch64 Modalix DVT, never by a host-side x86 ctest invocation.

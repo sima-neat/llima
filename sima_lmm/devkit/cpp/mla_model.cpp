@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
@@ -35,8 +36,43 @@ namespace mla = simaai::neat::mla;
 
 namespace {
 
-constexpr std::size_t kQueueAheadDepth = 2;
+/*
+ * Modalix DVT's 1/2/3/4/8 sweep selected three as the smallest accepted
+ * window that removes CQE-to-refill misses: depth two produced 546 no-READY
+ * boundaries in the representative 1,914-job LFM run, while depth three
+ * reduced that to the 79 segment/tail boundaries (depth four/eight did not
+ * improve it).  Keep this private and re-qualify rather than exposing a knob.
+ */
+constexpr std::size_t kDefaultQueueAheadDepth = 3;
 constexpr std::uint32_t kJobTimeoutMs = 60000;
+
+std::size_t configured_queue_ahead_depth() {
+#if defined(SIMA_LLIMA_ENABLE_DVT_QUEUE_DEPTH_OVERRIDE)
+    /*
+     * This seam exists only in the separately-built DVT qualification
+     * runtime.  It is intentionally not part of the LLiMa, Neat, Backend, or
+     * kernel API: queue depth is an executor implementation detail and must
+     * not become an application compatibility knob.  Qualification sweeps the
+     * same production executor at a few bounded depths, then the normal build
+     * bakes in the smallest value that hides measured steady-state refill
+     * boundaries (segment and sequence tails still end without successors).
+     */
+    if (const char* value = std::getenv("SIMA_LLIMA_DVT_QUEUE_DEPTH")) {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (errno != 0 || end == value || *end != '\0' ||
+            (parsed != 1 && parsed != 2 && parsed != 3 &&
+             parsed != 4 && parsed != 8)) {
+            throw std::runtime_error(
+                "SIMA_LLIMA_DVT_QUEUE_DEPTH must be one of 1,2,3,4,8"
+            );
+        }
+        return static_cast<std::size_t>(parsed);
+    }
+#endif
+    return kDefaultQueueAheadDepth;
+}
 
 std::mutex default_session_mutex;
 std::shared_ptr<MlaExecutionSession> default_session;
@@ -112,7 +148,9 @@ class MlaExecutionSession {
             throw_status("Backend::open", status);
         }
         return std::shared_ptr<MlaExecutionSession>(
-            new MlaExecutionSession(std::move(backend))
+            new MlaExecutionSession(
+                std::move(backend), configured_queue_ahead_depth()
+            )
         );
     }
 
@@ -390,18 +428,22 @@ class MlaExecutionSession {
         }
 
         /*
-         * Two jobs match the kernel's two immutable descriptor banks. Refill
-         * immediately after the oldest terminal CQE: while job N executes,
-         * N+1 is already prepared, but this Background context never consumes
-         * an unbounded number of global admission slots. Foreground Neat can
-         * therefore run at the first compiled-job boundary.
+         * Keep a bounded accepted window and refill it immediately after the
+         * oldest terminal CQE.  Two descriptor banks cap ACTIVE+READY
+         * generations for one model; they do not prove that an accepted depth
+         * of two is sufficient.  A third accepted job can hide CQE-to-refill
+         * jitter while the kernel advances RUNNING/READY preparation.  The
+         * private depth is therefore selected by the DVT sweep, not exposed as
+         * an application option.  Admission is per kernel context, so this
+         * bound controls retained state and failure blast radius rather than
+         * reserving another Neat context's credits.
          */
         std::deque<mla::Job> inflight;
         std::size_t next = 0;
         std::exception_ptr first_failure;
         while (next < snapshots.size() || !inflight.empty()) {
             while (!first_failure && next < snapshots.size() &&
-                   inflight.size() < kQueueAheadDepth) {
+                   inflight.size() < queue_ahead_depth_) {
                 mla::Job job;
                 mla::SubmitOptions options;
                 options.timeout_ms = kJobTimeoutMs;
@@ -534,8 +576,15 @@ class MlaExecutionSession {
         std::map<std::string, MLABufferSlice> active_adapters;
     };
 
-    explicit MlaExecutionSession(std::unique_ptr<mla::Backend> backend)
-      : backend_(std::move(backend)) {}
+    explicit MlaExecutionSession(
+        std::unique_ptr<mla::Backend> backend,
+        std::size_t queue_ahead_depth
+    ) : backend_(std::move(backend)),
+        queue_ahead_depth_(queue_ahead_depth) {
+        if (queue_ahead_depth_ == 0) {
+            throw std::invalid_argument("MLA queue-ahead depth must be nonzero");
+        }
+    }
 
     void validate_index_locked(std::size_t index) const {
         if (index >= models_.size()) {
@@ -705,6 +754,7 @@ class MlaExecutionSession {
     }
 
     std::unique_ptr<mla::Backend> backend_;
+    const std::size_t queue_ahead_depth_;
     mutable std::mutex mutex_;
     std::map<std::filesystem::path, std::size_t> path_to_index_;
     std::vector<ModelEntry> models_;
