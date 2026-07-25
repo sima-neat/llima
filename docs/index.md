@@ -22,6 +22,13 @@ The LLiMa runtime is installed natively on Modalix as part of the Neat runtime.
 See [Neat Framework installation](/getting-started/neat-library/)
 for the runtime installation flow.
 
+## Contributing
+
+Contributors changing LLiMa itself should follow the
+[LLiMa Contributor Guide](contributing.md) for repository structure,
+development environments, test tiers, model-input policy, and pull-request
+requirements.
+
 ## Supported Models
 
 The following table shows the supported model architectures and their

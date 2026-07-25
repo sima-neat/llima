@@ -1,0 +1,14 @@
+id: sima-llima-compile-run
+name: Compile and Test LLiMa Models
+version: 0.1.0
+agents: [codex, claude]
+description: Compile supported LLM and VLM models with LLiMa and validate them with llima run before application development.
+compatibility:
+  env_types: [host, sdk]
+  env_subtypes: [linux, palette]
+  min_cli_version: 2.1.2
+runtime:
+  requires:
+    - python3
+    - ssh
+    - rsync

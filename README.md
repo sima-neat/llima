@@ -285,3 +285,10 @@ LLiMa documentation is maintained in this repository:
 | [Model Deployment](docs/deployment.md) | Deploy compiled models to Modalix devices. |
 | [LLiMa CLI](docs/runtime.md) | Manage, run, and serve GenAI models on Modalix. |
 | [MoLE - Modalix Language Model Evaluator](docs/mole.md) | Benchmark LLM accuracy and performance on Modalix. |
+| [Contributor Guide](docs/contributing.md) | Develop, test, document, and review changes to LLiMa. |
+
+## Contributing
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Detailed development
+environments, test tiers, model-input policy, and validation requirements are
+documented in the [Contributor Guide](docs/contributing.md).

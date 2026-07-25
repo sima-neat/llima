@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compile and Test LLiMa Models"
+  short_description: "Compile and smoke-test LLM and VLM models"
+  default_prompt: "Use $sima-llima-compile-run to compile this LLM or VLM and validate it with llima run."
