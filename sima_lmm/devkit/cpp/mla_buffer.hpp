@@ -55,7 +55,7 @@ class MLABuffer {
 
         const std::string& get_name() const { return _name; }
         const std::string& get_dtype() const { return _dtype; }
-        const uint8_t get_elem_size() const { return _elem_size; }
+        uint8_t get_elem_size() const { return _elem_size; }
         const std::vector<size_t>& get_shape() const { return _shape; }
         size_t get_num_elems() const { return _size / _elem_size; }
         size_t get_allocation_size() const { return _size_padded; }

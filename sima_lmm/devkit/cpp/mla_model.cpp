@@ -117,6 +117,15 @@ class MlaExecutionSession {
     }
 
     ~MlaExecutionSession() {
+        /*
+         * A producer can fail while preparing the middle of a segment (for
+         * example, because one BufferView is out of range).  The snapshots
+         * already in pending_ were never submitted to hardware, so teardown
+         * must discard them rather than let a cleanup exception hide the
+         * original preparation error.  Submitted jobs are not stored here;
+         * run_segment() always drains those before it returns.
+         */
+        discard_pending_segment();
         try {
             free_models(std::nullopt);
         } catch (const std::exception& error) {
@@ -345,6 +354,24 @@ class MlaExecutionSession {
         pending_.push_back(std::move(snapshot));
     }
 
+    void discard_current_segment() noexcept {
+        std::lock_guard lock(mutex_);
+        if (pending_.empty()) {
+            return;
+        }
+
+        /*
+         * Only the producer that owns the transaction may roll it back.  A
+         * failing call from an unrelated thread must not silently erase work
+         * assembled by the real owner.  enqueue() will report that ownership
+         * violation if the unrelated caller reaches publication.
+         */
+        if (segment_owner_ == std::this_thread::get_id()) {
+            pending_.clear();
+            segment_owner_ = {};
+        }
+    }
+
     void run_segment() {
         std::deque<SubmissionSnapshot> snapshots;
         {
@@ -489,6 +516,12 @@ class MlaExecutionSession {
     }
 
   private:
+    void discard_pending_segment() noexcept {
+        std::lock_guard lock(mutex_);
+        pending_.clear();
+        segment_owner_ = {};
+    }
+
     struct PackageHold {
         mla::ModelPackage package;
         std::vector<std::size_t> model_indices;
@@ -707,9 +740,15 @@ void disconnect_mla() {
         std::lock_guard lock(default_session_mutex);
         session = std::move(default_session);
     }
-    if (session) {
-        session->free_models(std::nullopt);
-    }
+    /*
+     * Session destruction is the single no-throw shutdown path.  Calling
+     * free_models() here used to throw when model preparation failed after
+     * one or more snapshots had been queued, masking the useful root cause
+     * and, during exception unwinding, terminating the process.  The session
+     * destructor discards only never-submitted snapshots, releases packages,
+     * and then stops the kernel context in that order.
+     */
+    session.reset();
 }
 
 MLAModelWithBuffer::MLAModelWithBuffer(
@@ -751,9 +790,20 @@ void MLAModelWithBuffer::add_to_queue(
     std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
     load();
-    _session->enqueue(_session->prepare(
-        _model_idx, _ifms, _ofms, ifm_map_ptr, ofm_map_ptr
-    ));
+    try {
+        _session->enqueue(_session->prepare(
+            _model_idx, _ifms, _ofms, ifm_map_ptr, ofm_map_ptr
+        ));
+    } catch (...) {
+        /*
+         * Segment construction is transactional.  If preparing this model
+         * fails, none of the earlier snapshots in the same caller-owned
+         * segment may run later by accident.  They have not reached the
+         * kernel yet, so dropping them is both safe and syscall-free.
+         */
+        _session->discard_current_segment();
+        throw;
+    }
 }
 
 void MLAModelWithBuffer::run_queue() {

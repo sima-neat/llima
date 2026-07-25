@@ -80,6 +80,38 @@ int main(int argc, char** argv) {
     job_b.add_to_queue();
     simaai::llima::MLAModelWithBuffer::run_queue();
 
+    /*
+     * Prove that segment assembly is all-or-nothing.  Queue one valid snapshot
+     * and then deliberately prepare an output whose allocation is smaller
+     * than the compiler-declared OFM extent.  The second add must fail and
+     * discard the first, never-submitted snapshot.  A fresh segment must then
+     * execute normally; without rollback this used to leave the session open
+     * and disconnect() replaced the useful bounds error with a cleanup error.
+     */
+    simaai::llima::MLABuffer short_output(
+        "short_output", {8}, "int8", false
+    );
+    short_output.allocate();
+    simaai::llima::MLAModelWithBuffer invalid_job(
+        argv[1],
+        {simaai::llima::MLABufferSlice{&input_a}},
+        {simaai::llima::MLABufferSlice{&short_output}}
+    );
+    bool rejected_partial_segment = false;
+    job_a.add_to_queue();
+    try {
+        invalid_job.add_to_queue();
+    } catch (const std::out_of_range&) {
+        rejected_partial_segment = true;
+    }
+    if (!rejected_partial_segment) {
+        std::cerr << "undersized OFM did not abort segment construction\n";
+        simaai::llima::disconnect();
+        return 2;
+    }
+    job_b.add_to_queue();
+    simaai::llima::MLAModelWithBuffer::run_queue();
+
     output_a.invalidate_cache();
     output_b.invalidate_cache();
     const bool byte_exact =
@@ -97,6 +129,6 @@ int main(int argc, char** argv) {
 
     std::cout
         << "LLIMA_DIRECT_RESNET_PASS jobs=2 queue_depth=2 "
-        << "output=BYTE_EXACT\n";
+        << "segment_rollback=PASS output=BYTE_EXACT\n";
     return 0;
 }

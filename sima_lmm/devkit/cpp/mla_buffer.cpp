@@ -125,8 +125,22 @@ void MLABuffer::allocate() {
     }
 
     // Allocate the buffer.
+    /*
+     * Every LLiMa tensor that can be bound to JOB_EXEC must obey the one
+     * dma-buf mapping contract selected for the direct driver: coherent /
+     * noncached DMS0.  A cached legacy simaai-memory mapping cannot be
+     * exported safely because its dma-buf begin/end hooks cannot maintain a
+     * resource mapping above the linear map, and exporting it would also
+     * permit cached and coherent aliases of the same physical storage.
+     *
+     * Do not make this a runtime option.  Adapter, KV, intermediate, IFM and
+     * OFM buffers all travel through the same checked BufferView path, so one
+     * allocation policy keeps ownership semantics uniform and lets the
+     * kernel reject legacy cached exports instead of accepting an ambiguous
+     * coherency contract.
+     */
     _simaai_mem_ptr = simaai_memory_alloc_flags(
-        _size_padded, SIMAAI_MEM_TARGET_DMS0, SIMAAI_MEM_FLAG_CACHED
+        _size_padded, SIMAAI_MEM_TARGET_DMS0, SIMAAI_MEM_FLAG_DEFAULT
     );
     if (!_simaai_mem_ptr) {
         throw std::runtime_error(
