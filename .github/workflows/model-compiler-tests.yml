@@ -215,12 +215,3 @@ jobs:
           command -v llima-compile
           llima-compile --help >/dev/null
           echo "LLiMa Model Compiler smoke test passed."
-
-      - name: Upload model-input provenance
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: llima-model-input-provenance-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/llima-model-input-provenance.json
-          if-no-files-found: warn
-          retention-days: 7
