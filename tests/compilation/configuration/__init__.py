@@ -1,0 +1,1 @@
+"""Configuration contract regression tests."""
