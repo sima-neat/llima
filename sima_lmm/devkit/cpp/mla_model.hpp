@@ -5,13 +5,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
-
-#include <dispatcherbase.hh>
-#include <dispatcherfactory.hh>
-#include <job.hh>
 
 #include "mla_buffer.hpp"
 #include "utils.hpp"
@@ -21,13 +18,19 @@ namespace simaai {
 namespace llima {
 
 
-void connect_mla_rt(const std::vector<std::string>& args);
-void disconnect_mla_rt();
+class MlaExecutionSession;
+
+/*
+ * One LLiMa process owns one ordered /dev/mla context.  The retained argument
+ * is a source-compatibility boundary for existing Python callers; dispatcher
+ * and MLA-RT command-line options are no longer interpreted.
+ */
+void connect_mla(const std::vector<std::string>& legacy_args = {});
+void disconnect_mla();
 
 
 class MLAModelWithBuffer {
-    friend void connect_mla_rt(const std::vector<std::string>& args);
-    friend void disconnect_mla_rt();
+    friend class MlaExecutionSession;
 
     public:
         MLAModelWithBuffer(
@@ -47,9 +50,14 @@ class MLAModelWithBuffer {
             std::map<uint8_t, MLABufferSlice>* ifm_map_ptr = nullptr,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr = nullptr
         );
-        void update_reloc(const std::map<std::string, uint64_t>& reloc_addr_map);
+        /*
+         * Install a future-submission-only immutable adapter set. Already
+         * queued snapshots retain their original BufferViews.
+         */
+        void update_reloc(
+            const std::map<std::string, MLABufferSlice>& reloc_buffers
+        );
 
-        static void initialize();
         static void run_queue();
         static void load_all_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt
@@ -65,37 +73,18 @@ class MLAModelWithBuffer {
             _save_inouts = get_env_var("SIMA_LLIMA_RUN_SAVE_INOUTS", _save_inouts);
             if (_save_inouts)
                 _save_inout_dir = get_env_var("SIMA_LLIMA_RUN_SAVE_INOUT_DIR", _save_inout_dir);
-            _enable_queue = !get_env_var("SIMA_LLIMA_RUN_DISABLE_QUEUE", !_enable_queue);
-            _disable_parallel_load = get_env_var(
-                "SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD", _disable_parallel_load
-            );
         }
 
     private:
         void _debug_inouts(const std::string& name, std::map<uint8_t, MLABufferSlice>* fm_map_ptr);
-        simaaidispatcher::PreparedMlaRunRef _prepare_run_ref(
-            std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
-            std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
-        );
-        static simaaidispatcher::DispatcherBase* _get_dispatcher();
-
-        uint16_t _model_idx;
+        std::shared_ptr<MlaExecutionSession> _session;
+        std::size_t _model_idx = 0;
         std::vector<MLABufferSlice> _ifms;
         std::vector<MLABufferSlice> _ofms;
-        simaaidispatcher::PreparedMlaPlan _prepared_plan;
-
-        static std::map<std::filesystem::path, uint16_t> _unique_model_path_to_idx_map;
-        static std::vector<std::filesystem::path> _unique_model_paths;
-        static std::vector<mla_model_p> _unique_model_ptrs;
-        static thread_local simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest
-            _queue_request;
-        static simaaidispatcher::DispatcherBase* _dispatcher;
         static inline bool _profile = false;
         static inline bool _print_inouts = false;
         static inline bool _save_inouts = false;
         static inline std::string _save_inout_dir = "debug/model_io";
-        static inline bool _enable_queue = true;
-        static inline bool _disable_parallel_load = false;
 };
 
 

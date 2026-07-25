@@ -55,6 +55,11 @@ include(CMakePackageConfigHelpers)
 set(TARGET_BIND cpp_ext)
 set(TARGET_RUNTIME sima_lmm_runtime)
 option(SIMA_LMM_BUILD_PYTHON "Build the Python nanobind extension." ON)
+option(
+    SIMA_LMM_BUILD_DVT_DIRECT_TESTS
+    "Build DVT-only direct MLA session qualification executables."
+    OFF
+)
 set(SYSROOT "" CACHE PATH "Optional target sysroot prefix")
 set(
     SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR
@@ -109,7 +114,6 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
-find_package(NeatInternals ${SIMA_LMM_PLATFORM_VERSION} CONFIG REQUIRED)
 find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
@@ -316,16 +320,21 @@ foreach(_sima_lmm_license_index RANGE ${_sima_lmm_extra_license_last})
     )
 endforeach()
 
-find_library(
-    SIMAAI_DISPATCHER_LIB
-    NAMES neatdispatchercore simaaidispatcher
+find_path(
+    SIMAAI_MLA_KERNEL_BACKEND_INCLUDE_DIR
+    NAMES simaai/neat/mla/MlaKernelBackend.h
     PATHS
-        "${SYSROOT}/usr/lib/aarch64-linux-gnu/neat/runtime"
+        "${SYSROOT}/usr/include"
+    REQUIRED
+)
+find_library(
+    SIMAAI_MLA_KERNEL_BACKEND_LIB
+    NAMES neatmlakernelbackend
+    PATHS
         "${SYSROOT}/usr/lib/aarch64-linux-gnu"
         "${SYSROOT}/usr/lib"
     REQUIRED
 )
-set(SIMAAI_DISPATCHER_INSTALL_LIB_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/neat/runtime")
 
 # Build the core library.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
@@ -341,11 +350,7 @@ set_target_properties(
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
 )
-message(STATUS "Using MLA dispatcher library: ${SIMAAI_DISPATCHER_LIB}")
-set_target_properties(
-    ${TARGET_RUNTIME} PROPERTIES
-    INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
-)
+message(STATUS "Using direct MLA kernel backend: ${SIMAAI_MLA_KERNEL_BACKEND_LIB}")
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
 target_compile_definitions(
     ${TARGET_RUNTIME}
@@ -373,6 +378,7 @@ target_include_directories(
     # cnpy include directory is not automatically added when library is linked.
     $<BUILD_INTERFACE:${cnpy_SOURCE_DIR}>
     $<BUILD_INTERFACE:${llama_SOURCE_DIR}/ggml/include>
+    $<BUILD_INTERFACE:${SIMAAI_MLA_KERNEL_BACKEND_INCLUDE_DIR}>
     # tokenizers_cpp include directory is not added to tokenizers_c target.
     $<BUILD_INTERFACE:${tokenizers_cpp_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -387,9 +393,8 @@ target_link_libraries(
         PkgConfig::FFTW3
         cnpy-static
         simaaimem
-        ${SIMAAI_DISPATCHER_LIB}
+        ${SIMAAI_MLA_KERNEL_BACKEND_LIB}
     PUBLIC
-    NeatInternals::Headers
     opencv_core
     opencv_imgproc
     opencv_imgcodecs
@@ -416,6 +421,33 @@ target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
     $<BUILD_INTERFACE:${SYSROOT}/usr/include/simaai>
     $<BUILD_INTERFACE:${SYSROOT}/usr/include>
 )
+
+if(SIMA_LMM_BUILD_DVT_DIRECT_TESTS)
+    # These executables deliberately link the same runtime library as the CLI
+    # and exercise the production MlaExecutionSession.  They must be run on an
+    # AArch64 Modalix DVT, never by a host-side x86 ctest invocation.
+    add_executable(
+        llima_direct_session_smoke
+        tests/dvt/llima_direct_session_smoke.cpp
+    )
+    add_executable(
+        llima_direct_resnet_depth2
+        tests/dvt/llima_direct_resnet_depth2.cpp
+    )
+    foreach(_SIMA_LMM_DVT_TARGET IN ITEMS
+            llima_direct_session_smoke
+            llima_direct_resnet_depth2)
+        target_compile_features(${_SIMA_LMM_DVT_TARGET} PRIVATE cxx_std_20)
+        target_compile_options(
+            ${_SIMA_LMM_DVT_TARGET} PRIVATE
+            -Wall -Wextra -Werror -Wno-error=ignored-qualifiers
+        )
+        target_link_libraries(
+            ${_SIMA_LMM_DVT_TARGET} PRIVATE
+            ${TARGET_RUNTIME} OpenMP::OpenMP_CXX
+        )
+    endforeach()
+endif()
 
 if(SIMA_LMM_BUILD_PYTHON)
     nanobind_add_module(
@@ -587,8 +619,9 @@ set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
-    "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
+    # The direct MLA Backend is linked into sima_lmm_runtime.  Do not retain a
+    # runtime dependency on Neat Internals merely because its development
+    # package supplied the Backend at build time.
     "simaai-memory-lib (>= ${SIMA_LMM_PLATFORM_DEP_PACKAGE_MIN_VERSION}), "
     "simaai-memory-lib (<< ${SIMA_LMM_PLATFORM_DEP_PACKAGE_MAX_VERSION}), "
     "libcpp-httplib0.11, libfftw3-double3, "
@@ -598,8 +631,6 @@ string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
-    "neat-internals-dev (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
-    "neat-internals-dev (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "

@@ -1850,9 +1850,11 @@ void LanguageModel::_define_per_layer_models() {
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
     // Swap the model weights with the data from the `{_devkit_dir}/../npy_files/{reloc_name}`.
-    // Instead of overwrite the dram space allocated by the mla-rt, allocate new buffers populated
-    // with the data read from the npy files and relocates the dram addresses of the dma
-    // descriptors so that the models use the weights from the new buffers.
+    // Do not overwrite the immutable base-model weights retained by the direct
+    // execution session. Allocate dma-buf-backed adapter buffers from the NPY
+    // payloads instead; update_reloc() snapshots checked BufferViews from those
+    // buffers into future submissions while already-accepted jobs retain their
+    // original adapter views.
 
     if (_reloc_name == reloc_name) {
         // The model has already been relocated to the same path. Nothing to be done.
@@ -1867,7 +1869,12 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         uint8_t layer_idx;
         auto operator<=>(const RelocMapType&) const = default;
     };
-    using RelocMap = std::map<std::string, uint64_t>;
+    /*
+     * Keep dma-buf-backed slices, never raw physical addresses. The direct
+     * backend snapshots checked hidden-input BufferViews per accepted job, so
+     * switching adapters cannot mutate an older queued descriptor set.
+     */
+    using RelocMap = std::map<std::string, MLABufferSlice>;
 
     // Allocate the memory for the new content to be relocated and collect the maps of the addresses
     // to relocate the models' dma descriptors.
@@ -1918,8 +1925,8 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         // Upload the tensor.
         buf.upload(tensor.data<void>());
 
-        // Append the reloc addr map.
-        reloc_addr_maps[model_key][buffer_name] = buf.get_buf_addr();
+        // Append the immutable adapter-buffer candidate.
+        reloc_addr_maps[model_key][buffer_name] = MLABufferSlice{&buf};
     }
 
     // Relocation the dma descriptors
