@@ -207,11 +207,27 @@ def open_internal_url(url: str, *, timeout: int):
 
 
 def fetch_json(url: str) -> dict[str, Any]:
-    try:
-        with open_internal_url(url, timeout=60) as response:
-            payload = response.read()
-    except (OSError, urllib.error.URLError) as exc:
-        raise PreparationError(f"Unable to download cache manifest {url}: {exc}") from exc
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            with open_internal_url(url, timeout=60) as response:
+                payload = response.read()
+            break
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+            retryable = not isinstance(exc, urllib.error.HTTPError) or (
+                exc.code in {408, 429} or exc.code >= 500
+            )
+            if not retryable or attempt == DOWNLOAD_ATTEMPTS:
+                raise PreparationError(
+                    f"Unable to download cache manifest {url}: {exc}"
+                ) from exc
+            delay = attempt * 5
+            print(
+                f"Manifest download attempt {attempt} failed for {url}; "
+                f"retrying in {delay}s: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
     try:
         parsed = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
