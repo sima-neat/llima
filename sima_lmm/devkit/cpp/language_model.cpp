@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 
 #include <Eigen/Dense>
 #include <cnpy.h>
@@ -1280,7 +1282,10 @@ void LanguageModel::_define_model(
 ) {
     LanguageModelMap& map = get_model_map(model_type);
     map.emplace(
-        key, MLAModelWithBuffer(_mla_session, model_path, ifms, ofms)
+        key, MLAModelWithBuffer(
+            _mla_session, model_path, ifms, ofms,
+            _cfg.lm_cfg.has_lora()
+        )
     );
 }
 
@@ -1784,7 +1789,10 @@ void LanguageModel::_define_draft_fc_models() {
             MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))}
         };
         _fc_model_map.emplace(
-            num_tokens, MLAModelWithBuffer(_mla_session, elf_path, ifms, ofms)
+            num_tokens, MLAModelWithBuffer(
+                _mla_session, elf_path, ifms, ofms,
+                _cfg.lm_cfg.has_lora()
+            )
         );
     }
 }
@@ -1925,12 +1933,80 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         _reloc_models,
         [&]() -> std::vector<MLAModelWithBuffer::RelocUpdate> {
             std::map<RelocMapType, RelocMap> reloc_addr_maps;
-            for (const auto& dir_entry:
+            std::vector<std::filesystem::path> adapter_files;
+            for (const auto& dir_entry :
                  std::filesystem::directory_iterator(reloc_dir)) {
-                const auto file_name = dir_entry.path();
-                if (file_name.extension() != ".npy") {
-                    continue;
+                if (dir_entry.path().extension() == ".npy") {
+                    adapter_files.push_back(dir_entry.path());
                 }
+            }
+            std::sort(adapter_files.begin(), adapter_files.end());
+            if (adapter_files.empty()) {
+                throw std::invalid_argument(fmt::format(
+                    "Adapter directory {} contains no NPY files", reloc_dir
+                ));
+            }
+
+            /*
+             * One dma-buf per NPY made a real 1,888-tensor adapter exceed the
+             * process FD limit before publication. Pack the inactive adapter
+             * into one immutable arena instead. A conservative 64-KiB start
+             * alignment preserves the alignment each old standalone DMS0
+             * allocation received; compiler extents still bound every view.
+             * The upper bound uses on-disk file sizes (header + payload), so
+             * the subsequent raw payload packing cannot exceed it.
+             */
+            constexpr std::size_t arena_alignment = 64U * 1024U;
+            auto align_arena_offset = [](std::size_t value) {
+                const std::size_t remainder = value % arena_alignment;
+                if (remainder == 0) return value;
+                const std::size_t increment = arena_alignment - remainder;
+                if (value > std::numeric_limits<std::size_t>::max() - increment) {
+                    throw std::overflow_error("LoRA arena alignment overflow");
+                }
+                return value + increment;
+            };
+            std::size_t arena_capacity = 0;
+            for (const auto& file_name : adapter_files) {
+                arena_capacity = align_arena_offset(arena_capacity);
+                const std::uintmax_t file_bytes =
+                    std::filesystem::file_size(file_name);
+                if (file_bytes > std::numeric_limits<std::size_t>::max() ||
+                    static_cast<std::size_t>(file_bytes) >
+                        std::numeric_limits<std::size_t>::max() - arena_capacity) {
+                    throw std::overflow_error("LoRA arena size overflow");
+                }
+                arena_capacity += static_cast<std::size_t>(file_bytes);
+            }
+
+            const std::string arena_name = fmt::format(
+                "__reloc_bank{}_arena", candidate_bank
+            );
+            if (!has_buffer(arena_name)) {
+                define_buffer(arena_name, {arena_capacity}, "int8", false);
+            } else {
+                const auto& existing = get_buffer(arena_name);
+                if (existing.get_dtype() != "int8" ||
+                    existing.get_shape().size() != 1 ||
+                    existing.get_shape()[0] < arena_capacity) {
+                    /*
+                     * Resizing would invalidate an already imported dma-buf
+                     * generation. Compiled adapters for one model must have
+                     * the same hidden-port schema, so fail closed and require
+                     * session reconstruction instead of leaking an old bank.
+                     */
+                    throw std::invalid_argument(fmt::format(
+                        "Adapter {} does not fit the existing bank {}",
+                        reloc_name, arena_name
+                    ));
+                }
+            }
+            auto& arena = get_buffer(arena_name);
+            arena.try_allocate();
+            arena.clear(false);
+
+            std::size_t arena_cursor = 0;
+            for (const auto& file_name : adapter_files) {
 
                 std::regex pattern(R"(_n(\d+)_(pre|post)_layer(\d+)_)");
                 std::smatch match;
@@ -1957,23 +2033,55 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
                         "Adapter {} is not an int8 NPY payload", file_name
                     ));
                 }
-                const std::string port_name = file_name.stem().string();
-                const std::string storage_name = fmt::format(
-                    "__reloc_bank{}_{}", candidate_bank, port_name
-                );
-
-                if (!has_buffer(storage_name) ||
-                    get_buffer(storage_name).get_shape() != tensor.shape ||
-                    get_buffer(storage_name).get_dtype() != "int8") {
-                    /* This bank is inactive and the session is idle. */
-                    define_buffer(storage_name, tensor.shape, "int8");
+                const std::string file_stem = file_name.stem().string();
+                /*
+                 * Adapter files are named
+                 *   <qmla-elf-stem>_reloc.<hidden-port-name>.npy
+                 * while the package metadata intentionally exposes only the
+                 * compiler's hidden-port name (for example
+                 * `reloc.filter....lora_A.weight`).  The old MLA-RT path
+                 * discarded names and depended on map order, so carrying the
+                 * entire filename stem appeared to work there.  The direct
+                 * path validates names before publishing an immutable binding
+                 * set; strip exactly the compiler-added filename prefix rather
+                 * than weakening that validation or reverting to ordering.
+                 */
+                constexpr std::string_view reloc_marker = "_mla_reloc.";
+                const std::size_t reloc_pos = file_stem.rfind(reloc_marker);
+                if (reloc_pos == std::string::npos ||
+                    reloc_pos + reloc_marker.size() == file_stem.size()) {
+                    throw std::invalid_argument(fmt::format(
+                        "Adapter filename has no hidden-port suffix: {}",
+                        file_name
+                    ));
                 }
-                auto& buffer = get_buffer(storage_name);
-                buffer.try_allocate();
-                buffer.upload(tensor.data<void>());
+                const std::string port_name = file_stem.substr(
+                    reloc_pos + reloc_marker.size()
+                );
+                arena_cursor = align_arena_offset(arena_cursor);
+                const std::size_t tensor_bytes = tensor.num_bytes();
+                if (tensor_bytes == 0 || arena_cursor > arena_capacity ||
+                    tensor_bytes > arena_capacity - arena_cursor ||
+                    arena_cursor > std::numeric_limits<std::uint32_t>::max() ||
+                    tensor_bytes > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::overflow_error(fmt::format(
+                        "Adapter payload does not fit {}: {}",
+                        arena_name, file_name
+                    ));
+                }
+                arena.upload(
+                    tensor.data<void>(), arena_cursor, tensor_bytes, false
+                );
                 reloc_addr_maps[model_key][port_name] =
-                    MLABufferSlice{&buffer};
+                    MLABufferSlice{
+                        &arena,
+                        {static_cast<std::uint32_t>(arena_cursor)},
+                        {static_cast<std::uint32_t>(tensor_bytes)}
+                    };
+                arena_cursor += tensor_bytes;
             }
+            /* Publish all CPU writes to the device once, not once per NPY. */
+            arena.flush_cache();
             if (reloc_addr_maps.empty()) {
                 throw std::invalid_argument(fmt::format(
                     "Adapter directory {} contains no applicable NPY files",

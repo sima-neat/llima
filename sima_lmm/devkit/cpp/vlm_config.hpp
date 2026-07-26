@@ -183,6 +183,19 @@ struct LanguageModelConfig {
     bool rms_norm_unit_offset = false;
     uint32_t draft_vocab_size = 0;
     std::optional<SpeculativeDecodingConfig> speculative_decoding_cfg = std::nullopt;
+    /*
+     * The device runtime does not interpret PEFT's complete LoRA policy; the
+     * compiler has already reduced that policy to named hidden QMLA inputs.
+     * We nevertheless retain whether a LoRA configuration was present so the
+     * direct executor can select the one valid base binding for those inputs:
+     * immutable zero tensors. A zero A/B/scale contribution is the compiled
+     * base model, and is what the former MLA-RT updateReloc path kept selected
+     * after `unset lora`.
+     *
+     * Keep the payload opaque here. Parsing target-module policy a second
+     * time in the runtime would duplicate compiler logic and enlarge the ABI.
+     */
+    std::optional<nlohmann::json> lora_cfg = std::nullopt;
     bool is_kv_shared_layer(uint8_t layer_idx) const {
         uint8_t first_shared_layer = num_hidden_layers - num_kv_shared_layers;
         return num_kv_shared_layers > 0 && layer_idx >= first_shared_layer;
@@ -211,6 +224,10 @@ struct LanguageModelConfig {
         return speculative_decoding_cfg.has_value();
     }
 
+    bool has_lora() const {
+        return lora_cfg.has_value() && !lora_cfg.value().is_null();
+    }
+
     uint32_t get_lm_head_output_size() const {
         if (speculative_decoding_cfg.has_value()
             && speculative_decoding_cfg.value().is_draft){
@@ -224,7 +241,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache,
     hidden_size_per_layer_input, num_kv_shared_layers,
     rms_norm_eps, rms_norm_unit_offset,
-    draft_vocab_size, speculative_decoding_cfg
+    draft_vocab_size, speculative_decoding_cfg, lora_cfg
 )
 
 

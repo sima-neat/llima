@@ -80,13 +80,15 @@ class MLAModelWithBuffer {
         MLAModelWithBuffer(
             std::filesystem::path model_path,
             std::vector<MLABufferSlice> ifms,
-            std::vector<MLABufferSlice> ofms
+            std::vector<MLABufferSlice> ofms,
+            bool zero_hidden_inputs = false
         );
         MLAModelWithBuffer(
             std::shared_ptr<MlaExecutionSession> session,
             std::filesystem::path model_path,
             std::vector<MLABufferSlice> ifms,
-            std::vector<MLABufferSlice> ofms
+            std::vector<MLABufferSlice> ofms,
+            bool zero_hidden_inputs = false
         );
         ~MLAModelWithBuffer() {};
 

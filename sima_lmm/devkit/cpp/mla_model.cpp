@@ -178,7 +178,10 @@ class MlaExecutionSession {
         }
     }
 
-    std::size_t register_model(const std::filesystem::path& model_path) {
+    std::size_t register_model(
+        const std::filesystem::path& model_path,
+        bool zero_hidden_inputs
+    ) {
         const auto absolute_path =
             std::filesystem::absolute(model_path).lexically_normal();
         if (!std::filesystem::is_regular_file(absolute_path)) {
@@ -191,11 +194,21 @@ class MlaExecutionSession {
         require_healthy_locked();
         if (const auto found = path_to_index_.find(absolute_path);
             found != path_to_index_.end()) {
+            if (models_[found->second].zero_hidden_inputs !=
+                zero_hidden_inputs) {
+                throw std::logic_error(fmt::format(
+                    "MLA model {} was registered with conflicting hidden-input semantics",
+                    absolute_path
+                ));
+            }
             return found->second;
         }
         const std::size_t index = models_.size();
         path_to_index_.emplace(absolute_path, index);
-        models_.push_back(ModelEntry{.path = absolute_path});
+        models_.push_back(ModelEntry{
+            .path = absolute_path,
+            .zero_hidden_inputs = zero_hidden_inputs,
+        });
         return index;
     }
 
@@ -268,6 +281,7 @@ class MlaExecutionSession {
         packages_ = std::move(retained);
         if (!relative_directory.has_value()) {
             import_cache_.clear();
+            zero_hidden_input_.reset();
         }
     }
 
@@ -297,7 +311,21 @@ class MlaExecutionSession {
 
         const auto& info =
             entry.package->package.info(entry.package_ordinal);
+        if (entry.zero_hidden_inputs && entry.active_adapters.empty()) {
+            std::uint64_t largest_hidden_extent = 0;
+            for (const mla::TensorPortInfo& port : info.inputs) {
+                if (!port.public_port) {
+                    largest_hidden_extent = std::max(
+                        largest_hidden_extent, port.byte_extent
+                    );
+                }
+            }
+            if (largest_hidden_extent != 0) {
+                ensure_zero_hidden_input_locked(largest_hidden_extent);
+            }
+        }
         snapshot.bindings.inputs.reserve(info.inputs.size());
+        std::optional<MLABufferSlice> zero_hidden_slice;
         for (std::size_t port_index = 0;
              port_index < info.inputs.size(); ++port_index) {
             const mla::TensorPortInfo& port = info.inputs[port_index];
@@ -310,6 +338,22 @@ class MlaExecutionSession {
                     entry.active_adapters.find(port.name);
                 if (adapter != entry.active_adapters.end()) {
                     selected = &adapter->second;
+                }
+                if ((!selected || !selected->get_buf_ptr()) &&
+                    entry.zero_hidden_inputs) {
+                    /*
+                     * LoRA QMLA images expose A/B filters and their scales as
+                     * ordinary hidden read-only inputs. The neutral/base
+                     * model is therefore not an omitted binding: it is a
+                     * checked all-zero binding. Use one session-owned zero
+                     * allocation for every hidden port instead of allocating
+                     * thousands of per-layer zero tensors. The compiler
+                     * extent still controls each BufferView, so sharing does
+                     * not weaken bounds checking.
+                     */
+                    ensure_zero_hidden_input_locked(port.byte_extent);
+                    zero_hidden_slice.emplace(zero_hidden_input_.get());
+                    selected = &zero_hidden_slice.value();
                 }
             }
             snapshot.bindings.inputs.push_back(
@@ -471,6 +515,14 @@ class MlaExecutionSession {
                         name, entry.path
                     ));
                 }
+                const std::uint64_t supplied_extent =
+                    slice.get_buf_ptr()->get_buf_len(slice.get_buf_shapes());
+                if (port->byte_extent > supplied_extent) {
+                    throw std::out_of_range(fmt::format(
+                        "Adapter {} supplies {} bytes but {} requires {}",
+                        name, supplied_extent, entry.path, port->byte_extent
+                    ));
+                }
                 (void)import_view_locked(
                     &slice, *update.default_ifms, port->physical_index,
                     port->byte_extent, "adapter"
@@ -555,6 +607,7 @@ class MlaExecutionSession {
         std::filesystem::path path;
         std::shared_ptr<PackageHold> package;
         std::size_t package_ordinal = 0;
+        bool zero_hidden_inputs = false;
         std::map<std::string, MLABufferSlice> active_adapters;
     };
 
@@ -572,6 +625,41 @@ class MlaExecutionSession {
         if (index >= models_.size()) {
             throw std::out_of_range("invalid LLiMa MLA model index");
         }
+    }
+
+    void ensure_zero_hidden_input_locked(std::uint64_t required_extent) {
+        if (required_extent == 0 ||
+            required_extent > std::numeric_limits<std::size_t>::max()) {
+            throw std::out_of_range(
+                "invalid MLA neutral hidden-input extent"
+            );
+        }
+        if (zero_hidden_input_ &&
+            zero_hidden_input_->get_allocation_size() >= required_extent) {
+            return;
+        }
+
+        /*
+         * Callers own execution_mutex_ whenever model preparation can reach
+         * this function. Consequently no accepted job can still reference
+         * the old generation while a larger neutral buffer is installed.
+         * Remove its cached import before freeing the userspace allocation;
+         * this also keeps repeated package lifecycles at a flat DMS0 usage.
+         */
+        if (zero_hidden_input_) {
+            import_cache_.erase(zero_hidden_input_->get_allocation_cookie());
+        }
+        auto replacement = std::make_unique<MLABuffer>(
+            "__base_zero_hidden_input",
+            std::vector<std::size_t>{
+                static_cast<std::size_t>(required_extent)
+            },
+            "int8",
+            false
+        );
+        replacement->allocate();
+        replacement->clear();
+        zero_hidden_input_ = std::move(replacement);
     }
 
     void require_healthy_locked() const {
@@ -746,6 +834,12 @@ class MlaExecutionSession {
     std::vector<ModelEntry> models_;
     std::vector<std::shared_ptr<PackageHold>> packages_;
     std::unordered_map<std::uint64_t, mla::Buffer> import_cache_;
+    /*
+     * One immutable neutral LoRA binding shared by all hidden port views in
+     * this context. It is absent for non-LoRA models, preserving fail-closed
+     * behavior for an unexpected hidden input with no explicit semantics.
+     */
+    std::unique_ptr<MLABuffer> zero_hidden_input_;
     bool poisoned_ = false;
     std::string poison_reason_;
 };
@@ -868,24 +962,26 @@ void disconnect_mla() {
 MLAModelWithBuffer::MLAModelWithBuffer(
     std::filesystem::path model_path,
     std::vector<MLABufferSlice> ifms,
-    std::vector<MLABufferSlice> ofms
+    std::vector<MLABufferSlice> ofms,
+    bool zero_hidden_inputs
 ) : MLAModelWithBuffer(
         current_mla_execution_session(), std::move(model_path),
-        std::move(ifms), std::move(ofms)
+        std::move(ifms), std::move(ofms), zero_hidden_inputs
     ) {}
 
 MLAModelWithBuffer::MLAModelWithBuffer(
     std::shared_ptr<MlaExecutionSession> session,
     std::filesystem::path model_path,
     std::vector<MLABufferSlice> ifms,
-    std::vector<MLABufferSlice> ofms
+    std::vector<MLABufferSlice> ofms,
+    bool zero_hidden_inputs
 ) : _session(std::move(session)),
     _ifms(std::move(ifms)),
     _ofms(std::move(ofms)) {
     if (!_session) {
         throw std::invalid_argument("MLAModelWithBuffer requires a session");
     }
-    _model_idx = _session->register_model(model_path);
+    _model_idx = _session->register_model(model_path, zero_hidden_inputs);
 }
 
 void MLAModelWithBuffer::load() {
