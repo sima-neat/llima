@@ -3,7 +3,8 @@
 # Format:
 #   <repo_id> [revision]
 #
-# These additional checkpoints are used only by tests/test_vlm_config.py.
+# These additional checkpoints are used only by
+# tests/compilation/configuration/test_config_regression.py.
 # Their model weights are not needed.
 
 meta-llama/Llama-2-7b-chat-hf
