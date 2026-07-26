@@ -381,7 +381,7 @@ jobs:
       publish_manifest: true
 
   test-model-compiler:
-    name: Smoke test LLiMa on Model Compiler
+    name: Test LLiMa Compilation on Model Compiler
     needs:
       - resolve-vulcan-config
       - resolve-model-cache-config
@@ -392,7 +392,7 @@ jobs:
       artifact_base_url: ${{ needs.resolve-model-cache-config.outputs.artifact_base_url }}
 
   test-devkit:
-    name: Test LLiMa root artifact on DevKit
+    name: Test LLiMa Runtime on DevKit
     needs:
       - resolve-vulcan-config
       - resolve-test-runner
