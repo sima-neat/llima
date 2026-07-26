@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from safetensors import safe_open
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
@@ -13,6 +14,21 @@ from tests.compilation.helpers.paths import require_readable_path
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_source]
+
+
+def _read_hf_weight_shapes(
+    hf_model: LocalHuggingFaceModel,
+) -> dict[str, tuple[int, ...]]:
+    names_by_shard: dict[str, list[str]] = {}
+    for name, shard in hf_model.weight_map.items():
+        names_by_shard.setdefault(shard, []).append(name)
+
+    shapes: dict[str, tuple[int, ...]] = {}
+    for shard, names in names_by_shard.items():
+        with safe_open(hf_model.weights[shard], framework="numpy") as tensors:
+            for name in names:
+                shapes[name] = tuple(tensors.get_slice(name).get_shape())
+    return shapes
 
 
 @pytest.fixture(scope="module")
@@ -36,23 +52,23 @@ def weight_mapping_failures(
         )
         for case in GGUF_FILE_CASES
     }
+    hf_weight_shapes = _read_hf_weight_shapes(hf_model)
     failures: dict[str, str | None] = {
         case.quantization: None for case in GGUF_FILE_CASES
     }
 
-    for name in hf_model.weight_map:
-        hf_weight = hf_model.load_np_param(name)
+    for name, hf_shape in hf_weight_shapes.items():
         for case in GGUF_FILE_CASES:
             if failures[case.quantization] is not None:
                 continue
 
             try:
-                _, gguf_weight = gguf_models[case.quantization].load_weight(
-                    name, is_hf_name=True
-                )
-                assert hf_weight.shape == gguf_weight.shape, (
+                gguf_model = gguf_models[case.quantization]
+                gguf_name = gguf_model.convert_hf_weight_name(name)
+                gguf_shape = tuple(gguf_model.tensor_info[gguf_name]["shape"])
+                assert hf_shape == gguf_shape, (
                     f"GGUF weight mapped from {name} has shape "
-                    f"{gguf_weight.shape}; expected {hf_weight.shape}"
+                    f"{gguf_shape}; expected {hf_shape}"
                 )
             except Exception as exc:
                 failures[case.quantization] = (

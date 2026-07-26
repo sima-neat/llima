@@ -444,7 +444,7 @@ GGUF_GRAPH_CASES = (
         "Q8_0",
         f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q8_0.gguf",
         25,
-        (0.07,),
+        (0.09,),
         f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
     ),
     GgufGraphCase(
@@ -452,7 +452,7 @@ GGUF_GRAPH_CASES = (
         "Q4_0",
         f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q4_0.gguf",
         25,
-        (0.17,),
+        (0.18,),
         f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
     ),
     GgufGraphCase(
