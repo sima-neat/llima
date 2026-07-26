@@ -320,21 +320,37 @@ foreach(_sima_lmm_license_index RANGE ${_sima_lmm_extra_license_last})
     )
 endforeach()
 
-find_path(
-    SIMAAI_MLA_KERNEL_BACKEND_INCLUDE_DIR
-    NAMES simaai/neat/mla/MlaKernelBackend.h
-    PATHS
-        "${SYSROOT}/usr/include"
-    REQUIRED
-)
-find_library(
-    SIMAAI_MLA_KERNEL_BACKEND_LIB
-    NAMES neatmlakernelbackend
-    PATHS
-        "${SYSROOT}/usr/lib/aarch64-linux-gnu"
-        "${SYSROOT}/usr/lib"
-    REQUIRED
-)
+# Consume one coherent Backend target.  Never locate a header and archive
+# independently: that can compile one ABI while linking another.  A packaged
+# SDK supplies MlaKernelBackendConfig.cmake; source-tree development builds the
+# exact sibling Backend source pinned with this LLiMa candidate.
+find_package(MlaKernelBackend CONFIG QUIET)
+set(SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../processmla-kernel-direct/core/mla-kernel-backend"
+    CACHE PATH "Pinned MlaKernelBackend source fallback")
+if(NOT TARGET SiMa::MlaKernelBackend AND
+   EXISTS "${SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR}/CMakeLists.txt")
+    if(NOT MLA_KERNEL_UAPI_DIR)
+        set(_sima_lmm_kernel_uapi
+            "${CMAKE_CURRENT_SOURCE_DIR}/../simaai-linux-mla-kernel-driver-v1/include/uapi")
+        if(EXISTS "${_sima_lmm_kernel_uapi}/linux/simaai/mla.h")
+            set(MLA_KERNEL_UAPI_DIR "${_sima_lmm_kernel_uapi}" CACHE PATH
+                "Pinned MLA kernel UAPI" FORCE)
+        endif()
+    endif()
+    set(MLA_KERNEL_BACKEND_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MLA_KERNEL_BACKEND_BUILD_DVT_SMOKE OFF CACHE BOOL "" FORCE)
+    set(MLA_KERNEL_BACKEND_BUILD_DVT_STRESS OFF CACHE BOOL "" FORCE)
+    set(MLA_KERNEL_BACKEND_BUILD_PACKAGE_AUDIT OFF CACHE BOOL "" FORCE)
+    add_subdirectory(
+        "${SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/mla-kernel-backend")
+endif()
+if(NOT TARGET SiMa::MlaKernelBackend)
+    message(FATAL_ERROR
+        "MlaKernelBackend package/source target is required; refusing an "
+        "independently discovered header/archive pair")
+endif()
 
 # Build the core library.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
@@ -350,7 +366,7 @@ set_target_properties(
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
 )
-message(STATUS "Using direct MLA kernel backend: ${SIMAAI_MLA_KERNEL_BACKEND_LIB}")
+message(STATUS "Using coherent direct MLA Backend target: SiMa::MlaKernelBackend")
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
 target_compile_definitions(
     ${TARGET_RUNTIME}
@@ -378,7 +394,6 @@ target_include_directories(
     # cnpy include directory is not automatically added when library is linked.
     $<BUILD_INTERFACE:${cnpy_SOURCE_DIR}>
     $<BUILD_INTERFACE:${llama_SOURCE_DIR}/ggml/include>
-    $<BUILD_INTERFACE:${SIMAAI_MLA_KERNEL_BACKEND_INCLUDE_DIR}>
     # tokenizers_cpp include directory is not added to tokenizers_c target.
     $<BUILD_INTERFACE:${tokenizers_cpp_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
@@ -393,7 +408,7 @@ target_link_libraries(
         PkgConfig::FFTW3
         cnpy-static
         simaaimem
-        ${SIMAAI_MLA_KERNEL_BACKEND_LIB}
+        SiMa::MlaKernelBackend
     PUBLIC
     opencv_core
     opencv_imgproc
@@ -488,7 +503,12 @@ if(SIMA_LMM_BUILD_PYTHON)
     )
     set_target_properties(
         ${TARGET_BIND} PROPERTIES
-        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
+        # The direct-kernel runtime has no Dispatcher dependency.  Keeping the
+        # historical Dispatcher directory in the Python extension's RPATH can
+        # nevertheless select stale private libraries at load time, defeating
+        # the exact ABI-5 component closure.  Resolve only the sibling/runtime
+        # install directories used by this package.
+        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR}"
     )
 endif()
 

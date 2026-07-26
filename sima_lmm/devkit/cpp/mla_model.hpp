@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -21,12 +22,55 @@ namespace llima {
 class MlaExecutionSession;
 
 /*
+ * One caller-owned ordered transaction.  The first model added binds the
+ * segment to that model's explicit session and acquires the session execution
+ * lock; every later model must belong to the same session.  commit() submits
+ * the immutable snapshots with the private queue-ahead window and drains all
+ * authoritative completions. The segment intentionally retains the lock
+ * after a successful commit so one logical inference transaction can cross a
+ * CPU observation/mutation point and then commit another hardware subsegment
+ * without allowing a competing producer to interleave its dependent state.
+ * Destruction releases the lock; destruction without commit drops only
+ * never-submitted snapshots.
+ *
+ * A small pimpl keeps Backend and SubmissionSnapshot transport details out of
+ * LLiMa's installed header.
+ */
+class MlaExecutionSegment {
+    friend class MLAModelWithBuffer;
+
+    public:
+        MlaExecutionSegment();
+        explicit MlaExecutionSegment(
+            std::shared_ptr<MlaExecutionSession> session
+        );
+        ~MlaExecutionSegment();
+        MlaExecutionSegment(MlaExecutionSegment&&) noexcept;
+        MlaExecutionSegment& operator=(MlaExecutionSegment&&) noexcept;
+        MlaExecutionSegment(const MlaExecutionSegment&) = delete;
+        MlaExecutionSegment& operator=(const MlaExecutionSegment&) = delete;
+
+        void commit();
+        [[nodiscard]] bool empty() const noexcept;
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> _impl;
+        void abort() noexcept;
+};
+
+/*
  * One LLiMa process owns one ordered /dev/mla context.  The retained argument
  * is a source-compatibility boundary for existing Python callers; dispatcher
  * and MLA-RT command-line options are no longer interpreted.
  */
 void connect_mla(const std::vector<std::string>& legacy_args = {});
 void disconnect_mla();
+std::shared_ptr<MlaExecutionSession> create_mla_execution_session();
+std::shared_ptr<MlaExecutionSession> current_mla_execution_session();
+void require_mla_execution_session_healthy(
+    const std::shared_ptr<MlaExecutionSession>& session
+);
 
 
 class MLAModelWithBuffer {
@@ -34,6 +78,12 @@ class MLAModelWithBuffer {
 
     public:
         MLAModelWithBuffer(
+            std::filesystem::path model_path,
+            std::vector<MLABufferSlice> ifms,
+            std::vector<MLABufferSlice> ofms
+        );
+        MLAModelWithBuffer(
+            std::shared_ptr<MlaExecutionSession> session,
             std::filesystem::path model_path,
             std::vector<MLABufferSlice> ifms,
             std::vector<MLABufferSlice> ofms
@@ -46,23 +96,39 @@ class MLAModelWithBuffer {
             std::map<uint8_t, MLABufferSlice>* ifm_map_ptr = nullptr,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr = nullptr
         );
-        void add_to_queue(
+        void add_to_segment(
+            MlaExecutionSegment& segment,
             std::map<uint8_t, MLABufferSlice>* ifm_map_ptr = nullptr,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr = nullptr
         );
+        using RelocBuffers = std::map<std::string, MLABufferSlice>;
+        struct RelocUpdate {
+            MLAModelWithBuffer* model = nullptr;
+            RelocBuffers buffers;
+        };
+
         /*
-         * Install a future-submission-only immutable adapter set. Already
-         * queued snapshots retain their original BufferViews.
-         */
-        void update_reloc(
-            const std::map<std::string, MLABufferSlice>& reloc_buffers
+         * Atomically replace/clear the adapter bindings for a related model
+         * set. The preparation callback runs while this model's complete
+         * execution session is idle, so it may safely upload an inactive
+         * adapter bank. Publication occurs only after every hidden input and
+         * checked BufferView validates; an exception leaves the old set
+         * active. The optional clear callback runs after publication but
+         * before another segment may start, so storage can be scrubbed safely.
+        */
+        void set_reloc_set(
+            const std::vector<MLAModelWithBuffer*>& replaced_models,
+            const std::function<std::vector<RelocUpdate>()>& prepare
+        );
+        void clear_reloc_set(
+            const std::vector<MLAModelWithBuffer*>& models,
+            const std::function<void()>& after_clear = {}
         );
 
-        static void run_queue();
-        static void load_all_models(
+        void load_related_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt
         );
-        static void free_all_models(
+        void free_related_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt
         );
 

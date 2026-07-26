@@ -7,7 +7,12 @@ namespace llima {
 
 VisionModel::VisionModel(
     std::filesystem::path model_path
-) : BaseModel(model_path),
+) : VisionModel(current_mla_execution_session(), std::move(model_path)) {}
+
+VisionModel::VisionModel(
+    std::shared_ptr<MlaExecutionSession> session,
+    std::filesystem::path model_path
+) : BaseModel(model_path, std::move(session)),
     _vm_cfg(_cfg.vm_cfg.value()),
     _mm_cfg(_cfg.mm_cfg.value())
 {
@@ -18,11 +23,14 @@ VisionModel::VisionModel(
 std::vector<Eigen::bfloat16> VisionModel::run_model(
     const std::vector<Eigen::bfloat16>& ifm_tensor
 ) {
+    require_healthy_mla_session();
+    MlaExecutionSegment segment(_mla_session);
     // Upload the ifm.
     get_buffer("vision_ifm").upload(ifm_tensor.data());
 
     // Run the models.
-    _model_ptr->run();
+    _model_ptr->add_to_segment(segment);
+    segment.commit();
 
     // Download the ofm.
     auto& ofm_buf = get_buffer("vision_ofm");
@@ -35,11 +43,14 @@ std::vector<Eigen::bfloat16> VisionModel::run_model(
 void VisionModel::run_model(
     const std::vector<Eigen::bfloat16>& ifm_tensor, std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
+    require_healthy_mla_session();
+    MlaExecutionSegment segment(_mla_session);
     // Upload the ifm.
     get_buffer("vision_ifm").upload(ifm_tensor.data());
 
     // Run the models.
-    _model_ptr->run(nullptr, ofm_map_ptr);
+    _model_ptr->add_to_segment(segment, nullptr, ofm_map_ptr);
+    segment.commit();
 }
 
 
@@ -47,14 +58,14 @@ void VisionModel::_initialize() {
     _logger->info("Vision model initialize starting ...");
     BaseModel::_initialize();
     _define_models();
-    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.vision_model_name);
+    _model_ptr->load_related_models(_elf_dir / _cfg.vision_model_name);
     _logger->info("Vision model initialize completed");
 }
 
 
 void VisionModel::_finalize() {
     _logger->info("Vision model finalize starting ...");
-    MLAModelWithBuffer::free_all_models(_elf_dir / _cfg.vision_model_name);
+    _model_ptr->free_related_models(_elf_dir / _cfg.vision_model_name);
     BaseModel::_finalize();
     _logger->info("Vision model finalize completed");
 }
@@ -108,6 +119,7 @@ void VisionModel::_define_models() {
         ofms.emplace_back(&get_buffer(fmt::format("deepstack_feature_l{}", i)));
     }
     _model_ptr = std::make_unique<MLAModelWithBuffer>(
+        _mla_session,
         _elf_dir / elf_file_name,
         std::vector<MLABufferSlice>{MLABufferSlice{&get_buffer("vision_ifm")}},
         std::move(ofms)

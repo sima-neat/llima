@@ -241,7 +241,13 @@ const std::map<std::string, std::string> WhisperModel::_TO_LANGUAGE_CODE = {
 };
 
 
-WhisperModel::WhisperModel(std::filesystem::path model_path) : BaseModel(model_path),
+WhisperModel::WhisperModel(std::filesystem::path model_path)
+    : WhisperModel(current_mla_execution_session(), std::move(model_path)) {}
+
+WhisperModel::WhisperModel(
+    std::shared_ptr<MlaExecutionSession> session,
+    std::filesystem::path model_path
+) : BaseModel(model_path, std::move(session)),
     _preprocessor(_devkit_dir),
     _is_running(false)
 {
@@ -290,6 +296,8 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     const std::string& language,
     const std::string& task
 ) {
+    require_healthy_mla_session();
+    MlaExecutionSegment segment(_mla_session);
     _is_running.store(true, std::memory_order_relaxed);
     struct RunningGuard {
         std::atomic<bool>& running;
@@ -303,7 +311,8 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
 
     // Upload audio_tensor and run the encoder model.
     get_buffer("encoder_ifm").upload(mel.data());
-    _encoder_model_ptr->run();
+    _encoder_model_ptr->add_to_segment(segment);
+    segment.commit();
 
     /*
      * Older compiled Whisper drops do not contain the optional language-
@@ -314,7 +323,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
      */
     LanguageDetectResult language_detect_result{0, 0.0F};
     if (_decoder_language_detect_model_ptr) {
-        language_detect_result = _run_language_detect();
+        language_detect_result = _run_language_detect(segment);
     } else if (_is_auto_language(language)) {
         throw std::runtime_error(
             "This Whisper package does not support automatic language "
@@ -364,11 +373,11 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     // Run decoder init model to generate the first token.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
         if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1)
-            _decoder_init_log_probe_model_map.at(layer_idx).add_to_queue();
+            _decoder_init_log_probe_model_map.at(layer_idx).add_to_segment(segment);
         else
-            _decoder_init_model_map.at(layer_idx).add_to_queue();
+            _decoder_init_model_map.at(layer_idx).add_to_segment(segment);
     }
-    MLAModelWithBuffer::run_queue();
+    segment.commit();
     new_token_buf.invalidate_cache();
     new_tokens.emplace_back(new_token_ptr[0]);
     if (_cfg.log_probe_enabled) {
@@ -415,12 +424,12 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
                     )
                 );
             }
-            _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
-            _decoder_cache_model_map.at(model_key).add_to_queue();
-            _decoder_post_model_map.at(model_key).add_to_queue(&ifm_map);
+            _decoder_pre_model_map.at(model_key).add_to_segment(segment, &ifm_map);
+            _decoder_cache_model_map.at(model_key).add_to_segment(segment);
+            _decoder_post_model_map.at(model_key).add_to_segment(segment, &ifm_map);
         }
 
-        MLAModelWithBuffer::run_queue();
+        segment.commit();
         new_token_buf.invalidate_cache();
         new_tokens.emplace_back(new_token_ptr[0]);
         if (_cfg.log_probe_enabled) {
@@ -475,7 +484,7 @@ void WhisperModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_elf_dir);
+    _encoder_model_ptr->load_related_models(_elf_dir);
 
     // Upload token and position embeddings.
     auto token_embeddings_file_name = (
@@ -514,7 +523,7 @@ void WhisperModel::_initialize() {
 
 void WhisperModel::_finalize() {
     _logger->info("Whisper model finalize starting ...");
-    MLAModelWithBuffer::free_all_models(_elf_dir);
+    _encoder_model_ptr->free_related_models(_elf_dir);
     BaseModel::_finalize();
     _logger->info("Whisper model finalize completed");
 }
@@ -574,40 +583,42 @@ void WhisperModel::_define_model(
     const std::vector<MLABufferSlice>& ofms
 ) {
     if (model_type == "encoder") {
-        _encoder_model_ptr = std::make_unique<MLAModelWithBuffer>(model_path, ifms, ofms);
+        _encoder_model_ptr = std::make_unique<MLAModelWithBuffer>(
+            _mla_session, model_path, ifms, ofms
+        );
     } else if (model_type == "decoder_language_detect") {
         _decoder_language_detect_model_ptr = std::make_unique<MLAModelWithBuffer>(
-            model_path, ifms, ofms
+            _mla_session, model_path, ifms, ofms
         );
     } else if (model_type == "decoder_init") {
         _decoder_init_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<uint8_t>(key)),
-            std::forward_as_tuple(model_path, ifms, ofms)
+            std::forward_as_tuple(_mla_session, model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_init_log_probe") {
         _decoder_init_log_probe_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<uint8_t>(key)),
-            std::forward_as_tuple(model_path, ifms, ofms)
+            std::forward_as_tuple(_mla_session, model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_pre") {
         _decoder_pre_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
-            std::forward_as_tuple(model_path, ifms, ofms)
+            std::forward_as_tuple(_mla_session, model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_cache") {
         _decoder_cache_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
-            std::forward_as_tuple(model_path, ifms, ofms)
+            std::forward_as_tuple(_mla_session, model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_post") {
         _decoder_post_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
-            std::forward_as_tuple(model_path, ifms, ofms)
+            std::forward_as_tuple(_mla_session, model_path, ifms, ofms)
         );
     } else {
         throw std::runtime_error(fmt::format("Invalid model type: {}", model_type));
@@ -918,13 +929,16 @@ bool WhisperModel::_is_auto_language(const std::string& language) const {
 }
 
 
-WhisperModel::LanguageDetectResult WhisperModel::_run_language_detect() {
+WhisperModel::LanguageDetectResult WhisperModel::_run_language_detect(
+    MlaExecutionSegment& segment
+) {
     if (!_decoder_language_detect_model_ptr) {
         throw std::runtime_error(
             "Whisper language detection is unavailable in this package"
         );
     }
-    _decoder_language_detect_model_ptr->run();
+    _decoder_language_detect_model_ptr->add_to_segment(segment);
+    segment.commit();
     auto& new_token_buf = get_buffer("new_token");
     new_token_buf.invalidate_cache();
     auto* token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());

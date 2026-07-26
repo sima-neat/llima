@@ -17,10 +17,10 @@
  *
  * The model's physical input envelope is 301056 bytes.  The source fixture is
  * 150528 bytes, so both independent DMS0 inputs are cleared before copying the
- * fixture.  Two immutable submissions are then committed as one segment.  The
- * test checks that the two-deep executor preserves independent buffer lifetime,
- * FIFO execution, and identical output.  It does not replace the existing Neat
- * accuracy oracle or the pending LLM token/logit/KV parity suite.
+ * fixture. Two submissions are committed on one old retained session, then
+ * the same model runs on a newly connected session. The test covers queue FIFO,
+ * reconnect isolation, cross-context rejection, rollback, and byte-identical
+ * output. It does not replace the Neat or LLM numerical/state oracles.
  *
  * Inspect the resulting executable with `file` and run the AArch64 binary on
  * an authorized DVT; never execute it in the x86 build container.
@@ -49,36 +49,74 @@ int main(int argc, char** argv) {
 
     simaai::llima::MLABuffer input_a("input_a", {301056}, "int8", false);
     simaai::llima::MLABuffer input_b("input_b", {301056}, "int8", false);
+    simaai::llima::MLABuffer input_c("input_c", {301056}, "int8", false);
     simaai::llima::MLABuffer output_a("output_a", {2000}, "int8", false);
     simaai::llima::MLABuffer output_b("output_b", {2000}, "int8", false);
+    simaai::llima::MLABuffer output_c("output_c", {2000}, "int8", false);
     input_a.allocate();
     input_b.allocate();
+    input_c.allocate();
     output_a.allocate();
     output_b.allocate();
+    output_c.allocate();
 
     input_a.clear(false);
     input_b.clear(false);
+    input_c.clear(false);
     std::memcpy(input_a.get_virtual_addr(), input.data(), input.size());
     std::memcpy(input_b.get_virtual_addr(), input.data(), input.size());
+    std::memcpy(input_c.get_virtual_addr(), input.data(), input.size());
     input_a.flush_cache();
     input_b.flush_cache();
+    input_c.flush_cache();
+
+    /* Retain A across disconnect, then make B the compatibility default. */
+    auto session_a = simaai::llima::current_mla_execution_session();
+    simaai::llima::disconnect();
+    simaai::llima::connect(
+        {}, "/tmp/llima-direct-resnet-reconnect.log", spdlog::level::warn
+    );
+    auto session_b = simaai::llima::current_mla_execution_session();
 
     simaai::llima::MLAModelWithBuffer job_a(
-        argv[1],
+        session_a, argv[1],
         {simaai::llima::MLABufferSlice{&input_a}},
         {simaai::llima::MLABufferSlice{&output_a}}
     );
     simaai::llima::MLAModelWithBuffer job_b(
-        argv[1],
+        session_a, argv[1],
         {simaai::llima::MLABufferSlice{&input_b}},
         {simaai::llima::MLABufferSlice{&output_b}}
     );
+    simaai::llima::MLAModelWithBuffer job_c(
+        session_b, argv[1],
+        {simaai::llima::MLABufferSlice{&input_c}},
+        {simaai::llima::MLABufferSlice{&output_c}}
+    );
 
-    // Snapshot both bindings before commit.  run_queue() retains at most two
-    // kernel jobs and does not cross a caller-owned segment boundary.
-    job_a.add_to_queue();
-    job_b.add_to_queue();
-    simaai::llima::MLAModelWithBuffer::run_queue();
+    // Snapshot both bindings in one caller-owned transaction.  The production
+    // executor's private depth is independent of this two-job correctness
+    // fixture.
+    simaai::llima::MlaExecutionSegment segment;
+    job_a.add_to_segment(segment);
+    job_b.add_to_segment(segment);
+    segment.commit();
+
+    /* A committed transaction remains bound until its RAII lifetime ends. */
+    bool rejected_cross_context = false;
+    try {
+        job_c.add_to_segment(segment);
+    } catch (const std::invalid_argument&) {
+        rejected_cross_context = true;
+    }
+    if (!rejected_cross_context) {
+        std::cerr << "cross-context segment was not rejected\n";
+        simaai::llima::disconnect();
+        return 3;
+    }
+    simaai::llima::MlaExecutionSegment second_session_segment;
+    job_c.add_to_segment(second_session_segment);
+    second_session_segment.commit();
 
     /*
      * Prove that segment assembly is all-or-nothing.  Queue one valid snapshot
@@ -93,14 +131,14 @@ int main(int argc, char** argv) {
     );
     short_output.allocate();
     simaai::llima::MLAModelWithBuffer invalid_job(
-        argv[1],
+        session_a, argv[1],
         {simaai::llima::MLABufferSlice{&input_a}},
         {simaai::llima::MLABufferSlice{&short_output}}
     );
     bool rejected_partial_segment = false;
-    job_a.add_to_queue();
+    job_a.add_to_segment(segment);
     try {
-        invalid_job.add_to_queue();
+        invalid_job.add_to_segment(segment);
     } catch (const std::out_of_range&) {
         rejected_partial_segment = true;
     }
@@ -109,15 +147,21 @@ int main(int argc, char** argv) {
         simaai::llima::disconnect();
         return 2;
     }
-    job_b.add_to_queue();
-    simaai::llima::MLAModelWithBuffer::run_queue();
+    job_b.add_to_segment(segment);
+    segment.commit();
 
     output_a.invalidate_cache();
     output_b.invalidate_cache();
+    output_c.invalidate_cache();
     const bool byte_exact =
         std::memcmp(
             output_a.get_virtual_addr(),
             output_b.get_virtual_addr(),
+            output_a.get_allocation_size()
+        ) == 0 &&
+        std::memcmp(
+            output_a.get_virtual_addr(),
+            output_c.get_virtual_addr(),
             output_a.get_allocation_size()
         ) == 0;
 
@@ -128,7 +172,8 @@ int main(int argc, char** argv) {
     }
 
     std::cout
-        << "LLIMA_DIRECT_RESNET_PASS jobs=2 queue_depth=2 "
-        << "segment_rollback=PASS output=BYTE_EXACT\n";
+        << "LLIMA_DIRECT_RESNET_PASS jobs=3 segment=RAII depth=PRIVATE-3 "
+        << "segment_rollback=PASS reconnect_isolation=PASS "
+        << "cross_context=REJECTED output=BYTE_EXACT\n";
     return 0;
 }

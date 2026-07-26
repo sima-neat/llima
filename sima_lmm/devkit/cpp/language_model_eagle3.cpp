@@ -54,6 +54,8 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     int num_cached_tokens,
     bool is_prefill
 ) {
+    require_healthy_mla_session();
+    MlaExecutionSegment segment(_mla_session);
     const size_t seq_length = input_ids.size();
     size_t seq_len_with_past = seq_length;
     int past_key_values_length = 0;
@@ -174,7 +176,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
             )
         );
 
-        it->second.add_to_queue(&ifm_map);
+        it->second.add_to_segment(segment, &ifm_map);
     } else {
         // FC skipped, but pre_model IFM[1] is statically wired to
         // fc_n{N}_output — upload hidden_states there to overwrite stale data.
@@ -252,20 +254,20 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
             )
         );
     }
-    _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
+    _pre_model_map.at(model_key).add_to_segment(segment, &pre_ifm_map);
 
     // cache_model dispatch. IFMs/OFMs are all statically wired, no overrides.
-    _cache_model_map.at(model_key).add_to_queue();
+    _cache_model_map.at(model_key).add_to_segment(segment);
 
     // post_model dispatch (lm_head fused in). Override IFM[0] to fc_n{N}_output
     // (same buffer pre_model used as IFM[1]); IFM[1] is statically wired.
     std::map<uint8_t, MLABufferSlice> post_ifm_map;
     post_ifm_map.emplace(0, MLABufferSlice{&fc_output_buf});
-    _post_model_map.at(model_key).add_to_queue(&post_ifm_map);
+    _post_model_map.at(model_key).add_to_segment(segment, &post_ifm_map);
 
     // Download both outputs: hidden_states (n{N}_buffer5) and logits
     // (n{N}_buffer4, lm_head fused into post_model; single split for draft).
-    MLAModelWithBuffer::run_queue();
+    segment.commit();
     const uint32_t draft_vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
     DraftForwardResult result;
     {
@@ -297,6 +299,8 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     std::vector<uint32_t> input_ids,
     std::vector<int32_t> position_ids
 ) {
+    require_healthy_mla_session();
+    MlaExecutionSegment segment(_mla_session);
     const int num_cached_tokens = static_cast<int>(_eagle3_stable_kv);
 
     // num_tokens = 16 for target verify; seq_length is the valid candidate count.
@@ -461,15 +465,15 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             )
         );
 
-        _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
-        _cache_model_map.at(model_key).add_to_queue();
-        _post_model_map.at(model_key).add_to_queue(&ifm_map);
+        _pre_model_map.at(model_key).add_to_segment(segment, &pre_ifm_map);
+        _cache_model_map.at(model_key).add_to_segment(segment);
+        _post_model_map.at(model_key).add_to_segment(segment, &ifm_map);
 
         // post_model.ofms[0] writes n{N}_buffer1 (next layer's IFM[0]), so
         // reading it here yields this layer's output.
         auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
         if (it != capture_layers.end()) {
-            MLAModelWithBuffer::run_queue();
+            segment.commit();
             const size_t cap_idx = std::distance(capture_layers.begin(), it);
             auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
             buf.invalidate_cache();
@@ -490,7 +494,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
     result.logits.resize(static_cast<size_t>(num_tokens) * lm_head_output_size);
 
-    MLAModelWithBuffer::run_queue();
+    segment.commit();
     for (uint32_t s = 0; s < num_splits; ++s) {
         const std::string buf_name = (num_splits == 1)
             ? fmt::format("n{}_buffer4", num_tokens)

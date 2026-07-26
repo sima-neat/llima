@@ -6,6 +6,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -28,8 +29,18 @@ template <typename T>
 class BaseModel {
     protected:
         BaseModel(std::filesystem::path model_path) requires std::is_same_v<T, VlmConfig>
-          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
+          : BaseModel(model_path, current_mla_execution_session()) {}
+
+        BaseModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<MlaExecutionSession> session
+        ) requires std::is_same_v<T, VlmConfig>
+          : _mla_session(std::move(session)),
+            _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
         {
+            if (!_mla_session) {
+                throw std::invalid_argument("VLM requires an MLA execution session");
+            }
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("VLM") : spdlog::default_logger();
 
@@ -44,8 +55,18 @@ class BaseModel {
         }
 
         BaseModel(std::filesystem::path model_path) requires std::is_same_v<T, WhisperConfig>
-          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
+          : BaseModel(model_path, current_mla_execution_session()) {}
+
+        BaseModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<MlaExecutionSession> session
+        ) requires std::is_same_v<T, WhisperConfig>
+          : _mla_session(std::move(session)),
+            _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
         {
+            if (!_mla_session) {
+                throw std::invalid_argument("Whisper requires an MLA execution session");
+            }
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("Whisper") : spdlog::default_logger();
 
@@ -77,6 +98,9 @@ class BaseModel {
         }
         MLABuffer& get_buffer(const std::string& name) { return _buf_map.at(name); }
         bool has_buffer(const std::string& name) { return _buf_map.contains(name); }
+        void require_healthy_mla_session() const {
+            require_mla_execution_session_healthy(_mla_session);
+        }
 
         virtual void _define_buffers() {}
         virtual void _initialize() {
@@ -97,6 +121,8 @@ class BaseModel {
         }
 
 
+        /* Captured once and injected into every compiled child model. */
+        std::shared_ptr<MlaExecutionSession> _mla_session;
         T _cfg;
         std::filesystem::path _elf_dir;
         std::filesystem::path _devkit_dir;

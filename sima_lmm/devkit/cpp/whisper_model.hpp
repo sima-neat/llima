@@ -75,6 +75,10 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         };
 
         WhisperModel(std::filesystem::path model_path);
+        WhisperModel(
+            std::shared_ptr<MlaExecutionSession> session,
+            std::filesystem::path model_path
+        );
         virtual ~WhisperModel() { _finalize(); };
 
         TranscriptionResult run_model(
@@ -130,7 +134,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             uint32_t language_index;
             float no_speech_prob;
         };
-        LanguageDetectResult _run_language_detect();
+        LanguageDetectResult _run_language_detect(MlaExecutionSegment& segment);
         float _compute_token_logprob(MLABuffer& logits_buf, uint32_t token_id);
         float _compute_token_prob(MLABuffer& logits_buf, uint32_t token_id);
         uint32_t _language_token_from_index(uint32_t language_idx) const;

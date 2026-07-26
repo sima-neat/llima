@@ -139,6 +139,13 @@ class MlaExecutionSession {
         std::filesystem::path model_path;
     };
 
+    /* Non-owning inputs are consumed synchronously under both session locks. */
+    struct AdapterUpdate {
+        std::size_t index;
+        const std::map<std::string, MLABufferSlice>* adapters;
+        const std::vector<MLABufferSlice>* default_ifms;
+    };
+
     static std::shared_ptr<MlaExecutionSession> create() {
         mla::Status status;
         auto backend = mla::Backend::open(
@@ -155,15 +162,6 @@ class MlaExecutionSession {
     }
 
     ~MlaExecutionSession() {
-        /*
-         * A producer can fail while preparing the middle of a segment (for
-         * example, because one BufferView is out of range).  The snapshots
-         * already in pending_ were never submitted to hardware, so teardown
-         * must discard them rather than let a cleanup exception hide the
-         * original preparation error.  Submitted jobs are not stored here;
-         * run_segment() always drains those before it returns.
-         */
-        discard_pending_segment();
         try {
             free_models(std::nullopt);
         } catch (const std::exception& error) {
@@ -202,6 +200,7 @@ class MlaExecutionSession {
     }
 
     void load_model(std::size_t index) {
+        std::lock_guard execution_lock(execution_mutex_);
         std::lock_guard lock(mutex_);
         require_healthy_locked();
         validate_index_locked(index);
@@ -214,6 +213,7 @@ class MlaExecutionSession {
     void load_models(
         std::optional<std::filesystem::path> relative_directory
     ) {
+        std::lock_guard execution_lock(execution_mutex_);
         std::lock_guard lock(mutex_);
         require_healthy_locked();
         std::vector<std::size_t> missing;
@@ -237,12 +237,8 @@ class MlaExecutionSession {
     void free_models(
         std::optional<std::filesystem::path> relative_directory
     ) {
+        std::lock_guard execution_lock(execution_mutex_);
         std::lock_guard lock(mutex_);
-        if (!pending_.empty()) {
-            throw std::runtime_error(
-                "cannot release MLA packages inside an open execution segment"
-            );
-        }
 
         std::vector<std::shared_ptr<PackageHold>> retained;
         retained.reserve(packages_.size());
@@ -343,88 +339,14 @@ class MlaExecutionSession {
         return snapshot;
     }
 
-    void run(SubmissionSnapshot snapshot) {
+    std::unique_lock<std::mutex> acquire_execution_lock() {
+        return std::unique_lock<std::mutex>(execution_mutex_);
+    }
+
+    void run_snapshots(std::deque<SubmissionSnapshot> snapshots) {
         require_healthy();
-        mla::Job job;
-        mla::SubmitOptions options;
-        options.timeout_ms = kJobTimeoutMs;
-        mla::Status status = backend_->submit(
-            snapshot.model, snapshot.bindings, options, &job
-        );
-        if (!status) {
-            poison(fmt::format(
-                "submit failed for {}: {} ({})",
-                snapshot.model_path, status.code, status.message
-            ));
-            throw_status("Backend::submit", status);
-        }
-        mla::JobCompletion completion;
-        status = job.wait(&completion);
-        if (!status || completion.result != 0) {
-            poison(fmt::format(
-                "job failed for {}: {} completion={} fault={}",
-                snapshot.model_path, status.code, completion.result,
-                completion.fault_class
-            ));
-            throw_status("Job::wait", status);
-        }
-        if (MLAModelWithBuffer::_profile &&
-            (completion.valid & mla::kCompletionValidActive) != 0) {
-            spdlog::info(
-                "MLA model={} active_us={:.3f}",
-                snapshot.model_path,
-                completion.active_microseconds()
-            );
-        }
-    }
-
-    void enqueue(SubmissionSnapshot snapshot) {
-        std::lock_guard lock(mutex_);
-        require_healthy_locked();
-        const std::thread::id caller = std::this_thread::get_id();
-        if (pending_.empty()) {
-            segment_owner_ = caller;
-        } else if (segment_owner_ != caller) {
-            throw std::runtime_error(
-                "one LLiMa execution segment cannot span producer threads"
-            );
-        }
-        pending_.push_back(std::move(snapshot));
-    }
-
-    void discard_current_segment() noexcept {
-        std::lock_guard lock(mutex_);
-        if (pending_.empty()) {
+        if (snapshots.empty()) {
             return;
-        }
-
-        /*
-         * Only the producer that owns the transaction may roll it back.  A
-         * failing call from an unrelated thread must not silently erase work
-         * assembled by the real owner.  enqueue() will report that ownership
-         * violation if the unrelated caller reaches publication.
-         */
-        if (segment_owner_ == std::this_thread::get_id()) {
-            pending_.clear();
-            segment_owner_ = {};
-        }
-    }
-
-    void run_segment() {
-        std::deque<SubmissionSnapshot> snapshots;
-        {
-            std::lock_guard lock(mutex_);
-            require_healthy_locked();
-            if (pending_.empty()) {
-                return;
-            }
-            if (segment_owner_ != std::this_thread::get_id()) {
-                throw std::runtime_error(
-                    "execution segment must be committed by its producer"
-                );
-            }
-            snapshots.swap(pending_);
-            segment_owner_ = {};
         }
 
         /*
@@ -494,61 +416,117 @@ class MlaExecutionSession {
         }
     }
 
-    void set_adapters(
-        std::size_t index,
-        const std::map<std::string, MLABufferSlice>& adapters,
-        const std::vector<MLABufferSlice>& default_ifms
+    /* Caller owns execution_mutex_ across CPU preparation and publication. */
+    void replace_adapter_set_locked(
+        const std::vector<std::size_t>& replaced_indices,
+        const std::vector<AdapterUpdate>& updates
     ) {
         std::lock_guard lock(mutex_);
         require_healthy_locked();
-        validate_index_locked(index);
-        if (!models_[index].package) {
-            load_group_locked({index});
-        }
-        ModelEntry& entry = models_[index];
-        const auto& info =
-            entry.package->package.info(entry.package_ordinal);
 
-        for (const auto& [name, slice] : adapters) {
-            const auto port = std::find_if(
-                info.inputs.begin(), info.inputs.end(),
-                [&](const mla::TensorPortInfo& candidate) {
-                    return !candidate.public_port &&
-                           candidate.name == name;
+        std::vector<std::size_t> missing;
+        std::vector<std::size_t> seen;
+        missing.reserve(updates.size());
+        seen.reserve(updates.size());
+        for (const AdapterUpdate& update : updates) {
+            validate_index_locked(update.index);
+            if (!update.adapters || !update.default_ifms) {
+                throw std::invalid_argument("null MLA adapter transaction input");
+            }
+            if (std::find(seen.begin(), seen.end(), update.index) != seen.end()) {
+                throw std::invalid_argument(
+                    "MLA adapter transaction contains a model twice"
+                );
+            }
+            seen.push_back(update.index);
+            if (!models_[update.index].package) {
+                missing.push_back(update.index);
+            }
+        }
+        if (!missing.empty()) {
+            load_group_locked(missing);
+        }
+
+        for (const std::size_t index : replaced_indices) {
+            validate_index_locked(index);
+        }
+
+        /* Validate the complete candidate set before publishing any map. */
+        for (const AdapterUpdate& update : updates) {
+            ModelEntry& entry = models_[update.index];
+            const auto& info =
+                entry.package->package.info(entry.package_ordinal);
+
+            for (const auto& [name, slice] : *update.adapters) {
+                const auto port = std::find_if(
+                    info.inputs.begin(), info.inputs.end(),
+                    [&](const mla::TensorPortInfo& candidate) {
+                        return !candidate.public_port &&
+                               candidate.name == name;
+                    }
+                );
+                if (port == info.inputs.end() || !slice.get_buf_ptr()) {
+                    throw std::invalid_argument(fmt::format(
+                        "Adapter {} is not a valid hidden input of {}",
+                        name, entry.path
+                    ));
                 }
-            );
-            if (port == info.inputs.end() || !slice.get_buf_ptr()) {
-                throw std::invalid_argument(fmt::format(
-                    "Adapter {} is not a valid hidden input of {}",
-                    name, entry.path
-                ));
+                (void)import_view_locked(
+                    &slice, *update.default_ifms, port->physical_index,
+                    port->byte_extent, "adapter"
+                );
             }
-            /*
-             * Validate and import now. Publication is one map assignment only
-             * after every adapter has passed; accepted snapshots remain
-             * unchanged.
-             */
-            (void)import_view_locked(
-                &slice, default_ifms, port->physical_index,
-                port->byte_extent, "adapter"
-            );
+
+            for (const mla::TensorPortInfo& port : info.inputs) {
+                if (port.public_port) {
+                    continue;
+                }
+                const bool has_default =
+                    port.physical_index < update.default_ifms->size() &&
+                    (*update.default_ifms)[port.physical_index].get_buf_ptr();
+                if (!has_default && !update.adapters->contains(port.name)) {
+                    throw std::invalid_argument(fmt::format(
+                        "Adapter set for {} omits hidden input {}",
+                        entry.path, port.name
+                    ));
+                }
+            }
         }
 
-        for (const mla::TensorPortInfo& port : info.inputs) {
-            if (port.public_port) {
-                continue;
-            }
-            const bool has_default =
-                port.physical_index < default_ifms.size() &&
-                default_ifms[port.physical_index].get_buf_ptr();
-            if (!has_default && !adapters.contains(port.name)) {
-                throw std::invalid_argument(fmt::format(
-                    "Adapter set for {} omits hidden input {}",
-                    entry.path, port.name
-                ));
-            }
+        /* Clear the old family and publish the new family under one mutex. */
+        for (const std::size_t index : replaced_indices) {
+            models_[index].active_adapters.clear();
         }
-        entry.active_adapters = adapters;
+        for (const AdapterUpdate& update : updates) {
+            models_[update.index].active_adapters = *update.adapters;
+        }
+    }
+
+    /* Caller owns execution_mutex_; clear is one publication boundary. */
+    void clear_adapter_set_locked(const std::vector<std::size_t>& indices) {
+        std::lock_guard lock(mutex_);
+        require_healthy_locked();
+        std::vector<std::size_t> seen;
+        seen.reserve(indices.size());
+        for (const std::size_t index : indices) {
+            validate_index_locked(index);
+            if (std::find(seen.begin(), seen.end(), index) != seen.end()) {
+                throw std::invalid_argument(
+                    "MLA adapter clear transaction contains a model twice"
+                );
+            }
+            seen.push_back(index);
+        }
+        for (const std::size_t index : indices) {
+            /*
+             * Accepted SubmissionSnapshots own their imported BufferViews and
+             * remain unchanged. Clearing this future-submission map restores
+             * the package's immutable/default hidden inputs; if the package
+             * has no valid base binding, the next prepare fails closed rather
+             * than executing zeroed adapter storage.
+             */
+            models_[index].active_adapters.clear();
+        }
     }
 
     std::filesystem::path model_path(std::size_t index) const {
@@ -557,13 +535,17 @@ class MlaExecutionSession {
         return models_[index].path;
     }
 
-  private:
-    void discard_pending_segment() noexcept {
+    /*
+     * Public only through the opaque session handle: high-level inference
+     * owners call this at every API boundary so the first terminal failure
+     * permanently prevents publication of later token/KV state.
+     */
+    void require_healthy() const {
         std::lock_guard lock(mutex_);
-        pending_.clear();
-        segment_owner_ = {};
+        require_healthy_locked();
     }
 
+  private:
     struct PackageHold {
         mla::ModelPackage package;
         std::vector<std::size_t> model_indices;
@@ -594,15 +576,12 @@ class MlaExecutionSession {
 
     void require_healthy_locked() const {
         if (poisoned_) {
-            throw std::runtime_error(
-                "MLA execution session is poisoned and must be reconstructed"
-            );
+            throw std::runtime_error(fmt::format(
+                "MLA execution session is poisoned and must be reconstructed: {}",
+                poison_reason_.empty() ? "unknown terminal failure"
+                                       : poison_reason_
+            ));
         }
-    }
-
-    void require_healthy() const {
-        std::lock_guard lock(mutex_);
-        require_healthy_locked();
     }
 
     void poison_locked(std::string reason) {
@@ -755,16 +734,84 @@ class MlaExecutionSession {
 
     std::unique_ptr<mla::Backend> backend_;
     const std::size_t queue_ahead_depth_;
+    /*
+     * Serializes the entire logical execution transaction, not merely access
+     * to the model registry.  LLM layers mutate ordered KV/speculative state;
+     * permitting two producers to interleave their segment commits on the
+     * same FIFO context would be memory-safe but semantically corrupt.
+     */
+    std::mutex execution_mutex_;
     mutable std::mutex mutex_;
     std::map<std::filesystem::path, std::size_t> path_to_index_;
     std::vector<ModelEntry> models_;
     std::vector<std::shared_ptr<PackageHold>> packages_;
     std::unordered_map<std::uint64_t, mla::Buffer> import_cache_;
-    std::deque<SubmissionSnapshot> pending_;
-    std::thread::id segment_owner_;
     bool poisoned_ = false;
     std::string poison_reason_;
 };
+
+struct MlaExecutionSegment::Impl {
+    explicit Impl(std::shared_ptr<MlaExecutionSession> value)
+        : session(std::move(value)),
+          execution_lock(session
+              ? session->acquire_execution_lock()
+              : std::unique_lock<std::mutex>{}) {
+        if (!session) {
+            throw std::invalid_argument("MLA execution segment has no session");
+        }
+    }
+
+    std::shared_ptr<MlaExecutionSession> session;
+    std::unique_lock<std::mutex> execution_lock;
+    std::deque<MlaExecutionSession::SubmissionSnapshot> snapshots;
+};
+
+MlaExecutionSegment::MlaExecutionSegment() = default;
+MlaExecutionSegment::MlaExecutionSegment(
+    std::shared_ptr<MlaExecutionSession> session
+) : _impl(std::make_unique<Impl>(std::move(session))) {}
+MlaExecutionSegment::~MlaExecutionSegment() = default;
+MlaExecutionSegment::MlaExecutionSegment(MlaExecutionSegment&&) noexcept = default;
+MlaExecutionSegment&
+MlaExecutionSegment::operator=(MlaExecutionSegment&&) noexcept = default;
+
+bool MlaExecutionSegment::empty() const noexcept {
+    return !_impl || _impl->snapshots.empty();
+}
+
+void MlaExecutionSegment::abort() noexcept {
+    /*
+     * No snapshot in this object has reached Backend::submit until commit().
+     * Destroying the pimpl is therefore a complete transactional rollback and
+     * releases the per-session execution lock without cancellation syscalls.
+     */
+    _impl.reset();
+}
+
+void MlaExecutionSegment::commit() {
+    if (!_impl) {
+        return;
+    }
+    if (_impl->snapshots.empty()) {
+        return;
+    }
+    /*
+     * Keep the execution lock after a successful drain. Callers such as the
+     * LLM and Eagle executors have intentional CPU observation points between
+     * hardware subsegments; retaining the same caller-owned transaction there
+     * prevents another producer from interleaving KV/speculative state. On a
+     * failure abort() releases the lock only after run_snapshots() has drained
+     * every authoritative terminal CQE and poisoned the session.
+     */
+    std::deque<MlaExecutionSession::SubmissionSnapshot> snapshots;
+    snapshots.swap(_impl->snapshots);
+    try {
+        _impl->session->run_snapshots(std::move(snapshots));
+    } catch (...) {
+        abort();
+        throw;
+    }
+}
 
 void connect_mla(const std::vector<std::string>& legacy_args) {
     std::lock_guard lock(default_session_mutex);
@@ -778,10 +825,27 @@ void connect_mla(const std::vector<std::string>& legacy_args) {
             fmt::join(legacy_args, ", ")
         );
     }
-    default_session = MlaExecutionSession::create();
+    default_session = create_mla_execution_session();
     spdlog::info(
         "Connected LLiMa directly to /dev/mla with Background priority"
     );
+}
+
+std::shared_ptr<MlaExecutionSession> create_mla_execution_session() {
+    return MlaExecutionSession::create();
+}
+
+std::shared_ptr<MlaExecutionSession> current_mla_execution_session() {
+    return require_default_session();
+}
+
+void require_mla_execution_session_healthy(
+    const std::shared_ptr<MlaExecutionSession>& session
+) {
+    if (!session) {
+        throw std::runtime_error("MLA execution session is not available");
+    }
+    session->require_healthy();
 }
 
 void disconnect_mla() {
@@ -805,9 +869,22 @@ MLAModelWithBuffer::MLAModelWithBuffer(
     std::filesystem::path model_path,
     std::vector<MLABufferSlice> ifms,
     std::vector<MLABufferSlice> ofms
-) : _session(require_default_session()),
+) : MLAModelWithBuffer(
+        current_mla_execution_session(), std::move(model_path),
+        std::move(ifms), std::move(ofms)
+    ) {}
+
+MLAModelWithBuffer::MLAModelWithBuffer(
+    std::shared_ptr<MlaExecutionSession> session,
+    std::filesystem::path model_path,
+    std::vector<MLABufferSlice> ifms,
+    std::vector<MLABufferSlice> ofms
+) : _session(std::move(session)),
     _ifms(std::move(ifms)),
     _ofms(std::move(ofms)) {
+    if (!_session) {
+        throw std::invalid_argument("MLAModelWithBuffer requires a session");
+    }
     _model_idx = _session->register_model(model_path);
 }
 
@@ -827,21 +904,27 @@ void MLAModelWithBuffer::run(
     std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
     std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
-    load();
     _debug_inouts("ifm", ifm_map_ptr);
-    _session->run(_session->prepare(
-        _model_idx, _ifms, _ofms, ifm_map_ptr, ofm_map_ptr
-    ));
+    MlaExecutionSegment segment(_session);
+    add_to_segment(segment, ifm_map_ptr, ofm_map_ptr);
+    segment.commit();
     _debug_inouts("ofm", ofm_map_ptr);
 }
 
-void MLAModelWithBuffer::add_to_queue(
+void MLAModelWithBuffer::add_to_segment(
+    MlaExecutionSegment& segment,
     std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
     std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
-    load();
     try {
-        _session->enqueue(_session->prepare(
+        if (!segment._impl) {
+            segment._impl = std::make_unique<MlaExecutionSegment::Impl>(_session);
+        } else if (segment._impl->session != _session) {
+            throw std::invalid_argument(
+                "one MLA execution segment cannot mix kernel contexts"
+            );
+        }
+        segment._impl->snapshots.push_back(_session->prepare(
             _model_idx, _ifms, _ofms, ifm_map_ptr, ofm_map_ptr
         ));
     } catch (...) {
@@ -851,23 +934,79 @@ void MLAModelWithBuffer::add_to_queue(
          * segment may run later by accident.  They have not reached the
          * kernel yet, so dropping them is both safe and syscall-free.
          */
-        _session->discard_current_segment();
+        segment.abort();
         throw;
     }
 }
 
-void MLAModelWithBuffer::run_queue() {
-    require_default_session()->run_segment();
-}
-
-void MLAModelWithBuffer::update_reloc(
-    const std::map<std::string, MLABufferSlice>& reloc_buffers
+void MLAModelWithBuffer::set_reloc_set(
+    const std::vector<MLAModelWithBuffer*>& replaced_models,
+    const std::function<std::vector<RelocUpdate>()>& prepare
 ) {
-    load();
-    _session->set_adapters(_model_idx, reloc_buffers, _ifms);
+    if (!prepare) {
+        throw std::invalid_argument("MLA adapter preparation callback is empty");
+    }
+
+    /*
+     * The callback may allocate and upload an inactive adapter bank. Holding
+     * the execution lock across that CPU work, validation, and publication is
+     * what makes the switch a real DMA ownership boundary rather than merely
+     * a thread-safe map assignment.
+     */
+    auto execution_lock = _session->acquire_execution_lock();
+    std::vector<RelocUpdate> updates = prepare();
+    std::vector<std::size_t> replaced_indices;
+    replaced_indices.reserve(replaced_models.size());
+    for (const MLAModelWithBuffer* model : replaced_models) {
+        if (!model || model->_session != _session) {
+            throw std::invalid_argument(
+                "one MLA adapter transaction cannot mix kernel contexts"
+            );
+        }
+        if (std::find(replaced_indices.begin(), replaced_indices.end(),
+                      model->_model_idx) == replaced_indices.end()) {
+            replaced_indices.push_back(model->_model_idx);
+        }
+    }
+    std::vector<MlaExecutionSession::AdapterUpdate> session_updates;
+    session_updates.reserve(updates.size());
+    for (const RelocUpdate& update : updates) {
+        if (!update.model || update.model->_session != _session) {
+            throw std::invalid_argument(
+                "one MLA adapter transaction cannot mix kernel contexts"
+            );
+        }
+        session_updates.push_back({
+            .index = update.model->_model_idx,
+            .adapters = &update.buffers,
+            .default_ifms = &update.model->_ifms,
+        });
+    }
+    _session->replace_adapter_set_locked(replaced_indices, session_updates);
 }
 
-void MLAModelWithBuffer::load_all_models(
+void MLAModelWithBuffer::clear_reloc_set(
+    const std::vector<MLAModelWithBuffer*>& models,
+    const std::function<void()>& after_clear
+) {
+    auto execution_lock = _session->acquire_execution_lock();
+    std::vector<std::size_t> indices;
+    indices.reserve(models.size());
+    for (const MLAModelWithBuffer* model : models) {
+        if (!model || model->_session != _session) {
+            throw std::invalid_argument(
+                "one MLA adapter transaction cannot mix kernel contexts"
+            );
+        }
+        indices.push_back(model->_model_idx);
+    }
+    _session->clear_adapter_set_locked(indices);
+    if (after_clear) {
+        after_clear();
+    }
+}
+
+void MLAModelWithBuffer::load_related_models(
     std::optional<std::filesystem::path> relative_dir
 ) {
     /*
@@ -876,13 +1015,13 @@ void MLAModelWithBuffer::load_all_models(
      * and parallel loading therefore no longer exists: there is exactly one
      * admission path and failure cannot expose a partially loaded family.
      */
-    require_default_session()->load_models(std::move(relative_dir));
+    _session->load_models(std::move(relative_dir));
 }
 
-void MLAModelWithBuffer::free_all_models(
+void MLAModelWithBuffer::free_related_models(
     std::optional<std::filesystem::path> relative_dir
 ) {
-    require_default_session()->free_models(std::move(relative_dir));
+    _session->free_models(std::move(relative_dir));
 }
 
 void MLAModelWithBuffer::_debug_inouts(

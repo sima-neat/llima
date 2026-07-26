@@ -15,6 +15,10 @@ namespace llima {
 class VisionModel : public BaseModel<VlmConfig> {
     public:
         VisionModel(std::filesystem::path model_path);
+        VisionModel(
+            std::shared_ptr<MlaExecutionSession> session,
+            std::filesystem::path model_path
+        );
         virtual ~VisionModel() { _finalize(); };
 
         std::vector<Eigen::bfloat16> run_model(const std::vector<Eigen::bfloat16>& ifm_tensor);

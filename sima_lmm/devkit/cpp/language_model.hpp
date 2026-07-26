@@ -37,6 +37,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer
         );
+        LanguageModel(
+            std::shared_ptr<MlaExecutionSession> session,
+            std::filesystem::path model_path,
+            std::set<uint32_t> stop_token_ids,
+            std::optional<uint32_t> image_token_id,
+            std::optional<uint32_t> pad_token_id,
+            TextStreamer& text_streamer
+        );
         virtual ~LanguageModel() override { _finalize(); }
 
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
@@ -225,6 +233,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
+        MLAModelWithBuffer& _mla_model_anchor();
         void _define_draft_fc_models();
         struct CachedState {
             // Hidden-layer indices belonging to this stateful family.
@@ -348,6 +357,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         std::atomic<bool> _is_running;
         std::optional<std::string> _reloc_name;
+        /*
+         * Adapter storage is double-buffered. A replacement is uploaded into
+         * the inactive bank while the session is exclusively idle, validated
+         * as a complete set, then atomically published. Two banks bound both
+         * DMS/RSS and imported dma-buf cache growth during repeated A/B swaps.
+         */
+        uint8_t _reloc_buffer_bank = 0;
+        std::vector<MLAModelWithBuffer*> _reloc_models;
 };
 
 }
