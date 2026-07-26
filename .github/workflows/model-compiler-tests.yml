@@ -589,6 +589,12 @@ jobs:
           if report.get("status") != "passed":
               raise SystemExit(f"Compiler E2E report is not successful: {report}")
 
+          compile_stage = next(
+              stage for stage in report["stages"] if stage["name"] == "model_compiler"
+          )
+          if compile_stage.get("skipped"):
+              print("Skipped llima-compile --compile: ARM packages are not fixed yet.")
+
           with summary_path.open("a", encoding="utf-8") as summary:
               summary.write("### Selected-model full compilation E2E\n\n")
               summary.write(f"- Selected model: {report['selected_model']}\n")
@@ -597,12 +603,16 @@ jobs:
               )
               summary.write(f"- Selection seed: {report['selection_seed']}\n")
               summary.write(f"- Candidate SHA: {report['candidate_sha']}\n")
+              if compile_stage.get("skipped"):
+                  summary.write(
+                      "- Compile step: skipped until the ARM packages are fixed.\n"
+                  )
               summary.write("- Stages:\n")
               for stage in report["stages"]:
+                  if stage.get("skipped"):
+                      summary.write(f"  - {stage['name']}: skipped\n")
+                      continue
                   summary.write(
                       f"  - {stage['name']}: {stage['duration_seconds']} seconds\n"
                   )
-              summary.write(
-                  f"- Validated MPK archives: {len(report['artifacts'])}\n"
-              )
           PY
