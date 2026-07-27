@@ -99,6 +99,22 @@ class ScopeDecisionTests(unittest.TestCase):
         self.assertEqual(decision.matching_paths, ())
         self.assertIn("skipped", decision.reason)
 
+    def test_renamed_compiler_source_path_runs_compiler_tests(self):
+        decision = classify_pr_paths(
+            [
+                "docs/language_model.py",
+                "sima_lmm/model/language_model.py",
+            ],
+            pr_number=126,
+            base_ref="develop",
+        )
+
+        self.assertTrue(decision.run_compiler)
+        self.assertEqual(
+            decision.matching_paths,
+            ("sima_lmm/model/language_model.py",),
+        )
+
     def test_force_run_is_fail_safe(self):
         decision = force_run("GitHub PR lookup failed; running by default.")
 

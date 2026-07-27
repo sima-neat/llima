@@ -123,7 +123,8 @@ jobs:
             --paginate \
             -H "Accept: application/vnd.github+json" \
             "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/files?per_page=100" \
-            --jq '.[].filename' > "${changed_files}"; then
+            --jq '.[] | .filename, (.previous_filename // empty)' \
+            > "${changed_files}"; then
             force_run "Compiler tests required: changed-file lookup failed for PR #${pr_number}."
             exit 0
           fi
