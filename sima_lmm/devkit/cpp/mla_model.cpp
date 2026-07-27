@@ -279,10 +279,49 @@ class MlaExecutionSession {
             }
         }
         packages_ = std::move(retained);
-        if (!relative_directory.has_value()) {
-            import_cache_.clear();
-            zero_hidden_input_.reset();
+        /*
+         * A dma-buf import is session-owned, not package-owned, so the cookie
+         * cache cannot cheaply prove which package was its last user. Develop
+         * relied on MLA-RT teardown while freeing the associated MLABuffers;
+         * retaining these direct Backend handles would instead keep their
+         * dma-bufs (and therefore DMS0 allocations) alive until disconnect.
+         *
+         * execution_mutex_ is held and every segment drains before releasing
+         * it, so no accepted job can reference an entry here. Clear the small
+         * cache on every scoped model-family release and lazily re-import any
+         * buffers still needed by retained families on their next prepare.
+         * This is deliberately simpler and safer than maintaining a second
+         * per-package reference graph, and it adds no steady-state hot-path
+         * work.
+         */
+        import_cache_.clear();
+        zero_hidden_input_.reset();
+    }
+
+    std::size_t inspect_public_input_count(
+        const std::filesystem::path& model_path,
+        bool zero_hidden_inputs
+    ) {
+        /* register_model takes mutex_ itself; do it before the ordered
+         * execution boundary to avoid recursive locking. */
+        const std::size_t index =
+            register_model(model_path, zero_hidden_inputs);
+        std::lock_guard execution_lock(execution_mutex_);
+        std::lock_guard lock(mutex_);
+        require_healthy_locked();
+        validate_index_locked(index);
+        if (!models_[index].package) {
+            load_group_locked({index});
         }
+        const auto& info = models_[index].package->package.info(
+            models_[index].package_ordinal
+        );
+        return static_cast<std::size_t>(std::count_if(
+            info.inputs.begin(), info.inputs.end(),
+            [](const mla::TensorPortInfo& port) {
+                return port.public_port;
+            }
+        ));
     }
 
     SubmissionSnapshot prepare(
@@ -1118,6 +1157,21 @@ void MLAModelWithBuffer::free_related_models(
     std::optional<std::filesystem::path> relative_dir
 ) {
     _session->free_models(std::move(relative_dir));
+}
+
+std::size_t MLAModelWithBuffer::inspect_public_input_count(
+    const std::shared_ptr<MlaExecutionSession>& session,
+    const std::filesystem::path& model_path,
+    bool zero_hidden_inputs
+) {
+    if (!session) {
+        throw std::invalid_argument(
+            "cannot inspect MLA package without an execution session"
+        );
+    }
+    return session->inspect_public_input_count(
+        model_path, zero_hidden_inputs
+    );
 }
 
 void MLAModelWithBuffer::_debug_inouts(

@@ -662,9 +662,22 @@ void WhisperModel::_define_models() {
 
     // Decoder init model.
     uint32_t num_input_tokens = _input_token_ids.size();
+    const auto decoder_init_layer0_path = _get_elf_path_decoder_init(0);
+    const std::size_t decoder_init_layer0_public_inputs =
+        MLAModelWithBuffer::inspect_public_input_count(
+            _mla_session, decoder_init_layer0_path
+        );
+    if (decoder_init_layer0_public_inputs != 2 &&
+        decoder_init_layer0_public_inputs != 3) {
+        throw std::runtime_error(fmt::format(
+            "Unsupported Whisper decoder-init layer-0 QMLA layout: {} public inputs in {}",
+            decoder_init_layer0_public_inputs,
+            decoder_init_layer0_path
+        ));
+    }
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
         std::vector<MLABufferSlice> ifms = {&get_buffer("decoder_init")};
-        if (layer_idx == 0) {
+        if (layer_idx == 0 && decoder_init_layer0_public_inputs == 3) {
             /*
              * Preserve the published Whisper 2.0.0 artifact contract until
              * that package is regenerated from current LLiMa. Its layer-0
@@ -672,9 +685,10 @@ void WhisperModel::_define_models() {
              * token embeddings, the first four position embeddings, and
              * encoder features. The two embedding tensors happen to have the
              * same 6,144-byte extent, but they contain different data and are
-             * not aliases. This is intentionally package-specific; remove it
-             * only after the regenerated package's port inventory and numeric
-             * output have both been qualified.
+             * not aliases. Current develop packages advertise two ports and
+             * skip this branch, binding encoder_ofm as physical input 1. Gate
+             * on the QMLA metadata rather than the LLiMa version or filename
+             * so both packages remain correct during the regeneration window.
              */
             ifms.emplace_back(
                 &get_buffer("position_embeddings"),
@@ -717,7 +731,12 @@ void WhisperModel::_define_models() {
                 _cfg.get_decoder_head_dim()
             }
         );
-        _define_model("decoder_init", layer_idx, _get_elf_path_decoder_init(layer_idx), ifms, ofms);
+        _define_model(
+            "decoder_init", layer_idx,
+            layer_idx == 0 ? decoder_init_layer0_path
+                           : _get_elf_path_decoder_init(layer_idx),
+            ifms, ofms
+        );
 
         if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1) {
             std::vector<MLABufferSlice> log_probe_ofms;
