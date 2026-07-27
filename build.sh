@@ -410,6 +410,8 @@ ensure_git_submodules() {
   fi
 
   if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "[build] Synchronizing git submodule URLs"
+    git -C "$ROOT_DIR" submodule sync --recursive
     echo "[build] Updating git submodules"
     git -C "$ROOT_DIR" submodule update --init --recursive
   else
