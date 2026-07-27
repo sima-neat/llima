@@ -88,8 +88,9 @@ def test_s3_manifest_access_denial_has_no_http_fallback() -> None:
             prepare_model_inputs.subprocess,
             "run",
             return_value=denied,
-        ),
+        ) as run,
         mock.patch.object(prepare_model_inputs, "fetch_json") as fetch_json,
+        mock.patch.object(prepare_model_inputs.time, "sleep") as sleep,
         pytest.raises(
             prepare_model_inputs.PreparationError,
             match="directly from S3.*AccessDenied",
@@ -101,6 +102,42 @@ def test_s3_manifest_access_denial_has_no_http_fallback() -> None:
         )
 
     fetch_json.assert_not_called()
+    run.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_s3_manifest_retries_transient_failure() -> None:
+    source = prepare_model_inputs.ArtifactSource(
+        s3_bucket="sima-neat-artifacts-production",
+        aws_region="us-west-2",
+    )
+    transient_failure = mock.Mock(
+        returncode=1,
+        stdout=b"",
+        stderr=b"fatal error: An error occurred (SlowDown)",
+    )
+    success = mock.Mock(
+        returncode=0,
+        stdout=b'{"repo_id": "org/model"}',
+        stderr=b"",
+    )
+
+    with (
+        mock.patch.object(
+            prepare_model_inputs.subprocess,
+            "run",
+            side_effect=[transient_failure, success],
+        ) as run,
+        mock.patch.object(prepare_model_inputs.time, "sleep") as sleep,
+    ):
+        manifest = prepare_model_inputs.fetch_s3_json(
+            source,
+            source.object_uri("llima-safetensors/org/model/latest/manifest.json"),
+        )
+
+    assert manifest == {"repo_id": "org/model"}
+    assert run.call_count == 2
+    sleep.assert_called_once_with(5)
 
 
 def test_s3_object_is_streamed_and_hashed(tmp_path: Path) -> None:

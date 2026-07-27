@@ -320,17 +320,45 @@ def aws_s3_command(source: ArtifactSource, object_uri: str) -> list[str]:
     ]
 
 
+def is_non_retryable_s3_error(error: str | BaseException) -> bool:
+    message = str(error)
+    return any(
+        marker in message
+        for marker in (
+            "AccessDenied",
+            "ExpiredToken",
+            "InvalidAccessKeyId",
+            "InvalidClientTokenId",
+            "NoSuchBucket",
+            "NoSuchKey",
+            "Unable to locate credentials",
+            "(404)",
+        )
+    )
+
+
 def fetch_s3_json(source: ArtifactSource, object_uri: str) -> dict[str, Any]:
     command = aws_s3_command(source, object_uri)
-    try:
-        result = subprocess.run(command, check=False, capture_output=True)
-    except OSError as exc:
-        raise PreparationError(f"Unable to execute AWS CLI: {exc}") from exc
-    if result.returncode != 0:
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(command, check=False, capture_output=True)
+        except OSError as exc:
+            raise PreparationError(f"Unable to execute AWS CLI: {exc}") from exc
+        if result.returncode == 0:
+            break
         error = result.stderr.decode("utf-8", errors="replace").strip()
-        raise PreparationError(
-            f"Unable to read cache manifest {object_uri} directly from S3: {error}"
+        if is_non_retryable_s3_error(error) or attempt == DOWNLOAD_ATTEMPTS:
+            raise PreparationError(
+                f"Unable to read cache manifest {object_uri} directly from S3: {error}"
+            )
+        delay = attempt * 5
+        print(
+            f"Manifest download attempt {attempt} failed for {object_uri}; "
+            f"retrying in {delay}s: {error}",
+            file=sys.stderr,
+            flush=True,
         )
+        time.sleep(delay)
     try:
         parsed = json.loads(result.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -533,22 +561,6 @@ def stream_s3_object(
             f"Unable to download {cached_file.download_uri} directly from S3: {error}"
         )
     return byte_count, digest.hexdigest()
-
-
-def is_non_retryable_s3_error(exc: BaseException) -> bool:
-    message = str(exc)
-    return any(
-        marker in message
-        for marker in (
-            "AccessDenied",
-            "ExpiredToken",
-            "InvalidAccessKeyId",
-            "InvalidClientTokenId",
-            "NoSuchBucket",
-            "NoSuchKey",
-            "Unable to locate credentials",
-        )
-    )
 
 
 def download_file(
