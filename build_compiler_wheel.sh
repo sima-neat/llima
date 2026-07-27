@@ -25,7 +25,7 @@ mkdir -p "${OUTPUT_DIR}"
 find "${OUTPUT_DIR}" -maxdepth 1 -type f \
   \( -name 'sima_lmm-*.whl' -o -name 'sima_lmm-*.whl.sha256' \
      -o -name 'install_compiler.sh' -o -name 'manifest.json' \
-     -o -name 'metadata.json' \) \
+     -o -name 'metadata.json' -o -name 'metadata-wheel.json' \) \
   -delete
 
 echo "[compiler-wheel] Building the pure-Python LLiMa wheel"
@@ -192,6 +192,17 @@ SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
   --install-script 'bash ./install_compiler.sh' \
   --download-compatible-files-only
 
+SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
+  --name "gh:sima-neat/llima/compiler" \
+  --version "${WHEEL_VERSION}" \
+  --description "Pure-Python LLiMa compiler wheel" \
+  --install-script ':' \
+  --exclude '.sh' \
+  --exclude '.json' \
+  --exclude '.sha256' \
+  --download-compatible-files-only \
+  --variant wheel
+
 "${PYTHON_BIN}" - \
   "${OUTPUT_DIR}/metadata.json" \
   "${WHEEL_NAME}" \
@@ -228,6 +239,29 @@ metadata.setdefault("installation", {})["post-message"] = (
 metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 PY
 
+"${PYTHON_BIN}" - "${OUTPUT_DIR}/metadata-wheel.json" "${WHEEL_NAME}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metadata_path = Path(sys.argv[1])
+wheel_name = sys.argv[2]
+metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+if metadata.get("resources") != [wheel_name]:
+    raise SystemExit(
+        f"ERROR: {metadata_path} must contain only {wheel_name}; "
+        f"got {metadata.get('resources', [])!r}."
+    )
+
+metadata.setdefault("installation", {})["post-message"] = (
+    "[bold]LLiMa compiler wheel downloaded successfully.[/bold]\n"
+)
+metadata_path.write_text(
+    json.dumps(metadata, indent=4) + "\n", encoding="utf-8"
+)
+PY
+
 echo "[compiler-wheel] Built: ${WHEEL_PATH}"
 echo "[compiler-wheel] Installer: ${OUTPUT_DIR}/install_compiler.sh"
 echo "[compiler-wheel] Metadata: ${OUTPUT_DIR}/metadata.json"
+echo "[compiler-wheel] Download-only metadata: ${OUTPUT_DIR}/metadata-wheel.json"
