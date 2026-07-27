@@ -264,7 +264,7 @@ jobs:
             --aws-region "${AWS_REGION}" \
             --output-dir "${model_root}" \
             --provenance-output "${provenance}" \
-            --jobs 4
+            --jobs 8
           {
             echo "LLIMA_HF_MODELS_PATH=${model_root}"
             echo "LLIMA_MODEL_INPUT_PROVENANCE=${provenance}"
