@@ -10,6 +10,11 @@ from tests.compilation.helpers.paths import require_readable_path
 def pytest_addoption(parser):
     group = parser.getgroup("llima ONNX regression")
     group.addoption(
+        "--onnx-validation-mode",
+        choices=("compare", "candidate-only"),
+        default=os.environ.get("LLIMA_ONNX_VALIDATION_MODE", "compare"),
+    )
+    group.addoption(
         "--candidate-onnx-root",
         default=os.environ.get("LLIMA_CANDIDATE_ONNX_ROOT"),
     )
@@ -35,12 +40,19 @@ def _required_option(request, option: str, description: str) -> Path:
 
 
 @pytest.fixture(scope="session")
+def onnx_validation_mode(request) -> str:
+    return request.config.getoption("--onnx-validation-mode")
+
+
+@pytest.fixture(scope="session")
 def candidate_onnx_root(request) -> Path:
     return _required_option(request, "--candidate-onnx-root", "candidate ONNX root")
 
 
 @pytest.fixture(scope="session")
-def base_onnx_root(request) -> Path:
+def base_onnx_root(request, onnx_validation_mode: str) -> Path | None:
+    if onnx_validation_mode == "candidate-only":
+        return None
     return _required_option(request, "--base-onnx-root", "base ONNX root")
 
 
@@ -53,6 +65,8 @@ def candidate_onnx_manifest(request) -> dict:
 
 
 @pytest.fixture(scope="session")
-def base_onnx_manifest(request) -> dict:
+def base_onnx_manifest(request, onnx_validation_mode: str) -> dict | None:
+    if onnx_validation_mode == "candidate-only":
+        return None
     path = _required_option(request, "--base-onnx-manifest", "base ONNX manifest")
     return json.loads(path.read_text(encoding="utf-8"))

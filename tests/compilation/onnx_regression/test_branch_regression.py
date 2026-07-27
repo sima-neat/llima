@@ -90,6 +90,38 @@ def _run_onnx(path: Path, feeds: dict[str, np.ndarray]) -> list[np.ndarray]:
     return session.run([], feeds)
 
 
+def _validate_runtime_outputs(
+    case: OnnxRegressionCase,
+    signature: tuple,
+    outputs: list[np.ndarray],
+) -> None:
+    expected_outputs = signature[1]
+    assert len(outputs) == len(expected_outputs), (
+        f"ONNX output count differs from its graph interface for {case.id}: "
+        f"runtime={len(outputs)}, graph={len(expected_outputs)}"
+    )
+    for output, (name, elem_type, dimensions) in zip(
+        outputs, expected_outputs, strict=True
+    ):
+        expected_dtype = np.dtype(
+            onnx.helper.tensor_dtype_to_np_dtype(elem_type)
+        )
+        assert output.dtype == expected_dtype, (
+            f"ONNX runtime output {name} has dtype {output.dtype}; "
+            f"graph declares {expected_dtype}"
+        )
+        assert output.ndim == len(dimensions), (
+            f"ONNX runtime output {name} has rank {output.ndim}; "
+            f"graph declares rank {len(dimensions)}"
+        )
+        for actual, expected in zip(output.shape, dimensions, strict=True):
+            if isinstance(expected, int) and expected > 0:
+                assert actual == expected, (
+                    f"ONNX runtime output {name} has shape {output.shape}; "
+                    f"graph declares {dimensions}"
+                )
+
+
 def _case_path(root: Path, manifest: dict, case: OnnxRegressionCase) -> Path:
     manifest_case = manifest.get("cases", {}).get(case.id)
     if manifest_case is None:
@@ -109,17 +141,26 @@ def _report_regression(case: OnnxRegressionCase, message: str) -> None:
 @pytest.mark.parametrize("case", [_case_parameter(case) for case in ACTIVE_CASES])
 def test_branch_relative_onnx_regression(
     case: OnnxRegressionCase,
+    onnx_validation_mode: str,
     candidate_onnx_root: Path,
     candidate_onnx_manifest: dict,
-    base_onnx_root: Path,
-    base_onnx_manifest: dict,
+    base_onnx_root: Path | None,
+    base_onnx_manifest: dict | None,
 ):
     candidate_path = _case_path(
         candidate_onnx_root, candidate_onnx_manifest, case
     )
-    base_path = _case_path(base_onnx_root, base_onnx_manifest, case)
-
     candidate_signature = _validate_graph(candidate_path)
+    feeds = _make_inputs(case, candidate_signature)
+    candidate_outputs = _run_onnx(candidate_path, feeds)
+    _validate_runtime_outputs(case, candidate_signature, candidate_outputs)
+
+    if onnx_validation_mode == "candidate-only":
+        return
+
+    assert base_onnx_root is not None
+    assert base_onnx_manifest is not None
+    base_path = _case_path(base_onnx_root, base_onnx_manifest, case)
     base_signature = _validate_graph(base_path)
     if candidate_signature != base_signature:
         _report_regression(
@@ -129,9 +170,8 @@ def test_branch_relative_onnx_regression(
         )
         return
 
-    feeds = _make_inputs(case, base_signature)
-    candidate_outputs = _run_onnx(candidate_path, feeds)
     base_outputs = _run_onnx(base_path, feeds)
+    _validate_runtime_outputs(case, base_signature, base_outputs)
     if len(candidate_outputs) != len(base_outputs):
         _report_regression(
             case,
