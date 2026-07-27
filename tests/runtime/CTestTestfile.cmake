@@ -53,3 +53,14 @@ set_tests_properties(
         RESOURCE_LOCK dispatcher
         TIMEOUT 900
 )
+
+add_test(
+    runtime.tool_call_parser
+    "./sima_lmm_tool_call_parser_test"
+)
+set_tests_properties(
+    runtime.tool_call_parser
+    PROPERTIES
+        LABELS "devkit;runtime;unit"
+        TIMEOUT 30
+)

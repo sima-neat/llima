@@ -293,6 +293,8 @@ jobs:
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/sima_lmm_asr_transcription_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./share/sima-lmm/tests/runtime/pytest.ini" >/dev/null
         test -f dist/metadata.json
         test -f dist/debs/metadata.json
@@ -613,6 +615,7 @@ jobs:
           test -x "${test_dir}/sima_lmm_text_generation_test"
           test -x "${test_dir}/sima_lmm_vision_generation_test"
           test -x "${test_dir}/sima_lmm_asr_transcription_test"
+          test -x "${test_dir}/sima_lmm_tool_call_parser_test"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -623,6 +626,7 @@ jobs:
               "sima_lmm_text_generation_test",
               "sima_lmm_vision_generation_test",
               "sima_lmm_asr_transcription_test",
+              "sima_lmm_tool_call_parser_test",
           )
 
           for name in test_binaries:
