@@ -14,7 +14,7 @@ Generate golden VlmConfig JSON files for all supported models.
 
 Run this script once to create reference configs, and again whenever
 a new config field is intentionally added. The output files should be
-committed to the repo under tests/reference_configs/.
+committed to the repo under tests/compilation/configuration/references/.
 
 Usage:
     python scripts/generate_reference_configs.py --hf-models-path /path/to/huggingface
@@ -30,7 +30,13 @@ from transformers import AutoConfig
 
 from sima_lmm.config.vlm_config import VlmConfig, ModelFormat
 
-DEFAULT_OUTPUT_PATH = Path(__file__).parent.parent / "tests" / "reference_configs"
+DEFAULT_OUTPUT_PATH = (
+    Path(__file__).parent.parent
+    / "tests"
+    / "compilation"
+    / "configuration"
+    / "references"
+)
 
 _EXAMPLE_CONFIGS = [
     # (hf_model_folder,                                    golden_config,                          image_resolution)

@@ -9,7 +9,8 @@
 #
 # The active set contains checkpoints whose weights are required by the model,
 # compilation, and regression tests. Additional configuration-only inputs for
-# tests/test_vlm_config.py are in config-manifest.txt.
+# tests/compilation/configuration/test_config_regression.py are in
+# config-manifest.txt.
 #
 # Active regression set:
 
