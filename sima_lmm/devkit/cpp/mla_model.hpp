@@ -93,7 +93,7 @@ class MLAModelWithBuffer {
             std::vector<MLABufferSlice> ofms,
             bool zero_hidden_inputs = false
         );
-        ~MLAModelWithBuffer() {};
+        ~MLAModelWithBuffer();
 
         /*
          * Cold construction-time package query. This exists for the one
@@ -162,9 +162,16 @@ class MLAModelWithBuffer {
     private:
         void _debug_inouts(const std::string& name, std::map<uint8_t, MLABufferSlice>* fm_map_ptr);
         std::shared_ptr<MlaExecutionSession> _session;
-        std::size_t _model_idx = 0;
-        std::vector<MLABufferSlice> _ifms;
-        std::vector<MLABufferSlice> _ofms;
+        /*
+         * One stable cell replaces develop's parallel model-index/IFM/OFM
+         * fields. The session keeps only weak references, so package prebinding
+         * and adapter invalidation remain safe if wrappers move or die during
+         * construction. Keep that cache behind one opaque pointer-sized field:
+         * the new SONAME establishes this layout boundary, and later cache
+         * changes neither alter the public class nor expose a private cell type
+         * from the installed header.
+         */
+        std::shared_ptr<void> _binding;
         static inline bool _profile = false;
         static inline bool _print_inouts = false;
         static inline bool _save_inouts = false;

@@ -324,12 +324,15 @@ endforeach()
 # independently: that can compile one ABI while linking another.  A packaged
 # SDK supplies MlaKernelBackendConfig.cmake; source-tree development builds the
 # exact sibling Backend source pinned with this LLiMa candidate.
-find_package(MlaKernelBackend CONFIG QUIET)
+set(SIMA_LMM_MLA_KERNEL_BACKEND_API_VERSION "1.0.0")
 set(SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../processmla-kernel-direct/core/mla-kernel-backend"
     CACHE PATH "Pinned MlaKernelBackend source fallback")
 if(NOT TARGET SiMa::MlaKernelBackend AND
    EXISTS "${SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR}/CMakeLists.txt")
+    # A source checkout is an intentional coherent pair: prefer it over any
+    # installed package, even one with the same API version, so local reviews
+    # cannot compile the current LLiMa header against an older archive.
     if(NOT MLA_KERNEL_UAPI_DIR)
         set(_sima_lmm_kernel_uapi
             "${CMAKE_CURRENT_SOURCE_DIR}/../simaai-linux-mla-kernel-driver-v1/include/uapi")
@@ -347,6 +350,12 @@ if(NOT TARGET SiMa::MlaKernelBackend AND
         "${CMAKE_CURRENT_BINARY_DIR}/mla-kernel-backend")
 endif()
 if(NOT TARGET SiMa::MlaKernelBackend)
+    find_package(
+        MlaKernelBackend ${SIMA_LMM_MLA_KERNEL_BACKEND_API_VERSION}
+        EXACT CONFIG QUIET
+    )
+endif()
+if(NOT TARGET SiMa::MlaKernelBackend)
     message(FATAL_ERROR
         "MlaKernelBackend package/source target is required; refusing an "
         "independently discovered header/archive pair")
@@ -362,6 +371,12 @@ add_library(${TARGET_RUNTIME} SHARED ${SOURCES})
 set_target_properties(
     ${TARGET_RUNTIME}
     PROPERTIES
+    # Develop installed an unversioned C++ DSO even though public classes are
+    # used by value. The direct-kernel binding cell changes that layout, so
+    # establish an explicit ABI boundary and make every matched consumer record
+    # libsima_lmm_runtime.so.1 rather than silently loading the old DSO.
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 1
     INTERPROCEDURAL_OPTIMIZATION TRUE
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
@@ -465,11 +480,16 @@ if(SIMA_LMM_BUILD_DVT_DIRECT_TESTS)
         llima_direct_whisper
         tests/dvt/llima_direct_whisper.cpp
     )
+    add_executable(
+        llima_direct_vlm_benchmark
+        tests/dvt/llima_direct_vlm_benchmark.cpp
+    )
     foreach(_SIMA_LMM_DVT_TARGET IN ITEMS
             llima_direct_session_smoke
             llima_direct_resnet_depth2
             llima_direct_text_model
-            llima_direct_whisper)
+            llima_direct_whisper
+            llima_direct_vlm_benchmark)
         target_compile_features(${_SIMA_LMM_DVT_TARGET} PRIVATE cxx_std_20)
         target_compile_options(
             ${_SIMA_LMM_DVT_TARGET} PRIVATE
@@ -545,6 +565,7 @@ endif()
 install(
     TARGETS ${TARGET_RUNTIME}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
+    NAMELINK_COMPONENT dev
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT core
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT core
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
@@ -583,7 +604,9 @@ configure_file(
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfigVersion.cmake"
     VERSION ${SIMA_LMM_PLATFORM_VERSION}
-    COMPATIBILITY SameMajorVersion
+    # Public C++ objects are passed by value; candidate packages must be built
+    # against the exact installed header/runtime pair.
+    COMPATIBILITY ExactVersion
 )
 install(
     FILES

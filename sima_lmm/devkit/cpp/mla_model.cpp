@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -135,6 +136,26 @@ std::shared_ptr<MlaExecutionSession> require_default_session() {
 
 }  // namespace
 
+struct __attribute__((visibility("hidden"))) MlaBindingCell {
+    struct ParentGeneration {
+        const MLABuffer* parent = nullptr;
+        std::uint64_t allocation_cookie = 0;
+    };
+
+    std::size_t model_index = 0;
+    std::vector<MLABufferSlice> ifms;
+    std::vector<MLABufferSlice> ofms;
+    std::vector<ParentGeneration> parent_generations;
+    mla::BoundExecution exact_default;
+    std::uint64_t adapter_generation = 0;
+};
+
+static std::shared_ptr<MlaBindingCell> as_binding_cell(
+    const std::shared_ptr<void>& opaque
+) {
+    return std::static_pointer_cast<MlaBindingCell>(opaque);
+}
+
 /*
  * The complete LLiMa ownership and ordering domain.  There is one Backend,
  * hence one kernel context and one immutable Background priority.  Models,
@@ -143,18 +164,23 @@ std::shared_ptr<MlaExecutionSession> require_default_session() {
  * observable outside this object.
  */
 class MlaExecutionSession {
+  private:
+    struct BuiltBinding {
+        mla::BoundExecution execution;
+        std::vector<MlaBindingCell::ParentGeneration> parent_generations;
+    };
+
   public:
     struct SubmissionSnapshot {
-        mla::Model model;
-        mla::ExecutionBindings bindings;
-        std::filesystem::path model_path;
+        mla::BoundExecution execution;
+        std::uint32_t model_index = 0;
     };
 
     /* Non-owning inputs are consumed synchronously under both session locks. */
     struct AdapterUpdate {
         std::size_t index;
         const std::map<std::string, MLABufferSlice>* adapters;
-        const std::vector<MLABufferSlice>* default_ifms;
+        std::shared_ptr<MlaBindingCell> binding;
     };
 
     static std::shared_ptr<MlaExecutionSession> create() {
@@ -223,6 +249,18 @@ class MlaExecutionSession {
         return index;
     }
 
+    void register_binding_cell(
+        const std::shared_ptr<MlaBindingCell>& binding
+    ) {
+        if (!binding) {
+            throw std::invalid_argument("null MLA binding cell");
+        }
+        std::lock_guard lock(mutex_);
+        require_healthy_locked();
+        validate_index_locked(binding->model_index);
+        models_[binding->model_index].bindings.emplace_back(binding);
+    }
+
     void load_model(std::size_t index) {
         std::lock_guard execution_lock(execution_mutex_);
         std::lock_guard lock(mutex_);
@@ -284,9 +322,24 @@ class MlaExecutionSession {
              * than leave a partially resident package.
              */
             for (const std::size_t index : package->model_indices) {
+                /*
+                 * BoundExecution intentionally retains ModelState and every
+                 * dma-buf registration. Drop all live position-specific
+                 * handles before package/import teardown or the new fast path
+                 * would turn a scoped family release into permanent DMS0
+                 * residency.
+                 */
+                for (const auto& weak : models_[index].bindings) {
+                    if (auto binding = weak.lock()) {
+                        binding->exact_default = {};
+                        binding->parent_generations.clear();
+                        binding->adapter_generation = 0;
+                    }
+                }
                 models_[index].package.reset();
                 models_[index].package_ordinal = 0;
                 models_[index].active_adapters.clear();
+                ++models_[index].adapter_generation;
             }
         }
         packages_ = std::move(retained);
@@ -308,7 +361,25 @@ class MlaExecutionSession {
         import_cache_.clear();
         import_generation_.clear();
         import_use_epoch_ = 0;
-        zero_hidden_input_.reset();
+        /*
+         * The neutral LoRA allocation is shared by every zero-hidden family
+         * in this session, and retained binding cells keep its MLABuffer
+         * address as an allocation-generation witness.  Destroying it after a
+         * scoped release would leave those witnesses dangling even though
+         * their BoundExecutions correctly retain the underlying dma-buf.
+         * Keep the tiny owner object while any loaded family can still use it;
+         * a complete session/family teardown drops every witness first and may
+         * then release the allocation.
+         */
+        const bool neutral_binding_still_live = std::any_of(
+            models_.begin(), models_.end(),
+            [](const ModelEntry& entry) {
+                return entry.package && entry.zero_hidden_inputs;
+            }
+        );
+        if (!neutral_binding_still_live) {
+            zero_hidden_input_.reset();
+        }
     }
 
     std::size_t inspect_public_input_count(
@@ -338,123 +409,82 @@ class MlaExecutionSession {
     }
 
     SubmissionSnapshot prepare(
-        std::size_t index,
-        const std::vector<MLABufferSlice>& default_ifms,
-        const std::vector<MLABufferSlice>& default_ofms,
+        const std::shared_ptr<MlaBindingCell>& binding,
         std::map<uint8_t, MLABufferSlice>* ifm_overrides,
         std::map<uint8_t, MLABufferSlice>* ofm_overrides
     ) {
+        if (!binding) {
+            throw std::invalid_argument("null MLA binding cell");
+        }
         std::lock_guard lock(mutex_);
         require_healthy_locked();
-        validate_index_locked(index);
-        if (!models_[index].package) {
-            load_group_locked({index});
+        validate_index_locked(binding->model_index);
+        if (!models_[binding->model_index].package) {
+            load_group_locked({binding->model_index});
         }
 
-        ModelEntry& entry = models_[index];
-        SubmissionSnapshot snapshot;
-        snapshot.model =
-            entry.package->package.model(entry.package_ordinal);
-        snapshot.model_path = entry.path;
-        if (!snapshot.model.valid()) {
-            poison_locked("package returned an invalid model handle");
-            throw std::runtime_error("package returned an invalid model handle");
+        ModelEntry& entry = models_[binding->model_index];
+        const bool exact_request =
+            (!ifm_overrides || ifm_overrides->empty()) &&
+            (!ofm_overrides || ofm_overrides->empty());
+
+        if (exact_request &&
+            binding->adapter_generation == entry.adapter_generation &&
+            parent_generations_match_locked(*binding) &&
+            binding->exact_default.valid()) {
+            return {
+                .execution = binding->exact_default,
+                .model_index =
+                    static_cast<std::uint32_t>(binding->model_index),
+            };
         }
 
-        const auto& info =
-            entry.package->package.info(entry.package_ordinal);
-        if (default_ifms.size() > info.inputs.size()) {
-            /*
-             * Develop sized its Dispatcher vectors from the LLiMa defaults,
-             * so a version-skewed runtime could insert one surplus input and
-             * silently shift every later binding.  The direct path has the
-             * compiler-authoritative physical port table: reject surplus
-             * defaults before selecting by physical index.  Do not require
-             * equality because hidden RELOC ports may be supplied by the
-             * session adapter map or the explicit neutral binding below.
-             */
-            throw std::runtime_error(fmt::format(
-                "Model {} exposes {} physical inputs but LLiMa defines {}",
-                entry.path, info.inputs.size(), default_ifms.size()
-            ));
-        }
-        if (entry.zero_hidden_inputs && entry.active_adapters.empty()) {
-            std::uint64_t largest_hidden_extent = 0;
-            for (const mla::TensorPortInfo& port : info.inputs) {
-                if (!port.public_port) {
-                    largest_hidden_extent = std::max(
-                        largest_hidden_extent, port.byte_extent
-                    );
-                }
-            }
-            if (largest_hidden_extent != 0) {
-                ensure_zero_hidden_input_locked(largest_hidden_extent);
-            }
-        }
-        snapshot.bindings.inputs.reserve(info.inputs.size());
-        std::optional<MLABufferSlice> zero_hidden_slice;
-        for (std::size_t port_index = 0;
-             port_index < info.inputs.size(); ++port_index) {
-            const mla::TensorPortInfo& port = info.inputs[port_index];
-            const MLABufferSlice* selected = select_slice(
-                port_index, default_ifms, ifm_overrides
+        if (exact_request) {
+            BuiltBinding rebuilt = build_binding_locked(
+                *binding, nullptr, nullptr, &entry.active_adapters,
+                true
             );
-            if ((!selected || !selected->get_buf_ptr()) &&
-                !port.public_port) {
-                const auto adapter =
-                    entry.active_adapters.find(port.name);
-                if (adapter != entry.active_adapters.end()) {
-                    selected = &adapter->second;
-                }
-                if ((!selected || !selected->get_buf_ptr()) &&
-                    entry.zero_hidden_inputs) {
-                    /*
-                     * LoRA QMLA images expose A/B filters and their scales as
-                     * ordinary hidden read-only inputs. The neutral/base
-                     * model is therefore not an omitted binding: it is a
-                     * checked all-zero binding. Use one session-owned zero
-                     * allocation for every hidden port instead of allocating
-                     * thousands of per-layer zero tensors. The compiler
-                     * extent still controls each BufferView, so sharing does
-                     * not weaken bounds checking.
-                     */
-                    ensure_zero_hidden_input_locked(port.byte_extent);
-                    zero_hidden_slice.emplace(zero_hidden_input_.get());
-                    selected = &zero_hidden_slice.value();
-                }
+            binding->exact_default = std::move(rebuilt.execution);
+            binding->parent_generations =
+                std::move(rebuilt.parent_generations);
+            binding->adapter_generation = entry.adapter_generation;
+            if (binding->exact_default.valid()) {
+                return {
+                    .execution = binding->exact_default,
+                    .model_index =
+                        static_cast<std::uint32_t>(binding->model_index),
+                };
             }
-            snapshot.bindings.inputs.push_back(
-                import_view_locked(selected, default_ifms, port_index,
-                                   port.byte_extent, "input")
-            );
         }
 
-        if (info.outputs.size() != default_ofms.size()) {
-            throw std::runtime_error(fmt::format(
-                "Model {} requires {} outputs but LLiMa defines {}",
-                entry.path, info.outputs.size(), default_ofms.size()
-            ));
-        }
-        snapshot.bindings.outputs.reserve(info.outputs.size());
-        for (std::size_t port_index = 0;
-             port_index < info.outputs.size(); ++port_index) {
-            const MLABufferSlice* selected = select_slice(
-                port_index, default_ofms, ofm_overrides
-            );
-            snapshot.bindings.outputs.push_back(
-                import_view_locked(selected, default_ofms, port_index,
-                                   info.outputs[port_index].byte_extent,
-                                   "output")
+        /*
+         * Only genuinely changing physical ports take this path. Ordinary
+         * single-token LFM decode has one such embedding input and reuses 28
+         * exact handles. There is deliberately no mutable patch API: build a
+         * complete checked immutable object through the same Backend trust
+         * boundary as every other caller.
+         */
+        BuiltBinding dynamic = build_binding_locked(
+            *binding, ifm_overrides, ofm_overrides,
+            &entry.active_adapters, false
+        );
+        if (!dynamic.execution.valid()) {
+            throw std::logic_error(
+                "dynamic MLA binding did not produce an execution"
             );
         }
-        return snapshot;
+        return {
+            .execution = std::move(dynamic.execution),
+            .model_index =
+                static_cast<std::uint32_t>(binding->model_index),
+        };
     }
 
     std::unique_lock<std::mutex> acquire_execution_lock() {
         return std::unique_lock<std::mutex>(execution_mutex_);
     }
 
-    void run_snapshots(std::deque<SubmissionSnapshot> snapshots) {
+    void run_snapshots(std::vector<SubmissionSnapshot>& snapshots) {
         require_healthy();
         if (snapshots.empty()) {
             return;
@@ -481,16 +511,17 @@ class MlaExecutionSession {
                 mla::SubmitOptions options;
                 options.timeout_ms = kJobTimeoutMs;
                 mla::Status status = backend_->submit(
-                    snapshots[next].model,
-                    snapshots[next].bindings,
-                    options,
-                    &job
+                    snapshots[next].execution, options, &job
                 );
                 if (!status) {
+                    const std::uint32_t model_index =
+                        snapshots[next].model_index;
+                    const std::filesystem::path diagnostic_path =
+                        model_path(model_index);
                     first_failure = std::make_exception_ptr(
                         std::runtime_error(fmt::format(
                             "MLA segment submit {} failed: {} ({})",
-                            snapshots[next].model_path,
+                            diagnostic_path,
                             status.code,
                             status.message
                         ))
@@ -522,6 +553,15 @@ class MlaExecutionSession {
                 poison("ordered segment terminal failure");
             }
         }
+        /*
+         * All accepted jobs are terminal here, so no Backend slot needs the
+         * snapshot handles any longer. Clear logical contents but retain the
+         * vector's allocation for the next subsegment/token. The previous
+         * swap-and-reserve implementation performed one malloc/free pair per
+         * commit despite the segment object deliberately spanning multiple
+         * commits.
+         */
+        snapshots.clear();
         if (first_failure) {
             std::rethrow_exception(first_failure);
         }
@@ -541,7 +581,7 @@ class MlaExecutionSession {
         seen.reserve(updates.size());
         for (const AdapterUpdate& update : updates) {
             validate_index_locked(update.index);
-            if (!update.adapters || !update.default_ifms) {
+            if (!update.adapters || !update.binding) {
                 throw std::invalid_argument("null MLA adapter transaction input");
             }
             if (std::find(seen.begin(), seen.end(), update.index) != seen.end()) {
@@ -591,7 +631,7 @@ class MlaExecutionSession {
                     ));
                 }
                 (void)import_view_locked(
-                    &slice, *update.default_ifms, port->physical_index,
+                    &slice, update.binding->ifms, port->physical_index,
                     port->byte_extent, "adapter"
                 );
             }
@@ -601,8 +641,8 @@ class MlaExecutionSession {
                     continue;
                 }
                 const bool has_default =
-                    port.physical_index < update.default_ifms->size() &&
-                    (*update.default_ifms)[port.physical_index].get_buf_ptr();
+                    port.physical_index < update.binding->ifms.size() &&
+                    update.binding->ifms[port.physical_index].get_buf_ptr();
                 if (!has_default && !update.adapters->contains(port.name)) {
                     throw std::invalid_argument(fmt::format(
                         "Adapter set for {} omits hidden input {}",
@@ -612,12 +652,81 @@ class MlaExecutionSession {
             }
         }
 
-        /* Clear the old family and publish the new family under one mutex. */
+        /*
+         * Build every future exact template before publishing any adapter
+         * map. A late Backend extent/context failure must leave the complete
+         * old generation visible rather than switch half of the token
+         * positions. Already accepted snapshots retain their old immutable
+         * BoundExecution independently of these cells.
+         */
+        using AdapterMap = std::map<std::string, MLABufferSlice>;
+        /*
+         * Own every candidate map before touching published state. Copying a
+         * map/string can allocate and throw; doing that in the publication
+         * loop would expose a mixed adapter generation if allocation N failed.
+         * std::map keeps element addresses stable while later candidates are
+         * inserted, so the complete handle build below can safely reference
+         * these cold-path copies.
+         */
+        std::map<std::size_t, AdapterMap> candidate_maps;
         for (const std::size_t index : replaced_indices) {
-            models_[index].active_adapters.clear();
+            candidate_maps.try_emplace(index);
         }
         for (const AdapterUpdate& update : updates) {
-            models_[update.index].active_adapters = *update.adapters;
+            candidate_maps[update.index] = *update.adapters;
+        }
+
+        struct CandidateBinding {
+            std::shared_ptr<MlaBindingCell> binding;
+            BuiltBinding built;
+            std::uint64_t generation = 0;
+        };
+        std::vector<CandidateBinding> candidates;
+        for (const auto& [index, adapters] : candidate_maps) {
+            ModelEntry& entry = models_[index];
+            if (!entry.package) {
+                continue;
+            }
+            for (const auto& weak : entry.bindings) {
+                if (auto binding = weak.lock()) {
+                    candidates.push_back({
+                        .binding = binding,
+                        .built = build_binding_locked(
+                            *binding, nullptr, nullptr, &adapters, true
+                        ),
+                        .generation = entry.adapter_generation + 1,
+                    });
+                }
+            }
+        }
+
+        static_assert(
+            std::is_nothrow_move_assignable_v<mla::BoundExecution>
+        );
+        static_assert(noexcept(
+            std::declval<AdapterMap&>().swap(
+                std::declval<AdapterMap&>()
+            )
+        ));
+        /*
+         * Publication begins only after every allocating copy/import/bind has
+         * succeeded. From here through binding-cell publication every
+         * operation is no-throw: map/vector swap, shared_ptr move, and integer
+         * generation update. Therefore observers see either the complete old
+         * set or the complete new set, never a partially updated token.
+         */
+        for (auto& [index, adapters] : candidate_maps) {
+            models_[index].active_adapters.swap(adapters);
+            ++models_[index].adapter_generation;
+        }
+        for (CandidateBinding& candidate : candidates) {
+            candidate.binding->exact_default =
+                std::move(candidate.built.execution);
+            candidate.binding->parent_generations.swap(
+                candidate.built.parent_generations
+            );
+            candidate.binding->adapter_generation =
+                candidate.generation;
         }
     }
 
@@ -636,15 +745,43 @@ class MlaExecutionSession {
             }
             seen.push_back(index);
         }
+        const std::map<std::string, MLABufferSlice> empty_adapters;
+        struct CandidateBinding {
+            std::shared_ptr<MlaBindingCell> binding;
+            BuiltBinding built;
+            std::uint64_t generation = 0;
+        };
+        std::vector<CandidateBinding> candidates;
         for (const std::size_t index : indices) {
-            /*
-             * Accepted SubmissionSnapshots own their imported BufferViews and
-             * remain unchanged. Clearing this future-submission map restores
-             * the package's immutable/default hidden inputs; if the package
-             * has no valid base binding, the next prepare fails closed rather
-             * than executing zeroed adapter storage.
-             */
+            ModelEntry& entry = models_[index];
+            if (!entry.package) {
+                continue;
+            }
+            for (const auto& weak : entry.bindings) {
+                if (auto binding = weak.lock()) {
+                    candidates.push_back({
+                        .binding = binding,
+                        .built = build_binding_locked(
+                            *binding, nullptr, nullptr,
+                            &empty_adapters, true
+                        ),
+                        .generation = entry.adapter_generation + 1,
+                    });
+                }
+            }
+        }
+        for (const std::size_t index : indices) {
             models_[index].active_adapters.clear();
+            ++models_[index].adapter_generation;
+        }
+        for (CandidateBinding& candidate : candidates) {
+            candidate.binding->exact_default =
+                std::move(candidate.built.execution);
+            candidate.binding->parent_generations.swap(
+                candidate.built.parent_generations
+            );
+            candidate.binding->adapter_generation =
+                candidate.generation;
         }
     }
 
@@ -676,6 +813,8 @@ class MlaExecutionSession {
         std::size_t package_ordinal = 0;
         bool zero_hidden_inputs = false;
         std::map<std::string, MLABufferSlice> active_adapters;
+        std::uint64_t adapter_generation = 0;
+        std::vector<std::weak_ptr<MlaBindingCell>> bindings;
     };
 
     explicit MlaExecutionSession(
@@ -793,6 +932,251 @@ class MlaExecutionSession {
             );
         }
         packages_.push_back(std::move(hold));
+        /*
+         * Every position-specific MLAModelWithBuffer already exists before
+         * LanguageModel publishes its related package. Materialize all exact
+         * bindings here so decode never pays port traversal/import/validation
+         * for the 28 static jobs in an ordinary token. A public input with no
+         * default parent is intentionally left unbound and uses the one
+         * checked dynamic path when its caller supplies an override.
+         */
+        try {
+            prebind_all_locked();
+        } catch (...) {
+            poison_locked("eager MLA binding materialization failed");
+            throw;
+        }
+    }
+
+    bool parent_generations_match_locked(
+        const MlaBindingCell& binding
+    ) const {
+        if (binding.parent_generations.empty()) {
+            return false;
+        }
+        return std::all_of(
+            binding.parent_generations.begin(),
+            binding.parent_generations.end(),
+            [](const MlaBindingCell::ParentGeneration& generation) {
+                return generation.parent &&
+                       generation.allocation_cookie != 0 &&
+                       generation.parent->get_allocation_cookie() ==
+                           generation.allocation_cookie;
+            }
+        );
+    }
+
+    static MLABuffer* resolve_parent(
+        const MLABufferSlice* selected,
+        const std::vector<MLABufferSlice>& defaults,
+        std::size_t port_index
+    ) {
+        if (!selected) {
+            return nullptr;
+        }
+        MLABuffer* parent = selected->get_buf_ptr();
+        if (!parent && port_index < defaults.size()) {
+            parent = defaults[port_index].get_buf_ptr();
+        }
+        return parent;
+    }
+
+    static void record_parent_generation(
+        MLABuffer* parent,
+        std::vector<MlaBindingCell::ParentGeneration>* generations
+    ) {
+        if (!parent || !generations) {
+            return;
+        }
+        if (std::find_if(
+                generations->begin(), generations->end(),
+                [parent](
+                    const MlaBindingCell::ParentGeneration& candidate
+                ) {
+                    return candidate.parent == parent;
+                }
+            ) != generations->end()) {
+            return;
+        }
+        generations->push_back({
+            .parent = parent,
+            .allocation_cookie = parent->get_allocation_cookie(),
+        });
+    }
+
+    BuiltBinding build_binding_locked(
+        const MlaBindingCell& binding,
+        std::map<uint8_t, MLABufferSlice>* ifm_overrides,
+        std::map<uint8_t, MLABufferSlice>* ofm_overrides,
+        const std::map<std::string, MLABufferSlice>* adapters,
+        bool allow_incomplete
+    ) {
+        validate_index_locked(binding.model_index);
+        ModelEntry& entry = models_[binding.model_index];
+        if (!entry.package) {
+            throw std::logic_error("cannot bind an unloaded MLA model");
+        }
+
+        mla::Model model =
+            entry.package->package.model(entry.package_ordinal);
+        if (!model.valid()) {
+            poison_locked("package returned an invalid model handle");
+            throw std::runtime_error(
+                "package returned an invalid model handle"
+            );
+        }
+        const auto& info =
+            entry.package->package.info(entry.package_ordinal);
+        if (binding.ifms.size() > info.inputs.size()) {
+            /*
+             * Compiler physical order is the sole authority. Develop sized
+             * Dispatcher vectors from LLiMa defaults, which could silently
+             * shift later ports when a package changed cardinality.
+             */
+            throw std::runtime_error(fmt::format(
+                "Model {} exposes {} physical inputs but LLiMa defines {}",
+                entry.path, info.inputs.size(), binding.ifms.size()
+            ));
+        }
+        if (info.outputs.size() != binding.ofms.size()) {
+            throw std::runtime_error(fmt::format(
+                "Model {} requires {} outputs but LLiMa defines {}",
+                entry.path, info.outputs.size(), binding.ofms.size()
+            ));
+        }
+
+        BuiltBinding built;
+        std::vector<mla::BufferView> inputs;
+        std::vector<mla::BufferView> outputs;
+        inputs.reserve(info.inputs.size());
+        outputs.reserve(info.outputs.size());
+        std::optional<MLABufferSlice> zero_hidden_slice;
+
+        for (std::size_t port_index = 0;
+             port_index < info.inputs.size(); ++port_index) {
+            const mla::TensorPortInfo& port = info.inputs[port_index];
+            const MLABufferSlice* selected = select_slice(
+                port_index, binding.ifms, ifm_overrides
+            );
+            if ((!selected || !resolve_parent(
+                    selected, binding.ifms, port_index)) &&
+                !port.public_port && adapters) {
+                const auto adapter = adapters->find(port.name);
+                if (adapter != adapters->end()) {
+                    selected = &adapter->second;
+                }
+            }
+            if ((!selected || !resolve_parent(
+                    selected, binding.ifms, port_index)) &&
+                !port.public_port && entry.zero_hidden_inputs) {
+                /*
+                 * Hidden LoRA ports require a real neutral binding. The
+                 * prebind pass sizes this shared allocation before creating
+                 * any handle so a later larger port cannot invalidate earlier
+                 * exact templates.
+                 */
+                ensure_zero_hidden_input_locked(port.byte_extent);
+                zero_hidden_slice.emplace(zero_hidden_input_.get());
+                selected = &zero_hidden_slice.value();
+            }
+
+            MLABuffer* parent =
+                resolve_parent(selected, binding.ifms, port_index);
+            if (!parent) {
+                if (allow_incomplete && port.public_port) {
+                    return {};
+                }
+                throw std::invalid_argument(fmt::format(
+                    "MLA input {} has no allocated parent buffer",
+                    port_index
+                ));
+            }
+            inputs.push_back(import_view_locked(
+                selected, binding.ifms, port_index,
+                port.byte_extent, "input"
+            ));
+            record_parent_generation(
+                parent, &built.parent_generations
+            );
+        }
+
+        for (std::size_t port_index = 0;
+             port_index < info.outputs.size(); ++port_index) {
+            const MLABufferSlice* selected = select_slice(
+                port_index, binding.ofms, ofm_overrides
+            );
+            MLABuffer* parent =
+                resolve_parent(selected, binding.ofms, port_index);
+            if (!parent) {
+                if (allow_incomplete) {
+                    return {};
+                }
+                throw std::invalid_argument(fmt::format(
+                    "MLA output {} has no allocated parent buffer",
+                    port_index
+                ));
+            }
+            outputs.push_back(import_view_locked(
+                selected, binding.ofms, port_index,
+                info.outputs[port_index].byte_extent, "output"
+            ));
+            record_parent_generation(
+                parent, &built.parent_generations
+            );
+        }
+
+        mla::Status status =
+            backend_->bind(model, inputs, outputs, &built.execution);
+        if (!status) {
+            throw_status("Backend::bind", status);
+        }
+        return built;
+    }
+
+    void prebind_all_locked() {
+        std::uint64_t largest_zero_extent = 0;
+        for (const ModelEntry& entry : models_) {
+            if (!entry.package || !entry.zero_hidden_inputs) {
+                continue;
+            }
+            const auto& info =
+                entry.package->package.info(entry.package_ordinal);
+            for (const mla::TensorPortInfo& port : info.inputs) {
+                if (!port.public_port) {
+                    largest_zero_extent = std::max(
+                        largest_zero_extent, port.byte_extent
+                    );
+                }
+            }
+        }
+        if (largest_zero_extent != 0) {
+            ensure_zero_hidden_input_locked(largest_zero_extent);
+        }
+
+        for (ModelEntry& entry : models_) {
+            if (!entry.package) {
+                continue;
+            }
+            std::vector<std::weak_ptr<MlaBindingCell>> live;
+            live.reserve(entry.bindings.size());
+            for (const auto& weak : entry.bindings) {
+                auto binding = weak.lock();
+                if (!binding) {
+                    continue;
+                }
+                live.emplace_back(binding);
+                BuiltBinding built = build_binding_locked(
+                    *binding, nullptr, nullptr,
+                    &entry.active_adapters, true
+                );
+                binding->exact_default = std::move(built.execution);
+                binding->parent_generations =
+                    std::move(built.parent_generations);
+                binding->adapter_generation =
+                    entry.adapter_generation;
+            }
+            entry.bindings = std::move(live);
+        }
     }
 
     static const MLABufferSlice* select_slice(
@@ -1003,11 +1387,12 @@ struct MlaExecutionSegment::Impl {
         if (!session) {
             throw std::invalid_argument("MLA execution segment has no session");
         }
+        snapshots.reserve(64);
     }
 
     std::shared_ptr<MlaExecutionSession> session;
     std::unique_lock<std::mutex> execution_lock;
-    std::deque<MlaExecutionSession::SubmissionSnapshot> snapshots;
+    std::vector<MlaExecutionSession::SubmissionSnapshot> snapshots;
 };
 
 MlaExecutionSegment::MlaExecutionSegment() = default;
@@ -1047,10 +1432,8 @@ void MlaExecutionSegment::commit() {
      * failure abort() releases the lock only after run_snapshots() has drained
      * every authoritative terminal CQE and poisoned the session.
      */
-    std::deque<MlaExecutionSession::SubmissionSnapshot> snapshots;
-    snapshots.swap(_impl->snapshots);
     try {
-        _impl->session->run_snapshots(std::move(snapshots));
+        _impl->session->run_snapshots(_impl->snapshots);
     } catch (...) {
         abort();
         throw;
@@ -1125,17 +1508,24 @@ MLAModelWithBuffer::MLAModelWithBuffer(
     std::vector<MLABufferSlice> ifms,
     std::vector<MLABufferSlice> ofms,
     bool zero_hidden_inputs
-) : _session(std::move(session)),
-    _ifms(std::move(ifms)),
-    _ofms(std::move(ofms)) {
+) : _session(std::move(session)) {
     if (!_session) {
         throw std::invalid_argument("MLAModelWithBuffer requires a session");
     }
-    _model_idx = _session->register_model(model_path, zero_hidden_inputs);
+    const std::size_t model_index =
+        _session->register_model(model_path, zero_hidden_inputs);
+    auto binding = std::make_shared<MlaBindingCell>();
+    binding->model_index = model_index;
+    binding->ifms = std::move(ifms);
+    binding->ofms = std::move(ofms);
+    _binding = binding;
+    _session->register_binding_cell(binding);
 }
 
+MLAModelWithBuffer::~MLAModelWithBuffer() = default;
+
 void MLAModelWithBuffer::load() {
-    _session->load_model(_model_idx);
+    _session->load_model(as_binding_cell(_binding)->model_index);
 }
 
 void MLAModelWithBuffer::free() {
@@ -1171,7 +1561,7 @@ void MLAModelWithBuffer::add_to_segment(
             );
         }
         segment._impl->snapshots.push_back(_session->prepare(
-            _model_idx, _ifms, _ofms, ifm_map_ptr, ofm_map_ptr
+            as_binding_cell(_binding), ifm_map_ptr, ofm_map_ptr
         ));
     } catch (...) {
         /*
@@ -1209,9 +1599,10 @@ void MLAModelWithBuffer::set_reloc_set(
                 "one MLA adapter transaction cannot mix kernel contexts"
             );
         }
+        const auto binding = as_binding_cell(model->_binding);
         if (std::find(replaced_indices.begin(), replaced_indices.end(),
-                      model->_model_idx) == replaced_indices.end()) {
-            replaced_indices.push_back(model->_model_idx);
+                      binding->model_index) == replaced_indices.end()) {
+            replaced_indices.push_back(binding->model_index);
         }
     }
     std::vector<MlaExecutionSession::AdapterUpdate> session_updates;
@@ -1222,10 +1613,11 @@ void MLAModelWithBuffer::set_reloc_set(
                 "one MLA adapter transaction cannot mix kernel contexts"
             );
         }
+        const auto binding = as_binding_cell(update.model->_binding);
         session_updates.push_back({
-            .index = update.model->_model_idx,
+            .index = binding->model_index,
             .adapters = &update.buffers,
-            .default_ifms = &update.model->_ifms,
+            .binding = binding,
         });
     }
     _session->replace_adapter_set_locked(replaced_indices, session_updates);
@@ -1244,7 +1636,9 @@ void MLAModelWithBuffer::clear_reloc_set(
                 "one MLA adapter transaction cannot mix kernel contexts"
             );
         }
-        indices.push_back(model->_model_idx);
+        indices.push_back(
+            as_binding_cell(model->_binding)->model_index
+        );
     }
     _session->clear_adapter_set_locked(indices);
     if (after_clear) {
@@ -1289,9 +1683,12 @@ void MLAModelWithBuffer::_debug_inouts(
     const std::string& name,
     std::map<uint8_t, MLABufferSlice>* fm_map_ptr
 ) {
-    const auto model_path = _session->model_path(_model_idx);
+    const auto binding = as_binding_cell(_binding);
+    const auto model_path =
+        _session->model_path(binding->model_index);
     if (_print_inouts) {
-        auto& fms = (name == "ifm") ? _ifms : _ofms;
+        auto& fms =
+            (name == "ifm") ? binding->ifms : binding->ofms;
         std::ostringstream print_buffer;
         print_buffer << model_path << std::endl;
         for (uint32_t i = 0; i < fms.size(); ++i) {
@@ -1316,7 +1713,8 @@ void MLAModelWithBuffer::_debug_inouts(
     }
 
     if (_save_inouts) {
-        auto& fms = (name == "ifm") ? _ifms : _ofms;
+        auto& fms =
+            (name == "ifm") ? binding->ifms : binding->ofms;
         for (uint32_t i = 0; i < fms.size(); ++i) {
             std::filesystem::path directory = (
                 _save_inout_dir
