@@ -1,6 +1,6 @@
-name: Cache Hugging Face Safetensors
+name: Cache Hugging Face Model Inputs
 
-run-name: Cache Hugging Face safetensors (${{ inputs.vulcan_env || vars.VULCAN_ENV || 'production' }})
+run-name: Cache Hugging Face model inputs (${{ inputs.vulcan_env || vars.VULCAN_ENV || 'production' }})
 
 on:
   push:
@@ -22,10 +22,20 @@ on:
         type: string
         default: main
       manifest_path:
-        description: Path to the repo manifest used when repo_id is empty.
+        description: Path to the safetensors manifest used when repo_id is empty.
         required: false
         type: string
         default: tools/hf-safetensors/manifest.txt
+      config_manifest_path:
+        description: Path to the metadata-only manifest used when repo_id is empty.
+        required: false
+        type: string
+        default: tools/hf-safetensors/config-manifest.txt
+      gguf_manifest_path:
+        description: Path to the GGUF manifest used when repo_id is empty.
+        required: false
+        type: string
+        default: tools/hf-safetensors/gguf-manifest.txt
       huggingface_token:
         description: Optional Hugging Face token for guarded models. Prefer the HF_TOKEN secret when available.
         required: false
@@ -66,7 +76,7 @@ jobs:
       vulcan_env: ${{ inputs.vulcan_env || vars.VULCAN_ENV || 'production' }}
 
   cache-safetensors:
-    name: Cache latest safetensors
+    name: Cache model inputs
     needs: resolve-vulcan-config
     runs-on: ubuntu-latest
     environment: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
@@ -96,11 +106,13 @@ jobs:
           role-to-assume: ${{ needs.resolve-vulcan-config.outputs.artifact_publisher_role_arn }}
           role-session-name: llima-safetensors-${{ github.run_id }}
 
-      - name: Resolve and publish safetensors cache
+      - name: Resolve and publish model-input cache
         env:
           HF_REPO_ID: ${{ inputs.repo_id }}
           HF_REVISION: ${{ inputs.revision || 'main' }}
           HF_MANIFEST_PATH: ${{ inputs.manifest_path || 'tools/hf-safetensors/manifest.txt' }}
+          CONFIG_MANIFEST_PATH: ${{ inputs.config_manifest_path || 'tools/hf-safetensors/config-manifest.txt' }}
+          GGUF_MANIFEST_PATH: ${{ inputs.gguf_manifest_path || 'tools/hf-safetensors/gguf-manifest.txt' }}
           FORCE_SYNC: ${{ inputs.force }}
           DRY_RUN: ${{ github.event_name == 'push' && 'true' || inputs.dry_run }}
           RESOLVE_ONLY: ${{ github.event_name == 'push' && 'true' || 'false' }}
@@ -111,7 +123,11 @@ jobs:
             --bucket "${ARTIFACT_BUCKET}"
             --base-url "${ARTIFACT_BASE_URL}"
             --cache-root llima-safetensors
+            --config-cache-root llima-hf-config
+            --gguf-cache-root llima-gguf
             --manifest "${HF_MANIFEST_PATH}"
+            --config-manifest "${CONFIG_MANIFEST_PATH}"
+            --gguf-manifest "${GGUF_MANIFEST_PATH}"
           )
 
           if [[ -n "${HF_REPO_ID}" ]]; then

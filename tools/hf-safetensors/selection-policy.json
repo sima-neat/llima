@@ -1,0 +1,20 @@
+{
+  "config": [
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "image_processor_config.json"
+  ],
+  "safetensors": [
+    "model.safetensors",
+    "model-*.safetensors",
+    "model.safetensors.index.json"
+  ]
+}

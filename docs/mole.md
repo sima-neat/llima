@@ -16,7 +16,7 @@ MoLE requires the LLiMa runtime on the Modalix device. See [Neat Framework insta
 Install MoLE on your Modalix device using the `sima-cli`:
 
 ``` console
-host:~$ sima-cli install tools/mole
+host:~$ sima-cli neat install llima/mole
 ```
 
 This installs MoLE into a virtual environment at `~/sima-mole-venv`.

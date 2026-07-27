@@ -55,12 +55,13 @@ include(CMakePackageConfigHelpers)
 set(TARGET_BIND cpp_ext)
 set(TARGET_RUNTIME sima_lmm_runtime)
 option(SIMA_LMM_BUILD_PYTHON "Build the Python nanobind extension." ON)
+option(SIMA_LMM_BUILD_TESTS "Build DevKit runtime test targets." OFF)
 set(SYSROOT "" CACHE PATH "Optional target sysroot prefix")
 set(
     SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR
     "devkit"
     CACHE STRING
-    "Install destination for the cpp_ext Python extension. Wheels install relative to sima_lmm."
+    "Install destination for the cpp_ext Python extension."
 )
 option(SIMA_LMM_INSTALL_PYTHON_PACKAGE "Install the lean sima_lmm Python runtime package." OFF)
 set(
@@ -517,6 +518,11 @@ install(
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/SimaLMM
     COMPONENT dev
 )
+
+if(SIMA_LMM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests/runtime)
+endif()
 
 if(SIMA_LMM_INSTALL_PYTHON_PACKAGE)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sima_lmm_VERSION"

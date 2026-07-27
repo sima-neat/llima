@@ -1,0 +1,19 @@
+# Hugging Face GGUF cache manifest.
+#
+# Format:
+#   <repo_id> [revision [filename ...]]
+#
+# Without filenames, the downloader selects exactly one Q4_0 file, falling back
+# to Q8_0. Explicit filenames allow tests to request multiple quantizations from
+# one repository.
+
+unsloth/Llama-3.1-8B-Instruct-GGUF
+unsloth/Llama-3.2-1B-Instruct-GGUF
+unsloth/gemma-4-E2B-it-GGUF
+bartowski/Mistral-7B-Instruct-v0.3-GGUF
+bartowski/Phi-3.5-mini-instruct-GGUF
+Qwen/Qwen2.5-0.5B-Instruct-GGUF
+Qwen/Qwen3-0.6B-GGUF
+LiquidAI/LFM2-350M-GGUF
+unsloth/gemma-3-1b-it-GGUF main gemma-3-1b-it-BF16.gguf gemma-3-1b-it-Q8_0.gguf gemma-3-1b-it-Q4_0.gguf gemma-3-1b-it-Q4_1.gguf gemma-3-1b-it-Q6_K.gguf gemma-3-1b-it-Q5_K_S.gguf gemma-3-1b-it-Q4_K_S.gguf gemma-3-1b-it-Q3_K_S.gguf
+google/gemma-3-1b-it-qat-q4_0-gguf main gemma-3-1b-it-q4_0.gguf

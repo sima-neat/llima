@@ -672,8 +672,8 @@ class BaseModel(ABC):
         #     output = model._net.run(ifm_dict, node_callable=backend_runner.execute_node)
         #     print("output", output, flush=True)
         #     exit()
-
-        return model.execute(ifm_dict, use_jax=True)
+        #TODO Change to jax again after arm bug is fixed
+        return model.execute(ifm_dict, use_jax=False)
 
     def gen_files_from_model_list(
         self,
