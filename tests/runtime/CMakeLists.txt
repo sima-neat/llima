@@ -123,6 +123,7 @@ install(
         asr_transcription_test.cpp
         conftest.py
         dispatcher_lifecycle_test.cpp
+        pytest.ini
         runtime_test_utils.hpp
         test_cli_black_box.py
         test_http_black_box.py

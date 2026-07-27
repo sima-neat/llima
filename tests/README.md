@@ -175,7 +175,8 @@ without compiling an entire generative model. It is serial and high-memory.
 - `tests/compilation/conftest.py` resolves the prepared model-input directory.
 - `tests/compilation/helpers/` contains model-loading, path-validation, and
   output-comparison helpers.
-- `pytest.ini` declares compiler markers.
+- `tests/compilation/pytest.ini` declares compiler markers and isolates compiler
+  test discovery from the DevKit runtime suite.
 
 The workflow audits expected case counts and rejects unexpected skips. Update
 both the centralized matrix and the expected count in
@@ -190,7 +191,7 @@ Fast hermetic tests:
 
 ```bash
 python -P -m pytest \
-  -c pytest.ini \
+  -c tests/compilation/pytest.ini \
   tests/compilation/unit \
   -m compiler_unit \
   --strict-markers \
@@ -203,21 +204,21 @@ Cached-model groups:
 export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 python -P -m pytest \
-  -c pytest.ini \
+  -c tests/compilation/pytest.ini \
   tests/compilation/configuration \
   -m compiler_config \
   --strict-markers \
   -vv -ra
 
 python -P -m pytest \
-  -c pytest.ini \
+  -c tests/compilation/pytest.ini \
   tests/compilation/source_ingestion \
   -m compiler_source \
   --strict-markers \
   -vv -ra
 
 python -P -m pytest \
-  -c pytest.ini \
+  -c tests/compilation/pytest.ini \
   tests/compilation/graph_integration \
   -m "compiler_graph_integration and not high_memory" \
   --strict-markers \
@@ -315,6 +316,9 @@ Pytest validates the installed package and external interfaces:
 | OpenAI-compatible HTTP | Non-streaming response, SSE reconstruction, `/stop`, malformed-input recovery, and a successful request after interruption |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
 
+`tests/runtime/pytest.ini` is packaged with these tests and prevents compiler
+marker defaults from affecting runtime test selection.
+
 Speculative-decoding runtime coverage is intentionally deferred until a
 compiled target/draft model pair is published.
 
@@ -401,7 +405,10 @@ _work/runtime-test-venv/bin/python -m pip install --no-cache-dir \
   cd _work/runtime-tests
   share/sima-lmm/tests/runtime/run_with_cancellation_cleanup.sh \
     ../runtime-test-venv/bin/python \
-      -m pytest -q share/sima-lmm/tests/runtime
+      -m pytest \
+        -c share/sima-lmm/tests/runtime/pytest.ini \
+        -q \
+        share/sima-lmm/tests/runtime
 )
 ```
 
