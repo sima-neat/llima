@@ -211,6 +211,7 @@ jobs:
           rm -rf "${test_stage}"
           mkdir -p "${test_stage}"
           tar -C "${VULCAN_WORKSPACE}" -cf - \
+            pytest.ini \
             tests/__init__.py \
             tests/compilation |
             tar -C "${test_stage}" -xf -
@@ -223,7 +224,7 @@ jobs:
             cd "${test_stage}"
             unset PYTHONPATH
             python -P -m pytest \
-              -c tests/compilation/pytest.ini \
+              -c pytest.ini \
               tests/compilation/unit \
               -m compiler_unit \
               --strict-markers \
@@ -276,7 +277,7 @@ jobs:
             cd "${LLIMA_TEST_STAGE}"
             unset PYTHONPATH
             python -P -m pytest \
-              -c tests/compilation/pytest.ini \
+              -c pytest.ini \
               tests/compilation/configuration \
               -m compiler_config \
               --strict-markers \
@@ -310,7 +311,7 @@ jobs:
             cd "${LLIMA_TEST_STAGE}"
             unset PYTHONPATH
             python -P -m pytest \
-              -c tests/compilation/pytest.ini \
+              -c pytest.ini \
               tests/compilation/source_ingestion \
               -m compiler_source \
               --strict-markers \
@@ -439,7 +440,7 @@ jobs:
           fi
 
           pytest_args=(
-            -c tests/compilation/pytest.ini
+            -c pytest.ini
             tests/compilation/onnx_regression
             -m compiler_onnx_regression
             --strict-markers
@@ -496,7 +497,7 @@ jobs:
             cd "${LLIMA_TEST_STAGE}"
             unset PYTHONPATH
             python -P -m pytest \
-              -c tests/compilation/pytest.ini \
+              -c pytest.ini \
               tests/compilation/graph_integration \
               -m "compiler_graph_integration and not high_memory" \
               --strict-markers \
@@ -518,7 +519,7 @@ jobs:
             cd "${LLIMA_TEST_STAGE}"
             unset PYTHONPATH
             python -P -m pytest \
-              -c tests/compilation/pytest.ini \
+              -c pytest.ini \
               tests/compilation/graph_integration \
               -m "compiler_graph_integration and high_memory" \
               --strict-markers \
@@ -558,7 +559,7 @@ jobs:
             cd "${LLIMA_TEST_STAGE}"
             unset PYTHONPATH
             python -P -m pytest \
-              -c tests/compilation/pytest.ini \
+              -c pytest.ini \
               tests/compilation/e2e \
               -m compiler_e2e \
               --candidate-sha "${GITHUB_SHA}" \

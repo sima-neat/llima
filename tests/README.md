@@ -175,8 +175,9 @@ without compiling an entire generative model. It is serial and high-memory.
 - `tests/compilation/conftest.py` resolves the prepared model-input directory.
 - `tests/compilation/helpers/` contains model-loading, path-validation, and
   output-comparison helpers.
-- `tests/compilation/pytest.ini` declares compiler markers and isolates compiler
-  test discovery from the DevKit runtime suite.
+- The root `pytest.ini` declares compiler markers and makes the compiler
+  premerge suite the safe repository default. Its `testpaths` excludes the
+  DevKit runtime suite.
 
 The workflow audits expected case counts and rejects unexpected skips. Update
 both the centralized matrix and the expected count in
@@ -191,7 +192,7 @@ Fast hermetic tests:
 
 ```bash
 python -P -m pytest \
-  -c tests/compilation/pytest.ini \
+  -c pytest.ini \
   tests/compilation/unit \
   -m compiler_unit \
   --strict-markers \
@@ -204,21 +205,21 @@ Cached-model groups:
 export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 python -P -m pytest \
-  -c tests/compilation/pytest.ini \
+  -c pytest.ini \
   tests/compilation/configuration \
   -m compiler_config \
   --strict-markers \
   -vv -ra
 
 python -P -m pytest \
-  -c tests/compilation/pytest.ini \
+  -c pytest.ini \
   tests/compilation/source_ingestion \
   -m compiler_source \
   --strict-markers \
   -vv -ra
 
 python -P -m pytest \
-  -c tests/compilation/pytest.ini \
+  -c pytest.ini \
   tests/compilation/graph_integration \
   -m "compiler_graph_integration and not high_memory" \
   --strict-markers \
