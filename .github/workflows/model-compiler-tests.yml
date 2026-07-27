@@ -435,7 +435,8 @@ jobs:
                 --output-dir "${base_onnx_root}" \
                 --manifest-output "${base_onnx_manifest}" \
                 --expected-package-root "${base_package_root}" \
-                --revision "${base_revision}"
+                --revision "${base_revision}" \
+                --allow-informative-unavailable
           fi
 
           pytest_args=(

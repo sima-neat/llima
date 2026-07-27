@@ -123,6 +123,20 @@ vision, and speculative-decoding components. Every case:
 In compare mode, the test additionally generates and executes baseline ONNX,
 compares the runtime input/output interface, and compares numerical outputs.
 
+Each case has a regression mode in `tests/compilation/cases.py`:
+
+- `required`: candidate and baseline generation must succeed, and any interface
+  or numerical difference fails the test.
+- `informative`: candidate generation, checking, and execution must succeed. If
+  the baseline compiler does not support the model or component, the baseline
+  manifest records it as unavailable and the test emits a warning. When both
+  graphs are available, interface or numerical differences also emit warnings.
+- `disabled`: neither revision generates or executes the case.
+
+This allows a feature branch to validate newly added model support before that
+support exists in the published `develop` baseline. The case should change from
+`informative` to `required` once baseline support is available.
+
 ONNX payloads are generated during the workflow and deleted afterward. No
 reference ONNX files are stored in the repository or artifact cache.
 

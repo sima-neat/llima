@@ -122,13 +122,35 @@ def _validate_runtime_outputs(
                 )
 
 
-def _case_path(root: Path, manifest: dict, case: OnnxRegressionCase) -> Path:
+def _manifest_case(
+    manifest: dict,
+    case: OnnxRegressionCase,
+    source: str,
+) -> dict:
     manifest_case = manifest.get("cases", {}).get(case.id)
     if manifest_case is None:
-        raise KeyError(f"Generated ONNX manifest is missing required case {case.id}")
+        raise KeyError(
+            f"{source} ONNX manifest is missing required case {case.id}"
+        )
+    return manifest_case
+
+
+def _case_path(
+    root: Path,
+    manifest: dict,
+    case: OnnxRegressionCase,
+    source: str,
+) -> Path:
+    manifest_case = _manifest_case(manifest, case, source)
+    status = manifest_case.get("status", "available")
+    if status != "available":
+        raise RuntimeError(
+            f"{source} ONNX for {case.id} has unexpected status {status}: "
+            f"{manifest_case.get('reason', 'no reason recorded')}"
+        )
     return require_readable_path(
         root / manifest_case["onnx_path"],
-        f"generated ONNX for {case.id}",
+        f"{source} generated ONNX for {case.id}",
     )
 
 
@@ -148,7 +170,7 @@ def test_branch_relative_onnx_regression(
     base_onnx_manifest: dict | None,
 ):
     candidate_path = _case_path(
-        candidate_onnx_root, candidate_onnx_manifest, case
+        candidate_onnx_root, candidate_onnx_manifest, case, "candidate"
     )
     candidate_signature = _validate_graph(candidate_path)
     feeds = _make_inputs(case, candidate_signature)
@@ -160,7 +182,17 @@ def test_branch_relative_onnx_regression(
 
     assert base_onnx_root is not None
     assert base_onnx_manifest is not None
-    base_path = _case_path(base_onnx_root, base_onnx_manifest, case)
+    base_manifest_case = _manifest_case(base_onnx_manifest, case, "baseline")
+    if base_manifest_case.get("status", "available") == "unavailable":
+        _report_regression(
+            case,
+            "Baseline compiler could not generate this ONNX case: "
+            f"{base_manifest_case.get('reason', 'no reason recorded')}",
+        )
+        return
+    base_path = _case_path(
+        base_onnx_root, base_onnx_manifest, case, "baseline"
+    )
     base_signature = _validate_graph(base_path)
     if candidate_signature != base_signature:
         _report_regression(
