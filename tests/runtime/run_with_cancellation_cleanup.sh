@@ -37,7 +37,10 @@ on_exit() {
 }
 trap on_exit EXIT INT TERM
 
-setsid --wait "$@" &
+(
+  trap - INT
+  exec setsid --wait "$@"
+) &
 child_pid=$!
 
 set +e
