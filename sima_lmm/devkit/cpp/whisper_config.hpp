@@ -64,6 +64,19 @@ inline void from_json(const nlohmann::json& json, WhisperConfig& config) {
     config.language_codes = json.value(
         "language_codes", std::vector<std::string>{}
     );
+    /*
+     * The two arrays are one versioned lookup table. Older published packages
+     * omit both, while current develop emits both. Accept those two coherent
+     * states only: accepting a half-upgraded/mismatched pair defers the error
+     * until Whisper indexes one vector with an iterator from the other.
+     */
+    if (config.language_token_ids.size() != config.language_codes.size()) {
+        throw nlohmann::json::out_of_range::create(
+            401,
+            "Whisper language_token_ids and language_codes must have equal lengths",
+            &json
+        );
+    }
 }
 
 inline void to_json(nlohmann::json& json, const WhisperConfig& config) {

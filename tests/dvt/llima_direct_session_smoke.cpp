@@ -1,5 +1,6 @@
 #include "mla_buffer.hpp"
 #include "setup.hpp"
+#include "whisper_config.hpp"
 
 #include <array>
 #include <cstdint>
@@ -22,6 +23,25 @@
  * an authorized DVT; never execute it in the x86 build container.
  */
 int main() {
+    /* Older Whisper packages omit both language lookup arrays; current develop
+     * emits both. A half-upgraded pair must fail while loading metadata rather
+     * than indexing one table with an iterator derived from the other. */
+    simaai::llima::WhisperConfig whisper_config{};
+    whisper_config.language_token_ids = {50259};
+    whisper_config.language_codes = {"en"};
+    nlohmann::json malformed_whisper = whisper_config;
+    malformed_whisper.erase("language_codes");
+    bool rejected_mismatched_language_tables = false;
+    try {
+        (void)malformed_whisper.get<simaai::llima::WhisperConfig>();
+    } catch (const nlohmann::json::exception&) {
+        rejected_mismatched_language_tables = true;
+    }
+    if (!rejected_mismatched_language_tables) {
+        std::cerr << "mismatched Whisper language tables were accepted\n";
+        return 2;
+    }
+
     simaai::llima::MLABuffer padded(
         "layout", {2, 3}, "bfloat16", true
     );
@@ -34,7 +54,7 @@ int main() {
     // incorrectly returned six.
     if (second_row != 16) {
         std::cerr << "padded offset mismatch: " << second_row << "\n";
-        return 2;
+        return 3;
     }
 
     /*
@@ -51,7 +71,7 @@ int main() {
     padded.download(round_trip.data());
     if (source != round_trip) {
         std::cerr << "padded upload/download mismatch\n";
-        return 3;
+        return 4;
     }
     bool rejected_partial = false;
     try {
@@ -61,7 +81,7 @@ int main() {
     }
     if (!rejected_partial) {
         std::cerr << "partial padded upload was not rejected\n";
-        return 4;
+        return 5;
     }
     padded.free();
 
@@ -73,7 +93,7 @@ int main() {
     }
     if (!rejected_after_free) {
         std::cerr << "use-after-free buffer access was not rejected\n";
-        return 5;
+        return 6;
     }
 
     simaai::llima::connect(
@@ -84,6 +104,6 @@ int main() {
     std::cout
         << "LLIMA_DIRECT_SMOKE_PASS padded_row_offset="
         << second_row
-        << " padded_round_trip=BYTE_EXACT checked_rejections=2\n";
+        << " padded_round_trip=BYTE_EXACT checked_rejections=3\n";
     return 0;
 }

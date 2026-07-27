@@ -306,6 +306,8 @@ class MlaExecutionSession {
          * work.
          */
         import_cache_.clear();
+        import_generation_.clear();
+        import_use_epoch_ = 0;
         zero_hidden_input_.reset();
     }
 
@@ -361,6 +363,21 @@ class MlaExecutionSession {
 
         const auto& info =
             entry.package->package.info(entry.package_ordinal);
+        if (default_ifms.size() > info.inputs.size()) {
+            /*
+             * Develop sized its Dispatcher vectors from the LLiMa defaults,
+             * so a version-skewed runtime could insert one surplus input and
+             * silently shift every later binding.  The direct path has the
+             * compiler-authoritative physical port table: reject surplus
+             * defaults before selecting by physical index.  Do not require
+             * equality because hidden RELOC ports may be supplied by the
+             * session adapter map or the explicit neutral binding below.
+             */
+            throw std::runtime_error(fmt::format(
+                "Model {} exposes {} physical inputs but LLiMa defines {}",
+                entry.path, info.inputs.size(), default_ifms.size()
+            ));
+        }
         if (entry.zero_hidden_inputs && entry.active_adapters.empty()) {
             std::uint64_t largest_hidden_extent = 0;
             for (const mla::TensorPortInfo& port : info.inputs) {
@@ -697,7 +714,7 @@ class MlaExecutionSession {
          * this also keeps repeated package lifecycles at a flat DMS0 usage.
          */
         if (zero_hidden_input_) {
-            import_cache_.erase(zero_hidden_input_->get_allocation_cookie());
+            erase_import_locked(zero_hidden_input_->get_allocation_cookie());
         }
         auto replacement = std::make_unique<MLABuffer>(
             "__base_zero_hidden_input",
@@ -822,6 +839,20 @@ class MlaExecutionSession {
 
         const std::uint64_t offset =
             parent->get_buf_addr_offset(selected->get_buf_begins());
+        const std::uint64_t declared_extent =
+            parent->get_buf_len(selected->get_buf_shapes());
+        if (compiler_extent > declared_extent) {
+            /*
+             * A slice shape is an ownership boundary, not debug metadata.
+             * Develop passed this exact get_buf_len(shape) bound to Dispatcher;
+             * checking only the larger parent allocation in the direct path
+             * would let a short override expose adjacent rows to JOB_EXEC.
+             */
+            throw std::out_of_range(fmt::format(
+                "MLA {} {} compiler extent {} exceeds declared slice extent {}",
+                direction, port_index, compiler_extent, declared_extent
+            ));
+        }
         if (offset > parent->get_allocation_size() ||
             compiler_extent >
                 parent->get_allocation_size() - offset) {
@@ -833,6 +864,19 @@ class MlaExecutionSession {
         }
 
         const std::uint64_t cookie = parent->get_allocation_cookie();
+        /*
+         * MLABuffer::free()/allocate() gives the same logical buffer a new
+         * cookie. Develop discarded the old MLA-RT binding while patching the
+         * next run; a strong direct-cache entry would instead keep the prior
+         * dma-buf (and DMS0 allocation) alive forever. Replace that parent's
+         * previous generation before importing the new one.
+         */
+        if (const auto generation = import_generation_.find(parent);
+            generation != import_generation_.end() &&
+            generation->second != cookie) {
+            erase_import_locked(generation->second);
+        }
+
         auto imported = import_cache_.find(cookie);
         if (imported == import_cache_.end()) {
             const int fd = simaai_memory_export_dmabuf_fd(
@@ -855,12 +899,24 @@ class MlaExecutionSession {
                     status.code, status.message, saved_errno
                 ));
             }
-            imported =
-                import_cache_.emplace(cookie, std::move(buffer)).first;
+            ImportEntry entry;
+            entry.buffer = std::move(buffer);
+            entry.parent = parent;
+            entry.last_use = ++import_use_epoch_;
+            imported = import_cache_.emplace(cookie, std::move(entry)).first;
+            import_generation_[parent] = cookie;
+            trim_import_cache_locked();
+            /* trim_import_cache_locked() never selects the just-touched newest
+             * entry, but re-find it rather than retaining an iterator across a
+             * future unordered_map implementation change. */
+            imported = import_cache_.find(cookie);
+        } else {
+            imported->second.last_use = ++import_use_epoch_;
+            import_generation_[parent] = cookie;
         }
 
         mla::BufferView view =
-            imported->second.view(offset, compiler_extent);
+            imported->second.buffer.view(offset, compiler_extent);
         if (!view.valid()) {
             throw std::out_of_range(fmt::format(
                 "Backend rejected MLA {} {} BufferView",
@@ -868,6 +924,48 @@ class MlaExecutionSession {
             ));
         }
         return view;
+    }
+
+    struct ImportEntry {
+        mla::Buffer buffer;
+        const MLABuffer* parent = nullptr;
+        std::uint64_t last_use = 0;
+    };
+
+    void erase_import_locked(std::uint64_t cookie) {
+        const auto found = import_cache_.find(cookie);
+        if (found == import_cache_.end()) {
+            return;
+        }
+        const auto generation = import_generation_.find(found->second.parent);
+        if (generation != import_generation_.end() &&
+            generation->second == cookie) {
+            import_generation_.erase(generation);
+        }
+        import_cache_.erase(found);
+    }
+
+    void trim_import_cache_locked() {
+        /*
+         * Generation replacement handles the normal free/allocate cycle
+         * exactly. This small LRU is the final bound for callers that create
+         * and destroy ever-new MLABuffer objects without freeing a model
+         * family. Accepted SubmissionSnapshots retain their BufferViews, so an
+         * eviction cannot invalidate queued work; a later prepare simply
+         * reimports. 256 keeps normal LLM working sets resident while making
+         * pathological DMS0 retention finite. The scan is cold-path only and
+         * bounded, never part of CQE refill or kernel scheduling.
+         */
+        static constexpr std::size_t kMaxRetainedImports = 256;
+        while (import_cache_.size() > kMaxRetainedImports) {
+            const auto oldest = std::min_element(
+                import_cache_.begin(), import_cache_.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    return lhs.second.last_use < rhs.second.last_use;
+                }
+            );
+            erase_import_locked(oldest->first);
+        }
     }
 
     std::unique_ptr<mla::Backend> backend_;
@@ -883,7 +981,9 @@ class MlaExecutionSession {
     std::map<std::filesystem::path, std::size_t> path_to_index_;
     std::vector<ModelEntry> models_;
     std::vector<std::shared_ptr<PackageHold>> packages_;
-    std::unordered_map<std::uint64_t, mla::Buffer> import_cache_;
+    std::unordered_map<std::uint64_t, ImportEntry> import_cache_;
+    std::unordered_map<const MLABuffer*, std::uint64_t> import_generation_;
+    std::uint64_t import_use_epoch_ = 0;
     /*
      * One immutable neutral LoRA binding shared by all hidden port views in
      * this context. It is absent for non-LoRA models, preserving fail-closed
