@@ -50,3 +50,25 @@ def test_single_cache_model_when_grouping_is_disabled():
 
     assert not model._is_group_model
     assert model._cache_mask_size == 128
+
+
+def test_group_size_one_reuses_single_cache_model():
+    pipeline_cfg = PipelineConfig()
+    pipeline_cfg.set_max_num_tokens(2048)
+    pipeline_cfg.set_group_size(1)
+    pipeline_cfg.set_future_token_mask_size(128)
+    cfg = SimpleNamespace(
+        pipeline_cfg=pipeline_cfg,
+        lm_cfg=SimpleNamespace(speculative_decoding_cfg=None),
+    )
+
+    model = LanguageCacheModel(
+        cfg,
+        "group_cache",
+        num_tokens=1,
+        token_idx=127,
+        logit_softcapping=None,
+    )
+
+    assert not model._is_group_model
+    assert model._cache_mask_size == 128
