@@ -133,6 +133,17 @@ run_sudo() {
   exit 1
 }
 
+remove_stale_global_sima_lmm_pip_install() {
+  if ! command -v pip3 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if run_sudo pip3 show sima_lmm >/dev/null 2>&1; then
+    log "Removing stale global sima_lmm pip package before installing LLiMa DEBs."
+    run_sudo pip3 uninstall -y sima_lmm --break-system-packages
+  fi
+}
+
 stop_board_runtime_before_install() {
   if ! command -v systemctl >/dev/null 2>&1; then
     return 0
@@ -379,6 +390,7 @@ if [[ "${#removed_packages[@]}" -gt 0 ]]; then
 fi
 
 log "Installing bundled Internals and LLiMa packages."
+remove_stale_global_sima_lmm_pip_install
 stop_board_runtime_before_install
 run_sudo apt-get install -y --reinstall --allow-downgrades \
   -o Dpkg::Options::=--force-overwrite \
