@@ -1,6 +1,7 @@
 {
   "internals": {
-    "policy": "snap"
+    "branch": "codex-processmla-kernel-direct",
+    "spec": "latest"
   },
   "sdk": {
     "channel": "develop"
