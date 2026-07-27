@@ -93,32 +93,49 @@ The comparisons are exhaustive across the model tensors. Reference weights are
 shared across quantization variants where possible to avoid redundant loading;
 the validation coverage remains unchanged.
 
-### Run ONNX branch regression
+### Run ONNX generation and validation
 
 Location: `tests/compilation/onnx_regression/`  
 Marker: `compiler_onnx_regression`  
 Expected cases: 32
 
-Generates representative ONNX model components with both the baseline and
-candidate LLiMa compiler wheels. Both generations use the same cached source
-models.
+Generates representative ONNX model components with the candidate LLiMa
+compiler wheel. Feature branches also generate the same components with the
+latest published `develop` compiler wheel and compare the results.
 
-The baseline is selected as follows:
+The validation mode is selected as follows:
 
-- Feature branch push: latest published `develop` compiler wheel
-- `develop` push: latest published `main` compiler wheel
-- `main` push: compiler wheel from the previous `main` commit
-- Tag push: latest published `main` compiler wheel
+- Feature branch push, except `release*`: compare with the latest published
+  `develop` compiler wheel
+- `develop`, `main`, `release*`, and tag pushes: candidate-only validation with
+  no baseline artifact
 
 The matrix covers representative pre, cache, post, per-layer, convolution,
-vision, and speculative-decoding components. For each case, the test:
+vision, and speculative-decoding components. Every case:
 
-1. Generates baseline and candidate ONNX.
+1. Generates candidate ONNX.
 2. Runs `onnx.checker`.
-3. Compares the runtime input/output interface.
-4. Creates deterministic inputs.
-5. Executes both graphs with ONNX Runtime.
-6. Compares their numerical outputs.
+3. Creates deterministic inputs.
+4. Executes the candidate graph with ONNX Runtime.
+5. Validates runtime output count, dtype, rank, and fixed dimensions against
+   the graph interface.
+
+In compare mode, the test additionally generates and executes baseline ONNX,
+compares the runtime input/output interface, and compares numerical outputs.
+
+Each case has a regression mode in `tests/compilation/cases.py`:
+
+- `required`: candidate and baseline generation must succeed, and any interface
+  or numerical difference fails the test.
+- `informative`: candidate generation, checking, and execution must succeed. If
+  the baseline compiler does not support the model or component, the baseline
+  manifest records it as unavailable and the test emits a warning. When both
+  graphs are available, interface or numerical differences also emit warnings.
+- `disabled`: neither revision generates or executes the case.
+
+This allows a feature branch to validate newly added model support before that
+support exists in the published `develop` baseline. The case should change from
+`informative` to `required` once baseline support is available.
 
 ONNX payloads are generated during the workflow and deleted afterward. No
 reference ONNX files are stored in the repository or artifact cache.

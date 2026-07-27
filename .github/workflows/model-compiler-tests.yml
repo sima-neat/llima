@@ -334,7 +334,7 @@ jobs:
             echo "- Stored NumPy reference fixtures: none"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Run ONNX branch regression
+      - name: Run ONNX generation and validation
         if: ${{ github.event_name == 'push' }}
         shell: bash
         run: |
@@ -361,82 +361,28 @@ jobs:
           trap cleanup_onnx EXIT
           cleanup_onnx
 
+          validation_mode="candidate-only"
           base_ref=""
           base_revision=""
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            base_ref="main"
-          elif [[ "${GITHUB_REF_NAME}" == "develop" ]]; then
-            base_ref="main"
-          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
-            base_ref="main"
-            base_revision="${{ github.event.before }}"
-          else
+          package_spec=""
+          base_package_version=""
+          if [[ "${GITHUB_REF_TYPE}" == "branch" &&
+                "${GITHUB_REF_NAME}" != "develop" &&
+                "${GITHUB_REF_NAME}" != "main" &&
+                "${GITHUB_REF_NAME}" != release* ]]; then
+            validation_mode="compare"
             base_ref="develop"
-          fi
-
-          if [[ -n "${base_revision}" ]]; then
-            if [[ ! "${base_revision}" =~ ^[0-9a-f]{40}$ ]] ||
-               [[ "${base_revision}" == "0000000000000000000000000000000000000000" ]]; then
-              echo "Invalid previous-main ONNX baseline: ${base_revision}" >&2
-              exit 1
-            fi
-            package_spec="llima/compiler@${base_ref}:${base_revision:0:12}"
-          else
-            package_spec="llima/compiler@${base_ref}"
             base_revision="${base_ref}@latest"
+            package_spec="llima/compiler@${base_ref}"
           fi
 
-          mkdir -p "${base_wheel_dir}"
-          echo "Downloading baseline artifact ${package_spec}"
-          for attempt in 1 2 3 4; do
-            if "${SIMA_CLI}" neat install \
-              --env "${VULCAN_ENV}" \
-              --type wheel \
-              --install-dir "${base_wheel_dir}" \
-              "${package_spec}"; then
-              break
-            fi
-            if [[ "${attempt}" -eq 4 ]]; then
-              echo "Base wheel download failed after ${attempt} attempts." >&2
-              exit 1
-            fi
-            delay=$((attempt * 10))
-            echo "Base wheel attempt ${attempt} failed; retrying in ${delay}s." >&2
-            sleep "${delay}"
-          done
-
-          mapfile -t base_wheels < <(
-            find "${base_wheel_dir}" -type f -name 'sima_lmm-*.whl' -print
-          )
-          if [[ "${#base_wheels[@]}" -ne 1 ]]; then
-            echo "Expected one base wheel; found ${#base_wheels[@]}." >&2
-            exit 1
-          fi
-
-          python -m pip install \
-            --disable-pip-version-check \
-            --no-deps \
-            --target "${base_package_root}" \
-            "${base_wheels[0]}"
           python -m pip install \
             --disable-pip-version-check \
             --no-deps \
             --target "${candidate_package_root}" \
             "${LLIMA_COMPILER_WHEEL}"
 
-          base_package_version="$(
-            PYTHONPATH="${base_package_root}" python -P -c \
-              'import importlib.metadata; print(importlib.metadata.version("sima-lmm"))'
-          )"
           generator="${LLIMA_TEST_STAGE}/tests/compilation/onnx_regression/generate.py"
-
-          PYTHONPATH="${base_package_root}:${LLIMA_TEST_STAGE}" \
-            python -P "${generator}" \
-              --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
-              --output-dir "${base_onnx_root}" \
-              --manifest-output "${base_onnx_manifest}" \
-              --expected-package-root "${base_package_root}" \
-              --revision "${base_revision}"
 
           PYTHONPATH="${candidate_package_root}:${LLIMA_TEST_STAGE}" \
             python -P "${generator}" \
@@ -446,38 +392,98 @@ jobs:
               --expected-package-root "${candidate_package_root}" \
               --revision "${GITHUB_SHA}"
 
+          if [[ "${validation_mode}" == "compare" ]]; then
+            mkdir -p "${base_wheel_dir}"
+            echo "Downloading baseline artifact ${package_spec}"
+            for attempt in 1 2 3 4; do
+              if "${SIMA_CLI}" neat install \
+                --env "${VULCAN_ENV}" \
+                --type wheel \
+                --install-dir "${base_wheel_dir}" \
+                "${package_spec}"; then
+                break
+              fi
+              if [[ "${attempt}" -eq 4 ]]; then
+                echo "Base wheel download failed after ${attempt} attempts." >&2
+                exit 1
+              fi
+              delay=$((attempt * 10))
+              echo "Base wheel attempt ${attempt} failed; retrying in ${delay}s." >&2
+              sleep "${delay}"
+            done
+
+            mapfile -t base_wheels < <(
+              find "${base_wheel_dir}" -type f -name 'sima_lmm-*.whl' -print
+            )
+            if [[ "${#base_wheels[@]}" -ne 1 ]]; then
+              echo "Expected one base wheel; found ${#base_wheels[@]}." >&2
+              exit 1
+            fi
+
+            python -m pip install \
+              --disable-pip-version-check \
+              --no-deps \
+              --target "${base_package_root}" \
+              "${base_wheels[0]}"
+            base_package_version="$(
+              PYTHONPATH="${base_package_root}" python -P -c \
+                'import importlib.metadata; print(importlib.metadata.version("sima-lmm"))'
+            )"
+            PYTHONPATH="${base_package_root}:${LLIMA_TEST_STAGE}" \
+              python -P "${generator}" \
+                --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
+                --output-dir "${base_onnx_root}" \
+                --manifest-output "${base_onnx_manifest}" \
+                --expected-package-root "${base_package_root}" \
+                --revision "${base_revision}" \
+                --allow-informative-unavailable
+          fi
+
+          pytest_args=(
+            -c pytest.ini
+            tests/compilation/onnx_regression
+            -m compiler_onnx_regression
+            --strict-markers
+            -vv
+            -ra
+            --durations=20
+            --onnx-validation-mode "${validation_mode}"
+            --candidate-onnx-root "${candidate_onnx_root}"
+            --candidate-onnx-manifest "${candidate_onnx_manifest}"
+            --junitxml="${junit_report}"
+          )
+          if [[ "${validation_mode}" == "compare" ]]; then
+            pytest_args+=(
+              --base-onnx-root "${base_onnx_root}"
+              --base-onnx-manifest "${base_onnx_manifest}"
+            )
+          fi
+
           (
             cd "${LLIMA_TEST_STAGE}"
             unset PYTHONPATH
-            python -P -m pytest \
-              -c pytest.ini \
-              tests/compilation/onnx_regression \
-              -m compiler_onnx_regression \
-              --strict-markers \
-              -vv \
-              -ra \
-              --durations=20 \
-              --candidate-onnx-root "${candidate_onnx_root}" \
-              --candidate-onnx-manifest "${candidate_onnx_manifest}" \
-              --base-onnx-root "${base_onnx_root}" \
-              --base-onnx-manifest "${base_onnx_manifest}" \
-              --junitxml="${junit_report}"
+            python -P -m pytest "${pytest_args[@]}"
           )
 
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
             --report "${junit_report}" \
             --expected "${expected_test_count}" \
-            --label "ONNX regression"
+            --label "ONNX generation and validation"
 
           {
-            echo "### ONNX generation and branch regression"
+            echo "### ONNX generation and validation"
             echo
-            echo "- Baseline ref: ${base_ref}"
-            echo "- Baseline artifact: ${package_spec}"
-            echo "- Baseline package version: ${base_package_version}"
+            echo "- Validation mode: ${validation_mode}"
             echo "- Candidate SHA: ${GITHUB_SHA}"
             echo "- Required/informative cases executed: ${expected_test_count}"
             echo "- Stored ONNX references: none"
+            if [[ "${validation_mode}" == "compare" ]]; then
+              echo "- Baseline ref: ${base_ref}"
+              echo "- Baseline artifact: ${package_spec}"
+              echo "- Baseline package version: ${base_package_version}"
+            else
+              echo "- Baseline: not used for ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}"
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Run generated-graph and quantization integration

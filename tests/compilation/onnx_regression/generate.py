@@ -171,8 +171,28 @@ def _record_model(
     manifest["cases"][case.id] = {
         "component": case.component,
         "mode": case.mode,
+        "status": "available",
         "onnx_path": str(onnx_path.relative_to(output_dir.resolve())),
     }
+
+
+def _record_unavailable(
+    manifest: dict,
+    cases: list[OnnxRegressionCase],
+    error: Exception,
+) -> None:
+    reason = f"{type(error).__name__}: {error}"
+    for case in cases:
+        manifest["cases"][case.id] = {
+            "component": case.component,
+            "mode": case.mode,
+            "status": "unavailable",
+            "reason": reason,
+        }
+        print(
+            f"Informative baseline ONNX unavailable for {case.id}: {reason}",
+            flush=True,
+        )
 
 
 def _generate_standard_cases(
@@ -180,6 +200,7 @@ def _generate_standard_cases(
     model_inputs_path: Path,
     output_dir: Path,
     manifest: dict,
+    allow_informative_unavailable: bool,
 ) -> None:
     grouped: dict[tuple, list[OnnxRegressionCase]] = defaultdict(list)
     for case in cases:
@@ -189,21 +210,38 @@ def _generate_standard_cases(
         grouped.items()
     ):
         model_output = output_dir / f"standard-{group_index}"
-        vlm_model = load_hf_model(
-            model_folder,
-            model_output,
-            model_inputs_path,
-            image_resolution=image_resolution,
-        )
-        for case in group_cases:
-            model, precision = _standard_model(case, vlm_model)
-            model.gen_files(
-                FileGenMode.SOURCE_TO_ONNX,
-                layer_cfg={"precision": precision},
-                log_level=logging.WARNING,
-                resume=False,
+        try:
+            vlm_model = load_hf_model(
+                model_folder,
+                model_output,
+                model_inputs_path,
+                image_resolution=image_resolution,
             )
-            _record_model(manifest, case, model, output_dir)
+        except Exception as error:
+            if not allow_informative_unavailable or any(
+                case.mode != "informative" for case in group_cases
+            ):
+                raise
+            _record_unavailable(manifest, group_cases, error)
+            continue
+
+        for case in group_cases:
+            try:
+                model, precision = _standard_model(case, vlm_model)
+                model.gen_files(
+                    FileGenMode.SOURCE_TO_ONNX,
+                    layer_cfg={"precision": precision},
+                    log_level=logging.WARNING,
+                    resume=False,
+                )
+                _record_model(manifest, case, model, output_dir)
+            except Exception as error:
+                if (
+                    not allow_informative_unavailable
+                    or case.mode != "informative"
+                ):
+                    raise
+                _record_unavailable(manifest, [case], error)
         del vlm_model
         gc.collect()
 
@@ -213,6 +251,7 @@ def _generate_speculative_cases(
     model_inputs_path: Path,
     output_dir: Path,
     manifest: dict,
+    allow_informative_unavailable: bool,
 ) -> None:
     grouped: dict[tuple[str, str], list[OnnxRegressionCase]] = defaultdict(list)
     for case in cases:
@@ -223,22 +262,39 @@ def _generate_speculative_cases(
         grouped.items()
     ):
         model_output = output_dir / f"speculative-{group_index}"
-        draft_model = load_speculative_draft_model(
-            target_folder,
-            draft_folder,
-            model_output,
-            model_inputs_path,
-        )
-        for case in group_cases:
-            model, gen_config = _speculative_model(case, draft_model)
-            draft_model.gen_files(
-                FileGenMode.SOURCE_TO_ONNX,
-                gen_config=gen_config,
-                num_processes=1,
-                log_level=logging.WARNING,
-                resume=False,
+        try:
+            draft_model = load_speculative_draft_model(
+                target_folder,
+                draft_folder,
+                model_output,
+                model_inputs_path,
             )
-            _record_model(manifest, case, model, output_dir)
+        except Exception as error:
+            if not allow_informative_unavailable or any(
+                case.mode != "informative" for case in group_cases
+            ):
+                raise
+            _record_unavailable(manifest, group_cases, error)
+            continue
+
+        for case in group_cases:
+            try:
+                model, gen_config = _speculative_model(case, draft_model)
+                draft_model.gen_files(
+                    FileGenMode.SOURCE_TO_ONNX,
+                    gen_config=gen_config,
+                    num_processes=1,
+                    log_level=logging.WARNING,
+                    resume=False,
+                )
+                _record_model(manifest, case, model, output_dir)
+            except Exception as error:
+                if (
+                    not allow_informative_unavailable
+                    or case.mode != "informative"
+                ):
+                    raise
+                _record_unavailable(manifest, [case], error)
         del draft_model
         gc.collect()
 
@@ -250,6 +306,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest-output", type=Path, required=True)
     parser.add_argument("--expected-package-root", type=Path, required=True)
     parser.add_argument("--revision", required=True)
+    parser.add_argument("--allow-informative-unavailable", action="store_true")
     return parser.parse_args()
 
 
@@ -270,6 +327,7 @@ def main() -> None:
         "revision": args.revision,
         "package_version": importlib.metadata.version("sima-lmm"),
         "package_path": str(module_path),
+        "allow_informative_unavailable": args.allow_informative_unavailable,
         "cases": {},
     }
     print(
@@ -285,10 +343,18 @@ def main() -> None:
         case for case in enabled_cases if case.target_model_folder is not None
     ]
     _generate_standard_cases(
-        standard_cases, args.model_inputs_path, args.output_dir, manifest
+        standard_cases,
+        args.model_inputs_path,
+        args.output_dir,
+        manifest,
+        args.allow_informative_unavailable,
     )
     _generate_speculative_cases(
-        speculative_cases, args.model_inputs_path, args.output_dir, manifest
+        speculative_cases,
+        args.model_inputs_path,
+        args.output_dir,
+        manifest,
+        args.allow_informative_unavailable,
     )
 
     expected_ids = {case.id for case in enabled_cases}
