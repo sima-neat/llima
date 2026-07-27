@@ -15,9 +15,11 @@ VisionLanguageModel::VisionLanguageModel(
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
 {
     _tool_call_format = tool_call_format_for_model(_cfg.model_type);
-    _text_streamer.set_preserved_token_ids(
-        resolve_tool_call_special_tokens(_tool_call_format, *_vlm_helper.get_tokenizer())
-    );
+    if (auto* tokenizer = _vlm_helper.get_tokenizer()) {
+        _text_streamer.set_preserved_token_ids(
+            resolve_tool_call_special_tokens(_tool_call_format, *tokenizer)
+        );
+    }
     if (_cfg.support_image()) {
         _vision_model_ptr = std::make_unique<VisionModel>(model_path);
     }
