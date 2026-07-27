@@ -20,51 +20,47 @@
 namespace simaai {
 namespace llima {
 
-
 struct ZMQRequestMetadata {
-    std::string type;
-    std::string tensor_dtype;
-    std::vector<size_t> tensor_shape;
-    std::optional<uint16_t> max_num_tokens;
-    std::optional<std::set<uint32_t>> stop_token_ids;
+  std::string type;
+  std::string tensor_dtype;
+  std::vector<size_t> tensor_shape;
+  std::optional<uint16_t> max_num_tokens;
+  std::optional<std::set<uint32_t>> stop_token_ids;
 
-    MSGPACK_DEFINE_MAP(type, tensor_dtype, tensor_shape, max_num_tokens, stop_token_ids);
+  MSGPACK_DEFINE_MAP(type, tensor_dtype, tensor_shape, max_num_tokens, stop_token_ids);
 };
-
 
 struct ZMQResponseMetadata {
-    std::string tensor_dtype;
-    std::vector<size_t> tensor_shape;
-    size_t infer_time_ns;
+  std::string tensor_dtype;
+  std::vector<size_t> tensor_shape;
+  size_t infer_time_ns;
 
-    MSGPACK_DEFINE_MAP(tensor_dtype, tensor_shape, infer_time_ns);
+  MSGPACK_DEFINE_MAP(tensor_dtype, tensor_shape, infer_time_ns);
 };
-
 
 class EXPORT ZMQServer {
-    public:
-        ZMQServer(const std::filesystem::path& model_path, uint32_t port);
-        ~ZMQServer();
+public:
+  ZMQServer(const std::filesystem::path& model_path, uint32_t port);
+  ~ZMQServer();
 
-        void run();
-        void stop();
+  void run();
+  void stop();
 
-    private:
-        uint32_t _port;
-        zmq::context_t _zmq_ctx;
-        zmq::socket_t _zmq_socket;
+private:
+  uint32_t _port;
+  zmq::context_t _zmq_ctx;
+  zmq::socket_t _zmq_socket;
 
-        std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
+  std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
 
-        std::shared_ptr<spdlog::logger> _logger;
-        std::atomic<bool> _is_running;
+  std::shared_ptr<spdlog::logger> _logger;
+  std::atomic<bool> _is_running;
 
-        inline static ZMQServer* _singleton_ptr = nullptr;
-        inline static struct sigaction _old_sigint_action = {};
+  inline static ZMQServer* _singleton_ptr = nullptr;
+  inline static struct sigaction _old_sigint_action = {};
 };
 
-}
-}
-
+} // namespace llima
+} // namespace simaai
 
 #endif
