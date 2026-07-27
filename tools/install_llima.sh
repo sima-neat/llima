@@ -3,12 +3,110 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 INSTALL_MANIFEST="${LLIMA_INSTALL_MANIFEST:-llima-install-manifest.txt}"
+LLIMA_PACKAGE_MANIFEST="${LLIMA_PACKAGE_MANIFEST:-resolved-deps-manifest.json}"
+LLIMA_BUILDINFO_FILE="${LLIMA_BUILDINFO_FILE:-/etc/buildinfo}"
+ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
+LLIMA_INSTALLER_SKIP_PLATFORM_CHECK="${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK:-OFF}"
 SUDO_PASSWORD="${SUDO_PASSWORD:-${DEVKIT_PASSWORD:-}}"
 DEFAULT_SUDO_PASSWORD="${DEFAULT_SUDO_PASSWORD:-edgeai}"
 LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD="${LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD:-ON}"
 
 log() {
   printf '[install_llima] %s\n' "$*"
+}
+
+resolve_package_manifest_path() {
+  if [[ "${LLIMA_PACKAGE_MANIFEST}" == /* ]]; then
+    printf '%s\n' "${LLIMA_PACKAGE_MANIFEST}"
+    return 0
+  fi
+  printf '%s\n' "${SCRIPT_DIR}/${LLIMA_PACKAGE_MANIFEST}"
+}
+
+read_manifest_platform_version() {
+  local manifest_path="$1"
+  python3 - "${manifest_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+try:
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    raise SystemExit(f"missing package manifest: {manifest_path}")
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"invalid package manifest JSON: {manifest_path}: {exc}")
+
+version = str(data.get("platform-version", "")).strip()
+if not version:
+    raise SystemExit(f"missing or empty platform-version in package manifest: {manifest_path}")
+print(version.split("+", 1)[0])
+PY
+}
+
+read_devkit_platform_version() {
+  local buildinfo_file="$1"
+  awk -F'=' '
+    $1 ~ /^[[:space:]]*DISTRO_VERSION[[:space:]]*$/ {
+      value=$2
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      print value
+      exit
+    }
+  ' "${buildinfo_file}" 2>/dev/null || true
+}
+
+ensure_platform_compatible() {
+  if [[ "${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK}" == "ON" ]]; then
+    log "LLIMA_INSTALLER_SKIP_PLATFORM_CHECK=ON; skipping platform compatibility check."
+    return 0
+  fi
+  if [[ -f "${ELXR_SDK_RELEASE_FILE}" ]]; then
+    echo "The root LLiMa artifact installs a Modalix DevKit; it must not be run in an eLxr SDK container." >&2
+    exit 1
+  fi
+  if [[ "$(dpkg --print-architecture)" != "arm64" ]]; then
+    echo "The root LLiMa artifact requires an arm64 Modalix DevKit." >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to read the LLiMa package manifest before install." >&2
+    exit 1
+  fi
+
+  local manifest_path expected actual
+  manifest_path="$(resolve_package_manifest_path)"
+  if ! expected="$(read_manifest_platform_version "${manifest_path}")"; then
+    echo "Unable to verify LLiMa package platform compatibility." >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${LLIMA_BUILDINFO_FILE}" ]]; then
+    echo "Cannot verify Modalix DevKit compatibility: missing ${LLIMA_BUILDINFO_FILE}." >&2
+    echo "This installer only supports Modalix DevKit targets." >&2
+    exit 1
+  fi
+  if ! grep -qE '^MACHINE[[:space:]]*=[[:space:]]*modalix' "${LLIMA_BUILDINFO_FILE}"; then
+    echo "Cannot verify Modalix DevKit compatibility: ${LLIMA_BUILDINFO_FILE} does not report MACHINE=modalix." >&2
+    exit 1
+  fi
+
+  actual="$(read_devkit_platform_version "${LLIMA_BUILDINFO_FILE}")"
+  if [[ -z "${actual}" ]]; then
+    echo "Cannot verify platform compatibility: DISTRO_VERSION is missing in ${LLIMA_BUILDINFO_FILE}." >&2
+    exit 1
+  fi
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "Incompatible platform version for this LLiMa package." >&2
+    echo "  Package platform-version: ${expected} (${manifest_path})" >&2
+    echo "  Detected DISTRO_VERSION: ${actual} (${LLIMA_BUILDINFO_FILE})" >&2
+    echo "Refusing to install before modifying apt packages." >&2
+    exit 1
+  fi
+
+  log "Platform compatibility verified: ${actual}"
 }
 
 run_sudo() {
@@ -185,16 +283,7 @@ for command_name in apt-get dpkg dpkg-deb dpkg-query; do
   fi
 done
 
-if [[ "${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK:-OFF}" != "ON" ]]; then
-  if [[ -f /etc/sdk-release ]]; then
-    echo "The root LLiMa artifact installs a Modalix DevKit; it must not be run in an eLxr SDK container." >&2
-    exit 1
-  fi
-  if [[ "$(dpkg --print-architecture)" != "arm64" ]]; then
-    echo "The root LLiMa artifact requires an arm64 Modalix DevKit." >&2
-    exit 1
-  fi
-fi
+ensure_platform_compatible
 
 manifest_path="${SCRIPT_DIR}/${INSTALL_MANIFEST}"
 if [[ ! -f "${manifest_path}" ]]; then
