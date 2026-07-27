@@ -1,0 +1,624 @@
+name: LLiMa Model Compiler Tests
+
+on:
+  workflow_call:
+    inputs:
+      vulcan_env:
+        description: Vulcan environment used for runner allocation and artifact resolution.
+        required: true
+        type: string
+      artifact_base_url:
+        description: Base URL for internally cached model inputs.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  SIMA_CLI_CHECK_FOR_UPDATE: "0"
+  VULCAN_ENV: ${{ inputs.vulcan_env }}
+  VULCAN_RUNNER_PROFILE: ubuntu
+  VULCAN_ARCHITECTURE: arm64
+  VULCAN_CAPACITY: default
+  VULCAN_WORKSPACE: /mnt/vulcan/workspace
+  ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+
+jobs:
+  test:
+    name: Test LLiMa on Model Compiler
+    environment: ${{ inputs.vulcan_env }}
+    runs-on:
+      - self-hosted
+      - linux
+      - arm64
+      - vulcan-${{ inputs.vulcan_env }}
+      - ubuntu
+      - default
+
+    steps:
+      - name: Prepare Vulcan workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0775 "${VULCAN_WORKSPACE}"
+          find "${VULCAN_WORKSPACE}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          submodules: "false"
+
+      - name: Stage checkout into Vulcan workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "${VULCAN_WORKSPACE}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          tar -C "${GITHUB_WORKSPACE}" --exclude .git -cf - . |
+            tar -C "${VULCAN_WORKSPACE}" -xf -
+          test -f "${VULCAN_WORKSPACE}/README.md"
+
+      - name: Inspect Vulcan runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "VULCAN_ENV=${VULCAN_ENV}"
+          echo "VULCAN_RUNNER_PROFILE=${VULCAN_RUNNER_PROFILE}"
+          echo "VULCAN_ARCHITECTURE=${VULCAN_ARCHITECTURE}"
+          echo "VULCAN_CAPACITY=${VULCAN_CAPACITY}"
+          uname -a
+          id
+          df -h / /mnt/nvme "${GITHUB_WORKSPACE}" "${RUNNER_TEMP}"
+          findmnt --target /mnt/nvme
+          findmnt --target "${GITHUB_WORKSPACE}"
+          findmnt --target "${RUNNER_TEMP}"
+          test "$(uname -m)" = "aarch64"
+          test "${VULCAN_RUNNER_PROFILE}" = "ubuntu"
+          nvme_filesystem_id="$(stat -c '%d' /mnt/nvme)"
+          test "${nvme_filesystem_id}" = "$(stat -c '%d' "${GITHUB_WORKSPACE}")"
+          test "${nvme_filesystem_id}" = "$(stat -c '%d' "${RUNNER_TEMP}")"
+
+      - name: Install and verify compiler toolchain
+        shell: bash
+        working-directory: ${{ env.VULCAN_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/install_sima_cli_main.sh
+          sima_cli="${HOME}/.sima-cli/.venv/bin/sima-cli"
+          test -x "${sima_cli}"
+
+          model_compiler_spec="model-compiler/arm64@develop"
+          echo "Installing ${model_compiler_spec}"
+          "${sima_cli}" neat install \
+            --env "${VULCAN_ENV}" \
+            "${model_compiler_spec}"
+
+          model_compiler_dir=""
+          for candidate in \
+            "/sdk-extensions/model-compiler" \
+            "/sdk-add-on/model-compiler" \
+            "${HOME}/sdk-extensions/model-compiler"; do
+            if [[ -f "${candidate}/bin/activate" ]]; then
+              model_compiler_dir="${candidate}"
+              break
+            fi
+          done
+          if [[ -z "${model_compiler_dir}" ]]; then
+            echo "Model Compiler venv was not found in a supported install location." >&2
+            exit 1
+          fi
+
+          site_packages="$(
+            find "${model_compiler_dir}/lib" -maxdepth 3 -type d -name site-packages 2>/dev/null |
+              head -n 1
+          )"
+          library_path="${model_compiler_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          if [[ -n "${site_packages}" ]]; then
+            library_path="${site_packages}:${site_packages}/tvm:${library_path}"
+          fi
+
+          export MODEL_COMPILER_DIR="${model_compiler_dir}"
+          export VIRTUAL_ENV="${model_compiler_dir}"
+          export LD_LIBRARY_PATH="${library_path}"
+          export PATH="${model_compiler_dir}/bin:$(dirname "${sima_cli}"):${PATH}"
+
+          {
+            echo "SIMA_CLI=${sima_cli}"
+            echo "MODEL_COMPILER_DIR=${model_compiler_dir}"
+            echo "VIRTUAL_ENV=${model_compiler_dir}"
+            echo "LD_LIBRARY_PATH=${library_path}"
+          } >> "${GITHUB_ENV}"
+          echo "$(dirname "${sima_cli}")" >> "${GITHUB_PATH}"
+          echo "${model_compiler_dir}/bin" >> "${GITHUB_PATH}"
+
+          test "${VIRTUAL_ENV}" = "${MODEL_COMPILER_DIR}"
+          python - <<'PY'
+          import importlib.metadata
+
+          import afe
+
+          version = importlib.metadata.version("sima-frontend")
+          print(f"Model Compiler sima-frontend {version}: {afe.__file__}")
+          PY
+
+          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          short_sha="${GITHUB_SHA:0:12}"
+          package_spec="llima/compiler@${ref_name}:${short_sha}"
+          install_dir="${RUNNER_TEMP}/llima-compiler-smoke"
+
+          rm -rf "${install_dir}"
+          mkdir -p "${install_dir}"
+
+          echo "Installing exact artifact ${package_spec}"
+          for attempt in 1 2 3 4; do
+            if "${sima_cli}" neat install \
+              --env "${VULCAN_ENV}" \
+              --install-dir "${install_dir}" \
+              "${package_spec}"; then
+              break
+            fi
+            if [[ "${attempt}" -eq 4 ]]; then
+              echo "Compiler installation failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            delay=$((attempt * 10))
+            echo "Compiler installation attempt ${attempt} failed; retrying in ${delay}s." >&2
+            sleep "${delay}"
+          done
+
+          mapfile -t compiler_wheels < <(
+            find "${install_dir}" -type f -name 'sima_lmm-*.whl' -print
+          )
+          if [[ "${#compiler_wheels[@]}" -ne 1 ]]; then
+            echo "Expected one downloaded compiler wheel; found ${#compiler_wheels[@]}." >&2
+            exit 1
+          fi
+          echo "LLIMA_COMPILER_WHEEL=${compiler_wheels[0]}" >> "${GITHUB_ENV}"
+
+          PYTHONPATH= python -P - "${VIRTUAL_ENV}" "${VULCAN_WORKSPACE}" <<'PY'
+          import importlib.metadata
+          import sys
+          from pathlib import Path
+
+          import sima_lmm
+
+          virtual_env, checkout = sys.argv[1:]
+          installed_version = importlib.metadata.version("sima-lmm")
+          module_path = Path(sima_lmm.__file__).resolve()
+          virtual_env_path = Path(virtual_env).resolve()
+          checkout_path = Path(checkout).resolve()
+
+          if virtual_env_path not in module_path.parents:
+              raise SystemExit(f"sima_lmm was imported outside {virtual_env_path}: {module_path}")
+          if checkout_path in module_path.parents:
+              raise SystemExit(f"sima_lmm was imported from the checkout: {module_path}")
+
+          print(f"Installed sima-lmm: {installed_version}")
+          print(f"Import provenance: {module_path}")
+          PY
+
+      - name: Run fast compiler unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_stage="${RUNNER_TEMP}/llima-compiler-tests"
+          junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
+          expected_test_count=46
+
+          rm -rf "${test_stage}"
+          mkdir -p "${test_stage}"
+          tar -C "${VULCAN_WORKSPACE}" -cf - \
+            pytest.ini \
+            tests/__init__.py \
+            tests/compilation |
+            tar -C "${test_stage}" -xf -
+          echo "LLIMA_TEST_STAGE=${test_stage}" >> "${GITHUB_ENV}"
+
+          python -m pip install --disable-pip-version-check \
+            "${LLIMA_COMPILER_WHEEL}[tests]"
+
+          (
+            cd "${test_stage}"
+            unset PYTHONPATH
+            python -P -m pytest \
+              -c pytest.ini \
+              tests/compilation/unit \
+              -m compiler_unit \
+              --strict-markers \
+              -vv \
+              -ra \
+              --durations=20 \
+              --junitxml="${junit_report}"
+          )
+
+          python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
+            --report "${junit_report}" \
+            --expected "${expected_test_count}" \
+            --label "Fast compiler unit"
+
+          {
+            echo "### Fast compiler unit tests"
+            echo
+            echo "- Required tests executed with no external model cache"
+            echo "- Unexpected skips: 0"
+            echo "- Detailed test results and slowest cases are in the job log"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Download and verify cached models
+        shell: bash
+        working-directory: ${{ env.VULCAN_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          model_root="${RUNNER_TEMP}/llima-model-inputs"
+          provenance="${RUNNER_TEMP}/llima-model-input-provenance.json"
+          python3 tools/ci/prepare_model_inputs.py \
+            --base-url "${ARTIFACT_BASE_URL}" \
+            --output-dir "${model_root}" \
+            --provenance-output "${provenance}" \
+            --jobs 4
+          {
+            echo "LLIMA_HF_MODELS_PATH=${model_root}"
+            echo "LLIMA_MODEL_INPUT_PROVENANCE=${provenance}"
+            echo "HF_HUB_OFFLINE=1"
+            echo "TRANSFORMERS_OFFLINE=1"
+          } >> "${GITHUB_ENV}"
+
+      - name: Run configuration contract regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          junit_report="${RUNNER_TEMP}/compiler-config-junit.xml"
+          expected_test_count=25
+
+          (
+            cd "${LLIMA_TEST_STAGE}"
+            unset PYTHONPATH
+            python -P -m pytest \
+              -c pytest.ini \
+              tests/compilation/configuration \
+              -m compiler_config \
+              --strict-markers \
+              -vv \
+              -ra \
+              --durations=20 \
+              --junitxml="${junit_report}"
+          )
+
+          python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
+            --report "${junit_report}" \
+            --expected "${expected_test_count}" \
+            --label "Configuration regression"
+
+          {
+            echo "### Configuration contract regression"
+            echo
+            echo "- Configuration cases executed: ${expected_test_count}"
+            echo "- Unexpected skips: 0"
+            echo "- Model access: verified cache in offline mode"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Run model-source ingestion tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          junit_report="${RUNNER_TEMP}/compiler-source-junit.xml"
+          expected_test_count=15
+
+          (
+            cd "${LLIMA_TEST_STAGE}"
+            unset PYTHONPATH
+            python -P -m pytest \
+              -c pytest.ini \
+              tests/compilation/source_ingestion \
+              -m compiler_source \
+              --strict-markers \
+              -vv \
+              -ra \
+              --durations=20 \
+              --junitxml="${junit_report}"
+          )
+
+          python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
+            --report "${junit_report}" \
+            --expected "${expected_test_count}" \
+            --label "Model-source ingestion"
+
+          {
+            echo "### Model-source ingestion"
+            echo
+            echo "- Required ingestion cases executed: ${expected_test_count}"
+            echo "- Unexpected skips: 0"
+            echo "- Stored NumPy reference fixtures: none"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Run ONNX generation and validation
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          junit_report="${RUNNER_TEMP}/compiler-onnx-regression-junit.xml"
+          expected_test_count=32
+          base_wheel_dir="${RUNNER_TEMP}/llima-base-wheel"
+          base_package_root="${RUNNER_TEMP}/llima-base-package"
+          candidate_package_root="${RUNNER_TEMP}/llima-candidate-package"
+          base_onnx_root="${RUNNER_TEMP}/llima-base-onnx"
+          base_onnx_manifest="${RUNNER_TEMP}/llima-base-onnx-manifest.json"
+          candidate_onnx_root="${RUNNER_TEMP}/llima-candidate-onnx"
+          candidate_onnx_manifest="${RUNNER_TEMP}/llima-candidate-onnx-manifest.json"
+
+          cleanup_onnx() {
+            rm -rf \
+              "${base_wheel_dir}" \
+              "${base_package_root}" \
+              "${candidate_package_root}" \
+              "${base_onnx_root}" \
+              "${candidate_onnx_root}"
+            rm -f "${base_onnx_manifest}" "${candidate_onnx_manifest}"
+          }
+          trap cleanup_onnx EXIT
+          cleanup_onnx
+
+          validation_mode="candidate-only"
+          base_ref=""
+          base_revision=""
+          package_spec=""
+          base_package_version=""
+          if [[ "${GITHUB_REF_TYPE}" == "branch" &&
+                "${GITHUB_REF_NAME}" != "develop" &&
+                "${GITHUB_REF_NAME}" != "main" &&
+                "${GITHUB_REF_NAME}" != release* ]]; then
+            validation_mode="compare"
+            base_ref="develop"
+            base_revision="${base_ref}@latest"
+            package_spec="llima/compiler@${base_ref}"
+          fi
+
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --target "${candidate_package_root}" \
+            "${LLIMA_COMPILER_WHEEL}"
+
+          generator="${LLIMA_TEST_STAGE}/tests/compilation/onnx_regression/generate.py"
+
+          PYTHONPATH="${candidate_package_root}:${LLIMA_TEST_STAGE}" \
+            python -P "${generator}" \
+              --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
+              --output-dir "${candidate_onnx_root}" \
+              --manifest-output "${candidate_onnx_manifest}" \
+              --expected-package-root "${candidate_package_root}" \
+              --revision "${GITHUB_SHA}"
+
+          if [[ "${validation_mode}" == "compare" ]]; then
+            mkdir -p "${base_wheel_dir}"
+            echo "Downloading baseline artifact ${package_spec}"
+            for attempt in 1 2 3 4; do
+              if "${SIMA_CLI}" neat install \
+                --env "${VULCAN_ENV}" \
+                --type wheel \
+                --install-dir "${base_wheel_dir}" \
+                "${package_spec}"; then
+                break
+              fi
+              if [[ "${attempt}" -eq 4 ]]; then
+                echo "Base wheel download failed after ${attempt} attempts." >&2
+                exit 1
+              fi
+              delay=$((attempt * 10))
+              echo "Base wheel attempt ${attempt} failed; retrying in ${delay}s." >&2
+              sleep "${delay}"
+            done
+
+            mapfile -t base_wheels < <(
+              find "${base_wheel_dir}" -type f -name 'sima_lmm-*.whl' -print
+            )
+            if [[ "${#base_wheels[@]}" -ne 1 ]]; then
+              echo "Expected one base wheel; found ${#base_wheels[@]}." >&2
+              exit 1
+            fi
+
+            python -m pip install \
+              --disable-pip-version-check \
+              --no-deps \
+              --target "${base_package_root}" \
+              "${base_wheels[0]}"
+            base_package_version="$(
+              PYTHONPATH="${base_package_root}" python -P -c \
+                'import importlib.metadata; print(importlib.metadata.version("sima-lmm"))'
+            )"
+            PYTHONPATH="${base_package_root}:${LLIMA_TEST_STAGE}" \
+              python -P "${generator}" \
+                --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
+                --output-dir "${base_onnx_root}" \
+                --manifest-output "${base_onnx_manifest}" \
+                --expected-package-root "${base_package_root}" \
+                --revision "${base_revision}" \
+                --allow-informative-unavailable
+          fi
+
+          pytest_args=(
+            -c pytest.ini
+            tests/compilation/onnx_regression
+            -m compiler_onnx_regression
+            --strict-markers
+            -vv
+            -ra
+            --durations=20
+            --onnx-validation-mode "${validation_mode}"
+            --candidate-onnx-root "${candidate_onnx_root}"
+            --candidate-onnx-manifest "${candidate_onnx_manifest}"
+            --junitxml="${junit_report}"
+          )
+          if [[ "${validation_mode}" == "compare" ]]; then
+            pytest_args+=(
+              --base-onnx-root "${base_onnx_root}"
+              --base-onnx-manifest "${base_onnx_manifest}"
+            )
+          fi
+
+          (
+            cd "${LLIMA_TEST_STAGE}"
+            unset PYTHONPATH
+            python -P -m pytest "${pytest_args[@]}"
+          )
+
+          python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
+            --report "${junit_report}" \
+            --expected "${expected_test_count}" \
+            --label "ONNX generation and validation"
+
+          {
+            echo "### ONNX generation and validation"
+            echo
+            echo "- Validation mode: ${validation_mode}"
+            echo "- Candidate SHA: ${GITHUB_SHA}"
+            echo "- Required/informative cases executed: ${expected_test_count}"
+            echo "- Stored ONNX references: none"
+            if [[ "${validation_mode}" == "compare" ]]; then
+              echo "- Baseline ref: ${base_ref}"
+              echo "- Baseline artifact: ${package_spec}"
+              echo "- Baseline package version: ${base_package_version}"
+            else
+              echo "- Baseline: not used for ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Run generated-graph and quantization integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          junit_report="${RUNNER_TEMP}/compiler-graph-integration-junit.xml"
+          expected_test_count=22
+
+          (
+            cd "${LLIMA_TEST_STAGE}"
+            unset PYTHONPATH
+            python -P -m pytest \
+              -c pytest.ini \
+              tests/compilation/graph_integration \
+              -m "compiler_graph_integration and not high_memory" \
+              --strict-markers \
+              -vv \
+              -ra \
+              --durations=20 \
+              --junitxml="${junit_report}"
+          )
+
+          python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
+            --report "${junit_report}" \
+            --expected "${expected_test_count}" \
+            --label "Graph integration"
+
+          junit_report="${RUNNER_TEMP}/compiler-speculative-integration-junit.xml"
+          expected_test_count=4
+
+          (
+            cd "${LLIMA_TEST_STAGE}"
+            unset PYTHONPATH
+            python -P -m pytest \
+              -c pytest.ini \
+              tests/compilation/graph_integration \
+              -m "compiler_graph_integration and high_memory" \
+              --strict-markers \
+              -vv \
+              -ra \
+              --durations=20 \
+              --junitxml="${junit_report}"
+          )
+
+          python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
+            --report "${junit_report}" \
+            --expected "${expected_test_count}" \
+            --label "Speculative integration"
+
+          {
+            echo "### Generated-graph and quantization integration"
+            echo
+            echo "- Standard/embedding/GGUF cases: 22"
+            echo "- Serial speculative-decoding cases: 4"
+            echo "- Unexpected skips: 0"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Run selected-model full compilation E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          junit_report="${RUNNER_TEMP}/compiler-e2e-junit.xml"
+          e2e_report="${RUNNER_TEMP}/compiler-e2e-report.json"
+          e2e_temp="${RUNNER_TEMP}/llima-e2e-temp"
+          cleanup_e2e() {
+            rm -rf "${e2e_temp}"
+          }
+          trap cleanup_e2e EXIT
+          cleanup_e2e
+
+          (
+            cd "${LLIMA_TEST_STAGE}"
+            unset PYTHONPATH
+            python -P -m pytest \
+              -c pytest.ini \
+              tests/compilation/e2e \
+              -m compiler_e2e \
+              --candidate-sha "${GITHUB_SHA}" \
+              --e2e-report "${e2e_report}" \
+              --strict-markers \
+              -vv \
+              -ra \
+              --durations=20 \
+              --basetemp="${e2e_temp}" \
+              --junitxml="${junit_report}"
+          )
+
+          python - "${junit_report}" "${e2e_report}" "${GITHUB_STEP_SUMMARY}" <<'PY'
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          junit_path, report_path, summary_path = map(Path, sys.argv[1:])
+          junit = ET.parse(junit_path).getroot()
+          test_count = sum(1 for _ in junit.iter("testcase"))
+          skipped_count = sum(1 for _ in junit.iter("skipped"))
+          if test_count != 1:
+              raise SystemExit(
+                  f"Compiler E2E collection mismatch: expected 1, executed {test_count}."
+              )
+          if skipped_count:
+              raise SystemExit(
+                  f"Compiler E2E unexpectedly skipped {skipped_count} tests."
+              )
+
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          if report.get("status") != "passed":
+              raise SystemExit(f"Compiler E2E report is not successful: {report}")
+
+          compile_stage = next(
+              stage for stage in report["stages"] if stage["name"] == "model_compiler"
+          )
+          if compile_stage.get("skipped"):
+              print("Skipped llima-compile --compile: ARM packages are not fixed yet.")
+
+          with summary_path.open("a", encoding="utf-8") as summary:
+              summary.write("### Selected-model full compilation E2E\n\n")
+              summary.write(f"- Selected model: {report['selected_model']}\n")
+              summary.write(
+                  f"- Source revision: {report['source']['resolved_revision']}\n"
+              )
+              summary.write(f"- Selection seed: {report['selection_seed']}\n")
+              summary.write(f"- Candidate SHA: {report['candidate_sha']}\n")
+              if compile_stage.get("skipped"):
+                  summary.write(
+                      "- Compile step: skipped until the ARM packages are fixed.\n"
+                  )
+              summary.write("- Stages:\n")
+              for stage in report["stages"]:
+                  if stage.get("skipped"):
+                      summary.write(f"  - {stage['name']}: skipped\n")
+                      continue
+                  summary.write(
+                      f"  - {stage['name']}: {stage['duration_seconds']} seconds\n"
+                  )
+          PY

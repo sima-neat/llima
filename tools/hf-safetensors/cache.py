@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cache latest Hugging Face safetensors inputs in Vulcan artifacts."""
+"""Cache Hugging Face safetensors and GGUF inputs in Vulcan artifacts."""
 
 from __future__ import annotations
 
@@ -20,21 +20,13 @@ from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 
 
-ALLOW_PATTERNS = [
-    "*.safetensors",
-    "*.safetensors.index.json",
-    "model.safetensors.index.json",
-    "config.json",
-    "generation_config.json",
-    "tokenizer.json",
-    "tokenizer.model",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "added_tokens.json",
-    "chat_template.json",
-    "preprocessor_config.json",
-    "processor_config.json",
-    "image_processor_config.json",
+SELECTION_POLICY = json.loads(
+    Path(__file__).with_name("selection-policy.json").read_text(encoding="utf-8")
+)
+CONFIG_ALLOW_PATTERNS = SELECTION_POLICY["config"]
+SAFETENSORS_ALLOW_PATTERNS = [
+    *SELECTION_POLICY["safetensors"],
+    *CONFIG_ALLOW_PATTERNS,
 ]
 
 
@@ -42,18 +34,28 @@ ALLOW_PATTERNS = [
 class ModelSpec:
     repo_id: str
     revision: str
+    payload_format: str = "safetensors"
+    file_patterns: tuple[str, ...] = ()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Cache latest Hugging Face safetensors payloads in Vulcan S3."
+        description="Cache Hugging Face safetensors and GGUF payloads in Vulcan S3."
     )
     parser.add_argument("--manifest", default="tools/hf-safetensors/manifest.txt")
+    parser.add_argument(
+        "--config-manifest", default="tools/hf-safetensors/config-manifest.txt"
+    )
+    parser.add_argument(
+        "--gguf-manifest", default="tools/hf-safetensors/gguf-manifest.txt"
+    )
     parser.add_argument("--repo-id", default="", help="Optional single model override.")
     parser.add_argument("--revision", default="main", help="Revision for --repo-id.")
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--cache-root", default="llima-safetensors")
+    parser.add_argument("--config-cache-root", default="llima-hf-config")
+    parser.add_argument("--gguf-cache-root", default="llima-gguf")
     parser.add_argument("--kms-key-id", default="")
     parser.add_argument("--cloudfront-distribution-id", default="")
     parser.add_argument("--work-dir", default="_hf-safetensors-cache")
@@ -92,7 +94,7 @@ def validate_repo_id(repo_id: str) -> str:
     return "/".join(parts)
 
 
-def parse_manifest(path: Path) -> list[ModelSpec]:
+def parse_manifest(path: Path, payload_format: str = "safetensors") -> list[ModelSpec]:
     if not path.exists():
         fail(f"Manifest does not exist: {path}")
 
@@ -111,7 +113,52 @@ def parse_manifest(path: Path) -> list[ModelSpec]:
         if key in seen:
             fail(f"{path}:{line_no}: duplicate model entry: {key}")
         seen.add(key)
-        specs.append(ModelSpec(repo_id=repo_id, revision=revision))
+        specs.append(
+            ModelSpec(
+                repo_id=repo_id,
+                revision=revision,
+                payload_format=payload_format,
+            )
+        )
+
+    if not specs:
+        fail(f"Manifest did not contain any model entries: {path}")
+    return specs
+
+
+def parse_gguf_manifest(path: Path) -> list[ModelSpec]:
+    if not path.exists():
+        fail(f"Manifest does not exist: {path}")
+
+    specs: list[ModelSpec] = []
+    seen: set[str] = set()
+    for line_no, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        repo_id = validate_repo_id(parts[0])
+        revision = parts[1] if len(parts) >= 2 else "main"
+        file_patterns = tuple(parts[2:])
+        if any(not pattern.lower().endswith(".gguf") for pattern in file_patterns):
+            fail(
+                f"{path}:{line_no}: explicit GGUF filenames must end in .gguf: "
+                f"{raw_line!r}"
+            )
+        key = f"{repo_id}@{revision}"
+        if key in seen:
+            fail(f"{path}:{line_no}: duplicate model entry: {key}")
+        seen.add(key)
+        specs.append(
+            ModelSpec(
+                repo_id=repo_id,
+                revision=revision,
+                payload_format="gguf",
+                file_patterns=file_patterns,
+            )
+        )
 
     if not specs:
         fail(f"Manifest did not contain any model entries: {path}")
@@ -120,8 +167,41 @@ def parse_manifest(path: Path) -> list[ModelSpec]:
 
 def resolve_specs(args: argparse.Namespace) -> list[ModelSpec]:
     if args.repo_id.strip():
-        return [ModelSpec(validate_repo_id(args.repo_id), args.revision.strip() or "main")]
-    return parse_manifest(Path(args.manifest))
+        repo_id = validate_repo_id(args.repo_id)
+        config_repositories = {
+            spec.repo_id
+            for spec in parse_manifest(
+                Path(args.config_manifest), payload_format="config"
+            )
+        }
+        gguf_specs = {
+            spec.repo_id: spec
+            for spec in parse_gguf_manifest(Path(args.gguf_manifest))
+        }
+        if repo_id.lower().endswith("-gguf"):
+            payload_format = "gguf"
+            file_patterns = gguf_specs.get(
+                repo_id, ModelSpec(repo_id, "main", "gguf")
+            ).file_patterns
+        elif repo_id in config_repositories:
+            payload_format = "config"
+            file_patterns = ()
+        else:
+            payload_format = "safetensors"
+            file_patterns = ()
+        return [
+            ModelSpec(
+                repo_id,
+                args.revision.strip() or "main",
+                payload_format=payload_format,
+                file_patterns=file_patterns,
+            )
+        ]
+    return [
+        *parse_manifest(Path(args.manifest)),
+        *parse_manifest(Path(args.config_manifest), payload_format="config"),
+        *parse_gguf_manifest(Path(args.gguf_manifest)),
+    ]
 
 
 def run(command: list[str], *, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -151,6 +231,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def selection_fingerprint(payload_format: str, allow_patterns: list[str]) -> str:
+    selection = {
+        "format": payload_format,
+        "allow_patterns": sorted(allow_patterns),
+    }
+    payload = json.dumps(selection, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def cloudfront_url(base_url: str, s3_key: str) -> str:
     return f"{base_url.rstrip('/')}/{s3_key}"
 
@@ -163,6 +252,50 @@ def dry_run_probe_prefix(cache_root: str) -> str:
 
 def cache_prefix(cache_root: str, repo_id: str) -> str:
     return f"{cache_root.strip('/')}/{repo_id}/latest"
+
+
+def select_gguf_file(info: object, repo_id: str) -> str:
+    filenames = [
+        sibling.rfilename
+        for sibling in (getattr(info, "siblings", None) or [])
+        if getattr(sibling, "rfilename", "").lower().endswith(".gguf")
+    ]
+    for quantization in ("q4_0", "q8_0"):
+        matches = sorted(
+            filename
+            for filename in filenames
+            if Path(filename).stem.lower().endswith(quantization)
+        )
+        root_matches = [filename for filename in matches if "/" not in filename]
+        if root_matches:
+            matches = root_matches
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            fail(
+                f"Multiple {quantization.upper()} GGUF files found for {repo_id}: "
+                f"{', '.join(matches)}"
+            )
+    fail(f"No Q4_0 or Q8_0 GGUF file found for {repo_id}")
+
+
+def validate_gguf_files(
+    info: object, repo_id: str, requested_files: tuple[str, ...]
+) -> list[str]:
+    available_files = {
+        sibling.rfilename
+        for sibling in (getattr(info, "siblings", None) or [])
+        if getattr(sibling, "rfilename", "").lower().endswith(".gguf")
+    }
+    missing_files = [
+        filename for filename in requested_files if filename not in available_files
+    ]
+    if missing_files:
+        fail(
+            f"Requested GGUF files are missing for {repo_id}: "
+            f"{', '.join(missing_files)}"
+        )
+    return list(requested_files)
 
 
 def fetch_cached_manifest(bucket: str, prefix: str) -> dict | None:
@@ -205,6 +338,8 @@ def build_manifest(
     files: list[Path],
     snapshot_path: Path,
     base_url: str,
+    payload_format: str,
+    selection_sha256: str,
 ) -> dict:
     entries = []
     for path in files:
@@ -223,6 +358,8 @@ def build_manifest(
 
     return {
         "source": "hf",
+        "format": payload_format,
+        "selection_sha256": selection_sha256,
         "repo_id": spec.repo_id,
         "requested_revision": spec.revision,
         "resolved_revision": resolved_revision,
@@ -341,7 +478,12 @@ def publish_probe(args: argparse.Namespace) -> None:
 
 
 def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
-    prefix = cache_prefix(args.cache_root, spec.repo_id)
+    cache_root = {
+        "config": args.config_cache_root,
+        "gguf": args.gguf_cache_root,
+        "safetensors": args.cache_root,
+    }[spec.payload_format]
+    prefix = cache_prefix(cache_root, spec.repo_id)
     print(f"Resolving {spec.repo_id}@{spec.revision}")
     token = (
         os.environ.get("HF_TOKEN", "").strip()
@@ -352,23 +494,56 @@ def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
     resolved_revision = info.sha
     if not resolved_revision:
         fail(f"Unable to resolve Hugging Face revision for {spec.repo_id}@{spec.revision}")
+    if spec.payload_format == "gguf":
+        if spec.file_patterns:
+            allow_patterns = validate_gguf_files(
+                info, spec.repo_id, spec.file_patterns
+            )
+        else:
+            allow_patterns = [select_gguf_file(info, spec.repo_id)]
+    elif spec.payload_format == "config":
+        allow_patterns = CONFIG_ALLOW_PATTERNS
+    else:
+        allow_patterns = SAFETENSORS_ALLOW_PATTERNS
+    desired_selection_sha256 = selection_fingerprint(
+        spec.payload_format, allow_patterns
+    )
     if args.resolve_only:
-        print(f"Resolved {spec.repo_id}@{spec.revision}: {resolved_revision}")
+        detail = (
+            f" ({', '.join(allow_patterns)})"
+            if spec.payload_format == "gguf"
+            else ""
+        )
+        print(f"Resolved {spec.repo_id}@{spec.revision}: {resolved_revision}{detail}")
         return "resolved"
 
     cached_manifest = None if args.dry_run else fetch_cached_manifest(args.bucket, prefix)
     cached_revision = ""
+    cached_selection_sha256 = ""
     if cached_manifest:
         cached_revision = str(cached_manifest.get("resolved_revision", ""))
+        cached_selection_sha256 = str(
+            cached_manifest.get("selection_sha256", "")
+        )
 
-    if cached_revision == resolved_revision and not args.force:
+    if (
+        cached_revision == resolved_revision
+        and cached_selection_sha256 == desired_selection_sha256
+        and not args.force
+    ):
         print(f"Cache current for {spec.repo_id}: {resolved_revision}")
         return "current"
 
-    if cached_revision:
-        print(f"Cache stale for {spec.repo_id}: cached={cached_revision}, hf={resolved_revision}")
-    elif args.force:
+    if args.force:
         print(f"Force sync requested for {spec.repo_id}: hf={resolved_revision}")
+    elif cached_revision == resolved_revision:
+        print(
+            f"Cache selection stale for {spec.repo_id}: "
+            f"cached={cached_selection_sha256 or '<missing>'}, "
+            f"desired={desired_selection_sha256}"
+        )
+    elif cached_revision:
+        print(f"Cache stale for {spec.repo_id}: cached={cached_revision}, hf={resolved_revision}")
     else:
         print(f"Cache missing for {spec.repo_id}: hf={resolved_revision}")
 
@@ -383,15 +558,28 @@ def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
             revision=resolved_revision,
             local_dir=model_work_dir,
             local_dir_use_symlinks=False,
-            allow_patterns=ALLOW_PATTERNS,
+            allow_patterns=allow_patterns,
             token=token,
         )
     )
     files = find_downloaded_files(snapshot_path)
     if not files:
         fail(f"No cache files matched for {spec.repo_id}@{resolved_revision}")
-    if not has_safetensors(files):
+    if spec.payload_format == "safetensors" and not has_safetensors(files):
         fail(f"No safetensors files matched for {spec.repo_id}@{resolved_revision}")
+    if spec.payload_format == "config" and not any(
+        path.name == "config.json" for path in files
+    ):
+        fail(f"No config.json matched for {spec.repo_id}@{resolved_revision}")
+    if spec.payload_format == "gguf" and (
+        len(files) != len(allow_patterns)
+        or any(path.suffix.lower() != ".gguf" for path in files)
+    ):
+        fail(
+            f"Expected {len(allow_patterns)} GGUF file(s) for "
+            f"{spec.repo_id}@{resolved_revision}, "
+            f"found: {', '.join(str(path) for path in files)}"
+        )
 
     manifest = build_manifest(
         spec=spec,
@@ -400,6 +588,8 @@ def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
         files=files,
         snapshot_path=snapshot_path,
         base_url=args.base_url,
+        payload_format=spec.payload_format,
+        selection_sha256=desired_selection_sha256,
     )
     publish_model(
         args=args,
