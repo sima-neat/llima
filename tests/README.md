@@ -1,14 +1,48 @@
 # LLiMa test suite
 
-The test suite is organized around the compiler-test groups shown in
-`.github/workflows/model-compiler-tests.yml`. Compilation tests currently live
-under `tests/compilation/`. The `tests/runtime/` directory is reserved for
-future DevKit runtime tests.
+The test suite is organized around compiler tests and DevKit runtime tests.
+Compilation tests live under `tests/compilation/`. Runtime tests live under
+`tests/runtime/`, are cross-compiled with the C++ runtime, and require a real
+DevKit runtime environment. They do not fall back to host-only execution or
+mock the hardware services.
 
 The compilation workflow installs and tests the exact LLiMa compiler wheel for
 the candidate commit. Tests run against model inputs downloaded from the
 internal Vulcan cache; Hugging Face and Transformers are then placed in offline
 mode.
+
+## DevKit runtime tests
+
+`./build.sh --all` cross-compiles the C++ runtime tests and packages them as
+`dist/sima-lmm-<version>-Linux-extras.tar.gz`. The archive contains relocatable
+CTest metadata under `lib/sima-lmm/tests/` and pytest sources under
+`share/sima-lmm/tests/runtime/`.
+
+The pytest coverage uses the installed package and command-line entry points.
+It includes a real `llima` start/query/quit session rather than limiting CLI
+validation to `llima --help`.
+
+Runtime CI installs the exact LLiMa and Internals packages from the same build,
+downloads the extras archive, prepares the same GenAI models used by Core, and
+runs the tests serially against the real MLASHM dispatcher:
+
+- `Qwen2.5-0.5B-Instruct-GPTQ-a16w4`
+- `LFM2.5-VL-450M-a16w4`
+- `whisper-small-a16w8`
+
+The model root and names use the same environment contract as Core:
+`LLIMA_MODELS_PATH`, `SIMA_TEST_LLIMA_TEXT_MODEL`,
+`SIMA_TEST_LLIMA_VLM_MODEL`, and `SIMA_TEST_LLIMA_ASR_MODEL`.
+
+These tests require an ARM64 Modalix DevKit and an active
+`simaai-appcomplex.service`. Missing models, runtime packages, hardware
+services, or the wrong architecture are failures rather than host-side skips.
+CTest and pytest run in dedicated process groups; cancellation first sends
+`SIGINT` to active inference and waits for its graceful shutdown.
+
+Until mla-rt 2.1.3 fixes unreleased MLA buffers, every runtime case restarts
+`simaai-appcomplex.service` before loading its model. This keeps cases isolated
+without weakening the per-test daemon and CMA teardown assertions.
 
 ## CI test groups
 

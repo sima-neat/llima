@@ -161,12 +161,23 @@ jobs:
         test -f "dist/sima-lmm-${llima_version}-Linux-core.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-dev.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-cli.deb"
+        test -f "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz"
         test -f "dist/debs/sima-lmm-${llima_version}-Linux-core.deb"
         test -f "dist/debs/sima-lmm-${llima_version}-Linux-dev.deb"
         test -f "dist/debs/sima-lmm-${llima_version}-Linux-cli.deb"
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-core.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-dev.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-cli.deb" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/CTestTestfile.cmake" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_text_generation_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_vision_generation_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_asr_transcription_test" >/dev/null
         test -f dist/metadata.json
         test -f dist/debs/metadata.json
         test -x dist/install_llima.sh
@@ -457,6 +468,105 @@ jobs:
           dpkg-query -W sima-lmm-core sima-lmm-cli sima-lmm-dev
           llima --help >/dev/null
           python3 -c 'import sima_lmm'
+          systemctl is-active --quiet simaai-appcomplex.service
+
+      - name: Extract packaged runtime tests
+        run: |
+          set -euo pipefail
+
+          mapfile -t extras_archives < <(
+            find _work/llima-install -maxdepth 1 -type f \
+              -name 'sima-lmm-*-Linux-extras.tar.gz' | sort
+          )
+          if [[ "${#extras_archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one LLiMa runtime-test extras archive." >&2
+            printf '  %s\n' "${extras_archives[@]}" >&2 || true
+            exit 1
+          fi
+
+          rm -rf _work/runtime-tests
+          mkdir -p _work/runtime-tests
+          tar -C _work/runtime-tests -xzf "${extras_archives[0]}"
+
+          test_dir="_work/runtime-tests/lib/sima-lmm/tests"
+          test -f "${test_dir}/CTestTestfile.cmake"
+          test -x "${test_dir}/sima_lmm_dispatcher_lifecycle_test"
+          test -x "${test_dir}/sima_lmm_text_generation_test"
+          test -x "${test_dir}/sima_lmm_vision_generation_test"
+          test -x "${test_dir}/sima_lmm_asr_transcription_test"
+          file "${test_dir}/sima_lmm_dispatcher_lifecycle_test" | grep -q 'ARM aarch64'
+          file "${test_dir}/sima_lmm_text_generation_test" | grep -q 'ARM aarch64'
+          file "${test_dir}/sima_lmm_vision_generation_test" | grep -q 'ARM aarch64'
+          file "${test_dir}/sima_lmm_asr_transcription_test" | grep -q 'ARM aarch64'
+
+      - name: Prepare GenAI models
+        run: |
+          set -euo pipefail
+          export LLIMA_MODELS_PATH="${LLIMA_MODELS_PATH:-/media/nvme/llima/models}"
+          export SIMA_TEST_LLIMA_TEXT_MODEL="${SIMA_TEST_LLIMA_TEXT_MODEL:-Qwen2.5-0.5B-Instruct-GPTQ-a16w4}"
+          export SIMA_TEST_LLIMA_VLM_MODEL="${SIMA_TEST_LLIMA_VLM_MODEL:-LFM2.5-VL-450M-a16w4}"
+          export SIMA_TEST_LLIMA_ASR_MODEL="${SIMA_TEST_LLIMA_ASR_MODEL:-whisper-small-a16w8}"
+          prepare_models="_work/runtime-tests/share/sima-lmm/tests/runtime/prepare_genai_models.sh"
+          test -x "${prepare_models}"
+          "${prepare_models}"
+
+          {
+            printf 'LLIMA_MODELS_PATH=%s\n' "${LLIMA_MODELS_PATH}"
+            printf 'SIMA_TEST_LLIMA_TEXT_MODEL=%s\n' "${SIMA_TEST_LLIMA_TEXT_MODEL}"
+            printf 'SIMA_TEST_LLIMA_VLM_MODEL=%s\n' "${SIMA_TEST_LLIMA_VLM_MODEL}"
+            printf 'SIMA_TEST_LLIMA_ASR_MODEL=%s\n' "${SIMA_TEST_LLIMA_ASR_MODEL}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Run packaged C++ runtime tests
+        run: |
+          set -euo pipefail
+          command -v ctest >/dev/null
+          test_dir="_work/runtime-tests/lib/sima-lmm/tests"
+          cleanup_runner="_work/runtime-tests/share/sima-lmm/tests/runtime/run_with_cancellation_cleanup.sh"
+          test -x "${cleanup_runner}"
+
+          "${cleanup_runner}" ctest \
+            --test-dir "${test_dir}" \
+            --output-on-failure \
+            --no-tests=error \
+            --timeout 900 \
+            -j 1 \
+            -L devkit
+
+      - name: Run packaged Python runtime tests
+        run: |
+          set -euo pipefail
+          test_dir="_work/runtime-tests/share/sima-lmm/tests/runtime"
+          test -f "${test_dir}/test_python_runtime_lifecycle.py"
+
+          rm -rf _work/runtime-test-venv
+          python3 -m venv --system-site-packages _work/runtime-test-venv
+          _work/runtime-test-venv/bin/python -m pip install --no-cache-dir --upgrade pip
+          _work/runtime-test-venv/bin/python -m pip install --no-cache-dir \
+            'msgpack>=1.1,<2' \
+            'pytest>=8,<9'
+
+          (
+            cd _work/runtime-tests
+            "${GITHUB_WORKSPACE}/${test_dir}/run_with_cancellation_cleanup.sh" \
+              "${GITHUB_WORKSPACE}/_work/runtime-test-venv/bin/python" \
+                -m pytest -q share/sima-lmm/tests/runtime
+          )
+
+      - name: Clean runtime test workspace
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cleanup_paths=(
+            "_work/llima-install"
+            "_work/runtime-tests"
+            "_work/runtime-test-venv"
+          )
+          for cleanup_path in "${cleanup_paths[@]}"; do
+            if [[ -e "${cleanup_path}" || -L "${cleanup_path}" ]]; then
+              rm -rf -- "${cleanup_path}"
+            fi
+          done
 
   promote-latest-tag:
     name: Promote Vulcan latest tag

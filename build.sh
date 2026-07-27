@@ -31,7 +31,7 @@ Options:
   --build-dir <dir>   CMake build directory (default: llima/build-deb)
   --jobs <count>      Parallel build jobs (default: nproc; env: LLIMA_DEB_BUILD_JOBS)
   --clean             Remove the build directory and stale sima-lmm*.deb outputs
-  --all               Build all sima-lmm packages and publishable artifact layouts (default)
+  --all               Build all packages, DevKit runtime tests, and publishable layouts (default)
   --no-dist           Skip publishable artifact layout creation
   --core              Package only sima-lmm-core
   --dev               Package only sima-lmm-dev
@@ -47,6 +47,7 @@ EOF
 DO_CLEAN=0
 INSTALL_DEPS_ONLY=0
 SKIP_DIST=0
+BUILD_RUNTIME_TESTS=ON
 EXTRA_CMAKE_ARGS=()
 COMPONENTS=()
 
@@ -890,6 +891,54 @@ package_dist_archive() {
   fi
 }
 
+build_extras_archive() {
+  if [[ "${BUILD_RUNTIME_TESTS}" != "ON" ]]; then
+    echo "[build] Skipping runtime test extras archive because tests are disabled"
+    return
+  fi
+  if [[ "${SKIP_DIST}" -eq 1 ]]; then
+    echo "[build] Skipping runtime test extras archive (--no-dist)"
+    return
+  fi
+
+  local stage_root install_prefix archive_path
+  stage_root="$(mktemp -d /tmp/sima-lmm-extras-stage.XXXXXX)"
+  install_prefix="${stage_root}/prefix"
+  archive_path="${ROOT_DIR}/dist/sima-lmm-${LLIMA_VERSION}-Linux-extras.tar.gz"
+
+  (
+    trap 'rm -rf "${stage_root}"' EXIT
+    mkdir -p "${install_prefix}"
+    cmake --install "${BUILD_DIR}" --component extras --prefix "${install_prefix}"
+
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the dispatcher lifecycle executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_text_generation_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the text generation executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_vision_generation_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the vision generation executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_asr_transcription_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the ASR transcription executable." >&2
+      exit 1
+    fi
+    if [[ ! -f "${install_prefix}/lib/sima-lmm/tests/CTestTestfile.cmake" ]]; then
+      echo "ERROR: Runtime test extras are missing CTestTestfile.cmake." >&2
+      exit 1
+    fi
+
+    rm -f "${archive_path}"
+    tar -C "${install_prefix}" -czf "${archive_path}" .
+  )
+
+  echo "[build] Built runtime test extras archive: ${archive_path}"
+}
+
 read_package_compatibility_args() {
   local -n out_ref="$1"
   local compatibility_args
@@ -1033,6 +1082,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --all)
       COMPONENTS=()
+      BUILD_RUNTIME_TESTS=ON
       shift
       ;;
     --no-dist)
@@ -1041,18 +1091,22 @@ while [ "$#" -gt 0 ]; do
       ;;
     --core)
       add_component core
+      BUILD_RUNTIME_TESTS=OFF
       shift
       ;;
     --dev)
       add_component dev
+      BUILD_RUNTIME_TESTS=OFF
       shift
       ;;
     --cli)
       add_component cli
+      BUILD_RUNTIME_TESTS=OFF
       shift
       ;;
     --package)
       add_component "${2:-}"
+      BUILD_RUNTIME_TESTS=OFF
       shift 2
       ;;
     --)
@@ -1159,6 +1213,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DCMAKE_INSTALL_LIBDIR="lib/$MULTIARCH" \
   -DSKBUILD_SOABI="$PYTHON_TARGET_SOABI" \
   -DSIMA_LMM_BUILD_PYTHON=ON \
+  -DSIMA_LMM_BUILD_TESTS="$BUILD_RUNTIME_TESTS" \
   -DSIMA_LMM_INSTALL_PYTHON_PACKAGE=ON \
   -DSIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR="lib/python3/dist-packages/sima_lmm/devkit" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
@@ -1205,6 +1260,7 @@ else
 fi
 
 if [ "$SKIP_DIST" -eq 0 ]; then
+  build_extras_archive
   stage_package_artifacts "$LLIMA_VERSION"
   package_dist_archive "$LLIMA_VERSION"
   generate_package_metadata "$LLIMA_VERSION"
