@@ -300,6 +300,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
                 && _cfg.vm_cfg.has_value() && _cfg.mm_cfg.has_value();
         }
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
+        void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
             size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
         );

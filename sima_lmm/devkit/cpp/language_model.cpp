@@ -418,6 +418,64 @@ void LanguageModel::run_model_decode(
 }
 
 
+void LanguageModel::_upload_group_future_token_masks(
+    uint16_t num_tokens,
+    uint16_t token_idx
+) {
+    if (
+        num_tokens != _cfg.pipeline_cfg.input_token_group_size
+        || num_tokens == _cfg.lm_cfg.get_single_num_tokens()
+    ) {
+        return;
+    }
+
+    auto upload_group_mask = [&](
+        const std::string& name,
+        const std::string& layer_type,
+        uint16_t cache_token_idx_begin
+    ) {
+        const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
+        const uint16_t mask_size = _get_cache_mask_size(
+            layer_type, effective_context, true
+        );
+        if (mask_size <= num_tokens) {
+            return;
+        }
+        const uint16_t effective_token_idx = token_idx - cache_token_idx_begin;
+        const uint16_t aligned_context = std::min<uint16_t>(
+            round_up_to(effective_context, mask_size),
+            _cfg.pipeline_cfg.max_num_tokens
+        );
+        std::vector<Eigen::bfloat16> mask(
+            num_tokens * aligned_context,
+            std::numeric_limits<Eigen::bfloat16>::lowest()
+        );
+        for (uint16_t row = 0; row < num_tokens; ++row) {
+            std::fill_n(
+                mask.begin() + row * aligned_context,
+                effective_token_idx + row + 1,
+                Eigen::bfloat16{0.0f}
+            );
+        }
+        get_buffer(name).upload(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
+    };
+
+    upload_group_mask(
+        "group_future_token_mask", "full_attention", 0
+    );
+    if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        const uint16_t cache_token_idx_begin = std::max(
+            0,
+            token_idx + num_tokens
+                - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+        );
+        upload_group_mask(
+            "group_sliding_future_token_mask", "sliding_attention", cache_token_idx_begin
+        );
+    }
+}
+
+
 uint32_t LanguageModel::run_model_once(
     uint16_t num_tokens,
     uint16_t token_idx,
@@ -434,55 +492,7 @@ uint32_t LanguageModel::run_model_once(
     auto use_input_tokens = token_idx < num_input_tokens;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
-    if (
-        num_tokens == _cfg.pipeline_cfg.input_token_group_size
-        && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
-    ) {
-        auto upload_group_mask = [&](
-            const std::string& name,
-            const std::string& layer_type,
-            uint16_t cache_token_idx_begin
-        ) {
-            const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
-            const uint16_t mask_size = _get_cache_mask_size(
-                layer_type, effective_context, true
-            );
-            if (mask_size <= num_tokens) {
-                return;
-            }
-            const uint16_t effective_token_idx = token_idx - cache_token_idx_begin;
-            const uint16_t aligned_context = std::min<uint16_t>(
-                round_up_to(effective_context, mask_size),
-                _cfg.pipeline_cfg.max_num_tokens
-            );
-            std::vector<Eigen::bfloat16> mask(
-                num_tokens * aligned_context,
-                std::numeric_limits<Eigen::bfloat16>::lowest()
-            );
-            for (uint16_t row = 0; row < num_tokens; ++row) {
-                std::fill_n(
-                    mask.begin() + row * aligned_context,
-                    effective_token_idx + row + 1,
-                    Eigen::bfloat16{0.0f}
-                );
-            }
-            get_buffer(name).upload(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
-        };
-
-        upload_group_mask(
-            "group_future_token_mask", "full_attention", 0
-        );
-        if (_cfg.lm_cfg.attn_cfg.swa_enable) {
-            const uint16_t cache_token_idx_begin = std::max(
-                0,
-                token_idx + num_tokens
-                    - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-            );
-            upload_group_mask(
-                "group_sliding_future_token_mask", "sliding_attention", cache_token_idx_begin
-            );
-        }
-    }
+    _upload_group_future_token_masks(num_tokens, token_idx);
 
     MLABuffer* normal_input_buf;
     uint32_t normal_input_row;
