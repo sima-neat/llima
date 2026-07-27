@@ -494,10 +494,36 @@ jobs:
           test -x "${test_dir}/sima_lmm_text_generation_test"
           test -x "${test_dir}/sima_lmm_vision_generation_test"
           test -x "${test_dir}/sima_lmm_asr_transcription_test"
-          file "${test_dir}/sima_lmm_dispatcher_lifecycle_test" | grep -q 'ARM aarch64'
-          file "${test_dir}/sima_lmm_text_generation_test" | grep -q 'ARM aarch64'
-          file "${test_dir}/sima_lmm_vision_generation_test" | grep -q 'ARM aarch64'
-          file "${test_dir}/sima_lmm_asr_transcription_test" | grep -q 'ARM aarch64'
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          test_dir = Path("_work/runtime-tests/lib/sima-lmm/tests")
+          test_binaries = (
+              "sima_lmm_dispatcher_lifecycle_test",
+              "sima_lmm_text_generation_test",
+              "sima_lmm_vision_generation_test",
+              "sima_lmm_asr_transcription_test",
+          )
+
+          for name in test_binaries:
+              header = (test_dir / name).read_bytes()[:20]
+              if len(header) < 20 or header[:4] != b"\x7fELF":
+                  raise SystemExit(f"{name} is not an ELF executable")
+              if header[4] != 2:
+                  raise SystemExit(f"{name} is not an ELF64 executable")
+              if header[5] not in (1, 2):
+                  raise SystemExit(f"{name} has an invalid ELF byte order")
+
+              byte_order = "little" if header[5] == 1 else "big"
+              machine = int.from_bytes(header[18:20], byte_order)
+              if machine != 183:
+                  raise SystemExit(
+                      f"{name} is not an AArch64 executable (ELF e_machine={machine})"
+                  )
+
+              print(f"Verified ELF64/AArch64 runtime test: {name}")
+          PY
 
       - name: Prepare GenAI models
         run: |
