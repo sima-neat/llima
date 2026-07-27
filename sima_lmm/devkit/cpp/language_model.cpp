@@ -724,7 +724,14 @@ uint32_t LanguageModel::run_model_once(
         }
     }
 
-    // Run all the queued models.
+    /*
+     * Commit this dependency segment and consume every authoritative terminal
+     * CQE before CPU code reads logits/KV state.  The previous run-all path
+     * handed a list to MLA-RT/Dispatcher; this segment instead submits a
+     * bounded window directly to the kernel while preserving compiler order.
+     * Keeping the boundary explicit prevents queue-ahead from crossing a CPU
+     * observation or mutation point.
+     */
     segment.commit();
 
     // If this run landed exactly on a checkpoint boundary, save the tail.

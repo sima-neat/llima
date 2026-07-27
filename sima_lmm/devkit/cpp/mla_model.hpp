@@ -62,7 +62,10 @@ class MlaExecutionSegment {
 /*
  * One LLiMa process owns one ordered /dev/mla context.  The retained argument
  * is a source-compatibility boundary for existing Python callers; dispatcher
- * and MLA-RT command-line options are no longer interpreted.
+ * and MLA-RT command-line options are no longer interpreted.  Unlike the
+ * previous global MLA-RT handle, this call has no transport fallback: failure
+ * to construct the direct Backend is reported immediately, before any model
+ * can be registered against an ambiguous execution owner.
  */
 void connect_mla(const std::vector<std::string>& legacy_args = {});
 void disconnect_mla();
