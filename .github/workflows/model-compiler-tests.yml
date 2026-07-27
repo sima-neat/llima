@@ -7,8 +7,12 @@ on:
         description: Vulcan environment used for runner allocation and artifact resolution.
         required: true
         type: string
-      artifact_base_url:
-        description: Base URL for internally cached model inputs.
+      artifact_bucket:
+        description: S3 bucket containing internally cached model inputs.
+        required: true
+        type: string
+      aws_region:
+        description: AWS region containing the model-input cache bucket.
         required: true
         type: string
 
@@ -24,7 +28,8 @@ env:
   VULCAN_ARCHITECTURE: arm64
   VULCAN_CAPACITY: default
   VULCAN_WORKSPACE: /mnt/vulcan/workspace
-  ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+  ARTIFACT_BUCKET: ${{ inputs.artifact_bucket }}
+  AWS_REGION: ${{ inputs.aws_region }}
 
 jobs:
   test:
@@ -255,7 +260,8 @@ jobs:
           model_root="${RUNNER_TEMP}/llima-model-inputs"
           provenance="${RUNNER_TEMP}/llima-model-input-provenance.json"
           python3 tools/ci/prepare_model_inputs.py \
-            --base-url "${ARTIFACT_BASE_URL}" \
+            --s3-bucket "${ARTIFACT_BUCKET}" \
+            --aws-region "${AWS_REGION}" \
             --output-dir "${model_root}" \
             --provenance-output "${provenance}" \
             --jobs 4

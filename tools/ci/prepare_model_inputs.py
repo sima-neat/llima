@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -59,12 +60,26 @@ class SourceSpec:
 
 
 @dataclass(frozen=True)
+class ArtifactSource:
+    base_url: str | None = None
+    s3_bucket: str | None = None
+    aws_region: str | None = None
+
+    def object_uri(self, key: str) -> str:
+        if self.s3_bucket:
+            return f"s3://{self.s3_bucket}/{key}"
+        if self.base_url:
+            return build_url(self.base_url, key)
+        raise PreparationError("Artifact source is not configured")
+
+
+@dataclass(frozen=True)
 class CachedFile:
     relative_path: PurePosixPath
     s3_key: str
     size: int
     sha256: str
-    download_url: str
+    download_uri: str
 
 
 @dataclass(frozen=True)
@@ -81,7 +96,19 @@ def parse_args() -> argparse.Namespace:
             "Download and verify all active LLiMa model inputs from the Vulcan cache."
         )
     )
-    parser.add_argument("--base-url", required=True)
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        "--base-url",
+        help="HTTPS artifact URL (intended for local and non-AWS use).",
+    )
+    source_group.add_argument(
+        "--s3-bucket",
+        help="S3 artifact bucket accessed with the runner's AWS credentials.",
+    )
+    parser.add_argument(
+        "--aws-region",
+        help="AWS region for --s3-bucket (required in S3 mode).",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--manifest",
@@ -193,6 +220,35 @@ def normalize_base_url(raw_url: str) -> str:
     return base_url
 
 
+def normalize_s3_bucket(raw_bucket: str) -> str:
+    bucket = raw_bucket.strip()
+    if (
+        not 3 <= len(bucket) <= 63
+        or not re.fullmatch(r"[a-z0-9][a-z0-9.-]*[a-z0-9]", bucket)
+        or ".." in bucket
+        or ".-" in bucket
+        or "-." in bucket
+    ):
+        raise PreparationError(f"Invalid S3 bucket name: {raw_bucket!r}")
+    return bucket
+
+
+def artifact_source_from_args(args: argparse.Namespace) -> ArtifactSource:
+    if args.s3_bucket:
+        if not args.aws_region or not args.aws_region.strip():
+            raise PreparationError("--aws-region is required with --s3-bucket")
+        region = args.aws_region.strip()
+        if not re.fullmatch(r"[a-z]{2}(?:-gov)?-[a-z]+-\d", region):
+            raise PreparationError(f"Invalid AWS region: {args.aws_region!r}")
+        return ArtifactSource(
+            s3_bucket=normalize_s3_bucket(args.s3_bucket),
+            aws_region=region,
+        )
+    if args.aws_region:
+        raise PreparationError("--aws-region is valid only with --s3-bucket")
+    return ArtifactSource(base_url=normalize_base_url(args.base_url))
+
+
 def build_url(base_url: str, key: str) -> str:
     return f"{base_url}/{urllib.parse.quote(key, safe='/')}"
 
@@ -249,6 +305,49 @@ def fetch_json(url: str) -> dict[str, Any]:
     return parsed
 
 
+def aws_s3_command(source: ArtifactSource, object_uri: str) -> list[str]:
+    if not source.aws_region:
+        raise PreparationError("AWS region is not configured for S3 access")
+    return [
+        "aws",
+        "s3",
+        "cp",
+        object_uri,
+        "-",
+        "--only-show-errors",
+        "--region",
+        source.aws_region,
+    ]
+
+
+def fetch_s3_json(source: ArtifactSource, object_uri: str) -> dict[str, Any]:
+    command = aws_s3_command(source, object_uri)
+    try:
+        result = subprocess.run(command, check=False, capture_output=True)
+    except OSError as exc:
+        raise PreparationError(f"Unable to execute AWS CLI: {exc}") from exc
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise PreparationError(
+            f"Unable to read cache manifest {object_uri} directly from S3: {error}"
+        )
+    try:
+        parsed = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PreparationError(
+            f"Cache manifest is not valid JSON: {object_uri}: {exc}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise PreparationError(f"Cache manifest root must be an object: {object_uri}")
+    return parsed
+
+
+def fetch_manifest(source: ArtifactSource, object_uri: str) -> dict[str, Any]:
+    if source.s3_bucket:
+        return fetch_s3_json(source, object_uri)
+    return fetch_json(object_uri)
+
+
 def validate_relative_path(raw_path: object, *, context: str) -> PurePosixPath:
     if not isinstance(raw_path, str) or not raw_path:
         raise PreparationError(f"{context}: file path must be a non-empty string")
@@ -265,11 +364,13 @@ def require_string(manifest: dict[str, Any], key: str, *, context: str) -> str:
     return value
 
 
-def resolve_model_plan(base_url: str, source: SourceSpec) -> ModelPlan:
+def resolve_model_plan(
+    artifact_source: ArtifactSource, source: SourceSpec
+) -> ModelPlan:
     prefix = f"{source.cache_root}/{source.repo_id}/latest"
-    manifest_url = build_url(base_url, f"{prefix}/manifest.json")
+    manifest_uri = artifact_source.object_uri(f"{prefix}/manifest.json")
     print(f"Resolving cached inputs for {source.repo_id}@{source.revision}", flush=True)
-    manifest = fetch_json(manifest_url)
+    manifest = fetch_manifest(artifact_source, manifest_uri)
     context = f"{source.repo_id} cache manifest"
 
     if require_string(manifest, "repo_id", context=context) != source.repo_id:
@@ -336,7 +437,7 @@ def resolve_model_plan(base_url: str, source: SourceSpec) -> ModelPlan:
                 s3_key=expected_key,
                 size=size,
                 sha256=sha256.lower(),
-                download_url=build_url(base_url, expected_key),
+                download_uri=artifact_source.object_uri(expected_key),
             )
         )
 
@@ -382,7 +483,79 @@ def ensure_disk_capacity(output_dir: Path, total_size: int) -> None:
         )
 
 
-def download_file(cached_file: CachedFile, destination: Path) -> None:
+def stream_http_object(cached_file: CachedFile, partial: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    byte_count = 0
+    with open_internal_url(
+        cached_file.download_uri, timeout=300
+    ) as response, partial.open("wb") as handle:
+        while chunk := response.read(CHUNK_SIZE):
+            handle.write(chunk)
+            digest.update(chunk)
+            byte_count += len(chunk)
+    return byte_count, digest.hexdigest()
+
+
+def stream_s3_object(
+    artifact_source: ArtifactSource,
+    cached_file: CachedFile,
+    partial: Path,
+) -> tuple[int, str]:
+    command = aws_s3_command(artifact_source, cached_file.download_uri)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise PreparationError(f"Unable to execute AWS CLI: {exc}") from exc
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        raise PreparationError("Unable to capture AWS CLI output")
+
+    digest = hashlib.sha256()
+    byte_count = 0
+    try:
+        with partial.open("wb") as handle:
+            while chunk := process.stdout.read(CHUNK_SIZE):
+                handle.write(chunk)
+                digest.update(chunk)
+                byte_count += len(chunk)
+        error = process.stderr.read().decode("utf-8", errors="replace").strip()
+        return_code = process.wait()
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    if return_code != 0:
+        raise PreparationError(
+            f"Unable to download {cached_file.download_uri} directly from S3: {error}"
+        )
+    return byte_count, digest.hexdigest()
+
+
+def is_non_retryable_s3_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in (
+            "AccessDenied",
+            "ExpiredToken",
+            "InvalidAccessKeyId",
+            "InvalidClientTokenId",
+            "NoSuchBucket",
+            "NoSuchKey",
+            "Unable to locate credentials",
+        )
+    )
+
+
+def download_file(
+    artifact_source: ArtifactSource,
+    cached_file: CachedFile,
+    destination: Path,
+) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(
         f".{destination.name}.partial-{os.getpid()}-"
@@ -391,20 +564,26 @@ def download_file(cached_file: CachedFile, destination: Path) -> None:
     try:
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
             partial.unlink(missing_ok=True)
-            digest = hashlib.sha256()
-            byte_count = 0
             try:
-                with open_internal_url(
-                    cached_file.download_url, timeout=300
-                ) as response, partial.open("wb") as handle:
-                    while chunk := response.read(CHUNK_SIZE):
-                        handle.write(chunk)
-                        digest.update(chunk)
-                        byte_count += len(chunk)
-            except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+                if artifact_source.s3_bucket:
+                    byte_count, actual_sha256 = stream_s3_object(
+                        artifact_source, cached_file, partial
+                    )
+                else:
+                    byte_count, actual_sha256 = stream_http_object(
+                        cached_file, partial
+                    )
+            except (
+                OSError,
+                urllib.error.URLError,
+                http.client.HTTPException,
+                PreparationError,
+            ) as exc:
+                if artifact_source.s3_bucket and is_non_retryable_s3_error(exc):
+                    raise PreparationError(str(exc)) from exc
                 if attempt == DOWNLOAD_ATTEMPTS:
                     raise PreparationError(
-                        f"Unable to download {cached_file.download_url} after "
+                        f"Unable to download {cached_file.download_uri} after "
                         f"{DOWNLOAD_ATTEMPTS} attempts: {exc}"
                     ) from exc
                 delay = attempt * 5
@@ -433,7 +612,6 @@ def download_file(cached_file: CachedFile, destination: Path) -> None:
                     f"expected {cached_file.size}, got {byte_count}"
                 )
 
-            actual_sha256 = digest.hexdigest()
             if actual_sha256 != cached_file.sha256:
                 raise PreparationError(
                     f"SHA-256 mismatch for {cached_file.s3_key}: "
@@ -522,7 +700,7 @@ def load_sources(args: argparse.Namespace) -> list[SourceSpec]:
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
     if args.jobs < 1:
         raise PreparationError("--jobs must be at least 1")
-    base_url = normalize_base_url(args.base_url)
+    artifact_source = artifact_source_from_args(args)
     output_dir = validate_output_directory(args.output_dir)
     if output_dir.exists():
         raise PreparationError(
@@ -532,7 +710,10 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
         plans = list(
-            executor.map(lambda source: resolve_model_plan(base_url, source), sources)
+            executor.map(
+                lambda source: resolve_model_plan(artifact_source, source),
+                sources,
+            )
         )
 
     total_size = sum(file.size for plan in plans for file in plan.files)
@@ -551,7 +732,12 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
             futures = [
-                executor.submit(download_file, cached_file, destination)
+                executor.submit(
+                    download_file,
+                    artifact_source,
+                    cached_file,
+                    destination,
+                )
                 for cached_file, destination in download_tasks
             ]
             try:
