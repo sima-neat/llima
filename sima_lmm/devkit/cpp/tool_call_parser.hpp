@@ -49,6 +49,7 @@ class ToolCallStreamParser {
     public:
         struct Content {
             std::string text;
+            bool from_draft = false;
         };
         struct ToolCalls {
             nlohmann::json calls;
@@ -61,7 +62,11 @@ class ToolCallStreamParser {
             std::vector<std::string> allowed_tool_names
         );
 
-        std::vector<Event> add(std::string_view text, bool done = false);
+        std::vector<Event> add(
+            std::string_view text,
+            bool done = false,
+            bool from_draft = false
+        );
 
     private:
         enum class Mode {
@@ -72,10 +77,13 @@ class ToolCallStreamParser {
         };
 
         Mode decide(bool done) const;
+        void buffer_content(std::string_view text, bool from_draft);
+        std::vector<Event> take_buffered_content();
 
         Mode _mode = Mode::Undecided;
         ToolCallFormat _format = ToolCallFormat::GenericJson;
         std::string _buffer;
+        std::vector<Content> _content_buffer;
         std::optional<std::vector<std::string>> _allowed_tool_names;
 };
 

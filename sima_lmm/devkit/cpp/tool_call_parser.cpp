@@ -132,7 +132,9 @@ size_t find_matching_brace(
 
 std::string gemma4_bare_to_json(const std::string& text) {
     static const std::regex quote_marker(R"(<\|"\|>)");
-    static const std::regex unquoted_key(R"((\w+)\s*:)");
+    static const std::regex unquoted_key(
+        R"(([{,]\s*)([^{}\[\],:"]*?[^{}\[\],:\s"])\s*:)"
+    );
     static const std::regex unquoted_val(R"(:\s*([^{}\[\]",\s][^{}\[\]",]*))");
     std::string protected_text;
     bool in_marker_string = false;
@@ -148,7 +150,9 @@ std::string gemma4_bare_to_json(const std::string& text) {
         }
     }
     std::string normalized_quotes = std::regex_replace(protected_text, quote_marker, "\"");
-    std::string with_quoted_keys = std::regex_replace(normalized_quotes, unquoted_key, "\"$1\":");
+    std::string with_quoted_keys = std::regex_replace(
+        normalized_quotes, unquoted_key, "$1\"$2\":"
+    );
 
     std::string result;
     size_t previous = 0;
@@ -282,6 +286,7 @@ std::optional<nlohmann::json> parse_python_value(std::string_view value) {
     value = trim_view(value);
     if (value.size() >= 2 && ((value.front() == '\'' && value.back() == '\'') ||
                               (value.front() == '"' && value.back() == '"'))) {
+        const char quote = value.front();
         std::string result;
         for (size_t idx = 1; idx + 1 < value.size(); ++idx) {
             if (value[idx] == '\\' && idx + 2 < value.size()) {
@@ -315,6 +320,7 @@ std::optional<nlohmann::json> parse_python_value(std::string_view value) {
                 }
                 continue;
             }
+            if (value[idx] == quote) return std::nullopt;
             result += value[idx];
         }
         return result;
@@ -608,17 +614,19 @@ ToolCallStreamParser::ToolCallStreamParser(
 
 std::vector<ToolCallStreamParser::Event> ToolCallStreamParser::add(
     std::string_view text,
-    bool done
+    bool done,
+    bool from_draft
 ) {
     if (_mode == Mode::Content) {
         if (text.empty()) return {};
-        return {Content{std::string(text)}};
+        return {Content{std::string(text), from_draft}};
     }
     if (_mode == Mode::Done) {
         return {};
     }
 
     _buffer.append(text);
+    buffer_content(text, from_draft);
 
     if (_mode == Mode::Undecided) {
         auto decision = decide(done);
@@ -627,10 +635,8 @@ std::vector<ToolCallStreamParser::Event> ToolCallStreamParser::add(
         }
         if (decision == Mode::Content) {
             _mode = Mode::Content;
-            std::string content = std::move(_buffer);
             _buffer.clear();
-            if (content.empty()) return {};
-            return {Content{std::move(content)}};
+            return take_buffered_content();
         }
         _mode = decision;
     }
@@ -642,14 +648,32 @@ std::vector<ToolCallStreamParser::Event> ToolCallStreamParser::add(
     if (!parsed.is_null()) {
         _mode = Mode::Done;
         _buffer.clear();
+        _content_buffer.clear();
         return {ToolCalls{std::move(parsed)}};
     }
 
     _mode = Mode::Content;
-    std::string content = std::move(_buffer);
     _buffer.clear();
-    if (content.empty()) return {};
-    return {Content{std::move(content)}};
+    return take_buffered_content();
+}
+
+void ToolCallStreamParser::buffer_content(std::string_view text, bool from_draft) {
+    if (text.empty()) return;
+    if (!_content_buffer.empty() && _content_buffer.back().from_draft == from_draft) {
+        _content_buffer.back().text.append(text);
+        return;
+    }
+    _content_buffer.push_back(Content{std::string(text), from_draft});
+}
+
+std::vector<ToolCallStreamParser::Event> ToolCallStreamParser::take_buffered_content() {
+    std::vector<Event> events;
+    events.reserve(_content_buffer.size());
+    for (auto& content : _content_buffer) {
+        events.emplace_back(std::move(content));
+    }
+    _content_buffer.clear();
+    return events;
 }
 
 ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {

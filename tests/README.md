@@ -301,6 +301,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.text_generation` | Qwen text generation on MLA |
 | `runtime.vision_generation` | LFM2 image-conditioned generation using the installed sample image |
 | `runtime.asr_transcription` | Whisper transcription using the installed sample audio |
+| `runtime.tool_call_parser` | Tool-call parsing safety and streaming provenance without model inference |
 
 The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on

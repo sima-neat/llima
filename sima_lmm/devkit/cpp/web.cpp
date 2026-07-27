@@ -711,18 +711,19 @@ void WEB::_execute_streaming_chat(
                 return std::nullopt;
             };
 
-            auto send_content = [&](const std::string& text) {
+            auto send_content = [&](const std::string& text, bool from_draft) {
                 if (text.empty()) return;
                 if (is_openai) {
                     send_openai_initial();
                     auto chunk = _format_openai_sse_chunk(
                         text, model, completion_id, created, false, std::nullopt,
-                        take_ttft_once(), tps_value
+                        take_ttft_once(), tps_value, from_draft
                     );
                     sink.write(chunk.data(), chunk.size());
                 } else {
                     auto chunk = _format_ollama_ndjson_chunk(
-                        text, model, false, std::nullopt, take_ttft_once(), tps_value
+                        text, model, false, std::nullopt, take_ttft_once(), tps_value,
+                        from_draft
                     );
                     sink.write(chunk.data(), chunk.size());
                 }
@@ -760,7 +761,9 @@ void WEB::_execute_streaming_chat(
             auto handle_tool_parser_events = [&](std::vector<ToolCallStreamParser::Event> events) {
                 for (auto& event : events) {
                     if (std::holds_alternative<ToolCallStreamParser::Content>(event)) {
-                        send_content(std::get<ToolCallStreamParser::Content>(event).text);
+                        const auto& content =
+                            std::get<ToolCallStreamParser::Content>(event);
+                        send_content(content.text, content.from_draft);
                     } else {
                         const auto& calls = std::get<ToolCallStreamParser::ToolCalls>(event).calls;
                         saw_tool_calls = true;
@@ -857,7 +860,9 @@ void WEB::_execute_streaming_chat(
                 const std::string& text, bool stream_end, bool from_draft
             ) {
                 if (has_tools) {
-                    handle_tool_parser_events(tool_parser.add(text, stream_end));
+                    handle_tool_parser_events(
+                        tool_parser.add(text, stream_end, from_draft)
+                    );
                     return;
                 }
 
