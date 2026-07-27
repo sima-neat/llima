@@ -48,6 +48,7 @@ create a second environment that shadows its compiler packages.
 
 ```bash
 source <model-compiler-venv>/bin/activate
+cd /path/to/llima
 python -m pip install -e '.[sdk_ext,tests]'
 llima-compile --help
 ```
@@ -71,12 +72,20 @@ Run the smallest tier that proves the changed behavior:
 - Model-backed compiler tests:
 
   ```bash
-  tox -e premerge
+  export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
+  python -P -m pytest \
+    -c pytest.ini \
+    tests/compilation/configuration \
+    -m compiler_config \
+    --strict-markers \
+    -vv -ra
   ```
 
-  These tests require the model and reference paths documented in
-  [Contributor Guide](docs/contributing.md#model-backed-test-inputs). A skipped
-  model-backed test is not validation of the changed behavior.
+  Choose the affected group and marker from
+  [tests/README.md](tests/README.md#running-compiler-tests-locally). Model-backed
+  tests use the prepared input root supplied through `LLIMA_HF_MODELS_PATH` or
+  `--model-inputs-path`. A skipped model-backed test is not validation of the
+  changed behavior.
 
 - Runtime C++ or Python changes:
 
@@ -108,6 +117,23 @@ links and commands must be checked.
 - Use immutable model revisions and approved internal caches in automation.
 - Never print or commit Hugging Face tokens, credentials, private URLs, or
   customer model data.
+
+## Coding Standards
+
+- Keep C++ compatible with C++20 and Python compatible with the versions
+  declared in `pyproject.toml`.
+- Follow surrounding formatting, naming, and include grouping. Keep functional
+  changes separate from broad reformatting.
+- Treat installed APIs, CLI commands, serialized configuration, and artifact
+  layouts as compatibility surfaces. Prefer backward-compatible additions.
+- Keep compiler/runtime boundaries and generated output deterministic.
+- Fail with actionable context instead of silently changing the model,
+  precision, compilation path, or runtime behavior.
+- Keep shared state safe and teardown bounded; avoid unnecessary allocation,
+  copies, and synchronization in latency-sensitive runtime paths.
+
+See [Coding Standards](docs/contributing.md#coding-standards) for the complete
+error-handling, lifecycle, compatibility, documentation, and review rules.
 
 ## Commit and Pull Request Standards
 

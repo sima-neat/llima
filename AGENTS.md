@@ -40,6 +40,29 @@ packages or make compiler code depend on DevKit runtime state.
 - Preserve the compiler, MoLE, and runtime artifact profiles and their
   metadata/checksum contracts.
 
+## Coding Standards
+
+- C++ code must remain compatible with C++20. Python code must remain
+  compatible with the versions declared in `pyproject.toml`.
+- Follow the formatting and naming of the surrounding code. Keep changes
+  focused; do not mix functional changes with broad reformatting or include
+  reordering.
+- Keep public interfaces intentional and minimal. Prefer backward-compatible
+  additions, keep implementation details out of installed headers, and update
+  all callers when an internal contract changes.
+- Add type annotations to new Python interfaces where practical. Use comments
+  and docstrings to explain non-obvious contracts and design decisions, not to
+  restate the implementation.
+- Keep model compilation, configuration serialization, cache-model selection,
+  and artifact naming deterministic for identical inputs.
+- Reject invalid or unsupported input with an actionable error. Do not add
+  silent fallbacks that select a different architecture, precision, model,
+  compilation path, or runtime behavior.
+- Keep teardown and worker coordination bounded. Do not block indefinitely,
+  and protect state shared across compiler processes or runtime threads.
+- Avoid unnecessary abstractions and duplication. Search for an existing
+  helper or nearby implementation before introducing a new one.
+
 ## Model Inputs and Generated Artifacts
 
 - Never commit downloaded model weights or customer model data.

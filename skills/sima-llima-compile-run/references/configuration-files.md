@@ -31,8 +31,8 @@ LLiMa calls the function once for every compiler unit exposed by the model.
 `layer` contains:
 
 - `part`: the logical component, normally `PRE`, `CACHE`, `POST`, or `VISION`;
-- `is_group`: `True` for multi-token prefill models and `False` for
-  single-token decode models; and
+- `is_group`: `True` for a multi-token/group variant and `False` otherwise;
+  and
 - `index`: the index of that compiler unit.
 
 Some architectures also expose parts such as `DRAFT_FC` or `PER_LAYER`. Treat

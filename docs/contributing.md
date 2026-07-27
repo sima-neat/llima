@@ -15,7 +15,7 @@ Repository-specific agent rules are in [AGENTS.md](../AGENTS.md).
 | --- | --- | --- |
 | Configuration | `sima_lmm/config/` | Serializable LLM, VLM, and ASR configuration contracts |
 | Model ingestion | `sima_lmm/hf/`, `sima_lmm/gguf/` | Hugging Face and GGUF loading/conversion |
-| Graph generation | `sima_lmm/model/`, `sima_lmm/preproc/` | ONNX graph construction, quantization paths, and preprocessing |
+| Model compilation | `sima_lmm/model/`, `sima_lmm/preproc/` | Model-part construction, quantization paths, and preprocessing |
 | Host tools | `sima_lmm/host/` | Compile, deploy, LoRA, and benchmark entry points |
 | Evaluation | `sima_lmm/mole/` | Modalix Language Model Evaluator workflows |
 | Runtime | `sima_lmm/devkit/` | Python runtime orchestration and model management |
@@ -76,6 +76,7 @@ Activate that environment and install the checkout:
 
 ```bash
 source <model-compiler-venv>/bin/activate
+cd /path/to/llima
 python -m pip install -e '.[sdk_ext,tests]'
 llima-compile --help
 ```
@@ -112,29 +113,36 @@ tier.
 
 ### Model-backed compiler tests
 
-The current premerge suite is:
+Compiler tests live under `tests/compilation/`. Select the smallest affected
+group using the marker declared in `pytest.ini`. For example, run the
+configuration-contract group with:
 
 ```bash
-tox -e premerge
+export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
+
+python -P -m pytest \
+  -c pytest.ini \
+  tests/compilation/configuration \
+  -m compiler_config \
+  --strict-markers \
+  -vv -ra
 ```
 
-It runs parallel and serial pytest groups. Several tests require large model
-inputs or reference paths. Configure the required inputs rather than accepting
-fixture skips.
+The authoritative group matrix, local commands, expected case counts, and
+baseline-generation requirements are maintained in
+[`tests/README.md`](../tests/README.md). The CI invocation is maintained in
+`.github/workflows/model-compiler-tests.yml`. Several groups require large
+model inputs; configure them rather than accepting fixture skips.
 
 #### Model-backed test inputs
 
 | CLI option | Environment variable | Purpose |
 | --- | --- | --- |
-| `--hf-models-path` | `LLIMA_HF_MODELS_PATH` | Root containing prepared Hugging Face model directories |
-| `--gguf-models-path` | `LLIMA_GGUF_MODELS_PATH` | Root containing prepared GGUF inputs |
-| `--gguf-hf-model-path` | `LLIMA_GGUF_HF_MODEL_PATH` | Hugging Face source used for GGUF comparisons |
-| `--reference-onnx-path` | `LLIMA_REFERENCE_ONNX_PATH` | Existing external ONNX input used by legacy regression tests |
-| `--reference-draft-onnx-path` | `LLIMA_REFERENCE_DRAFT_ONNX_PATH` | Existing external draft ONNX input used by legacy tests |
+| `--model-inputs-path` | `LLIMA_HF_MODELS_PATH` | Root containing prepared Hugging Face, configuration-only, and GGUF inputs |
 
 CI prepares approved Hugging Face and GGUF inputs from the manifests under
-`tools/hf-safetensors/`. Local runs may point these variables at an equivalent
-readable cache.
+`tools/hf-safetensors/`. Local runs may point this option or variable at an
+equivalent readable cache.
 
 Do not add new persistent ONNX or NumPy baselines. Generate branch-relative
 ONNX and numerical comparison inputs during the test run using the same source
@@ -181,9 +189,9 @@ Allowed persistent test inputs include:
 Do not commit or publish as regression references:
 
 - downloaded Hugging Face or GGUF weights;
-- generated ONNX graphs;
+- generated ONNX models;
 - NumPy `.npy` or `.npz` outputs;
-- quantized intermediate graphs or tensors;
+- quantized intermediate models or tensors;
 - compiled MPK, ELF, or runtime model trees; or
 - customer model data.
 
@@ -191,19 +199,88 @@ Generated outputs belong in temporary or ignored build directories. CI should
 download approved source inputs, generate candidate and baseline outputs in
 the same run, compare them, and then discard them.
 
-## Code and Compatibility Standards
+## Coding Standards
+
+These standards apply to compiler, runtime, evaluation, packaging, and test
+code. Follow established local style and keep changes narrowly scoped; do not
+combine behavior changes with unrelated formatting.
+
+### Language and formatting
 
 - C++ code targets C++20.
-- Keep public headers and implementations coherent.
-- Treat installed C++ headers, Python APIs, console scripts, generated
-  configuration, and artifact layouts as compatibility surfaces.
-- Prefer additive changes and document migration impact for breaking behavior.
-- Keep compiler and runtime dependency graphs separate.
-- Fail clearly for unsupported architectures, formats, precisions, missing
-  artifacts, and invalid configuration. Do not silently choose a different
-  model or compilation path.
-- Keep deterministic inputs, stable configuration serialization, and
-  reproducible generated graphs wherever practical.
+- Python code must remain compatible with the versions declared in
+  `pyproject.toml`.
+- Follow the formatting, naming, and include grouping of the surrounding code.
+  LLiMa does not currently define a repository-wide formatter configuration, so
+  avoid broad mechanical reformatting.
+- Keep source headers and implementations coherent. Do not expose internal
+  implementation details through installed headers.
+- Add type annotations to new Python interfaces where practical.
+- Use comments and docstrings for non-obvious contracts, numerical assumptions,
+  hardware constraints, and design decisions. Do not merely restate the code.
+- Avoid duplicate code and unnecessary abstractions. Search for an existing
+  helper or nearby implementation before adding a new one.
+
+### API and artifact compatibility
+
+Treat these as compatibility surfaces:
+
+- installed C++ headers and Python APIs;
+- public CLI commands and options;
+- serialized configuration and metadata;
+- generated model-part names and artifact layouts; and
+- the responsibilities of runtime, compiler, and MoLE packages.
+
+Prefer backward-compatible additions over breaking changes. When a break is
+unavoidable, document the affected interfaces, downstream impact, migration
+steps, and release intent in the pull request. Update callers, tests, examples,
+and user documentation in the same change.
+
+Keep compiler and runtime dependencies separate. Compiler-only packages
+must not become Modalix runtime dependencies, and runtime state must not become
+an input to host-side model compilation.
+
+### Determinism
+
+- Identical model inputs and configuration should produce stable model-part
+  structure, model selection, serialization, and artifact names.
+- Keep cache-model selection and token-boundary behavior reproducible.
+- Use deterministic test inputs and record seeds where randomness is required.
+- Do not depend on filesystem iteration order, process completion order, or
+  mutable remote model state.
+
+### Error handling and diagnostics
+
+- Reject unsupported architectures, formats, precisions, invalid
+  configurations, and missing artifacts with actionable context.
+- Do not silently select a different model, precision, compilation path, or
+  runtime behavior.
+- Preserve the original cause when translating exceptions across compiler,
+  packaging, or runtime boundaries.
+- Include the relevant model part, layer, artifact, or configuration field in
+  diagnostics, while keeping credentials and private paths out of logs.
+
+### Concurrency and lifecycle
+
+- Do not block indefinitely during compiler-worker coordination, model loading,
+  inference shutdown, or runtime teardown.
+- Keep shared state thread-safe and process-safe. Make ownership and lifetime
+  explicit for buffers, model handles, temporary files, and worker results.
+- Ensure failure paths clean up partial work without deleting valid artifacts
+  produced by other workers or previous resumable runs.
+- Keep latency-sensitive runtime paths lightweight and avoid unnecessary
+  allocation, copies, and synchronization.
+
+### Documentation and review quality
+
+A code contribution should include:
+
+- a clear rationale in the code, commit, and pull request;
+- focused tests for new behavior and regressions;
+- compatibility and migration analysis for changed contracts;
+- updated documentation for user-visible behavior; and
+- explicit evidence for model-, compiler-, packaging-, and hardware-dependent
+  validation that was performed.
 
 ## Dependencies and Vendored Code
 

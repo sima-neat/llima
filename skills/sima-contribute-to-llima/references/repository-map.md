@@ -41,18 +41,20 @@ Keep evaluation dependencies out of the runtime Debian package.
 
 ## Tests and CI
 
-- `tests/`: pytest configuration, compiler/model/configuration coverage, and
-  reference JSON.
-- `pytest.ini`, `tox.ini`: marker and premerge execution policy.
+- `tests/compilation/`: compiler unit, configuration, source-ingestion, ONNX,
+  graph-integration, and bounded end-to-end coverage.
+- `tests/runtime/`: Modalix C++ and Python runtime validation.
+- `tests/README.md`, `pytest.ini`: test matrix, local commands, markers, and
+  compiler premerge policy.
 - `.github/workflows/vulcan-ci.yml`: build, publication, compiler smoke, and
   DevKit validation orchestration.
-- `.github/workflows/model-compiler-tests.yml`: Ubuntu/Model Compiler smoke
-  workflow.
+- `.github/workflows/model-compiler-tests.yml`: Model Compiler test workflow.
 - `tools/ci/prepare_model_inputs.py`: approved cached model preparation.
 - `tools/hf-safetensors/`: source-model manifests and cache publisher logic.
 
-Read `tests/conftest.py` for the currently supported local model-path
-overrides. Do not accept unintended fixture skips as proof.
+Read `tests/README.md` for local commands and
+`tests/compilation/conftest.py` for the current model-input override. Do not
+accept unintended fixture skips as proof.
 
 ## Documentation and Skills
 

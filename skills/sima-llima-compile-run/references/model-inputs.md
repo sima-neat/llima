@@ -5,8 +5,8 @@
 LLiMa supports these GenAI source families:
 
 - Hugging Face safetensors for supported LLMs and VLMs;
-- supported compressed-tensor GPTQ, AWQ, or AutoRound-style safetensor LLMs;
-  and
+- supported compressed-tensor GPTQ, AWQ, or AutoRound-style safetensor LLMs
+  and VLMs; and
 - GGUF for supported LLMs.
 
 GGUF is not the default VLM source path. Check the current supported-model and
