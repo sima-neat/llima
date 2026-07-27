@@ -1,6 +1,6 @@
 {
   "internals": {
-    "branch": "codex-processmla-kernel-direct",
+    "branch": "codex/processmla-kernel-direct",
     "spec": "latest"
   },
   "sdk": {

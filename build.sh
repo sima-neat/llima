@@ -346,14 +346,28 @@ fetch_neat_internals_vulcan_artifacts() {
     base_args+=(--base-url "${NEAT_VULCAN_BASE_URL}")
   fi
 
-  local exact_tag resolve_output resolved_ref
+  local dependency_spec exact_tag resolve_output resolved_ref
+  if ! dependency_spec="$(manifest_dependency_spec "internals" "${NEAT_INTERNALS_MANIFEST}")"; then
+    exit 1
+  fi
+  local allow_develop_fallback="OFF"
+  if [[ "${dependency_spec}" == "__SNAP__" ]]; then
+    allow_develop_fallback="${NEAT_INTERNALS_SNAP_POLICY}"
+  fi
+
   if ! resolve_output="$(SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli "${base_args[@]}" "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" --json)"; then
     exact_tag="$(current_exact_tag)"
     if [[ -n "${exact_tag}" && "${internals_ref}" == "${exact_tag}:latest" ]]; then
       echo "ERROR: Failed to resolve exact tag-snap internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
       exit 1
     fi
-    if [[ "${NEAT_INTERNALS_SNAP_POLICY}" != "ON" || "${internals_ref}" == "develop:latest" ]]; then
+    # Develop's snap policy deliberately falls back to develop:latest when a
+    # same-name companion artifact has not been published.  That is unsafe for
+    # this direct-kernel PR: an explicit companion pin is a coherence boundary,
+    # and silently installing develop recreates an Internals sysroot without
+    # MlaKernelBackend.  Only an actual {"policy":"snap"} manifest may use the
+    # fallback; explicit branch/spec dependencies must fail at resolution.
+    if [[ "${allow_develop_fallback}" != "ON" || "${internals_ref}" == "develop:latest" ]]; then
       echo "ERROR: Failed to resolve internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
       exit 1
     fi
