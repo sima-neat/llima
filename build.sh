@@ -932,7 +932,8 @@ build_extras_archive() {
       exit 1
     fi
 
-    rm -f "${archive_path}"
+    find "${ROOT_DIR}/dist" -maxdepth 1 -type f \
+      -name 'sima-lmm-*-Linux-extras.tar.gz' -delete
     tar -C "${install_prefix}" -czf "${archive_path}" .
   )
 
