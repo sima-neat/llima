@@ -616,6 +616,15 @@ ensure_neat_internals() {
 
   local deb_pattern_groups=(
     'neat-common_*_all.deb simaai-common_*_all.deb'
+    # Develop could compile LLiMa against the platform image's older memory
+    # package because MLA-RT owned all device submission.  The direct branch
+    # calls simaai_memory_export_dmabuf_fd() itself, so the runtime library and
+    # its matching development header are part of the same companion-artifact
+    # coherence boundary as MlaKernelBackend.  Install the exact packages from
+    # the pinned Internals artifact; do not let a stale SDK overlay satisfy one
+    # half of that ABI.
+    'simaai-memory-lib_*_arm64.deb'
+    'simaai-memory-lib-dev_*_arm64.deb'
     'neat-runtime_*_arm64.deb'
     'neat-gst-plugins_*_arm64.deb'
     'neat-internals-dev_*_arm64.deb'
@@ -658,6 +667,7 @@ ensure_neat_internals() {
   fi
 
   local config_dir dispatcher_factory_header dispatcher_base_header runtime_lib
+  local memory_header memory_lib
   local missing=()
 
   if [[ "${ELXR_SDK}" == "ON" ]]; then
@@ -665,22 +675,45 @@ ensure_neat_internals() {
     dispatcher_factory_header="${sysroot}/usr/include/dispatcherfactory.hh"
     dispatcher_base_header="${sysroot}/usr/include/dispatcherbase.hh"
     runtime_lib="${sysroot}/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
+    memory_header="${sysroot}/usr/include/simaai/simaai_memory.h"
+    memory_lib="${sysroot}/usr/lib/aarch64-linux-gnu/libsimaaimem.so.2"
   else
     config_dir="/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
     dispatcher_factory_header="/usr/include/dispatcherfactory.hh"
     dispatcher_base_header="/usr/include/dispatcherbase.hh"
     runtime_lib="/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
+    memory_header="/usr/include/simaai/simaai_memory.h"
+    memory_lib="/usr/lib/aarch64-linux-gnu/libsimaaimem.so.2"
   fi
 
   [[ -d "${config_dir}" ]] || missing+=("${config_dir}")
   [[ -f "${dispatcher_factory_header}" ]] || missing+=("${dispatcher_factory_header}")
   [[ -f "${dispatcher_base_header}" ]] || missing+=("${dispatcher_base_header}")
   [[ -f "${runtime_lib}" ]] || missing+=("${runtime_lib}")
+  [[ -f "${memory_header}" ]] || missing+=("${memory_header}")
+  [[ -e "${memory_lib}" ]] || missing+=("${memory_lib}")
 
   if [[ "${#missing[@]}" -gt 0 ]]; then
     echo "ERROR: NEAT internals artifact install is incomplete." >&2
     echo "Missing:" >&2
     printf '  %s\n' "${missing[@]}" >&2
+    exit 1
+  fi
+
+  # A path-only check is insufficient here: the SDK already contains a
+  # same-guard pre-direct header and SONAME.  Verify the one declaration and
+  # ELF export that distinguish the companion ABI so CI fails during artifact
+  # admission rather than several minutes later in the LLiMa compile or on a
+  # board at dlopen time.  readelf inspects the AArch64 file as data; it does
+  # not execute a target binary in the x86 build container.
+  if ! grep -q 'simaai_memory_export_dmabuf_fd' "${memory_header}"; then
+    echo "ERROR: Companion simaai-memory header lacks dma-buf export ABI: ${memory_header}" >&2
+    exit 1
+  fi
+  if ! command -v readelf >/dev/null 2>&1 ||
+     ! readelf --wide --dyn-syms "${memory_lib}" |
+       grep -q '[[:space:]]simaai_memory_export_dmabuf_fd$'; then
+    echo "ERROR: Companion simaai-memory library lacks dma-buf export ABI: ${memory_lib}" >&2
     exit 1
   fi
 
