@@ -402,7 +402,8 @@ jobs:
     uses: ./.github/workflows/model-compiler-tests.yml
     with:
       vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
-      artifact_base_url: ${{ needs.resolve-model-cache-config.outputs.artifact_base_url }}
+      artifact_bucket: ${{ needs.resolve-model-cache-config.outputs.artifact_bucket }}
+      aws_region: ${{ needs.resolve-model-cache-config.outputs.aws_region }}
 
   test-devkit:
     name: Test LLiMa Runtime on DevKit
