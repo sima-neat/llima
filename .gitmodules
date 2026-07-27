@@ -1,6 +1,6 @@
 [submodule "third_party/minja"]
 	path = third_party/minja
-	url = https://github.com/ochafik/minja.git
+	url = https://github.com/sima-neat/minja.git
 [submodule "third_party/tokenizers-cpp"]
 	path = third_party/tokenizers-cpp
 	url = https://github.com/mlc-ai/tokenizers-cpp
