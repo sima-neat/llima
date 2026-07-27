@@ -22,9 +22,11 @@ explicit.
    - packaging or dependencies;
    - CI, tests, or model caches;
    - documentation or skills.
-4. Search with `rg` for nearby implementations, tests, CLI definitions, and
+4. For a new architecture, source layout, tokenizer, or chat template, also use
+   `sima-add-llima-model-support`.
+5. Search with `rg` for nearby implementations, tests, CLI definitions, and
    documentation before editing.
-5. Preserve unrelated user changes and vendored code.
+6. Preserve unrelated user changes and vendored code.
 
 ## Invariants
 

@@ -24,6 +24,11 @@ validation; application composition belongs to the Neat application workflow.
      choosing among available formats.
    - Check the current LLiMa supported-model documentation before downloading
      large artifacts or starting compilation.
+   - A checkpoint conforming to an existing architecture remains in this
+     workflow and should not require repository changes.
+   - If investigation shows that the model requires a new architecture, source
+     layout, tokenizer, or chat-template repository change, stop this workflow
+     and use `sima-add-llima-model-support`.
 3. Resolve access safely.
    - Prefer an existing local model or approved cache.
    - For a gated Hugging Face model, verify access without printing the token.

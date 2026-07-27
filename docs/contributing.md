@@ -20,7 +20,7 @@ Repository-specific agent rules are in [AGENTS.md](../AGENTS.md).
 | Evaluation | `sima_lmm/mole/` | Modalix Language Model Evaluator workflows |
 | Runtime | `sima_lmm/devkit/` | Python runtime orchestration and model management |
 | C++ runtime | `sima_lmm/devkit/cpp/` | LLM, VLM, ASR, tokenizer, MLA, CLI, web, and ZMQ runtime |
-| Tests | `tests/` | Compiler/configuration tests and shared fixtures |
+| Tests | `tests/` | Compiler/configuration tests, Modalix runtime tests, and shared fixtures |
 | Packaging | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian, wheel, and artifact assembly |
 | CI and caches | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | Vulcan builds, compiler smoke tests, and immutable model caches |
 | Documentation | `README.md`, `docs/` | Repository and official user/contributor documentation |
