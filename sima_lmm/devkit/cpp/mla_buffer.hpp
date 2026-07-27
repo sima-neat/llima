@@ -27,6 +27,10 @@ class MLABuffer {
             bool align_last_dim
         );
         ~MLABuffer();
+        MLABuffer(const MLABuffer&) = delete;
+        MLABuffer& operator=(const MLABuffer&) = delete;
+        MLABuffer(MLABuffer&&) = delete;
+        MLABuffer& operator=(MLABuffer&&) = delete;
         void allocate();
         void try_allocate() { if (!_simaai_mem_ptr) allocate(); }
         void free();
@@ -40,10 +44,7 @@ class MLABuffer {
             const void* data, size_t data_begin = 0, size_t data_size = 0, bool flush = true
         );
         void download(void* data) const;
-        uint32_t get_buf_addr_offset(
-            const std::optional<std::vector<uint32_t>>& begin = std::nullopt
-        ) const;
-        uint64_t get_buf_addr(
+        uint64_t get_buf_addr_offset(
             const std::optional<std::vector<uint32_t>>& begin = std::nullopt
         ) const;
         uint64_t get_buf_len(
@@ -54,9 +55,11 @@ class MLABuffer {
 
         const std::string& get_name() const { return _name; }
         const std::string& get_dtype() const { return _dtype; }
-        const uint8_t get_elem_size() const { return _elem_size; }
+        uint8_t get_elem_size() const { return _elem_size; }
         const std::vector<size_t>& get_shape() const { return _shape; }
         size_t get_num_elems() const { return _size / _elem_size; }
+        size_t get_allocation_size() const { return _size_padded; }
+        uint64_t get_allocation_cookie() const { return _allocation_cookie; }
         void* get_virtual_addr() const { return _virtual_addr; }
         simaai_memory_t* get_simaai_memory() const { return _simaai_mem_ptr; }
 
@@ -81,10 +84,12 @@ class MLABuffer {
 
         size_t _size;
         size_t _size_padded;
-        std::vector<int64_t> _stride;
+        // Physical element strides.  These include MLA row padding and are
+        // unsigned because a negative tensor stride is never valid here.
+        std::vector<uint64_t> _stride;
         simaai_memory_t* _simaai_mem_ptr;
-        uint64_t _physical_addr;
         void* _virtual_addr;
+        uint64_t _allocation_cookie = 0;
 };
 
 
@@ -104,10 +109,9 @@ class MLABufferSlice {
         ~MLABufferSlice() {}
 
         MLABuffer* get_buf_ptr() const { return _buf_ptr; }
-        uint64_t get_buf_addr() const;
-        uint64_t get_buf_addr(const std::optional<std::vector<uint32_t>>& begins) const;
         auto get_buf_begins() const { return _begins; }
         auto get_buf_shapes() const { return _shapes; }
+        uint64_t get_byte_offset() const;
 
         void to_file(const std::filesystem::path& file_name) const;
 

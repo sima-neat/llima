@@ -18,6 +18,8 @@ EXPORT void set_log_level(spdlog::level::level_enum log_level);
 EXPORT void initialize_default_sample_files();
 
 EXPORT void connect(
+    // Retained for source/Python compatibility only.  Direct-kernel sessions
+    // do not parse or forward historical MLA-RT command-line arguments.
     const std::vector<std::string>& mla_rt_args,
     const std::filesystem::path& log_file_name = "run.log",
     const spdlog::level::level_enum log_level = spdlog::level::warn

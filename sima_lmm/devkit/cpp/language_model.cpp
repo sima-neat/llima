@@ -1,9 +1,11 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 
 #include <Eigen/Dense>
 #include <cnpy.h>
@@ -29,7 +31,19 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer
-) : BaseModel(model_path),
+) : LanguageModel(
+        current_mla_execution_session(), std::move(model_path),
+        std::move(stop_token_ids), image_token_id, pad_token_id, text_streamer
+    ) {}
+
+LanguageModel::LanguageModel(
+    std::shared_ptr<MlaExecutionSession> session,
+    std::filesystem::path model_path,
+    std::set<uint32_t> stop_token_ids,
+    std::optional<uint32_t> image_token_id,
+    std::optional<uint32_t> pad_token_id,
+    TextStreamer& text_streamer
+) : BaseModel(model_path, std::move(session)),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id),
@@ -229,6 +243,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids
 ) {
+    require_healthy_mla_session();
     // Update the state.
     _is_running = true;
 
@@ -283,6 +298,7 @@ uint32_t LanguageModel::run_model_prefill(
     uint16_t num_cached_tokens,
     std::optional<ChronoTimer> timer_ttft
 ) {
+    require_healthy_mla_session();
     if (_uses_per_layer_inputs())
         _prompt_per_layer_token_ids = _get_per_layer_token_ids(input_token_ids);
     if (!timer_ttft.has_value())
@@ -382,6 +398,7 @@ uint32_t LanguageModel::run_model_prefill(
 void LanguageModel::run_model_decode(
     uint16_t num_input_tokens, uint32_t token_id
 ) {
+    require_healthy_mla_session();
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
@@ -415,6 +432,14 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
+    require_healthy_mla_session();
+    /*
+     * All compiled layers contributing to this state transition share one
+     * explicit transaction. Mid-function commits are intentional CPU
+     * observation boundaries; the segment retains the session lock across
+     * them so another producer cannot interleave dependent KV state.
+     */
+    MlaExecutionSegment segment(_mla_session);
     uint16_t next_token_idx;
     if (num_tokens > 1) {
         next_token_idx = std::min(num_input_tokens, uint16_t(token_idx + num_tokens));
@@ -481,7 +506,7 @@ uint32_t LanguageModel::run_model_once(
                 std::vector<uint32_t>{normal_input_num_tokens, _cfg.lm_cfg.hidden_size}
             )
         );
-        _per_layer_model_map.at(per_layer_key).add_to_queue(&per_layer_ifm_map);
+        _per_layer_model_map.at(per_layer_key).add_to_segment(segment, &per_layer_ifm_map);
     }
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
@@ -503,7 +528,7 @@ uint32_t LanguageModel::run_model_once(
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
-            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
+            _pre_model_map.at(model_key).add_to_segment(segment, &ifm_map);
 
             if (
                 num_input_tokens > next_token_idx
@@ -512,7 +537,7 @@ uint32_t LanguageModel::run_model_once(
                 break;
             }
 
-            _cache_model_map.at(model_key).add_to_queue();
+            _cache_model_map.at(model_key).add_to_segment(segment);
 
             const bool is_draft = _cfg.lm_cfg.is_spec_decode()
                 && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
@@ -638,7 +663,7 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            _post_model_map.at(model_key).add_to_segment(segment, &ifm_map);
 
             // Spec-decoding capture: download n128_buffer1 (this layer's hidden
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
@@ -655,7 +680,7 @@ uint32_t LanguageModel::run_model_once(
                 };
                 auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
                 if (it != capture_layers.end()) {
-                    MLAModelWithBuffer::run_queue();
+                    segment.commit();
                     if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
                         _eagle3_intermediate_hidden_states.resize(capture_layers.size());
                     }
@@ -668,7 +693,7 @@ uint32_t LanguageModel::run_model_once(
             }
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
-            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+            _conv_model_map.at(conv_model_key).add_to_segment(segment, &ifm_map);
 
             if (
                 num_input_tokens > next_token_idx
@@ -691,7 +716,7 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
-            _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+            _conv_final_model_map.at(conv_model_key).add_to_segment(segment, &ifm_map);
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
@@ -699,8 +724,15 @@ uint32_t LanguageModel::run_model_once(
         }
     }
 
-    // Run all the queued models.
-    MLAModelWithBuffer::run_queue();
+    /*
+     * Commit this dependency segment and consume every authoritative terminal
+     * CQE before CPU code reads logits/KV state.  The previous run-all path
+     * handed a list to MLA-RT/Dispatcher; this segment instead submits a
+     * bounded window directly to the kernel while preserving compiler order.
+     * Keeping the boundary explicit prevents queue-ahead from crossing a CPU
+     * observation or mutation point.
+     */
+    segment.commit();
 
     // If this run landed exactly on a checkpoint boundary, save the tail.
     if (!_cached_states.empty()) {
@@ -808,7 +840,9 @@ void LanguageModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
+    _mla_model_anchor().load_related_models(
+        _elf_dir / _cfg.language_model_name
+    );
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
@@ -1001,7 +1035,9 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
 
 void LanguageModel::_finalize() {
     _logger->info("Language model finalize starting ...");
-    MLAModelWithBuffer::free_all_models(_elf_dir / _cfg.language_model_name);
+    _mla_model_anchor().free_related_models(
+        _elf_dir / _cfg.language_model_name
+    );
     BaseModel::_finalize();
     _logger->info("Language model finalize completed");
 }
@@ -1252,7 +1288,12 @@ void LanguageModel::_define_model(
     const std::vector<MLABufferSlice>& ofms
 ) {
     LanguageModelMap& map = get_model_map(model_type);
-    map.emplace(key, MLAModelWithBuffer(model_path, ifms, ofms));
+    map.emplace(
+        key, MLAModelWithBuffer(
+            _mla_session, model_path, ifms, ofms,
+            _cfg.lm_cfg.has_lora()
+        )
+    );
 }
 
 
@@ -1755,7 +1796,10 @@ void LanguageModel::_define_draft_fc_models() {
             MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))}
         };
         _fc_model_map.emplace(
-            num_tokens, MLAModelWithBuffer(elf_path, ifms, ofms)
+            num_tokens, MLAModelWithBuffer(
+                _mla_session, elf_path, ifms, ofms,
+                _cfg.lm_cfg.has_lora()
+            )
         );
     }
 }
@@ -1764,6 +1808,7 @@ void LanguageModel::_define_draft_fc_models() {
 void LanguageModel::compact_kv_after_accept(
     std::span<const uint16_t> select_indices, uint16_t prev_input_len
 ) {
+    require_healthy_mla_session();
     const size_t n = select_indices.size();
     const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
     const auto& layer_types = _cfg.lm_cfg.layer_types;
@@ -1849,10 +1894,9 @@ void LanguageModel::_define_per_layer_models() {
 
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
-    // Swap the model weights with the data from the `{_devkit_dir}/../npy_files/{reloc_name}`.
-    // Instead of overwrite the dram space allocated by the mla-rt, allocate new buffers populated
-    // with the data read from the npy files and relocates the dram addresses of the dma
-    // descriptors so that the models use the weights from the new buffers.
+    require_healthy_mla_session();
+    // Swap model adapters from `{devkit}/../npy_files/{reloc_name}` without
+    // changing the immutable compiled base model.
 
     if (_reloc_name == reloc_name) {
         // The model has already been relocated to the same path. Nothing to be done.
@@ -1867,10 +1911,13 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         uint8_t layer_idx;
         auto operator<=>(const RelocMapType&) const = default;
     };
-    using RelocMap = std::map<std::string, uint64_t>;
+    /*
+     * Keep dma-buf-backed slices, never raw physical addresses. The direct
+     * backend snapshots checked hidden-input BufferViews per accepted job, so
+     * switching adapters cannot mutate an older queued descriptor set.
+     */
+    using RelocMap = std::map<std::string, MLABufferSlice>;
 
-    // Allocate the memory for the new content to be relocated and collect the maps of the addresses
-    // to relocate the models' dma descriptors.
     auto reloc_dir = _devkit_dir / "../npy_files" / reloc_name;
     _logger->info("Relocation with data from: {}", reloc_dir);
     if (!std::filesystem::is_directory(reloc_dir)) {
@@ -1879,87 +1926,230 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
             std::make_error_code(std::errc::no_such_file_or_directory)
         );
     }
-    std::map<RelocMapType, RelocMap> reloc_addr_maps;
-    for (const auto& dir_entry: std::filesystem::directory_iterator(reloc_dir)) {
-        auto file_name = dir_entry.path();
-        auto file_name_str = file_name.string();
-        if (file_name.extension() != ".npy")
-            continue;
+    const uint8_t candidate_bank = _reloc_buffer_bank ^ 1U;
+    std::vector<MLAModelWithBuffer*> candidate_models;
 
-        // Extract the num_tokens and layer_idx from the file name.
-        std::regex pattern(R"(_n(\d+)_(pre|post)_layer(\d+)_)");
-        std::smatch match;
-        RelocMapType model_key;
-        if (std::regex_search(file_name_str, match, pattern)) {
-            uint16_t num_tokens = std::stoi(match[1].str());
-            std::string model_type = match[2].str();
-            uint8_t layer_idx = std::stoi(match[3].str());
-            model_key = {model_type, num_tokens, layer_idx};
-        } else {
-            auto msg = fmt::format("Invalid file name for relocation: {}", file_name);
-            throw std::runtime_error(msg);
-        }
+    /*
+     * set_reloc_set owns the session execution lock for this entire callback.
+     * Consequently every previously accepted job has a terminal CQE before an
+     * inactive bank is overwritten, and no new snapshot can observe a partial
+     * upload. Validation/publishing is performed only after the callback
+     * returns its complete candidate vector.
+     */
+    _mla_model_anchor().set_reloc_set(
+        _reloc_models,
+        [&]() -> std::vector<MLAModelWithBuffer::RelocUpdate> {
+            std::map<RelocMapType, RelocMap> reloc_addr_maps;
+            std::vector<std::filesystem::path> adapter_files;
+            for (const auto& dir_entry :
+                 std::filesystem::directory_iterator(reloc_dir)) {
+                if (dir_entry.path().extension() == ".npy") {
+                    adapter_files.push_back(dir_entry.path());
+                }
+            }
+            std::sort(adapter_files.begin(), adapter_files.end());
+            if (adapter_files.empty()) {
+                throw std::invalid_argument(fmt::format(
+                    "Adapter directory {} contains no NPY files", reloc_dir
+                ));
+            }
 
-        // Skip the file for group token models if not used.
-        if (!_use_group_token_models && model_key.num_tokens > 1)
-            continue;
+            /*
+             * One dma-buf per NPY made a real 1,888-tensor adapter exceed the
+             * process FD limit before publication. Pack the inactive adapter
+             * into one immutable arena instead. A conservative 64-KiB start
+             * alignment preserves the alignment each old standalone DMS0
+             * allocation received; compiler extents still bound every view.
+             * The upper bound uses on-disk file sizes (header + payload), so
+             * the subsequent raw payload packing cannot exceed it.
+             */
+            constexpr std::size_t arena_alignment = 64U * 1024U;
+            auto align_arena_offset = [](std::size_t value) {
+                const std::size_t remainder = value % arena_alignment;
+                if (remainder == 0) return value;
+                const std::size_t increment = arena_alignment - remainder;
+                if (value > std::numeric_limits<std::size_t>::max() - increment) {
+                    throw std::overflow_error("LoRA arena alignment overflow");
+                }
+                return value + increment;
+            };
+            std::size_t arena_capacity = 0;
+            for (const auto& file_name : adapter_files) {
+                arena_capacity = align_arena_offset(arena_capacity);
+                const std::uintmax_t file_bytes =
+                    std::filesystem::file_size(file_name);
+                if (file_bytes > std::numeric_limits<std::size_t>::max() ||
+                    static_cast<std::size_t>(file_bytes) >
+                        std::numeric_limits<std::size_t>::max() - arena_capacity) {
+                    throw std::overflow_error("LoRA arena size overflow");
+                }
+                arena_capacity += static_cast<std::size_t>(file_bytes);
+            }
 
-        // Upload the tensor to the buffer.
-        auto tensor = cnpy::npy_load(file_name);
-        auto buffer_name = file_name.stem();
-
-        // If the buffer does not exist, define and allocate it first.
-        if (!has_buffer(buffer_name)) {
-            define_buffer(buffer_name, tensor.shape, "int8");
-        }
-        auto& buf = get_buffer(buffer_name);
-        buf.try_allocate();
-
-        // Upload the tensor.
-        buf.upload(tensor.data<void>());
-
-        // Append the reloc addr map.
-        reloc_addr_maps[model_key][buffer_name] = buf.get_buf_addr();
-    }
-
-    // Relocation the dma descriptors
-    for (const auto& [reloc_map_type, reloc_addr_map]: reloc_addr_maps) {
-        // For each pre/post model, we only need to relocate the unique model once.
-        LanguageModelMapKey model_key{reloc_map_type.num_tokens, reloc_map_type.layer_idx, 0};
-
-        MLAModelWithBuffer* model_ptr;
-        if (reloc_map_type.model_type == "pre") {
-            model_ptr = &_pre_model_map.at(model_key);
-        } else if (reloc_map_type.model_type == "post") {
-            model_ptr = &_post_model_map.at(model_key);
-        } else {
-            auto msg = fmt::format(
-                "Relocate data for {} is not supported", reloc_map_type.model_type
+            const std::string arena_name = fmt::format(
+                "__reloc_bank{}_arena", candidate_bank
             );
-            throw std::runtime_error(msg);
+            if (!has_buffer(arena_name)) {
+                define_buffer(arena_name, {arena_capacity}, "int8", false);
+            } else {
+                const auto& existing = get_buffer(arena_name);
+                if (existing.get_dtype() != "int8" ||
+                    existing.get_shape().size() != 1 ||
+                    existing.get_shape()[0] < arena_capacity) {
+                    /*
+                     * Resizing would invalidate an already imported dma-buf
+                     * generation. Compiled adapters for one model must have
+                     * the same hidden-port schema, so fail closed and require
+                     * session reconstruction instead of leaking an old bank.
+                     */
+                    throw std::invalid_argument(fmt::format(
+                        "Adapter {} does not fit the existing bank {}",
+                        reloc_name, arena_name
+                    ));
+                }
+            }
+            auto& arena = get_buffer(arena_name);
+            arena.try_allocate();
+            arena.clear(false);
+
+            std::size_t arena_cursor = 0;
+            for (const auto& file_name : adapter_files) {
+
+                std::regex pattern(R"(_n(\d+)_(pre|post)_layer(\d+)_)");
+                std::smatch match;
+                RelocMapType model_key;
+                const std::string file_name_str = file_name.string();
+                if (std::regex_search(file_name_str, match, pattern)) {
+                    model_key = {
+                        match[2].str(),
+                        static_cast<uint16_t>(std::stoi(match[1].str())),
+                        static_cast<uint8_t>(std::stoi(match[3].str()))
+                    };
+                } else {
+                    throw std::runtime_error(fmt::format(
+                        "Invalid file name for relocation: {}", file_name
+                    ));
+                }
+                if (!_use_group_token_models && model_key.num_tokens > 1) {
+                    continue;
+                }
+
+                auto tensor = cnpy::npy_load(file_name);
+                if (tensor.word_size != 1) {
+                    throw std::invalid_argument(fmt::format(
+                        "Adapter {} is not an int8 NPY payload", file_name
+                    ));
+                }
+                const std::string file_stem = file_name.stem().string();
+                /*
+                 * Adapter files are named
+                 *   <qmla-elf-stem>_reloc.<hidden-port-name>.npy
+                 * while the package metadata intentionally exposes only the
+                 * compiler's hidden-port name (for example
+                 * `reloc.filter....lora_A.weight`).  The old MLA-RT path
+                 * discarded names and depended on map order, so carrying the
+                 * entire filename stem appeared to work there.  The direct
+                 * path validates names before publishing an immutable binding
+                 * set; strip exactly the compiler-added filename prefix rather
+                 * than weakening that validation or reverting to ordering.
+                 */
+                constexpr std::string_view reloc_marker = "_mla_reloc.";
+                const std::size_t reloc_pos = file_stem.rfind(reloc_marker);
+                if (reloc_pos == std::string::npos ||
+                    reloc_pos + reloc_marker.size() == file_stem.size()) {
+                    throw std::invalid_argument(fmt::format(
+                        "Adapter filename has no hidden-port suffix: {}",
+                        file_name
+                    ));
+                }
+                const std::string port_name = file_stem.substr(
+                    reloc_pos + reloc_marker.size()
+                );
+                arena_cursor = align_arena_offset(arena_cursor);
+                const std::size_t tensor_bytes = tensor.num_bytes();
+                if (tensor_bytes == 0 || arena_cursor > arena_capacity ||
+                    tensor_bytes > arena_capacity - arena_cursor ||
+                    arena_cursor > std::numeric_limits<std::uint32_t>::max() ||
+                    tensor_bytes > std::numeric_limits<std::uint32_t>::max()) {
+                    throw std::overflow_error(fmt::format(
+                        "Adapter payload does not fit {}: {}",
+                        arena_name, file_name
+                    ));
+                }
+                arena.upload(
+                    tensor.data<void>(), arena_cursor, tensor_bytes, false
+                );
+                reloc_addr_maps[model_key][port_name] =
+                    MLABufferSlice{
+                        &arena,
+                        {static_cast<std::uint32_t>(arena_cursor)},
+                        {static_cast<std::uint32_t>(tensor_bytes)}
+                    };
+                arena_cursor += tensor_bytes;
+            }
+            /* Publish all CPU writes to the device once, not once per NPY. */
+            arena.flush_cache();
+            if (reloc_addr_maps.empty()) {
+                throw std::invalid_argument(fmt::format(
+                    "Adapter directory {} contains no applicable NPY files",
+                    reloc_dir
+                ));
+            }
+
+            std::vector<MLAModelWithBuffer::RelocUpdate> updates;
+            updates.reserve(reloc_addr_maps.size());
+            candidate_models.clear();
+            for (auto& [reloc_map_type, reloc_addr_map] : reloc_addr_maps) {
+                const LanguageModelMapKey model_key{
+                    reloc_map_type.num_tokens, reloc_map_type.layer_idx, 0
+                };
+                MLAModelWithBuffer* model = nullptr;
+                if (reloc_map_type.model_type == "pre") {
+                    model = &_pre_model_map.at(model_key);
+                } else if (reloc_map_type.model_type == "post") {
+                    model = &_post_model_map.at(model_key);
+                } else {
+                    throw std::runtime_error(fmt::format(
+                        "Relocate data for {} is not supported",
+                        reloc_map_type.model_type
+                    ));
+                }
+                candidate_models.push_back(model);
+                updates.push_back({model, std::move(reloc_addr_map)});
+            }
+            return updates;
         }
-        model_ptr->update_reloc(reloc_addr_map);
-    }
+    );
 
     _cached_token_ids.clear();
+    _reloc_buffer_bank = candidate_bank;
+    _reloc_models = std::move(candidate_models);
     _reloc_name = reloc_name;
     _logger->info("Relocation completed");
 }
 
 
 void LanguageModel::unset_reloc() {
+    require_healthy_mla_session();
     // Unset the new weignts set by the set_reloc function.
     if (!_reloc_name.has_value()) return;
 
-    // Find the buffers with `reloc` in the name and unset the buffer data.
-    for (auto& [name, buffer]: _buf_map) {
-        if (name.find("reloc") == std::string::npos) continue;
-
-        // Zero out the buffer data.
-        buffer.clear();
-    }
+    /*
+     * Publish base bindings first, then scrub both inactive adapter banks while
+     * the same execution lock is still held. The old implementation merely
+     * zeroed storage and left active maps installed, silently selecting a zero
+     * adapter on future jobs.
+     */
+    _mla_model_anchor().clear_reloc_set(_reloc_models, [&]() {
+        for (auto& [name, buffer] : _buf_map) {
+            if (name.starts_with("__reloc_bank")) {
+                buffer.clear();
+            }
+        }
+    });
 
     _cached_token_ids.clear();
+    _reloc_models.clear();
     _reloc_name = std::nullopt;
     _logger->info("Undo relocation completed");
 }
@@ -1981,6 +2171,23 @@ LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) {
     } else {
         throw std::runtime_error(std::string("Invalid model type: ") + model_type);
     }
+}
+
+MLAModelWithBuffer& LanguageModel::_mla_model_anchor() {
+    /*
+     * All entries owned by one LanguageModel are constructed while the same
+     * explicit session is current and retain that session thereafter.  Pick
+     * any existing entry only to reach the session-owned package operation;
+     * never consult the reconnectable process-global compatibility factory.
+     */
+    if (!_pre_model_map.empty()) return _pre_model_map.begin()->second;
+    if (!_cache_model_map.empty()) return _cache_model_map.begin()->second;
+    if (!_post_model_map.empty()) return _post_model_map.begin()->second;
+    if (!_conv_model_map.empty()) return _conv_model_map.begin()->second;
+    if (!_conv_final_model_map.empty()) return _conv_final_model_map.begin()->second;
+    if (!_per_layer_model_map.empty()) return _per_layer_model_map.begin()->second;
+    if (!_fc_model_map.empty()) return _fc_model_map.begin()->second;
+    throw std::logic_error("LanguageModel has no MLA model/session anchor");
 }
 
 

@@ -1,5 +1,8 @@
+#include <atomic>
 #include <fstream>
+#include <limits>
 #include <set>
+#include <stdexcept>
 
 #include <fmt/ranges.h>
 #include <simaai_memory.h>
@@ -8,6 +11,32 @@
 
 namespace simaai {
 namespace llima {
+
+namespace {
+std::atomic<uint64_t> next_allocation_cookie{1};
+
+size_t checked_mul_size(size_t lhs, size_t rhs, const char* what) {
+    if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs) {
+        throw std::overflow_error(what);
+    }
+    return lhs * rhs;
+}
+
+size_t checked_round_up_size(size_t value, size_t alignment, const char* what) {
+    if (alignment == 0) {
+        throw std::invalid_argument("MLA buffer alignment must be non-zero");
+    }
+    const size_t remainder = value % alignment;
+    if (remainder == 0) {
+        return value;
+    }
+    const size_t increment = alignment - remainder;
+    if (value > std::numeric_limits<size_t>::max() - increment) {
+        throw std::overflow_error(what);
+    }
+    return value + increment;
+}
+}
 
 MLABuffer::MLABuffer(
     std::string name,
@@ -18,7 +47,8 @@ MLABuffer::MLABuffer(
     _shape(std::move(shape)),
     _dtype(std::move(dtype)),
     _align_last_dim(align_last_dim),
-    _simaai_mem_ptr(nullptr) {
+    _simaai_mem_ptr(nullptr),
+    _virtual_addr(nullptr) {
 
     if (!_shape.size())
         throw std::runtime_error(
@@ -34,33 +64,50 @@ MLABuffer::MLABuffer(
     else
         throw std::runtime_error(std::string("Dtype to elem size is not defined: ") + _dtype);
 
-    // Compute the total number of bytes required.
+    /*
+     * Compute both logical and physically padded sizes with checked
+     * arithmetic.  An overflow here would otherwise wrap into a small DMS0
+     * allocation and make every later BufferView range check meaningless.
+     */
     _size = _elem_size;
-    for (uint32_t i = 0; i < _shape.size(); ++i) {
-        _size *= _shape[i];
+    for (const size_t dim : _shape) {
+        if (dim == 0) {
+            throw std::runtime_error(fmt::format("Invalid zero-sized shape: {}", _shape));
+        }
+        _size = checked_mul_size(_size, dim, "MLA buffer logical size overflow");
     }
-    if (!_size)
-        throw std::runtime_error(fmt::format("Invalid shape: {}", _shape));
-    _stride = std::vector<int64_t>(_shape.size());
+    _stride = std::vector<uint64_t>(_shape.size());
     _stride[_shape.size() - 1] = 1;
     if (_align_last_dim) {
-        _size_padded = round_up_to_row(_shape.back() * _elem_size);
+        const size_t logical_row_bytes = checked_mul_size(
+            _shape.back(), _elem_size, "MLA buffer row size overflow"
+        );
+        _size_padded = checked_round_up_size(
+            logical_row_bytes, MLA_ROW_SIZE, "MLA buffer padded row size overflow"
+        );
         for (uint32_t i = 0; i < _shape.size() - 1; ++i) {
-            _size_padded *= _shape[i];
+            _size_padded = checked_mul_size(
+                _size_padded, _shape[i], "MLA buffer padded size overflow"
+            );
         }
         if (_shape.size() > 1) {
-            _stride[_shape.size() - 2] = round_up_to(_shape.back(), MLA_ROW_SIZE / _elem_size);
+            _stride[_shape.size() - 2] = checked_round_up_size(
+                logical_row_bytes, MLA_ROW_SIZE, "MLA buffer padded row size overflow"
+            ) / _elem_size;
         }
     } else {
-        _size_padded = round_up_to_row(_size);
+        _size_padded = checked_round_up_size(
+            _size, MLA_ROW_SIZE, "MLA buffer padded size overflow"
+        );
         if (_shape.size() > 1) {
             _stride[_shape.size() - 2] = _shape.back();
         }
     }
     if (_shape.size() > 2) {
         for (int i = _shape.size() - 3; i >= 0; --i) {
-            _stride[i] = _stride[i + 1] * _shape[i + 1];
-        
+            _stride[i] = checked_mul_size(
+                _stride[i + 1], _shape[i + 1], "MLA buffer stride overflow"
+            );
         }
     }
 }
@@ -78,8 +125,22 @@ void MLABuffer::allocate() {
     }
 
     // Allocate the buffer.
+    /*
+     * Every LLiMa tensor that can be bound to JOB_EXEC must obey the one
+     * dma-buf mapping contract selected for the direct driver: coherent /
+     * noncached DMS0.  A cached legacy simaai-memory mapping cannot be
+     * exported safely because its dma-buf begin/end hooks cannot maintain a
+     * resource mapping above the linear map, and exporting it would also
+     * permit cached and coherent aliases of the same physical storage.
+     *
+     * Do not make this a runtime option.  Adapter, KV, intermediate, IFM and
+     * OFM buffers all travel through the same checked BufferView path, so one
+     * allocation policy keeps ownership semantics uniform and lets the
+     * kernel reject legacy cached exports instead of accepting an ambiguous
+     * coherency contract.
+     */
     _simaai_mem_ptr = simaai_memory_alloc_flags(
-        _size_padded, SIMAAI_MEM_TARGET_DMS0, SIMAAI_MEM_FLAG_CACHED
+        _size_padded, SIMAAI_MEM_TARGET_DMS0, SIMAAI_MEM_FLAG_DEFAULT
     );
     if (!_simaai_mem_ptr) {
         throw std::runtime_error(
@@ -95,8 +156,17 @@ void MLABuffer::allocate() {
         throw std::runtime_error("Failed to map buffer (" + _name + "): " + std::strerror(errno));
     }
 
-    // Get the physical address.
-    _physical_addr = simaai_memory_get_phys(_simaai_mem_ptr);
+    /*
+     * The direct kernel path imports this allocation as a dma-buf.  Do not
+     * fetch or expose a physical address: it would recreate the unsafe
+     * application contract that the final Backend intentionally removed.
+     */
+    _allocation_cookie =
+        next_allocation_cookie.fetch_add(1, std::memory_order_relaxed);
+    if (_allocation_cookie == 0) {
+        _allocation_cookie =
+            next_allocation_cookie.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void MLABuffer::free() {
@@ -104,17 +174,28 @@ void MLABuffer::free() {
     simaai_memory_unmap(_simaai_mem_ptr);
     simaai_memory_free(_simaai_mem_ptr);
     _simaai_mem_ptr = nullptr;
+    _virtual_addr = nullptr;
+    _allocation_cookie = 0;
 }
 
 void MLABuffer::flush_cache() const {
+    if (!_simaai_mem_ptr) {
+        throw std::logic_error("cannot flush an unallocated MLA buffer");
+    }
     simaai_memory_flush_cache(_simaai_mem_ptr);
 }
 
 void MLABuffer::invalidate_cache() const {
+    if (!_simaai_mem_ptr) {
+        throw std::logic_error("cannot invalidate an unallocated MLA buffer");
+    }
     simaai_memory_invalidate_cache(_simaai_mem_ptr);
 }
 
 void MLABuffer::clear(bool flush) {
+    if (!_simaai_mem_ptr || !_virtual_addr) {
+        throw std::logic_error("cannot clear an unallocated MLA buffer");
+    }
     std::memset(_virtual_addr, 0, _size_padded);
     if (flush)
         flush_cache();
@@ -156,24 +237,48 @@ void MLABuffer::load_stream(std::istream& stream) {
 
 
 void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bool flush) {
-    if (_align_last_dim && (_shape.back() % MLA_ROW_SIZE != 0)) {
-        assert(data_begin == 0);
-        assert(data_size == 0 || data_size == _size);
-        uint32_t last_dim = _shape.back() * _elem_size;
-        uint32_t last_dim_padded = round_up_to_row(last_dim);
-        uint32_t num_last_dims = _size_padded / last_dim_padded;
-
-        for (uint32_t i = 0; i < num_last_dims; ++i) {
-            std::memcpy(
-                reinterpret_cast<uint8_t*>(_virtual_addr) + i * last_dim_padded,
-                reinterpret_cast<const uint8_t*>(data) + i * last_dim,
-                last_dim
+    if (!_simaai_mem_ptr || !_virtual_addr) {
+        throw std::logic_error("cannot upload to an unallocated MLA buffer");
+    }
+    if (!data) {
+        throw std::invalid_argument("MLA buffer upload source is null");
+    }
+    if (data_size == 0) {
+        if (data_begin != 0) {
+            throw std::invalid_argument(
+                "full MLA buffer upload must begin at byte zero"
             );
         }
-    } else if (data_size > 0 && data_size < _size) {
-        std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + data_begin, data, data_size);
+        data_size = _size;
+    }
+    if (data_begin > _size || data_size > _size - data_begin) {
+        throw std::out_of_range("MLA buffer upload exceeds logical extent");
+    }
+
+    const size_t logical_row_bytes =
+        checked_mul_size(_shape.back(), _elem_size, "MLA upload row overflow");
+    const size_t physical_row_bytes = checked_round_up_size(
+        logical_row_bytes, MLA_ROW_SIZE, "MLA upload padded row overflow"
+    );
+    if (_align_last_dim && logical_row_bytes != physical_row_bytes) {
+        if (data_begin != 0 || data_size != _size) {
+            throw std::invalid_argument(
+                "partial upload is unsupported for a padded MLA buffer"
+            );
+        }
+        const size_t row_count = _size_padded / physical_row_bytes;
+
+        for (size_t i = 0; i < row_count; ++i) {
+            std::memcpy(
+                reinterpret_cast<uint8_t*>(_virtual_addr) +
+                    i * physical_row_bytes,
+                reinterpret_cast<const uint8_t*>(data) +
+                    i * logical_row_bytes,
+                logical_row_bytes
+            );
+        }
     } else {
-        std::memcpy(_virtual_addr, data, _size);
+        std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + data_begin, data, data_size);
     }
     if (flush)
         flush_cache();
@@ -181,18 +286,28 @@ void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bo
 
 
 void MLABuffer::download(void* data) const {
+    if (!_simaai_mem_ptr || !_virtual_addr) {
+        throw std::logic_error("cannot download an unallocated MLA buffer");
+    }
+    if (!data) {
+        throw std::invalid_argument("MLA buffer download destination is null");
+    }
     invalidate_cache();
-    if (_align_last_dim && (_shape.back() % MLA_ROW_SIZE != 0)) {
-        uint32_t last_dim = _shape.back() * _elem_size;
-        uint32_t last_dim_padded = round_up_to_row(last_dim);
-        uint32_t num_last_dims = _size_padded / last_dim_padded;
+    const size_t logical_row_bytes =
+        checked_mul_size(_shape.back(), _elem_size, "MLA download row overflow");
+    const size_t physical_row_bytes = checked_round_up_size(
+        logical_row_bytes, MLA_ROW_SIZE, "MLA download padded row overflow"
+    );
+    if (_align_last_dim && logical_row_bytes != physical_row_bytes) {
+        const size_t row_count = _size_padded / physical_row_bytes;
 
         std::memset(data, 0, _size);
-        for (uint32_t i = 0; i < num_last_dims; ++i) {
+        for (size_t i = 0; i < row_count; ++i) {
             std::memcpy(
-                reinterpret_cast<uint8_t*>(data) + i * last_dim,
-                reinterpret_cast<const uint8_t*>(_virtual_addr) + i * last_dim_padded,
-                last_dim
+                reinterpret_cast<uint8_t*>(data) + i * logical_row_bytes,
+                reinterpret_cast<const uint8_t*>(_virtual_addr) +
+                    i * physical_row_bytes,
+                logical_row_bytes
             );
         }
     } else {
@@ -201,29 +316,72 @@ void MLABuffer::download(void* data) const {
 }
 
 
-uint32_t MLABuffer::get_buf_addr_offset(const std::optional<std::vector<uint32_t>>& begin) const {
-    if (begin.has_value()) {
-        uint32_t offset = 0;
-        for (uint32_t i = 0; i < _shape.size(); ++i) {
-            offset = offset * _shape[i] + begin.value()[i];
-        }
-        return offset * _elem_size;
-    } else {
+uint64_t MLABuffer::get_buf_addr_offset(
+    const std::optional<std::vector<uint32_t>>& begin
+) const {
+    if (!begin.has_value()) {
         return 0;
     }
-}
+    if (begin->size() != _shape.size()) {
+        throw std::invalid_argument(fmt::format(
+            "Buffer {} slice rank {} does not match allocation rank {}",
+            _name, begin->size(), _shape.size()
+        ));
+    }
 
-
-uint64_t MLABuffer::get_buf_addr(const std::optional<std::vector<uint32_t>>& begin) const {
-    return _physical_addr + get_buf_addr_offset(begin);
+    /*
+     * `_stride` is the physical element stride, including the padded MLA row.
+     * The previous logical row-major recurrence silently addressed the wrong
+     * row whenever align_last_dim was enabled.
+     */
+    uint64_t element_offset = 0;
+    for (std::size_t i = 0; i < _shape.size(); ++i) {
+        if ((*begin)[i] >= _shape[i]) {
+            throw std::out_of_range(fmt::format(
+                "Buffer {} slice index {} is outside dimension {}",
+                _name, (*begin)[i], _shape[i]
+            ));
+        }
+        const uint64_t stride = static_cast<uint64_t>(_stride[i]);
+        if ((*begin)[i] != 0 &&
+            stride > std::numeric_limits<uint64_t>::max() / (*begin)[i]) {
+            throw std::overflow_error("MLA buffer slice offset overflow");
+        }
+        const uint64_t term = stride * (*begin)[i];
+        if (term > std::numeric_limits<uint64_t>::max() - element_offset) {
+            throw std::overflow_error("MLA buffer slice offset overflow");
+        }
+        element_offset += term;
+    }
+    if (element_offset >
+        std::numeric_limits<uint64_t>::max() / _elem_size) {
+        throw std::overflow_error("MLA buffer byte offset overflow");
+    }
+    const uint64_t byte_offset = element_offset * _elem_size;
+    if (byte_offset >= _size_padded) {
+        throw std::out_of_range("MLA buffer slice starts outside allocation");
+    }
+    return byte_offset;
 }
 
 
 uint64_t MLABuffer::get_buf_len(const std::optional<std::vector<uint32_t>>& shape) const {
     if (shape.has_value()) {
-        uint32_t size = _elem_size;
-        for (uint32_t i = 0; i < shape->size(); ++i) {
-            size *= shape.value()[i];
+        if (shape->size() != _shape.size()) {
+            throw std::invalid_argument(fmt::format(
+                "Buffer {} slice rank {} does not match allocation rank {}",
+                _name, shape->size(), _shape.size()
+            ));
+        }
+        size_t size = _elem_size;
+        for (const uint32_t dim : *shape) {
+            if (dim == 0) {
+                throw std::invalid_argument("MLA buffer slice has a zero-sized dimension");
+            }
+            size = checked_mul_size(size, dim, "MLA buffer slice size overflow");
+        }
+        if (size > _size_padded) {
+            throw std::out_of_range("MLA buffer slice is larger than its allocation");
         }
         return size;
     } else {
@@ -356,21 +514,11 @@ MLABufferSlice::MLABufferSlice(
 ) : _buf_ptr(buf_ptr), _begins(std::move(begins)), _shapes(std::move(shapes)) {}
 
 
-uint64_t MLABufferSlice::get_buf_addr() const {
-    if (_buf_ptr) {
-        return _buf_ptr->get_buf_addr(_begins);
-    } else {
-        return 0;
+uint64_t MLABufferSlice::get_byte_offset() const {
+    if (!_buf_ptr) {
+        throw std::invalid_argument("MLA buffer slice has no parent");
     }
-}
-
-
-uint64_t MLABufferSlice::get_buf_addr(const std::optional<std::vector<uint32_t>>& begins) const {
-    if (_buf_ptr) {
-        return _buf_ptr->get_buf_addr(begins);
-    } else {
-        return 0;
-    }
+    return _buf_ptr->get_buf_addr_offset(_begins);
 }
 
 
@@ -379,13 +527,27 @@ void MLABufferSlice::to_file(const std::filesystem::path& file_name) const {
     std::ofstream out_file(file_name, std::ios::out | std::ios::binary);
 
     assert(_buf_ptr != nullptr);
+    const uint64_t byte_offset = _buf_ptr->get_buf_addr_offset(_begins);
+    const uint64_t num_bytes = _buf_ptr->get_buf_len(_shapes);
+    /*
+     * Size and offset are individually checked by MLABuffer.  Check their
+     * combined envelope as well: a small slice near the end of an allocation
+     * must not make a file export read beyond the mapped dma-buf.
+     */
+    if (byte_offset > _buf_ptr->get_allocation_size() ||
+        num_bytes > _buf_ptr->get_allocation_size() - byte_offset) {
+        throw std::out_of_range("MLA buffer slice export exceeds allocation");
+    }
+    if (num_bytes >
+        static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::overflow_error("MLA buffer slice is too large for stream I/O");
+    }
     const char* ptr = (
         reinterpret_cast<const char*>(_buf_ptr->get_virtual_addr())
-        + _buf_ptr->get_buf_addr_offset(_begins)
+        + byte_offset
     );
-    std::streamsize num_bytes = _buf_ptr->get_buf_len(_shapes);
 
-    out_file.write(ptr, num_bytes);
+    out_file.write(ptr, static_cast<std::streamsize>(num_bytes));
     out_file.close();
 }
 

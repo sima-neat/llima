@@ -73,8 +73,8 @@ void connect(
     // Configure the llama.cpp log level.
     setup_llama_cpp_logger();
 
-    // Connect to the MLA dispatcher.
-    connect_mla_rt(mla_rt_args);
+    // Create the one direct /dev/mla execution session.
+    connect_mla(mla_rt_args);
 
     // Read environment variables.
     MLAModelWithBuffer::read_env_vars();
@@ -89,7 +89,7 @@ void connect(
 
 
 void disconnect() {
-    disconnect_mla_rt();
+    disconnect_mla();
     spdlog::shutdown();
 }
 

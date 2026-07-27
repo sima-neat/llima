@@ -55,6 +55,11 @@ include(CMakePackageConfigHelpers)
 set(TARGET_BIND cpp_ext)
 set(TARGET_RUNTIME sima_lmm_runtime)
 option(SIMA_LMM_BUILD_PYTHON "Build the Python nanobind extension." ON)
+option(
+    SIMA_LMM_BUILD_DVT_DIRECT_TESTS
+    "Build DVT-only direct MLA session qualification executables."
+    OFF
+)
 set(SYSROOT "" CACHE PATH "Optional target sysroot prefix")
 set(
     SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR
@@ -109,7 +114,6 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
-find_package(NeatInternals ${SIMA_LMM_PLATFORM_VERSION} CONFIG REQUIRED)
 find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
@@ -316,16 +320,37 @@ foreach(_sima_lmm_license_index RANGE ${_sima_lmm_extra_license_last})
     )
 endforeach()
 
-find_library(
-    SIMAAI_DISPATCHER_LIB
-    NAMES neatdispatchercore simaaidispatcher
-    PATHS
-        "${SYSROOT}/usr/lib/aarch64-linux-gnu/neat/runtime"
-        "${SYSROOT}/usr/lib/aarch64-linux-gnu"
-        "${SYSROOT}/usr/lib"
-    REQUIRED
-)
-set(SIMAAI_DISPATCHER_INSTALL_LIB_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/neat/runtime")
+# Consume one coherent Backend target.  Never locate a header and archive
+# independently: that can compile one ABI while linking another.  A packaged
+# SDK supplies MlaKernelBackendConfig.cmake; source-tree development builds the
+# exact sibling Backend source pinned with this LLiMa candidate.
+find_package(MlaKernelBackend CONFIG QUIET)
+set(SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../processmla-kernel-direct/core/mla-kernel-backend"
+    CACHE PATH "Pinned MlaKernelBackend source fallback")
+if(NOT TARGET SiMa::MlaKernelBackend AND
+   EXISTS "${SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR}/CMakeLists.txt")
+    if(NOT MLA_KERNEL_UAPI_DIR)
+        set(_sima_lmm_kernel_uapi
+            "${CMAKE_CURRENT_SOURCE_DIR}/../simaai-linux-mla-kernel-driver-v1/include/uapi")
+        if(EXISTS "${_sima_lmm_kernel_uapi}/linux/simaai/mla.h")
+            set(MLA_KERNEL_UAPI_DIR "${_sima_lmm_kernel_uapi}" CACHE PATH
+                "Pinned MLA kernel UAPI" FORCE)
+        endif()
+    endif()
+    set(MLA_KERNEL_BACKEND_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MLA_KERNEL_BACKEND_BUILD_DVT_SMOKE OFF CACHE BOOL "" FORCE)
+    set(MLA_KERNEL_BACKEND_BUILD_DVT_STRESS OFF CACHE BOOL "" FORCE)
+    set(MLA_KERNEL_BACKEND_BUILD_PACKAGE_AUDIT OFF CACHE BOOL "" FORCE)
+    add_subdirectory(
+        "${SIMA_LMM_MLA_KERNEL_BACKEND_SOURCE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/mla-kernel-backend")
+endif()
+if(NOT TARGET SiMa::MlaKernelBackend)
+    message(FATAL_ERROR
+        "MlaKernelBackend package/source target is required; refusing an "
+        "independently discovered header/archive pair")
+endif()
 
 # Build the core library.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
@@ -341,11 +366,7 @@ set_target_properties(
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
 )
-message(STATUS "Using MLA dispatcher library: ${SIMAAI_DISPATCHER_LIB}")
-set_target_properties(
-    ${TARGET_RUNTIME} PROPERTIES
-    INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
-)
+message(STATUS "Using coherent direct MLA Backend target: SiMa::MlaKernelBackend")
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
 target_compile_definitions(
     ${TARGET_RUNTIME}
@@ -387,9 +408,8 @@ target_link_libraries(
         PkgConfig::FFTW3
         cnpy-static
         simaaimem
-        ${SIMAAI_DISPATCHER_LIB}
+        SiMa::MlaKernelBackend
     PUBLIC
-    NeatInternals::Headers
     opencv_core
     opencv_imgproc
     opencv_imgcodecs
@@ -417,6 +437,57 @@ target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
     $<BUILD_INTERFACE:${SYSROOT}/usr/include>
 )
 
+if(SIMA_LMM_BUILD_DVT_DIRECT_TESTS)
+    # Compile a private qualification-only queue-depth seam into this runtime.
+    # Normal product builds do not contain the environment override, and no
+    # queue-depth control is added to a public header or stable ABI.
+    target_compile_definitions(
+        ${TARGET_RUNTIME} PRIVATE
+        SIMA_LLIMA_ENABLE_DVT_QUEUE_DEPTH_OVERRIDE=1
+    )
+
+    # These executables deliberately link the same runtime library as the CLI
+    # and exercise the production MlaExecutionSession.  They must be run on an
+    # AArch64 Modalix DVT, never by a host-side x86 ctest invocation.
+    add_executable(
+        llima_direct_session_smoke
+        tests/dvt/llima_direct_session_smoke.cpp
+    )
+    add_executable(
+        llima_direct_resnet_depth2
+        tests/dvt/llima_direct_resnet_depth2.cpp
+    )
+    add_executable(
+        llima_direct_text_model
+        tests/dvt/llima_direct_text_model.cpp
+    )
+    add_executable(
+        llima_direct_whisper
+        tests/dvt/llima_direct_whisper.cpp
+    )
+    foreach(_SIMA_LMM_DVT_TARGET IN ITEMS
+            llima_direct_session_smoke
+            llima_direct_resnet_depth2
+            llima_direct_text_model
+            llima_direct_whisper)
+        target_compile_features(${_SIMA_LMM_DVT_TARGET} PRIVATE cxx_std_20)
+        target_compile_options(
+            ${_SIMA_LMM_DVT_TARGET} PRIVATE
+            -Wall -Wextra -Werror
+        )
+        target_link_libraries(
+            ${_SIMA_LMM_DVT_TARGET} PRIVATE
+            ${TARGET_RUNTIME} OpenMP::OpenMP_CXX
+        )
+        # DVT qualification binaries are copied beside the exact runtime under
+        # test.  Prefer that sibling over an older system-installed LLiMa so a
+        # passing result always describes the source tree being qualified.
+        set_target_properties(
+            ${_SIMA_LMM_DVT_TARGET} PROPERTIES BUILD_RPATH "$ORIGIN"
+        )
+    endforeach()
+endif()
+
 if(SIMA_LMM_BUILD_PYTHON)
     nanobind_add_module(
         ${TARGET_BIND}
@@ -432,7 +503,12 @@ if(SIMA_LMM_BUILD_PYTHON)
     )
     set_target_properties(
         ${TARGET_BIND} PROPERTIES
-        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
+        # The direct-kernel runtime has no Dispatcher dependency.  Keeping the
+        # historical Dispatcher directory in the Python extension's RPATH can
+        # nevertheless select stale private libraries at load time, defeating
+        # the exact ABI-5 component closure.  Resolve only the sibling/runtime
+        # install directories used by this package.
+        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR}"
     )
 endif()
 
@@ -587,8 +663,9 @@ set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
-    "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
+    # The direct MLA Backend is linked into sima_lmm_runtime.  Do not retain a
+    # runtime dependency on Neat Internals merely because its development
+    # package supplied the Backend at build time.
     "simaai-memory-lib (>= ${SIMA_LMM_PLATFORM_DEP_PACKAGE_MIN_VERSION}), "
     "simaai-memory-lib (<< ${SIMA_LMM_PLATFORM_DEP_PACKAGE_MAX_VERSION}), "
     "libcpp-httplib0.11, libfftw3-double3, "
@@ -598,8 +675,6 @@ string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
-    "neat-internals-dev (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
-    "neat-internals-dev (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "

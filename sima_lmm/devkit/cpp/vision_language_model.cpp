@@ -10,15 +10,26 @@ VisionLanguageModel::VisionLanguageModel(
     std::filesystem::path model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template
-) : BaseModel(model_path),
+) : VisionLanguageModel(
+        current_mla_execution_session(), std::move(model_path),
+        std::move(system_prompt), std::move(chat_template)
+    ) {}
+
+VisionLanguageModel::VisionLanguageModel(
+    std::shared_ptr<MlaExecutionSession> session,
+    std::filesystem::path model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template
+) : BaseModel(model_path, std::move(session)),
     _vlm_helper(_cfg, _devkit_dir, system_prompt, chat_template),
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
 {
     if (_cfg.support_image()) {
-        _vision_model_ptr = std::make_unique<VisionModel>(model_path);
+        _vision_model_ptr =
+            std::make_unique<VisionModel>(_mla_session, model_path);
     }
     _language_model_ptr = std::make_unique<LanguageModel>(
-        model_path,
+        _mla_session, model_path,
         _vlm_helper.get_stop_token_ids(),
         _vlm_helper.get_image_token_id(),
         _vlm_helper.get_pad_token_id(),
