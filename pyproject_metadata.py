@@ -50,7 +50,7 @@ def get_version(pkg_dir):
             vinfo = _version_info(version)
 
     if "GIT_HASH" in os.environ:
-        # In tox the .git directory is not available so do this instead
+        # Allow isolated source builds without .git to inject the revision.
         vinfo["git_hash"] = os.environ["GIT_HASH"]
     else:
         proc = subprocess.Popen(['git','log','-1','--format=%h'], stdout=subprocess.PIPE)

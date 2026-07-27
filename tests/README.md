@@ -1,203 +1,192 @@
 # LLiMa test suite
 
-The test suite is organized around the compiler-test groups shown in
-`.github/workflows/model-compiler-tests.yml`. Compilation tests currently live
-under `tests/compilation/`. The `tests/runtime/` directory is reserved for
-future DevKit runtime tests.
+## Overview
 
-The compilation workflow installs and tests the exact LLiMa compiler wheel for
-the candidate commit. Tests run against model inputs downloaded from the
-internal Vulcan cache; Hugging Face and Transformers are then placed in offline
-mode.
+LLiMa has two CI test paths with different artifacts and execution
+environments. Vulcan CI orchestrates both paths: compiler tests are delegated
+to a reusable workflow, while runtime tests run in a dedicated DevKit job.
 
-## CI test groups
+| Area | CI entry point | Runner | Tested artifact | Hardware |
+|------|----------------|--------|-----------------|----------|
+| Model compiler | `.github/workflows/model-compiler-tests.yml`, called by `test-model-compiler` in `vulcan-ci.yml` | Host test runner | Exact compiler wheel for the candidate commit | No DevKit |
+| Runtime | `test-devkit` in `.github/workflows/vulcan-ci.yml` | ARM64 Modalix runner | Exact LLiMa and Internals DEBs plus the runtime-test extras archive | Real DevKit and MLASHM dispatcher |
 
-### Run fast compiler unit tests
+Compiler tests live under `tests/compilation/`. Runtime tests live under
+`tests/runtime/`. Runtime coverage never falls back to host-only execution or
+mock hardware services.
 
-Location: `tests/compilation/unit/`  
-Marker: `compiler_unit`  
-Expected cases: 23
+## Model compiler CI
 
-Fast, hermetic tests that run before downloading model inputs:
+### Purpose
 
-- Configuration parsing and validation
-- Quantization configuration and precision selection
-- Weight-name mapping
-- Small pure-Python compiler checks
+The compiler workflow validates the exact LLiMa compiler wheel produced for
+the candidate commit. It covers configuration, model ingestion, generated
+ONNX, quantization, and a bounded full compilation pipeline.
 
-The unit-test fixtures remove model-cache environment variables, enable
-Hugging Face offline mode, and reject network connections. These tests should
-remain fast and independent of external model files.
+Model inputs are downloaded from the internal Vulcan cache. After preparation,
+Hugging Face and Transformers run in offline mode so test groups cannot
+silently fetch additional inputs.
 
-### Download and verify cached models
+### Test inputs and model cache
 
-This is workflow preparation rather than a pytest group. It downloads every
-active source from the Hugging Face, configuration-only, and GGUF manifests
-into a runner-local model directory.
+The workflow downloads every active source from the Hugging Face,
+configuration-only, and GGUF manifests into a runner-local model directory.
 
 The preparation step:
 
-- Validates cache manifests and selection fingerprints
-- Downloads files concurrently
-- Verifies file sizes and SHA-256 digests
-- Produces model-input provenance
-- Exports `LLIMA_HF_MODELS_PATH`
-- Enables `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
+- Validates cache manifests and selection fingerprints.
+- Downloads files concurrently.
+- Verifies file sizes and SHA-256 digests.
+- Produces model-input provenance.
+- Exports `LLIMA_HF_MODELS_PATH`.
+- Enables `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`.
 
-All subsequent model-backed test groups use these prepared files. They must not
-download models directly from Hugging Face.
-
-For local runs, point `LLIMA_HF_MODELS_PATH` at a directory with the same
-prepared layout:
+All model-backed compiler groups use these prepared files. For local runs,
+point `LLIMA_HF_MODELS_PATH` at a directory with the same layout:
 
 ```bash
 export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 ```
 
-### Run configuration contract regression
+### Test groups
 
-Location: `tests/compilation/configuration/`  
-Marker: `compiler_config`  
-Expected cases: 25
+#### Fast compiler unit tests
+
+- Location: `tests/compilation/unit/`
+- Marker: `compiler_unit`
+- Expected cases: 23
+
+Fast, hermetic tests that run before model inputs are downloaded:
+
+- Configuration parsing and validation.
+- Quantization configuration and precision selection.
+- Weight-name mapping.
+- Small pure-Python compiler checks.
+
+The fixtures remove model-cache environment variables, enable Hugging Face
+offline mode, and reject network connections.
+
+#### Configuration contract regression
+
+- Location: `tests/compilation/configuration/`
+- Marker: `compiler_config`
+- Expected cases: 25
 
 Generates `VlmConfig` objects from cached Hugging Face and GGUF sources and
 compares them with the checked-in JSON contracts under
 `tests/compilation/configuration/references/`.
 
-This group protects:
+This protects:
 
-- Model and architecture detection
-- Language, vision, and multimodal configuration
-- Tensor dimensions and attention configuration
-- Tokenizer and context configuration
-- HF and GGUF configuration compatibility
+- Model and architecture detection.
+- Language, vision, and multimodal configuration.
+- Tensor dimensions and attention configuration.
+- Tokenizer and context configuration.
+- Hugging Face and GGUF configuration compatibility.
 
-JSON configuration contracts are intentionally stored in the repository.
-Generated ONNX files and NumPy output fixtures are not.
+#### Model-source ingestion
 
-### Run model-source ingestion tests
+- Location: `tests/compilation/source_ingestion/`
+- Marker: `compiler_source`
+- Expected cases: 15
 
-Location: `tests/compilation/source_ingestion/`  
-Marker: `compiler_source`  
-Expected cases: 15
+This group validates:
 
-Validates full-model GGUF source ingestion:
+- GGUF parser detection for Q8_0 and Q4_0 inputs.
+- Dequantization for Q8_0, Q4_0, Q6_K, Q5_K, Q4_K, and Q3_K.
+- Numerical comparison with the BF16 GGUF reference and GGUF library.
+- Resolution of Hugging Face weight names to GGUF weights.
+- Shape agreement between Hugging Face and GGUF weights.
 
-- GGUF parser detection for Q8_0 and Q4_0 inputs
-- Dequantization of every tensor for Q8_0, Q4_0, Q6_K, Q5_K, Q4_K, and Q3_K
-- Numerical comparison with both the BF16 GGUF reference and the GGUF library
-- Resolution of every Hugging Face weight name to a GGUF weight
-- Shape agreement between Hugging Face and GGUF weights
+The comparisons are exhaustive across model tensors. Reference weights are
+shared across quantization variants where possible.
 
-The comparisons are exhaustive across the model tensors. Reference weights are
-shared across quantization variants where possible to avoid redundant loading;
-the validation coverage remains unchanged.
+#### ONNX generation and validation
 
-### Run ONNX generation and validation
+- Location: `tests/compilation/onnx_regression/`
+- Marker: `compiler_onnx_regression`
+- Expected cases: 32
 
-Location: `tests/compilation/onnx_regression/`  
-Marker: `compiler_onnx_regression`  
-Expected cases: 32
-
-Generates representative ONNX model components with the candidate LLiMa
-compiler wheel. Feature branches also generate the same components with the
-latest published `develop` compiler wheel and compare the results.
-
-The validation mode is selected as follows:
-
-- Feature branch push, except `release*`: compare with the latest published
-  `develop` compiler wheel
-- `develop`, `main`, `release*`, and tag pushes: candidate-only validation with
-  no baseline artifact
-
-The matrix covers representative pre, cache, post, per-layer, convolution,
-vision, and speculative-decoding components. Every case:
+Every case:
 
 1. Generates candidate ONNX.
 2. Runs `onnx.checker`.
 3. Creates deterministic inputs.
-4. Executes the candidate graph with ONNX Runtime.
-5. Validates runtime output count, dtype, rank, and fixed dimensions against
-   the graph interface.
+4. Executes the graph with ONNX Runtime.
+5. Validates output count, dtype, rank, and fixed dimensions.
 
-In compare mode, the test additionally generates and executes baseline ONNX,
-compares the runtime input/output interface, and compares numerical outputs.
+Feature branches, except `release*`, also generate the same components with
+the latest published `develop` compiler wheel. `develop`, `main`, `release*`,
+and tag builds validate the candidate only because those refs do not have a
+separate baseline artifact.
 
-Each case has a regression mode in `tests/compilation/cases.py`:
+Each case declares one regression mode in `tests/compilation/cases.py`:
 
-- `required`: candidate and baseline generation must succeed, and any interface
-  or numerical difference fails the test.
-- `informative`: candidate generation, checking, and execution must succeed. If
-  the baseline compiler does not support the model or component, the baseline
-  manifest records it as unavailable and the test emits a warning. When both
-  graphs are available, interface or numerical differences also emit warnings.
+- `required`: candidate and baseline generation must succeed; interface or
+  numerical differences fail.
+- `informative`: candidate generation and execution must succeed. Missing
+  baseline support or differences emit warnings.
 - `disabled`: neither revision generates or executes the case.
 
-This allows a feature branch to validate newly added model support before that
-support exists in the published `develop` baseline. The case should change from
-`informative` to `required` once baseline support is available.
+Use `informative` for new model support that is not yet available from the
+published `develop` compiler. Change it to `required` once baseline support is
+available.
 
-ONNX payloads are generated during the workflow and deleted afterward. No
-reference ONNX files are stored in the repository or artifact cache.
+Generated ONNX and NumPy payloads are deleted after the workflow. They are not
+stored in the repository or artifact cache.
 
-### Run generated-graph and quantization integration
+#### Generated-graph and quantization integration
 
-Location: `tests/compilation/graph_integration/`  
-Marker: `compiler_graph_integration`  
-Expected cases: 22 standard and 4 high-memory
+- Location: `tests/compilation/graph_integration/`
+- Marker: `compiler_graph_integration`
+- Expected cases: 22 standard and 4 high-memory
 
-Validates generated SiMa Model SDK graphs and quantization behavior:
+This group validates:
 
-- `test_embedding_quantization.py`: embedding quantization and dequantization
-  wiring for LLM, VLM, and per-layer inputs
-- `test_path_equivalence.py`: staged
-  source-to-ONNX-to-quant generation versus direct source-to-quant generation
-- `test_gguf_integration.py`: generated GGUF-based quantized graphs versus
-  corresponding Hugging Face or BF16 source graphs
-- `test_speculative_decoding.py`: staged versus direct generation for
-  speculative pre, cache, post, and draft-FC graphs
+- Embedding quantization and dequantization wiring.
+- Staged source-to-ONNX-to-quant generation versus direct generation.
+- GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
+- Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are marked `serial` and `high_memory`. The
-workflow runs the 22 standard cases first and the 4 high-memory cases
-separately.
+The speculative-decoding cases are serial and high-memory. CI runs the 22
+standard cases first and the 4 high-memory cases separately.
 
-### Run selected-model full compilation E2E
+#### Selected-model full compilation E2E
 
-Location: `tests/compilation/e2e/`  
-Marker: `compiler_e2e`  
-Expected cases: 1
+- Location: `tests/compilation/e2e/`
+- Marker: `compiler_e2e`
+- Expected cases: 1
 
-Performs one bounded full compiler pipeline:
+This bounded end-to-end case:
 
 1. Selects an eligible model deterministically from the candidate commit SHA.
-2. Resolves and validates its cached source provenance.
+2. Resolves and validates cached source provenance.
 3. Generates ONNX.
 4. Quantizes the selected model component.
 5. Invokes Model Compiler.
 6. Validates the resulting MPK archive and MLA ELF.
 
-The compile configuration selects layer 0 and INT4 quantization so the test
-exercises the complete pipeline without compiling an entire generative model.
-The case is marked `serial` and `high_memory`.
+The test selects layer 0 and INT4 quantization to cover the complete pipeline
+without compiling an entire generative model. It is serial and high-memory.
 
-## Test definitions and shared helpers
+### Compiler test definitions and helpers
 
-- `tests/compilation/cases.py` contains the centralized model and component
-  matrices.
+- `tests/compilation/cases.py` contains the model and component matrices.
 - `tests/compilation/conftest.py` resolves the prepared model-input directory.
-- `tests/compilation/helpers/` contains shared model-loading, path-validation,
-  and output-comparison utilities.
-- `pytest.ini` declares the test markers used by the workflow.
+- `tests/compilation/helpers/` contains model-loading, path-validation, and
+  output-comparison helpers.
+- The root `pytest.ini` declares compiler markers and makes the compiler
+  premerge suite the safe repository default. Its `testpaths` excludes the
+  DevKit runtime suite.
 
-The workflow audits the expected case count and rejects unexpected skips. When
-adding or removing a case, update both the centralized matrix and the
-corresponding expected count in
-`.github/workflows/model-compiler-tests.yml`.
+The workflow audits expected case counts and rejects unexpected skips. Update
+both the centralized matrix and the expected count in
+`.github/workflows/model-compiler-tests.yml` when adding or removing cases.
 
-## Running groups locally
+### Running compiler tests locally
 
-Activate a Model Compiler environment and install the LLiMa compiler wheel with
-its test dependencies before running these commands.
+Activate a Model Compiler environment and install the LLiMa compiler wheel
+with its test dependencies.
 
 Fast hermetic tests:
 
@@ -210,7 +199,7 @@ python -P -m pytest \
   -vv -ra
 ```
 
-Cached-model test groups:
+Cached-model groups:
 
 ```bash
 export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
@@ -237,16 +226,228 @@ python -P -m pytest \
   -vv -ra
 ```
 
-ONNX regression additionally requires separately generated baseline and
-candidate ONNX roots and manifests. The authoritative invocation is maintained
-in `.github/workflows/model-compiler-tests.yml`.
+ONNX regression additionally requires separately generated candidate and
+baseline roots and manifests. The authoritative invocation is maintained in
+`.github/workflows/model-compiler-tests.yml`.
 
-## Reference-artifact policy
+### Compiler reference-artifact policy
 
 - Checked-in JSON configuration contracts are allowed.
-- Checked-in or externally stored reference ONNX and NumPy output files are
-  not used.
-- Numerical regression compares artifacts generated from the candidate branch
-  with artifacts generated from the appropriate baseline branch during the
-  same workflow run.
+- Reference ONNX and NumPy output files are not checked in or stored
+  externally.
+- Numerical regression compares candidate and baseline artifacts generated
+  during the same workflow run.
 - Generated ONNX, quantization, and compilation payloads are temporary.
+
+## DevKit runtime CI
+
+### Purpose and requirements
+
+Runtime CI validates installed artifacts through the same public entry points
+used on a Modalix DevKit. It requires:
+
+- ARM64 Modalix hardware.
+- An active `simaai-appcomplex.service`.
+- The MLASHM dispatcher and MLA hardware.
+- Exact LLiMa and Internals packages from the candidate build.
+
+Missing models, packages, services, or the wrong architecture are failures,
+not skips or host-side fallbacks.
+
+### Runtime artifacts
+
+`./build.sh --all` cross-compiles the C++ tests and creates:
+
+```text
+dist/sima-lmm-<version>-Linux-extras.tar.gz
+```
+
+The extras archive contains:
+
+- Relocatable test executables and CTest metadata under
+  `lib/sima-lmm/tests/`.
+- Pytest sources and runtime helpers under
+  `share/sima-lmm/tests/runtime/`.
+
+The archive does not duplicate runtime libraries or media. Tests link against
+the installed runtime and use the image and audio assets installed by
+`sima-lmm-core`.
+
+### GenAI model preparation
+
+The dedicated `Prepare GenAI models` step keeps the runtime fixtures aligned
+with Core:
+
+- `Qwen2.5-0.5B-Instruct-GPTQ-a16w4`
+- `LFM2.5-VL-450M-a16w4`
+- `whisper-small-a16w8`
+
+The shared environment contract is:
+
+- `LLIMA_MODELS_PATH`
+- `SIMA_TEST_LLIMA_TEXT_MODEL`
+- `SIMA_TEST_LLIMA_VLM_MODEL`
+- `SIMA_TEST_LLIMA_ASR_MODEL`
+
+Models are retained on the runner between CI runs.
+
+### C++ runtime tests
+
+CTest executes serially with a dispatcher resource lock:
+
+| Test | Coverage |
+|------|----------|
+| `runtime.dispatcher_lifecycle` | Connect and disconnect through the installed dispatcher stack |
+| `runtime.text_generation` | Qwen text generation on MLA |
+| `runtime.vision_generation` | LFM2 image-conditioned generation using the installed sample image |
+| `runtime.asr_transcription` | Whisper transcription using the installed sample audio |
+
+The executables link directly against the in-tree runtime while building, then
+use install RPATHs to load the installed runtime and dispatcher libraries on
+the DevKit.
+
+### Python and black-box tests
+
+Pytest validates the installed package and external interfaces:
+
+| Test | Coverage |
+|------|----------|
+| Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
+| CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
+| OpenAI-compatible HTTP | Non-streaming response, SSE reconstruction, `/stop`, malformed-input recovery, and a successful request after interruption |
+| ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
+
+`tests/runtime/pytest.ini` is packaged with these tests and prevents compiler
+marker defaults from affecting runtime test selection.
+
+Speculative-decoding runtime coverage is intentionally deferred until a
+compiled target/draft model pair is published.
+
+### Lifecycle and teardown assertions
+
+The CLI lifecycle test establishes a steady-state baseline and checks that
+subsequent execution:
+
+- Keeps the `mlashmcomplex` daemon PID stable.
+- Does not grow daemon thread or file-descriptor counts.
+- Reaps the `llima` process.
+- Returns CMA memory within the configured tolerance.
+
+### Cancellation and test isolation
+
+CTest and pytest run in dedicated process groups. Cancellation sends only
+`SIGINT` to active inference and waits for graceful shutdown; it never
+escalates to `SIGTERM` or `SIGKILL`.
+
+mla-rt versions before 2.1.3 can retain MLA buffers between processes. Until
+mla-rt 2.1.3 is available, every runtime case restarts
+`simaai-appcomplex.service` before loading its model. Remove this workaround
+when the fixed runtime is adopted.
+
+### Cleanup and retained state
+
+An `if: always()` workflow step removes:
+
+- `_work/llima-install`
+- `_work/runtime-tests`
+- `_work/runtime-test-venv`
+
+Runtime test dependency installation uses `pip --no-cache-dir`.
+
+The runner deliberately retains:
+
+- Installed LLiMa and Internals Debian packages, which the next run
+  overwrites.
+- Downloaded Qwen, LFM2, and Whisper models.
+- The running `simaai-appcomplex.service`.
+
+Runtime tests do not upload reports or generated outputs after execution.
+
+### Running runtime tests on a DevKit
+
+Build and install the candidate LLiMa and Internals packages, then extract the
+extras archive:
+
+```bash
+mkdir -p _work/runtime-tests
+tar -C _work/runtime-tests \
+  -xzf dist/sima-lmm-<version>-Linux-extras.tar.gz
+```
+
+Prepare models:
+
+```bash
+bash _work/runtime-tests/share/sima-lmm/tests/runtime/prepare_genai_models.sh
+```
+
+Run C++ tests serially:
+
+```bash
+_work/runtime-tests/share/sima-lmm/tests/runtime/run_with_cancellation_cleanup.sh \
+  ctest \
+    --test-dir _work/runtime-tests/lib/sima-lmm/tests \
+    --output-on-failure \
+    --no-tests=error \
+    --timeout 900 \
+    -j 1 \
+    -L devkit
+```
+
+Run Python tests from a system-site-packages venv:
+
+```bash
+python3 -m venv --system-site-packages _work/runtime-test-venv
+_work/runtime-test-venv/bin/python -m pip install --no-cache-dir \
+  'msgpack>=1.1,<2' \
+  'pyzmq>=27.1,<28' \
+  'pytest>=8,<9'
+
+(
+  cd _work/runtime-tests
+  share/sima-lmm/tests/runtime/run_with_cancellation_cleanup.sh \
+    ../runtime-test-venv/bin/python \
+      -m pytest \
+        -c share/sima-lmm/tests/runtime/pytest.ini \
+        -q \
+        share/sima-lmm/tests/runtime
+)
+```
+
+### Adding a runtime test
+
+When adding runtime coverage:
+
+1. Use a real DevKit, installed packages, and the dispatcher path.
+2. Add C++ targets and extras installation rules in
+   `tests/runtime/CMakeLists.txt`, or package a pytest under
+   `tests/runtime/`.
+3. Keep model names and environment variables aligned with Core.
+4. Add a bounded timeout and dispatcher serialization.
+5. Assert observable behavior and teardown, not only process startup.
+6. Update the extras archive validation in `vulcan-ci.yml`.
+7. Do not add post-test uploads.
+
+## Shared CI rules
+
+### Failure and skip policy
+
+- Required dependencies and fixtures fail loudly when missing.
+- Runtime tests do not skip because a DevKit, service, or model is absent.
+- Compiler case counts are audited and unexpected skips fail the workflow.
+- New compiler support may use informative ONNX comparison until it exists in
+  the published `develop` baseline.
+
+### Provenance
+
+- Compiler tests install the exact candidate wheel.
+- Runtime tests install the exact candidate LLiMa packages and resolved
+  Internals packages.
+- Build metadata and manifests tie packages and test extras to the candidate
+  commit.
+
+### Execution policy
+
+- Runtime tests execute serially against the dispatcher.
+- High-memory compiler cases execute separately from the standard matrix.
+- Generated compiler payloads and extracted runtime-test workspaces are
+  temporary.
