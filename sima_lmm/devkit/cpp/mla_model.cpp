@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 SiMa.ai
 
+/*
+ * The direct session needs the dma-buf export API added by the companion
+ * Internals/kernel work.  Include the package-owned namespaced header before
+ * any legacy LLiMa header: develop normally finds the older flat
+ * <simaai_memory.h> through the SDK sysroot, and both revisions intentionally
+ * share one include guard.  If that flat header wins first, the compiler hides
+ * simaai_memory_export_dmabuf_fd even though the coherent Internals dev package
+ * is installed.  This ordering makes the companion package authoritative
+ * without copying another memory-library ABI into LLiMa.
+ */
+#include <simaai/simaai_memory.h>
+
 #include "mla_model.hpp"
 
 #include <simaai/neat/mla/MlaKernelBackend.h>
-#include <simaai_memory.h>
 
 #include <algorithm>
 #include <cerrno>
