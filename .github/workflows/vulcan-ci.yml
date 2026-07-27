@@ -24,6 +24,24 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  code-format:
+    name: Check C++ formatting
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+
+      - name: Check first-party C++ formatting
+        env:
+          CLANG_FORMAT_BIN: clang-format-18
+        run: ./scripts/check_format.sh --all
+
   resolve-vulcan-config:
     name: Resolve Vulcan Config
     uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
@@ -42,7 +60,9 @@ jobs:
 
   build:
     name: Build all LLiMa packages on one Vulcan instance
-    needs: resolve-vulcan-config
+    needs:
+      - code-format
+      - resolve-vulcan-config
     uses: sima-neat/.github/.github/workflows/vulcan-build.yml@main
     with:
       vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
