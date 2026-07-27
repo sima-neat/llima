@@ -570,6 +570,7 @@ jobs:
           _work/runtime-test-venv/bin/python -m pip install --no-cache-dir --upgrade pip
           _work/runtime-test-venv/bin/python -m pip install --no-cache-dir \
             'msgpack>=1.1,<2' \
+            'pyzmq>=27.1,<28' \
             'pytest>=8,<9'
 
           (

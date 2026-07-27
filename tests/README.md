@@ -394,6 +394,7 @@ Run Python tests from a system-site-packages venv:
 python3 -m venv --system-site-packages _work/runtime-test-venv
 _work/runtime-test-venv/bin/python -m pip install --no-cache-dir \
   'msgpack>=1.1,<2' \
+  'pyzmq>=27.1,<28' \
   'pytest>=8,<9'
 
 (
