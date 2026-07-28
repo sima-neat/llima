@@ -345,6 +345,13 @@ int main(int argc, char** argv) {
              * analyzer treats these lines as the source of truth; the PASS
              * line is only a convenient independently-computed summary.
              */
+            std::cout
+                << std::fixed << std::setprecision(9)
+                << "LLIMA_DIRECT_VLM_FIRST"
+                << " trial=" << (trial + 1)
+                << " output_token_id=" << snapshot.output_token_ids.front()
+                << " ttft_us=" << (snapshot.ttft_s * 1.0e6)
+                << "\n";
             for (std::size_t interval = 0;
                  interval < snapshot.decode_intervals_s.size();
                  ++interval) {
