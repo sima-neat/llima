@@ -119,17 +119,11 @@ def gen_files(
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
-                elif lora_path is not None or quantize_embeddings or quantize_kv_cache:
-                    # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
+                else:
+                    # Use direct SiMa Builder graph generation for ordinary HF models.
                     modes = [
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
                         FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
-                    ]
-                else:
-                    # Use ONNX mode, no need to track LoRA weights
-                    modes = [
-                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                        FileGenMode.MODEL_SDK_COMPILE
                     ]
             else:
                 assert isinstance(model.hf_model, GgufModel)
@@ -241,8 +235,9 @@ def main():
 
     group = parser.add_argument_group("Model compilation parameters")
     group.add_argument(
-        "--max_num_tokens", type=int, metavar="N", default=1024,
-        help="Maximum number of input tokens that the model will support (default: 1024)"
+        "--max_num_tokens", type=int, metavar="N", default=4096,
+        help="Maximum number of input tokens that the model will support; "
+             "must be a multiple of 1024 (default: 4096)"
     )
     group.add_argument(
         "--language_group_size", type=int, metavar="N", default=128,
@@ -255,6 +250,8 @@ def main():
         help="Size of token mask.  "
              "Token masks reduce compiled code size at the cost of redundant computation by "
              "reusing models for generating multiple tokens.  "
+             "Full attention uses 1024 at context lengths of 2048 or greater; sliding attention "
+             "continues to use this value.  "
              "(default: 128)"
     )
     group.add_argument(
@@ -270,17 +267,18 @@ def main():
         )
     )
     group.add_argument(
-        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=False,
+        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=True,
         help=(
-            "Quantizes embedding tables for LLMs and Gemma4 VLMs to reduce memory "
-            "consumption. This may result in a loss of accuracy."
+            "Quantizes embedding tables for LLMs and VLMs to reduce memory "
+            "consumption. This may result in a loss of accuracy. Enabled by default; disable with "
+            "--no-quantize_embeddings."
         )
     )
     group.add_argument(
-        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=False,
+        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "Enables kv_cache quantization to reduce memory consumption. This may result in a loss"
-            " of accuracy."
+            " of accuracy. Enabled by default; disable with --no-quantize_kv_cache."
         )
     )
     egroup = group.add_mutually_exclusive_group()
@@ -401,18 +399,20 @@ def main():
     elif args.input_height is not None or args.input_width is not None:
         _abort("Both --input_height and --input_width must be provided.")
 
-    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_embeddings:
+    is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
+    is_speculative_decoding = args.draft_model_path is not None
+
+    if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
-            "Embedding quantization is not supported for ONNX file generation mode."
+            "ONNX generation does not support embedding or KV-cache quantization. "
+            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
         )
-    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_kv_cache:
+    # TODO: Enable these features for EAGLE3 once its target/draft staging and runtime
+    # paths support embedding and KV-cache quantization.
+    if is_speculative_decoding and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
-            "KV cache quantization is not supported for ONNX file generation mode."
-        )
-    if args.draft_model_path is not None and args.quantize_kv_cache:
-        _abort(
-            "KV cache quantization with speculative decoding is not currently supported. "
-            "Please disable either --quantize_kv_cache or --draft_model_path."
+            "EAGLE3 does not support embedding or KV-cache quantization. "
+            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
         )
 
     lora_path_for_base_model = None
@@ -423,7 +423,7 @@ def main():
     elif args.lora_names is not None or args.lora_paths is not None:
         _abort("Number of --lora_name do not match the number of --lora_path")
 
-    # Enable mlp splitting and LoRA is not used. The feature is not implemented for LoRA.
+    # Enable MLP splitting when LoRA is not used. The feature is not implemented for LoRA.
     split_mlp = lora_path_for_base_model is None
 
     gen_files(

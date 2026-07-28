@@ -26,29 +26,51 @@ from sima_lmm.config.layer_id import LayerID
 from sima_lmm.model import EvalMode, FileGenMode, FileGenPrecision, VisionLanguageModel
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
+from sima_lmm.model.language_pre_model import LanguagePreModel
 from tests.compilation.helpers.paths import require_readable_path
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_graph_integration]
 
-MODEL_FOLDER = "models--google--gemma-4-E2B-it"
+GEMMA4_MODEL_FOLDER = "models--google--gemma-4-E2B-it"
+QWEN3_VL_MODEL_FOLDER = "models--Qwen--Qwen3-VL-2B-Instruct"
 NORMAL_SCALE = 0.25
 PER_LAYER_SCALE = 0.5
 
 
 @pytest.fixture(scope="module")
 def gemma4_model(model_inputs_path: Path, tmp_path_factory) -> VisionLanguageModel:
-    model_path = require_readable_path(model_inputs_path / MODEL_FOLDER)
+    model_path = require_readable_path(model_inputs_path / GEMMA4_MODEL_FOLDER)
     output_path = tmp_path_factory.mktemp("gemma4_embedding_quantization")
     return VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
         onnx_path=output_path / "onnx",
         sima_path=output_path / "sima",
-        max_num_tokens=128,
+        max_num_tokens=1024,
         image_resolution=[240, 240],
         quantize_embeddings=True,
     )
+
+
+@pytest.fixture(scope="module")
+def qwen3_vl_model(model_inputs_path: Path, tmp_path_factory) -> VisionLanguageModel:
+    model_path = require_readable_path(model_inputs_path / QWEN3_VL_MODEL_FOLDER)
+    output_path = tmp_path_factory.mktemp("qwen3_vl_embedding_quantization")
+    return VisionLanguageModel.from_hf_cache(
+        hf_cache_path=model_path,
+        model_name=model_path.name,
+        onnx_path=output_path / "onnx",
+        sima_path=output_path / "sima",
+        max_num_tokens=1024,
+        image_resolution=[224, 224],
+        quantize_embeddings=True,
+    )
+
+
+@pytest.fixture(params=["gemma4_model", "qwen3_vl_model"], ids=["gemma4", "qwen3-vl"])
+def quantized_vlm_model(request) -> VisionLanguageModel:
+    return request.getfixturevalue(request.param)
 
 
 def _language_model(
@@ -121,12 +143,12 @@ def test_embedding_tensor_quantization(
 
 
 def test_vlm_passes_dequantized_embeddings_to_decode(
-    gemma4_model: VisionLanguageModel, monkeypatch: pytest.MonkeyPatch
+    quantized_vlm_model: VisionLanguageModel, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     quantized_embeddings = np.array([[4, -8], [12, -16]], dtype=np.int8)
     captured = {}
     monkeypatch.setattr(
-        gemma4_model.language_model,
+        quantized_vlm_model.language_model,
         "get_embeddings_tensor",
         lambda: (quantized_embeddings, 0.25),
     )
@@ -135,12 +157,30 @@ def test_vlm_passes_dequantized_embeddings_to_decode(
         captured["embeddings"] = embeddings_tensor
         return []
 
-    monkeypatch.setattr(gemma4_model.language_model, "run_model", capture_decode_embeddings)
+    monkeypatch.setattr(quantized_vlm_model.language_model, "run_model", capture_decode_embeddings)
 
-    gemma4_model.run_model(EvalMode.SDK, [np.array([[0]], dtype=np.int32)])
+    quantized_vlm_model.run_model(EvalMode.SDK, [np.array([[0]], dtype=np.int32)])
 
     np.testing.assert_allclose(
         captured["embeddings"], quantized_embeddings.astype(np.float32) * 0.25
+    )
+
+
+def test_non_gemma4_vlm_graph_receives_bf16_embeddings(
+    qwen3_vl_model: VisionLanguageModel,
+) -> None:
+    pre_model = qwen3_vl_model.language_model._get_part_model(
+        "pre", num_tokens=1, layer_idx=0
+    )
+    assert isinstance(pre_model, LanguagePreModel)
+
+    net = pre_model._build_sima_nodes(pre_model._layer_base_name, quantizable=False)
+
+    assert _input_scalar_type(net, "input") == ScalarType.bfloat16
+    assert not any(
+        isinstance(node.ir, SiMaIR)
+        and isinstance(node.ir.operation, DequantizationTransformOp)
+        for node in _all_nodes(net)
     )
 
 
