@@ -14,6 +14,7 @@
 #include <simaai/simaai_memory.h>
 
 #include "mla_model.hpp"
+#include "mla_execution_plan.hpp"
 
 #include <simaai/neat/mla/MlaKernelBackend.h>
 
@@ -452,6 +453,13 @@ class MlaExecutionSession {
         if (!neutral_binding_still_live) {
             zero_hidden_input_.reset();
         }
+        /*
+         * A scoped free may also clear the shared import cache for retained
+         * families.  Bump even when the selector matched no live package:
+         * conservative invalidation is cold and is safer than allowing a
+         * plan to outlive any teardown attempt.
+         */
+        publication_epoch_.fetch_add(1, std::memory_order_release);
     }
 
     std::size_t inspect_public_input_count(
@@ -625,10 +633,79 @@ class MlaExecutionSession {
         return snapshot_scratch_;
     }
 
-    void run_snapshots(std::vector<SubmissionSnapshot>& snapshots) {
+    [[nodiscard]] std::uint64_t publication_epoch() const noexcept {
+        return publication_epoch_.load(std::memory_order_acquire);
+    }
+
+    /*
+     * CPU ownership must be claimed through the exact Backend BufferState
+     * used by BoundExecution.  Calling simaai_memory cache helpers directly
+     * would bypass accepted-job ownership and allow staging bytes to change
+     * under DMA.  The status boundary is noexcept so P3 can reuse it from the
+     * CQ continuation without unwinding through the completion pump.
+     */
+    mla::Status begin_cpu_access(
+        MLABuffer* parent,
+        mla::CpuAccessMode mode,
+        mla::CpuAccessGuard* guard
+    ) noexcept {
+        if (!parent || !guard) {
+            return mla::Status::error(
+                -EINVAL, "invalid LLiMa CPU-access arguments"
+            );
+        }
+        try {
+            std::lock_guard lock(mutex_);
+            require_healthy_locked();
+            mla::Buffer* buffer = import_buffer_locked(parent);
+            if (!buffer) {
+                return mla::Status::error(
+                    -EPROTO, "MLA import cache did not retain buffer"
+                );
+            }
+            return buffer->begin_cpu_access(mode, guard);
+        } catch (const std::bad_alloc&) {
+            return mla::Status::error(
+                -ENOMEM, "MLA CPU-access import allocation failed"
+            );
+        } catch (const std::exception& error) {
+            return mla::Status::error(-EIO, error.what());
+        } catch (...) {
+            return mla::Status::error(
+                -EIO, "unknown MLA CPU-access import failure"
+            );
+        }
+    }
+
+    struct PlanSpan {
+        const SubmissionSnapshot* data = nullptr;
+        std::size_t size = 0;
+
+        [[nodiscard]] bool empty() const noexcept {
+            return data == nullptr || size == 0;
+        }
+    };
+
+    /*
+     * P3 will use this one outer hook to supply the next physical position.
+     * It is deliberately multiplexed by the executor's existing per-Job
+     * continuation; registering another callback on the final Job would
+     * create two completion authorities and is rejected by Backend.
+     */
+    using PositionHook = bool (*)(
+        void* context, PlanSpan* next
+    ) noexcept;
+
+    void start_snapshots(
+        PlanSpan snapshots,
+        void* hook_context = nullptr,
+        PositionHook hook = nullptr
+    ) {
         require_healthy();
         if (snapshots.empty()) {
-            return;
+            throw std::invalid_argument(
+                "cannot start an empty MLA execution plan"
+            );
         }
 
         /*
@@ -652,64 +729,56 @@ class MlaExecutionSession {
          */
         {
             std::lock_guard lock(rolling_mutex_);
-            if (rolling_snapshots_ || rolling_outstanding_ != 0) {
+            if (rolling_active_ || rolling_outstanding_ != 0) {
                 throw std::logic_error(
                     "MLA rolling executor still owns a prior segment"
                 );
             }
-            rolling_snapshots_ = &snapshots;
+            rolling_data_ = snapshots.data;
+            rolling_size_ = snapshots.size;
             rolling_next_ = 0;
             rolling_outstanding_ = 0;
             rolling_available_head_ = 0;
-            rolling_available_count_ = 0;
-            rolling_initialized_ = false;
-            rolling_refill_active_ = false;
+            rolling_available_count_ = rolling_available_slots_.size();
+            for (std::size_t slot = 0;
+                 slot < rolling_available_slots_.size(); ++slot) {
+                rolling_available_slots_[slot] = slot;
+            }
+            rolling_active_ = true;
+            rolling_logical_done_ = false;
+            rolling_drive_active_ = false;
+            rolling_hook_active_ = false;
+            rolling_hook_context_ = hook_context;
+            rolling_position_hook_ = hook;
             rolling_failure_ = {};
             for (auto& job : job_window_) {
                 job.reset();
             }
         }
+        drive_rolling();
+    }
 
-        /*
-         * Publish the initial jobs on the caller. While this small loop is in
-         * progress callbacks only retire slots; they cannot refill and race a
-         * later initial member into the FIFO. After the barrier, the pump owns
-         * all progressive refills.
-         */
-        for (std::size_t slot = 0;
-             slot < job_window_.size() && slot < snapshots.size();
-             ++slot) {
-            std::size_t snapshot_index = 0;
-            {
-                std::lock_guard lock(rolling_mutex_);
-                if (rolling_failure_.kind != RollingFailureKind::kNone) {
-                    break;
-                }
-                snapshot_index = rolling_next_++;
-                ++rolling_outstanding_;
-            }
-            submit_rolling_slot(slot, snapshot_index);
-        }
-        {
-            std::lock_guard lock(rolling_mutex_);
-            rolling_initialized_ = true;
-        }
-        start_rolling_refill();
-
+    void drain_and_join() {
         RollingFailure failure;
         std::vector<mla::Job> terminal_jobs;
         {
             std::unique_lock lock(rolling_mutex_);
+            if (!rolling_active_) {
+                throw std::logic_error(
+                    "MLA rolling executor has not been started"
+                );
+            }
             rolling_cv_.wait(lock, [&] {
-                return rolling_outstanding_ == 0 &&
-                       (rolling_failure_.kind !=
-                            RollingFailureKind::kNone ||
-                        rolling_next_ == snapshots.size());
+                return rolling_logical_done_;
             });
             failure = rolling_failure_;
-            rolling_snapshots_ = nullptr;
-            rolling_initialized_ = false;
-            rolling_refill_active_ = false;
+            rolling_active_ = false;
+            rolling_data_ = nullptr;
+            rolling_size_ = 0;
+            rolling_next_ = 0;
+            rolling_position_hook_ = nullptr;
+            rolling_hook_context_ = nullptr;
+            rolling_hook_active_ = false;
             rolling_available_head_ = 0;
             rolling_available_count_ = 0;
             terminal_jobs.reserve(job_window_.size());
@@ -735,17 +804,9 @@ class MlaExecutionSession {
             for (auto& job : job_window_) {
                 job.reset();
             }
+            rolling_logical_done_ = false;
         }
 
-        /*
-         * All accepted jobs are terminal here, so no Backend slot needs the
-         * snapshot handles any longer. Clear logical contents but retain the
-         * vector's allocation for the next subsegment/token. The previous
-         * swap-and-reserve implementation performed one malloc/free pair per
-         * commit despite the segment object deliberately spanning multiple
-         * commits.
-         */
-        snapshots.clear();
         if (failure.kind != RollingFailureKind::kNone) {
             const auto path = model_path(failure.model_index);
             if (failure.kind == RollingFailureKind::kSubmit) {
@@ -766,6 +827,24 @@ class MlaExecutionSession {
                 failure.fault_class
             ));
         }
+    }
+
+    void run_and_wait(PlanSpan snapshots) {
+        start_snapshots(snapshots);
+        drain_and_join();
+    }
+
+    void run_snapshots(std::vector<SubmissionSnapshot>& snapshots) {
+        if (snapshots.empty()) {
+            return;
+        }
+        run_and_wait({snapshots.data(), snapshots.size()});
+        /*
+         * All accepted jobs and their callbacks are joined here, so no
+         * Backend slot needs the snapshot handles any longer. Retain vector
+         * capacity for the next generic subsegment.
+         */
+        snapshots.clear();
     }
 
     /* Caller owns execution_mutex_ across CPU preparation and publication. */
@@ -929,6 +1008,7 @@ class MlaExecutionSession {
             candidate.binding->adapter_generation =
                 candidate.generation;
         }
+        publication_epoch_.fetch_add(1, std::memory_order_release);
     }
 
     /* Caller owns execution_mutex_; clear is one publication boundary. */
@@ -984,6 +1064,7 @@ class MlaExecutionSession {
             candidate.binding->adapter_generation =
                 candidate.generation;
         }
+        publication_epoch_.fetch_add(1, std::memory_order_release);
     }
 
     std::filesystem::path model_path(std::size_t index) const {
@@ -1071,13 +1152,6 @@ class MlaExecutionSession {
         );
     }
 
-    bool rolling_done_locked() const noexcept {
-        return rolling_initialized_ && rolling_outstanding_ == 0 &&
-               rolling_snapshots_ &&
-               (rolling_failure_.kind != RollingFailureKind::kNone ||
-                rolling_next_ == rolling_snapshots_->size());
-    }
-
     void record_rolling_failure_locked(
         RollingFailureKind kind, std::size_t snapshot_index,
         int status_code, int completion_result,
@@ -1086,9 +1160,8 @@ class MlaExecutionSession {
             return;
         }
         const std::uint32_t model_index =
-            rolling_snapshots_ &&
-                    snapshot_index < rolling_snapshots_->size()
-                ? (*rolling_snapshots_)[snapshot_index].model_index
+            rolling_data_ && snapshot_index < rolling_size_
+                ? rolling_data_[snapshot_index].model_index
                 : 0;
         rolling_failure_ = {
             .kind = kind,
@@ -1103,7 +1176,6 @@ class MlaExecutionSession {
     void fail_rolling_submit(
         std::size_t slot, std::size_t snapshot_index,
         int status_code) noexcept {
-        bool notify = false;
         {
             std::lock_guard lock(rolling_mutex_);
             /*
@@ -1118,10 +1190,6 @@ class MlaExecutionSession {
                 RollingFailureKind::kSubmit, snapshot_index,
                 status_code, status_code, 0
             );
-            notify = rolling_done_locked();
-        }
-        if (notify) {
-            rolling_cv_.notify_all();
         }
     }
 
@@ -1143,7 +1211,7 @@ class MlaExecutionSession {
             mla::SubmitOptions options;
             options.timeout_ms = kJobTimeoutMs;
             status = backend_->submit(
-                (*rolling_snapshots_)[snapshot_index].execution,
+                rolling_data_[snapshot_index].execution,
                 options, &job
             );
         } catch (...) {
@@ -1202,29 +1270,43 @@ class MlaExecutionSession {
         }
     }
 
-    void start_rolling_refill() noexcept {
+    /*
+     * Single non-recursive driver for initial fill, CQ-owned refill, and the
+     * one outer position transition.  A late callback may run inline from
+     * set_completion_callback(); it only records retirement and calls this
+     * function. If a driver is already active it returns, and that driver
+     * consumes the newly available slot on its next iteration.
+     */
+    void drive_rolling() noexcept {
         {
             std::lock_guard lock(rolling_mutex_);
-            if (!rolling_initialized_ || rolling_refill_active_) {
+            if (!rolling_active_ || rolling_drive_active_) {
                 return;
             }
-            rolling_refill_active_ = true;
+            rolling_drive_active_ = true;
         }
 
         while (true) {
             std::size_t slot = 0;
             std::size_t snapshot_index = 0;
-            bool have_work = false;
+            bool submit = false;
+            bool invoke_hook = false;
             bool notify = false;
             {
                 std::lock_guard lock(rolling_mutex_);
-                if (rolling_failure_.kind != RollingFailureKind::kNone ||
-                    !rolling_snapshots_ ||
-                    rolling_next_ == rolling_snapshots_->size() ||
-                    rolling_available_count_ == 0) {
-                    rolling_refill_active_ = false;
-                    notify = rolling_done_locked();
-                } else {
+                if (!rolling_active_) {
+                    rolling_drive_active_ = false;
+                    return;
+                }
+                if (rolling_failure_.kind != RollingFailureKind::kNone) {
+                    if (rolling_outstanding_ == 0) {
+                        rolling_logical_done_ = true;
+                        notify = true;
+                    }
+                    rolling_drive_active_ = false;
+                } else if (
+                    rolling_next_ < rolling_size_ &&
+                    rolling_available_count_ != 0) {
                     slot = rolling_available_slots_[
                         rolling_available_head_
                     ];
@@ -1234,16 +1316,76 @@ class MlaExecutionSession {
                     --rolling_available_count_;
                     snapshot_index = rolling_next_++;
                     ++rolling_outstanding_;
-                    have_work = true;
+                    submit = true;
+                } else if (
+                    rolling_next_ == rolling_size_ &&
+                    rolling_outstanding_ == 0) {
+                    if (rolling_position_hook_ &&
+                        !rolling_hook_active_) {
+                        rolling_hook_active_ = true;
+                        invoke_hook = true;
+                    } else {
+                        rolling_logical_done_ = true;
+                        rolling_drive_active_ = false;
+                        notify = true;
+                    }
+                } else {
+                    /*
+                     * All available slots are in flight. Relinquish the drive
+                     * token; the next completion will reacquire it.
+                     */
+                    rolling_drive_active_ = false;
                 }
             }
             if (notify) {
                 rolling_cv_.notify_all();
             }
-            if (!have_work) {
+            if (submit) {
+                submit_rolling_slot(slot, snapshot_index);
+                continue;
+            }
+            if (invoke_hook) {
+                PlanSpan next;
+                bool keep_running = false;
+                try {
+                    keep_running =
+                        rolling_position_hook_(
+                            rolling_hook_context_, &next
+                        );
+                } catch (...) {
+                    /*
+                     * PositionHook is noexcept by type. Retain this guard
+                     * against ABI-violating foreign code so no exception can
+                     * escape through Backend's sole CQ consumer.
+                     */
+                    std::terminate();
+                }
+                {
+                    std::lock_guard lock(rolling_mutex_);
+                    rolling_hook_active_ = false;
+                    if (!rolling_active_) {
+                        rolling_drive_active_ = false;
+                        return;
+                    }
+                    if (keep_running && !next.empty()) {
+                        rolling_data_ = next.data;
+                        rolling_size_ = next.size;
+                        rolling_next_ = 0;
+                    } else {
+                        rolling_logical_done_ = true;
+                        rolling_drive_active_ = false;
+                        notify = true;
+                    }
+                }
+                if (notify) {
+                    rolling_cv_.notify_all();
+                    return;
+                }
+                continue;
+            }
+            if (!submit) {
                 return;
             }
-            submit_rolling_slot(slot, snapshot_index);
         }
     }
 
@@ -1251,11 +1393,10 @@ class MlaExecutionSession {
         std::size_t slot, std::size_t snapshot_index,
         const mla::Status& status,
         const mla::JobCompletion& completion) noexcept {
-        bool refill = false;
-        bool notify = false;
         {
             std::lock_guard lock(rolling_mutex_);
-            if (!rolling_snapshots_ || slot >= job_window_.size() ||
+            if (!rolling_active_ || !rolling_data_ ||
+                slot >= job_window_.size() ||
                 !job_window_[slot] ||
                 rolling_callback_slots_[slot].snapshot_index !=
                     snapshot_index ||
@@ -1278,14 +1419,8 @@ class MlaExecutionSession {
                     completion.fault_class
                 );
             }
-            refill = rolling_initialized_ && !rolling_refill_active_;
-            notify = !refill && rolling_done_locked();
         }
-        if (refill) {
-            start_rolling_refill();
-        } else if (notify) {
-            rolling_cv_.notify_all();
-        }
+        drive_rolling();
     }
 
     void validate_index_locked(std::size_t index) const {
@@ -1407,6 +1542,7 @@ class MlaExecutionSession {
             poison_locked("eager MLA binding materialization failed");
             throw;
         }
+        publication_epoch_.fetch_add(1, std::memory_order_release);
     }
 
     bool parent_generations_match_locked(
@@ -1658,56 +1794,13 @@ class MlaExecutionSession {
         return &defaults[index];
     }
 
-    mla::BufferView import_view_locked(
-        const MLABufferSlice* selected,
-        const std::vector<MLABufferSlice>& defaults,
-        std::size_t port_index,
-        std::uint64_t compiler_extent,
-        std::string_view direction
-    ) {
-        if (!selected) {
-            throw std::invalid_argument(fmt::format(
-                "MLA {} {} has no buffer slice", direction, port_index
-            ));
-        }
-        MLABuffer* parent = selected->get_buf_ptr();
-        if (!parent && port_index < defaults.size()) {
-            parent = defaults[port_index].get_buf_ptr();
-        }
+    mla::Buffer* import_buffer_locked(MLABuffer* parent) {
         if (!parent || !parent->get_simaai_memory() ||
             parent->get_allocation_cookie() == 0) {
-            throw std::invalid_argument(fmt::format(
-                "MLA {} {} has no allocated parent buffer",
-                direction, port_index
-            ));
+            throw std::invalid_argument(
+                "MLA buffer import requires an allocated parent"
+            );
         }
-
-        const std::uint64_t offset =
-            parent->get_buf_addr_offset(selected->get_buf_begins());
-        const std::uint64_t declared_extent =
-            parent->get_buf_len(selected->get_buf_shapes());
-        if (compiler_extent > declared_extent) {
-            /*
-             * A slice shape is an ownership boundary, not debug metadata.
-             * Develop passed this exact get_buf_len(shape) bound to Dispatcher;
-             * checking only the larger parent allocation in the direct path
-             * would let a short override expose adjacent rows to JOB_EXEC.
-             */
-            throw std::out_of_range(fmt::format(
-                "MLA {} {} compiler extent {} exceeds declared slice extent {}",
-                direction, port_index, compiler_extent, declared_extent
-            ));
-        }
-        if (offset > parent->get_allocation_size() ||
-            compiler_extent >
-                parent->get_allocation_size() - offset) {
-            throw std::out_of_range(fmt::format(
-                "MLA {} {} compiler extent {} at offset {} exceeds {}",
-                direction, port_index, compiler_extent, offset,
-                parent->get_allocation_size()
-            ));
-        }
-
         const std::uint64_t cookie = parent->get_allocation_cookie();
         /*
          * MLABuffer::free()/allocate() gives the same logical buffer a new
@@ -1759,9 +1852,67 @@ class MlaExecutionSession {
             imported->second.last_use = ++import_use_epoch_;
             import_generation_[parent] = cookie;
         }
+        return imported == import_cache_.end()
+            ? nullptr : &imported->second.buffer;
+    }
 
-        mla::BufferView view =
-            imported->second.buffer.view(offset, compiler_extent);
+    mla::BufferView import_view_locked(
+        const MLABufferSlice* selected,
+        const std::vector<MLABufferSlice>& defaults,
+        std::size_t port_index,
+        std::uint64_t compiler_extent,
+        std::string_view direction
+    ) {
+        if (!selected) {
+            throw std::invalid_argument(fmt::format(
+                "MLA {} {} has no buffer slice", direction, port_index
+            ));
+        }
+        MLABuffer* parent = selected->get_buf_ptr();
+        if (!parent && port_index < defaults.size()) {
+            parent = defaults[port_index].get_buf_ptr();
+        }
+        if (!parent || !parent->get_simaai_memory() ||
+            parent->get_allocation_cookie() == 0) {
+            throw std::invalid_argument(fmt::format(
+                "MLA {} {} has no allocated parent buffer",
+                direction, port_index
+            ));
+        }
+
+        const std::uint64_t offset =
+            parent->get_buf_addr_offset(selected->get_buf_begins());
+        const std::uint64_t declared_extent =
+            parent->get_buf_len(selected->get_buf_shapes());
+        if (compiler_extent > declared_extent) {
+            /*
+             * A slice shape is an ownership boundary, not debug metadata.
+             * Develop passed this exact get_buf_len(shape) bound to Dispatcher;
+             * checking only the larger parent allocation in the direct path
+             * would let a short override expose adjacent rows to JOB_EXEC.
+             */
+            throw std::out_of_range(fmt::format(
+                "MLA {} {} compiler extent {} exceeds declared slice extent {}",
+                direction, port_index, compiler_extent, declared_extent
+            ));
+        }
+        if (offset > parent->get_allocation_size() ||
+            compiler_extent >
+                parent->get_allocation_size() - offset) {
+            throw std::out_of_range(fmt::format(
+                "MLA {} {} compiler extent {} at offset {} exceeds {}",
+                direction, port_index, compiler_extent, offset,
+                parent->get_allocation_size()
+            ));
+        }
+
+        mla::Buffer* imported = import_buffer_locked(parent);
+        if (!imported) {
+            throw std::runtime_error(
+                "MLA buffer import vanished after cache insertion"
+            );
+        }
+        mla::BufferView view = imported->view(offset, compiler_extent);
         if (!view.valid()) {
             throw std::out_of_range(fmt::format(
                 "Backend rejected MLA {} {} BufferView",
@@ -1827,13 +1978,18 @@ class MlaExecutionSession {
     std::condition_variable rolling_cv_;
     std::vector<RollingCallbackSlot> rolling_callback_slots_;
     std::vector<std::size_t> rolling_available_slots_;
-    std::vector<SubmissionSnapshot>* rolling_snapshots_ = nullptr;
+    const SubmissionSnapshot* rolling_data_ = nullptr;
+    std::size_t rolling_size_ = 0;
     std::size_t rolling_next_ = 0;
     std::size_t rolling_outstanding_ = 0;
     std::size_t rolling_available_head_ = 0;
     std::size_t rolling_available_count_ = 0;
-    bool rolling_initialized_ = false;
-    bool rolling_refill_active_ = false;
+    bool rolling_active_ = false;
+    bool rolling_logical_done_ = false;
+    bool rolling_drive_active_ = false;
+    bool rolling_hook_active_ = false;
+    void* rolling_hook_context_ = nullptr;
+    PositionHook rolling_position_hook_ = nullptr;
     RollingFailure rolling_failure_;
     std::vector<MlaPendingBinding> pending_scratch_;
     std::vector<SubmissionSnapshot> snapshot_scratch_;
@@ -1852,6 +2008,13 @@ class MlaExecutionSession {
     std::unordered_map<const MLABuffer*, std::uint64_t> import_generation_;
     std::uint64_t import_use_epoch_ = 0;
     /*
+     * One cheap fast-path generation covers package and adapter publication.
+     * MLABuffer owns the complementary allocation generation. Both are
+     * sampled only while execution_mutex_ excludes publication, so a plan
+     * either runs entirely in one generation or is rejected before submit.
+     */
+    std::atomic<std::uint64_t> publication_epoch_{1};
+    /*
      * One immutable neutral LoRA binding shared by all hidden port views in
      * this context. It is absent for non-LoRA models, preserving fail-closed
      * behavior for an unexpected hidden input with no explicit semantics.
@@ -1860,6 +2023,184 @@ class MlaExecutionSession {
     bool poisoned_ = false;
     std::string poison_reason_;
 };
+
+struct MlaExecutionPlan::Impl {
+    struct PositionPlan {
+        std::uint32_t first = 0;
+        std::uint16_t count = 0;
+    };
+    struct ParentGeneration {
+        const MLABuffer* parent = nullptr;
+        std::uint64_t allocation_cookie = 0;
+    };
+
+    explicit Impl(std::shared_ptr<MlaExecutionSession> value)
+        : session(std::move(value)) {
+        if (!session) {
+            throw std::invalid_argument(
+                "MLA execution plan has no session"
+            );
+        }
+    }
+
+    std::shared_ptr<MlaExecutionSession> session;
+    std::vector<MlaPendingBinding> pending;
+    std::vector<MlaExecutionSession::SubmissionSnapshot> jobs;
+    std::vector<PositionPlan> positions;
+    std::vector<ParentGeneration> parent_generations;
+    std::size_t open_first = 0;
+    bool position_open = false;
+    bool sealed = false;
+    std::uint64_t publication_epoch = 0;
+};
+
+MlaExecutionPlan::MlaExecutionPlan(
+    std::shared_ptr<MlaExecutionSession> session
+) : _impl(std::make_unique<Impl>(std::move(session))) {}
+MlaExecutionPlan::~MlaExecutionPlan() = default;
+MlaExecutionPlan::MlaExecutionPlan(MlaExecutionPlan&&) noexcept = default;
+MlaExecutionPlan&
+MlaExecutionPlan::operator=(MlaExecutionPlan&&) noexcept = default;
+
+void MlaExecutionPlan::begin_position() {
+    if (!_impl || _impl->sealed || _impl->position_open) {
+        throw std::logic_error(
+            "invalid begin_position on MLA execution plan"
+        );
+    }
+    _impl->open_first = _impl->pending.size();
+    _impl->position_open = true;
+}
+
+void MlaExecutionPlan::end_position() {
+    if (!_impl || _impl->sealed || !_impl->position_open) {
+        throw std::logic_error(
+            "invalid end_position on MLA execution plan"
+        );
+    }
+    const std::size_t count =
+        _impl->pending.size() - _impl->open_first;
+    if (count == 0 ||
+        _impl->open_first >
+            std::numeric_limits<std::uint32_t>::max() ||
+        count > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::overflow_error(
+            "MLA position plan is empty or exceeds flat-arena indices"
+        );
+    }
+    _impl->positions.push_back({
+        .first = static_cast<std::uint32_t>(_impl->open_first),
+        .count = static_cast<std::uint16_t>(count),
+    });
+    _impl->position_open = false;
+}
+
+void MlaExecutionPlan::seal() {
+    if (!_impl || _impl->sealed || _impl->position_open ||
+        _impl->positions.empty()) {
+        throw std::logic_error("MLA execution plan cannot be sealed");
+    }
+
+    /*
+     * Build into the private candidate arena while package/adapter/buffer
+     * publication is excluded. prepare_many() performs complete checked bind
+     * materialization before this method exposes `sealed=true`; an exception
+     * therefore leaves no runnable partial prefix.
+     */
+    auto execution_lock = _impl->session->acquire_execution_lock();
+    _impl->session->prepare_many(_impl->pending, _impl->jobs);
+    if (_impl->jobs.size() != _impl->pending.size()) {
+        throw std::logic_error(
+            "MLA execution plan binding count changed during seal"
+        );
+    }
+    _impl->publication_epoch =
+        _impl->session->publication_epoch();
+    /*
+     * Record exactly the parents referenced by this plan rather than a
+     * process-global allocation epoch. Requests legitimately allocate a fresh
+     * input_embeds buffer after this plan is built; invalidating an unrelated
+     * ordinary-decode arena would turn every request into the generic path.
+     */
+    auto record_parent = [&](const MLABuffer* parent) {
+        if (!parent ||
+            std::find_if(
+                _impl->parent_generations.begin(),
+                _impl->parent_generations.end(),
+                [parent](const Impl::ParentGeneration& candidate) {
+                    return candidate.parent == parent;
+                }
+            ) != _impl->parent_generations.end()) {
+            return;
+        }
+        _impl->parent_generations.push_back({
+            .parent = parent,
+            .allocation_cookie = parent->get_allocation_cookie(),
+        });
+    };
+    for (const MlaPendingBinding& request : _impl->pending) {
+        for (const MLABufferSlice& slice : request.binding->ifms) {
+            record_parent(slice.get_buf_ptr());
+        }
+        for (const MLABufferSlice& slice : request.binding->ofms) {
+            record_parent(slice.get_buf_ptr());
+        }
+        if (request.ifm_overrides) {
+            for (const auto& [port, slice] : *request.ifm_overrides) {
+                (void)port;
+                record_parent(slice.get_buf_ptr());
+            }
+        }
+        if (request.ofm_overrides) {
+            for (const auto& [port, slice] : *request.ofm_overrides) {
+                (void)port;
+                record_parent(slice.get_buf_ptr());
+            }
+        }
+    }
+    _impl->pending.clear();
+    _impl->pending.shrink_to_fit();
+    _impl->sealed = true;
+}
+
+bool MlaExecutionPlan::valid(std::size_t position) const noexcept {
+    return _impl && _impl->sealed &&
+           position < _impl->positions.size() &&
+           _impl->publication_epoch ==
+               _impl->session->publication_epoch() &&
+           std::all_of(
+               _impl->parent_generations.begin(),
+               _impl->parent_generations.end(),
+               [](const Impl::ParentGeneration& generation) {
+                   return generation.parent &&
+                          generation.allocation_cookie != 0 &&
+                          generation.parent->get_allocation_cookie() ==
+                              generation.allocation_cookie;
+               }
+           );
+}
+
+std::size_t MlaExecutionPlan::position_count() const noexcept {
+    return _impl ? _impl->positions.size() : 0;
+}
+
+std::size_t MlaExecutionPlan::metadata_bytes() const noexcept {
+    if (!_impl) {
+        return 0;
+    }
+    /*
+     * This is the flat plan's owned arena, not transitive Backend/package
+     * storage which exists independently. Capacity is reported rather than
+     * size so the release gate measures actual retained allocation.
+     */
+    return _impl->jobs.capacity() *
+               sizeof(MlaExecutionSession::SubmissionSnapshot) +
+           _impl->positions.capacity() *
+               sizeof(Impl::PositionPlan) +
+           _impl->parent_generations.capacity() *
+               sizeof(Impl::ParentGeneration) +
+           sizeof(Impl);
+}
 
 struct MlaExecutionSegment::Impl {
     explicit Impl(std::shared_ptr<MlaExecutionSession> value)
@@ -1945,6 +2286,46 @@ void MlaExecutionSegment::commit() {
     }
 }
 
+void MlaExecutionSegment::commit(
+    const MlaExecutionPlan& plan, std::size_t position
+) {
+    if (!plan._impl || !plan._impl->sealed ||
+        !plan.valid(position)) {
+        throw std::logic_error(
+            "MLA execution plan is stale or position is invalid"
+        );
+    }
+    if (!_impl) {
+        _impl = std::make_unique<Impl>(plan._impl->session);
+    }
+    if (_impl->session != plan._impl->session) {
+        throw std::invalid_argument(
+            "MLA execution plan and segment use different contexts"
+        );
+    }
+    if (_impl->pending && !_impl->pending->empty()) {
+        throw std::logic_error(
+            "cannot mix generic bindings and a prebound plan in one commit"
+        );
+    }
+    const auto entry = plan._impl->positions[position];
+    if (entry.first > plan._impl->jobs.size() ||
+        entry.count > plan._impl->jobs.size() - entry.first) {
+        throw std::logic_error(
+            "MLA execution plan arena range is corrupt"
+        );
+    }
+    try {
+        _impl->session->run_and_wait({
+            plan._impl->jobs.data() + entry.first,
+            entry.count,
+        });
+    } catch (...) {
+        abort();
+        throw;
+    }
+}
+
 void connect_mla(const std::vector<std::string>& legacy_args) {
     std::lock_guard lock(default_session_mutex);
     if (default_session) {
@@ -1978,6 +2359,20 @@ void require_mla_execution_session_healthy(
         throw std::runtime_error("MLA execution session is not available");
     }
     session->require_healthy();
+}
+
+mla::Status begin_mla_buffer_cpu_access(
+    const std::shared_ptr<MlaExecutionSession>& session,
+    MLABuffer* buffer,
+    mla::CpuAccessMode mode,
+    mla::CpuAccessGuard* guard
+) noexcept {
+    if (!session) {
+        return mla::Status::error(
+            -ENODEV, "MLA execution session is unavailable"
+        );
+    }
+    return session->begin_cpu_access(buffer, mode, guard);
 }
 
 void disconnect_mla() {
@@ -2121,6 +2516,57 @@ void MLAModelWithBuffer::_add_embedding_row_to_segment(
         segment.abort();
         throw;
     }
+}
+
+void MLAModelWithBuffer::_add_to_plan(MlaExecutionPlan& plan) {
+    if (!plan._impl || plan._impl->sealed ||
+        !plan._impl->position_open) {
+        throw std::logic_error(
+            "MLA plan model must be added inside an open position"
+        );
+    }
+    if (plan._impl->session != _session) {
+        throw std::invalid_argument(
+            "one MLA execution plan cannot mix kernel contexts"
+        );
+    }
+    plan._impl->pending.push_back({
+        .binding = as_binding_cell(_binding),
+    });
+}
+
+void MLAModelWithBuffer::_add_embedding_row_to_plan(
+    MlaExecutionPlan& plan,
+    uint8_t port,
+    MLABuffer* parent,
+    uint32_t row,
+    uint32_t width
+) {
+    if (!plan._impl || plan._impl->sealed ||
+        !plan._impl->position_open || !parent || width == 0) {
+        throw std::logic_error(
+            "invalid MLA embedding-plan entry"
+        );
+    }
+    if (plan._impl->session != _session) {
+        throw std::invalid_argument(
+            "one MLA execution plan cannot mix kernel contexts"
+        );
+    }
+    MlaPendingBinding pending{
+        .binding = as_binding_cell(_binding),
+    };
+    pending.ifm_overrides.emplace();
+    pending.ifm_overrides->emplace(
+        std::piecewise_construct,
+        std::forward_as_tuple(port),
+        std::forward_as_tuple(
+            parent,
+            std::vector<uint32_t>{row, 0},
+            std::vector<uint32_t>{1, width}
+        )
+    );
+    plan._impl->pending.push_back(std::move(pending));
 }
 
 void MLAModelWithBuffer::set_reloc_set(

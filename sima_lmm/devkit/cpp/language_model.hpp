@@ -45,7 +45,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer
         );
-        virtual ~LanguageModel() override { _finalize(); }
+        virtual ~LanguageModel() override;
 
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
@@ -290,6 +290,16 @@ class LanguageModel : public BaseModel<VlmConfig> {
             MLABuffer* embedding,
             uint32_t embedding_row
         );
+        void _append_ordinary_decode_recipe(
+            MlaExecutionPlan& plan,
+            uint16_t token_idx,
+            MLABuffer* embedding,
+            uint32_t embedding_row
+        );
+        void _rebuild_ordinary_decode_plan();
+        void _stage_ordinary_decode_embedding(
+            uint32_t token_id, MLABuffer& staging
+        );
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
@@ -348,6 +358,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
         std::vector<OrdinaryDecodeRecipe> _ordinary_decode_recipes;
+        /*
+         * Immutable flat position arena for the narrow scalar ordinary-decode
+         * shape. It is destroyed before package teardown and rebuilt after
+         * each adapter publication; generic recipes remain the safe fallback
+         * for stale or unsupported generations.
+         */
+        std::unique_ptr<MlaExecutionPlan> _ordinary_decode_plan;
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
 

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -13,9 +14,11 @@
 #include <fmt/ranges.h>
 #include <fmt/std.h>
 #include <spdlog/spdlog.h>
+#include <simaai/neat/mla/MlaKernelBackend.h>
 
 #include "eagle_helpers.hpp"
 #include "language_model.hpp"
+#include "mla_execution_plan.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -23,6 +26,42 @@ namespace llima {
 
 namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
+
+enum class OrdinaryDecodeArm {
+    kStagingPlan,
+    kStagingDynamic,
+    kZeroCopyDynamic,
+};
+
+OrdinaryDecodeArm ordinary_decode_arm() {
+#if defined(SIMA_LLIMA_ENABLE_DVT_QUEUE_DEPTH_OVERRIDE)
+    /*
+     * Qualification-only attribution seam for the frozen P1 three-arm A/B.
+     * It is compiled out of the product build and does not become a LLiMa,
+     * Neat, Backend, or kernel tuning API.
+     */
+    static const OrdinaryDecodeArm arm = [] {
+        const char* value =
+            std::getenv("SIMA_LLIMA_DVT_ORDINARY_DECODE_ARM");
+        if (!value || std::strcmp(value, "staging_plan") == 0) {
+            return OrdinaryDecodeArm::kStagingPlan;
+        }
+        if (std::strcmp(value, "staging_dynamic") == 0) {
+            return OrdinaryDecodeArm::kStagingDynamic;
+        }
+        if (std::strcmp(value, "zero_copy_dynamic") == 0) {
+            return OrdinaryDecodeArm::kZeroCopyDynamic;
+        }
+        throw std::runtime_error(
+            "SIMA_LLIMA_DVT_ORDINARY_DECODE_ARM must be "
+            "staging_plan, staging_dynamic, or zero_copy_dynamic"
+        );
+    }();
+    return arm;
+#else
+    return OrdinaryDecodeArm::kStagingPlan;
+#endif
+}
 }
 
 LanguageModel::LanguageModel(
@@ -153,6 +192,10 @@ LanguageModel::LanguageModel(
     }
 
     _initialize();
+}
+
+LanguageModel::~LanguageModel() {
+    _finalize();
 }
 
 
@@ -447,6 +490,16 @@ uint32_t LanguageModel::run_model_once(
         next_token_idx = token_idx + 1;
     }
     auto use_input_tokens = token_idx < num_input_tokens;
+    const bool qualified_ordinary_decode =
+        num_tokens == 1 &&
+        !use_input_tokens &&
+        logits_ptr == nullptr &&
+        !_need_argmax &&
+        _has_ordinary_decode_recipe(token_idx);
+    const OrdinaryDecodeArm decode_arm = ordinary_decode_arm();
+    const bool stage_ordinary_decode =
+        qualified_ordinary_decode &&
+        decode_arm != OrdinaryDecodeArm::kZeroCopyDynamic;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
     MLABuffer* normal_input_buf;
@@ -456,7 +509,17 @@ uint32_t LanguageModel::run_model_once(
         normal_input_buf = &get_buffer("input_embeds");
         normal_input_row = token_idx;
         normal_input_num_tokens = num_tokens;
+    } else if (stage_ordinary_decode) {
+        normal_input_buf = &get_buffer("decode_embedding");
+        normal_input_row = 0;
+        normal_input_num_tokens = 1;
+        _stage_ordinary_decode_embedding(token_id, *normal_input_buf);
     } else if (_uses_cpu_dequantized_embeddings()) {
+        /*
+         * Unsupported multimodal/per-layer shapes retain develop's generic
+         * staging path. They are excluded from the prebound arena, so changing
+         * their ownership behavior is neither necessary nor part of P1.
+         */
         normal_input_buf = &get_buffer("decode_embedding");
         normal_input_row = 0;
         normal_input_num_tokens = 1;
@@ -520,9 +583,21 @@ uint32_t LanguageModel::run_model_once(
         !use_input_tokens &&
         _has_ordinary_decode_recipe(token_idx);
     if (use_ordinary_recipe) {
-        _append_ordinary_decode_recipe(
-            segment, token_idx, normal_input_buf, normal_input_row
-        );
+        if (qualified_ordinary_decode &&
+            decode_arm == OrdinaryDecodeArm::kStagingPlan &&
+            _ordinary_decode_plan &&
+            _ordinary_decode_plan->valid(token_idx)) {
+            /*
+             * segment owns the execution lease acquired before staging. The
+             * second validity check inside commit closes the generation race
+             * before the first submit without adding metadata locks.
+             */
+            segment.commit(*_ordinary_decode_plan, token_idx);
+        } else {
+            _append_ordinary_decode_recipe(
+                segment, token_idx, normal_input_buf, normal_input_row
+            );
+        }
     } else {
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         LanguageModelMapKey model_key(num_tokens, layer_idx, token_idx);
@@ -968,6 +1043,15 @@ void LanguageModel::_initialize() {
         }
     }
 
+    /*
+     * Models, all BaseModel buffers, embedding contents and cache/frequency
+     * storage are final at this point. Build the candidate arena last so its
+     * parent-cookie witnesses describe the exact published generation. A
+     * later request may allocate an unrelated input_embeds buffer without
+     * invalidating this ordinary-decode-only plan.
+     */
+    _rebuild_ordinary_decode_plan();
+
     _logger->info("Language model initialize completed");
 }
 
@@ -1087,6 +1171,12 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
 
 void LanguageModel::_finalize() {
     _logger->info("Language model finalize starting ...");
+    /*
+     * BoundExecution retains ModelState and dma-buf registrations. Drop the
+     * flat plan before package/import and BaseModel buffer teardown so its
+     * ownership cannot extend either lifetime.
+     */
+    _ordinary_decode_plan.reset();
     _mla_model_anchor().free_related_models(
         _elf_dir / _cfg.language_model_name
     );
@@ -1117,9 +1207,14 @@ void LanguageModel::_define_buffers() {
             {_cfg.lm_cfg.token_cfg.vocab_size, _cfg.lm_cfg.hidden_size},
             (_cfg.pipeline_cfg.quantize_embeddings)? "int8" : "bfloat16"
         );
-        if (_uses_cpu_dequantized_embeddings()) {
-            define_buffer("decode_embedding", {1, _cfg.lm_cfg.hidden_size});
-        }
+        /*
+         * One stable row is the ordinary scalar-decode address for both BF16
+         * and quantized embedding tables. Develop bound a changing table row
+         * directly for BF16; that zero-copy choice forced two checked dynamic
+         * binds at every token. A 2-KiB LFM row copy makes the physical
+         * address immutable and enables the flat position plan.
+         */
+        define_buffer("decode_embedding", {1, _cfg.lm_cfg.hidden_size});
     }
 
     // Frequency tables.
@@ -1400,7 +1495,19 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
     } else {
-        pre_ifms.emplace_back(MLABufferSlice{});
+        /*
+         * Ordinary n1 decode always consumes the fixed staging row. Making it
+         * the wrapper's canonical default lets eager package publication
+         * create the exact BoundExecution once. Prefill and every excluded
+         * shape still supply an explicit checked override.
+         */
+        if (num_tokens == 1 && !_cfg.lm_cfg.is_spec_decode()) {
+            pre_ifms.emplace_back(
+                MLABufferSlice{&get_buffer("decode_embedding")}
+            );
+        } else {
+            pre_ifms.emplace_back(MLABufferSlice{});
+        }
         if (is_draft) {
             pre_ifms.emplace_back(MLABufferSlice{});
         }
@@ -1725,7 +1832,13 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
             MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
         );
     } else {
-        conv_ifms.emplace_back(MLABufferSlice{});
+        if (num_tokens == 1 && !_cfg.lm_cfg.is_spec_decode()) {
+            conv_ifms.emplace_back(
+                MLABufferSlice{&get_buffer("decode_embedding")}
+            );
+        } else {
+            conv_ifms.emplace_back(MLABufferSlice{});
+        }
     }
     conv_ifms.emplace_back(
         MLABufferSlice{
@@ -1983,6 +2096,154 @@ void LanguageModel::_append_ordinary_decode_recipe(
         } else {
             step.model->add_to_segment(segment);
         }
+    }
+}
+
+void LanguageModel::_append_ordinary_decode_recipe(
+    MlaExecutionPlan& plan,
+    uint16_t token_idx,
+    MLABuffer* embedding,
+    uint32_t embedding_row
+) {
+    if (!_has_ordinary_decode_recipe(token_idx) || !embedding) {
+        throw std::logic_error(
+            "ordinary MLA decode plan recipe is unavailable"
+        );
+    }
+    plan.begin_position();
+    try {
+        for (const OrdinaryDecodeRecipeStep& step :
+             _ordinary_decode_recipes[token_idx]) {
+            if (!step.model) {
+                throw std::logic_error(
+                    "ordinary MLA decode plan contains a null model"
+                );
+            }
+            /*
+             * The ordinary wrapper's canonical IFM0 is the same fixed staging
+             * row. Use its eager exact handle; adding an identical override
+             * would unnecessarily allocate a second BoundExecution for every
+             * physical position.
+             */
+            (void)embedding;
+            (void)embedding_row;
+            step.model->_add_to_plan(plan);
+        }
+        plan.end_position();
+    } catch (...) {
+        /*
+         * The candidate is never published until seal(), so abandoning the
+         * local object is the complete rollback. Do not try to close a
+         * partially constructed physical position.
+         */
+        throw;
+    }
+}
+
+void LanguageModel::_rebuild_ordinary_decode_plan() {
+    _ordinary_decode_plan.reset();
+    if (_ordinary_decode_recipes.empty() || _need_argmax) {
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    auto candidate =
+        std::make_unique<MlaExecutionPlan>(_mla_session);
+    MLABuffer* staging = &get_buffer("decode_embedding");
+    for (std::size_t position = 0;
+         position < _ordinary_decode_recipes.size(); ++position) {
+        _append_ordinary_decode_recipe(
+            *candidate, static_cast<uint16_t>(position),
+            staging, 0
+        );
+    }
+    candidate->seal();
+    const auto elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start
+        ).count();
+    const std::size_t bytes = candidate->metadata_bytes();
+    if (bytes > 16U * 1024U * 1024U) {
+        throw std::runtime_error(fmt::format(
+            "ordinary MLA decode plan retains {} bytes; release gate is 16 MiB",
+            bytes
+        ));
+    }
+    _logger->info(
+        "Built ordinary MLA flat plan: positions={} metadata_bytes={} "
+        "build_ms={:.3f}",
+        candidate->position_count(), bytes, elapsed_ms
+    );
+    _ordinary_decode_plan = std::move(candidate);
+}
+
+void LanguageModel::_stage_ordinary_decode_embedding(
+    uint32_t token_id, MLABuffer& staging
+) {
+    MLABuffer& embeddings = get_buffer("embeddings");
+    if (token_id >= embeddings.get_shape().front() ||
+        staging.get_shape().empty() ||
+        staging.get_shape().back() != _cfg.lm_cfg.hidden_size) {
+        throw std::out_of_range(
+            "ordinary MLA embedding token or staging shape is invalid"
+        );
+    }
+
+    simaai::neat::mla::CpuAccessGuard guard;
+    const auto begin = begin_mla_buffer_cpu_access(
+        _mla_session, &staging,
+        simaai::neat::mla::CpuAccessMode::kWrite, &guard
+    );
+    if (!begin) {
+        throw std::runtime_error(fmt::format(
+            "begin ordinary MLA embedding CPU ownership failed: {} ({})",
+            begin.code, begin.message
+        ));
+    }
+
+    try {
+        if (embeddings.get_dtype() == "int8") {
+            if (!_cfg.pipeline_cfg.embeddings_scale.has_value()) {
+                throw std::runtime_error(
+                    "quantized embeddings require embeddings_scale"
+                );
+            }
+            _dequantize_embedding_row(token_id, staging);
+        } else if (
+            embeddings.get_dtype() == "bfloat16" &&
+            staging.get_dtype() == "bfloat16") {
+            const std::size_t row_bytes =
+                static_cast<std::size_t>(_cfg.lm_cfg.hidden_size) *
+                sizeof(Eigen::bfloat16);
+            const auto* source =
+                static_cast<const std::uint8_t*>(
+                    embeddings.get_virtual_addr()
+                ) + static_cast<std::size_t>(token_id) * row_bytes;
+            std::memcpy(
+                staging.get_virtual_addr(), source, row_bytes
+            );
+        } else {
+            throw std::runtime_error(fmt::format(
+                "unsupported ordinary embedding staging {} -> {}",
+                embeddings.get_dtype(), staging.get_dtype()
+            ));
+        }
+    } catch (...) {
+        (void)guard.end();
+        throw;
+    }
+
+    /*
+     * end() is the release/publication edge for CPU writes and is specified
+     * noexcept. It replaces develop's direct flush_cache() call and makes the
+     * same helper safe for the later CQ-owned continuation.
+     */
+    const auto end = guard.end();
+    if (!end) {
+        throw std::runtime_error(fmt::format(
+            "end ordinary MLA embedding CPU ownership failed: {} ({})",
+            end.code, end.message
+        ));
     }
 }
 
@@ -2334,6 +2595,22 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
     _reloc_buffer_bank = candidate_bank;
     _reloc_models = std::move(candidate_models);
     _reloc_name = reloc_name;
+    try {
+        _rebuild_ordinary_decode_plan();
+    } catch (const std::exception& error) {
+        /*
+         * Adapter publication is already complete and canonical generic
+         * bindings are valid. A prebound optimization failure must not roll
+         * back or misreport that semantic transaction; leave the plan absent
+         * and use checked dynamic recipes until the next cold rebuild.
+         */
+        _ordinary_decode_plan.reset();
+        _logger->warn(
+            "Relocation kept generic MLA decode because flat-plan rebuild "
+            "failed: {}",
+            error.what()
+        );
+    }
     _logger->info("Relocation completed");
 }
 
@@ -2360,6 +2637,16 @@ void LanguageModel::unset_reloc() {
     _cached_token_ids.clear();
     _reloc_models.clear();
     _reloc_name = std::nullopt;
+    try {
+        _rebuild_ordinary_decode_plan();
+    } catch (const std::exception& error) {
+        _ordinary_decode_plan.reset();
+        _logger->warn(
+            "Base adapter generation kept generic MLA decode because "
+            "flat-plan rebuild failed: {}",
+            error.what()
+        );
+    }
     _logger->info("Undo relocation completed");
 }
 

@@ -14,6 +14,11 @@
 #include "mla_buffer.hpp"
 #include "utils.hpp"
 
+namespace simaai::neat::mla {
+class CpuAccessGuard;
+enum class CpuAccessMode : std::uint8_t;
+struct Status;
+}
 
 namespace simaai {
 namespace llima {
@@ -21,6 +26,7 @@ namespace llima {
 
 class MlaExecutionSession;
 class LanguageModel;
+class MlaExecutionPlan;
 
 /*
  * One caller-owned ordered transaction.  The first model added binds the
@@ -52,6 +58,7 @@ class MlaExecutionSegment {
         MlaExecutionSegment& operator=(const MlaExecutionSegment&) = delete;
 
         void commit();
+        void commit(const MlaExecutionPlan& plan, std::size_t position);
         [[nodiscard]] bool empty() const noexcept;
 
     private:
@@ -75,6 +82,17 @@ std::shared_ptr<MlaExecutionSession> current_mla_execution_session();
 void require_mla_execution_session_healthy(
     const std::shared_ptr<MlaExecutionSession>& session
 );
+/*
+ * Acquire Backend ownership for CPU access to an MLABuffer.  This is the only
+ * supported bridge between LLiMa's allocation wrapper and the canonical
+ * imported dma-buf BufferState.
+ */
+simaai::neat::mla::Status begin_mla_buffer_cpu_access(
+    const std::shared_ptr<MlaExecutionSession>& session,
+    MLABuffer* buffer,
+    simaai::neat::mla::CpuAccessMode mode,
+    simaai::neat::mla::CpuAccessGuard* guard
+) noexcept;
 
 
 class MLAModelWithBuffer {
@@ -171,6 +189,14 @@ class MLAModelWithBuffer {
          */
         void _add_embedding_row_to_segment(
             MlaExecutionSegment& segment,
+            uint8_t port,
+            MLABuffer* parent,
+            uint32_t row,
+            uint32_t width
+        );
+        void _add_to_plan(MlaExecutionPlan& plan);
+        void _add_embedding_row_to_plan(
+            MlaExecutionPlan& plan,
             uint8_t port,
             MLABuffer* parent,
             uint32_t row,
