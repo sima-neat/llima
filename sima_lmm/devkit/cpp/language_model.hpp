@@ -327,13 +327,18 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::atomic<bool> terminal{false};
             std::mutex wait_mutex;
             std::condition_variable wait_cv;
+            std::unique_lock<std::mutex> decision_lock;
             uint16_t position = 0;
             uint32_t input_token = 0;
+            bool pending_record = false;
             bool failure_after_token = false;
         };
         static bool _continue_persistent_decode(
             void* context, bool position_succeeded,
             std::size_t* next_position
+        ) noexcept;
+        static void _publish_persistent_decode(
+            void* context, bool next_position_started
         ) noexcept;
         bool _can_run_persistent_decode(uint16_t position) const noexcept;
         void _run_persistent_decode(

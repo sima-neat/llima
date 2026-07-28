@@ -506,6 +506,9 @@ bool LanguageModel::_continue_persistent_decode(
          * failed.  Wake the producer; drain_and_join() will format the exact
          * Backend/kernel failure on that thread after all callbacks are joined.
          */
+        if (state->decision_lock.owns_lock()) {
+            state->decision_lock.unlock();
+        }
         state->terminal.store(true, std::memory_order_release);
         state->wait_cv.notify_one();
         return false;
@@ -530,8 +533,9 @@ bool LanguageModel::_continue_persistent_decode(
     );
 
     bool keep_running = false;
+    state->decision_lock =
+        std::unique_lock<std::mutex>(owner._decode_decision_mutex);
     {
-        std::lock_guard decision(owner._decode_decision_mutex);
         if (owner._stop_token_ids.contains(record.output_token)) {
             record.reason = DecodeTerminalReason::kStopToken;
         } else if (!owner._is_running.load(std::memory_order_relaxed)) {
@@ -579,17 +583,59 @@ bool LanguageModel::_continue_persistent_decode(
         state->produced.load(std::memory_order_relaxed);
     if (index >= state->records.size()) {
         state->failure_after_token = true;
+        state->decision_lock.unlock();
         state->terminal.store(true, std::memory_order_release);
         state->wait_cv.notify_one();
         return false;
     }
     state->records[index] = record;
+    state->pending_record = true;
+    if (keep_running) {
+        /*
+         * Keep the decision gate owned until the rolling executor confirms
+         * that the first next-position JOB_EXEC was accepted.  Its deferred
+         * publish callback runs on this same non-recursive CQ drive thread.
+         */
+        return true;
+    }
+    state->decision_lock.unlock();
+    _publish_persistent_decode(state, true);
+    return false;
+}
+
+void LanguageModel::_publish_persistent_decode(
+    void* opaque, bool next_position_started
+) noexcept {
+    auto* state = static_cast<PersistentDecodeState*>(opaque);
+    if (!state || !state->pending_record) {
+        return;
+    }
+    const std::size_t index =
+        state->produced.load(std::memory_order_relaxed);
+    if (index >= state->records.size()) {
+        if (state->decision_lock.owns_lock()) {
+            state->decision_lock.unlock();
+        }
+        state->failure_after_token = true;
+        state->terminal.store(true, std::memory_order_release);
+        state->wait_cv.notify_one();
+        return;
+    }
+    DecodeRecord& record = state->records[index];
+    if (!next_position_started &&
+        record.reason == DecodeTerminalReason::kContinue) {
+        record.reason = DecodeTerminalReason::kFailureAfterToken;
+        state->failure_after_token = true;
+    }
+    state->pending_record = false;
+    if (state->decision_lock.owns_lock()) {
+        state->decision_lock.unlock();
+    }
     state->produced.store(index + 1, std::memory_order_release);
-    if (!keep_running) {
+    if (record.reason != DecodeTerminalReason::kContinue) {
         state->terminal.store(true, std::memory_order_release);
     }
     state->wait_cv.notify_one();
-    return keep_running;
 }
 
 void LanguageModel::_run_persistent_decode(
@@ -622,7 +668,7 @@ void LanguageModel::_run_persistent_decode(
     _stage_ordinary_decode_embedding(token_id, *state.staging);
     segment.start(
         *_ordinary_decode_plan, num_input_tokens, &state,
-        _continue_persistent_decode
+        _continue_persistent_decode, _publish_persistent_decode
     );
 
     std::size_t consumed = 0;

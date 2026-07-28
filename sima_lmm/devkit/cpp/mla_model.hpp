@@ -76,9 +76,13 @@ class MlaExecutionSegment {
             void* context, bool position_succeeded,
             std::size_t* next_position
         ) noexcept;
+        using PositionPublished = void (*)(
+            void* context, bool next_position_started
+        ) noexcept;
         void start(
             const MlaExecutionPlan& plan, std::size_t position,
-            void* context, PositionContinuation continuation
+            void* context, PositionContinuation continuation,
+            PositionPublished published
         );
         void drain_and_join();
         [[nodiscard]] bool empty() const noexcept;

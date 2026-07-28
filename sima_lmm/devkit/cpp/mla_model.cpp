@@ -699,11 +699,15 @@ class MlaExecutionSession {
     using PositionHook = bool (*)(
         void* context, bool position_succeeded, PlanSpan* next
     ) noexcept;
+    using PositionPublishHook = void (*)(
+        void* context, bool next_position_started
+    ) noexcept;
 
     void start_snapshots(
         PlanSpan snapshots,
         void* hook_context = nullptr,
-        PositionHook hook = nullptr
+        PositionHook hook = nullptr,
+        PositionPublishHook publish_hook = nullptr
     ) {
         require_healthy();
         if (snapshots.empty()) {
@@ -754,6 +758,8 @@ class MlaExecutionSession {
             rolling_hook_active_ = false;
             rolling_hook_context_ = hook_context;
             rolling_position_hook_ = hook;
+            rolling_position_publish_hook_ = publish_hook;
+            rolling_position_publish_pending_ = false;
             rolling_failure_ = {};
             for (auto& job : job_window_) {
                 job.reset();
@@ -781,6 +787,8 @@ class MlaExecutionSession {
             rolling_size_ = 0;
             rolling_next_ = 0;
             rolling_position_hook_ = nullptr;
+            rolling_position_publish_hook_ = nullptr;
+            rolling_position_publish_pending_ = false;
             rolling_hook_context_ = nullptr;
             rolling_hook_active_ = false;
             rolling_available_head_ = 0;
@@ -1197,7 +1205,7 @@ class MlaExecutionSession {
         }
     }
 
-    void submit_rolling_slot(
+    bool submit_rolling_slot(
         std::size_t slot, std::size_t snapshot_index) noexcept {
         {
             std::lock_guard lock(rolling_mutex_);
@@ -1226,13 +1234,13 @@ class MlaExecutionSession {
              * the completion pump.
              */
             fail_rolling_submit(slot, snapshot_index, -ENOMEM);
-            return;
+            return false;
         }
         if (!status || !job.valid()) {
             fail_rolling_submit(
                 slot, snapshot_index, status ? -EPROTO : status.code
             );
-            return;
+            return false;
         }
 
         RollingCallbackSlot* callback = nullptr;
@@ -1272,6 +1280,7 @@ class MlaExecutionSession {
         if (!armed) {
             std::terminate();
         }
+        return true;
     }
 
     /*
@@ -1353,7 +1362,28 @@ class MlaExecutionSession {
                 rolling_cv_.notify_all();
             }
             if (submit) {
-                submit_rolling_slot(slot, snapshot_index);
+                const bool accepted =
+                    submit_rolling_slot(slot, snapshot_index);
+                PositionPublishHook publish_hook = nullptr;
+                void* publish_context = nullptr;
+                {
+                    std::lock_guard lock(rolling_mutex_);
+                    if (rolling_position_publish_pending_) {
+                        rolling_position_publish_pending_ = false;
+                        publish_hook =
+                            rolling_position_publish_hook_;
+                        publish_context = rolling_hook_context_;
+                    }
+                }
+                /*
+                 * P3 deliberately publishes/wakes the token producer only
+                 * after the first successor JOB_EXEC has been accepted. This
+                 * keeps futex wakeup and text-stream work out of the serial
+                 * token-to-next-GO path and also closes stop_model's decision
+                 * gate at a precise physical-submission boundary.
+                 */
+                if (publish_hook)
+                    publish_hook(publish_context, accepted);
                 continue;
             }
             if (invoke_hook) {
@@ -1384,6 +1414,8 @@ class MlaExecutionSession {
                         rolling_data_ = next.data;
                         rolling_size_ = next.size;
                         rolling_next_ = 0;
+                        rolling_position_publish_pending_ =
+                            rolling_position_publish_hook_ != nullptr;
                     } else {
                         rolling_logical_done_ = true;
                         rolling_drive_active_ = false;
@@ -2003,6 +2035,8 @@ class MlaExecutionSession {
     bool rolling_hook_active_ = false;
     void* rolling_hook_context_ = nullptr;
     PositionHook rolling_position_hook_ = nullptr;
+    PositionPublishHook rolling_position_publish_hook_ = nullptr;
+    bool rolling_position_publish_pending_ = false;
     RollingFailure rolling_failure_;
     std::vector<MlaPendingBinding> pending_scratch_;
     std::vector<SubmissionSnapshot> snapshot_scratch_;
@@ -2261,6 +2295,7 @@ struct MlaExecutionSegment::Impl {
     const MlaExecutionPlan* continuation_plan = nullptr;
     void* continuation_context = nullptr;
     MlaExecutionSegment::PositionContinuation continuation = nullptr;
+    MlaExecutionSegment::PositionPublished published = nullptr;
     bool persistent_started = false;
 
     static bool continue_position(
@@ -2296,6 +2331,18 @@ struct MlaExecutionSegment::Impl {
             entry.count,
         };
         return true;
+    }
+
+    static void publish_position(
+        void* opaque, bool next_position_started
+    ) noexcept {
+        auto* self = static_cast<Impl*>(opaque);
+        if (!self || !self->published) {
+            return;
+        }
+        self->published(
+            self->continuation_context, next_position_started
+        );
     }
 };
 
@@ -2394,9 +2441,11 @@ void MlaExecutionSegment::commit(
 
 void MlaExecutionSegment::start(
     const MlaExecutionPlan& plan, std::size_t position,
-    void* context, PositionContinuation continuation
+    void* context, PositionContinuation continuation,
+    PositionPublished published
 ) {
-    if (!continuation || !plan._impl || !plan._impl->sealed ||
+    if (!continuation || !published ||
+        !plan._impl || !plan._impl->sealed ||
         !plan.valid(position)) {
         throw std::logic_error(
             "persistent MLA execution requires a valid plan and continuation"
@@ -2420,6 +2469,7 @@ void MlaExecutionSegment::start(
     _impl->continuation_plan = &plan;
     _impl->continuation_context = context;
     _impl->continuation = continuation;
+    _impl->published = published;
     _impl->persistent_started = true;
     try {
         _impl->session->start_snapshots(
@@ -2427,7 +2477,8 @@ void MlaExecutionSegment::start(
                 plan._impl->jobs.data() + entry.first,
                 entry.count,
             },
-            _impl.get(), Impl::continue_position
+            _impl.get(), Impl::continue_position,
+            Impl::publish_position
         );
     } catch (...) {
         _impl->persistent_started = false;
