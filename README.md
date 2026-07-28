@@ -124,6 +124,11 @@ Model files load in parallel by default. When starting LLiMa alongside an
 active MLA workload, set `SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD=1` to load models
 one at a time so other inference requests can run between model loads.
 
+LLiMa executes compiled QMLA models through the direct MLA kernel backend. For
+the ownership model, queue-ahead behavior, model-family boundaries, and
+maintainer qualification guide, see
+[Direct MLA execution](docs/direct_mla_execution.md).
+
 For EAGLE3 speculative decoding, pass the parent compiled-model directory that
 contains both the target and draft model subdirectories. `llima run` reads each
 subdirectory's `sima_files/devkit/vlm_config.json` and automatically selects the
