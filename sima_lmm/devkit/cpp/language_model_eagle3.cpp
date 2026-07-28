@@ -99,10 +99,12 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     );
 
     // Decode mask stride must match the cache ELF's compiled bucket; a wider
-    // stride misaligns rows >= 1 and collapses the tree. Prefill mask is baked
-    // into the ELF, so this local buffer is unused.
+    // stride misaligns rows >= 1 and collapses the tree. Prefill group masks
+    // are prepared separately before cache dispatch, so this local buffer is unused.
     const uint16_t num_tokens = is_prefill ? 128 : 5;
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    const uint16_t mask_bucket = _get_cache_mask_size(
+        "full_attention", seq_len_with_past, false
+    );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = is_prefill
         ? static_cast<size_t>(num_tokens)
@@ -117,8 +119,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         }
     }
 
-    // Decode (n5) needs a runtime mask upload; prefill (n128) has its mask
-    // baked into the graph.
+    // Decode (n5) uses this runtime mask; prefill (n128) uses the group-mask buffer.
     if (!is_prefill) {
         get_buffer("future_token_mask").upload(padded_mask.data());
     }
@@ -207,6 +208,10 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
     const LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
     auto& fc_output_buf = get_buffer(fmt::format("fc_n{}_output", num_tokens));
+
+    if (is_prefill) {
+        _upload_group_future_token_masks(num_tokens, token_idx);
+    }
 
     // pre_model dispatch with explicit IFM begins/shapes for token embeds
     // (IFM[0]) and FC output (IFM[1]).
@@ -360,7 +365,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
 
     // pad_cols must match the cache ELF's compiled stride: rounding up
     // seq_len_with_past to mask_bucket. Wider strides misalign rows >= 1.
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    const uint16_t mask_bucket = _get_cache_mask_size(
+        "full_attention", seq_len_with_past, false
+    );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = static_cast<size_t>(
         round_up_to(static_cast<uint32_t>(seq_len_with_past), mask_bucket)

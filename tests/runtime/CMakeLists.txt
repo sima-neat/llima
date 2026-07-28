@@ -14,6 +14,10 @@ add_executable(
     sima_lmm_asr_transcription_test
     asr_transcription_test.cpp
 )
+add_executable(
+    sima_lmm_tool_call_parser_test
+    tool_call_parser_test.cpp
+)
 target_link_libraries(
     sima_lmm_dispatcher_lifecycle_test
     PRIVATE
@@ -31,6 +35,11 @@ target_link_libraries(
 )
 target_link_libraries(
     sima_lmm_asr_transcription_test
+    PRIVATE
+        sima_lmm_runtime
+)
+target_link_libraries(
+    sima_lmm_tool_call_parser_test
     PRIVATE
         sima_lmm_runtime
 )
@@ -39,6 +48,7 @@ set_target_properties(
     sima_lmm_text_generation_test
     sima_lmm_vision_generation_test
     sima_lmm_asr_transcription_test
+    sima_lmm_tool_call_parser_test
     PROPERTIES
         INSTALL_RPATH
             "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
@@ -72,6 +82,11 @@ add_test(
         "${CMAKE_CURRENT_SOURCE_DIR}/restart_appcomplex_before_test.sh"
         "$<TARGET_FILE:sima_lmm_asr_transcription_test>"
 )
+add_test(
+    NAME runtime.tool_call_parser
+    COMMAND
+        "$<TARGET_FILE:sima_lmm_tool_call_parser_test>"
+)
 set_tests_properties(
     runtime.dispatcher_lifecycle
     PROPERTIES
@@ -100,6 +115,12 @@ set_tests_properties(
         RESOURCE_LOCK dispatcher
         TIMEOUT 900
 )
+set_tests_properties(
+    runtime.tool_call_parser
+    PROPERTIES
+        LABELS "devkit;runtime;unit"
+        TIMEOUT 30
+)
 
 install(
     TARGETS
@@ -107,6 +128,7 @@ install(
         sima_lmm_text_generation_test
         sima_lmm_vision_generation_test
         sima_lmm_asr_transcription_test
+        sima_lmm_tool_call_parser_test
     RUNTIME DESTINATION lib/sima-lmm/tests
     COMPONENT extras
 )
@@ -130,6 +152,7 @@ install(
         test_python_runtime_lifecycle.py
         test_zmq_black_box.py
         text_generation_test.cpp
+        tool_call_parser_test.cpp
         vision_generation_test.cpp
     DESTINATION share/sima-lmm/tests/runtime
     COMPONENT extras

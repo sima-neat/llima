@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
-    ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmArchType, VlmConfig, model_file_type,
+    ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
 )
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
@@ -118,12 +118,6 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg.pipeline_cfg.set_split_mlp(split_mlp)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)
 
-        # Multimodal embedding quantization is initially supported for Gemma4 only.
-        if quantize_embeddings and vlm_cfg.is_multimodal:
-            if vlm_cfg.model_type != VlmArchType.VLM_GEMMA4:
-                raise NotImplementedError(
-                    "Embeddings quantization is only supported for LLMs and Gemma4 VLMs."
-                )
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 

@@ -184,6 +184,8 @@ def test_selected_model_full_compilation(
             "-o",
             str(output_path),
             str(model_path),
+            "--no-quantize_embeddings",
+            "--no-quantize_kv_cache",
         ]
         _run_stage("onnx", base_command + ["--onnx"], report)
         _run_stage("quantization", base_command + ["--quantize"], report)

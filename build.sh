@@ -410,6 +410,8 @@ ensure_git_submodules() {
   fi
 
   if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "[build] Synchronizing git submodule URLs"
+    git -C "$ROOT_DIR" submodule sync --recursive
     echo "[build] Updating git submodules"
     git -C "$ROOT_DIR" submodule update --init --recursive
   else
@@ -925,6 +927,10 @@ build_extras_archive() {
     fi
     if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_asr_transcription_test" ]]; then
       echo "ERROR: Runtime test extras are missing the ASR transcription executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the tool-call parser executable." >&2
       exit 1
     fi
     if [[ ! -f "${install_prefix}/lib/sima-lmm/tests/CTestTestfile.cmake" ]]; then

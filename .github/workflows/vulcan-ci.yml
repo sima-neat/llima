@@ -15,6 +15,7 @@ permissions:
   contents: read
   id-token: write
   packages: read
+  pull-requests: read
 
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
@@ -24,6 +25,119 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  resolve-test-scope:
+    name: Resolve Test Scope
+    runs-on: ubuntu-latest
+    outputs:
+      run_compiler: ${{ steps.scope.outputs.run_compiler }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          submodules: "false"
+
+      - name: Validate compiler scope classifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v tests.ci.test_resolve_compiler_test_scope
+
+      - name: Resolve compiler test scope
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          resolver=(
+            python3 tools/ci/resolve_compiler_test_scope.py
+            --github-output "${GITHUB_OUTPUT}"
+            --github-summary "${GITHUB_STEP_SUMMARY}"
+          )
+
+          force_run() {
+            "${resolver[@]}" --force-run-reason "$1"
+          }
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            force_run "Compiler tests required: manual workflow dispatch."
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF_TYPE}" != "branch" ]]; then
+            force_run "Compiler tests required: ${GITHUB_REF_TYPE} ref ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" == "develop" ||
+                "${GITHUB_REF_NAME}" == "main" ||
+                "${GITHUB_REF_NAME}" == release* ]]; then
+            force_run "Compiler tests required: protected or release branch ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          if ! pr_json="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --base develop \
+              --head "${GITHUB_REF_NAME}" \
+              --limit 10 \
+              --json number
+          )"; then
+            force_run "Compiler tests required: GitHub PR lookup failed."
+            exit 0
+          fi
+
+          if ! pr_count="$(
+            python3 -c 'import json, sys; print(len(json.load(sys.stdin)))' \
+              <<< "${pr_json}"
+          )"; then
+            force_run "Compiler tests required: GitHub PR response could not be parsed."
+            exit 0
+          fi
+          if [[ "${pr_count}" == "0" ]]; then
+            force_run \
+              "Compiler tests required: branch ${GITHUB_REF_NAME} has no open PR targeting develop."
+            exit 0
+          fi
+          if [[ "${pr_count}" != "1" ]]; then
+            force_run \
+              "Compiler tests required: branch ${GITHUB_REF_NAME} has ${pr_count} open PRs targeting develop."
+            exit 0
+          fi
+
+          if ! pr_number="$(
+            python3 -c \
+              'import json, sys; print(json.load(sys.stdin)[0]["number"])' \
+              <<< "${pr_json}"
+          )"; then
+            force_run "Compiler tests required: GitHub PR number could not be parsed."
+            exit 0
+          fi
+          changed_files="${RUNNER_TEMP}/llima-pr-${pr_number}-changed-files.txt"
+          if ! gh api \
+            --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/files?per_page=100" \
+            --jq '.[] | .filename, (.previous_filename // empty)' \
+            > "${changed_files}"; then
+            force_run "Compiler tests required: changed-file lookup failed for PR #${pr_number}."
+            exit 0
+          fi
+          if [[ ! -s "${changed_files}" ]]; then
+            force_run "Compiler tests required: PR #${pr_number} returned no changed files."
+            exit 0
+          fi
+
+          "${resolver[@]}" \
+            --changed-files "${changed_files}" \
+            --pr-number "${pr_number}" \
+            --base-ref develop
+
   resolve-vulcan-config:
     name: Resolve Vulcan Config
     uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
@@ -178,6 +292,8 @@ jobs:
           "./lib/sima-lmm/tests/sima_lmm_vision_generation_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/sima_lmm_asr_transcription_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./share/sima-lmm/tests/runtime/pytest.ini" >/dev/null
         test -f dist/metadata.json
@@ -395,14 +511,17 @@ jobs:
 
   test-model-compiler:
     name: Test LLiMa Compilation on Model Compiler
+    if: ${{ needs.resolve-test-scope.outputs.run_compiler == 'true' }}
     needs:
+      - resolve-test-scope
       - resolve-vulcan-config
       - resolve-model-cache-config
       - publish-vulcan-artifacts
     uses: ./.github/workflows/model-compiler-tests.yml
     with:
       vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
-      artifact_base_url: ${{ needs.resolve-model-cache-config.outputs.artifact_base_url }}
+      artifact_bucket: ${{ needs.resolve-model-cache-config.outputs.artifact_bucket }}
+      aws_region: ${{ needs.resolve-model-cache-config.outputs.aws_region }}
 
   test-devkit:
     name: Test LLiMa Runtime on DevKit
@@ -496,6 +615,7 @@ jobs:
           test -x "${test_dir}/sima_lmm_text_generation_test"
           test -x "${test_dir}/sima_lmm_vision_generation_test"
           test -x "${test_dir}/sima_lmm_asr_transcription_test"
+          test -x "${test_dir}/sima_lmm_tool_call_parser_test"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -506,6 +626,7 @@ jobs:
               "sima_lmm_text_generation_test",
               "sima_lmm_vision_generation_test",
               "sima_lmm_asr_transcription_test",
+              "sima_lmm_tool_call_parser_test",
           )
 
           for name in test_binaries:
@@ -603,8 +724,22 @@ jobs:
 
   promote-latest-tag:
     name: Promote Vulcan latest tag
-    if: ${{ always() && (github.ref_type == 'branch' || github.ref_type == 'tag') && needs.test-model-compiler.result == 'success' && needs.test-devkit.result == 'success' }}
+    if: >-
+      ${{
+        always() &&
+        (github.ref_type == 'branch' || github.ref_type == 'tag') &&
+        needs.resolve-test-scope.result == 'success' &&
+        needs.test-devkit.result == 'success' &&
+        (
+          needs.test-model-compiler.result == 'success' ||
+          (
+            needs.resolve-test-scope.outputs.run_compiler == 'false' &&
+            needs.test-model-compiler.result == 'skipped'
+          )
+        )
+      }}
     needs:
+      - resolve-test-scope
       - resolve-vulcan-config
       - test-model-compiler
       - test-devkit
