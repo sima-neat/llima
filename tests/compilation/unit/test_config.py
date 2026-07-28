@@ -128,6 +128,16 @@ def test_invalid_future_token_mask_is_rejected_for_long_context():
         config.set_future_token_mask_size(0)
 
 
+def test_speculative_decoding_rejects_sliding_attention():
+    config = _load_reference_config("gemma3_vlm_config.json")
+
+    with pytest.raises(
+        ValueError,
+        match="EAGLE3 speculative decoding does not support sliding-window attention",
+    ):
+        config.lm_cfg.set_speculative_decoding_config({})
+
+
 def test_legacy_pipeline_config_uses_stored_mask_for_all_attention_types():
     config = PipelineConfig(max_num_tokens=2048, future_token_mask_size=128)
 

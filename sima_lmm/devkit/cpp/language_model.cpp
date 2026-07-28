@@ -48,6 +48,11 @@ LanguageModel::LanguageModel(
             "max_num_tokens must be a positive multiple of 1024"
         );
     }
+    if (_cfg.lm_cfg.is_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+        throw std::runtime_error(
+            "EAGLE3 speculative decoding does not support sliding-window attention"
+        );
+    }
 
     _use_group_token_models = (
         _cfg.pipeline_cfg.input_token_group_offsets.has_value()

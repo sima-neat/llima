@@ -119,17 +119,11 @@ def gen_files(
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
-                elif lora_path is not None or quantize_embeddings or quantize_kv_cache:
-                    # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
+                else:
+                    # Use direct SiMa Builder graph generation for ordinary HF models.
                     modes = [
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
                         FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
-                    ]
-                else:
-                    # Use ONNX mode, no need to track LoRA weights
-                    modes = [
-                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                        FileGenMode.MODEL_SDK_COMPILE
                     ]
             else:
                 assert isinstance(model.hf_model, GgufModel)
@@ -405,18 +399,20 @@ def main():
     elif args.input_height is not None or args.input_width is not None:
         _abort("Both --input_height and --input_width must be provided.")
 
-    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_embeddings:
+    is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
+    is_speculative_decoding = args.draft_model_path is not None
+
+    if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
-            "Embedding quantization is not supported for ONNX file generation mode."
+            "ONNX generation does not support embedding or KV-cache quantization. "
+            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
         )
-    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_kv_cache:
+    # TODO: Enable these features for EAGLE3 once its target/draft staging and runtime
+    # paths support embedding and KV-cache quantization.
+    if is_speculative_decoding and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
-            "KV cache quantization is not supported for ONNX file generation mode."
-        )
-    if args.draft_model_path is not None and args.quantize_kv_cache:
-        _abort(
-            "KV cache quantization with speculative decoding is not currently supported. "
-            "Please disable either --quantize_kv_cache or --draft_model_path."
+            "EAGLE3 does not support embedding or KV-cache quantization. "
+            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
         )
 
     lora_path_for_base_model = None

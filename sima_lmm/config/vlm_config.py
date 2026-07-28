@@ -709,6 +709,10 @@ class LanguageModelConfig(BaseConfig):
         if cfg is None:
             self.speculative_decoding_cfg = None
         else:
+            if self.attn_cfg.swa_enable:
+                raise ValueError(
+                    "EAGLE3 speculative decoding does not support sliding-window attention"
+                )
             self.speculative_decoding_cfg = SpeculativeDecodingConfig()
             self.speculative_decoding_cfg.set_config(cfg)
 
