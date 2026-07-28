@@ -415,14 +415,14 @@ nlohmann::json parse_gemma_tool_calls(
     const std::vector<std::string>* allowed_tool_names
 ) {
     text = trim_view(text);
-    if (text.starts_with('{')) {
-        return parse_json_tool_call_envelope(text, id_counter, allowed_tool_names);
-    }
     if (text.starts_with(gemma_open)) {
         if (!text.ends_with(gemma_close)) return nullptr;
         text.remove_prefix(gemma_open.size());
         text.remove_suffix(gemma_close.size());
         text = trim_view(text);
+    }
+    if (text.starts_with('{')) {
+        return parse_json_tool_call_envelope(text, id_counter, allowed_tool_names);
     }
     if (!text.starts_with(gemma_call)) return nullptr;
 

@@ -97,6 +97,17 @@ void test_parses_gemma_json_tool_call_envelope() {
             ).at("enabled") == false,
         "the second Gemma JSON envelope call must preserve its arguments"
     );
+
+    const auto wrapped_calls = try_parse_tool_calls(
+        ToolCallFormat::Gemma,
+        R"(<|tool_call>{"tool_calls":[{"name":"set_ac","arguments":{"enabled":false}}],"content":""}<tool_call|>)",
+        {"set_ac"}
+    );
+    expect(
+        !wrapped_calls.is_null() && wrapped_calls.size() == 1 &&
+            wrapped_calls.at(0).at("function").at("name") == "set_ac",
+        "wrapped Gemma JSON tool-call envelopes must parse"
+    );
 }
 
 void test_rejects_unsafe_gemma_json_tool_call_envelopes() {
@@ -132,6 +143,27 @@ void test_streams_gemma_json_tool_call_envelope() {
     if (calls != nullptr) {
         expect(calls->calls.size() == 1, "the streamed Gemma envelope call must be preserved");
     }
+
+    ToolCallStreamParser wrapped_parser(ToolCallFormat::Gemma, {"set_ac"});
+    expect(
+        wrapped_parser.add(R"(<|tool_call>{"tool_calls":)", false).empty(),
+        "a partial wrapped Gemma JSON envelope must remain buffered"
+    );
+    const auto wrapped_events = wrapped_parser.add(
+        R"([{"name":"set_ac","arguments":{"enabled":false}}],"content":""}<tool_call|>)",
+        true
+    );
+    expect(
+        wrapped_events.size() == 1,
+        "a complete wrapped Gemma JSON envelope must emit one event"
+    );
+    if (wrapped_events.size() != 1) return;
+    const auto* wrapped_calls =
+        std::get_if<ToolCallStreamParser::ToolCalls>(&wrapped_events[0]);
+    expect(
+        wrapped_calls != nullptr && wrapped_calls->calls.size() == 1,
+        "the streamed wrapped Gemma envelope must be structured tool calls"
+    );
 }
 
 void test_preserves_stream_content_provenance() {
