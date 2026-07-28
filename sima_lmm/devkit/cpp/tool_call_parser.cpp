@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <initializer_list>
 #include <regex>
 #include <stdexcept>
 
@@ -29,6 +30,24 @@ std::string_view trim_view(std::string_view text) {
 
 bool is_prefix_of(std::string_view prefix, std::string_view text) {
     return prefix.size() <= text.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+enum class JsonPrefixMatch { Complete, Incomplete, Mismatch };
+
+JsonPrefixMatch match_json_prefix(
+    std::string_view text,
+    std::initializer_list<std::string_view> tokens
+) {
+    for (const auto token : tokens) {
+        text = trim_left_view(text);
+        if (text.size() < token.size()) {
+            return is_prefix_of(text, token) ? JsonPrefixMatch::Incomplete
+                                             : JsonPrefixMatch::Mismatch;
+        }
+        if (!is_prefix_of(token, text)) return JsonPrefixMatch::Mismatch;
+        text.remove_prefix(token.size());
+    }
+    return JsonPrefixMatch::Complete;
 }
 
 constexpr std::string_view lfm_open = "<|tool_call_start|>";
@@ -191,6 +210,33 @@ nlohmann::json parse_json_array_tool_calls(
         result.push_back(std::move(entry));
     }
     return result;
+}
+
+nlohmann::json parse_json_tool_call_envelope(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    const auto parsed = nlohmann::json::parse(std::string(text));
+    if (!parsed.is_object() || !parsed.contains("tool_calls") ||
+        !parsed["tool_calls"].is_array()) {
+        return nullptr;
+    }
+
+    // Fail closed on prose or unrelated model output wrapped around a call.
+    // Gemma's JSON fallback emits only `tool_calls` and an empty/null `content`.
+    for (const auto& item : parsed.items()) {
+        if (item.key() != "tool_calls" && item.key() != "content") return nullptr;
+    }
+    if (parsed.contains("content") && !parsed["content"].is_null() &&
+        (!parsed["content"].is_string() ||
+         !parsed["content"].get<std::string>().empty())) {
+        return nullptr;
+    }
+
+    return parse_json_array_tool_calls(
+        parsed["tool_calls"], id_counter, allowed_tool_names
+    );
 }
 
 nlohmann::json parse_plain_json_tool_calls(
@@ -387,11 +433,15 @@ nlohmann::json parse_gemma_tool_calls(
     int& id_counter,
     const std::vector<std::string>* allowed_tool_names
 ) {
+    text = trim_view(text);
     if (text.starts_with(gemma_open)) {
         if (!text.ends_with(gemma_close)) return nullptr;
         text.remove_prefix(gemma_open.size());
         text.remove_suffix(gemma_close.size());
         text = trim_view(text);
+    }
+    if (text.starts_with('{')) {
+        return parse_json_tool_call_envelope(text, id_counter, allowed_tool_names);
     }
     if (!text.starts_with(gemma_call)) return nullptr;
 
@@ -694,6 +744,32 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
         case ToolCallFormat::Lfm:
             return marker_mode(lfm_open);
         case ToolCallFormat::Gemma: {
+            if (stripped.front() == '{') {
+                const auto tool_calls_first = match_json_prefix(
+                    stripped, {"{", R"("tool_calls")", ":"}
+                );
+                const auto empty_content_first = match_json_prefix(
+                    stripped,
+                    {"{", R"("content")", ":", R"("")", ",", R"("tool_calls")", ":"}
+                );
+                const auto null_content_first = match_json_prefix(
+                    stripped,
+                    {"{", R"("content")", ":", "null", ",", R"("tool_calls")", ":"}
+                );
+
+                if (tool_calls_first == JsonPrefixMatch::Complete ||
+                    empty_content_first == JsonPrefixMatch::Complete ||
+                    null_content_first == JsonPrefixMatch::Complete) {
+                    return Mode::ToolCall;
+                }
+                if (!done &&
+                    (tool_calls_first == JsonPrefixMatch::Incomplete ||
+                     empty_content_first == JsonPrefixMatch::Incomplete ||
+                     null_content_first == JsonPrefixMatch::Incomplete)) {
+                    return Mode::Undecided;
+                }
+                return Mode::Content;
+            }
             const auto wrapper_mode = marker_mode(gemma_open);
             return wrapper_mode == Mode::Content ? marker_mode(gemma_call) : wrapper_mode;
         }
