@@ -110,7 +110,16 @@ NB_MODULE(cpp_ext, m) {
     ;
 
     nb::class_<ZMQServer>(m, "ZMQServer")
-        .def(nb::init<const std::filesystem::path&, uint32_t>())
+        .def(
+            nb::init<
+                const std::filesystem::path&,
+                uint32_t,
+                std::optional<std::filesystem::path>
+            >(),
+            nb::arg("model_path"),
+            nb::arg("port"),
+            nb::arg("draft_model_path") = nb::none()
+        )
         .def("run", &ZMQServer::run)
         .def("stop", &ZMQServer::stop)
     ;

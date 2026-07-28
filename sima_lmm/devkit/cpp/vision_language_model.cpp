@@ -168,7 +168,7 @@ LogLikelihoodResult VisionLanguageModel::run_model_for_loglikelihood(
 }
 
 
-std::vector<double> VisionLanguageModel::run_model_for_ttnt(
+GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids
@@ -178,6 +178,32 @@ std::vector<double> VisionLanguageModel::run_model_for_ttnt(
     _text_streamer.disable();
 
     _language_model_ptr->create_input_buffers(input_token_ids);
+    GenerationPerformanceResult result;
+
+    if (_draft_vlm_ptr != nullptr) {
+        auto original_stop_token_ids = _language_model_ptr->set_stop_token_ids(
+            override_stop_token_ids
+        );
+        try {
+            _language_model_ptr->run_model_speculative_decoding(
+                *_draft_vlm_ptr->_language_model_ptr,
+                input_token_ids,
+                override_max_num_tokens,
+                std::nullopt,
+                &result
+            );
+            _language_model_ptr->set_stop_token_ids(original_stop_token_ids);
+            _language_model_ptr->clear_cached_token_ids();
+            _draft_vlm_ptr->_language_model_ptr->clear_cached_token_ids();
+            _text_streamer.enable();
+            return result;
+        } catch (...) {
+            _language_model_ptr->set_stop_token_ids(original_stop_token_ids);
+            _text_streamer.enable();
+            throw;
+        }
+    }
+
     std::vector<double> ttnt;
 
     ChronoTimer timer(true);
@@ -221,7 +247,9 @@ std::vector<double> VisionLanguageModel::run_model_for_ttnt(
     _language_model_ptr->clear_cached_token_ids();
 
     _text_streamer.enable();
-    return ttnt;
+    result.token_durations = std::move(ttnt);
+    result.generated_tokens = result.token_durations.size();
+    return result;
 }
 
 

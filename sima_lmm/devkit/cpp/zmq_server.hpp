@@ -43,15 +43,24 @@ struct ZMQResponseMetadata {
     std::vector<size_t> tensor_shape;
     size_t infer_time_ns = 0;
     std::optional<std::string> result_type;
+    std::optional<uint32_t> generated_tokens;
+    std::optional<uint32_t> accepted_draft_tokens;
     std::optional<std::string> error;
 
-    MSGPACK_DEFINE_MAP(tensor_dtype, tensor_shape, infer_time_ns, result_type, error);
+    MSGPACK_DEFINE_MAP(
+        tensor_dtype, tensor_shape, infer_time_ns, result_type, generated_tokens,
+        accepted_draft_tokens, error
+    );
 };
 
 
 class EXPORT ZMQServer {
     public:
-        ZMQServer(const std::filesystem::path& model_path, uint32_t port);
+        ZMQServer(
+            const std::filesystem::path& model_path,
+            uint32_t port,
+            std::optional<std::filesystem::path> draft_model_path = std::nullopt
+        );
         ~ZMQServer();
 
         void run();
@@ -63,6 +72,7 @@ class EXPORT ZMQServer {
         zmq::socket_t _zmq_socket;
 
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
+        std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
 
         std::shared_ptr<spdlog::logger> _logger;
         std::atomic<bool> _is_running;

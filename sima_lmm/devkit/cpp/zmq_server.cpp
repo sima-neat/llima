@@ -9,7 +9,9 @@ namespace llima {
 
 
 ZMQServer::ZMQServer(
-    const std::filesystem::path& model_path, uint32_t port
+    const std::filesystem::path& model_path,
+    uint32_t port,
+    std::optional<std::filesystem::path> draft_model_path
 ) : _port(port), _zmq_ctx(1), _zmq_socket(_zmq_ctx, zmq::socket_type::rep), _is_running(false) {
     if (_singleton_ptr)
         throw std::runtime_error("Only one ZMQServer instance can be created");
@@ -21,6 +23,14 @@ ZMQServer::ZMQServer(
 
     // Create the vlm model.
     _vision_language_model_ptr = std::make_unique<VisionLanguageModel>(model_path);
+    if (draft_model_path.has_value()) {
+        _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
+            draft_model_path.value()
+        );
+        _vision_language_model_ptr->set_draft_vlm(
+            _vision_language_draft_model_ptr.get()
+        );
+    }
 
     // Override the signal handler for ctrl-c.
     struct sigaction new_sigint_action;
@@ -174,8 +184,13 @@ void ZMQServer::run() {
                         request_metadata.stop_token_ids
                     );
                     response_metadata.tensor_dtype = "float64";
-                    response_metadata.tensor_shape = {1, result.size()};
-                    response_messages[1] = {result.data(), result.size() * sizeof(double)};
+                    response_metadata.tensor_shape = {1, result.token_durations.size()};
+                    response_metadata.generated_tokens = result.generated_tokens;
+                    response_metadata.accepted_draft_tokens = result.accepted_draft_tokens;
+                    response_messages[1] = {
+                        result.token_durations.data(),
+                        result.token_durations.size() * sizeof(double)
+                    };
                 } else {
                     throw std::runtime_error(
                         fmt::format("Unknown request type: {}", request_metadata.type)

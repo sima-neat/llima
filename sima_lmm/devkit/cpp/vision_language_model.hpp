@@ -48,7 +48,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> continuation_token_ids,
             bool use_group_prefill = true
         );
-        std::vector<double> run_model_for_ttnt(
+        GenerationPerformanceResult run_model_for_ttnt(
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt

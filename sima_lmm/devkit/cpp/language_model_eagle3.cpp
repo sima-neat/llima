@@ -1208,7 +1208,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         _eagle3_stable_kv          = _cached_eagle3_stable_kv;
         draft_lm._eagle3_stable_kv = draft_lm._cached_eagle3_stable_kv;
         result.root_ready_time = std::chrono::steady_clock::now();
-        _notify_first_token(result.token, timer_ttft.stop());
+        result.time_to_first_token = timer_ttft.stop();
+        _notify_first_token(result.token, result.time_to_first_token);
         return result;
     }
 
@@ -1258,7 +1259,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 
     _logger->info("root token: {}", result.token);
     result.root_ready_time = std::chrono::steady_clock::now();
-    _notify_first_token(result.token, timer_ttft.stop());
+    result.time_to_first_token = timer_ttft.stop();
+    _notify_first_token(result.token, result.time_to_first_token);
 
     // Cache for next-turn prefix matching. Must run BEFORE push_back so
     // input_ids still matches the pre-root-token prefill length.
@@ -1315,8 +1317,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     LanguageModel& draft_lm,
     std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
-    std::optional<ChronoTimer> timer_ttft
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result
 ) {
+    if (performance_result != nullptr) {
+        *performance_result = GenerationPerformanceResult{};
+        performance_result->accepted_draft_tokens = 0;
+    }
     if (!timer_ttft.has_value())
         timer_ttft = ChronoTimer{true};
 
@@ -1359,6 +1366,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     auto init = initialize_tree(
         draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
     );
+    if (performance_result != nullptr) {
+        performance_result->token_durations.emplace_back(init.time_to_first_token);
+        performance_result->generated_tokens = 1;
+    }
 
     // Sync target's _eagle3_stable_kv with draft's — the draft incremented it
     // inside initialize_tree's first topk_generate, and tree_decoding reads it.
@@ -1486,6 +1497,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             const size_t offset = i - prev_size;
             const bool from_draft = (offset > 0) && (offset <= post.accept_length);
             _text_streamer.push(DecodeCallbackType::TPS, input_ids[i], per_token, from_draft);
+            if (performance_result != nullptr) {
+                performance_result->token_durations.emplace_back(per_token);
+                ++performance_result->generated_tokens;
+                if (from_draft) {
+                    ++performance_result->accepted_draft_tokens.value();
+                }
+            }
         }
         if (streamed > 0)
             iter_begin = iter_end;

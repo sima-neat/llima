@@ -428,6 +428,7 @@ class ModalixLM(HFLM):
             n_samples=n_samples,
             input_lengths=input_lengths,
         )
+        speculative_stats: dict[int, dict[str, list[float]]] = {}
 
         def inference_fn(tokens: list[int]) -> list[float]:
             context = torch.tensor([tokens], device=self.device)
@@ -436,6 +437,24 @@ class ModalixLM(HFLM):
                 request_type="generate_for_perf",
                 max_num_tokens=min(self.max_length, len(tokens) + max_new_tokens)
             )
+            generated_tokens = self.last_profile_data.get("generated_tokens")
+            accepted_draft_tokens = self.last_profile_data.get("accepted_draft_tokens")
+            if isinstance(generated_tokens, int) and isinstance(accepted_draft_tokens, int):
+                bucket = speculative_stats.setdefault(
+                    len(tokens),
+                    {
+                        "generated_tokens": [],
+                        "accepted_draft_tokens": [],
+                        "acceptance_rate_pct": [],
+                    },
+                )
+                bucket["generated_tokens"].append(float(generated_tokens))
+                bucket["accepted_draft_tokens"].append(float(accepted_draft_tokens))
+                acceptance_rate = (
+                    100.0 * accepted_draft_tokens / generated_tokens
+                    if generated_tokens > 0 else 0.0
+                )
+                bucket["acceptance_rate_pct"].append(acceptance_rate)
             return generate_time_tensor.cpu().tolist()[0]
 
         logger.info('Running Performance Benchmark')
@@ -443,6 +462,8 @@ class ModalixLM(HFLM):
             data=sample_data,
             inference_fn=inference_fn
         )
+        for input_length, metrics in speculative_stats.items():
+            perf_stats[input_length].update(metrics)
 
         logger.info("Summarizing Results")
         summary = performance_bench.summarize(
