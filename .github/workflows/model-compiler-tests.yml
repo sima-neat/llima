@@ -211,7 +211,7 @@ jobs:
           set -euo pipefail
           test_stage="${RUNNER_TEMP}/llima-compiler-tests"
           junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
-          expected_test_count=23
+          expected_test_count=55
 
           rm -rf "${test_stage}"
           mkdir -p "${test_stage}"
@@ -497,7 +497,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-graph-integration-junit.xml"
-          expected_test_count=22
+          expected_test_count=24
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -543,7 +543,7 @@ jobs:
           {
             echo "### Generated-graph and quantization integration"
             echo
-            echo "- Standard/embedding/GGUF cases: 22"
+            echo "- Standard/embedding/GGUF cases: 24"
             echo "- Serial speculative-decoding cases: 4"
             echo "- Unexpected skips: 0"
           } >> "${GITHUB_STEP_SUMMARY}"

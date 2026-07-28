@@ -67,7 +67,7 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `model_path` | Input model path (HuggingFace directory, GGUF file, or pre-quantized compressed tensor directory). |
 | `-o, --output` | Output directory for compiled files. Defaults to the model name. |
 | `-c, --configuration_file` | Python script to configure precision per layer (e.g., for mixed-precision). |
-| `--max_num_tokens` | Max context length. Default: 1024. |
+| `--max_num_tokens` | Max context length. Must be a multiple of 1024. Default: 4096. |
 | `--resume` | Resume interrupted builds by skipping existing files. |
 | `-j, --jobs` | Number of parallel compilation jobs. Default: Number of physical CPU cores. |
 | `--log_level` | Logging level (DEBUG, INFO, WARNING, ERROR). Default: WARNING. |
@@ -76,12 +76,17 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
 | `--system_prompt_file` | Path to a text file containing the system prompt. |
 
+:::note
+Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 8192` to enable an 8K context length.
+:::
+
 | Advanced Argument | Description |
 |----|----|
 | `--language_group_size` | Batch size for parallel token processing during prefill. Larger values (e.g., 256) can improve TTFT for large input prompts, but can decrease TTFT for smaller input prompts. Default: 128. |
 | `--future_token_mask_size` | Mask size for reusing compiled models across token positions. Larger values reduce number of compiled binary files, but may reduce TPS. Default: 128. |
-| `--enable_filter_sharing` | Reduces DRAM usage by sharing weights between group and single models. Useful for 16GB Modalix boards. Note: only effective when both group and single models use the same precision. **Required when compiling with LoRA.** |
-| `--quantize_embeddings` | Quantizes embedding tables for LLMs and VLMs. May result in a loss of accuracy. |
+| `--enable_filter_sharing` | Enable filter sharing between group and single models to reduce DRAM usage at a cost of higher TTFT and lower TPS. This is only effective when both model types use the same precision. |
+| `--no-quantize_embeddings` | Disable embedding-table quantization, which is enabled by default for supported LLMs and VLMs. |
+| `--no-quantize_kv_cache` | Disable KV-cache quantization, which is enabled by default. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
@@ -161,7 +166,7 @@ sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct -o L
 This will:
 
 - Use default BF16 precision for all layers
-- Set context length to 1024 tokens
+- Set context length to 4096 tokens
 - Output to `Llama-3.2-3B-Instruct_out` directory
 
 **Example 2: Compiling with Custom Context Length**
@@ -232,7 +237,7 @@ def get_layer_configuration(model_properties, layer):
 LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter to be dynamically applied or removed at runtime without recompiling the base model. The base model is compiled with parallel LoRA branches (initialized to zero), and the adapter weights are compiled separately into `.npy` files that are loaded on demand.
 
 :::note
-`--enable_filter_sharing` is required when compiling with LoRA. LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
+Filter sharing is required when compiling with LoRA. Enable it with `--enable_filter_sharing`. LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
 :::
 
 1.  **Download the base model and LoRA adapter**:
@@ -258,9 +263,9 @@ LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter 
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
+        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
-        --enable_filter_sharing \
         -c lora_config.py \
         -o Llama-3.2-3B-lora-out
     ```
@@ -271,9 +276,9 @@ LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter 
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
+        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
-        --enable_filter_sharing \
         -c lora_config.py \
         -o Llama-3.2-3B-lora-out
     ```

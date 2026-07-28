@@ -1,6 +1,7 @@
 #ifndef _SIMA_LLIMA_LANGUAGE_MODEL_
 #define _SIMA_LLIMA_LANGUAGE_MODEL_
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -280,12 +281,36 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _define_per_layer_models();
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
-            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+            uint16_t num_tokens,
+            uint16_t token_idx,
+            bool use_sliding_cache
         );
         std::filesystem::path _get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
+        static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
+        static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
+        uint16_t _get_cache_mask_size(
+            const std::string& layer_type, uint16_t context_length, bool is_group
+        ) const {
+            if (
+                layer_type != "sliding_attention"
+                && _cfg.pipeline_cfg.long_context_future_token_mask_size.has_value()
+                && context_length > LONG_CONTEXT_MIN_TOKENS
+            ) {
+                return _cfg.pipeline_cfg.long_context_future_token_mask_size.value();
+            }
+            return is_group
+                ? _cfg.pipeline_cfg.input_token_group_size
+                : _cfg.pipeline_cfg.future_token_mask_size;
+        }
+        uint16_t _get_max_future_token_mask_size() const {
+            return std::max(
+                _cfg.pipeline_cfg.future_token_mask_size,
+                _cfg.pipeline_cfg.long_context_future_token_mask_size.value_or(0)
+            );
+        }
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }
@@ -294,6 +319,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
                 && _cfg.vm_cfg.has_value() && _cfg.mm_cfg.has_value();
         }
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
+        void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
             size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
         );
