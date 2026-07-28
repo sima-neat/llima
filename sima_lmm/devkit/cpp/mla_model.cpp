@@ -131,11 +131,19 @@ bool path_matches_family(
      * reviving the unsafe raw-prefix behavior where "text2_n1.elf" also
      * matched "text".
      */
-    const bool contained = std::equal(
+    /*
+     * This is a component-prefix test, not equality of two complete paths.
+     * The four-iterator std::equal overload also requires equal range lengths,
+     * so it rejected every ordinary file below a selector directory (for
+     * example Whisper's elf_files/model.elf).  Stop when the selector is
+     * exhausted instead; path components preserve the boundary guarantee that
+     * a raw string-prefix comparison would lose.
+     */
+    const auto prefix_end = std::mismatch(
         normalized_selector.begin(), normalized_selector.end(),
         normalized_path.begin(), normalized_path.end()
     );
-    if (contained) {
+    if (prefix_end.first == normalized_selector.end()) {
         return true;
     }
     if (normalized_selector.parent_path() !=
@@ -340,9 +348,12 @@ class MlaExecutionSession {
          * model merely because it crossed a compiled position bucket.
          */
         if (relative_directory && matched == 0) {
+            const std::filesystem::path first_registered =
+                models_.empty() ? std::filesystem::path{} : models_.front().path;
             throw std::invalid_argument(fmt::format(
-                "no registered MLA model matches family selector {}",
-                *relative_directory
+                "no registered MLA model matches family selector {} "
+                "(registered_models={} first={})",
+                *relative_directory, models_.size(), first_registered
             ));
         }
         if (!missing.empty()) {
