@@ -144,6 +144,33 @@ void test_streams_gemma_json_tool_call_envelope() {
         expect(calls->calls.size() == 1, "the streamed Gemma envelope call must be preserved");
     }
 
+    for (const auto content_value :
+         {std::string_view(R"("")"), std::string_view("null")}) {
+        ToolCallStreamParser content_first_parser(ToolCallFormat::Gemma, {"set_ac"});
+        const std::string prefix =
+            std::string(R"({"content":)") + std::string(content_value) + R"(,"tool_)";
+        expect(
+            content_first_parser.add(prefix, false).empty(),
+            "a content-first Gemma envelope prefix must remain buffered"
+        );
+        const auto content_first_events = content_first_parser.add(
+            R"(calls":[{"name":"set_ac","arguments":{"enabled":false}}]})",
+            true
+        );
+        expect(
+            content_first_events.size() == 1,
+            "a content-first Gemma envelope must emit one event"
+        );
+        if (content_first_events.size() == 1) {
+            const auto* content_first_calls =
+                std::get_if<ToolCallStreamParser::ToolCalls>(&content_first_events[0]);
+            expect(
+                content_first_calls != nullptr && content_first_calls->calls.size() == 1,
+                "empty and null content-first envelopes must emit structured tool calls"
+            );
+        }
+    }
+
     ToolCallStreamParser wrapped_parser(ToolCallFormat::Gemma, {"set_ac"});
     expect(
         wrapped_parser.add(R"(<|tool_call>{"tool_calls":)", false).empty(),
@@ -178,12 +205,32 @@ void test_streams_non_tool_gemma_json_without_waiting_for_end() {
         events.size() == 1,
         "a non-tool Gemma JSON key must release buffered content before the stream ends"
     );
-    if (events.size() != 1) return;
-    const auto* content = std::get_if<ToolCallStreamParser::Content>(&events[0]);
+    if (events.size() == 1) {
+        const auto* content = std::get_if<ToolCallStreamParser::Content>(&events[0]);
+        expect(
+            content != nullptr && content->text == R"({"answer":42})",
+            "the released Gemma JSON content must preserve all buffered bytes"
+        );
+    }
+
+    ToolCallStreamParser content_parser(ToolCallFormat::Gemma, {"set_ac"});
     expect(
-        content != nullptr && content->text == R"({"answer":42})",
-        "the released Gemma JSON content must preserve all buffered bytes"
+        content_parser.add(R"({"content":")", false).empty(),
+        "a content value that may still be empty must remain undecided"
     );
+    const auto content_events = content_parser.add(R"(hello"})", false);
+    expect(
+        content_events.size() == 1,
+        "non-empty content must be released before the stream ends"
+    );
+    if (content_events.size() == 1) {
+        const auto* content =
+            std::get_if<ToolCallStreamParser::Content>(&content_events[0]);
+        expect(
+            content != nullptr && content->text == R"({"content":"hello"})",
+            "non-empty content-first JSON must preserve all buffered bytes"
+        );
+    }
 }
 
 void test_preserves_stream_content_provenance() {

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <initializer_list>
 #include <regex>
 #include <stdexcept>
 
@@ -29,6 +30,24 @@ std::string_view trim_view(std::string_view text) {
 
 bool is_prefix_of(std::string_view prefix, std::string_view text) {
     return prefix.size() <= text.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+enum class JsonPrefixMatch { Complete, Incomplete, Mismatch };
+
+JsonPrefixMatch match_json_prefix(
+    std::string_view text,
+    std::initializer_list<std::string_view> tokens
+) {
+    for (const auto token : tokens) {
+        text = trim_left_view(text);
+        if (text.size() < token.size()) {
+            return is_prefix_of(text, token) ? JsonPrefixMatch::Incomplete
+                                             : JsonPrefixMatch::Mismatch;
+        }
+        if (!is_prefix_of(token, text)) return JsonPrefixMatch::Mismatch;
+        text.remove_prefix(token.size());
+    }
+    return JsonPrefixMatch::Complete;
 }
 
 constexpr std::string_view lfm_open = "<|tool_call_start|>";
@@ -726,20 +745,30 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
             return marker_mode(lfm_open);
         case ToolCallFormat::Gemma: {
             if (stripped.front() == '{') {
-                constexpr std::string_view envelope_key = R"("tool_calls")";
-                auto remainder = trim_left_view(stripped.substr(1));
-                if (remainder.size() < envelope_key.size()) {
-                    return is_prefix_of(remainder, envelope_key) && !done
-                        ? Mode::Undecided
-                        : Mode::Content;
-                }
-                if (!is_prefix_of(envelope_key, remainder)) return Mode::Content;
+                const auto tool_calls_first = match_json_prefix(
+                    stripped, {"{", R"("tool_calls")", ":"}
+                );
+                const auto empty_content_first = match_json_prefix(
+                    stripped,
+                    {"{", R"("content")", ":", R"("")", ",", R"("tool_calls")", ":"}
+                );
+                const auto null_content_first = match_json_prefix(
+                    stripped,
+                    {"{", R"("content")", ":", "null", ",", R"("tool_calls")", ":"}
+                );
 
-                remainder = trim_left_view(remainder.substr(envelope_key.size()));
-                if (remainder.empty()) {
-                    return done ? Mode::Content : Mode::Undecided;
+                if (tool_calls_first == JsonPrefixMatch::Complete ||
+                    empty_content_first == JsonPrefixMatch::Complete ||
+                    null_content_first == JsonPrefixMatch::Complete) {
+                    return Mode::ToolCall;
                 }
-                return remainder.front() == ':' ? Mode::ToolCall : Mode::Content;
+                if (!done &&
+                    (tool_calls_first == JsonPrefixMatch::Incomplete ||
+                     empty_content_first == JsonPrefixMatch::Incomplete ||
+                     null_content_first == JsonPrefixMatch::Incomplete)) {
+                    return Mode::Undecided;
+                }
+                return Mode::Content;
             }
             const auto wrapper_mode = marker_mode(gemma_open);
             return wrapper_mode == Mode::Content ? marker_mode(gemma_call) : wrapper_mode;
