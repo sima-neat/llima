@@ -15,6 +15,7 @@ permissions:
   contents: read
   id-token: write
   packages: read
+  pull-requests: read
 
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
@@ -24,11 +25,130 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  resolve-test-scope:
+    name: Resolve Test Scope
+    runs-on: ubuntu-latest
+    outputs:
+      run_compiler: ${{ steps.scope.outputs.run_compiler }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          submodules: "false"
+
+      - name: Validate compiler scope classifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v tests.ci.test_resolve_compiler_test_scope
+
+      - name: Resolve compiler test scope
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          resolver=(
+            python3 tools/ci/resolve_compiler_test_scope.py
+            --github-output "${GITHUB_OUTPUT}"
+            --github-summary "${GITHUB_STEP_SUMMARY}"
+          )
+
+          force_run() {
+            "${resolver[@]}" --force-run-reason "$1"
+          }
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            force_run "Compiler tests required: manual workflow dispatch."
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF_TYPE}" != "branch" ]]; then
+            force_run "Compiler tests required: ${GITHUB_REF_TYPE} ref ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" == "develop" ||
+                "${GITHUB_REF_NAME}" == "main" ||
+                "${GITHUB_REF_NAME}" == release* ]]; then
+            force_run "Compiler tests required: protected or release branch ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          if ! pr_json="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --base develop \
+              --head "${GITHUB_REF_NAME}" \
+              --limit 10 \
+              --json number
+          )"; then
+            force_run "Compiler tests required: GitHub PR lookup failed."
+            exit 0
+          fi
+
+          if ! pr_count="$(
+            python3 -c 'import json, sys; print(len(json.load(sys.stdin)))' \
+              <<< "${pr_json}"
+          )"; then
+            force_run "Compiler tests required: GitHub PR response could not be parsed."
+            exit 0
+          fi
+          if [[ "${pr_count}" == "0" ]]; then
+            force_run \
+              "Compiler tests required: branch ${GITHUB_REF_NAME} has no open PR targeting develop."
+            exit 0
+          fi
+          if [[ "${pr_count}" != "1" ]]; then
+            force_run \
+              "Compiler tests required: branch ${GITHUB_REF_NAME} has ${pr_count} open PRs targeting develop."
+            exit 0
+          fi
+
+          if ! pr_number="$(
+            python3 -c \
+              'import json, sys; print(json.load(sys.stdin)[0]["number"])' \
+              <<< "${pr_json}"
+          )"; then
+            force_run "Compiler tests required: GitHub PR number could not be parsed."
+            exit 0
+          fi
+          changed_files="${RUNNER_TEMP}/llima-pr-${pr_number}-changed-files.txt"
+          if ! gh api \
+            --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/files?per_page=100" \
+            --jq '.[] | .filename, (.previous_filename // empty)' \
+            > "${changed_files}"; then
+            force_run "Compiler tests required: changed-file lookup failed for PR #${pr_number}."
+            exit 0
+          fi
+          if [[ ! -s "${changed_files}" ]]; then
+            force_run "Compiler tests required: PR #${pr_number} returned no changed files."
+            exit 0
+          fi
+
+          "${resolver[@]}" \
+            --changed-files "${changed_files}" \
+            --pr-number "${pr_number}" \
+            --base-ref develop
+
   resolve-vulcan-config:
     name: Resolve Vulcan Config
     uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
     with:
       vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
+
+  resolve-model-cache-config:
+    name: Resolve Model Cache Config
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
+    with:
+      vulcan_env: production
 
   resolve-test-runner:
     name: Resolve Test Runner
@@ -155,6 +275,7 @@ jobs:
         test -f "dist/sima-lmm-${llima_version}-Linux-core.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-dev.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-cli.deb"
+        test -f "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz"
         memory_deb="$(find dist -maxdepth 1 -type f -name 'simaai-memory-lib_*.deb' -print -quit)"
         if [[ -z "${memory_deb}" ]]; then
           echo "Root bundle is missing simaai-memory-lib." >&2
@@ -175,6 +296,20 @@ jobs:
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-core.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-dev.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-cli.deb" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/CTestTestfile.cmake" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_text_generation_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_vision_generation_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_asr_transcription_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./share/sima-lmm/tests/runtime/pytest.ini" >/dev/null
         test -f dist/metadata.json
         test -f dist/debs/metadata.json
         test -x dist/install_llima.sh
@@ -286,6 +421,7 @@ jobs:
             "compiler": {
                 "install_compiler.sh",
                 "metadata.json",
+                "metadata-wheel.json",
             },
             "mole": {
                 "install_mole.sh",
@@ -387,8 +523,22 @@ jobs:
       min_artifact_count: 20
       publish_manifest: true
 
+  test-model-compiler:
+    name: Test LLiMa Compilation on Model Compiler
+    if: ${{ needs.resolve-test-scope.outputs.run_compiler == 'true' }}
+    needs:
+      - resolve-test-scope
+      - resolve-vulcan-config
+      - resolve-model-cache-config
+      - publish-vulcan-artifacts
+    uses: ./.github/workflows/model-compiler-tests.yml
+    with:
+      vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      artifact_bucket: ${{ needs.resolve-model-cache-config.outputs.artifact_bucket }}
+      aws_region: ${{ needs.resolve-model-cache-config.outputs.aws_region }}
+
   test-devkit:
-    name: Test LLiMa root artifact on DevKit
+    name: Test LLiMa Runtime on DevKit
     needs:
       - resolve-vulcan-config
       - resolve-test-runner
@@ -453,12 +603,159 @@ jobs:
           dpkg-query -W sima-lmm-core sima-lmm-cli sima-lmm-dev
           llima --help >/dev/null
           python3 -c 'import sima_lmm'
+          systemctl is-active --quiet simaai-appcomplex.service
+
+      - name: Extract packaged runtime tests
+        run: |
+          set -euo pipefail
+
+          mapfile -t extras_archives < <(
+            find _work/llima-install -maxdepth 1 -type f \
+              -name 'sima-lmm-*-Linux-extras.tar.gz' | sort
+          )
+          if [[ "${#extras_archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one LLiMa runtime-test extras archive." >&2
+            printf '  %s\n' "${extras_archives[@]}" >&2 || true
+            exit 1
+          fi
+
+          rm -rf _work/runtime-tests
+          mkdir -p _work/runtime-tests
+          tar -C _work/runtime-tests -xzf "${extras_archives[0]}"
+
+          test_dir="_work/runtime-tests/lib/sima-lmm/tests"
+          test -f "${test_dir}/CTestTestfile.cmake"
+          test -x "${test_dir}/sima_lmm_dispatcher_lifecycle_test"
+          test -x "${test_dir}/sima_lmm_text_generation_test"
+          test -x "${test_dir}/sima_lmm_vision_generation_test"
+          test -x "${test_dir}/sima_lmm_asr_transcription_test"
+          test -x "${test_dir}/sima_lmm_tool_call_parser_test"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          test_dir = Path("_work/runtime-tests/lib/sima-lmm/tests")
+          test_binaries = (
+              "sima_lmm_dispatcher_lifecycle_test",
+              "sima_lmm_text_generation_test",
+              "sima_lmm_vision_generation_test",
+              "sima_lmm_asr_transcription_test",
+              "sima_lmm_tool_call_parser_test",
+          )
+
+          for name in test_binaries:
+              header = (test_dir / name).read_bytes()[:20]
+              if len(header) < 20 or header[:4] != b"\x7fELF":
+                  raise SystemExit(f"{name} is not an ELF executable")
+              if header[4] != 2:
+                  raise SystemExit(f"{name} is not an ELF64 executable")
+              if header[5] not in (1, 2):
+                  raise SystemExit(f"{name} has an invalid ELF byte order")
+
+              byte_order = "little" if header[5] == 1 else "big"
+              machine = int.from_bytes(header[18:20], byte_order)
+              if machine != 183:
+                  raise SystemExit(
+                      f"{name} is not an AArch64 executable (ELF e_machine={machine})"
+                  )
+
+              print(f"Verified ELF64/AArch64 runtime test: {name}")
+          PY
+
+      - name: Prepare GenAI models
+        run: |
+          set -euo pipefail
+          export LLIMA_MODELS_PATH="${LLIMA_MODELS_PATH:-/media/nvme/llima/models}"
+          export SIMA_TEST_LLIMA_TEXT_MODEL="${SIMA_TEST_LLIMA_TEXT_MODEL:-Qwen2.5-0.5B-Instruct-GPTQ-a16w4}"
+          export SIMA_TEST_LLIMA_VLM_MODEL="${SIMA_TEST_LLIMA_VLM_MODEL:-LFM2.5-VL-450M-a16w4}"
+          export SIMA_TEST_LLIMA_ASR_MODEL="${SIMA_TEST_LLIMA_ASR_MODEL:-whisper-small-a16w8}"
+          prepare_models="_work/runtime-tests/share/sima-lmm/tests/runtime/prepare_genai_models.sh"
+          test -x "${prepare_models}"
+          "${prepare_models}"
+
+          {
+            printf 'LLIMA_MODELS_PATH=%s\n' "${LLIMA_MODELS_PATH}"
+            printf 'SIMA_TEST_LLIMA_TEXT_MODEL=%s\n' "${SIMA_TEST_LLIMA_TEXT_MODEL}"
+            printf 'SIMA_TEST_LLIMA_VLM_MODEL=%s\n' "${SIMA_TEST_LLIMA_VLM_MODEL}"
+            printf 'SIMA_TEST_LLIMA_ASR_MODEL=%s\n' "${SIMA_TEST_LLIMA_ASR_MODEL}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Run packaged C++ runtime tests
+        run: |
+          set -euo pipefail
+          command -v ctest >/dev/null
+          test_dir="_work/runtime-tests/lib/sima-lmm/tests"
+          cleanup_runner="_work/runtime-tests/share/sima-lmm/tests/runtime/run_with_cancellation_cleanup.sh"
+          test -x "${cleanup_runner}"
+
+          "${cleanup_runner}" ctest \
+            --test-dir "${test_dir}" \
+            --output-on-failure \
+            --no-tests=error \
+            --timeout 900 \
+            -j 1 \
+            -L devkit
+
+      - name: Run packaged Python runtime tests
+        run: |
+          set -euo pipefail
+          test_dir="_work/runtime-tests/share/sima-lmm/tests/runtime"
+          test -f "${test_dir}/test_python_runtime_lifecycle.py"
+          test -f "${test_dir}/pytest.ini"
+
+          rm -rf _work/runtime-test-venv
+          python3 -m venv --system-site-packages _work/runtime-test-venv
+          _work/runtime-test-venv/bin/python -m pip install --no-cache-dir --upgrade pip
+          _work/runtime-test-venv/bin/python -m pip install --no-cache-dir \
+            'msgpack>=1.1,<2' \
+            'pyzmq>=27.1,<28' \
+            'pytest>=8,<9'
+
+          (
+            cd _work/runtime-tests
+            "${GITHUB_WORKSPACE}/${test_dir}/run_with_cancellation_cleanup.sh" \
+              "${GITHUB_WORKSPACE}/_work/runtime-test-venv/bin/python" \
+                -m pytest \
+                  -c share/sima-lmm/tests/runtime/pytest.ini \
+                  -q \
+                  share/sima-lmm/tests/runtime
+          )
+
+      - name: Clean runtime test workspace
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cleanup_paths=(
+            "_work/llima-install"
+            "_work/runtime-tests"
+            "_work/runtime-test-venv"
+          )
+          for cleanup_path in "${cleanup_paths[@]}"; do
+            if [[ -e "${cleanup_path}" || -L "${cleanup_path}" ]]; then
+              rm -rf -- "${cleanup_path}"
+            fi
+          done
 
   promote-latest-tag:
     name: Promote Vulcan latest tag
-    if: ${{ always() && (github.ref_type == 'branch' || github.ref_type == 'tag') && needs.test-devkit.result == 'success' }}
+    if: >-
+      ${{
+        always() &&
+        (github.ref_type == 'branch' || github.ref_type == 'tag') &&
+        needs.resolve-test-scope.result == 'success' &&
+        needs.test-devkit.result == 'success' &&
+        (
+          needs.test-model-compiler.result == 'success' ||
+          (
+            needs.resolve-test-scope.outputs.run_compiler == 'false' &&
+            needs.test-model-compiler.result == 'skipped'
+          )
+        )
+      }}
     needs:
+      - resolve-test-scope
       - resolve-vulcan-config
+      - test-model-compiler
       - test-devkit
     uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
     with:

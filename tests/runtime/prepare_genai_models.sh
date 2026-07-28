@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep these defaults and environment names aligned with Core's GenAI runtime tests.
+DEFAULT_LLIMA_MODELS_PATH="/media/nvme/llima/models"
+DEFAULT_TEXT_MODEL="Qwen2.5-0.5B-Instruct-GPTQ-a16w4"
+DEFAULT_VLM_MODEL="LFM2.5-VL-450M-a16w4"
+DEFAULT_ASR_MODEL="whisper-small-a16w8"
+DEFAULT_ASR_REPO="florianvoss/whisper-small-a16w8"
+
+validate_model_name() {
+  local env_name="$1"
+  local model_name="$2"
+
+  if [[ -z "${model_name}" ||
+        "${model_name}" = /* ||
+        "${model_name}" == *"/"* ||
+        "${model_name}" == *".."* ]]; then
+    echo "ERROR: ${env_name} must be a model directory name under LLIMA_MODELS_PATH: ${model_name}" >&2
+    exit 1
+  fi
+}
+
+download_model() {
+  local label="$1"
+  local repo_id="$2"
+  local model_name="$3"
+  local expected_config="$4"
+  local target_dir="${LLIMA_MODELS_PATH}/${model_name}"
+
+  mkdir -p "${target_dir}"
+  echo "[runtime-models] ${label}: synchronizing ${repo_id} to ${target_dir}"
+  hf download "${repo_id}" --local-dir "${target_dir}"
+
+  if [[ ! -f "${target_dir}/${expected_config}" ]]; then
+    echo "ERROR: downloaded ${label} model is missing ${expected_config}: ${target_dir}" >&2
+    exit 1
+  fi
+}
+
+if [[ "$#" -ne 0 ]]; then
+  echo "Usage: $(basename "$0")" >&2
+  exit 2
+fi
+if ! command -v hf >/dev/null 2>&1; then
+  echo "ERROR: hf CLI is required to prepare runtime model fixtures." >&2
+  exit 1
+fi
+
+LLIMA_MODELS_PATH="${LLIMA_MODELS_PATH:-${DEFAULT_LLIMA_MODELS_PATH}}"
+SIMA_TEST_LLIMA_TEXT_MODEL="${SIMA_TEST_LLIMA_TEXT_MODEL:-${DEFAULT_TEXT_MODEL}}"
+SIMA_TEST_LLIMA_VLM_MODEL="${SIMA_TEST_LLIMA_VLM_MODEL:-${DEFAULT_VLM_MODEL}}"
+SIMA_TEST_LLIMA_ASR_MODEL="${SIMA_TEST_LLIMA_ASR_MODEL:-${DEFAULT_ASR_MODEL}}"
+SIMA_TEST_LLIMA_ASR_REPO="${SIMA_TEST_LLIMA_ASR_REPO:-${DEFAULT_ASR_REPO}}"
+
+validate_model_name "SIMA_TEST_LLIMA_TEXT_MODEL" "${SIMA_TEST_LLIMA_TEXT_MODEL}"
+validate_model_name "SIMA_TEST_LLIMA_VLM_MODEL" "${SIMA_TEST_LLIMA_VLM_MODEL}"
+validate_model_name "SIMA_TEST_LLIMA_ASR_MODEL" "${SIMA_TEST_LLIMA_ASR_MODEL}"
+
+mkdir -p "${LLIMA_MODELS_PATH}"
+download_model \
+  "text" "simaai/${SIMA_TEST_LLIMA_TEXT_MODEL}" "${SIMA_TEST_LLIMA_TEXT_MODEL}" \
+  "devkit/vlm_config.json"
+download_model \
+  "vlm" "simaai/${SIMA_TEST_LLIMA_VLM_MODEL}" "${SIMA_TEST_LLIMA_VLM_MODEL}" \
+  "devkit/vlm_config.json"
+download_model \
+  "asr" "${SIMA_TEST_LLIMA_ASR_REPO}" "${SIMA_TEST_LLIMA_ASR_MODEL}" \
+  "devkit/whisper_config.json"
+
+echo "[runtime-models] ready under ${LLIMA_MODELS_PATH}"

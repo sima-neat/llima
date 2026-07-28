@@ -3,8 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 INSTALL_MANIFEST="${LLIMA_INSTALL_MANIFEST:-llima-install-manifest.txt}"
+LLIMA_PACKAGE_MANIFEST="${LLIMA_PACKAGE_MANIFEST:-resolved-deps-manifest.json}"
+LLIMA_BUILDINFO_FILE="${LLIMA_BUILDINFO_FILE:-/etc/buildinfo}"
+ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
+LLIMA_INSTALLER_SKIP_PLATFORM_CHECK="${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK:-OFF}"
 SUDO_PASSWORD="${SUDO_PASSWORD:-${DEVKIT_PASSWORD:-}}"
 DEFAULT_SUDO_PASSWORD="${DEFAULT_SUDO_PASSWORD:-edgeai}"
+LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD="${LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD:-ON}"
 
 log() {
   printf '[install_llima] %s\n' "$*"
@@ -62,6 +67,100 @@ find_verified_replacement() {
   return 1
 }
 
+resolve_package_manifest_path() {
+  if [[ "${LLIMA_PACKAGE_MANIFEST}" == /* ]]; then
+    printf '%s\n' "${LLIMA_PACKAGE_MANIFEST}"
+    return 0
+  fi
+  printf '%s\n' "${SCRIPT_DIR}/${LLIMA_PACKAGE_MANIFEST}"
+}
+
+read_manifest_platform_version() {
+  local manifest_path="$1"
+  python3 - "${manifest_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+try:
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    raise SystemExit(f"missing package manifest: {manifest_path}")
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"invalid package manifest JSON: {manifest_path}: {exc}")
+
+version = str(data.get("platform-version", "")).strip()
+if not version:
+    raise SystemExit(f"missing or empty platform-version in package manifest: {manifest_path}")
+print(version.split("+", 1)[0])
+PY
+}
+
+read_devkit_platform_version() {
+  local buildinfo_file="$1"
+  awk -F'=' '
+    $1 ~ /^[[:space:]]*DISTRO_VERSION[[:space:]]*$/ {
+      value=$2
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      print value
+      exit
+    }
+  ' "${buildinfo_file}" 2>/dev/null || true
+}
+
+ensure_platform_compatible() {
+  if [[ "${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK}" == "ON" ]]; then
+    log "LLIMA_INSTALLER_SKIP_PLATFORM_CHECK=ON; skipping platform compatibility check."
+    return 0
+  fi
+  if [[ -f "${ELXR_SDK_RELEASE_FILE}" ]]; then
+    echo "The root LLiMa artifact installs a Modalix DevKit; it must not be run in an eLxr SDK container." >&2
+    exit 1
+  fi
+  if [[ "$(dpkg --print-architecture)" != "arm64" ]]; then
+    echo "The root LLiMa artifact requires an arm64 Modalix DevKit." >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to read the LLiMa package manifest before install." >&2
+    exit 1
+  fi
+
+  local manifest_path expected actual
+  manifest_path="$(resolve_package_manifest_path)"
+  if ! expected="$(read_manifest_platform_version "${manifest_path}")"; then
+    echo "Unable to verify LLiMa package platform compatibility." >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${LLIMA_BUILDINFO_FILE}" ]]; then
+    echo "Cannot verify Modalix DevKit compatibility: missing ${LLIMA_BUILDINFO_FILE}." >&2
+    echo "This installer only supports Modalix DevKit targets." >&2
+    exit 1
+  fi
+  if ! grep -qE '^MACHINE[[:space:]]*=[[:space:]]*modalix' "${LLIMA_BUILDINFO_FILE}"; then
+    echo "Cannot verify Modalix DevKit compatibility: ${LLIMA_BUILDINFO_FILE} does not report MACHINE=modalix." >&2
+    exit 1
+  fi
+
+  actual="$(read_devkit_platform_version "${LLIMA_BUILDINFO_FILE}")"
+  if [[ -z "${actual}" ]]; then
+    echo "Cannot verify platform compatibility: DISTRO_VERSION is missing in ${LLIMA_BUILDINFO_FILE}." >&2
+    exit 1
+  fi
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "Incompatible platform version for this LLiMa package." >&2
+    echo "  Package platform-version: ${expected} (${manifest_path})" >&2
+    echo "  Detected DISTRO_VERSION: ${actual} (${LLIMA_BUILDINFO_FILE})" >&2
+    echo "Refusing to install before modifying apt packages." >&2
+    exit 1
+  fi
+
+  log "Platform compatibility verified: ${actual}"
+}
+
 run_sudo() {
   if [[ "${EUID}" -eq 0 ]]; then
     "$@"
@@ -86,6 +185,160 @@ run_sudo() {
   exit 1
 }
 
+remove_stale_global_sima_lmm_pip_install() {
+  if ! command -v pip3 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if run_sudo pip3 show sima_lmm >/dev/null 2>&1; then
+    log "Removing stale global sima_lmm pip package before installing LLiMa DEBs."
+    run_sudo pip3 uninstall -y sima_lmm --break-system-packages
+  fi
+}
+
+stop_board_runtime_before_install() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Stopping NEAT runtime services before package replacement."
+  local svc
+  for svc in \
+      simaai-pipeline-manager.service \
+      simaai-appcomplex.service \
+      rctd.service \
+      encoder.service \
+      decoder.service \
+      simaai-log.service; do
+    if systemctl cat "${svc}" >/dev/null 2>&1; then
+      run_sudo systemctl stop "${svc}" >/dev/null 2>&1 || true
+      run_sudo systemctl reset-failed "${svc}" >/dev/null 2>&1 || true
+    fi
+  done
+
+  if [[ -x /usr/libexec/simaai-appcomplex/clean-stale-mlashmcomplex ]]; then
+    run_sudo /usr/libexec/simaai-appcomplex/clean-stale-mlashmcomplex || true
+  else
+    run_sudo pkill -TERM -x mlashmcomplex >/dev/null 2>&1 || true
+    sleep 0.5
+    run_sudo pkill -KILL -x mlashmcomplex >/dev/null 2>&1 || true
+  fi
+
+  run_sudo rm -f /tmp/mlactrl /dev/shm/mlashmdata
+}
+
+activate_board_runtime_after_install() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # These files are recreated by simaai-appcomplex.service. Remove stale IPC
+  # before the post-install MLA init/reset path so clients cannot observe an
+  # old dispatcher lifetime after package replacement.
+  run_sudo rm -f /tmp/mlactrl /dev/shm/mlashmdata
+  # Package configuration intentionally does not restart services. Reload
+  # systemd here so the owned maintenance window starts services from the unit
+  # files that were just unpacked.
+  run_sudo systemctl daemon-reload || true
+
+  if [[ "${LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD}" == "ON" &&
+        -x /usr/libexec/sima-neat-firmware/install.sh ]]; then
+    log "Activating staged EV74 firmware and resetting runtime state."
+    run_sudo /usr/libexec/sima-neat-firmware/install.sh --activate
+  else
+    log "EV74 firmware activation skipped; starting simaai-appcomplex.service directly."
+    if systemctl cat simaai-appcomplex.service >/dev/null 2>&1; then
+      run_sudo systemctl restart simaai-appcomplex.service || true
+    fi
+  fi
+}
+
+verify_board_runtime_services() {
+  local service="simaai-appcomplex.service"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! systemctl list-unit-files "${service}" --no-legend 2>/dev/null | grep -q "^${service}[[:space:]]"; then
+    return 0
+  fi
+
+  # Debian service start failures can be non-fatal during package installation,
+  # but LLiMa cannot run without the MLA shared-memory dispatcher.
+  if ! systemctl is-active --quiet "${service}"; then
+    log "${service} is not active after package install; attempting to start it once."
+    run_sudo systemctl start "${service}" || true
+    sleep 1
+  fi
+
+  if ! systemctl is-active --quiet "${service}"; then
+    echo "${service} is not active after LLiMa package installation." >&2
+    run_sudo systemctl --no-pager --full status "${service}" >&2 || true
+    run_sudo journalctl -u "${service}" --no-pager -n 80 >&2 || true
+    run_sudo bash -c 'for f in /sys/class/remoteproc/remoteproc*/name /sys/class/remoteproc/remoteproc*/state; do [ -e "$f" ] && printf "%s: " "$f" && cat "$f"; done' >&2 || true
+    exit 1
+  fi
+
+  log "Verified ${service} is active."
+}
+
+restart_board_codec_services() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local -a services=()
+  local service
+  for service in encoder.service decoder.service; do
+    if systemctl list-unit-files "${service}" --no-legend 2>/dev/null | grep -q "^${service}[[:space:]]"; then
+      services+=("${service}")
+    fi
+  done
+
+  if [[ "${#services[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  log "Restarting codec services after package replacement."
+  run_sudo systemctl daemon-reload || true
+  run_sudo systemctl enable "${services[@]}" || true
+  if ! run_sudo systemctl restart "${services[@]}"; then
+    echo "Failed to restart codec services after LLiMa package installation." >&2
+    run_sudo systemctl --no-pager --full status "${services[@]}" >&2 || true
+    run_sudo journalctl -u encoder.service -u decoder.service --no-pager -n 80 >&2 || true
+    exit 1
+  fi
+}
+
+verify_board_codec_services() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local service
+  for service in encoder.service decoder.service; do
+    if ! systemctl list-unit-files "${service}" --no-legend 2>/dev/null | grep -q "^${service}[[:space:]]"; then
+      continue
+    fi
+
+    if ! systemctl is-active --quiet "${service}"; then
+      log "${service} is not active after package install; attempting to start it once."
+      run_sudo systemctl start "${service}" || true
+      sleep 1
+    fi
+
+    if ! systemctl is-active --quiet "${service}"; then
+      echo "${service} is not active after LLiMa package installation." >&2
+      run_sudo systemctl --no-pager --full status "${service}" >&2 || true
+      run_sudo journalctl -u "${service}" --no-pager -n 80 >&2 || true
+      exit 1
+    fi
+
+    log "Verified ${service} is active."
+  done
+}
+
 for command_name in apt-get dpkg dpkg-deb dpkg-query; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "${command_name} is required to install LLiMa." >&2
@@ -93,16 +346,7 @@ for command_name in apt-get dpkg dpkg-deb dpkg-query; do
   fi
 done
 
-if [[ "${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK:-OFF}" != "ON" ]]; then
-  if [[ -f /etc/sdk-release ]]; then
-    echo "The root LLiMa artifact installs a Modalix DevKit; it must not be run in an eLxr SDK container." >&2
-    exit 1
-  fi
-  if [[ "$(dpkg --print-architecture)" != "arm64" ]]; then
-    echo "The root LLiMa artifact requires an arm64 Modalix DevKit." >&2
-    exit 1
-  fi
-fi
+ensure_platform_compatible
 
 manifest_path="${SCRIPT_DIR}/${INSTALL_MANIFEST}"
 if [[ ! -f "${manifest_path}" ]]; then
@@ -221,10 +465,16 @@ if [[ "${#removed_packages[@]}" -gt 0 ]]; then
 fi
 
 log "Installing bundled Internals and LLiMa packages."
+remove_stale_global_sima_lmm_pip_install
+stop_board_runtime_before_install
 run_sudo apt-get install -y --reinstall --allow-downgrades \
   -o Dpkg::Options::=--force-overwrite \
   "${debs[@]}"
 run_sudo apt-get check
+activate_board_runtime_after_install
+restart_board_codec_services
+verify_board_codec_services
+verify_board_runtime_services
 
 for deb_path in "${debs[@]}"; do
   package="$(dpkg-deb -f "${deb_path}" Package)"

@@ -26,7 +26,8 @@ The Modalix DevKit runtime is delivered as three Debian packages:
 The Model Compiler tooling is delivered as a Python wheel:
 
 - `sima-lmm[sdk]`: compiler SDK dependencies, including internal SiMa packages.
-- `sima-lmm[sdk_ext]`: external MoLE, benchmark, and evaluation dependencies.
+- `sima-lmm[sdk_ext]`: external model, MoLE, benchmark, and evaluation dependencies for use
+  alongside an installed Model Compiler environment.
 
 ## Install Runtime Packages
 
@@ -162,26 +163,31 @@ Inside `llima run --mode cli`:
 Set `SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT=1` to highlight tokens accepted from the
 draft model when running EAGLE3 speculative decoding in CLI mode.
 
-## Python Wheel
-
-The Python wheel path is used for SDK/build-facing workflows and optional
-dependency sets.
+## Model Compiler Python Package
 
 ### Install the Model Compiler tooling in editable mode
 
-For active compiler development, create a Python 3.12 environment and install
-LLiMa with the `sdk` dependencies. Disabling the CMake portion keeps this a
-pure-Python compiler installation:
+For active compiler development, use the Python 3.12 virtual environment
+installed by Model Compiler; do not create a separate LLiMa virtual
+environment. The Model Compiler installer creates a `model-compiler` virtual
+environment and installation directory in the first writable location:
+
+1. `/sdk-extensions/model-compiler`
+2. `/sdk-add-on/model-compiler` (legacy fallback)
+3. `$HOME/sdk-extensions/model-compiler`
+
+Activate the installation used by your system, then install LLiMa with the
+`sdk_ext` dependencies. The installed Model Compiler environment already
+provides the internal SiMa compiler packages.
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[sdk]" \
-  -Cwheel.cmake=false \
-  -Cbuild-dir="build/compiler-editable/{wheel_tag}"
+source <model-compiler-venv>/bin/activate
+python -m pip install -e '.[sdk_ext]'
 llima-compile --help
 ```
+
+Alternatively, use a self-managed Python 3.12 development environment that
+already has a compatible Model Compiler package set installed.
 
 ### Build wheel artifacts
 
@@ -209,6 +215,15 @@ package metadata in `dist/mole/`. As in Core packages, artifact checksums are
 recorded in each profile's `metadata.json`; the legacy Debian archive keeps its
 separate checksum file under `dist/debs/`.
 
+`dist/compiler/metadata-wheel.json` is a download-only profile for consumers
+that need the compiler wheel as an input to another package bundle. It contains
+only the wheel and its checksum. Its installation command is the POSIX no-op
+`:`—the same download-only convention as Core. For example:
+
+```bash
+sima-cli neat install --type wheel --install-dir <wheel-dir> llima/compiler@develop
+```
+
 ```text
 dist/
 ├── sima-lmm-<version>-Linux-{core,dev,cli}.deb
@@ -225,7 +240,8 @@ dist/
 ├── compiler/
 │   ├── sima_lmm-<version>-py3-none-any.whl
 │   ├── install_compiler.sh
-│   └── metadata.json
+│   ├── metadata.json
+│   └── metadata-wheel.json
 └── mole/
     ├── sima_lmm-<version>-py3-none-any.whl
     ├── install_mole.sh
