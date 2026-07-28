@@ -27,9 +27,14 @@ class ModalixBoard:
         # Start the llima benchmark server on the board.
         llima_cmd = "llima"
         if self.venv_path is not None:
-            llima_cmd = f"{self.venv_path}/bin/llima"
+            llima_path = f"{self.venv_path}/bin/llima"
+            llima_cmd = (
+                f'"$HOME"{shlex.quote(llima_path[1:])}'
+                if llima_path.startswith("~/")
+                else shlex.quote(llima_path)
+            )
         server_cmd = (
-            f"{shlex.quote(llima_cmd)} benchmark-server "
+            f"{llima_cmd} benchmark-server "
             f"{shlex.quote(str(self.model))} --port {shlex.quote(str(self.port))}"
         )
         logger.info(f"Starting server on {self.address}:{self.port}")
@@ -42,9 +47,8 @@ class ModalixBoard:
         conn.run("pkill -f '[l]lima benchmark-server' 2>/dev/null", warn=True)
         conn.run("pkill --older 60 -f '[l]lima' 2>/dev/null", warn=True)
         time.sleep(2)
-        remote_home = shlex.quote(f"/home/{self.ssh_user}")
         conn.run(
-            f"cd {remote_home} && nohup {server_cmd} > server.log 2>&1 < /dev/null &",
+            f'cd "$HOME" && nohup {server_cmd} > server.log 2>&1 < /dev/null &',
             disown=True,
         )
         conn.close()

@@ -1,5 +1,7 @@
 #include <spdlog/spdlog.h>
 
+#include <stdexcept>
+
 #include "utils.hpp"
 #include "vision_language_model.hpp"
 
@@ -185,13 +187,20 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
             override_stop_token_ids
         );
         try {
-            _language_model_ptr->run_model_speculative_decoding(
+            auto output_token_ids = _language_model_ptr->run_model_speculative_decoding(
                 *_draft_vlm_ptr->_language_model_ptr,
                 input_token_ids,
                 override_max_num_tokens,
                 std::nullopt,
                 &result
             );
+            if (!output_token_ids.has_value()) {
+                throw std::runtime_error(
+                    "Speculative performance request leaves insufficient token capacity "
+                    "for one verification round; increase --max_new_tokens or reduce "
+                    "the input length"
+                );
+            }
             _language_model_ptr->set_stop_token_ids(original_stop_token_ids);
             _language_model_ptr->clear_cached_token_ids();
             _draft_vlm_ptr->_language_model_ptr->clear_cached_token_ids();

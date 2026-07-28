@@ -129,24 +129,29 @@ def create_sample_data(
             + tokens[content_end:]
         )
 
-    def tok_and_len(batch):
-        tok = tokenize_text(batch["text"])
-        return {"input_ids": tok, "len": len(tok)}
-
-    tokenized_dataset = (
-        datasets.load_dataset("cimec/lambada", split=f"train[:{required_samples}]")
-        .map(tok_and_len, batched=False, remove_columns=["text", "domain"])
-        .filter(lambda data: data["len"] >= longest_input)
+    tokenized_samples = []
+    dataset = datasets.load_dataset(
+        "cimec/lambada",
+        split="train",
+        streaming=True,
     )
-    if len(tokenized_dataset) < required_samples:
+    for row in dataset:
+        tokens = tokenize_text(row["text"])
+        if len(tokens) < longest_input:
+            continue
+        tokenized_samples.append(tokens)
+        if len(tokenized_samples) == required_samples:
+            break
+
+    if len(tokenized_samples) < required_samples:
         raise RuntimeError(
-            f"LAMBADA provided {len(tokenized_dataset)} samples with at least "
+            f"LAMBADA provided {len(tokenized_samples)} samples with at least "
             f"{longest_input} tokens; {required_samples} are required"
         )
 
     samples = {
         tok_len: [
-            truncate_tokens(tokenized_dataset[j]["input_ids"], tok_len)
+            truncate_tokens(tokenized_samples[j], tok_len)
             for j in range(i * n_samples, (i + 1) * n_samples)
         ]
         for i, tok_len in enumerate(sorted(tok_lens))
