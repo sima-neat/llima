@@ -929,6 +929,10 @@ build_extras_archive() {
       echo "ERROR: Runtime test extras are missing the ASR transcription executable." >&2
       exit 1
     fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the tool-call parser executable." >&2
+      exit 1
+    fi
     if [[ ! -f "${install_prefix}/lib/sima-lmm/tests/CTestTestfile.cmake" ]]; then
       echo "ERROR: Runtime test extras are missing CTestTestfile.cmake." >&2
       exit 1

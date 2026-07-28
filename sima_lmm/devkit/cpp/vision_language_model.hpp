@@ -14,6 +14,7 @@
 #include "base_model.hpp"
 #include "chat.hpp"
 #include "language_model.hpp"
+#include "tool_call_parser.hpp"
 #include "vision_model.hpp"
 #include "vlm_helper.hpp"
 
@@ -54,6 +55,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
 
         Chat create_chat() { return Chat(_vlm_helper); }
         bool support_image() const { return _cfg.support_image(); }
+        ToolCallFormat tool_call_format() const { return _tool_call_format; }
 
         void set_info_callback(TextStreamer::InfoCallback callback) {
             _text_streamer.set_info_callback(callback);
@@ -75,6 +77,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
     private:
         VlmHelper _vlm_helper;
         TextStreamer _text_streamer;
+        ToolCallFormat _tool_call_format = ToolCallFormat::GenericJson;
         std::unique_ptr<VisionModel> _vision_model_ptr;
         std::unique_ptr<LanguageModel> _language_model_ptr;
         std::mutex _run_mutex;  // Protects run_model from concurrent access

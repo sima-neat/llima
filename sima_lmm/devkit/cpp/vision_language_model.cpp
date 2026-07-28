@@ -14,6 +14,12 @@ VisionLanguageModel::VisionLanguageModel(
     _vlm_helper(_cfg, _devkit_dir, system_prompt, chat_template),
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
 {
+    _tool_call_format = tool_call_format_for_model(_cfg.model_type);
+    if (auto* tokenizer = _vlm_helper.get_tokenizer()) {
+        _text_streamer.set_preserved_token_ids(
+            resolve_tool_call_special_tokens(_tool_call_format, *tokenizer)
+        );
+    }
     if (_cfg.support_image()) {
         _vision_model_ptr = std::make_unique<VisionModel>(model_path);
     }
@@ -50,6 +56,7 @@ std::optional<std::string> VisionLanguageModel::run_model(
 ) {
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
+    _text_streamer.set_tool_call_enabled(chat.has_tools());
     
     ChronoTimer timer_ttft(true);
 
@@ -108,6 +115,7 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
 ) {
     // Given a list of input token ids, return a list of generated token ids. The text streamer is
     // disabled for this mode.
+    _text_streamer.set_tool_call_enabled(false);
     _text_streamer.disable();
 
     _language_model_ptr->create_input_buffers(input_token_ids);
