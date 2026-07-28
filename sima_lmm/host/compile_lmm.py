@@ -273,17 +273,18 @@ def main():
         )
     )
     group.add_argument(
-        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=False,
+        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "Quantizes embedding tables for LLMs and Gemma4 VLMs to reduce memory "
-            "consumption. This may result in a loss of accuracy."
+            "consumption. This may result in a loss of accuracy. Enabled by default; disable with "
+            "--no-quantize_embeddings."
         )
     )
     group.add_argument(
-        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=False,
+        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "Enables kv_cache quantization to reduce memory consumption. This may result in a loss"
-            " of accuracy."
+            " of accuracy. Enabled by default; disable with --no-quantize_kv_cache."
         )
     )
     egroup = group.add_mutually_exclusive_group()
@@ -426,7 +427,7 @@ def main():
     elif args.lora_names is not None or args.lora_paths is not None:
         _abort("Number of --lora_name do not match the number of --lora_path")
 
-    # Enable mlp splitting and LoRA is not used. The feature is not implemented for LoRA.
+    # Enable MLP splitting when LoRA is not used. The feature is not implemented for LoRA.
     split_mlp = lora_path_for_base_model is None
 
     gen_files(
