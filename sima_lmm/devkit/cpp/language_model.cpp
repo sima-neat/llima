@@ -442,6 +442,10 @@ void LanguageModel::run_model_decode(
     uint16_t num_input_tokens, uint32_t token_id
 ) {
     require_healthy_mla_session();
+    if (_can_run_persistent_decode(num_input_tokens)) {
+        _run_persistent_decode(num_input_tokens, token_id);
+        return;
+    }
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
@@ -465,6 +469,247 @@ void LanguageModel::run_model_decode(
     if (token_idx == _max_num_tokens) {
         _notify_cache_full();
     }
+}
+
+bool LanguageModel::_can_run_persistent_decode(
+    uint16_t position
+) const noexcept {
+    /*
+     * Keep the CQ-owned path intentionally narrow.  Every excluded shape has
+     * a legitimate CPU observation or dynamic binding boundary and therefore
+     * retains develop's synchronous run_model_once() semantics.
+     */
+    return ordinary_decode_arm() == OrdinaryDecodeArm::kStagingPlan &&
+           !_need_argmax &&
+           !_cfg.lm_cfg.is_spec_decode() &&
+           !_uses_per_layer_inputs() &&
+           (!_cfg.vm_cfg.has_value() ||
+            _cfg.vm_cfg->deepstack_visual_indexes.empty()) &&
+           _ordinary_decode_plan &&
+           _ordinary_decode_plan->valid(position) &&
+           _has_ordinary_decode_recipe(position);
+}
+
+bool LanguageModel::_continue_persistent_decode(
+    void* opaque, bool position_succeeded,
+    std::size_t* next_position
+) noexcept {
+    auto* state = static_cast<PersistentDecodeState*>(opaque);
+    if (!state || !state->owner || !next_position) {
+        return false;
+    }
+    LanguageModel& owner = *state->owner;
+
+    if (!position_succeeded) {
+        /*
+         * No scalar is authoritative when any physical job in this position
+         * failed.  Wake the producer; drain_and_join() will format the exact
+         * Backend/kernel failure on that thread after all callbacks are joined.
+         */
+        state->terminal.store(true, std::memory_order_release);
+        state->wait_cv.notify_one();
+        return false;
+    }
+
+    DecodeRecord record;
+    record.position = state->position;
+    record.input_token = state->input_token;
+    record.terminal_timestamp_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count()
+    );
+    /*
+     * The terminal CQE is Backend's acquire edge for coherent DMS0 output.
+     * This fence is the compiler/CPU ordering half of the same scalar read
+     * used by run_model_once(); no cache-maintenance syscall belongs here.
+     */
+    std::atomic_thread_fence(std::memory_order_acquire);
+    record.output_token = *static_cast<const uint32_t*>(
+        state->scalar_output->get_virtual_addr()
+    );
+
+    bool keep_running = false;
+    {
+        std::lock_guard decision(owner._decode_decision_mutex);
+        if (owner._stop_token_ids.contains(record.output_token)) {
+            record.reason = DecodeTerminalReason::kStopToken;
+        } else if (!owner._is_running.load(std::memory_order_relaxed)) {
+            record.reason = DecodeTerminalReason::kInterrupted;
+        } else if (
+            static_cast<std::size_t>(state->position) + 1 >=
+            owner._max_num_tokens) {
+            record.reason = DecodeTerminalReason::kCacheFull;
+        } else if (
+            !state->plan ||
+            static_cast<std::size_t>(state->position) + 1 >=
+                state->plan->position_count()) {
+            record.reason = DecodeTerminalReason::kFailureAfterToken;
+            state->failure_after_token = true;
+        } else {
+            try {
+                /*
+                 * One fixed row is safe to overwrite now: every job that
+                 * consumed its previous contents has an authoritative CQE.
+                 * CpuAccessGuard::end() publishes this row before the same CQ
+                 * owner submits the next immutable position span.
+                 */
+                owner._stage_ordinary_decode_embedding(
+                    record.output_token, *state->staging
+                );
+                record.reason = DecodeTerminalReason::kContinue;
+                *next_position =
+                    static_cast<std::size_t>(state->position) + 1;
+                state->position++;
+                state->input_token = record.output_token;
+                keep_running = true;
+            } catch (...) {
+                /*
+                 * Exception text/allocation must not escape through the CQ
+                 * pump.  The main thread publishes this already-produced
+                 * token once, poisons the session, and reports a fixed error.
+                 */
+                record.reason = DecodeTerminalReason::kFailureAfterToken;
+                state->failure_after_token = true;
+            }
+        }
+    }
+
+    const std::size_t index =
+        state->produced.load(std::memory_order_relaxed);
+    if (index >= state->records.size()) {
+        state->failure_after_token = true;
+        state->terminal.store(true, std::memory_order_release);
+        state->wait_cv.notify_one();
+        return false;
+    }
+    state->records[index] = record;
+    state->produced.store(index + 1, std::memory_order_release);
+    if (!keep_running) {
+        state->terminal.store(true, std::memory_order_release);
+    }
+    state->wait_cv.notify_one();
+    return keep_running;
+}
+
+void LanguageModel::_run_persistent_decode(
+    uint16_t num_input_tokens, uint32_t token_id
+) {
+    if (!_ordinary_decode_plan ||
+        !_ordinary_decode_plan->valid(num_input_tokens)) {
+        throw std::logic_error("persistent ordinary decode plan is stale");
+    }
+
+    PersistentDecodeState state;
+    state.owner = this;
+    state.plan = _ordinary_decode_plan.get();
+    state.staging = &get_buffer("decode_embedding");
+    state.scalar_output = &get_buffer("n1_buffer4");
+    state.position = num_input_tokens;
+    state.input_token = token_id;
+    state.records.resize(
+        static_cast<std::size_t>(_max_num_tokens) - num_input_tokens
+    );
+
+    /*
+     * Segment is declared after state so its destructor/join runs first on an
+     * exceptional unwind.  The main thread owns this one execution lease for
+     * the entire token chain; the CQ continuation never creates a second
+     * ring, session or scheduler.
+     */
+    auto previous_terminal = std::chrono::steady_clock::now();
+    MlaExecutionSegment segment(_mla_session);
+    _stage_ordinary_decode_embedding(token_id, *state.staging);
+    segment.start(
+        *_ordinary_decode_plan, num_input_tokens, &state,
+        _continue_persistent_decode
+    );
+
+    std::size_t consumed = 0;
+    DecodeTerminalReason final_reason = DecodeTerminalReason::kContinue;
+    while (true) {
+        {
+            std::unique_lock lock(state.wait_mutex);
+            state.wait_cv.wait(lock, [&] {
+                return state.produced.load(std::memory_order_acquire) >
+                           consumed ||
+                       state.terminal.load(std::memory_order_acquire);
+            });
+        }
+        const std::size_t available =
+            state.produced.load(std::memory_order_acquire);
+        while (consumed < available) {
+            const DecodeRecord& record = state.records[consumed++];
+            _cached_token_ids.emplace_back(record.input_token);
+            const auto terminal_time =
+                std::chrono::steady_clock::time_point(
+                    std::chrono::nanoseconds(record.terminal_timestamp_ns)
+                );
+            const double duration =
+                std::chrono::duration<double>(
+                    terminal_time - previous_terminal
+                ).count();
+            previous_terminal = terminal_time;
+            _notify_new_token(record.output_token, duration);
+            final_reason = record.reason;
+        }
+        if (state.terminal.load(std::memory_order_acquire) &&
+            consumed == state.produced.load(std::memory_order_acquire)) {
+            break;
+        }
+    }
+
+    /*
+     * Publication is not a callback join.  Keep the plan, callback context
+     * and execution lease alive until the rolling executor has joined every
+     * retained Job wrapper.
+     */
+    segment.drain_and_join();
+    if (state.failure_after_token) {
+        poison_mla_execution_session(
+            _mla_session, "ordinary decode continuation failed after token"
+        );
+        throw std::runtime_error(
+            "MLA ordinary decode failed while preparing the next token"
+        );
+    }
+    switch (final_reason) {
+    case DecodeTerminalReason::kStopToken:
+        _notify_stop();
+        return;
+    case DecodeTerminalReason::kInterrupted:
+        _notify_interrupt();
+        return;
+    case DecodeTerminalReason::kCacheFull:
+        _notify_cache_full();
+        return;
+    case DecodeTerminalReason::kFailureAfterToken:
+        throw std::runtime_error(
+            "MLA ordinary decode continuation failed"
+        );
+    case DecodeTerminalReason::kContinue:
+        /*
+         * A normal chain cannot terminate with kContinue. Treat it as a
+         * lifecycle invariant failure rather than silently losing a token.
+         */
+        poison_mla_execution_session(
+            _mla_session, "ordinary decode ended without terminal reason"
+        );
+        throw std::runtime_error(
+            "MLA ordinary decode ended without a terminal reason"
+        );
+    }
+}
+
+void LanguageModel::stop_model() {
+    /*
+     * This lock is the continuation decision's linearization point. If stop
+     * wins it, the hook observes false and submits nothing else. If the hook
+     * wins, exactly one next position has been logically accepted and drains
+     * to the same boundary as develop's synchronous loop.
+     */
+    std::lock_guard decision(_decode_decision_mutex);
+    _is_running.store(false, std::memory_order_relaxed);
 }
 
 

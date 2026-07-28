@@ -3,10 +3,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -79,7 +81,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<ChronoTimer> timer_ttft = std::nullopt
         );
-        void stop_model() { _is_running = false; }
+        void stop_model();
 
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
@@ -300,6 +302,43 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _stage_ordinary_decode_embedding(
             uint32_t token_id, MLABuffer& staging
         );
+        enum class DecodeTerminalReason : uint8_t {
+            kContinue,
+            kStopToken,
+            kInterrupted,
+            kCacheFull,
+            kFailureAfterToken,
+        };
+        struct DecodeRecord {
+            uint16_t position = 0;
+            uint32_t input_token = 0;
+            uint32_t output_token = 0;
+            uint64_t terminal_timestamp_ns = 0;
+            DecodeTerminalReason reason =
+                DecodeTerminalReason::kContinue;
+        };
+        struct PersistentDecodeState {
+            LanguageModel* owner = nullptr;
+            MlaExecutionPlan* plan = nullptr;
+            MLABuffer* staging = nullptr;
+            MLABuffer* scalar_output = nullptr;
+            std::vector<DecodeRecord> records;
+            std::atomic<std::size_t> produced{0};
+            std::atomic<bool> terminal{false};
+            std::mutex wait_mutex;
+            std::condition_variable wait_cv;
+            uint16_t position = 0;
+            uint32_t input_token = 0;
+            bool failure_after_token = false;
+        };
+        static bool _continue_persistent_decode(
+            void* context, bool position_succeeded,
+            std::size_t* next_position
+        ) noexcept;
+        bool _can_run_persistent_decode(uint16_t position) const noexcept;
+        void _run_persistent_decode(
+            uint16_t num_input_tokens, uint32_t token_id
+        );
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
@@ -365,6 +404,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
          * for stale or unsupported generations.
          */
         std::unique_ptr<MlaExecutionPlan> _ordinary_decode_plan;
+        /*
+         * This is a decision gate, not a scheduler lock.  A CQ continuation
+         * and stop_model() serialize only the decision whether another
+         * physical token transition is logically accepted.  Hardware work,
+         * text decoding and callback delivery never run under it.
+         */
+        mutable std::mutex _decode_decision_mutex;
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
 

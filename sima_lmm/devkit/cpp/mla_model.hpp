@@ -59,6 +59,28 @@ class MlaExecutionSegment {
 
         void commit();
         void commit(const MlaExecutionPlan& plan, std::size_t position);
+        /*
+         * Start one prebound position and keep the existing rolling executor
+         * alive across later positions.  The continuation runs on Backend's
+         * sole CQ owner only after every job in the current position has an
+         * authoritative terminal CQE.  Returning a next position does not add
+         * another scheduler or completion authority: it merely changes the
+         * immutable span consumed by the same depth-three executor.
+         *
+         * `position_succeeded == false` is delivered once after an accepted
+         * prefix has drained.  The callback must then return false; detailed
+         * status remains owned by drain_and_join(), which poisons the session
+         * and throws on the caller thread rather than the CQ thread.
+         */
+        using PositionContinuation = bool (*)(
+            void* context, bool position_succeeded,
+            std::size_t* next_position
+        ) noexcept;
+        void start(
+            const MlaExecutionPlan& plan, std::size_t position,
+            void* context, PositionContinuation continuation
+        );
+        void drain_and_join();
         [[nodiscard]] bool empty() const noexcept;
 
     private:
@@ -82,6 +104,10 @@ std::shared_ptr<MlaExecutionSession> current_mla_execution_session();
 void require_mla_execution_session_healthy(
     const std::shared_ptr<MlaExecutionSession>& session
 );
+void poison_mla_execution_session(
+    const std::shared_ptr<MlaExecutionSession>& session,
+    const char* reason
+) noexcept;
 /*
  * Acquire Backend ownership for CPU access to an MLABuffer.  This is the only
  * supported bridge between LLiMa's allocation wrapper and the canonical

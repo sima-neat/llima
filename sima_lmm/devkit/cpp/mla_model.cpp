@@ -215,6 +215,10 @@ static std::shared_ptr<MlaBindingCell> as_binding_cell(
  * observable outside this object.
  */
 class MlaExecutionSession {
+    friend void poison_mla_execution_session(
+        const std::shared_ptr<MlaExecutionSession>&, const char*
+    ) noexcept;
+
   private:
     struct BuiltBinding {
         mla::BoundExecution execution;
@@ -693,7 +697,7 @@ class MlaExecutionSession {
      * create two completion authorities and is rejected by Backend.
      */
     using PositionHook = bool (*)(
-        void* context, PlanSpan* next
+        void* context, bool position_succeeded, PlanSpan* next
     ) noexcept;
 
     void start_snapshots(
@@ -1292,6 +1296,7 @@ class MlaExecutionSession {
             bool submit = false;
             bool invoke_hook = false;
             bool notify = false;
+            bool position_succeeded = true;
             {
                 std::lock_guard lock(rolling_mutex_);
                 if (!rolling_active_) {
@@ -1300,8 +1305,15 @@ class MlaExecutionSession {
                 }
                 if (rolling_failure_.kind != RollingFailureKind::kNone) {
                     if (rolling_outstanding_ == 0) {
-                        rolling_logical_done_ = true;
-                        notify = true;
+                        if (rolling_position_hook_ &&
+                            !rolling_hook_active_) {
+                            rolling_hook_active_ = true;
+                            invoke_hook = true;
+                            position_succeeded = false;
+                        } else {
+                            rolling_logical_done_ = true;
+                            notify = true;
+                        }
                     }
                     rolling_drive_active_ = false;
                 } else if (
@@ -1350,7 +1362,7 @@ class MlaExecutionSession {
                 try {
                     keep_running =
                         rolling_position_hook_(
-                            rolling_hook_context_, &next
+                            rolling_hook_context_, position_succeeded, &next
                         );
                 } catch (...) {
                     /*
@@ -1367,7 +1379,8 @@ class MlaExecutionSession {
                         rolling_drive_active_ = false;
                         return;
                     }
-                    if (keep_running && !next.empty()) {
+                    if (position_succeeded &&
+                        keep_running && !next.empty()) {
                         rolling_data_ = next.data;
                         rolling_size_ = next.size;
                         rolling_next_ = 0;
@@ -2217,6 +2230,20 @@ struct MlaExecutionSegment::Impl {
     }
 
     ~Impl() {
+        if (persistent_started) {
+            /*
+             * A callback borrows continuation_context and this pimpl.  Never
+             * release either merely because a caller unwinds unexpectedly.
+             * The normal path calls drain_and_join() explicitly so this is a
+             * fail-safe lifecycle join, not token-boundary work.
+             */
+            try {
+                session->drain_and_join();
+            } catch (...) {
+                /* drain_and_join already fail-stops/poisons the session. */
+            }
+            persistent_started = false;
+        }
         /*
          * execution_lock is still owned while reusable handles and override
          * maps are dropped.  This covers both a successful drain and the
@@ -2231,6 +2258,45 @@ struct MlaExecutionSegment::Impl {
     std::unique_lock<std::mutex> execution_lock;
     std::vector<MlaPendingBinding>* pending = nullptr;
     std::vector<MlaExecutionSession::SubmissionSnapshot>* snapshots = nullptr;
+    const MlaExecutionPlan* continuation_plan = nullptr;
+    void* continuation_context = nullptr;
+    MlaExecutionSegment::PositionContinuation continuation = nullptr;
+    bool persistent_started = false;
+
+    static bool continue_position(
+        void* opaque, bool position_succeeded,
+        MlaExecutionSession::PlanSpan* next
+    ) noexcept {
+        auto* self = static_cast<Impl*>(opaque);
+        std::size_t position = 0;
+        if (!self || !self->continuation || !self->continuation_plan ||
+            !self->continuation(
+                self->continuation_context, position_succeeded, &position
+            )) {
+            return false;
+        }
+        const auto& plan = *self->continuation_plan;
+        /*
+         * start() validated the complete plan generation while this segment
+         * acquired the session execution lease. Package, adapter and buffer
+         * publication require that same lease, so repeating the O(parents)
+         * generation walk at every token would add pure CQ-path overhead.
+         */
+        if (!position_succeeded ||
+            position >= plan._impl->positions.size()) {
+            return false;
+        }
+        const auto entry = plan._impl->positions[position];
+        if (entry.first > plan._impl->jobs.size() ||
+            entry.count > plan._impl->jobs.size() - entry.first) {
+            return false;
+        }
+        *next = {
+            plan._impl->jobs.data() + entry.first,
+            entry.count,
+        };
+        return true;
+    }
 };
 
 MlaExecutionSegment::MlaExecutionSegment() = default;
@@ -2326,6 +2392,66 @@ void MlaExecutionSegment::commit(
     }
 }
 
+void MlaExecutionSegment::start(
+    const MlaExecutionPlan& plan, std::size_t position,
+    void* context, PositionContinuation continuation
+) {
+    if (!continuation || !plan._impl || !plan._impl->sealed ||
+        !plan.valid(position)) {
+        throw std::logic_error(
+            "persistent MLA execution requires a valid plan and continuation"
+        );
+    }
+    if (!_impl) {
+        _impl = std::make_unique<Impl>(plan._impl->session);
+    }
+    if (_impl->session != plan._impl->session ||
+        _impl->persistent_started ||
+        (_impl->pending && !_impl->pending->empty())) {
+        throw std::logic_error(
+            "persistent MLA execution segment is not idle"
+        );
+    }
+    const auto entry = plan._impl->positions[position];
+    if (entry.first > plan._impl->jobs.size() ||
+        entry.count > plan._impl->jobs.size() - entry.first) {
+        throw std::logic_error("MLA execution plan arena range is corrupt");
+    }
+    _impl->continuation_plan = &plan;
+    _impl->continuation_context = context;
+    _impl->continuation = continuation;
+    _impl->persistent_started = true;
+    try {
+        _impl->session->start_snapshots(
+            {
+                plan._impl->jobs.data() + entry.first,
+                entry.count,
+            },
+            _impl.get(), Impl::continue_position
+        );
+    } catch (...) {
+        _impl->persistent_started = false;
+        abort();
+        throw;
+    }
+}
+
+void MlaExecutionSegment::drain_and_join() {
+    if (!_impl || !_impl->persistent_started) {
+        throw std::logic_error(
+            "persistent MLA execution segment has not been started"
+        );
+    }
+    try {
+        _impl->session->drain_and_join();
+        _impl->persistent_started = false;
+    } catch (...) {
+        _impl->persistent_started = false;
+        abort();
+        throw;
+    }
+}
+
 void connect_mla(const std::vector<std::string>& legacy_args) {
     std::lock_guard lock(default_session_mutex);
     if (default_session) {
@@ -2359,6 +2485,20 @@ void require_mla_execution_session_healthy(
         throw std::runtime_error("MLA execution session is not available");
     }
     session->require_healthy();
+}
+
+void poison_mla_execution_session(
+    const std::shared_ptr<MlaExecutionSession>& session,
+    const char* reason
+) noexcept {
+    if (!session) {
+        return;
+    }
+    try {
+        session->poison(reason ? reason : "LLiMa persistent decode failure");
+    } catch (...) {
+        /* poison() is a best-effort fail-stop boundary for noexcept callers. */
+    }
 }
 
 mla::Status begin_mla_buffer_cpu_access(
