@@ -1,16 +1,20 @@
 import json
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from sima_lmm.config.vlm_config import (
+    ModelFormat,
     PipelineConfig,
     VlmConfig,
     group_cache_model_indices,
     single_cache_model_indices,
 )
 from sima_lmm.config.whisper_config import WhisperConfig
+from sima_lmm.model import VisionLanguageModel
+from sima_lmm.model import vision_language_model
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -51,6 +55,41 @@ def test_whisper_finds_generation_config_in_cache_root(tmp_path):
 
 def test_embedding_scale_is_absent_without_embedding_quantization():
     assert PipelineConfig().embeddings_scale is None
+
+
+def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp_path):
+    config = _load_reference_config("qwen3_vl_vlm_config.json")
+    hf_model = SimpleNamespace(config={})
+    vlm_helper = object()
+
+    monkeypatch.setattr(
+        vision_language_model, "model_file_type", lambda _path: ModelFormat.FORMAT_HF
+    )
+    monkeypatch.setattr(
+        vision_language_model.LocalHuggingFaceModel,
+        "create_from_directory",
+        lambda **_kwargs: hf_model,
+    )
+    monkeypatch.setattr(
+        vision_language_model.VlmConfig,
+        "from_hf_config",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        vision_language_model, "VlmHelper", lambda *_args, **_kwargs: vlm_helper
+    )
+
+    model = VisionLanguageModel.from_hf_cache(
+        model_name="qwen3-vl",
+        hf_cache_path=tmp_path / "model",
+        onnx_path=tmp_path / "onnx",
+        sima_path=tmp_path / "sima",
+        max_num_tokens=1024,
+        quantize_embeddings=True,
+    )
+
+    assert model.cfg.is_multimodal
+    assert model.cfg.pipeline_cfg.quantize_embeddings
 
 
 def test_default_max_num_tokens():

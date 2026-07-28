@@ -275,7 +275,7 @@ def main():
     group.add_argument(
         "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=True,
         help=(
-            "Quantizes embedding tables for LLMs and Gemma4 VLMs to reduce memory "
+            "Quantizes embedding tables for LLMs and VLMs to reduce memory "
             "consumption. This may result in a loss of accuracy. Enabled by default; disable with "
             "--no-quantize_embeddings."
         )
