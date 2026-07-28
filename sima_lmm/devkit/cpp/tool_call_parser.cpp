@@ -193,6 +193,33 @@ nlohmann::json parse_json_array_tool_calls(
     return result;
 }
 
+nlohmann::json parse_json_tool_call_envelope(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    const auto parsed = nlohmann::json::parse(std::string(text));
+    if (!parsed.is_object() || !parsed.contains("tool_calls") ||
+        !parsed["tool_calls"].is_array()) {
+        return nullptr;
+    }
+
+    // Fail closed on prose or unrelated model output wrapped around a call.
+    // Gemma's JSON fallback emits only `tool_calls` and an empty/null `content`.
+    for (const auto& item : parsed.items()) {
+        if (item.key() != "tool_calls" && item.key() != "content") return nullptr;
+    }
+    if (parsed.contains("content") && !parsed["content"].is_null() &&
+        (!parsed["content"].is_string() ||
+         !parsed["content"].get<std::string>().empty())) {
+        return nullptr;
+    }
+
+    return parse_json_array_tool_calls(
+        parsed["tool_calls"], id_counter, allowed_tool_names
+    );
+}
+
 nlohmann::json parse_plain_json_tool_calls(
     std::string_view text,
     int& id_counter,
@@ -387,6 +414,10 @@ nlohmann::json parse_gemma_tool_calls(
     int& id_counter,
     const std::vector<std::string>* allowed_tool_names
 ) {
+    text = trim_view(text);
+    if (text.starts_with('{')) {
+        return parse_json_tool_call_envelope(text, id_counter, allowed_tool_names);
+    }
     if (text.starts_with(gemma_open)) {
         if (!text.ends_with(gemma_close)) return nullptr;
         text.remove_prefix(gemma_open.size());
@@ -694,6 +725,7 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
         case ToolCallFormat::Lfm:
             return marker_mode(lfm_open);
         case ToolCallFormat::Gemma: {
+            if (stripped.front() == '{') return Mode::ToolCall;
             const auto wrapper_mode = marker_mode(gemma_open);
             return wrapper_mode == Mode::Content ? marker_mode(gemma_call) : wrapper_mode;
         }

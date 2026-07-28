@@ -74,6 +74,66 @@ void test_quotes_complete_gemma_keys() {
     );
 }
 
+
+void test_parses_gemma_json_tool_call_envelope() {
+    const auto calls = try_parse_tool_calls(
+        ToolCallFormat::Gemma,
+        R"({"tool_calls":[{"name":"set_fan_speed","arguments":{"level":3}},{"name":"set_ac","arguments":{"enabled":false}}],"content":""})",
+        {"set_fan_speed", "set_ac"}
+    );
+    expect(!calls.is_null(), "Gemma JSON tool-call envelopes must parse");
+    if (calls.is_null()) return;
+
+    expect(calls.size() == 2, "all Gemma JSON envelope calls must be preserved");
+    expect(
+        calls.at(0).at("function").at("name") == "set_fan_speed" &&
+            arguments_from(calls).at("level") == 3,
+        "the first Gemma JSON envelope call must preserve its arguments"
+    );
+    expect(
+        calls.at(1).at("function").at("name") == "set_ac" &&
+            nlohmann::json::parse(
+                calls.at(1).at("function").at("arguments").get<std::string>()
+            ).at("enabled") == false,
+        "the second Gemma JSON envelope call must preserve its arguments"
+    );
+}
+
+void test_rejects_unsafe_gemma_json_tool_call_envelopes() {
+    const auto mixed_content = try_parse_tool_calls(
+        ToolCallFormat::Gemma,
+        R"({"tool_calls":[{"name":"set_ac","arguments":{"enabled":false}}],"content":"I also answered in prose"})",
+        {"set_ac"}
+    );
+    expect(mixed_content.is_null(), "Gemma JSON envelopes with prose must fail closed");
+
+    const auto unknown_tool = try_parse_tool_calls(
+        ToolCallFormat::Gemma,
+        R"({"tool_calls":[{"name":"delete_everything","arguments":{}}],"content":""})",
+        {"set_ac"}
+    );
+    expect(unknown_tool.is_null(), "Gemma JSON envelopes must enforce the tool allowlist");
+}
+
+void test_streams_gemma_json_tool_call_envelope() {
+    ToolCallStreamParser parser(ToolCallFormat::Gemma, {"set_ac"});
+    expect(
+        parser.add(R"({"tool_calls":)", false).empty(),
+        "a partial Gemma JSON envelope must remain buffered"
+    );
+    const auto events = parser.add(
+        R"([{"name":"set_ac","arguments":{"enabled":false}}],"content":""})",
+        true
+    );
+    expect(events.size() == 1, "a complete Gemma JSON envelope must emit one event");
+    if (events.size() != 1) return;
+    const auto* calls = std::get_if<ToolCallStreamParser::ToolCalls>(&events[0]);
+    expect(calls != nullptr, "the Gemma JSON envelope event must be structured tool calls");
+    if (calls != nullptr) {
+        expect(calls->calls.size() == 1, "the streamed Gemma envelope call must be preserved");
+    }
+}
+
 void test_preserves_stream_content_provenance() {
     ToolCallStreamParser parser(ToolCallFormat::Lfm, {"send"});
 
@@ -111,6 +171,9 @@ void test_preserves_stream_content_provenance() {
 int main() {
     test_rejects_premature_lfm_string_close();
     test_quotes_complete_gemma_keys();
+    test_parses_gemma_json_tool_call_envelope();
+    test_rejects_unsafe_gemma_json_tool_call_envelopes();
+    test_streams_gemma_json_tool_call_envelope();
     test_preserves_stream_content_provenance();
 
     if (failures != 0) {
