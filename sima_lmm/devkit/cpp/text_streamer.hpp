@@ -53,6 +53,19 @@ class TextStreamer {
         // sink decide how to render — ANSI for terminal, HTML/metadata for
         // web, ignored for plain output.
         using TextCallback = std::function<void(const std::string&, bool, bool)>;
+        /*
+         * Lossless generation observation used by qualification tools.
+         *
+         * InfoCallback intentionally exposes only presentation metrics
+         * ("ttft", reciprocal instantaneous "tps", and terminal strings).
+         * Reconstructing token evidence from that interface loses both the
+         * token ID and the original interval.  This callback observes the
+         * immutable queue record on the same streamer thread before it is
+         * decoded.  It does not run on the MLA CQ thread and therefore cannot
+         * delay hardware refill.
+         */
+        using DecodeCallback =
+            std::function<void(const DecodeCallbackData&)>;
 
         TextStreamer(
             Tokenizer* tokenizer_ptr,
@@ -80,6 +93,11 @@ class TextStreamer {
         void set_text_callback(TextCallback callback) {
             std::lock_guard<std::mutex> lock(_mutex);
             _callback_finalize_text = callback;
+        }
+
+        void set_decode_callback(DecodeCallback callback) {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _callback_decode = std::move(callback);
         }
 
         void put(uint32_t token_id, bool from_draft = false);
@@ -121,6 +139,8 @@ class TextStreamer {
 
         InfoCallback _callback_info;
         TextCallback _callback_finalize_text;
+        DecodeCallback _callback_decode =
+            [](const DecodeCallbackData&) {};
         std::jthread _pop_thread;
         std::atomic<bool> _is_streaming;
 

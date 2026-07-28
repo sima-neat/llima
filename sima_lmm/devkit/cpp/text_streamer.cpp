@@ -74,6 +74,14 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
 
         DecodeCallbackData data = std::move(_queue.front());
         _queue.pop();
+
+        /*
+         * Invoke the evidence observer while the streamer's mutex is still
+         * held, just like the existing info/text callbacks.  set_*_callback()
+         * consequently cannot replace a callable while it is executing, and
+         * one trial's terminal marker cannot overtake its final token record.
+         */
+        _callback_decode(data);
         
         switch (data.type) {
             case DecodeCallbackType::TTFT:

@@ -71,6 +71,10 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             _text_streamer.set_text_callback(callback);
         }
 
+        void set_decode_callback(TextStreamer::DecodeCallback callback) {
+            _text_streamer.set_decode_callback(std::move(callback));
+        }
+
         void wait_for_streamer_completion() {
             _text_streamer.wait_streaming();
         }

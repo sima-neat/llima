@@ -24,14 +24,15 @@
  *
  * Usage:
  *   llima_direct_vlm_benchmark <compiled-model-directory> <image>
- *                              [measured-decode-intervals [trials [prompt]]]
+ *                              [measured-decode-intervals [trials [prompt
+ *                              [warmup-decode-intervals]]]]
  *
  * The published LFM2.5-VL-450M MLA-RT result reports response TPS after an
  * image plus a seven-token text prompt. Keep the same product boundary here:
  * TTFT includes image preprocessing/encoding and language prefill, while TPS
  * is the harmonic response rate of exactly N post-warmup decode intervals.
  * The harness disables semantic stop tokens for the measured call, produces
- * one first token plus 32 warmup intervals plus N measured intervals, and
+ * one first token plus the declared warmup and N measured intervals, and
  * rejects any shorter/longer result.  This fixes the old benchmark bug where
  * `max_new_tokens=256` silently stopped at 191 tokens and mixed a cold first
  * interval into the reported mean.  Do not use total process or
@@ -47,7 +48,7 @@
  */
 namespace {
 
-constexpr std::size_t kWarmupDecodeIntervals = 32;
+constexpr std::size_t kDefaultWarmupDecodeIntervals = 32;
 
 std::uint32_t parse_bounded(
     const char* text, const char* name, std::uint32_t low, std::uint32_t high
@@ -68,6 +69,7 @@ std::uint32_t parse_bounded(
 struct TrialMetrics {
     double ttft_s = -1.0;
     std::vector<double> decode_intervals_s;
+    std::vector<std::uint32_t> output_token_ids;
     bool ended = false;
 };
 
@@ -82,6 +84,7 @@ struct TrialResult {
 
 TrialResult finalize_metrics(
     TrialMetrics metrics,
+    std::size_t warmup_decode_intervals,
     std::size_t measured_decode_intervals,
     double wall_s,
     std::size_t response_bytes
@@ -100,7 +103,7 @@ TrialResult finalize_metrics(
     }
 
     const std::size_t expected_intervals =
-        kWarmupDecodeIntervals + measured_decode_intervals;
+        warmup_decode_intervals + measured_decode_intervals;
     if (metrics.decode_intervals_s.size() != expected_intervals) {
         throw std::runtime_error(
             "fixed-length benchmark expected " +
@@ -112,13 +115,13 @@ TrialResult finalize_metrics(
 
     /*
      * Erase no observations after the measurement window begins.  The first
-     * 32 decode intervals are a declared warmup contract, not statistical
+     * warmup decode intervals are a declared contract, not statistical
      * outlier removal; every one of the following N intervals contributes to
      * the per-trial harmonic rate.
      */
     metrics.decode_intervals_s.erase(
         metrics.decode_intervals_s.begin(),
-        metrics.decode_intervals_s.begin() + kWarmupDecodeIntervals
+        metrics.decode_intervals_s.begin() + warmup_decode_intervals
     );
     const double decode_s = std::accumulate(
         metrics.decode_intervals_s.begin(),
@@ -181,11 +184,12 @@ constexpr double kOneSidedT95[] = {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 3 || argc > 6) {
+    if (argc < 3 || argc > 7) {
         std::cerr
             << "usage: " << argv[0]
             << " <compiled-model-directory> <image>"
-               " [measured-decode-intervals [trials [prompt]]]\n";
+               " [measured-decode-intervals [trials [prompt"
+               " [warmup-decode-intervals]]]]\n";
         return 64;
     }
 
@@ -204,6 +208,8 @@ int main(int argc, char** argv) {
 
     std::uint32_t measured_decode_intervals = 256;
     std::uint32_t trials = 3;
+    std::uint32_t warmup_decode_intervals =
+        kDefaultWarmupDecodeIntervals;
     std::string prompt = "Describe what's in the image";
     try {
         if (argc >= 4) {
@@ -214,11 +220,23 @@ int main(int argc, char** argv) {
         if (argc >= 5) {
             trials = parse_bounded(argv[4], "trials", 1, 20);
         }
-        if (argc == 6) {
+        if (argc >= 6) {
             prompt = argv[5];
             if (prompt.empty()) {
                 throw std::invalid_argument("prompt must not be empty");
             }
+        }
+        if (argc == 7) {
+            warmup_decode_intervals = parse_bounded(
+                argv[6], "warmup-decode-intervals", 0, 992
+            );
+        }
+        if (static_cast<std::uint64_t>(warmup_decode_intervals) +
+                measured_decode_intervals >
+            std::numeric_limits<std::uint16_t>::max()) {
+            throw std::invalid_argument(
+                "warmup plus measured intervals exceeds uint16 range"
+            );
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << "\n";
@@ -245,19 +263,31 @@ int main(int argc, char** argv) {
         model.set_text_callback(
             [](const std::string&, bool, bool) {}
         );
-        model.set_info_callback(
-            [&](const std::string& type, double value) {
+        model.set_decode_callback(
+            [&](const simaai::llima::DecodeCallbackData& data) {
                 std::lock_guard<std::mutex> lock(metrics_mutex);
-                if (type == "ttft") {
-                    current.ttft_s = value;
-                } else if (type == "tps") {
-                    if (!(value > 0.0) || !std::isfinite(value)) {
+                if (data.type ==
+                    simaai::llima::DecodeCallbackType::TTFT) {
+                    current.ttft_s = data.duration;
+                    current.output_token_ids.emplace_back(data.token_id);
+                } else if (
+                    data.type ==
+                    simaai::llima::DecodeCallbackType::TPS) {
+                    if (!(data.duration > 0.0) ||
+                        !std::isfinite(data.duration)) {
                         throw std::runtime_error(
-                            "invalid instantaneous TPS callback"
+                            "invalid decode interval callback"
                         );
                     }
-                    current.decode_intervals_s.emplace_back(1.0 / value);
-                } else if (type == "END" || type == "FULL") {
+                    current.decode_intervals_s.emplace_back(data.duration);
+                    current.output_token_ids.emplace_back(data.token_id);
+                }
+            }
+        );
+        model.set_info_callback(
+            [&](const std::string& type, double) {
+                std::lock_guard<std::mutex> lock(metrics_mutex);
+                if (type == "END" || type == "FULL") {
                     current.ended = true;
                 }
             }
@@ -272,7 +302,7 @@ int main(int argc, char** argv) {
          * TTFT token followed by that many TPS intervals.
          */
         const auto requested_new_tokens = static_cast<std::uint16_t>(
-            kWarmupDecodeIntervals + measured_decode_intervals
+            warmup_decode_intervals + measured_decode_intervals
         );
         for (std::uint32_t trial = 0; trial < trials; ++trial) {
             {
@@ -304,8 +334,37 @@ int main(int argc, char** argv) {
                 std::lock_guard<std::mutex> lock(metrics_mutex);
                 snapshot = current;
             }
+            if (snapshot.output_token_ids.size() !=
+                snapshot.decode_intervals_s.size() + 1) {
+                throw std::runtime_error(
+                    "token observer did not preserve one token per interval"
+                );
+            }
+            /*
+             * Emit every unrounded observation before aggregation.  The
+             * analyzer treats these lines as the source of truth; the PASS
+             * line is only a convenient independently-computed summary.
+             */
+            for (std::size_t interval = 0;
+                 interval < snapshot.decode_intervals_s.size();
+                 ++interval) {
+                const bool warmup =
+                    interval < warmup_decode_intervals;
+                std::cout
+                    << std::fixed << std::setprecision(9)
+                    << "LLIMA_DIRECT_VLM_INTERVAL"
+                    << " trial=" << (trial + 1)
+                    << " interval=" << interval
+                    << " phase=" << (warmup ? "warmup" : "measured")
+                    << " output_token_id="
+                    << snapshot.output_token_ids[interval + 1]
+                    << " period_us="
+                    << (snapshot.decode_intervals_s[interval] * 1.0e6)
+                    << "\n";
+            }
             auto result = finalize_metrics(
-                std::move(snapshot), measured_decode_intervals, wall_s,
+                std::move(snapshot), warmup_decode_intervals,
+                measured_decode_intervals, wall_s,
                 response.has_value() ? response->size() : 0U
             );
             results.emplace_back(result);
@@ -313,7 +372,7 @@ int main(int argc, char** argv) {
                 << std::fixed << std::setprecision(3)
                 << "LLIMA_DIRECT_VLM_TRIAL trial=" << (trial + 1)
                 << " generated_tokens=" << result.generated_tokens
-                << " warmup_intervals=" << kWarmupDecodeIntervals
+                << " warmup_intervals=" << warmup_decode_intervals
                 << " measured_intervals=" << measured_decode_intervals
                 << " response_tps=" << result.response_tps
                 << " median_tps=" << result.median_tps
@@ -350,7 +409,7 @@ int main(int argc, char** argv) {
             << " model=" << model_path.filename()
             << " trials=" << trials
             << " requested_new_tokens=" << requested_new_tokens
-            << " warmup_intervals=" << kWarmupDecodeIntervals
+            << " warmup_intervals=" << warmup_decode_intervals
             << " measured_intervals=" << measured_decode_intervals
             << " response_tps_mean=" << response_tps_mean
             << " response_tps_stddev=" << response_tps_stddev
