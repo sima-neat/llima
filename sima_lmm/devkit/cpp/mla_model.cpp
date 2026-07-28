@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -631,85 +632,111 @@ class MlaExecutionSession {
         }
 
         /*
-         * Keep a bounded accepted window and refill it immediately after the
-         * oldest terminal CQE.  Two descriptor banks cap ACTIVE+READY
-         * generations for one model; they do not prove that an accepted depth
-         * of two is sufficient.  A third accepted job can hide CQE-to-refill
-         * jitter while the kernel advances RUNNING/READY preparation.  The
-         * private depth is therefore selected by the DVT sweep, not exposed as
-         * an application option.  Admission is per kernel context, so this
-         * bound controls retained state and failure blast radius rather than
-         * reserving another Neat context's credits.
+         * MLA-RT's useful property was not its userspace scheduler. Its
+         * multi-model path consumed completion and launched the next piece of
+         * work on one execution thread.  The first direct implementation lost
+         * that property: io_uring task-work woke the submitting LLiMa thread,
+         * that thread woke the Backend CQ pump, and the pump woke LLiMa again
+         * so it could refill this depth-three window. DVT sched tracing measured
+         * that second relay at about 30 us per CQE.
+         *
+         * Keep the same measured depth-three set of independent JOB_EXECs, the
+         * same kernel FIFO/priority arbitration, and one CQE per job. Only the
+         * refill continuation moves onto the sole CQ consumer. Once the first
+         * window completes, replacement SQEs are therefore submitted by the
+         * pump itself; io_uring task-work and CQ consumption stay on that
+         * thread instead of ping-ponging through the token producer. This is
+         * progressive publication, not the rejected all-at-once sequence ABI:
+         * at most three ordinary jobs remain accepted, and another context can
+         * still win at every physical model boundary.
          */
-        /*
-         * The execution lock permits one drain at a time, so retain a fixed
-         * circular set of optional jobs in the session.  std::deque allocated
-         * nodes on the decode boundary even though the accepted depth is a
-         * small private constant selected by DVT measurement.
-         */
-        std::size_t head = 0;
-        std::size_t count = 0;
-        std::size_t next = 0;
-        std::exception_ptr first_failure;
-        while (next < snapshots.size() || count != 0) {
-            while (!first_failure && next < snapshots.size() &&
-                   count < job_window_.size()) {
-                const std::size_t tail =
-                    (head + count) % job_window_.size();
-                if (job_window_[tail]) {
-                    throw std::logic_error(
-                        "MLA job window slot was not drained"
-                    );
-                }
-                mla::Job job;
-                mla::SubmitOptions options;
-                options.timeout_ms = kJobTimeoutMs;
-                mla::Status status = backend_->submit(
-                    snapshots[next].execution, options, &job
+        {
+            std::lock_guard lock(rolling_mutex_);
+            if (rolling_snapshots_ || rolling_outstanding_ != 0) {
+                throw std::logic_error(
+                    "MLA rolling executor still owns a prior segment"
                 );
-                if (!status) {
-                    const std::uint32_t model_index =
-                        snapshots[next].model_index;
-                    const std::filesystem::path diagnostic_path =
-                        model_path(model_index);
-                    first_failure = std::make_exception_ptr(
-                        std::runtime_error(fmt::format(
-                            "MLA segment submit {} failed: {} ({})",
-                            diagnostic_path,
-                            status.code,
-                            status.message
-                        ))
-                    );
-                    poison(fmt::format(
-                        "ordered segment submit failed at {}", next
-                    ));
-                    break;
-                }
-                job_window_[tail].emplace(std::move(job));
-                ++count;
-                ++next;
             }
-
-            if (count == 0) {
-                break;
-            }
-            mla::JobCompletion completion;
-            const mla::Status status =
-                job_window_[head]->wait(&completion);
-            job_window_[head].reset();
-            head = (head + 1) % job_window_.size();
-            --count;
-            if ((!status || completion.result != 0) && !first_failure) {
-                first_failure = std::make_exception_ptr(
-                    std::runtime_error(fmt::format(
-                        "MLA ordered segment failed: {} completion={} fault={}",
-                        status.code, completion.result,
-                        completion.fault_class
-                    ))
-                );
-                poison("ordered segment terminal failure");
+            rolling_snapshots_ = &snapshots;
+            rolling_next_ = 0;
+            rolling_outstanding_ = 0;
+            rolling_available_head_ = 0;
+            rolling_available_count_ = 0;
+            rolling_initialized_ = false;
+            rolling_refill_active_ = false;
+            rolling_failure_ = {};
+            for (auto& job : job_window_) {
+                job.reset();
             }
         }
+
+        /*
+         * Publish the initial jobs on the caller. While this small loop is in
+         * progress callbacks only retire slots; they cannot refill and race a
+         * later initial member into the FIFO. After the barrier, the pump owns
+         * all progressive refills.
+         */
+        for (std::size_t slot = 0;
+             slot < job_window_.size() && slot < snapshots.size();
+             ++slot) {
+            std::size_t snapshot_index = 0;
+            {
+                std::lock_guard lock(rolling_mutex_);
+                if (rolling_failure_.kind != RollingFailureKind::kNone) {
+                    break;
+                }
+                snapshot_index = rolling_next_++;
+                ++rolling_outstanding_;
+            }
+            submit_rolling_slot(slot, snapshot_index);
+        }
+        {
+            std::lock_guard lock(rolling_mutex_);
+            rolling_initialized_ = true;
+        }
+        start_rolling_refill();
+
+        RollingFailure failure;
+        std::vector<mla::Job> terminal_jobs;
+        {
+            std::unique_lock lock(rolling_mutex_);
+            rolling_cv_.wait(lock, [&] {
+                return rolling_outstanding_ == 0 &&
+                       (rolling_failure_.kind !=
+                            RollingFailureKind::kNone ||
+                        rolling_next_ == snapshots.size());
+            });
+            failure = rolling_failure_;
+            rolling_snapshots_ = nullptr;
+            rolling_initialized_ = false;
+            rolling_refill_active_ = false;
+            rolling_available_head_ = 0;
+            rolling_available_count_ = 0;
+            terminal_jobs.reserve(job_window_.size());
+            for (const auto& job : job_window_) {
+                if (job) {
+                    terminal_jobs.emplace_back(*job);
+                }
+            }
+        }
+        /*
+         * rolling_outstanding_ reaches zero inside the last continuation, just
+         * before it returns to JobState. Join those final Job wrappers here so
+         * the session cannot be destroyed while the CQ thread is still
+         * returning through a callback slot owned by this object. This is
+         * cold once per logical segment and does not add another kernel call:
+         * Job::wait() observes the same already-terminal CQE.
+         */
+        for (const auto& job : terminal_jobs) {
+            (void)job.wait();
+        }
+        {
+            std::lock_guard lock(rolling_mutex_);
+            for (auto& job : job_window_) {
+                job.reset();
+            }
+        }
+
         /*
          * All accepted jobs are terminal here, so no Backend slot needs the
          * snapshot handles any longer. Clear logical contents but retain the
@@ -719,8 +746,25 @@ class MlaExecutionSession {
          * commits.
          */
         snapshots.clear();
-        if (first_failure) {
-            std::rethrow_exception(first_failure);
+        if (failure.kind != RollingFailureKind::kNone) {
+            const auto path = model_path(failure.model_index);
+            if (failure.kind == RollingFailureKind::kSubmit) {
+                poison(fmt::format(
+                    "ordered segment submit failed at {}",
+                    failure.snapshot_index
+                ));
+                throw std::runtime_error(fmt::format(
+                    "MLA segment submit {} failed: {}",
+                    path, failure.status_code
+                ));
+            }
+            poison("ordered segment terminal failure");
+            throw std::runtime_error(fmt::format(
+                "MLA ordered segment {} failed: status={} completion={} "
+                "fault={}",
+                path, failure.status_code, failure.completion_result,
+                failure.fault_class
+            ));
         }
     }
 
@@ -959,6 +1003,33 @@ class MlaExecutionSession {
     }
 
   private:
+    enum class RollingFailureKind : std::uint8_t {
+        kNone,
+        kSubmit,
+        kTerminal,
+    };
+
+    /*
+     * Failure publication from the CQ thread must itself be allocation-free:
+     * a hardware/capacity failure is exactly when relying on fmt/string/heap
+     * construction is least safe. The token producer turns this fixed record
+     * into the detailed exception only after every accepted job has drained.
+     */
+    struct RollingFailure {
+        RollingFailureKind kind = RollingFailureKind::kNone;
+        std::size_t snapshot_index = 0;
+        std::uint32_t model_index = 0;
+        int status_code = 0;
+        int completion_result = 0;
+        std::uint32_t fault_class = 0;
+    };
+
+    struct RollingCallbackSlot {
+        MlaExecutionSession* owner = nullptr;
+        std::size_t slot = 0;
+        std::size_t snapshot_index = 0;
+    };
+
     struct PackageHold {
         mla::ModelPackage package;
         std::vector<std::size_t> model_indices;
@@ -979,9 +1050,241 @@ class MlaExecutionSession {
         std::size_t queue_ahead_depth
     ) : backend_(std::move(backend)),
         queue_ahead_depth_(queue_ahead_depth),
-        job_window_(queue_ahead_depth) {
+        job_window_(queue_ahead_depth),
+        rolling_callback_slots_(queue_ahead_depth),
+        rolling_available_slots_(queue_ahead_depth) {
         if (queue_ahead_depth_ == 0) {
             throw std::invalid_argument("MLA queue-ahead depth must be nonzero");
+        }
+        for (std::size_t slot = 0; slot < queue_ahead_depth_; ++slot) {
+            rolling_callback_slots_[slot].owner = this;
+            rolling_callback_slots_[slot].slot = slot;
+        }
+    }
+
+    static void rolling_job_completed(
+        void* opaque, const mla::Status& status,
+        const mla::JobCompletion& completion) noexcept {
+        auto* callback = static_cast<RollingCallbackSlot*>(opaque);
+        callback->owner->complete_rolling_job(
+            callback->slot, callback->snapshot_index, status, completion
+        );
+    }
+
+    bool rolling_done_locked() const noexcept {
+        return rolling_initialized_ && rolling_outstanding_ == 0 &&
+               rolling_snapshots_ &&
+               (rolling_failure_.kind != RollingFailureKind::kNone ||
+                rolling_next_ == rolling_snapshots_->size());
+    }
+
+    void record_rolling_failure_locked(
+        RollingFailureKind kind, std::size_t snapshot_index,
+        int status_code, int completion_result,
+        std::uint32_t fault_class) noexcept {
+        if (rolling_failure_.kind != RollingFailureKind::kNone) {
+            return;
+        }
+        const std::uint32_t model_index =
+            rolling_snapshots_ &&
+                    snapshot_index < rolling_snapshots_->size()
+                ? (*rolling_snapshots_)[snapshot_index].model_index
+                : 0;
+        rolling_failure_ = {
+            .kind = kind,
+            .snapshot_index = snapshot_index,
+            .model_index = model_index,
+            .status_code = status_code,
+            .completion_result = completion_result,
+            .fault_class = fault_class,
+        };
+    }
+
+    void fail_rolling_submit(
+        std::size_t slot, std::size_t snapshot_index,
+        int status_code) noexcept {
+        bool notify = false;
+        {
+            std::lock_guard lock(rolling_mutex_);
+            /*
+             * The reservation is counted before Backend::submit so completion
+             * and the main drain predicate cannot observe a false zero.
+             */
+            if (rolling_outstanding_ == 0 || job_window_[slot]) {
+                std::terminate();
+            }
+            --rolling_outstanding_;
+            record_rolling_failure_locked(
+                RollingFailureKind::kSubmit, snapshot_index,
+                status_code, status_code, 0
+            );
+            notify = rolling_done_locked();
+        }
+        if (notify) {
+            rolling_cv_.notify_all();
+        }
+    }
+
+    void submit_rolling_slot(
+        std::size_t slot, std::size_t snapshot_index) noexcept {
+        {
+            std::lock_guard lock(rolling_mutex_);
+            /*
+             * The availability queue is populated only by the prior
+             * continuation for this slot. Drop its wrapper before attempting
+             * replacement admission; Backend::finish() still owns that prior
+             * JobState until the current callback returns.
+             */
+            job_window_[slot].reset();
+        }
+        mla::Job job;
+        mla::Status status;
+        try {
+            mla::SubmitOptions options;
+            options.timeout_ms = kJobTimeoutMs;
+            status = backend_->submit(
+                (*rolling_snapshots_)[snapshot_index].execution,
+                options, &job
+            );
+        } catch (...) {
+            /*
+             * Backend submission is specified as a Status-returning boundary,
+             * but convert an unexpected allocation/standard-library exception
+             * too. Let the already accepted prefix drain; never unwind through
+             * the completion pump.
+             */
+            fail_rolling_submit(slot, snapshot_index, -ENOMEM);
+            return;
+        }
+        if (!status || !job.valid()) {
+            fail_rolling_submit(
+                slot, snapshot_index, status ? -EPROTO : status.code
+            );
+            return;
+        }
+
+        RollingCallbackSlot* callback = nullptr;
+        mla::Job callback_job;
+        {
+            std::lock_guard lock(rolling_mutex_);
+            if (job_window_[slot]) {
+                std::terminate();
+            }
+            /*
+             * A slot becomes reusable only from its prior continuation. The
+             * previous wrapper was cleared before admission while JobState was
+             * still owned by Backend::finish(); an occupied slot here means
+             * two producers violated the executor's single-refill invariant.
+             */
+            job_window_[slot].emplace(std::move(job));
+            /*
+             * Copy the shared Job wrapper so registration can happen after
+             * dropping rolling_mutex_. A very short job may already be
+             * terminal, in which case registration invokes the continuation
+             * inline and that continuation needs the same mutex.
+             */
+            callback_job = *job_window_[slot];
+            callback = &rolling_callback_slots_[slot];
+            callback->snapshot_index = snapshot_index;
+        }
+        /*
+         * The Job is fresh and has exactly one owner-side registration site.
+         * A failure here would mean a local executor invariant violation, not
+         * a recoverable device condition. Continuing without the callback
+         * would strand an accepted job and make buffer ownership ambiguous.
+         */
+        const mla::Status armed =
+            callback_job.set_completion_callback(
+                callback, rolling_job_completed
+            );
+        if (!armed) {
+            std::terminate();
+        }
+    }
+
+    void start_rolling_refill() noexcept {
+        {
+            std::lock_guard lock(rolling_mutex_);
+            if (!rolling_initialized_ || rolling_refill_active_) {
+                return;
+            }
+            rolling_refill_active_ = true;
+        }
+
+        while (true) {
+            std::size_t slot = 0;
+            std::size_t snapshot_index = 0;
+            bool have_work = false;
+            bool notify = false;
+            {
+                std::lock_guard lock(rolling_mutex_);
+                if (rolling_failure_.kind != RollingFailureKind::kNone ||
+                    !rolling_snapshots_ ||
+                    rolling_next_ == rolling_snapshots_->size() ||
+                    rolling_available_count_ == 0) {
+                    rolling_refill_active_ = false;
+                    notify = rolling_done_locked();
+                } else {
+                    slot = rolling_available_slots_[
+                        rolling_available_head_
+                    ];
+                    rolling_available_head_ =
+                        (rolling_available_head_ + 1) %
+                        rolling_available_slots_.size();
+                    --rolling_available_count_;
+                    snapshot_index = rolling_next_++;
+                    ++rolling_outstanding_;
+                    have_work = true;
+                }
+            }
+            if (notify) {
+                rolling_cv_.notify_all();
+            }
+            if (!have_work) {
+                return;
+            }
+            submit_rolling_slot(slot, snapshot_index);
+        }
+    }
+
+    void complete_rolling_job(
+        std::size_t slot, std::size_t snapshot_index,
+        const mla::Status& status,
+        const mla::JobCompletion& completion) noexcept {
+        bool refill = false;
+        bool notify = false;
+        {
+            std::lock_guard lock(rolling_mutex_);
+            if (!rolling_snapshots_ || slot >= job_window_.size() ||
+                !job_window_[slot] ||
+                rolling_callback_slots_[slot].snapshot_index !=
+                    snapshot_index ||
+                rolling_outstanding_ == 0 ||
+                rolling_available_count_ >=
+                    rolling_available_slots_.size()) {
+                std::terminate();
+            }
+            --rolling_outstanding_;
+            rolling_available_slots_[
+                (rolling_available_head_ + rolling_available_count_) %
+                rolling_available_slots_.size()
+            ] = slot;
+            ++rolling_available_count_;
+            if ((!status || completion.result != 0) &&
+                rolling_failure_.kind == RollingFailureKind::kNone) {
+                record_rolling_failure_locked(
+                    RollingFailureKind::kTerminal, snapshot_index,
+                    status.code, completion.result,
+                    completion.fault_class
+                );
+            }
+            refill = rolling_initialized_ && !rolling_refill_active_;
+            notify = !refill && rolling_done_locked();
+        }
+        if (refill) {
+            start_rolling_refill();
+        } else if (notify) {
+            rolling_cv_.notify_all();
         }
     }
 
@@ -1513,6 +1816,25 @@ class MlaExecutionSession {
     std::unique_ptr<mla::Backend> backend_;
     const std::size_t queue_ahead_depth_;
     std::vector<std::optional<mla::Job>> job_window_;
+    /*
+     * Allocation-free rolling-executor state. All fields below are protected
+     * by rolling_mutex_. The execution lock guarantees one logical segment,
+     * while this smaller lock coordinates its caller with the Backend CQ
+     * consumer. Fixed-size vectors are allocated once with the session; the
+     * callback path performs no container growth.
+     */
+    std::mutex rolling_mutex_;
+    std::condition_variable rolling_cv_;
+    std::vector<RollingCallbackSlot> rolling_callback_slots_;
+    std::vector<std::size_t> rolling_available_slots_;
+    std::vector<SubmissionSnapshot>* rolling_snapshots_ = nullptr;
+    std::size_t rolling_next_ = 0;
+    std::size_t rolling_outstanding_ = 0;
+    std::size_t rolling_available_head_ = 0;
+    std::size_t rolling_available_count_ = 0;
+    bool rolling_initialized_ = false;
+    bool rolling_refill_active_ = false;
+    RollingFailure rolling_failure_;
     std::vector<MlaPendingBinding> pending_scratch_;
     std::vector<SubmissionSnapshot> snapshot_scratch_;
     /*
