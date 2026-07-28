@@ -1,4 +1,5 @@
 #include <spdlog/spdlog.h>
+#include <stdexcept>
 
 #include "utils.hpp"
 #include "vision_language_model.hpp"
@@ -57,7 +58,9 @@ VisionLanguageModel::VisionLanguageModel(
 
 
 std::optional<std::string> VisionLanguageModel::run_model(
-    const Chat& chat, std::optional<uint16_t> max_new_tokens
+    const Chat& chat,
+    std::optional<uint16_t> max_new_tokens,
+    std::optional<std::set<uint32_t>> override_stop_token_ids
 ) {
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
@@ -94,6 +97,18 @@ std::optional<std::string> VisionLanguageModel::run_model(
 
     std::optional<std::vector<uint32_t>> output_token_ids;
     if (_draft_vlm_ptr != nullptr) {
+        /*
+         * The ordinary decoder already has a scoped stop-token override.
+         * Speculative decoding coordinates target and draft stop state
+         * separately and does not yet expose the same contract.  Fail
+         * explicitly rather than silently making a "fixed token count"
+         * benchmark stop early in speculative mode.
+         */
+        if (override_stop_token_ids.has_value()) {
+            throw std::invalid_argument(
+                "stop-token override is not supported with speculative decoding"
+            );
+        }
         output_token_ids = _language_model_ptr->run_model_speculative_decoding(
             *_draft_vlm_ptr->_language_model_ptr,
             preprocessed_data.input_token_ids,
@@ -102,7 +117,10 @@ std::optional<std::string> VisionLanguageModel::run_model(
         );
     } else {
         output_token_ids = _language_model_ptr->run_model(
-            preprocessed_data.input_token_ids, timer_ttft, max_num_tokens
+            preprocessed_data.input_token_ids,
+            timer_ttft,
+            max_num_tokens,
+            std::move(override_stop_token_ids)
         );
     }
 

@@ -37,7 +37,9 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
 
         std::optional<std::string> run_model(
             const Chat& chat,
-            std::optional<uint16_t> max_new_tokens = std::nullopt
+            std::optional<uint16_t> max_new_tokens = std::nullopt,
+            std::optional<std::set<uint32_t>> override_stop_token_ids =
+                std::nullopt
         );
         std::vector<uint32_t> run_model(
             std::span<const uint32_t> input_token_ids,
