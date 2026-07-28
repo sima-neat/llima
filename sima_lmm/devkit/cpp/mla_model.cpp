@@ -23,7 +23,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <fcntl.h>
 #include <limits>
 #include <mutex>
@@ -101,27 +100,57 @@ std::shared_ptr<MlaExecutionSession> default_session;
     ));
 }
 
-bool path_is_within(
+bool path_matches_family(
     const std::filesystem::path& path,
-    const std::optional<std::filesystem::path>& directory
+    const std::optional<std::filesystem::path>& selector
 ) {
-    if (!directory.has_value()) {
+    if (!selector.has_value()) {
         return true;
     }
     const auto normalized_path =
         std::filesystem::absolute(path).lexically_normal();
-    const auto normalized_directory =
-        std::filesystem::absolute(*directory).lexically_normal();
+    const auto normalized_selector =
+        std::filesystem::absolute(*selector).lexically_normal();
 
     /*
-     * Compare path components, not string prefixes.  `/models/text2` is not
-     * inside `/models/text`; a prefix check could otherwise publish or release
-     * the wrong transactional package family.
+     * LLiMa develop uses two forms of "related model" selector:
+     *
+     *   * Whisper passes an actual directory containing its QMLAs.
+     *   * Language/vision models pass the common filename stem, for example
+     *     ".../elf_files/LFM_language", while the files are siblings named
+     *     "LFM_language_n1_...elf".
+     *
+     * Treating every selector as a directory made the second form match
+     * nothing. The direct runtime then loaded a new position bucket lazily in
+     * prepare_locked(); at positions 384 and 512 that put roughly 315 ms of
+     * model admission directly in the token latency.
+     *
+     * Preserve exact component containment for real directories. For the
+     * filename-stem form, require the same parent and a separator boundary
+     * after the complete stem. This admits "text_n1.elf" for "text" without
+     * reviving the unsafe raw-prefix behavior where "text2_n1.elf" also
+     * matched "text".
      */
-    return std::equal(
-        normalized_directory.begin(), normalized_directory.end(),
+    const bool contained = std::equal(
+        normalized_selector.begin(), normalized_selector.end(),
         normalized_path.begin(), normalized_path.end()
     );
+    if (contained) {
+        return true;
+    }
+    if (normalized_selector.parent_path() !=
+        normalized_path.parent_path()) {
+        return false;
+    }
+
+    const std::string stem = normalized_selector.filename().string();
+    const std::string candidate = normalized_path.filename().string();
+    if (candidate.size() <= stem.size() ||
+        candidate.compare(0, stem.size(), stem) != 0) {
+        return false;
+    }
+    const char boundary = candidate[stem.size()];
+    return boundary == '_' || boundary == '.';
 }
 
 std::shared_ptr<MlaExecutionSession> require_default_session() {
@@ -148,6 +177,18 @@ struct __attribute__((visibility("hidden"))) MlaBindingCell {
     std::vector<ParentGeneration> parent_generations;
     mla::BoundExecution exact_default;
     std::uint64_t adapter_generation = 0;
+};
+
+/*
+ * A segment records immutable binding intent and materializes the complete
+ * transaction at commit.  Copies of the uncommon override maps preserve the
+ * old stack-local caller contract; no pointer to an add_to_segment() local
+ * survives.  Backend submission starts only after every entry has validated.
+ */
+struct __attribute__((visibility("hidden"))) MlaPendingBinding {
+    std::shared_ptr<MlaBindingCell> binding;
+    std::optional<std::map<uint8_t, MLABufferSlice>> ifm_overrides;
+    std::optional<std::map<uint8_t, MLABufferSlice>> ofm_overrides;
 };
 
 static std::shared_ptr<MlaBindingCell> as_binding_cell(
@@ -279,11 +320,30 @@ class MlaExecutionSession {
         std::lock_guard lock(mutex_);
         require_healthy_locked();
         std::vector<std::size_t> missing;
+        std::size_t matched = 0;
         for (std::size_t index = 0; index < models_.size(); ++index) {
-            if (!models_[index].package &&
-                path_is_within(models_[index].path, relative_directory)) {
+            if (!path_matches_family(
+                    models_[index].path, relative_directory)) {
+                continue;
+            }
+            ++matched;
+            if (!models_[index].package) {
                 missing.push_back(index);
             }
+        }
+        /*
+         * A related-family load is a model-initialization contract, not an
+         * optional prefetch hint. Silently accepting an unmatched selector
+         * previously deferred every MODEL_DEFINE to the first token that used
+         * that QMLA family. Fail at initialization instead: this both catches
+         * malformed packages and guarantees that decode cannot acquire a new
+         * model merely because it crossed a compiled position bucket.
+         */
+        if (relative_directory && matched == 0) {
+            throw std::invalid_argument(fmt::format(
+                "no registered MLA model matches family selector {}",
+                *relative_directory
+            ));
         }
         if (!missing.empty()) {
             /*
@@ -307,7 +367,7 @@ class MlaExecutionSession {
         for (auto& package : packages_) {
             bool release = false;
             for (const std::size_t index : package->model_indices) {
-                if (path_is_within(models_[index].path, relative_directory)) {
+                if (path_matches_family(models_[index].path, relative_directory)) {
                     release = true;
                     break;
                 }
@@ -408,15 +468,55 @@ class MlaExecutionSession {
         ));
     }
 
-    SubmissionSnapshot prepare(
+    /*
+     * Resolve one complete caller-owned segment under one metadata lock.
+     * Develop and the first direct implementation acquired mutex_ once per
+     * compiled partition (29 times for the measured LFM token), even though
+     * execution_mutex_ already excludes publication changes for the segment.
+     * Keeping validation here preserves the same safety boundary while
+     * removing repeated lock/unlock and health checks from the serial token
+     * path.
+     */
+    void prepare_many(
+        const std::vector<MlaPendingBinding>& pending,
+        std::vector<SubmissionSnapshot>& snapshots
+    ) {
+        std::lock_guard lock(mutex_);
+        require_healthy_locked();
+        snapshots.clear();
+        if (snapshots.capacity() < pending.size()) {
+            snapshots.reserve(pending.size());
+        }
+        try {
+            for (const MlaPendingBinding& request : pending) {
+                if (!request.binding) {
+                    throw std::invalid_argument("null MLA binding cell");
+                }
+                snapshots.push_back(prepare_locked(
+                    request.binding,
+                    request.ifm_overrides ? &*request.ifm_overrides : nullptr,
+                    request.ofm_overrides ? &*request.ofm_overrides : nullptr
+                ));
+            }
+        } catch (...) {
+            /*
+             * No Backend::submit occurs until this method returns.  Do not
+             * leave a valid prefix in reusable scratch after a validation or
+             * allocation failure.
+             */
+            snapshots.clear();
+            throw;
+        }
+    }
+
+    SubmissionSnapshot prepare_locked(
         const std::shared_ptr<MlaBindingCell>& binding,
-        std::map<uint8_t, MLABufferSlice>* ifm_overrides,
-        std::map<uint8_t, MLABufferSlice>* ofm_overrides
+        const std::map<uint8_t, MLABufferSlice>* ifm_overrides,
+        const std::map<uint8_t, MLABufferSlice>* ofm_overrides
     ) {
         if (!binding) {
             throw std::invalid_argument("null MLA binding cell");
         }
-        std::lock_guard lock(mutex_);
         require_healthy_locked();
         validate_index_locked(binding->model_index);
         if (!models_[binding->model_index].package) {
@@ -484,6 +584,35 @@ class MlaExecutionSession {
         return std::unique_lock<std::mutex>(execution_mutex_);
     }
 
+    /*
+     * execution_mutex_ permits one live segment per session.  The request and
+     * immutable-snapshot arrays can therefore be session-owned scratch rather
+     * than one malloc/free pair per generated token.
+     */
+    void begin_segment() {
+        pending_scratch_.clear();
+        snapshot_scratch_.clear();
+        if (pending_scratch_.capacity() < 64) {
+            pending_scratch_.reserve(64);
+        }
+        if (snapshot_scratch_.capacity() < 64) {
+            snapshot_scratch_.reserve(64);
+        }
+    }
+
+    void end_segment() noexcept {
+        pending_scratch_.clear();
+        snapshot_scratch_.clear();
+    }
+
+    std::vector<MlaPendingBinding>& pending_scratch() noexcept {
+        return pending_scratch_;
+    }
+
+    std::vector<SubmissionSnapshot>& snapshot_scratch() noexcept {
+        return snapshot_scratch_;
+    }
+
     void run_snapshots(std::vector<SubmissionSnapshot>& snapshots) {
         require_healthy();
         if (snapshots.empty()) {
@@ -501,12 +630,26 @@ class MlaExecutionSession {
          * bound controls retained state and failure blast radius rather than
          * reserving another Neat context's credits.
          */
-        std::deque<mla::Job> inflight;
+        /*
+         * The execution lock permits one drain at a time, so retain a fixed
+         * circular set of optional jobs in the session.  std::deque allocated
+         * nodes on the decode boundary even though the accepted depth is a
+         * small private constant selected by DVT measurement.
+         */
+        std::size_t head = 0;
+        std::size_t count = 0;
         std::size_t next = 0;
         std::exception_ptr first_failure;
-        while (next < snapshots.size() || !inflight.empty()) {
+        while (next < snapshots.size() || count != 0) {
             while (!first_failure && next < snapshots.size() &&
-                   inflight.size() < queue_ahead_depth_) {
+                   count < job_window_.size()) {
+                const std::size_t tail =
+                    (head + count) % job_window_.size();
+                if (job_window_[tail]) {
+                    throw std::logic_error(
+                        "MLA job window slot was not drained"
+                    );
+                }
                 mla::Job job;
                 mla::SubmitOptions options;
                 options.timeout_ms = kJobTimeoutMs;
@@ -531,17 +674,20 @@ class MlaExecutionSession {
                     ));
                     break;
                 }
-                inflight.push_back(std::move(job));
+                job_window_[tail].emplace(std::move(job));
+                ++count;
                 ++next;
             }
 
-            if (inflight.empty()) {
+            if (count == 0) {
                 break;
             }
             mla::JobCompletion completion;
             const mla::Status status =
-                inflight.front().wait(&completion);
-            inflight.pop_front();
+                job_window_[head]->wait(&completion);
+            job_window_[head].reset();
+            head = (head + 1) % job_window_.size();
+            --count;
             if ((!status || completion.result != 0) && !first_failure) {
                 first_failure = std::make_exception_ptr(
                     std::runtime_error(fmt::format(
@@ -821,7 +967,8 @@ class MlaExecutionSession {
         std::unique_ptr<mla::Backend> backend,
         std::size_t queue_ahead_depth
     ) : backend_(std::move(backend)),
-        queue_ahead_depth_(queue_ahead_depth) {
+        queue_ahead_depth_(queue_ahead_depth),
+        job_window_(queue_ahead_depth) {
         if (queue_ahead_depth_ == 0) {
             throw std::invalid_argument("MLA queue-ahead depth must be nonzero");
         }
@@ -1006,8 +1153,8 @@ class MlaExecutionSession {
 
     BuiltBinding build_binding_locked(
         const MlaBindingCell& binding,
-        std::map<uint8_t, MLABufferSlice>* ifm_overrides,
-        std::map<uint8_t, MLABufferSlice>* ofm_overrides,
+        const std::map<uint8_t, MLABufferSlice>* ifm_overrides,
+        const std::map<uint8_t, MLABufferSlice>* ofm_overrides,
         const std::map<std::string, MLABufferSlice>* adapters,
         bool allow_incomplete
     ) {
@@ -1182,7 +1329,7 @@ class MlaExecutionSession {
     static const MLABufferSlice* select_slice(
         std::size_t index,
         const std::vector<MLABufferSlice>& defaults,
-        std::map<uint8_t, MLABufferSlice>* overrides
+        const std::map<uint8_t, MLABufferSlice>* overrides
     ) {
         if (index >= defaults.size()) {
             return nullptr;
@@ -1354,6 +1501,9 @@ class MlaExecutionSession {
 
     std::unique_ptr<mla::Backend> backend_;
     const std::size_t queue_ahead_depth_;
+    std::vector<std::optional<mla::Job>> job_window_;
+    std::vector<MlaPendingBinding> pending_scratch_;
+    std::vector<SubmissionSnapshot> snapshot_scratch_;
     /*
      * Serializes the entire logical execution transaction, not merely access
      * to the model registry.  LLM layers mutate ordered KV/speculative state;
@@ -1387,12 +1537,26 @@ struct MlaExecutionSegment::Impl {
         if (!session) {
             throw std::invalid_argument("MLA execution segment has no session");
         }
-        snapshots.reserve(64);
+        session->begin_segment();
+        pending = &session->pending_scratch();
+        snapshots = &session->snapshot_scratch();
+    }
+
+    ~Impl() {
+        /*
+         * execution_lock is still owned while reusable handles and override
+         * maps are dropped.  This covers both a successful drain and the
+         * transactional abort path.
+         */
+        if (session) {
+            session->end_segment();
+        }
     }
 
     std::shared_ptr<MlaExecutionSession> session;
     std::unique_lock<std::mutex> execution_lock;
-    std::vector<MlaExecutionSession::SubmissionSnapshot> snapshots;
+    std::vector<MlaPendingBinding>* pending = nullptr;
+    std::vector<MlaExecutionSession::SubmissionSnapshot>* snapshots = nullptr;
 };
 
 MlaExecutionSegment::MlaExecutionSegment() = default;
@@ -1405,7 +1569,7 @@ MlaExecutionSegment&
 MlaExecutionSegment::operator=(MlaExecutionSegment&&) noexcept = default;
 
 bool MlaExecutionSegment::empty() const noexcept {
-    return !_impl || _impl->snapshots.empty();
+    return !_impl || !_impl->pending || _impl->pending->empty();
 }
 
 void MlaExecutionSegment::abort() noexcept {
@@ -1421,7 +1585,7 @@ void MlaExecutionSegment::commit() {
     if (!_impl) {
         return;
     }
-    if (_impl->snapshots.empty()) {
+    if (!_impl->pending || _impl->pending->empty()) {
         return;
     }
     /*
@@ -1433,7 +1597,15 @@ void MlaExecutionSegment::commit() {
      * every authoritative terminal CQE and poisoned the session.
      */
     try {
-        _impl->session->run_snapshots(_impl->snapshots);
+        _impl->session->prepare_many(
+            *_impl->pending, *_impl->snapshots
+        );
+        /*
+         * Overrides and binding intents are no longer needed once immutable
+         * Backend handles exist. Retain capacity for the next subsegment.
+         */
+        _impl->pending->clear();
+        _impl->session->run_snapshots(*_impl->snapshots);
     } catch (...) {
         abort();
         throw;
@@ -1560,16 +1732,59 @@ void MLAModelWithBuffer::add_to_segment(
                 "one MLA execution segment cannot mix kernel contexts"
             );
         }
-        segment._impl->snapshots.push_back(_session->prepare(
-            as_binding_cell(_binding), ifm_map_ptr, ofm_map_ptr
-        ));
+        MlaPendingBinding pending{
+            .binding = as_binding_cell(_binding),
+        };
+        if (ifm_map_ptr && !ifm_map_ptr->empty()) {
+            pending.ifm_overrides = *ifm_map_ptr;
+        }
+        if (ofm_map_ptr && !ofm_map_ptr->empty()) {
+            pending.ofm_overrides = *ofm_map_ptr;
+        }
+        segment._impl->pending->push_back(std::move(pending));
     } catch (...) {
         /*
          * Segment construction is transactional.  If preparing this model
-         * fails, none of the earlier snapshots in the same caller-owned
-         * segment may run later by accident.  They have not reached the
-         * kernel yet, so dropping them is both safe and syscall-free.
+         * intent fails, none of the earlier entries in the same caller-owned
+         * segment may run later by accident.  Validation/materialization at
+         * commit has the same rule and happens before the first submit.
          */
+        segment.abort();
+        throw;
+    }
+}
+
+void MLAModelWithBuffer::_add_embedding_row_to_segment(
+    MlaExecutionSegment& segment,
+    uint8_t port,
+    MLABuffer* parent,
+    uint32_t row,
+    uint32_t width
+) {
+    try {
+        if (!segment._impl) {
+            segment._impl =
+                std::make_unique<MlaExecutionSegment::Impl>(_session);
+        } else if (segment._impl->session != _session) {
+            throw std::invalid_argument(
+                "one MLA execution segment cannot mix kernel contexts"
+            );
+        }
+        MlaPendingBinding pending{
+            .binding = as_binding_cell(_binding),
+        };
+        pending.ifm_overrides.emplace();
+        pending.ifm_overrides->emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(port),
+            std::forward_as_tuple(
+                parent,
+                std::vector<uint32_t>{row, 0},
+                std::vector<uint32_t>{1, width}
+            )
+        );
+        segment._impl->pending->push_back(std::move(pending));
+    } catch (...) {
         segment.abort();
         throw;
     }

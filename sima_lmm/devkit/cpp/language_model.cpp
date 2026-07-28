@@ -509,6 +509,21 @@ uint32_t LanguageModel::run_model_once(
         _per_layer_model_map.at(per_layer_key).add_to_segment(segment, &per_layer_ifm_map);
     }
 
+    /*
+     * Ordinary decode has a construction-time, position-specific recipe.
+     * Unlike a global handle list, token_idx selects the exact KV/RoPE/mask
+     * cells created for this physical position.  All other execution shapes
+     * retain develop's generic traversal below.
+     */
+    const bool use_ordinary_recipe =
+        num_tokens == 1 &&
+        !use_input_tokens &&
+        _has_ordinary_decode_recipe(token_idx);
+    if (use_ordinary_recipe) {
+        _append_ordinary_decode_recipe(
+            segment, token_idx, normal_input_buf, normal_input_row
+        );
+    } else {
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         LanguageModelMapKey model_key(num_tokens, layer_idx, token_idx);
 
@@ -723,6 +738,7 @@ uint32_t LanguageModel::run_model_once(
             );
         }
     }
+    }
 
     /*
      * Commit this dependency segment and consume every authoritative terminal
@@ -819,7 +835,21 @@ uint32_t LanguageModel::run_model_once(
         } else {
             // Non-spec: read from single n1_buffer4
             MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-            buf_ptr->invalidate_cache();
+            /*
+             * Direct MLA n1 buffers use SIMAAI_MEM_FLAG_DEFAULT:
+             * dma_alloc_coherent() plus a coherent userspace mapping.  The
+             * kernel executes dma_rmb() before terminal CQE publication and
+             * Backend consumes that CQE through an acquire load.  Keep the
+             * final compiler fence explicit, then use ordinary coherent CPU
+             * loads.  Develop's dc civac + dsb sy invalidation was required
+             * by older transport/cache assumptions and added avoidable work
+             * at every serial token boundary.
+             *
+             * This is intentionally limited to the proven ordinary n1 token
+             * output. Speculative logits, checkpoints, Whisper, CVU, and
+             * legacy cached allocations retain their existing maintenance.
+             */
+            std::atomic_thread_fence(std::memory_order_acquire);
             if (_need_argmax) {
                 next_token_id = _calc_next_token_id(buf_ptr);
             } else {
@@ -997,12 +1027,26 @@ void LanguageModel::_save_state_checkpoint(
         ? static_cast<uint32_t>(valid_tokens - 1)
         : static_cast<uint32_t>(_cfg.pipeline_cfg.input_token_group_size - 1);
 
+    /*
+     * These state buffers obey the same uniform allocation contract as the
+     * ordinary n1 token output: SIMAAI_MEM_FLAG_DEFAULT is backed by
+     * dma_alloc_coherent() and mapped with the coherent pgprot. The final
+     * segment CQE is published only after the driver's dma_rmb(), and Backend
+     * consumes it with acquire semantics. Repeating the legacy dc civac +
+     * dsb sy once per convolution layer here cost about 0.88 ms at the
+     * position-320 checkpoint on LFM2.5-VL-450M, even though it cannot make a
+     * coherent mapping more current.
+     *
+     * Keep checkpoint copying synchronous: later decode jobs mutate these
+     * exact cache rows, so deferring the memcpy would be a data race. Only the
+     * redundant maintenance is removed.
+     */
+    std::atomic_thread_fence(std::memory_order_acquire);
     for (auto& state: _cached_states) {
         const size_t src_offset_bytes = tail_row_offset * state.num_elems * state.elem_size;
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
             auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
             std::memcpy(
                 state.checkpoints[layer_slot][boundary_idx].data(),
@@ -1018,18 +1062,26 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
     // After a partial last group, move the valid tail to the end of the conv buffer,
     //  where the decode MLAModel expects it.
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
+    /*
+     * This is the reverse ownership transition of checkpoint capture. The
+     * grouped-prefill CQE makes coherent MLA writes visible before these CPU
+     * reads; the release fence orders the CPU memmoves before subsequent
+     * JOB_EXEC submissions. Per-buffer invalidate/flush calls were legacy
+     * cached-alias maintenance and are both redundant for the direct path's
+     * mandatory coherent DMS0 mapping.
+     */
+    std::atomic_thread_fence(std::memory_order_acquire);
     for (auto& state: _cached_states) {
         const size_t src_offset_bytes = (valid_tokens - 1) * state.num_elems * state.elem_size;
         const size_t dst_offset_bytes = tail_begin * state.num_elems * state.elem_size;
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
             auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
             std::memmove(ptr + dst_offset_bytes, ptr + src_offset_bytes, state.tail_bytes);
-            buf.flush_cache();
         }
     }
+    std::atomic_thread_fence(std::memory_order_release);
 }
 
 
@@ -1774,6 +1826,163 @@ void LanguageModel::_define_models() {
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
     if (is_draft) {
         _define_draft_fc_models();
+    }
+    _build_ordinary_decode_recipes();
+}
+
+void LanguageModel::_build_ordinary_decode_recipes() {
+    _ordinary_decode_recipes.clear();
+
+    /*
+     * Keep the first optimized shape deliberately narrow.  These conditions
+     * describe the same ordinary n1 decode traversal below: no speculative
+     * capture boundary, no per-layer CPU staging, and no deepstack input whose
+     * topology can vary with the multimodal request.  Every excluded shape
+     * continues through the generic builder unchanged.
+     */
+    const bool has_deepstack =
+        _cfg.vm_cfg.has_value() &&
+        !_cfg.vm_cfg->deepstack_visual_indexes.empty();
+    const bool supported_layers = std::all_of(
+        _cfg.lm_cfg.layer_types.begin(),
+        _cfg.lm_cfg.layer_types.end(),
+        [](const std::string& type) {
+            return type == "full_attention" ||
+                   type == "sliding_attention" ||
+                   type == "conv";
+        }
+    );
+    if (_cfg.lm_cfg.get_single_num_tokens() != 1 ||
+        _cfg.lm_cfg.is_spec_decode() ||
+        _uses_per_layer_inputs() ||
+        has_deepstack ||
+        !supported_layers) {
+        return;
+    }
+
+    const uint16_t max_num_tokens =
+        _cfg.pipeline_cfg.max_num_tokens;
+    _ordinary_decode_recipes.resize(max_num_tokens);
+    for (uint16_t token_idx = 0;
+         token_idx < max_num_tokens; ++token_idx) {
+        OrdinaryDecodeRecipe& recipe =
+            _ordinary_decode_recipes[token_idx];
+        /*
+         * Twenty-nine map lookups and the topology branches used to run at
+         * every LFM token boundary.  Build exactly that order once while all
+         * map nodes are stable, but retain only borrowed wrappers: their
+         * binding cells still select the current package/LoRA generation.
+         */
+        recipe.reserve(
+            static_cast<std::size_t>(_cfg.lm_cfg.num_hidden_layers) * 3 + 1
+        );
+        for (uint8_t layer_idx = 0;
+             layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+            const std::string& type =
+                _cfg.lm_cfg.layer_types[layer_idx];
+            if (type == "full_attention" ||
+                type == "sliding_attention") {
+                const LanguageModelMapKey key{
+                    1, layer_idx, token_idx
+                };
+                recipe.push_back({
+                    .model = &_pre_model_map.at(key),
+                    .embedding_override = layer_idx == 0,
+                    .position_sensitive = true,
+                });
+                recipe.push_back({
+                    .model = &_cache_model_map.at(key),
+                    .embedding_override = false,
+                    .position_sensitive = true,
+                });
+                recipe.push_back({
+                    .model = &_post_model_map.at(key),
+                    .embedding_override = layer_idx == 0,
+                    .position_sensitive = true,
+                });
+            } else {
+                const LanguageModelMapKey key{1, layer_idx, 0};
+                recipe.push_back({
+                    .model = &_conv_model_map.at(key),
+                    .embedding_override = layer_idx == 0,
+                    .position_sensitive = false,
+                });
+                if (layer_idx ==
+                    _cfg.lm_cfg.num_hidden_layers - 1) {
+                    recipe.push_back({
+                        .model = &_conv_final_model_map.at(key),
+                        .embedding_override = layer_idx == 0,
+                        .position_sensitive = false,
+                    });
+                }
+            }
+        }
+
+        /*
+         * Construction-time position oracle: an attention wrapper contains
+         * position-specific KV/RoPE/mask slices.  Accidentally substituting
+         * the p-1 recipe must fail before packages are published, rather than
+         * silently producing plausible but stale token state at runtime.
+         */
+        if (token_idx != 0) {
+            const OrdinaryDecodeRecipe& previous =
+                _ordinary_decode_recipes[token_idx - 1];
+            if (previous.size() != recipe.size()) {
+                throw std::logic_error(
+                    "ordinary MLA decode recipe topology changed by position"
+                );
+            }
+            for (std::size_t i = 0; i < recipe.size(); ++i) {
+                if (!recipe[i].model ||
+                    recipe[i].embedding_override !=
+                        previous[i].embedding_override ||
+                    recipe[i].position_sensitive !=
+                        previous[i].position_sensitive ||
+                    (recipe[i].position_sensitive &&
+                     recipe[i].model == previous[i].model)) {
+                    throw std::logic_error(
+                        "ordinary MLA decode recipe reused a stale position cell"
+                    );
+                }
+            }
+        }
+    }
+}
+
+bool LanguageModel::_has_ordinary_decode_recipe(
+    uint16_t token_idx
+) const {
+    return token_idx < _ordinary_decode_recipes.size() &&
+           !_ordinary_decode_recipes[token_idx].empty();
+}
+
+void LanguageModel::_append_ordinary_decode_recipe(
+    MlaExecutionSegment& segment,
+    uint16_t token_idx,
+    MLABuffer* embedding,
+    uint32_t embedding_row
+) {
+    if (!_has_ordinary_decode_recipe(token_idx) || !embedding) {
+        throw std::logic_error(
+            "ordinary MLA decode recipe is unavailable"
+        );
+    }
+
+    for (const OrdinaryDecodeRecipeStep& step :
+         _ordinary_decode_recipes[token_idx]) {
+        if (!step.model) {
+            throw std::logic_error(
+                "ordinary MLA decode recipe contains a null model"
+            );
+        }
+        if (step.embedding_override) {
+            step.model->_add_embedding_row_to_segment(
+                segment, 0, embedding, embedding_row,
+                _cfg.lm_cfg.hidden_size
+            );
+        } else {
+            step.model->add_to_segment(segment);
+        }
     }
 }
 

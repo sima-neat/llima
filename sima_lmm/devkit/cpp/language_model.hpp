@@ -268,6 +268,28 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_models();
         void _define_per_layer_models();
+        /*
+         * Private, position-specific ordinary-decode recipe.  It borrows
+         * pointers to std::map-owned wrappers (map node addresses are stable)
+         * and never owns a package, buffer, or Backend handle.  The wrappers'
+         * binding cells remain the canonical publication point for package
+         * reload and LoRA generation changes.
+         */
+        struct OrdinaryDecodeRecipeStep {
+            MLAModelWithBuffer* model = nullptr;
+            bool embedding_override = false;
+            bool position_sensitive = false;
+        };
+        using OrdinaryDecodeRecipe =
+            std::vector<OrdinaryDecodeRecipeStep>;
+        void _build_ordinary_decode_recipes();
+        bool _has_ordinary_decode_recipe(uint16_t token_idx) const;
+        void _append_ordinary_decode_recipe(
+            MlaExecutionSegment& segment,
+            uint16_t token_idx,
+            MLABuffer* embedding,
+            uint32_t embedding_row
+        );
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
@@ -325,6 +347,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_model_map;
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
+        std::vector<OrdinaryDecodeRecipe> _ordinary_decode_recipes;
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
 

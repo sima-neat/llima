@@ -2,6 +2,7 @@
 #include "mla_model.hpp"
 #include "setup.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -137,8 +138,15 @@ int main(int argc, char** argv) {
     );
     bool rejected_partial_segment = false;
     job_a.add_to_segment(segment);
+    invalid_job.add_to_segment(segment);
     try {
-        invalid_job.add_to_segment(segment);
+        /*
+         * The final executor records stack-local override intent while the
+         * segment is assembled, then validates the complete batch under one
+         * metadata lock at commit.  Failure is still pre-submit and aborts the
+         * entire segment; it no longer pays one session lock per add.
+         */
+        segment.commit();
     } catch (const std::out_of_range&) {
         rejected_partial_segment = true;
     }
@@ -150,9 +158,13 @@ int main(int argc, char** argv) {
     job_b.add_to_segment(segment);
     segment.commit();
 
-    output_a.invalidate_cache();
-    output_b.invalidate_cache();
-    output_c.invalidate_cache();
+    /*
+     * DEFAULT DMS0 allocations are dma_alloc_coherent() mappings. The kernel
+     * orders OFM writes before terminal CQE publication and Backend observes
+     * the CQ with acquire semantics, so direct ordinary reads are the oracle:
+     * do not hide a coherency bug with the legacy dc civac helper.
+     */
+    std::atomic_thread_fence(std::memory_order_acquire);
     const bool byte_exact =
         std::memcmp(
             output_a.get_virtual_addr(),
@@ -165,15 +177,56 @@ int main(int argc, char** argv) {
             output_a.get_allocation_size()
         ) == 0;
 
+    /*
+     * Changing-data coherency oracle.  A constant-output or stale-cache test
+     * can pass accidentally, so drive a radically different IFM, require the
+     * coherent OFM to change, restore the original IFM, and require the exact
+     * original OFM to return.  Neither OFM observation invalidates cache.
+     */
+    segment = simaai::llima::MlaExecutionSegment{};
+    std::vector<std::uint8_t> baseline_output(
+        output_a.get_allocation_size()
+    );
+    std::memcpy(
+        baseline_output.data(), output_a.get_virtual_addr(),
+        baseline_output.size()
+    );
+    std::memset(
+        input_a.get_virtual_addr(), 0xa5, input_a.get_allocation_size()
+    );
+    input_a.flush_cache();
+    job_a.run();
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const bool changed_output =
+        std::memcmp(
+            baseline_output.data(), output_a.get_virtual_addr(),
+            baseline_output.size()
+        ) != 0;
+
+    input_a.clear(false);
+    std::memcpy(input_a.get_virtual_addr(), input.data(), input.size());
+    input_a.flush_cache();
+    job_a.run();
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const bool restored_output =
+        std::memcmp(
+            baseline_output.data(), output_a.get_virtual_addr(),
+            baseline_output.size()
+        ) == 0;
+
     simaai::llima::disconnect();
-    if (!byte_exact) {
-        std::cerr << "two-job output mismatch\n";
+    if (!byte_exact || !changed_output || !restored_output) {
+        std::cerr
+            << "coherent output oracle failed: byte_exact=" << byte_exact
+            << " changed=" << changed_output
+            << " restored=" << restored_output << "\n";
         return 1;
     }
 
     std::cout
         << "LLIMA_DIRECT_RESNET_PASS jobs=3 segment=RAII depth=PRIVATE-3 "
         << "segment_rollback=PASS reconnect_isolation=PASS "
-        << "cross_context=REJECTED output=BYTE_EXACT\n";
+        << "cross_context=REJECTED output=BYTE_EXACT "
+        << "coherent_changing_data=PASS\n";
     return 0;
 }

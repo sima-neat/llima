@@ -20,6 +20,7 @@ namespace llima {
 
 
 class MlaExecutionSession;
+class LanguageModel;
 
 /*
  * One caller-owned ordered transaction.  The first model added binds the
@@ -78,6 +79,7 @@ void require_mla_execution_session_healthy(
 
 class MLAModelWithBuffer {
     friend class MlaExecutionSession;
+    friend class LanguageModel;
 
     public:
         MLAModelWithBuffer(
@@ -160,6 +162,20 @@ class MLAModelWithBuffer {
         }
 
     private:
+        /*
+         * Ordinary decode has exactly one changing embedding port.  Building
+         * that override directly in session scratch avoids copying a
+         * stack-local std::map node at every token while keeping the helper
+         * private to LanguageModel; arbitrary public multi-port overrides
+         * continue through the checked generic API.
+         */
+        void _add_embedding_row_to_segment(
+            MlaExecutionSegment& segment,
+            uint8_t port,
+            MLABuffer* parent,
+            uint32_t row,
+            uint32_t width
+        );
         void _debug_inouts(const std::string& name, std::map<uint8_t, MLABufferSlice>* fm_map_ptr);
         std::shared_ptr<MlaExecutionSession> _session;
         /*
