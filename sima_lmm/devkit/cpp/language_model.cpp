@@ -469,12 +469,6 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     std::span<const uint32_t> continuation_token_ids,
     bool use_group_prefill
 ) {
-    if (_cfg.lm_cfg.is_spec_decode()) {
-        throw std::runtime_error(
-            "Accuracy/loglikelihood benchmarking is not supported for "
-            "speculative-decoding models"
-        );
-    }
     if (!_cfg.pipeline_cfg.return_logits) {
         throw std::runtime_error(
             "model not compiled with --return_logits; "

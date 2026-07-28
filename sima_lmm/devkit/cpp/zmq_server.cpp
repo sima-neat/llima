@@ -114,6 +114,19 @@ void ZMQServer::run() {
                     request_metadata.use_group_prefill
                 );
 
+                if (
+                    _vision_language_draft_model_ptr != nullptr
+                    && (
+                        request_metadata.type == "generate"
+                        || request_metadata.type == "model_call"
+                    )
+                ) {
+                    throw std::runtime_error(
+                        "Accuracy benchmarking is not supported for "
+                        "speculative-decoding models"
+                    );
+                }
+
                 // Construct input token ids.
                 std::span<const uint32_t> input_token_ids(
                     reinterpret_cast<const uint32_t*>(request_messages[1].data()),
