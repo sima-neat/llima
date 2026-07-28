@@ -725,7 +725,22 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
         case ToolCallFormat::Lfm:
             return marker_mode(lfm_open);
         case ToolCallFormat::Gemma: {
-            if (stripped.front() == '{') return Mode::ToolCall;
+            if (stripped.front() == '{') {
+                constexpr std::string_view envelope_key = R"("tool_calls")";
+                auto remainder = trim_left_view(stripped.substr(1));
+                if (remainder.size() < envelope_key.size()) {
+                    return is_prefix_of(remainder, envelope_key) && !done
+                        ? Mode::Undecided
+                        : Mode::Content;
+                }
+                if (!is_prefix_of(envelope_key, remainder)) return Mode::Content;
+
+                remainder = trim_left_view(remainder.substr(envelope_key.size()));
+                if (remainder.empty()) {
+                    return done ? Mode::Content : Mode::Undecided;
+                }
+                return remainder.front() == ':' ? Mode::ToolCall : Mode::Content;
+            }
             const auto wrapper_mode = marker_mode(gemma_open);
             return wrapper_mode == Mode::Content ? marker_mode(gemma_call) : wrapper_mode;
         }

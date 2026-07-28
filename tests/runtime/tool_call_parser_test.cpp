@@ -129,11 +129,11 @@ void test_rejects_unsafe_gemma_json_tool_call_envelopes() {
 void test_streams_gemma_json_tool_call_envelope() {
     ToolCallStreamParser parser(ToolCallFormat::Gemma, {"set_ac"});
     expect(
-        parser.add(R"({"tool_calls":)", false).empty(),
+        parser.add(R"({"tool_)", false).empty(),
         "a partial Gemma JSON envelope must remain buffered"
     );
     const auto events = parser.add(
-        R"([{"name":"set_ac","arguments":{"enabled":false}}],"content":""})",
+        R"(calls":[{"name":"set_ac","arguments":{"enabled":false}}],"content":""})",
         true
     );
     expect(events.size() == 1, "a complete Gemma JSON envelope must emit one event");
@@ -163,6 +163,26 @@ void test_streams_gemma_json_tool_call_envelope() {
     expect(
         wrapped_calls != nullptr && wrapped_calls->calls.size() == 1,
         "the streamed wrapped Gemma envelope must be structured tool calls"
+    );
+}
+
+void test_streams_non_tool_gemma_json_without_waiting_for_end() {
+    ToolCallStreamParser parser(ToolCallFormat::Gemma, {"set_ac"});
+    expect(
+        parser.add("{", false).empty(),
+        "an opening JSON brace must remain undecided"
+    );
+
+    const auto events = parser.add(R"("answer":42})", false);
+    expect(
+        events.size() == 1,
+        "a non-tool Gemma JSON key must release buffered content before the stream ends"
+    );
+    if (events.size() != 1) return;
+    const auto* content = std::get_if<ToolCallStreamParser::Content>(&events[0]);
+    expect(
+        content != nullptr && content->text == R"({"answer":42})",
+        "the released Gemma JSON content must preserve all buffered bytes"
     );
 }
 
@@ -206,6 +226,7 @@ int main() {
     test_parses_gemma_json_tool_call_envelope();
     test_rejects_unsafe_gemma_json_tool_call_envelopes();
     test_streams_gemma_json_tool_call_envelope();
+    test_streams_non_tool_gemma_json_without_waiting_for_end();
     test_preserves_stream_content_provenance();
 
     if (failures != 0) {
