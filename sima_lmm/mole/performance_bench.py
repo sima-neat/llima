@@ -46,6 +46,7 @@ def create_sample_data(
     tokenizer: PreTrainedTokenizer,
     max_toks: int = 1024,
     n_samples: int = 128,
+    input_lengths: tuple[int, ...] | None = None,
 ) -> TokenizedSamples:
     """
     create_sample_data Creates a dataset token sample for LLM evaluation. Data is sampled from
@@ -59,6 +60,8 @@ def create_sample_data(
             Defaults to 1024.
         n_samples: The number of unique text samples to generate
             for *each* context length bucket. Defaults to 128.
+        input_lengths: Exact input-token lengths to generate. When omitted,
+            powers-of-two buckets are generated from 128 up to max_toks.
 
     Returns:
         A dictionary where keys are integer context lengths and values are lists of tokenized
@@ -66,18 +69,30 @@ def create_sample_data(
     """
     if n_samples < 100:
         logger.warning(f"n_samples = {n_samples}. Do not use this run for benchmarking!")
-    # 128 -> max token len
-    tok_lens = [2**x for x in range(7, math.floor(math.log2(max_toks)))]
+    if input_lengths is None:
+        # 128 -> max token len
+        tok_lens = [2**x for x in range(7, math.floor(math.log2(max_toks)))]
+    else:
+        tok_lens = list(input_lengths)
+    if not tok_lens:
+        raise ValueError("No performance input lengths were generated")
+    longest_input = max(tok_lens)
+    required_samples = n_samples * len(tok_lens)
 
     def tok_and_len(batch):
         tok = tokenizer(batch["text"], padding=False, truncation=False)["input_ids"]
         return {"input_ids": tok, "len": len(tok)}
 
     tokenized_dataset = (
-        datasets.load_dataset("cimec/lambada", split=f"train[:{n_samples * len(tok_lens)}]")
+        datasets.load_dataset("cimec/lambada", split=f"train[:{required_samples}]")
         .map(tok_and_len, batched=False, remove_columns=["text", "domain"])
-        .filter(lambda data: data["len"] > max_toks)
+        .filter(lambda data: data["len"] >= longest_input)
     )
+    if len(tokenized_dataset) < required_samples:
+        raise RuntimeError(
+            f"LAMBADA provided {len(tokenized_dataset)} samples with at least "
+            f"{longest_input} tokens; {required_samples} are required"
+        )
 
     samples = {
         tok_len: [

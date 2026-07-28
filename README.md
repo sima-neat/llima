@@ -191,14 +191,16 @@ already has a compatible Model Compiler package set installed.
 
 ### Build wheel artifacts
 
-Build and validate the pure-Python compiler wheel and stage its MoLE profile:
+Build and validate the pure-Python compiler wheel and the independently
+installable MoLE package:
 
 ```bash
 ./build_compiler_wheel.sh
 ./build_mole_package.sh
 ```
 
-Both packaging scripts create or reuse the shared
+The commands are independent; `build_mole_package.sh` does not require
+`build_compiler_wheel.sh` to run first. Both packaging scripts create or reuse the shared
 `build/wheel-tools-venv` Python 3.12 environment. The helper installs the
 `build` package there when needed and does not modify the system Python.
 

@@ -406,19 +406,27 @@ class ModalixLM(HFLM):
         with dumpfile.open("w") as fp:
             json.dump(self.profile_data, fp, sort_keys=True)
 
-    def perf_bench(self, n_samples: int = 128, max_new_tokens: int = 256):
+    def perf_bench(
+        self,
+        n_samples: int = 128,
+        max_new_tokens: int = 256,
+        input_lengths: tuple[int, ...] | None = None,
+    ):
         """
         perf_bench Run performance benchmark using LAMBADA (cimec/lambada) dataset.
 
         Args:
             n_samples: The number of unique text samples to generate for each context length bucket.
             max_new_tokens: The maximum number of new tokens to generate.
+            input_lengths: Exact input-token lengths to benchmark. When omitted,
+                power-of-two buckets are generated automatically.
         """
         logger.info("Starting performance benchmark using sample data from cimec/lambada")
         sample_data = performance_bench.create_sample_data(
             tokenizer=self.tokenizer,
             max_toks=self.max_length,
             n_samples=n_samples,
+            input_lengths=input_lengths,
         )
 
         def inference_fn(tokens: list[int]) -> list[float]:

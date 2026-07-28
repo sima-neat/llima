@@ -80,7 +80,8 @@ Measures Time To First Token (TTFT) and Tokens Per Second (TPS) on a Modalix boa
     -o <output_dir> \
     --board_ip <board_ip> \
     --board_model <model_path_on_board> \
-    --max_num_tokens <max_num_tokens> --max_new_tokens <max_new_tokens>
+    --max_num_tokens <max_num_tokens> --max_new_tokens <max_new_tokens> \
+    --input_lengths 1024 2048 3072 4096
 ```
 
 | Argument | Description |
@@ -91,6 +92,7 @@ Measures Time To First Token (TTFT) and Tokens Per Second (TPS) on a Modalix boa
 | `--board_model` | Path to the compiled model directory on the Modalix device (e.g., `/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`). |
 | `--max_num_tokens` | Maximum context length. Must be equal to or smaller than the value used during compilation. |
 | `--max_new_tokens` | Maximum number of tokens to generate in the output. |
+| `--input_lengths` | Optional exact input-token lengths to benchmark. Values must be unique and each value plus `--max_new_tokens` must fit within `--max_num_tokens`. When omitted, MoLE generates automatic power-of-two buckets. |
 | `--board_ssh_user` | SSH username for the Modalix board. Optional, default: `sima`. |
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 

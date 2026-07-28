@@ -42,6 +42,8 @@ class Config:
         do_perf: Whether to perform performance benchmarking.
         max_num_tokens: Max number of tokens. Used only for perf benchmarking.
         max_new_tokens: Max number of new tokens. Used only for perf benchmarking.
+        input_lengths: Exact input-token lengths to benchmark, or None to generate
+            automatic buckets.
         batch_size: The batch size to use for the evaluation, defaults to 1.
         random_seed: The random seed to ensure reproducibility, defaults to 42.
     """
@@ -57,6 +59,7 @@ class Config:
     do_perf: bool
     max_num_tokens: int
     max_new_tokens: int | None
+    input_lengths: tuple[int, ...] | None
     batch_size: int = dataclasses.field(init=False, default=1)
     random_seed: int = dataclasses.field(init=False, default=42)
 
@@ -74,7 +77,8 @@ def prepare_mole(
     do_start_server: bool = False,
     do_perf: bool = False,
     max_num_tokens: int = 1024,
-    max_new_tokens: int = 256
+    max_new_tokens: int = 256,
+    input_lengths: list[int] | None = None,
 ) -> Config | None:
     """
     prepare_mole Prepares and validates the configuration for a MOLE evaluation run.
@@ -90,6 +94,8 @@ def prepare_mole(
         do_perf: Whether to perform performance benchmarking.
         max_num_tokens: Max number of tokens.
         max_new_tokens: Max number of new tokens. Used only for perf benchmarking.
+        input_lengths: Exact input-token lengths for performance benchmarking.
+            When omitted, power-of-two buckets are generated automatically.
 
     Returns:
         A Config object if the setup is successful, otherwise None.
@@ -106,6 +112,25 @@ def prepare_mole(
     if not do_perf and not tasks:
         logger.error("No tasks is specified")
         return None
+    normalized_input_lengths = None
+    if input_lengths is not None:
+        if not do_perf:
+            logger.error("--input_lengths is only supported for performance benchmarking")
+            return None
+        if len(input_lengths) != len(set(input_lengths)):
+            logger.error("--input_lengths values must be unique")
+            return None
+        if any(length <= 0 for length in input_lengths):
+            logger.error("--input_lengths values must be positive")
+            return None
+        if any(length + max_new_tokens > max_num_tokens for length in input_lengths):
+            logger.error(
+                "Every --input_lengths value plus --max_new_tokens must be less than "
+                "or equal to --max_num_tokens"
+            )
+            return None
+        normalized_input_lengths = tuple(sorted(input_lengths))
+
     metadata = {"pretrained": model_id}
     task_manager = lm_eval.tasks.TaskManager(metadata=metadata)
     for task in tasks:
@@ -167,6 +192,7 @@ def prepare_mole(
         do_perf=do_perf,
         max_num_tokens=max_num_tokens,
         max_new_tokens=max_new_tokens,
+        input_lengths=normalized_input_lengths,
     )
 
 
@@ -279,7 +305,11 @@ def perf_bench(config: Config):
         board=config.board, pretrained=config.model_id, batch_size=config.batch_size,
         max_length=config.max_num_tokens, device=config.device
     )
-    lm.perf_bench(config.limit, config.max_new_tokens)
+    lm.perf_bench(
+        n_samples=config.limit,
+        max_new_tokens=config.max_new_tokens,
+        input_lengths=config.input_lengths,
+    )
 
     if config.do_start_server:
         # Stop the server.
