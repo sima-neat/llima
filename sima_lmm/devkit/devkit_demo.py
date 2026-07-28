@@ -273,12 +273,13 @@ def rm_model(args: argparse.Namespace) -> int:
 
 
 def benchmark_model(args: argparse.Namespace) -> int:
-    model_path = _resolve_run_model_path(args.model)
+    user_model_path = _resolve_run_model_path(args.model)
+    model_path, draft_model_path = _resolve_target_and_draft_paths(user_model_path)
     connect(logging.INFO)
 
     # Create a ZMQServer.
     try:
-        server = ZMQServer(model_path, args.port)
+        server = ZMQServer(model_path, args.port, draft_model_path)
     except Exception:
         msg = "Failed to create server"
         print(msg, flush=True)

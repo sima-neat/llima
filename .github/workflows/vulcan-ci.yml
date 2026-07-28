@@ -237,7 +237,7 @@ jobs:
 
             echo "::group::Build wheel packages"
             ./build_compiler_wheel.sh
-            ./build_mole_package.sh
+            LLIMA_MOLE_REUSE_COMPILER_WHEEL=ON ./build_mole_package.sh
             echo "::endgroup::"
           '
 

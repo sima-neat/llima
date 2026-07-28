@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -19,6 +20,45 @@
 
 namespace simaai {
 namespace llima {
+
+namespace {
+
+LogLikelihoodResult score_logits(
+    std::span<const Eigen::bfloat16> logits, uint32_t target_token_id
+) {
+    if (target_token_id >= logits.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Target token id {} is outside logits vocabulary size {}",
+                target_token_id,
+                logits.size()
+            )
+        );
+    }
+
+    double max_logit = -std::numeric_limits<double>::infinity();
+    uint32_t argmax_token_id = 0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        const double value = static_cast<float>(logits[i]);
+        if (value > max_logit) {
+            max_logit = value;
+            argmax_token_id = static_cast<uint32_t>(i);
+        }
+    }
+
+    double exp_sum = 0.0;
+    for (const auto logit : logits) {
+        exp_sum += std::exp(static_cast<float>(logit) - max_logit);
+    }
+
+    const double target_logit = static_cast<float>(logits[target_token_id]);
+    return {
+        target_logit - (max_logit + std::log(exp_sum)),
+        argmax_token_id == target_token_id
+    };
+}
+
+}
 
 namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
@@ -420,6 +460,264 @@ void LanguageModel::run_model_decode(
     if (token_idx == _max_num_tokens) {
         _notify_cache_full();
     }
+}
+
+
+LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
+    std::span<const uint32_t> input_token_ids,
+    size_t continuation_start,
+    std::span<const uint32_t> continuation_token_ids,
+    bool use_group_prefill
+) {
+    if (!_cfg.pipeline_cfg.return_logits) {
+        throw std::runtime_error(
+            "model not compiled with --return_logits; "
+            "accuracy/loglikelihood tasks are unsupported"
+        );
+    }
+    if (input_token_ids.empty()) {
+        throw std::runtime_error("Loglikelihood request must include at least one input token");
+    }
+    if (input_token_ids.size() > _max_num_tokens) {
+        throw std::runtime_error(
+            fmt::format(
+                "Loglikelihood input length {} exceeds max_num_tokens {}",
+                input_token_ids.size(),
+                _max_num_tokens
+            )
+        );
+    }
+    if (continuation_token_ids.empty()) {
+        throw std::runtime_error("Loglikelihood request must include continuation token ids");
+    }
+    if (continuation_start > input_token_ids.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Continuation start {} exceeds input length {}",
+                continuation_start,
+                input_token_ids.size()
+            )
+        );
+    }
+    if (continuation_start + continuation_token_ids.size() > input_token_ids.size()) {
+        throw std::runtime_error(
+            fmt::format(
+                "Continuation span [{}:{}) exceeds input length {}",
+                continuation_start,
+                continuation_start + continuation_token_ids.size(),
+                input_token_ids.size()
+            )
+        );
+    }
+
+    _is_running = true;
+    double total_logprob = 0.0;
+    bool is_greedy = true;
+    const size_t continuation_end = continuation_start + continuation_token_ids.size();
+    size_t token_idx_begin = 0;
+
+    auto score_current_logits = [this](uint32_t target_token_id) -> LogLikelihoodResult {
+        MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
+        buf_ptr->invalidate_cache();
+
+        const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+            buf_ptr->get_virtual_addr()
+        );
+        return score_logits(
+            std::span<const Eigen::bfloat16>(logits_ptr, _cfg.lm_cfg.token_cfg.vocab_size),
+            target_token_id
+        );
+    };
+
+    try {
+        const size_t group_size = _cfg.pipeline_cfg.input_token_group_size;
+        const bool should_group_prefill = (
+            use_group_prefill && _use_group_token_models && group_size > 1
+        );
+        if (!should_group_prefill) {
+            // Single-token scoring rewrites the model cache from token zero without going
+            // through run_model_prefill(), so the cached-token metadata is no longer valid.
+            _cached_token_ids.clear();
+        }
+        if (should_group_prefill) {
+            create_input_buffers(input_token_ids);
+
+            // Include the final context token so the grouped prefill output scores the first
+            // continuation token, matching normal generation prefill behavior for short prompts.
+            const size_t prefill_token_count = continuation_start + 1;
+            std::span<const uint32_t> prefill_input_tokens(
+                input_token_ids.data(), prefill_token_count
+            );
+            auto num_cached_tokens = _set_input_text_embeds(prefill_input_tokens);
+            if (num_cached_tokens >= prefill_token_count && prefill_token_count > 0) {
+                // Force the last prefill block to run so n1_buffer4 contains logits for the
+                // final context token, not stale logits from a previous request.
+                num_cached_tokens = static_cast<uint16_t>(prefill_token_count - 1);
+            }
+            run_model_prefill(prefill_input_tokens, num_cached_tokens, std::nullopt);
+            if (!_is_running.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("Loglikelihood group prefill was interrupted");
+            }
+            const auto first_token_score = score_current_logits(continuation_token_ids[0]);
+            total_logprob += first_token_score.logprob;
+            is_greedy = is_greedy && first_token_score.is_greedy;
+            token_idx_begin = prefill_token_count;
+        }
+
+        for (size_t token_idx = token_idx_begin; token_idx < input_token_ids.size(); ++token_idx) {
+            if (token_idx >= continuation_start && token_idx < continuation_end) {
+                const auto token_score = _run_model_once_for_loglikelihood(
+                    static_cast<uint16_t>(token_idx),
+                    input_token_ids[token_idx],
+                    continuation_token_ids[token_idx - continuation_start]
+                );
+                total_logprob += token_score.logprob;
+                is_greedy = is_greedy && token_score.is_greedy;
+            } else {
+                _run_model_once_for_loglikelihood_logits(
+                    static_cast<uint16_t>(token_idx), input_token_ids[token_idx]
+                );
+            }
+        }
+    } catch (...) {
+        _is_running = false;
+        throw;
+    }
+
+    _is_running = false;
+    return {total_logprob, is_greedy};
+}
+
+
+void LanguageModel::_run_model_once_for_loglikelihood_logits(
+    uint16_t token_idx, uint32_t input_token_id
+) {
+    constexpr uint16_t num_tokens = 1;
+    const uint16_t next_token_idx = token_idx + 1;
+    _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
+
+    // Loglikelihood only needs the single-token decode path to refresh n1_buffer4.
+    // Keep this separate from run_model_once(), which is shared by normal generation.
+    MLABuffer* normal_input_buf;
+    uint32_t normal_input_row;
+    if (_uses_cpu_dequantized_embeddings()) {
+        normal_input_buf = &get_buffer("decode_embedding");
+        normal_input_row = 0;
+        _dequantize_embedding_row(input_token_id, *normal_input_buf);
+        normal_input_buf->flush_cache();
+    } else {
+        normal_input_buf = &get_buffer("embeddings");
+        normal_input_row = input_token_id;
+    }
+
+    if (_uses_per_layer_inputs()) {
+        LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
+        std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
+        const uint32_t per_layer_token_id = (
+            _image_token_id.has_value() && input_token_id == _image_token_id.value()
+        ) ? _pad_token_id.value() : input_token_id;
+        const size_t shard_idx = (
+            per_layer_token_id / _per_layer_embedding_rows_per_shard
+        );
+        const size_t row_in_shard = (
+            per_layer_token_id % _per_layer_embedding_rows_per_shard
+        );
+        auto* shard = _per_layer_embedding_shards[shard_idx];
+        per_layer_ifm_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(0),
+            std::forward_as_tuple(
+                shard,
+                std::vector<uint32_t>{static_cast<uint32_t>(row_in_shard), 0},
+                std::vector<uint32_t>{1, static_cast<uint32_t>(shard->get_shape().back())}
+            )
+        );
+        per_layer_ifm_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(1),
+            std::forward_as_tuple(
+                normal_input_buf,
+                std::vector<uint32_t>{normal_input_row, 0},
+                std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+            )
+        );
+        _per_layer_model_map.at(per_layer_key).add_to_queue(&per_layer_ifm_map);
+    }
+
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        LanguageModelMapKey model_key(num_tokens, layer_idx, token_idx);
+
+        std::map<uint8_t, MLABufferSlice> ifm_map;
+        if (layer_idx == 0) {
+            ifm_map.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(0),
+                std::forward_as_tuple(
+                    normal_input_buf,
+                    std::vector<uint32_t>{normal_input_row, 0},
+                    std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+                )
+            );
+        }
+        if (
+            _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
+            || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
+        ) {
+            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
+            _cache_model_map.at(model_key).add_to_queue();
+            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
+            LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
+            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+
+            if (layer_idx != (_cfg.lm_cfg.num_hidden_layers - 1)) {
+                continue;
+            }
+
+            ifm_map.clear();
+            _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+        } else {
+            throw std::runtime_error(
+                std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
+            );
+        }
+    }
+
+    MLAModelWithBuffer::run_queue();
+
+    if (!_cached_states.empty()) {
+        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
+            if (_checkpoint_boundaries[i] == next_token_idx) {
+                _save_state_checkpoint(i, num_tokens, 1);
+                break;
+            }
+        }
+    }
+}
+
+
+LogLikelihoodResult LanguageModel::_run_model_once_for_loglikelihood(
+    uint16_t token_idx, uint32_t input_token_id, uint32_t target_token_id
+) {
+    if (!_cfg.pipeline_cfg.return_logits) {
+        throw std::runtime_error(
+            "model not compiled with --return_logits; "
+            "accuracy/loglikelihood tasks are unsupported"
+        );
+    }
+
+    _run_model_once_for_loglikelihood_logits(token_idx, input_token_id);
+
+    MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
+    buf_ptr->invalidate_cache();
+
+    const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+        buf_ptr->get_virtual_addr()
+    );
+    return score_logits(
+        std::span<const Eigen::bfloat16>(logits_ptr, _cfg.lm_cfg.token_cfg.vocab_size),
+        target_token_id
+    );
 }
 
 
@@ -2285,6 +2583,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
             }
             if (
                 num_images == 0
+                && token_idx == num_cached_tokens
                 && token_idx < _cached_token_ids.size()
                 && token_id == _cached_token_ids[token_idx]
             )
