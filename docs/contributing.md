@@ -164,6 +164,13 @@ llima run <model_dir> --mode cli
 For VLM changes, include an image-grounded prompt. Manual smoke testing
 complements, but does not replace, affected packaged coverage.
 
+Neat Core consumes LLiMa's installed C++ API and runtime packages. When either
+of those surfaces—or behavior exposed through Core's GenAI API—changes, build
+Core against the candidate `sima-lmm-core` and `sima-lmm-dev` packages, not a
+published or cached LLiMa build. Run the affected Core GenAI C++ tests on
+Modalix. This downstream validation is not required for isolated compiler,
+documentation, or test-only changes.
+
 ### Packaging validation
 
 Build each changed profile:

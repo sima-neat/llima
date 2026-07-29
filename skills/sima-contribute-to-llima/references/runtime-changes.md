@@ -53,7 +53,13 @@ For installed C++ API changes:
 1. Install candidate `core` and `dev` packages into the test sysroot overlay.
 2. Compile/link a consumer with `find_package(SimaLMM CONFIG REQUIRED)` and
    `SimaLMM::sima_lmm_runtime`, without source-tree includes.
-3. Exercise the API, rebuild known consumers, and update docs/migration notes.
+3. Rebuild Neat Core against those candidate packages and run affected GenAI
+   C++ tests on Modalix.
+4. Exercise other affected consumers and update docs/migration notes.
+
+Also run the Neat Core check when runtime-package contents or behavior exposed
+through Core's GenAI API changes. Do not satisfy it with cached or published
+LLiMa artifacts.
 
 For an ABI-compatible claim, compare against the last compatible published
 library: exported symbols, affected layouts/virtual interfaces, calling

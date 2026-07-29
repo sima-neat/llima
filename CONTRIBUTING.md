@@ -89,6 +89,10 @@ black-box tests. Install the candidate packages on Modalix and follow
 Also run a representative `llima run` scenario when the change reaches model
 loading or inference.
 
+If the change affects the installed C++ API/ABI, runtime packages, or behavior
+exposed through Neat Core's GenAI API, rebuild Core against the candidate LLiMa
+packages and run its affected GenAI tests on Modalix.
+
 For compiler or MoLE packaging changes, also run the corresponding wheel build
 shown above. Documentation-only changes require link and command checks, not
 model compilation.
