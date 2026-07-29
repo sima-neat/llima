@@ -348,10 +348,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
 
     // Run decoder init model to generate the first token.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
-        if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1)
-            _decoder_init_log_probe_model_map.at(layer_idx).add_to_queue();
-        else
-            _decoder_init_model_map.at(layer_idx).add_to_queue();
+        _decoder_init_model_map.at(layer_idx).add_to_queue();
     }
     MLAModelWithBuffer::run_queue();
     new_token_buf.invalidate_cache();
@@ -570,12 +567,6 @@ void WhisperModel::_define_model(
             std::forward_as_tuple(std::get<uint8_t>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
         );
-    } else if (model_type == "decoder_init_log_probe") {
-        _decoder_init_log_probe_model_map.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(std::get<uint8_t>(key)),
-            std::forward_as_tuple(model_path, ifms, ofms)
-        );
     } else if (model_type == "decoder_pre") {
         _decoder_pre_model_map.emplace(
             std::piecewise_construct,
@@ -630,8 +621,11 @@ void WhisperModel::_define_models() {
         std::vector<MLABufferSlice> ofms;
         if (layer_idx < _cfg.decoder_layers - 1)
             ofms.emplace_back(&get_buffer("decoder_init"));
-        else
+        else {
             ofms.emplace_back(&get_buffer("new_token"));
+            if (_cfg.log_probe_enabled)
+                ofms.emplace_back(&get_buffer("decoder_logits"));
+        }
         ofms.emplace_back(
             &get_buffer(fmt::format("decoder_cache_key{}", layer_idx)),
             std::vector<uint32_t>{0, 0},
@@ -661,47 +655,6 @@ void WhisperModel::_define_models() {
             }
         );
         _define_model("decoder_init", layer_idx, _get_elf_path_decoder_init(layer_idx), ifms, ofms);
-
-        if (_cfg.log_probe_enabled && layer_idx == _cfg.decoder_layers - 1) {
-            std::vector<MLABufferSlice> log_probe_ofms;
-            log_probe_ofms.emplace_back(&get_buffer("new_token"));
-            log_probe_ofms.emplace_back(&get_buffer("decoder_logits"));
-            log_probe_ofms.emplace_back(
-                &get_buffer(fmt::format("decoder_cache_key{}", layer_idx)),
-                std::vector<uint32_t>{0, 0},
-                std::vector<uint32_t>{num_input_tokens, _cfg.d_model}
-            );
-            log_probe_ofms.emplace_back(
-                &get_buffer(fmt::format("decoder_cache_val{}", layer_idx)),
-                std::vector<uint32_t>{0, 0},
-                std::vector<uint32_t>{num_input_tokens, _cfg.d_model}
-            );
-            log_probe_ofms.emplace_back(
-                &get_buffer(fmt::format("encoder_cache_key{}", layer_idx)),
-                std::vector<uint32_t>{0, 0, 0},
-                std::vector<uint32_t>{
-                    _cfg.decoder_attention_heads,
-                    _cfg.max_source_positions,
-                    _cfg.get_decoder_head_dim()
-                }
-            );
-            log_probe_ofms.emplace_back(
-                &get_buffer(fmt::format("encoder_cache_val{}", layer_idx)),
-                std::vector<uint32_t>{0, 0, 0},
-                std::vector<uint32_t>{
-                    _cfg.decoder_attention_heads,
-                    _cfg.max_source_positions,
-                    _cfg.get_decoder_head_dim()
-                }
-            );
-            _define_model(
-                "decoder_init_log_probe",
-                layer_idx,
-                _get_elf_path_decoder_init_log_probe(layer_idx),
-                ifms,
-                log_probe_ofms
-            );
-        }
     }
 
     // Decoder pre/cache/post.
@@ -823,14 +776,6 @@ std::filesystem::path WhisperModel::_get_elf_path_encoder() const {
 std::filesystem::path WhisperModel::_get_elf_path_decoder_init(uint8_t layer_idx) const {
     auto elf_file_name = fmt::format(
         "{}_decoder_init_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
-    );
-    return _elf_dir / elf_file_name;
-}
-
-
-std::filesystem::path WhisperModel::_get_elf_path_decoder_init_log_probe(uint8_t layer_idx) const {
-    auto elf_file_name = fmt::format(
-        "{}_decoder_init_log_probe_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
     );
     return _elf_dir / elf_file_name;
 }

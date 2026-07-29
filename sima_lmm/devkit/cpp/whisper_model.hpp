@@ -119,7 +119,6 @@ class WhisperModel : public BaseModel<WhisperConfig> {
 
         std::filesystem::path _get_elf_path_encoder() const;
         std::filesystem::path _get_elf_path_decoder_init(uint8_t layer_idx) const;
-        std::filesystem::path _get_elf_path_decoder_init_log_probe(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_pre(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_cache(uint16_t token_idx) const;
         std::filesystem::path _get_elf_path_decoder_post(uint8_t layer_idx) const;
@@ -148,7 +147,6 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::unique_ptr<MLAModelWithBuffer> _encoder_model_ptr;
         std::unique_ptr<MLAModelWithBuffer> _decoder_language_detect_model_ptr;
         std::map<uint8_t, MLAModelWithBuffer> _decoder_init_model_map;
-        std::map<uint8_t, MLAModelWithBuffer> _decoder_init_log_probe_model_map;
         WhisperDecoderModelMap _decoder_pre_model_map;
         WhisperDecoderModelMap _decoder_cache_model_map;
         WhisperDecoderModelMap _decoder_post_model_map;
