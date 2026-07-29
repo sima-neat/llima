@@ -149,6 +149,7 @@ install(
         runtime_test_utils.hpp
         test_cli_black_box.py
         test_http_black_box.py
+        test_mla_memory_cleanup.py
         test_python_runtime_lifecycle.py
         test_zmq_black_box.py
         text_generation_test.cpp
