@@ -11,15 +11,15 @@ It extends [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm
 
 ## Installation
 
-MoLE requires the LLiMa runtime on the Modalix device. See [Neat Framework installation](/getting-started/neat-library/) for the runtime installation flow.
+MoLE is a host-side benchmarking tool. Install and run it on the host machine outside the SDK Docker container, not from the SDK container and not on the Modalix device. The Modalix device only needs the LLiMa runtime and the `llima benchmark-server` process. See [Neat Framework installation](/getting-started/neat-library/) for the runtime installation flow.
 
-Install MoLE on your Modalix device using the `sima-cli`:
+Install MoLE on the host using `sima-cli`:
 
 ``` console
 host:~$ sima-cli neat install llima/mole
 ```
 
-This installs MoLE into a virtual environment at `~/sima-mole-venv`.
+This installs MoLE into a host virtual environment at `~/sima-mole-venv`.
 
 ## Usage
 
@@ -29,7 +29,7 @@ First, activate the MoLE virtual environment:
 host:~$ source ~/sima-mole-venv/bin/activate
 ```
 
-MoLE is then invoked via the `llima-benchmark` CLI with two subcommands. The `<model_id>` argument is always the HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`).
+MoLE is then invoked via the `llima-benchmark` CLI with two subcommands. The `<model_id>` argument is always the HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). In `-b modalix` mode this is not just a display label: it must match the tokenizer and config used to compile the deployed board model, because the board returns token scores only and does not provide tokenizer metadata.
 
 ### Accuracy Benchmarking
 
@@ -46,7 +46,7 @@ Evaluates model quality against standard tasks:
 
 | Argument | Description |
 |----|----|
-| `model_id` | HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). |
+| `model_id` | HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). For `-b modalix`, this must match the deployed model's tokenizer/config. |
 | `-b` | Backend to use: `modalix` (run on board) or `hf` (run on host as reference baseline). |
 | `-t` | **Required.** One or more evaluation tasks. Example tasks: `hellaswag`, `triviaqa`, `piqa`, `winogrande`, `wikitext`. See the [task list](https://github.com/EleutherAI/lm-evaluation-harness/blob/v0.4.11/lm_eval/tasks/README.md) for all available tasks. |
 | `-o` | Output directory for benchmark results. |
@@ -58,8 +58,10 @@ Evaluates model quality against standard tasks:
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 
 :::important
-Accuracy benchmarking with `-b modalix` requires the model to be compiled with the `--return_logits` flag. See [Model Compilation](compilation_genai.md). If the model was compiled without this flag, benchmarking will fail at runtime.
+Accuracy and loglikelihood benchmarking with `-b modalix` requires the deployed model to be compiled with `--return_logits`. This flag is off by default. See [Model Compilation](compilation_genai.md). If the model was compiled without this flag, the benchmark fails with: `model not compiled with --return_logits; accuracy/loglikelihood tasks are unsupported`.
 :::
+
+In `-b modalix` mode, result tables are labeled as Modalix backend results and include the board target. The HuggingFace `model_id` still appears because MoLE uses it for tokenization and task metadata.
 
 To use the HuggingFace backend as a reference baseline:
 
@@ -78,17 +80,19 @@ Measures Time To First Token (TTFT) and Tokens Per Second (TPS) on a Modalix boa
     -o <output_dir> \
     --board_ip <board_ip> \
     --board_model <model_path_on_board> \
-    --max_num_tokens <max_num_tokens> --max_new_tokens <max_new_tokens>
+    --max_num_tokens <max_num_tokens> --max_new_tokens <max_new_tokens> \
+    --input_lengths 1024 2048 3072 4096
 ```
 
 | Argument | Description |
 |----|----|
-| `model_id` | HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). |
+| `model_id` | HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). For Modalix performance runs, this should match the tokenizer/config for the deployed model. |
 | `-o` | Output directory for benchmark results. |
 | `--board_ip` | IP address of the Modalix board. |
 | `--board_model` | Path to the compiled model directory on the Modalix device (e.g., `/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`). |
 | `--max_num_tokens` | Maximum context length. Must be equal to or smaller than the value used during compilation. |
 | `--max_new_tokens` | Maximum number of tokens to generate in the output. |
+| `--input_lengths` | Optional exact input-token lengths to benchmark. Values must be unique and each value plus `--max_new_tokens` must fit within `--max_num_tokens`. When omitted, MoLE generates automatic power-of-two buckets. |
 | `--board_ssh_user` | SSH username for the Modalix board. Optional, default: `sima`. |
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 

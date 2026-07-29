@@ -8,6 +8,7 @@ SIMA_CLI_BIN="${SIMA_CLI_BIN:-sima-cli}"
 COMPILER_DIR="${LLIMA_COMPILER_WHEEL_OUTPUT_DIR:-${ROOT_DIR}/dist/compiler}"
 OUTPUT_DIR="${LLIMA_MOLE_PACKAGE_OUTPUT_DIR:-${ROOT_DIR}/dist/mole}"
 INSTALLER_SOURCE="${ROOT_DIR}/tools/install_mole.sh"
+REUSE_COMPILER_WHEEL="${LLIMA_MOLE_REUSE_COMPILER_WHEEL:-OFF}"
 
 # shellcheck source=tools/ensure_wheel_build_env.sh
 source "${ROOT_DIR}/tools/ensure_wheel_build_env.sh"
@@ -19,16 +20,92 @@ if ! command -v "${SIMA_CLI_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
-mapfile -t SOURCE_WHEELS < <(
-  find "${COMPILER_DIR}" -maxdepth 1 -type f -name 'sima_lmm-*.whl' -print | sort
-)
-if [[ "${#SOURCE_WHEELS[@]}" -ne 1 ]]; then
-  echo "ERROR: Expected one compiler wheel in ${COMPILER_DIR}; found ${#SOURCE_WHEELS[@]}." >&2
-  echo "       Run ./build_compiler_wheel.sh first." >&2
-  exit 1
-fi
+mkdir -p "${OUTPUT_DIR}"
+find "${OUTPUT_DIR}" -maxdepth 1 -type f \
+  \( -name 'sima_lmm-*.whl' -o -name 'sima_lmm-*.whl.sha256' \
+     -o -name 'install_mole.sh' -o -name 'metadata.json' \) \
+  -delete
 
-SOURCE_WHEEL="${SOURCE_WHEELS[0]}"
+case "${REUSE_COMPILER_WHEEL}" in
+  ON)
+    mapfile -t SOURCE_WHEELS < <(
+      if [[ -d "${COMPILER_DIR}" ]]; then
+        find "${COMPILER_DIR}" -maxdepth 1 -type f -name 'sima_lmm-*.whl' -print | sort
+      fi
+    )
+    if [[ "${#SOURCE_WHEELS[@]}" -ne 1 ]]; then
+      echo "ERROR: Expected one compiler wheel in ${COMPILER_DIR}; found ${#SOURCE_WHEELS[@]}." >&2
+      exit 1
+    fi
+    SOURCE_WHEEL="${SOURCE_WHEELS[0]}"
+    echo "[mole-package] Reusing compiler wheel: ${SOURCE_WHEEL}"
+    ;;
+  OFF)
+    DEBIAN_PACKAGE_VERSION="$(bash "${ROOT_DIR}/tools/compute_package_version.sh")"
+    DIRECT_WHEEL_VERSION="${LLIMA_WHEEL_VERSION:-}"
+    if [[ -z "${DIRECT_WHEEL_VERSION}" ]]; then
+      DIRECT_WHEEL_VERSION="$(
+        "${PYTHON_BIN}" - "${DEBIAN_PACKAGE_VERSION}" <<'PY'
+import re
+import sys
+
+from packaging.version import InvalidVersion, Version
+
+debian_version = sys.argv[1]
+if "+" in debian_version:
+    public, local = debian_version.split("+", 1)
+    local = re.sub(r"[^a-z0-9]+", ".", local.lower()).strip(".")
+    if not local:
+        raise SystemExit(
+            f"ERROR: Debian package version has no usable wheel suffix: {debian_version}"
+        )
+    candidate = f"{public}+{local}"
+else:
+    candidate = debian_version
+
+try:
+    print(Version(candidate))
+except InvalidVersion as error:
+    raise SystemExit(f"ERROR: Invalid wheel version {candidate!r}: {error}") from error
+PY
+      )"
+    fi
+
+    WHEEL_GIT_HASH="${GIT_HASH:-}"
+    if [[ -z "${WHEEL_GIT_HASH}" && -n "${GITHUB_SHA:-}" ]]; then
+      WHEEL_GIT_HASH="${GITHUB_SHA:0:7}"
+    fi
+    if [[ -z "${WHEEL_GIT_HASH}" ]]; then
+      WHEEL_GIT_HASH="$(git -C "${ROOT_DIR}" rev-parse --short=7 HEAD 2>/dev/null || true)"
+    fi
+    if [[ -z "${WHEEL_GIT_HASH}" ]]; then
+      echo "ERROR: Unable to resolve the source commit for wheel metadata." >&2
+      exit 1
+    fi
+
+    echo "[mole-package] Building the pure-Python LLiMa wheel"
+    echo "[mole-package] Version: ${DIRECT_WHEEL_VERSION}"
+    GIT_HASH="${WHEEL_GIT_HASH}" LLIMA_WHEEL_VERSION="${DIRECT_WHEEL_VERSION}" \
+      "${PYTHON_BIN}" -m build \
+      --wheel \
+      --outdir "${OUTPUT_DIR}" \
+      "${ROOT_DIR}"
+
+    mapfile -t SOURCE_WHEELS < <(
+      find "${OUTPUT_DIR}" -maxdepth 1 -type f -name 'sima_lmm-*.whl' -print | sort
+    )
+    if [[ "${#SOURCE_WHEELS[@]}" -ne 1 ]]; then
+      echo "ERROR: Expected one MoLE wheel in ${OUTPUT_DIR}; found ${#SOURCE_WHEELS[@]}." >&2
+      exit 1
+    fi
+    SOURCE_WHEEL="${SOURCE_WHEELS[0]}"
+    ;;
+  *)
+    echo "ERROR: LLIMA_MOLE_REUSE_COMPILER_WHEEL must be ON or OFF." >&2
+    exit 2
+    ;;
+esac
+
 WHEEL_NAME="$(basename "${SOURCE_WHEEL}")"
 
 "${PYTHON_BIN}" - "${SOURCE_WHEEL}" <<'PY'
@@ -76,13 +153,9 @@ print(metadata["Version"])
 PY
 )"
 
-mkdir -p "${OUTPUT_DIR}"
-find "${OUTPUT_DIR}" -maxdepth 1 -type f \
-  \( -name 'sima_lmm-*.whl' -o -name 'sima_lmm-*.whl.sha256' \
-     -o -name 'install_mole.sh' -o -name 'metadata.json' \) \
-  -delete
-
-cp "${SOURCE_WHEEL}" "${OUTPUT_DIR}/${WHEEL_NAME}"
+if [[ "${SOURCE_WHEEL}" != "${OUTPUT_DIR}/${WHEEL_NAME}" ]]; then
+  cp "${SOURCE_WHEEL}" "${OUTPUT_DIR}/${WHEEL_NAME}"
+fi
 install -m 0755 "${INSTALLER_SOURCE}" "${OUTPUT_DIR}/install_mole.sh"
 
 SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \

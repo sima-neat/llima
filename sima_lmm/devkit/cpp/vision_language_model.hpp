@@ -42,7 +42,13 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         std::vector<Eigen::bfloat16> run_model_for_logits(
             std::span<const uint32_t> input_token_ids
         );
-        std::vector<double> run_model_for_ttnt(
+        LogLikelihoodResult run_model_for_loglikelihood(
+            std::span<const uint32_t> input_token_ids,
+            size_t continuation_start,
+            std::span<const uint32_t> continuation_token_ids,
+            bool use_group_prefill = true
+        );
+        GenerationPerformanceResult run_model_for_ttnt(
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt

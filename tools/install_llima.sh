@@ -15,6 +15,58 @@ log() {
   printf '[install_llima] %s\n' "$*"
 }
 
+relation_field_has_package() {
+  local field="$1"
+  local expected_package="$2"
+  local relation package
+
+  while IFS= read -r relation; do
+    relation="${relation#"${relation%%[![:space:]]*}"}"
+    relation="${relation%"${relation##*[![:space:]]}"}"
+    package="${relation%%[[:space:](]*}"
+    package="${package%%:*}"
+    if [[ "${package}" == "${expected_package}" ]]; then
+      return 0
+    fi
+  done < <(printf '%s\n' "${field}" | tr ',' '\n')
+  return 1
+}
+
+relation_field_provides_exact_version() {
+  local field="$1"
+  local expected_package="$2"
+  local expected_version="$3"
+  local relation
+
+  while IFS= read -r relation; do
+    relation="$(printf '%s' "${relation}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')"
+    if [[ "${relation}" == "${expected_package} (= ${expected_version})" ]]; then
+      return 0
+    fi
+  done < <(printf '%s\n' "${field}" | tr ',' '\n')
+  return 1
+}
+
+find_verified_replacement() {
+  local removed_package="$1"
+  local installed_version="$2"
+  local deb_path provides replaces conflicts
+
+  for deb_path in "${debs[@]}"; do
+    provides="$(dpkg-deb -f "${deb_path}" Provides 2>/dev/null || true)"
+    replaces="$(dpkg-deb -f "${deb_path}" Replaces 2>/dev/null || true)"
+    conflicts="$(dpkg-deb -f "${deb_path}" Conflicts 2>/dev/null || true)"
+    if relation_field_provides_exact_version \
+         "${provides}" "${removed_package}" "${installed_version}" &&
+       relation_field_has_package "${replaces}" "${removed_package}" &&
+       relation_field_has_package "${conflicts}" "${removed_package}"; then
+      basename "${deb_path}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 resolve_package_manifest_path() {
   if [[ "${LLIMA_PACKAGE_MANIFEST}" == /* ]]; then
     printf '%s\n' "${LLIMA_PACKAGE_MANIFEST}"
@@ -378,15 +430,38 @@ if ! apt-get install --simulate --reinstall --allow-downgrades "${debs[@]}" >"${
   exit 1
 fi
 mapfile -t removed_packages < <(awk '$1 == "Remv" {print $2}' "${simulate_output}")
+verified_replacements=()
+removed_neat_packages=()
 if [[ "${#removed_packages[@]}" -gt 0 ]]; then
   for package in "${removed_packages[@]}"; do
-    if [[ "${package%%:*}" != "sima-neat" && "${package%%:*}" != "sima-neat-dev" ]]; then
-      cat "${simulate_output}" >&2
-      echo "Refusing to install because APT would remove ${package}." >&2
-      exit 1
+    package_name="${package%%:*}"
+    if [[ "${package_name}" == "sima-neat" || "${package_name}" == "sima-neat-dev" ]]; then
+      removed_neat_packages+=("${package}")
+      continue
     fi
+
+    installed_version="$(dpkg-query -W -f='${Version}' "${package_name}" 2>/dev/null || true)"
+    replacement_deb=""
+    if [[ -n "${installed_version}" ]]; then
+      replacement_deb="$(find_verified_replacement \
+        "${package_name}" "${installed_version}" || true)"
+    fi
+    if [[ -n "${replacement_deb}" ]]; then
+      verified_replacements+=("${package_name}=${installed_version} -> ${replacement_deb}")
+      continue
+    fi
+
+    cat "${simulate_output}" >&2
+    echo "Refusing to install because APT would remove ${package} without a bundled package that Provides its exact installed version and explicitly Replaces and Conflicts with it." >&2
+    exit 1
   done
-  log "Removing incompatible Neat packages: ${removed_packages[*]}"
+  if [[ "${#verified_replacements[@]}" -gt 0 ]]; then
+    log "Verified platform package replacements:"
+    printf '  %s\n' "${verified_replacements[@]}"
+  fi
+  if [[ "${#removed_neat_packages[@]}" -gt 0 ]]; then
+    log "Removing incompatible Neat packages: ${removed_neat_packages[*]}"
+  fi
 fi
 
 log "Installing bundled Internals and LLiMa packages."
@@ -395,6 +470,7 @@ stop_board_runtime_before_install
 run_sudo apt-get install -y --reinstall --allow-downgrades \
   -o Dpkg::Options::=--force-overwrite \
   "${debs[@]}"
+run_sudo apt-get check
 activate_board_runtime_after_install
 restart_board_codec_services
 verify_board_codec_services
@@ -416,6 +492,6 @@ if ! command -v llima >/dev/null 2>&1; then
 fi
 llima --help >/dev/null
 log "LLiMa ${expected_version} installed successfully."
-if [[ "${#removed_packages[@]}" -gt 0 ]]; then
-  echo "WARNING: Removed incompatible Neat packages: ${removed_packages[*]}. Reinstall a Core package compatible with the bundled Internals before using Neat." >&2
+if [[ "${#removed_neat_packages[@]}" -gt 0 ]]; then
+  echo "WARNING: Removed incompatible Neat packages: ${removed_neat_packages[*]}. Reinstall a Core package compatible with the bundled Internals before using Neat." >&2
 fi

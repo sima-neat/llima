@@ -237,7 +237,7 @@ jobs:
 
             echo "::group::Build wheel packages"
             ./build_compiler_wheel.sh
-            ./build_mole_package.sh
+            LLIMA_MOLE_REUSE_COMPILER_WHEEL=ON ./build_mole_package.sh
             echo "::endgroup::"
           '
 
@@ -276,6 +276,20 @@ jobs:
         test -f "dist/sima-lmm-${llima_version}-Linux-dev.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-cli.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz"
+        memory_deb="$(find dist -maxdepth 1 -type f -name 'simaai-memory-lib_*.deb' -print -quit)"
+        if [[ -z "${memory_deb}" ]]; then
+          echo "Root bundle is missing simaai-memory-lib." >&2
+          exit 1
+        fi
+        memory_version="$(dpkg-deb -f "${memory_deb}" Version)"
+        core_depends="$(dpkg-deb -f "dist/sima-lmm-${llima_version}-Linux-core.deb" Depends)"
+        expected_memory_dependency="simaai-memory-lib (= ${memory_version})"
+        if [[ ", ${core_depends}, " != *", ${expected_memory_dependency}, "* ]]; then
+          echo "sima-lmm-core does not depend on the bundled memory package." >&2
+          echo "Expected: ${expected_memory_dependency}" >&2
+          echo "Actual:   ${core_depends}" >&2
+          exit 1
+        fi
         test -f "dist/debs/sima-lmm-${llima_version}-Linux-core.deb"
         test -f "dist/debs/sima-lmm-${llima_version}-Linux-dev.deb"
         test -f "dist/debs/sima-lmm-${llima_version}-Linux-cli.deb"
