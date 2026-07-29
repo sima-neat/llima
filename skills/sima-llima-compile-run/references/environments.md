@@ -8,9 +8,34 @@ Use CLI help and docs matching the installed release:
 - `docs/setup.md`, `docs/compilation_genai.md`, `docs/deployment.md`,
   `docs/runtime.md`
 
+## Custom Fine-Tune Quantization Host
+
+Skip this environment when compiling a published pre-quantized checkpoint.
+
+For a custom fine-tune, use the exact matching SiMa.ai model repository's
+`quantize.py` in a separate environment matching that repository's
+`versions.txt`. Do not assume the Model Compiler Python environment has
+compatible PyTorch, Transformers, llm-compressor, AutoRound, or
+compressed-tensors versions.
+
+Treat an NVIDIA CUDA GPU as required unless the exact repository explicitly
+documents another supported environment. Confirm the GPU and Python stack
+before starting:
+
+```bash
+nvidia-smi
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+python <recipe-directory>/quantize.py --help
+```
+
+Ensure enough GPU memory, host RAM, and storage for source weights,
+calibration, compressed output, and temporary files. Never expose Hugging Face
+tokens or private fine-tuned weights.
+
 ## Compilation Host
 
-Activate the Python 3.12 environment installed by Model Compiler, commonly:
+After selecting or producing the pre-quantized checkpoint, activate the Python
+3.12 environment installed by Model Compiler, commonly:
 
 1. `/sdk-extensions/model-compiler`
 2. `/sdk-add-on/model-compiler`

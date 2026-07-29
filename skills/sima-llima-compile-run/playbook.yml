@@ -1,8 +1,8 @@
 id: sima-llima-compile-run
 name: Compile and Test LLiMa Models
-version: 0.1.0
+version: 0.1.2
 agents: [codex, claude]
-description: Compile supported LLM and VLM models with LLiMa and validate them with llima run before application development.
+description: Prefer exact SiMa.ai pre-quantized LLM and VLM inputs by default, honor explicit source or fidelity requirements, compile with LLiMa, and validate with llima run.
 compatibility:
   env_types: [host, sdk]
   env_subtypes: [linux, palette]

@@ -1,5 +1,32 @@
 # LLiMa Model Validation
 
+## Quantized Input
+
+For a published pre-quantized checkpoint, record its model repository and
+immutable revision. Confirm the checkpoint is a supported compressed-tensors
+input and contains the tokenizer and any required processor assets.
+
+For a custom fine-tune, also require:
+
+- the custom source model and revision;
+- the exact matching SiMa.ai recipe repository and revision;
+- the unmodified repository-specific `quantize.py`, `recipe.yaml`, and
+  `versions.txt`;
+- successful completion of the script's scale/metadata checks; and
+- a compressed-checkpoint load/generation smoke test when documented.
+
+Do not report a generic collection quantization recipe; the recipe provenance
+is the individual model repository.
+
+## Compiled Output
+
+Require both `sima_files/devkit/` and `sima_files/mpk/`. Treat missing
+directories, unexpected partial output, or compiler errors as failure.
+
+This validation covers one complete model tree. Speculative decoding is
+unsupported by this workflow until issue #128 lands because target and draft
+compilation produce separate artifact trees.
+
 ## Deploy
 
 ```bash
@@ -38,7 +65,10 @@ clean image clearing or exit. Use non-sensitive media.
 
 Capture:
 
-- public model ID/revision and source format;
+- public source model ID/revision, pre-quantized repository/revision, and
+  source format;
+- custom fine-tune and model-specific quantization-script provenance when
+  applicable;
 - non-secret options and Model Compiler/LLiMa versions;
 - output/deployment paths and exact smoke command;
 - LLM/VLM scenario and result; and

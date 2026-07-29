@@ -4,46 +4,89 @@
 
 **Model Compiler** provides the LLiMa command-line tool `llima-compile` to
 compile models from Hugging Face safetensors, GGUF files, or pre-quantized
-compressed tensor models (GPTQ/AWQ):
+compressed-tensors models (GPTQ/AutoRound):
 
 ``` console
 llima-compile [options] <model_path>
 ```
 
-When you run this command, the tool handles the entire compilation pipeline including calibration, quantization, and code generation. The pipeline consists of several stages that differ slightly depending on the input format:
+### Model input formats
 
-**For HuggingFace Models:**
+LLiMa accepts three model input paths. Choose one based on checkpoint
+availability, fidelity requirements, and whether the model is an LLM or VLM.
 
-1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **ONNX** - Convert model to ONNX intermediate representation
-3.  **QUANTIZE** - Quantize model weights and calibrate
-4.  **COMPILE** - Compile to Modalix machine code
+| Input | Description | When to use |
+| --- | --- | --- |
+| Original Hugging Face safetensors | An FP/BF16 checkpoint that LLiMa quantizes during compilation. | No exact pre-quantized match exists, or the original weights are required. |
+| Pre-quantized Hugging Face safetensors (GPTQ/AutoRound) | A checkpoint whose quantized weights are reused by LLiMa. | Preferred when the collection provides an exact match. |
+| GGUF | An existing quantized LLM checkpoint. | A convenient LLM fallback; not supported for VLMs. |
 
-**For GGUF Models:**
+The input format alone does not establish compatibility. The model
+architecture, size, tokenizer, and any multimodal components must also be
+supported.
 
-1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **MODEL_SDK_DIRECT** - Convert GGUF directly to ModelSDK format (quantization already applied)
-3.  **COMPILE** - Compile to Modalix machine code
+### Start with a SiMa.ai pre-quantized model
 
-**For Pre-quantized Compressed Tensor Models (GPTQ/AWQ):**
-
-1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **SOURCE_TO_QUANT** - Convert compressed tensor model directly to ModelSDK format
-3.  **COMPILE** - Compile to Modalix machine code
-
-:::note
-Compressed tensor models are safetensor models pre-quantized with [llm-compressor](https://github.com/vllm-project/llm-compressor) (e.g. GPTQ or AWQ). Supported LLMs and VLMs can use this path when the model has symmetric 4-bit or 8-bit weights in a supported compressed-tensors layout. LLiMa consumes the existing quantized weights directly; it does not run the original model-quantization algorithm.
+:::tip Recommended input
+Before downloading original Hugging Face or GGUF weights, check the
+[SiMa.ai Pre-Quantized Models collection](https://huggingface.co/collections/simaai/pre-quantized-models).
+Use an exact match for the requested architecture, parameter size, variant,
+and modality when one is available.
 :::
 
-You can run individual stages using `--onnx`, `--source_to_fp`, `--fp_to_quant`,
-`--quantize`, `--model_sdk`, `--compile`, or `--devkit` if needed.
+Collection checkpoints are model-specific, pre-LLiMa compressed-tensors
+artifacts that can be passed directly to `llima-compile`. They avoid the
+additional floating-point-to-quantized compiler stage and include the
+quantization provenance needed to understand their accuracy and layout. They
+are compiler inputs, not compiled Modalix models.
 
-The compilation process generates the following directory structure in your output directory:
+For a custom fine-tune of an existing supported model, the exact matching
+collection repository may also provide its model-specific `quantize.py`,
+`recipe.yaml`, and `versions.txt`. Read that repository's model card and use
+its documented script; do not reuse a recipe from a merely similar model.
+
+``` console
+hf download simaai/<model-repository> \
+    --revision <immutable-revision> \
+    --local-dir <prequantized-model-directory>
+llima-compile <prequantized-model-directory> -o <output-directory>
+```
+
+### Describe the model. An agent with LLiMa skills compiles it.
+
+SiMa.ai LLiMa supports agentic model compilation out of the box through skills
+included with the Neat Development Environment (Neat SDK). These skills give
+coding agents the context to assess LLM and VLM compatibility, select an exact
+pre-quantized input when available, use the installed LLiMa CLI, and follow the
+Modalix deployment and validation workflow.
+
+The recommended agentic path can compile a model, deploy it to a reachable
+Modalix DevKit, inspect results and diagnostics, and refine the compilation.
+Traditional CLI compilation remains a parallel path for direct control through
+the same tools. Both produce standard, inspectable LLiMa artifacts, so you can
+review the selected model, commands, options, and output or move between the
+two workflows as requirements evolve. See
+[Set up the Neat SDK](https://developer.sima.ai/software/getting-started/dev-environment/)
+to enable agentic compilation.
+
+Ask for the complete workflow in natural language, for example:
+
+``` text
+Compile <model ID or local path> with LLiMa, deploy it to my Modalix at
+<user@host>, and smoke-test it. Prefer an exact SiMa.ai pre-quantized
+checkpoint when available.
+```
+
+The agent records model and recipe provenance, follows the CLI contract of the
+installed release, and reports any unsupported model boundary or unavailable
+hardware validation instead of silently substituting another model or format.
+
+### Compilation output
+
+The default complete pipeline generates the following directory structure:
 
 ``` text
 output_directory/
-├── onnx_files/                # ONNX intermediate files (HF models only)
-│   └── ...
 └── sima_files/                # Compiled model files
     ├── devkit/                # Runtime configuration and model data
     │   ├── tokenizer.json

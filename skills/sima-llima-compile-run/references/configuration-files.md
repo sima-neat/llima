@@ -1,5 +1,25 @@
 # LLiMa Compilation Configuration
 
+## Pre-Quantized Inputs
+
+Do not apply a generic precision configuration to a published pre-quantized
+checkpoint or to the output of its matching repository-specific
+`quantize.py`. The compressed checkpoint's encoded precision and
+`quantization_config` are authoritative.
+
+A configuration may select compiler units from a pre-quantized input for
+debugging through its `compile` decisions. This selection does not override
+the checkpoint's INT4/INT8 weights. Do not claim that a `precision` return
+value requantizes those weights, replaces model-specific targets, or
+reconstructs the repository's llm-compressor recipe.
+
+The precision examples below are for an explicitly approved FP/BF16 fallback.
+For a pre-quantized input, follow the installed LLiMa release when selecting
+units and verify that the emitted unit list preserves the checkpoint's encoded
+weight quantization. A partial compiler-debug output is normally undeployable.
+
+## FP/BF16 Fallback
+
 Use trusted Python configuration files to select precision and compiler units:
 
 ```bash
@@ -37,7 +57,7 @@ Return keys:
 | `compile` | `True` (default); `False` omits the unit |
 | `lora` | Optional mode documented by the installed LLiMa version |
 
-## Mixed Precision
+## Mixed Precision Fallback
 
 This common policy uses BF16 vision, INT8 group/prefill, and INT4
 single-token/decode:
@@ -53,9 +73,12 @@ def get_layer_configuration(model_properties, layer):
     return {"precision": precision}
 ```
 
-BF16 gives highest fidelity and largest output; INT8/INT4 reduce size and can
-change accuracy, compilation time, TTFT, and TPS. Validate representative
-prompts and images.
+Use this for an explicit FP/BF16 requirement—such as maximum fidelity or
+source-weight reproduction—or as an agreed fallback when no exact
+pre-quantized checkpoint or matching custom fine-tune script exists. BF16
+gives highest fidelity and largest output; INT8/INT4 reduce size and can change
+accuracy, compilation time, TTFT, and TPS. Validate representative prompts and
+images.
 
 ## Select Units
 
@@ -84,3 +107,5 @@ not assume every part exposes every index.
 Selective compilation is for debugging and focused tests. Omitting a required
 unit normally makes output undeployable. Inspect the printed unit list before
 expensive stages and retain the exact `config.py` in the compilation report.
+For a pre-quantized input, use selection only; do not describe the
+configuration as overriding its encoded weight quantization.
