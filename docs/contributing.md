@@ -31,18 +31,15 @@ runtime packages.
 
 ### Runtime and packaging
 
-Initialize submodules and native dependencies:
-
-```bash
-git submodule update --init --recursive
-./build.sh --install-deps-only
-```
-
-Build all runtime packages and packaged tests:
+Use the Neat SDK as the supported build environment. Build all runtime packages
+and packaged tests with:
 
 ```bash
 ./build.sh --all --clean
 ```
+
+The normal build handles its required setup, including submodules; do not run a
+separate dependency-bootstrap step for the standard workflow.
 
 Useful narrower builds:
 

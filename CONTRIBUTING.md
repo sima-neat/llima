@@ -9,23 +9,18 @@ and validation requirements.
 
 Requirements:
 
-- Git with submodule support
-- CMake 3.24+, C++20, and native dependencies for runtime work
+- The Neat SDK environment for runtime and package builds
 - Python 3.12 and Model Compiler for compiler work
 - Modalix for hardware-dependent runtime validation
 
-Initialize the checkout and runtime dependencies:
-
-```bash
-git submodule update --init --recursive
-./build.sh --install-deps-only
-```
-
-Build runtime packages and tests:
+In the Neat SDK, build runtime packages and tests with:
 
 ```bash
 ./build.sh --all --clean
 ```
+
+The normal build handles its required setup, including submodules; no separate
+dependency-bootstrap step is needed.
 
 Build compiler and MoLE wheels:
 

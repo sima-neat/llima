@@ -63,7 +63,8 @@ syntax and environment options.
 
 ## Build LLiMa
 
-For source builds, use `build.sh`:
+Build from source inside the Neat SDK. The normal full build handles required
+setup, including submodules:
 
 ```bash
 ./build.sh --all --clean
@@ -72,7 +73,6 @@ For source builds, use `build.sh`:
 Common build modes:
 
 ```bash
-./build.sh --install-deps-only   # install host build dependencies
 ./build.sh --all --clean         # build all runtime debs and artifact layouts
 ./build.sh --clean --core        # package only sima-lmm-core
 ./build.sh --clean --core --dev  # package core and development files
@@ -83,21 +83,8 @@ Build output is generated under `build-deb/`. The installable bundle is written
 to `dist/`; its download-only three-package profile and archive are written to
 `dist/debs/`.
 
-On a fresh DevKit, install the native build requirements first:
-
-```bash
-sudo apt update
-sudo apt install -y git cmake pkg-config python3-pip python3-venv python3-dev \
-  libfftw3-dev libyaml-cpp-dev cppzmq-dev libreadline-dev simaai-memory-lib-dev
-```
-
-LLiMa also builds third-party tokenizer code that uses Rust. Install Rust if
-`cargo` is not already available:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
+Install and validate those packages on Modalix; do not use the DevKit as the
+source-build environment.
 
 ## Run
 
