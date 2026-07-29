@@ -62,7 +62,7 @@ if __name__ == "__main__":
         "--part",
         choices=[
             "all", "encoder", "language_detect", "init", "single_pre", "single_post",
-            "single_cache", "init_log_probe",
+            "single_cache",
         ],
         default="all",
         help="Whisper model part to compile.",
