@@ -22,6 +22,13 @@ The LLiMa runtime is installed natively on Modalix as part of the Neat runtime.
 See [Neat Framework installation](/getting-started/neat-library/)
 for the runtime installation flow.
 
+## Contributing
+
+Contributors changing LLiMa itself should follow the
+[LLiMa Contributor Guide](contributing.md) for repository structure,
+development environments, test tiers, model-input policy, and pull-request
+requirements.
+
 ## Supported Models
 
 The following table shows the supported model architectures and their
@@ -55,8 +62,8 @@ capabilities:
 |----|----|
 | Model Architecture | Only models based on the architectures listed above are supported. |
 | Model Parameters | Only models with parameter count less than 10B are supported. |
-| HF Models | Models must be downloaded from Hugging Face and contain: `config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json` and weights in safetensors format |
+| HF Models | Models must be available as a local Hugging Face directory containing `config.json`, safetensor weights, and the tokenizer and processor files required by the architecture. `generation_config.json` is optional. |
 | GGUF Models | GGUF format is supported for LLMs only. VLMs must be compiled from the Hugging Face safetensors format. Note that performance may decrease compared to Hugging Face safetensor compilation. |
-| Compressed Tensor Models | Pre-quantized safetensor models (GPTQ/AWQ) created with llm-compressor are supported for LLMs only. The model must use symmetric quantization. These models can achieve better accuracy than standard INT4 quantization while maintaining high performance. |
+| Compressed Tensor Models | Supported LLMs and VLMs can use pre-quantized safetensor models (GPTQ/AWQ) created with llm-compressor. The model must use symmetric quantization and a supported compressed-tensors layout. These models can achieve better accuracy than standard INT4 quantization while maintaining high performance. |
 | Gemma3 VLM | Supported with modified SigLip 448 vision encoder |
 | LLAMA 3.2 Vision | Vision models are not supported |

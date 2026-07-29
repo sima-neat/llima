@@ -4,47 +4,91 @@
 
 **Model Compiler** provides the LLiMa command-line tool `llima-compile` to
 compile models from Hugging Face safetensors, GGUF files, or pre-quantized
-compressed tensor models (GPTQ/AWQ):
+compressed-tensors models (GPTQ/AutoRound):
 
 ``` console
 llima-compile [options] <model_path>
 ```
 
-When you run this command, the tool handles the entire compilation pipeline including calibration, quantization, and code generation. The pipeline consists of several stages that differ slightly depending on the input format:
+### Model input formats
 
-**For HuggingFace Models:**
+LLiMa accepts three model input paths. Choose one based on checkpoint
+availability, fidelity requirements, and whether the model is an LLM or VLM.
 
-1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **ONNX** - Convert model to ONNX intermediate representation
-3.  **QUANTIZE** - Quantize model weights and calibrate
-4.  **COMPILE** - Compile to Modalix machine code
+| Input | Description | When to use |
+| --- | --- | --- |
+| Original Hugging Face safetensors | An FP/BF16 checkpoint that LLiMa quantizes during compilation. | No exact pre-quantized match exists, or the original weights are required. |
+| Pre-quantized Hugging Face safetensors (GPTQ/AutoRound) | A checkpoint whose quantized weights are reused by LLiMa. | Preferred when the collection provides an exact match. |
+| GGUF | An existing quantized LLM checkpoint. | A convenient LLM fallback; not supported for VLMs. |
 
-**For GGUF Models:**
+The input format alone does not establish compatibility. The model
+architecture, size, tokenizer, and any multimodal components must also be
+supported.
 
-1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **MODEL_SDK_DIRECT** - Convert GGUF directly to ModelSDK format (quantization already applied)
-3.  **COMPILE** - Compile to Modalix machine code
+### Start with a SiMa.ai pre-quantized model
 
-**For Pre-quantized Compressed Tensor Models (GPTQ/AWQ):**
-
-1.  **DEVKIT** - Generate runtime orchestration scripts
-2.  **SOURCE_TO_QUANT** - Convert compressed tensor model directly to ModelSDK format
-3.  **COMPILE** - Compile to Modalix machine code
-
-:::note
-Compressed tensor models are safetensor models pre-quantized with [llm-compressor](https://github.com/vllm-project/llm-compressor) (e.g. GPTQ or AWQ). Supported for LLMs only. A GPU is recommended for the quantization step.
+:::tip Recommended input
+Before downloading original Hugging Face or GGUF weights, check the
+[SiMa.ai Pre-Quantized Models collection](https://huggingface.co/collections/simaai/pre-quantized-models).
+Use an exact match for the requested architecture, parameter size, variant,
+and modality when one is available.
 :::
 
-You can run individual stages using `--onnx`, `--quantize`, `--model_sdk`, `--compile`, or `--devkit` flags if needed.
+Collection checkpoints are model-specific, pre-LLiMa compressed-tensors
+artifacts that can be passed directly to `llima-compile`. They avoid the
+additional floating-point-to-quantized compiler stage and include the
+quantization provenance needed to understand their accuracy and layout. They
+are compiler inputs, not compiled Modalix models.
 
-The compilation process generates the following directory structure in your output directory:
+For a custom fine-tune of an existing supported model, the exact matching
+collection repository may also provide its model-specific `quantize.py`,
+`recipe.yaml`, and `versions.txt`. Read that repository's model card and use
+its documented script; do not reuse a recipe from a merely similar model.
+
+``` console
+hf download simaai/<model-repository> \
+    --revision <immutable-revision> \
+    --local-dir <prequantized-model-directory>
+llima-compile <prequantized-model-directory> -o <output-directory>
+```
+
+### Describe the model. An agent with LLiMa skills compiles it.
+
+SiMa.ai LLiMa supports agentic model compilation out of the box through skills
+included with the Neat Development Environment (Neat SDK). These skills give
+coding agents the context to assess LLM and VLM compatibility, select an exact
+pre-quantized input when available, use the installed LLiMa CLI, and follow the
+Modalix deployment and validation workflow.
+
+The recommended agentic path can compile a model, deploy it to a reachable
+Modalix DevKit, inspect results and diagnostics, and refine the compilation.
+Traditional CLI compilation remains a parallel path for direct control through
+the same tools. Both produce standard, inspectable LLiMa artifacts, so you can
+review the selected model, commands, options, and output or move between the
+two workflows as requirements evolve. See
+[Set up the Neat SDK](https://developer.sima.ai/software/getting-started/dev-environment/)
+to enable agentic compilation.
+
+Ask for the complete workflow in natural language, for example:
+
+``` text
+Compile <model ID or local path> with LLiMa, deploy it to my Modalix at
+<user@host>, and smoke-test it. Prefer an exact SiMa.ai pre-quantized
+checkpoint when available.
+```
+
+The agent records model and recipe provenance, follows the CLI contract of the
+installed release, and reports any unsupported model boundary or unavailable
+hardware validation instead of silently substituting another model or format.
+
+### Compilation output
+
+The default complete pipeline generates the following directory structure:
 
 ``` text
 output_directory/
-├── onnx_files/                # ONNX intermediate files (HF models only)
-│   └── ...
 └── sima_files/                # Compiled model files
-    ├── devkit/                # Python runtime orchestration files
+    ├── devkit/                # Runtime configuration and model data
     │   ├── tokenizer.json
     │   ├── vlm_config.json
     │   └── ...
@@ -71,10 +115,12 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--resume` | Resume interrupted builds by skipping existing files. |
 | `-j, --jobs` | Number of parallel compilation jobs. Default: Number of physical CPU cores. |
 | `--log_level` | Logging level (DEBUG, INFO, WARNING, ERROR). Default: WARNING. |
-| `--input_height` | Input image height in pixels. Required for Siglip2 and Qwen-VL based models. |
-| `--input_width` | Input image width in pixels. Required for Siglip2 and Qwen-VL based models. |
+| `--input_height` | Input image height in pixels. Must be provided with `--input_width`. Required for Qwen 2 VL, Qwen 3 VL, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
+| `--input_width` | Input image width in pixels. Must be provided with `--input_height`. Required for Qwen 2 VL, Qwen 3 VL, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
 | `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
 | `--system_prompt_file` | Path to a text file containing the system prompt. |
+| `--chat_template` | Chat template string to store in the compiled model. Mutually exclusive with the system-prompt and chat-template file options. |
+| `--chat_template_file` | Path to a file containing the chat template. Mutually exclusive with the system-prompt options and `--chat_template`. |
 
 :::note
 Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 8192` to enable an 8K context length.
@@ -84,12 +130,14 @@ Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 819
 |----|----|
 | `--language_group_size` | Batch size for parallel token processing during prefill. Larger values (e.g., 256) can improve TTFT for large input prompts, but can decrease TTFT for smaller input prompts. Default: 128. |
 | `--future_token_mask_size` | Mask size for reusing compiled models across token positions. Larger values reduce number of compiled binary files, but may reduce TPS. Default: 128. |
-| `--enable_filter_sharing` | Enable filter sharing between group and single models to reduce DRAM usage at a cost of higher TTFT and lower TPS. This is only effective when both model types use the same precision. |
+| `--enable_filter_sharing` | Enable filter sharing between group and single models to reduce DRAM usage at a cost of higher TTFT and lower TPS. This is only effective when both model types use the same precision and is required when compiling with LoRA. |
 | `--no-quantize_embeddings` | Disable embedding-table quantization, which is enabled by default for supported LLMs and VLMs. |
 | `--no-quantize_kv_cache` | Disable KV-cache quantization, which is enabled by default. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
+| `--draft_model_path` | Path to an EAGLE3 draft model for speculative decoding. |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
+| `--compile_lora`, `--no-compile_lora` | Enable or disable adapter-weight compilation when LoRA paths are supplied. Enabled by default. |
 
 ## System Prompts
 
@@ -112,7 +160,8 @@ of the first request and every follow-up request.
 
 ## Configuration File
 
-The configuration file allows customizing compilation on a per-layer basis, enabling mixed-precision compilation and selective layer compilation.
+The configuration file customizes compilation for each compiler unit, enabling
+mixed-precision and selective compilation.
 
 LLM inference consists of two distinct phases, and the compiler generates optimized models for each:
 
@@ -123,20 +172,24 @@ Because these phases have different performance characteristics, you can apply d
 
 **Input Parameters**
 
-The `get_layer_configuration` function is called for each layer and receives:
+The `get_layer_configuration` function is called for each compiler unit and
+receives:
 
 - `model_properties`: Dictionary with `{"num_hidden_layers": int}`
 
-- `layer`: Dictionary with:  
-  - `"part"`: Layer type - `"PRE"`, `"CACHE"`, `"POST"`, or `"VISION"`
-  - `"is_group"`: `True` for batch processing layers, `False` for single-token layers
-  - `"index"`: Layer index (0 to num_hidden_layers-1)
+- `layer`: Dictionary with:
+  - `"part"`: Logical component such as `"PRE"`, `"CACHE"`, `"POST"`,
+    `"VISION"`, `"DRAFT_FC"`, or `"PER_LAYER"`
+  - `"is_group"`: `True` for a multi-token/group variant and `False` otherwise
+  - `"index"`: Index of that compiler unit. For `"PRE"` and `"POST"` this
+    normally corresponds to a transformer layer. For `"CACHE"` it identifies
+    a cache or token-position variant rather than a transformer layer.
 
 **Return Values**
 
 The function returns a dictionary with:
 
-- `"precision"`: Quantization level (required)  
+- `"precision"`: Quantization level (optional, default: `"BF16"`)
   - `"BF16"`: Full precision - best quality, largest size, slowest
   - `"A_BF16_W_INT8"`: Medium quantization - good quality, moderate size
   - `"A_BF16_W_INT4"`: High quantization - acceptable quality, smallest size, fastest
@@ -216,21 +269,21 @@ For complex models like Gemma 3 VLM, you may need to specify different precision
 
 **Example 4: Advanced Configuration**
 
-Mixed precision with layer-specific control:
+Mixed precision with transformer-layer-specific control:
 
 ``` python
 def get_layer_configuration(model_properties, layer):
-    # Skip compiling certain cache layers
-    if layer["part"] == "CACHE" and layer["index"] > 20:
-        return {"compile": False}
-
-    # Higher precision for early layers
-    if layer["index"] < 4:
+    # PRE and POST indices normally identify transformer layers.
+    if layer["part"] in {"PRE", "POST"} and layer["index"] < 4:
         return {"precision": "BF16"}
 
-    # Standard quantization for middle layers
+    # Keep every required compiler unit and use INT8 elsewhere.
     return {"precision": "A_BF16_W_INT8"}
 ```
+
+Do not interpret `"CACHE"` indices as transformer-layer indices. Omitting
+cache variants can make the compiled output incomplete and unusable at
+runtime.
 
 **Example 5: Compiling an LLM with LoRA**
 
