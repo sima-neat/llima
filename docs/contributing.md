@@ -252,6 +252,20 @@ and `AGENTS.md` as enforceable agent rules. Skills must contain valid
 `SKILL.md`, `playbook.yml`, and agent metadata; keep their main workflow short
 and move conditional details into direct references.
 
+Validate all skill payloads from the repository root in the Neat SDK without
+changing installed agent state:
+
+```bash
+playbooks_validation_dir="$(mktemp -d)"
+CODEX_HOME="${playbooks_validation_dir}/codex" \
+CLAUDE_HOME="${playbooks_validation_dir}/claude" \
+SIMA_CLI_HOME="${playbooks_validation_dir}/sima-cli" \
+sima-cli playbooks install ./skills
+```
+
+The install summary must report `detected: 3`, `valid: 3`, and `discarded: 0`.
+The `sima-cli` version must satisfy `min_cli_version` in each `playbook.yml`.
+
 For pull requests:
 
 - branch from and target current `develop`;

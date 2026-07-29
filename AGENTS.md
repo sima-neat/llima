@@ -66,8 +66,8 @@ update or required integration fix, and document submodule revisions.
 - ONNX/numerical regression: generate comparison artifacts during the run.
 - MLA/runtime behavior: run affected packaged tests on Modalix.
 - Packaging: build every affected Debian or wheel profile.
-- Skills: run `quick_validate.py` and an isolated
-  `sima-cli playbooks install`.
+- Skills: run the isolated `sima-cli playbooks install ./skills` validation
+  documented in the contributor guide.
 
 Use exact commands from [Contributor Guide](docs/contributing.md) and
 [Test Suites](tests/README.md). Run targeted checks before broader tiers.

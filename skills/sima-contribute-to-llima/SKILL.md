@@ -38,7 +38,8 @@ Use exact commands from `docs/contributing.md` and `tests/README.md`:
 - configured model-backed tests without unintended skips;
 - affected Debian/wheel builds for packaging;
 - packaged Modalix tests for MLA/runtime behavior; and
-- `quick_validate.py` plus isolated Playbooks installation for skills.
+- the isolated `sima-cli playbooks install ./skills` check from
+  `docs/contributing.md` for skills.
 
 Run targeted checks before broader tiers. Report unavailable model, compiler,
 or hardware checks as limitations, not passes.
