@@ -4,6 +4,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,8 +278,12 @@ def test_repeated_cli_quit_releases_mla_memory(tmp_path):
         DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     )
     configured_log_dir = os.environ.get("SIMA_TEST_LLIMA_MEMORY_LOG_DIR")
-    log_dir = Path(configured_log_dir) if configured_log_dir else tmp_path
-    log_dir.mkdir(parents=True, exist_ok=True)
+    if configured_log_dir:
+        log_root = Path(configured_log_dir)
+        log_root.mkdir(parents=True, exist_ok=True)
+        log_dir = Path(tempfile.mkdtemp(prefix="run-", dir=log_root))
+    else:
+        log_dir = tmp_path
 
     env = os.environ.copy()
     env["LLIMA_MODELS_PATH"] = str(models_path)

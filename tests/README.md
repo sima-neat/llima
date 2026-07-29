@@ -347,6 +347,9 @@ directory can be overridden with:
 - `SIMA_TEST_LLIMA_MEMORY_CLEANUP_TIMEOUT_SECONDS`
 - `SIMA_TEST_LLIMA_MEMORY_LOG_DIR`
 
+When a persistent log directory is configured, each test invocation writes to
+its own `run-*` subdirectory so earlier results remain available.
+
 ### Cancellation and test isolation
 
 CTest and pytest run in dedicated process groups. Cancellation sends only
