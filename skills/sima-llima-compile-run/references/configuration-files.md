@@ -1,65 +1,46 @@
-# LLiMa Compilation Configuration Files
+# LLiMa Compilation Configuration
 
-## Use `-c config.py`
-
-Pass a Python configuration file to control precision and select which
-compiler units are generated:
+Use trusted Python configuration files to select precision and compiler units:
 
 ```bash
-llima-compile <model-path> \
-  -c config.py \
-  -o <output-directory>
+llima-compile <model-path> -c config.py -o <output-directory>
 ```
 
-LLiMa imports and executes this file. Use only trusted configuration files; do
-not place credentials or unrelated side effects in them.
+LLiMa imports and executes this file. Keep credentials and unrelated side
+effects out of it.
 
-The file must define:
+Define:
 
 ```python
 def get_layer_configuration(model_properties, layer):
     return {"precision": "BF16"}
 ```
 
-LLiMa calls the function once for every compiler unit exposed by the model.
-`model_properties` contains:
+LLiMa calls this function for every unit exposed by the model.
 
-```python
-{"num_hidden_layers": 32}
-```
+| Input | Meaning |
+| --- | --- |
+| `model_properties["num_hidden_layers"]` | Transformer layer count |
+| `layer["part"]` | Usually `PRE`, `CACHE`, `POST`, `VISION`; may include `DRAFT_FC` or `PER_LAYER` |
+| `layer["is_group"]` | `True` for multi-token/group, `False` for single-token |
+| `layer["index"]` | Unit index |
 
-`layer` contains:
+`PRE`/`POST` indices usually map to transformer layers. `CACHE` indices may
+identify cache or token-position variants. Treat units printed by
+`llima-compile` as authoritative.
 
-- `part`: the logical component, normally `PRE`, `CACHE`, `POST`, or `VISION`;
-- `is_group`: `True` for a multi-token/group variant and `False` otherwise;
-  and
-- `index`: the index of that compiler unit.
+Return keys:
 
-Some architectures also expose parts such as `DRAFT_FC` or `PER_LAYER`. Treat
-the units printed by `llima-compile` as authoritative. For `PRE` and `POST`,
-`index` normally corresponds to a transformer layer. Cache indices can
-identify cache variants or token-position ranges rather than transformer
-layers.
+| Key | Values/default |
+| --- | --- |
+| `precision` | `BF16` (default), `A_BF16_W_INT8`, `A_BF16_W_INT4` |
+| `compile` | `True` (default); `False` omits the unit |
+| `lora` | Optional mode documented by the installed LLiMa version |
 
-Return a dictionary containing:
+## Mixed Precision
 
-- `precision`: `BF16`, `A_BF16_W_INT8`, or `A_BF16_W_INT4`;
-- `compile`: `False` to omit the unit; defaults to `True`; and
-- `lora`: an optional LoRA mode documented by the installed LLiMa version.
-
-For every unit that will be compiled, return `precision` explicitly. Return
-`{"compile": False}` for an omitted unit.
-
-## Choose Precision
-
-Use:
-
-- `BF16` for the highest fidelity and largest compiled model;
-- `A_BF16_W_INT8` for BF16 activations with INT8 weights; or
-- `A_BF16_W_INT4` for BF16 activations with INT4 weights.
-
-A practical mixed-precision policy is BF16 for vision, INT8 for group/prefill
-units, and INT4 for single-token/decode units:
+This common policy uses BF16 vision, INT8 group/prefill, and INT4
+single-token/decode:
 
 ```python
 def get_layer_configuration(model_properties, layer):
@@ -69,46 +50,16 @@ def get_layer_configuration(model_properties, layer):
         precision = "A_BF16_W_INT8"
     else:
         precision = "A_BF16_W_INT4"
-
     return {"precision": precision}
 ```
 
-Quantization changes accuracy, memory use, compilation time, TTFT, and TPS.
-Validate the resulting model on representative prompts and images.
+BF16 gives highest fidelity and largest output; INT8/INT4 reduce size and can
+change accuracy, compilation time, TTFT, and TPS. Validate representative
+prompts and images.
 
-## Compile Only Selected Parts
+## Select Units
 
-Compile only decode-time `PRE` and `POST` units:
-
-```python
-SELECTED_PARTS = {"PRE", "POST"}
-
-
-def get_layer_configuration(model_properties, layer):
-    if layer["part"] not in SELECTED_PARTS or layer["is_group"]:
-        return {"compile": False}
-
-    return {"precision": "A_BF16_W_INT4"}
-```
-
-Change `SELECTED_PARTS` to select `CACHE`, `VISION`, or another part exposed by
-the model. Use `is_group` independently when both prefill and decode variants
-of a part exist.
-
-## Compile Only Selected Indices
-
-Compile index 0 of every single-token/decode part:
-
-```python
-def get_layer_configuration(model_properties, layer):
-    if layer["is_group"] or layer["index"] != 0:
-        return {"compile": False}
-
-    return {"precision": "A_BF16_W_INT4"}
-```
-
-Compile only single-token `PRE` and `POST` units for transformer layers 4
-through 7:
+Compile only single-token `PRE`/`POST` units at indices 4–7:
 
 ```python
 SELECTED_PARTS = {"PRE", "POST"}
@@ -123,34 +74,13 @@ def get_layer_configuration(model_properties, layer):
     )
     if not selected:
         return {"compile": False}
-
     return {"precision": "A_BF16_W_INT8"}
 ```
 
-Use `model_properties["num_hidden_layers"]` when selection depends on model
-depth:
+Adjust parts, `is_group`, and indices independently. Use
+`model_properties["num_hidden_layers"]` for depth-relative selection, but do
+not assume every part exposes every index.
 
-```python
-def get_layer_configuration(model_properties, layer):
-    last_index = model_properties["num_hidden_layers"] - 1
-    if layer["part"] not in {"PRE", "POST"}:
-        return {"compile": False}
-    if layer["index"] not in {0, last_index}:
-        return {"compile": False}
-
-    return {"precision": "BF16"}
-```
-
-Do not assume every part has every index. LLiMa calls the function only for
-units that exist for the selected architecture.
-
-## Understand Partial Compilation
-
-Selective compilation is useful for compiler debugging, focused testing, and
-reducing iteration time. An output that omits required units is not a complete
-model and normally cannot pass deployment or `llima run` validation.
-
-For a deployable model, ensure the configuration includes every runtime unit
-required by that architecture. Inspect the compiler's printed unit list before
-the expensive stages begin and keep the exact `config.py` with the compilation
-report.
+Selective compilation is for debugging and focused tests. Omitting a required
+unit normally makes output undeployable. Inspect the printed unit list before
+expensive stages and retain the exact `config.py` in the compilation report.

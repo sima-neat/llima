@@ -1,3 +1,10 @@
+"""Repository-local compiler utility for the existing Whisper ASR path.
+
+This script invokes ``WhisperModel`` directly for contributor development. It
+is not a public ``llima-compile`` entry point or a framework for new ASR
+architectures.
+"""
+
 import logging
 
 from pathlib import Path
@@ -45,7 +52,9 @@ def gen_files(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Whisper generate file arguments")
+    parser = argparse.ArgumentParser(
+        description="Generate Whisper compiler artifacts for LLiMa contributor development"
+    )
     parser.add_argument("--model_path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument(
         "-o",

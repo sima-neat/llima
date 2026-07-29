@@ -11,18 +11,30 @@ in `docs/contributing.md` and `tests/README.md`.
 | VLM numerical behavior | Vision/projector ONNX comparison | Compare the final projected image embeddings before language insertion |
 | Hugging Face layout | Synthetic transform plus source-ingestion case | Split a marked fused QKV tensor and assert every output slice |
 | GGUF layout | Config parity, permutation, and quantization cases | Compare Mistral HF/GGUF config and Q/K tensors |
-| Tokenizer/template | Exact rendered prompt and token IDs | Render a Gemma adjacent-literal template through Jinja and Minja |
+| Tokenizer/prompt contract | Exact rendered prompt and token IDs | Render ordinary and tool-enabled messages through the source Jinja implementation and Minja |
 | Compiler integration | Required units generated without unintended skips | Generate all selected group/single or vision units |
 | Modalix runtime | Representative task succeeds and exits cleanly | Run two LLM turns or one image-grounded VLM prompt |
 
-## CI Inputs
+## Model-Support CI Checklist
 
-- Pin source models by immutable revision in the appropriate
-  `tools/hf-safetensors/manifest.txt`, `config-manifest.txt`, or
-  `gguf-manifest.txt`.
-- Add the smallest maintained case to `tests/compilation/cases.py`.
-- Generate ONNX and numerical comparison artifacts during the test run.
-- Do not treat cache absence or a skipped required case as a pass.
+1. Add the smallest affected cases to `tests/compilation/cases.py`.
+2. Pin inputs by immutable revision in the matching cache manifest:
+   - weighted HF: `tools/hf-safetensors/manifest.txt`;
+   - metadata-only HF: `tools/hf-safetensors/config-manifest.txt`;
+   - GGUF: `tools/hf-safetensors/gguf-manifest.txt` (name files explicitly
+     when needed).
+3. Extend `tools/hf-safetensors/selection-policy.json` only for required files
+   not already selected; avoid broad cache patterns.
+4. Set ONNX regression mode:
+   - `required` when the published `develop` compiler supports the baseline;
+   - `informative` for candidate-only support, promoted after publication;
+   - `disabled` only with a documented reason; it runs neither revision.
+5. When case counts change, update `tests/README.md` and the matching
+   `expected_test_count` in `.github/workflows/model-compiler-tests.yml`.
+6. Verify complete output includes required runtime config and
+   tokenizer/template/processor assets. Generate numerical artifacts during
+   the run; never commit them. Missing inputs, cache misses, and unexpected
+   skips fail.
 
 ## Completion Example
 
@@ -30,8 +42,8 @@ For a new Qwen3-VL-style VLM, report:
 
 - source model ID and revision;
 - VLM and source-layout routes selected;
-- configuration, processor, vision ONNX, and graph-integration tests passed;
-- complete compilation options and artifact location;
-- Modalix image-prompt result;
+- manifest/policy/count changes and temporary `informative` mode;
+- config, processor, ONNX, graph, output-asset, and Modalix results;
+- compilation options and artifact location;
 - GGUF not supported because it was not implemented or validated; and
 - supported-model documentation updated only for Hugging Face input.

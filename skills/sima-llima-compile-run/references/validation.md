@@ -2,73 +2,47 @@
 
 ## Deploy
 
-Prepare and transfer a successfully compiled model:
-
 ```bash
-llima-deploy <compiled-output> <user@modalix:/media/nvme/llima/models/model-name>
+llima-deploy \
+  <compiled-output> \
+  <user@modalix:/media/nvme/llima/models/model-name>
 ```
 
-`llima-deploy` validates the compiler output, extracts runtime ELF files from
-the MPK archives, and synchronizes the runtime configuration and optional LoRA
-arrays. Use `llima-deploy --help` from the installed version as the command
-contract.
-
-Confirm the deployed model directory contains the runtime configuration and
-ELF files expected by LLiMa.
+Use installed `llima-deploy --help` as the command contract. It validates the
+output, extracts runtime ELF files, and synchronizes configuration and optional
+LoRA arrays. Confirm expected runtime config and ELFs at the destination.
 
 ## LLM Smoke Test
-
-On Modalix:
 
 ```bash
 llima run <model-path-or-name> --mode cli
 ```
 
-Verify:
-
-- all model components load;
-- a short deterministic prompt is accepted;
-- output tokens are produced;
-- a second prompt works when chat history is relevant; and
-- `quit` exits cleanly.
-
-Do not use output wording as a strict numerical or semantic benchmark. This is
-an initial functional smoke test.
+Verify all components load, a short prompt produces tokens, a second turn works
+when history matters, and `quit` exits cleanly. This is functional validation,
+not a strict quality benchmark.
 
 ## VLM Smoke Test
 
-Start the same CLI mode, then use:
+In the same CLI:
 
 ```text
 add image <image-path>
 <ask a prompt grounded in the image>
 ```
 
-Verify:
-
-- the image is readable and accepted;
-- vision and language components load;
-- the prompt produces output related to the supplied input; and
-- clearing the image or exiting does not crash the runtime.
-
-Use a non-sensitive representative image. Do not upload customer media into a
-report or repository.
+Verify image acceptance, vision/language loading, input-related output, and
+clean image clearing or exit. Use non-sensitive media.
 
 ## Report
 
 Capture:
 
-- public model ID and immutable revision when available;
-- source format;
-- non-secret compilation options;
-- Model Compiler and LLiMa versions;
-- output and deployment paths;
-- exact smoke command;
-- whether LLM or VLM validation ran; and
-- pass/fail outcome with redacted error context.
+- public model ID/revision and source format;
+- non-secret options and Model Compiler/LLiMa versions;
+- output/deployment paths and exact smoke command;
+- LLM/VLM scenario and result; and
+- redacted failures or unavailable Modalix validation.
 
-If Modalix access is unavailable, report compilation and deployment preparation
-separately and state that `llima run` remains unvalidated.
-
-After this smoke test succeeds, use `neat-application-builder` for application
-integration with public Neat APIs.
+After the smoke test, use `neat-application-builder` for application
+integration.

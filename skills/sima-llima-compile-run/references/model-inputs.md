@@ -1,77 +1,53 @@
 # LLiMa Model Inputs
 
-## Select the Source Format
+## Formats and Tradeoffs
 
-LLiMa supports these GenAI source families:
+Supported source families:
 
-- Hugging Face safetensors for supported LLMs and VLMs;
-- supported compressed-tensor GPTQ, AWQ, or AutoRound-style safetensor LLMs
-  and VLMs; and
+- Hugging Face safetensors for supported LLMs/VLMs;
+- supported compressed-tensors GPTQ/AutoRound-style safetensors; and
 - GGUF for supported LLMs.
 
-GGUF is not the default VLM source path. Check the current supported-model and
-limitations tables before proceeding.
+| Input | Typical use | Main tradeoff |
+| --- | --- | --- |
+| HF BF16/FP, quantized by LLiMa | Native INT8/INT4 runtime path | Quantization may reduce accuracy |
+| Supported prequantized compressed-tensors, symmetric 4/8-bit, group size 128/256 | Often strong speed/accuracy balance | Layout and quantization compatibility are model-specific |
+| GGUF | Convenient existing quantized LLM | Common Q4_0/Q8_0 block-32 formats are usually slower than native/prequantized paths |
 
-Do not use this skill for a generic ONNX computer-vision model.
+Check the
+[SiMa.ai Pre-Quantized Models collection](https://huggingface.co/collections/simaai/pre-quantized-models)
+first. It provides GPTQ/AutoRound safetensor checkpoints for most supported
+models; prefer an exact compatible match when available. These are
+pre-quantized compiler inputs, not compiled Modalix runtime models, so they
+still require `llima-compile`.
 
-## Compare Input-Format Tradeoffs
+If the collection has no compatible checkpoint, start from original HF weights
+and choose LLiMa INT8/INT4 by accuracy, memory, and performance. Use GGUF when
+availability outweighs peak performance.
 
-Treat these as typical characteristics, not performance or accuracy
-guarantees:
+Do not infer support from `GPTQ` or `AutoRound` in a repository name.
+Inspect `quantization_config`: the direct path requires supported
+compressed-tensors layout, symmetric 4/8-bit weights, and no unsupported zero
+points. Measure group sizes other than 128/256. Inspect each GGUF quantization
+type; non-Q4_0/Q8_0 formats may convert or dequantize differently.
 
-| Model input | Typical result | Main tradeoff |
-|----|----|----|
-| Hugging Face BF16/FP safetensors, quantized by LLiMa | Fast Modalix runtime using LLiMa's native INT8 or INT4 weight quantization | Quantization, especially INT4, can degrade model accuracy; validate representative prompts and images |
-| Prequantized GPTQ, AWQ, or AutoRound model in LLiMa's supported compressed-tensors format with block/group size 128 or 256 | Usually combines fast runtime with high accuracy because the weights were quantized with an accuracy-aware method before compilation | Availability and compatibility are model-specific; the published layout and quantization settings must be supported |
-| GGUF | Convenient when a supported GGUF is already available and avoids quantizing the original weights again | Runtime is normally slower than the native LLiMa or supported prequantized path because common Q4_0/Q8_0 GGUF weights use block quantization with a block size of 32 |
+## Check Support First
 
-Prefer a compatible prequantized GPTQ, AWQ, or AutoRound model when one is
-available and has passed model-quality validation. Otherwise, start from the
-original Hugging Face safetensors and choose LLiMa INT8 or INT4 based on the
-required accuracy, memory, and performance. Use GGUF when availability or
-convenience matters more than peak runtime performance.
+Read `docs/index.md` and `docs/compilation_genai.md` for supported
+architectures/sizes, formats, required assets, vision shapes, quantization, and
+flags. Reject unsupported input rather than choosing a similarly named model.
+GGUF is not the default VLM path.
 
-Do not infer compatibility from `GPTQ`, `AWQ`, or `AutoRound` in the repository
-name. For the current direct prequantized path, require the Hugging Face
-`quantization_config` to use the `compressed-tensors` format with supported
-symmetric 4-bit or 8-bit weights. Expect the fast runtime path only for
-block/group size 128 or 256; measure other supported configurations rather
-than assuming equivalent performance. Reject unsupported layouts or
-asymmetric zero points instead of silently dequantizing or requantizing them.
-
-GGUF quantization varies by file. The block-size statement applies directly to
-the commonly used Q4_0 and Q8_0 formats; other GGUF formats may be converted by
-LLiMa or fall back to dequantization. Inspect the exact GGUF quantization type
-rather than relying only on the filename.
-
-## Check Support Before Download
-
-Read the installed or source-controlled `docs/index.md` and
-`docs/compilation_genai.md` for:
-
-- supported architectures and model sizes;
-- required tokenizer, processor, configuration, and weight files;
-- source-format limitations;
-- vision input requirements;
-- supported quantization options; and
-- architecture-specific compiler flags.
-
-Fail early when the architecture or source format is unsupported. Do not
-silently choose a similarly named model.
-
-## Resolve Hugging Face Access
+## Resolve Access
 
 Prefer:
 
-1. an existing complete local model directory;
-2. an approved organization cache at an immutable revision; or
-3. a direct Hugging Face download when authorization permits it.
+1. a complete local directory;
+2. an approved immutable organization cache; or
+3. an authorized direct Hugging Face download.
 
-For gated models, the account or service token must have access to that exact
-repository. Never print a token or embed it in a URL. Pass authentication
-through the standard Hugging Face environment or credential store.
-
-When a direct download is required, pin a known revision:
+For gated models, use the standard Hugging Face credential store/environment;
+never print or embed tokens. Pin direct downloads:
 
 ```bash
 hf download <organization/model> \
@@ -79,37 +55,24 @@ hf download <organization/model> \
   --local-dir <model-directory>
 ```
 
-Record the public model ID and immutable revision when available. Do not copy
-private weights, customer data, or token values into reports.
+Record public model ID/revision, not credentials, private weights, or customer
+data.
 
-## Choose Compilation Options
+## Options and Output
 
-Start with the documented default configuration. Add options only for a stated
-need, such as:
+Start with defaults. Add context length, group size, precision, vision size,
+embedding quantization, LoRA, or speculative decoding only for a stated need;
+record choices because they affect accuracy, size, compilation time, TTFT, and
+TPS.
 
-- context length;
-- prefill group size;
-- BF16, INT8, or INT4 layer policy;
-- VLM image dimensions;
-- embedding quantization;
-- LoRA; or
-- speculative decoding.
-
-Use a reviewed configuration file for per-layer policy. Record the selected
-policy because it affects accuracy, memory, compilation time, TTFT, and TPS.
-
-## Expected Compiler Output
-
-A deployable compiler output must include:
+A deployable output contains:
 
 ```text
-<output>/
-└── sima_files/
-    ├── devkit/
-    ├── mpk/
-    └── npy_files/  # optional, for supported LoRA workflows
+<output>/sima_files/
+├── devkit/
+├── mpk/
+└── npy_files/  # optional LoRA material
 ```
 
-Generated `onnx_files/` and other compiler intermediates remain host-side.
-Deploy the runtime material through `llima-deploy`; do not manually treat the
-whole compiler working directory as the Modalix runtime model.
+Keep `onnx_files/` and compiler intermediates on the host. Deploy with
+`llima-deploy`; do not copy the entire compiler workspace as a runtime model.

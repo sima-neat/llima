@@ -1,66 +1,95 @@
 # Add an LLM Architecture
 
-Use this route only when existing language graph semantics cannot represent the
-model.
+Use this route only when existing language graph or state semantics cannot
+represent the model. Config-key or tensor-name differences alone belong in
+ingestion/source-layout handling.
+
+## Implementation Order
+
+1. Use the matching
+   [Transformers model implementation](https://github.com/huggingface/transformers/tree/main/src/transformers/models/)
+   at a pinned commit as the architecture and numerical reference. If it is
+   absent, use the model repository's pinned remote-code implementation and
+   document that provenance.
+2. Add the LLiMa architecture identifier and source detection.
+3. Add only configuration fields required to express new behavior.
+4. Adapt existing pre/cache/post, attention, or convolution modeling files
+   when their tensor flow and state contract already fit.
+5. Add a new layer type and modeling file only for genuinely new computation
+   or persistent state; include it in the compiler-unit matrix.
+6. Generate and compile affected units, comparing them with the reference
+   implementation. Establish generated config, names, tensor layouts, and
+   state interfaces before changing runtime code.
+7. Adapt the C++ runtime only for a new execution contract. Drive selection,
+   dimensions, and behavior from generated configuration.
 
 ## Define the Contract
 
-Document:
+Compare the upstream config, implementation, and tensor index with the closest
+supported architecture. Document:
 
-- attention type, Q/K/V shapes, head layout, scaling, masks, and biases;
-- positional encoding and RoPE variant;
+- attention type; Q/K/V shape, heads, scaling, masks, and biases;
+- position/RoPE behavior and full/sliding-window rules;
 - normalization type, placement, epsilon, and unit offset;
-- MLP topology, activation, tensor names, and intermediate widths;
-- full, sliding, convolutional, or other layer schedule;
-- KV-cache tensors, update rules, and prefill/decode differences;
-- embedding and LM-head tying; and
-- required compiler units for group and single-token execution.
+- MLP topology, activation, tensor names, and widths;
+- ordered attention/convolution/other layer schedule;
+- KV or convolution state shapes and prefill/decode updates;
+- embedding/LM-head tying, logits shape, and stop-token behavior; and
+- required group, single, per-layer, or speculative compiler units.
 
-## Implementation Surfaces
+Reject incomplete or contradictory evidence instead of inferring semantics
+from a model name.
 
-- Register and parse the architecture in `sima_lmm/config/vlm_config.py`.
-- Normalize source configuration and tensor names under `sima_lmm/hf/` or
-  `sima_lmm/gguf/`.
-- Reuse `language_part_base.py` primitives and extend
-  `language_pre_model.py`, `language_cache_model.py`, and
-  `language_post_model.py` only where computation differs.
-- Add convolution or per-layer compiler units only when the architecture
-  requires them.
-- Keep ONNX and direct Model SDK graph implementations numerically aligned.
-- Audit C++ runtime assumptions about generated part names, cache buffers, RoPE,
-  stop tokens, and output shapes. Prefer generated configuration over new
-  runtime model-type branches.
+## Configuration and Compiler Graphs
 
-## Example: LFM2-Style Hybrid Layers
+- Register/parse the architecture in `sima_lmm/config/vlm_config.py`.
+- Normalize Hugging Face or GGUF config/tensors at the source boundary.
+- Validate required fields, tensor rank/shape/dtype, schedule length, tied
+  weights, and optional features.
+- Ensure generated `vlm_config.json` carries every runtime-required value.
+- Extend `VlmConfig.get_layer_ids()` only for a different unit matrix.
+- Reuse `language_part_base.py` and the nearest
+  `language_{pre,cache,post}_model.py` implementation.
+- Reuse shared attention, MLP, normalization, embedding, and LM-head builders;
+  branch only where computation or state differs.
+- Keep ONNX and direct Model SDK implementations aligned where both apply.
+- Preserve deterministic layer and model-part ordering.
 
-Request:
+## Runtime Contract
 
-> Add a language architecture that alternates attention and short-convolution
-> layers and uses `w1`, `w3`, and `w2` MLP tensors.
+Audit `sima_lmm/devkit/cpp/vlm_config.hpp` and `language_model.*` for:
 
-Investigation:
+- generated part names and group/single selection;
+- state allocation, update, rollover, reset, and prefill/decode transition;
+- masks, RoPE/head dimensions, sliding boundaries, and partial final groups;
+- logits, sampling, stop tokens, and context limits; and
+- cleanup after completion, cancellation, and failure.
 
-- Use LFM2 as the nearest supported analogue.
-- Derive the ordered `layer_types` from upstream configuration or tensor
-  evidence.
-- Confirm convolution state and cache behavior differ from transformer KV
-  cache rather than treating every layer as attention.
+Prefer data-driven generated config. Add a runtime model-type branch only when
+the execution contract cannot be expressed by existing configuration.
 
-Implementation:
+## Validation
 
-- Add a language architecture identifier and config normalization.
-- Reuse the shared MLP builder by selecting `w1`/`w3`/`w2` when those tensors
-  exist.
-- Route convolution layers through the convolution model while retaining the
-  normal pre/cache/post path for attention layers.
-- Preserve the generated layer order; do not infer it from filesystem order.
+- Test config parsing/defaults/serialization and invalid inputs.
+- Test source ingestion and deterministic tensor transforms.
+- Compare affected prefill, decode, and state outputs with the reference.
+- Exercise group/single variants, boundary lengths, and cache transitions.
+- Run ONNX regression and direct graph parity where supported.
+- Verify complete required-unit generation and graph integration.
+- Run multi-turn generation and clean teardown on Modalix.
 
-Validation:
+Add cases through `tests/compilation/cases.py`; follow `validation-matrix.md`
+for manifests, regression mode, and audited counts.
 
-- Unit-test layer-schedule parsing and invalid schedules.
-- Compare prefill, decode, post, and convolution outputs with the upstream
-  implementation using deterministic inputs.
-- Exercise group and single-token compiler units.
-- Run compiler graph integration, a complete build, and multi-token generation
-  on Modalix.
+## Example: LFM2-Style Hybrid
 
+For alternating attention/short-convolution layers with `w1`/`w3`/`w2` MLP:
+
+- use LFM2 as the closest analogue and derive ordered `layer_types` from
+  upstream config/tensors, never filesystem order;
+- keep rolling convolution state separate from transformer KV cache;
+- reuse shared MLP and normal pre/cache/post models for attention;
+- add a fused convolution model only for convolution layers and preserve its
+  state across group-prefill/decode; and
+- compare deterministic outputs, compile every required unit, and run
+  multi-token Modalix generation.

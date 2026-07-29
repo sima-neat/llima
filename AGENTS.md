@@ -1,137 +1,84 @@
 # Agent Guidance
 
-This file defines repository-specific expectations for automated and human
-contributors. Read [Contributor Guide](docs/contributing.md) before changing
-LLiMa.
+Read [Contributor Guide](docs/contributing.md) before changing LLiMa.
 
-## Classify the Change
+## Before Editing
 
-Identify the primary surface before editing:
+1. Classify the primary surface:
+   - compiler: `sima_lmm/config`, `hf`, `gguf`, `host`, `model`, `preproc`;
+   - runtime: `sima_lmm/devkit` and `sima_lmm/devkit/cpp`;
+   - evaluation: `sima_lmm/mole`;
+   - packaging: `CMakeLists.txt`, `build*.sh`, `cmake`, `deps`, installers;
+   - CI/tests: `.github/workflows`, `tools/ci`, `tests`; or
+   - documentation/skills: `README.md`, `docs`, `skills`.
+2. Search for nearby implementations, tests, CLI definitions, and docs.
+3. Preserve unrelated working-tree changes.
 
-- compilation: `sima_lmm/config`, `hf`, `gguf`, `host`, `model`, `preproc`;
-- runtime: `sima_lmm/devkit` and `sima_lmm/devkit/cpp`;
-- evaluation: `sima_lmm/mole`;
-- packaging: `CMakeLists.txt`, `build*.sh`, `cmake`, `deps`, and installers;
-- CI and test infrastructure: `.github/workflows`, `tools/ci`, and `tests`;
-- documentation and skills: `README.md`, `docs`, and `skills`.
-
-Preserve the distinction between host-side model preparation and Modalix-side
-execution. Do not introduce a runtime dependency on compiler-only Python
-packages or make compiler code depend on DevKit runtime state.
+Keep host-side model preparation separate from Modalix execution. Runtime code
+must not depend on compiler-only Python packages; compiler code must not depend
+on DevKit runtime state.
 
 ## Sources of Truth
 
-- Use `deps/manifest.json` for package and platform dependency versions.
-- Use the public CLI entry points declared in `pyproject.toml`.
-- Use `docs/setup.md`, `docs/compilation_genai.md`,
-  `docs/deployment.md`, and `docs/runtime.md` for user workflows.
-- Use `CONTRIBUTING.md` and `docs/contributing.md` for development and
-  validation policy.
-- Search for nearby implementations and tests before adding a new abstraction.
+- Dependencies and platform versions: `deps/manifest.json`
+- Public CLI entry points: `pyproject.toml`
+- User workflows: `docs/setup.md`, `docs/compilation_genai.md`,
+  `docs/deployment.md`, `docs/runtime.md`
+- Development and validation: `CONTRIBUTING.md`, `docs/contributing.md`,
+  `tests/README.md`
 
-## Compatibility
+Treat `third_party/` as vendored code. Change it only for an intentional vendor
+update or required integration fix, and document submodule revisions.
 
-- Treat installed C++ headers, Python APIs, CLI commands, generated
-  configuration, and artifact layouts as compatibility surfaces.
-- Prefer additive changes. Document migration impact when behavior, file
-  layout, command syntax, or configuration changes.
-- Keep the three runtime package responsibilities intact:
-  `sima-lmm-core`, `sima-lmm-dev`, and `sima-lmm-cli`.
-- Preserve the compiler, MoLE, and runtime artifact profiles and their
-  metadata/checksum contracts.
+## Implementation Rules
 
-## Coding Standards
+- Target C++20 and the Python versions declared in `pyproject.toml`.
+- Follow local formatting and naming; avoid unrelated reformatting.
+- Treat installed C++ headers, Python APIs, CLI commands, serialized
+  configuration, package metadata, and artifact layouts as compatibility
+  surfaces.
+- Keep public interfaces minimal and prefer backward-compatible additions.
+  Document migrations and update callers for intentional breaks.
+- Preserve the roles of `sima-lmm-core`, `sima-lmm-dev`, `sima-lmm-cli`, and
+  the compiler/MoLE publication profiles.
+- Keep compilation, serialization, model selection, and artifact naming
+  deterministic for identical inputs.
+- Reject invalid or unsupported input with actionable errors; never silently
+  switch architecture, model, revision, precision, format, or execution path.
+- Bound teardown and worker coordination, protect shared state, and avoid
+  unnecessary allocation or synchronization on runtime hot paths.
 
-- C++ code must remain compatible with C++20. Python code must remain
-  compatible with the versions declared in `pyproject.toml`.
-- Follow the formatting and naming of the surrounding code. Keep changes
-  focused; do not mix functional changes with broad reformatting or include
-  reordering.
-- Keep public interfaces intentional and minimal. Prefer backward-compatible
-  additions, keep implementation details out of installed headers, and update
-  all callers when an internal contract changes.
-- Add type annotations to new Python interfaces where practical. Use comments
-  and docstrings to explain non-obvious contracts and design decisions, not to
-  restate the implementation.
-- Keep model compilation, configuration serialization, cache-model selection,
-  and artifact naming deterministic for identical inputs.
-- Reject invalid or unsupported input with an actionable error. Do not add
-  silent fallbacks that select a different architecture, precision, model,
-  compilation path, or runtime behavior.
-- Keep teardown and worker coordination bounded. Do not block indefinitely,
-  and protect state shared across compiler processes or runtime threads.
-- Avoid unnecessary abstractions and duplication. Search for an existing
-  helper or nearby implementation before introducing a new one.
+## Models, Artifacts, and Secrets
 
-## Model Inputs and Generated Artifacts
-
-- Never commit downloaded model weights or customer model data.
-- Never add generated ONNX, NumPy, quantized, compiled, ELF, MPK, or runtime
-  model outputs as persistent regression references.
+- Keep downloaded weights, customer data, and generated ONNX, NumPy,
+  quantized, MPK, ELF, or runtime model trees out of Git.
 - Reviewed JSON configuration references are allowed when they are the
-  contract under test.
-- Use immutable model revisions and the approved Hugging Face/GGUF caches for
-  model-backed automation.
-- Keep generated outputs in temporary or ignored build directories.
-- Do not silently fall back to a different model, precision, revision, or
-  source format when a requested input is unavailable.
+  human-readable contract under test.
+- Use immutable model revisions and approved Hugging Face/GGUF caches in CI.
+- Never expose tokens, SSH credentials, private or signed URLs, or proprietary
+  model contents. Use public identifiers, redacted logs, and minimal
+  reproductions; do not ask users to paste credentials or proprietary assets.
 
-## Security
+## Validation
 
-- Never expose `HF_TOKEN`, `HUGGINGFACE_TOKEN`, GitHub tokens, SSH credentials,
-  private artifact URLs, or signed download URLs in source, logs, reports, or
-  documentation.
-- Do not ask users to paste tokens or proprietary model contents into chat.
-- Prefer redacted logs, public model identifiers, immutable revisions, and
-  minimal reproductions.
+- Pure logic: hermetic tests without network or model downloads.
+- Model-backed compiler changes: configure required cached inputs; unintended
+  skips fail validation.
+- ONNX/numerical regression: generate comparison artifacts during the run.
+- MLA/runtime behavior: run affected packaged tests on Modalix.
+- Packaging: build every affected Debian or wheel profile.
+- Skills: run `quick_validate.py` and an isolated
+  `sima-cli playbooks install`.
 
-## Testing
+Use exact commands from [Contributor Guide](docs/contributing.md) and
+[Test Suites](tests/README.md). Run targeted checks before broader tiers.
 
-- Pure logic must have hermetic tests that do not require network access or
-  model downloads.
-- Model-backed compiler changes require the relevant cached Hugging Face or
-  GGUF inputs and must not pass merely because fixtures were skipped.
-- ONNX or numerical regression outputs must be generated during the test run,
-  not read from newly committed binary references.
-- Runtime changes that reach MLA execution require Modalix validation when
-  practical.
-- Packaging changes require the affected Debian and/or wheel build.
-- Skill changes require `quick_validate.py` and an isolated
-  `sima-cli playbooks install` check.
+## Documentation and Completion
 
-Use the commands and model-path variables in
-[Contributor Guide](docs/contributing.md). Run targeted checks first, then the
-broader affected tier.
+Update the closest official guide for user-visible behavior, `README.md` for
+top-level workflows, and contributor policy only where it is authoritative.
+Keep skills procedural and move conditional detail into direct references.
 
-## Third-Party Code
-
-- Treat `third_party/` as vendored code.
-- Avoid edits there unless the task explicitly requires a vendor update or a
-  local integration fix.
-- Keep submodule revisions intentional and document why they changed.
-- Do not mix unrelated generated or vendor changes into a LLiMa contribution.
-
-## Documentation
-
-When behavior changes:
-
-- update the relevant official guide under `docs/`;
-- update `README.md` when the top-level install, package, build, or runtime
-  workflow changes;
-- keep examples and command names synchronized with the actual CLI; and
-- update `docs/contributing.md` or this file when contributor policy changes.
-
-Skills must stay concise and use progressive disclosure. Reference live
-repository documentation instead of copying contributor policy into
-`SKILL.md`.
-
-## Definition of Done
-
-A change is ready when:
-
-- relevant tests pass without unintended skips;
-- generated artifacts and secrets remain outside Git;
-- compatibility and documentation impact are assessed;
-- hardware- or model-dependent checks are completed or explicitly reported as
-  unavailable; and
-- the final summary lists validation performed and residual risk.
+A change is ready when affected tests pass, compatibility and documentation
+impact are addressed, unavailable model/hardware checks are explicit, and the
+final summary reports validation and residual risk.
