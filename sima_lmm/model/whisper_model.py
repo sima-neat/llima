@@ -109,7 +109,6 @@ class WhisperModel(BaseModel):
         encoder = False
         language_detect = False
         init_layer_idx_list = list()
-        init_log_probe_layer_idx_list = list()
         single_pre_layer_idx_list = list()
         single_post_layer_idx_list = list()
         single_cache_token_idx_list = list()
@@ -122,8 +121,6 @@ class WhisperModel(BaseModel):
                 language_detect = True
             if part in ("init", None):
                 init_layer_idx_list = list(range(self.cfg.decoder_layers))
-            if self.cfg.log_probe_enabled and part in ("init_log_probe", None):
-                init_log_probe_layer_idx_list = [self.cfg.decoder_layers - 1]
             if part in ("single_pre", None):
                 single_pre_layer_idx_list = list(range(self.cfg.decoder_layers))
             if part in ("single_post", None):
@@ -140,10 +137,6 @@ class WhisperModel(BaseModel):
                 case "init":
                     assert 0 <= part_idx < self.cfg.decoder_layers
                     init_layer_idx_list.append(part_idx)
-                case "init_log_probe":
-                    assert self.cfg.log_probe_enabled
-                    assert part_idx == self.cfg.decoder_layers - 1
-                    init_log_probe_layer_idx_list.append(part_idx)
                 case "single_pre":
                     assert 0 <= part_idx < self.cfg.decoder_layers
                     single_pre_layer_idx_list.append(part_idx)
@@ -204,10 +197,6 @@ class WhisperModel(BaseModel):
 
         for layer_idx in init_layer_idx_list:
             model_list.append((self._get_part_model("init", layer_idx=layer_idx), init_precision))
-        for layer_idx in init_log_probe_layer_idx_list:
-            model_list.append((
-                self._get_part_model("init_log_probe", layer_idx=layer_idx), init_precision
-            ))
 
         for layer_idx in single_pre_layer_idx_list:
             model_list.append(
@@ -349,10 +338,19 @@ class WhisperModel(BaseModel):
             decoder_init_ofms = decoder_init_model.run_model(eval_mode, decoder_init_ifms)
 
             # Update cache.
-            decoder_cache_key[layer_idx][..., :num_tokens, :] = decoder_init_ofms[1]
-            decoder_cache_value[layer_idx][..., :num_tokens, :] = decoder_init_ofms[2]
-            encoder_cache_key[layer_idx] = decoder_init_ofms[3]
-            encoder_cache_value[layer_idx] = decoder_init_ofms[4]
+            cache_output_idx = (
+                2
+                if self.cfg.log_probe_enabled and layer_idx == self.cfg.decoder_layers - 1
+                else 1
+            )
+            decoder_cache_key[layer_idx][..., :num_tokens, :] = (
+                decoder_init_ofms[cache_output_idx]
+            )
+            decoder_cache_value[layer_idx][..., :num_tokens, :] = (
+                decoder_init_ofms[cache_output_idx + 1]
+            )
+            encoder_cache_key[layer_idx] = decoder_init_ofms[cache_output_idx + 2]
+            encoder_cache_value[layer_idx] = decoder_init_ofms[cache_output_idx + 3]
         new_token = decoder_init_ofms[0].item()
         new_tokens = [new_token]
         perf_cnt_delta = (time.perf_counter_ns() - perf_cnt_begin) * 1e-9
@@ -552,13 +550,9 @@ class WhisperModel(BaseModel):
                 return WhisperDecoderInitModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, layer_idx=layer_idx,
-                    use_filter_sharing=self.use_filter_sharing
-                )
-            case "init_log_probe":
-                model_name = f"{self.model_name}_decoder_init_log_probe_layer{layer_idx}"
-                return WhisperDecoderInitModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-                    hf_model=self.hf_model, layer_idx=layer_idx, enable_log_probe=True,
+                    enable_log_probe=(
+                        self.cfg.log_probe_enabled and layer_idx == self.cfg.decoder_layers - 1
+                    ),
                     use_filter_sharing=self.use_filter_sharing
                 )
             case "pre":
