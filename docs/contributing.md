@@ -93,7 +93,9 @@ python scripts/gen_models--openai--whisper.py \
 
 Run it in the Model Compiler environment with an explicit model path.
 `--part` accepts `all`, `encoder`, `language_detect`, `init`, `single_pre`,
-`single_post`, `single_cache`, and `init_log_probe`.
+`single_post`, and `single_cache`. Add `--enable_log_probe` to compile
+log-probe-enabled decoder outputs; use `--part all --enable_log_probe` for a
+complete log-probe build.
 
 Compiler changes normally touch `sima_lmm/config/whisper_config.py`,
 `sima_lmm/model/whisper_*.py`, and the script; runtime changes touch
