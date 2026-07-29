@@ -9,7 +9,7 @@ runtime-package changes.
 | --- | --- |
 | `sima-lmm-core` | `libsima_lmm_runtime.so` and shared runtime assets |
 | `sima-lmm-dev` | Installed `sima_lmm` and required bundled headers; `SimaLMM` CMake package |
-| `sima-lmm-cli` | Python extension/modules and `llima` launcher |
+| `sima-lmm-cli` | Python CLI modules, internal nanobind bridge, and `llima` launcher |
 
 `dev` and `cli` require the exact matching `core`. Keep compiler-only
 dependencies out of all three.
@@ -34,7 +34,7 @@ Do not publish a header solely for an in-tree test.
 Implement shared semantics in the common C++ layer, then inspect:
 
 - installed declarations and implementation;
-- `binding.cpp` and Python orchestration;
+- internal `binding.cpp` bridge and Python CLI orchestration;
 - CLI, OpenAI-compatible HTTP, and ZMQ behavior;
 - errors, cancellation, and subsequent requests;
 - buffer, model, thread, process, and descriptor lifetime; and
@@ -74,7 +74,7 @@ Verify:
 - common C++ cancellation stops inference within a bound;
 - CLI uses graceful `SIGINT`, never `SIGTERM` or `SIGKILL`;
 - HTTP `/stop` ends the stream and a later request succeeds;
-- Python/ZMQ remain valid or gain coverage when cancellation is exposed;
+- CLI/ZMQ remain valid or gain coverage when cancellation is exposed;
 - the client exits and releases buffers, threads, and descriptors; and
 - appcomplex PID, thread/descriptor counts, and CMA memory remain near
   baseline.

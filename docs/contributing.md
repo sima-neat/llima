@@ -1,7 +1,9 @@
 # Contributing to LLiMa
 
-LLiMa contains a host-side GenAI compiler and a C++/Python runtime for
-Modalix. Keep their environments and dependencies separate. The root
+LLiMa contains a host-side GenAI compiler and a C++ runtime for Modalix. The
+runtime is operated through packaged CLI/HTTP/ZMQ entry points; Python is CLI
+orchestration, not a separate public runtime API. Keep compiler and runtime
+environments and dependencies separate. The root
 [CONTRIBUTING.md](../CONTRIBUTING.md) is the quick start; this guide is the
 detailed contributor policy. Agent-specific rules are in
 [AGENTS.md](../AGENTS.md).
@@ -15,8 +17,8 @@ detailed contributor policy. Agent-specific rules are in
 | Compilation | `sima_lmm/model/`, `sima_lmm/preproc/` | Model parts, quantization, graphs, and preprocessing |
 | Host tools | `sima_lmm/host/` | Compile, deploy, LoRA, and benchmark entry points |
 | Evaluation | `sima_lmm/mole/` | MoLE workflows |
-| Runtime | `sima_lmm/devkit/` | Python orchestration and model management |
-| C++ runtime | `sima_lmm/devkit/cpp/` | Models, tokenizer, MLA, CLI, HTTP, ZMQ, and bindings |
+| Runtime CLI | `sima_lmm/devkit/` | Python CLI orchestration and model management |
+| C++ runtime | `sima_lmm/devkit/cpp/` | Models, tokenizer, MLA, CLI/HTTP/ZMQ implementations, and the internal CLI binding |
 | Tests | `tests/` | Compiler and Modalix runtime tests |
 | Packaging | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian, wheel, and artifact assembly |
 | CI/caches | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | Builds, tests, and model caches |
@@ -182,8 +184,8 @@ checksums, and metadata.
 
 ### Compatibility and boundaries
 
-Treat installed C++ headers, Python APIs, CLI commands, serialized
-configuration, package metadata, and generated artifact layouts as
+Treat installed C++ headers, CLI commands, serialized configuration, package
+metadata, and generated artifact layouts as
 compatibility surfaces. Prefer additive changes. For a break, document
 affected consumers, migration, and release intent; update callers, tests,
 examples, and user docs.

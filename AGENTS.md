@@ -34,9 +34,8 @@ update or required integration fix, and document submodule revisions.
 
 - Target C++20 and the Python versions declared in `pyproject.toml`.
 - Follow local formatting and naming; avoid unrelated reformatting.
-- Treat installed C++ headers, Python APIs, CLI commands, serialized
-  configuration, package metadata, and artifact layouts as compatibility
-  surfaces.
+- Treat installed C++ headers, CLI commands, serialized configuration, package
+  metadata, and artifact layouts as compatibility surfaces.
 - Keep public interfaces minimal and prefer backward-compatible additions.
   Document migrations and update callers for intentional breaks.
 - Preserve the roles of `sima-lmm-core`, `sima-lmm-dev`, `sima-lmm-cli`, and

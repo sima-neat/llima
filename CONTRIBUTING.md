@@ -88,8 +88,8 @@ Runtime or packaging behavior:
 ./build.sh --all --clean
 ```
 
-This builds, but does not execute, the packaged C++ and Python runtime tests.
-Install the candidate packages on Modalix and follow
+This builds, but does not execute, the packaged C++ runtime and Python
+black-box tests. Install the candidate packages on Modalix and follow
 [Running runtime tests on a DevKit](tests/README.md#running-runtime-tests-on-a-devkit).
 Also run a representative `llima run` scenario when the change reaches model
 loading or inference.

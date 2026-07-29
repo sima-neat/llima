@@ -1,6 +1,6 @@
 ---
 name: sima-contribute-to-llima
-description: Make safe changes in the sima-neat/llima repository across GenAI compilation, Hugging Face or GGUF ingestion, generated graphs, quantization, Modalix runtime, C++ or Python APIs, packaging, CI, tests, documentation, and skills. Use for implementation, diagnosis, refactoring, testing, review fixes, and contributor documentation. Do not use for compiling a customer's model or building a Neat application.
+description: Make safe changes in the sima-neat/llima repository across GenAI compilation, Hugging Face or GGUF ingestion, generated graphs, quantization, the Modalix C++ runtime, CLI/HTTP/ZMQ interfaces, packaging, CI, tests, documentation, and skills. Use for implementation, diagnosis, refactoring, testing, review fixes, and contributor documentation. Do not use for compiling a customer's model or building a Neat application.
 ---
 
 # Contribute to LLiMa

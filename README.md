@@ -10,9 +10,10 @@
 LLiMa is SiMa.ai's runtime and Model Compiler toolkit for generative AI models
 on Modalix DevKits, including LLMs, VLMs, and ASR models.
 
-It provides a C++ runtime, Python bindings, a command-line experience, and
-Model Compiler tooling for running compiled GenAI model directories on SiMa
-hardware.
+It provides a C++ runtime, Python-backed command-line orchestration, and Model
+Compiler tooling for running compiled GenAI model directories on SiMa
+hardware. The Python layer supports the CLI; it is not a separate public
+runtime API.
 
 ## Packages
 
@@ -20,7 +21,7 @@ The Modalix DevKit runtime is delivered as three Debian packages:
 
 - `sima-lmm-core`: C++ runtime library, including `libsima_lmm_runtime.so`.
 - `sima-lmm-dev`: public C++ headers and `SimaLMM` CMake package metadata.
-- `sima-lmm-cli`: lean Python runtime package, nanobind extension, and `llima`
+- `sima-lmm-cli`: Python CLI modules, internal nanobind bridge, and `llima`
   command-line entry point.
 
 The Model Compiler tooling is delivered as a Python wheel:
