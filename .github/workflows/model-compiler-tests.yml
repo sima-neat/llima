@@ -7,8 +7,12 @@ on:
         description: Vulcan environment used for runner allocation and artifact resolution.
         required: true
         type: string
-      artifact_base_url:
-        description: Base URL for internally cached model inputs.
+      artifact_bucket:
+        description: S3 bucket containing internally cached model inputs.
+        required: true
+        type: string
+      aws_region:
+        description: AWS region containing the model-input cache bucket.
         required: true
         type: string
 
@@ -24,7 +28,8 @@ env:
   VULCAN_ARCHITECTURE: arm64
   VULCAN_CAPACITY: default
   VULCAN_WORKSPACE: /mnt/vulcan/workspace
-  ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+  ARTIFACT_BUCKET: ${{ inputs.artifact_bucket }}
+  AWS_REGION: ${{ inputs.aws_region }}
 
 jobs:
   test:
@@ -206,7 +211,7 @@ jobs:
           set -euo pipefail
           test_stage="${RUNNER_TEMP}/llima-compiler-tests"
           junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
-          expected_test_count=23
+          expected_test_count=55
 
           rm -rf "${test_stage}"
           mkdir -p "${test_stage}"
@@ -255,10 +260,11 @@ jobs:
           model_root="${RUNNER_TEMP}/llima-model-inputs"
           provenance="${RUNNER_TEMP}/llima-model-input-provenance.json"
           python3 tools/ci/prepare_model_inputs.py \
-            --base-url "${ARTIFACT_BASE_URL}" \
+            --s3-bucket "${ARTIFACT_BUCKET}" \
+            --aws-region "${AWS_REGION}" \
             --output-dir "${model_root}" \
             --provenance-output "${provenance}" \
-            --jobs 4
+            --jobs 8
           {
             echo "LLIMA_HF_MODELS_PATH=${model_root}"
             echo "LLIMA_MODEL_INPUT_PROVENANCE=${provenance}"
@@ -491,7 +497,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-graph-integration-junit.xml"
-          expected_test_count=22
+          expected_test_count=24
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -537,7 +543,7 @@ jobs:
           {
             echo "### Generated-graph and quantization integration"
             echo
-            echo "- Standard/embedding/GGUF cases: 22"
+            echo "- Standard/embedding/GGUF cases: 24"
             echo "- Serial speculative-decoding cases: 4"
             echo "- Unexpected skips: 0"
           } >> "${GITHUB_STEP_SUMMARY}"

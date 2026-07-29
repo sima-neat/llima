@@ -410,6 +410,8 @@ ensure_git_submodules() {
   fi
 
   if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "[build] Synchronizing git submodule URLs"
+    git -C "$ROOT_DIR" submodule sync --recursive
     echo "[build] Updating git submodules"
     git -C "$ROOT_DIR" submodule update --init --recursive
   else
@@ -677,6 +679,32 @@ ensure_neat_internals() {
   echo "[build] NEAT internals are ready."
 }
 
+resolve_neat_internals_memory_version() {
+  local deb package version
+  local -a runtime_debs=()
+
+  while IFS= read -r deb; do
+    package="$(dpkg-deb -f "${deb}" Package 2>/dev/null || true)"
+    if [[ "${package}" == "simaai-memory-lib" ]]; then
+      runtime_debs+=("${deb}")
+    fi
+  done < <(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' | sort)
+
+  if [[ "${#runtime_debs[@]}" -ne 1 ]]; then
+    echo "ERROR: Expected exactly one simaai-memory-lib package in the resolved Internals artifact; found ${#runtime_debs[@]}." >&2
+    printf '  %s\n' "${runtime_debs[@]}" >&2
+    return 1
+  fi
+
+  version="$(dpkg-deb -f "${runtime_debs[0]}" Version 2>/dev/null || true)"
+  if [[ -z "${version}" ]]; then
+    echo "ERROR: Unable to read the Debian version from ${runtime_debs[0]}." >&2
+    return 1
+  fi
+
+  printf '%s\n' "${version}"
+}
+
 detect_build_jobs() {
   if [ -n "$BUILD_JOBS" ]; then
     return
@@ -927,6 +955,10 @@ build_extras_archive() {
       echo "ERROR: Runtime test extras are missing the ASR transcription executable." >&2
       exit 1
     fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the tool-call parser executable." >&2
+      exit 1
+    fi
     if [[ ! -f "${install_prefix}/lib/sima-lmm/tests/CTestTestfile.cmake" ]]; then
       echo "ERROR: Runtime test extras are missing CTestTestfile.cmake." >&2
       exit 1
@@ -1157,6 +1189,8 @@ check_local_build_tools
 ensure_git_submodules
 detect_elxr_sdk
 ensure_neat_internals
+SIMA_LMM_MEMORY_LIB_VERSION="$(resolve_neat_internals_memory_version)"
+echo "[build] Using Internals simaai-memory-lib version: ${SIMA_LMM_MEMORY_LIB_VERSION}"
 write_resolved_deps_manifest
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
@@ -1220,6 +1254,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
   -DSKBUILD_PROJECT_VERSION="$LLIMA_PROJECT_VERSION" \
   -DSIMA_LMM_PACKAGE_VERSION="$LLIMA_VERSION" \
+  -DSIMA_LMM_MEMORY_LIB_VERSION="$SIMA_LMM_MEMORY_LIB_VERSION" \
   -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$ARCH" \
   "${CMAKE_SOABI_ARGS[@]}" \
   "${CMAKE_PYTHON_ARGS[@]}" \

@@ -99,10 +99,12 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     );
 
     // Decode mask stride must match the cache ELF's compiled bucket; a wider
-    // stride misaligns rows >= 1 and collapses the tree. Prefill mask is baked
-    // into the ELF, so this local buffer is unused.
+    // stride misaligns rows >= 1 and collapses the tree. Prefill group masks
+    // are prepared separately before cache dispatch, so this local buffer is unused.
     const uint16_t num_tokens = is_prefill ? 128 : 5;
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    const uint16_t mask_bucket = _get_cache_mask_size(
+        "full_attention", seq_len_with_past, false
+    );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = is_prefill
         ? static_cast<size_t>(num_tokens)
@@ -117,8 +119,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         }
     }
 
-    // Decode (n5) needs a runtime mask upload; prefill (n128) has its mask
-    // baked into the graph.
+    // Decode (n5) uses this runtime mask; prefill (n128) uses the group-mask buffer.
     if (!is_prefill) {
         get_buffer("future_token_mask").upload(padded_mask.data());
     }
@@ -207,6 +208,10 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
     const LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
     auto& fc_output_buf = get_buffer(fmt::format("fc_n{}_output", num_tokens));
+
+    if (is_prefill) {
+        _upload_group_future_token_masks(num_tokens, token_idx);
+    }
 
     // pre_model dispatch with explicit IFM begins/shapes for token embeds
     // (IFM[0]) and FC output (IFM[1]).
@@ -360,7 +365,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
 
     // pad_cols must match the cache ELF's compiled stride: rounding up
     // seq_len_with_past to mask_bucket. Wider strides misalign rows >= 1.
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    const uint16_t mask_bucket = _get_cache_mask_size(
+        "full_attention", seq_len_with_past, false
+    );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = static_cast<size_t>(
         round_up_to(static_cast<uint32_t>(seq_len_with_past), mask_bucket)
@@ -1208,7 +1215,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         _eagle3_stable_kv          = _cached_eagle3_stable_kv;
         draft_lm._eagle3_stable_kv = draft_lm._cached_eagle3_stable_kv;
         result.root_ready_time = std::chrono::steady_clock::now();
-        _notify_first_token(result.token, timer_ttft.stop());
+        result.time_to_first_token = timer_ttft.stop();
+        _notify_first_token(result.token, result.time_to_first_token);
         return result;
     }
 
@@ -1258,7 +1266,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 
     _logger->info("root token: {}", result.token);
     result.root_ready_time = std::chrono::steady_clock::now();
-    _notify_first_token(result.token, timer_ttft.stop());
+    result.time_to_first_token = timer_ttft.stop();
+    _notify_first_token(result.token, result.time_to_first_token);
 
     // Cache for next-turn prefix matching. Must run BEFORE push_back so
     // input_ids still matches the pre-root-token prefill length.
@@ -1315,8 +1324,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     LanguageModel& draft_lm,
     std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
-    std::optional<ChronoTimer> timer_ttft
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result
 ) {
+    if (performance_result != nullptr) {
+        *performance_result = GenerationPerformanceResult{};
+        performance_result->accepted_draft_tokens = 0;
+    }
     if (!timer_ttft.has_value())
         timer_ttft = ChronoTimer{true};
 
@@ -1359,6 +1373,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     auto init = initialize_tree(
         draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
     );
+    if (performance_result != nullptr) {
+        performance_result->token_durations.emplace_back(init.time_to_first_token);
+        performance_result->generated_tokens = 1;
+    }
 
     // Sync target's _eagle3_stable_kv with draft's — the draft incremented it
     // inside initialize_tree's first topk_generate, and tree_decoding reads it.
@@ -1486,6 +1504,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             const size_t offset = i - prev_size;
             const bool from_draft = (offset > 0) && (offset <= post.accept_length);
             _text_streamer.push(DecodeCallbackType::TPS, input_ids[i], per_token, from_draft);
+            if (performance_result != nullptr) {
+                performance_result->token_durations.emplace_back(per_token);
+                ++performance_result->generated_tokens;
+                if (from_draft) {
+                    ++performance_result->accepted_draft_tokens.value();
+                }
+            }
         }
         if (streamed > 0)
             iter_begin = iter_end;

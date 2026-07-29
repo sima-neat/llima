@@ -133,10 +133,11 @@
     "pipeline_cfg": {
         "system_prompt": null,
         "chat_template": null,
-        "max_num_tokens": 1024,
+        "max_num_tokens": 4096,
         "input_token_group_size": 1,
         "input_token_group_offsets": null,
         "future_token_mask_size": 1,
+        "long_context_future_token_mask_size": null,
         "return_logits": false,
         "enable_filter_sharing": false,
         "quantize_embeddings": false,

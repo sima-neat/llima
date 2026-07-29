@@ -271,6 +271,7 @@ struct PipelineConfig {
     uint16_t input_token_group_size;
     std::optional<std::vector<uint16_t>> input_token_group_offsets;
     uint16_t future_token_mask_size;
+    std::optional<uint16_t> long_context_future_token_mask_size = std::nullopt;
     bool return_logits;
     bool use_strided_kv_cache = true;
     bool enable_filter_sharing;
@@ -280,8 +281,9 @@ struct PipelineConfig {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     PipelineConfig, system_prompt, chat_template, max_num_tokens, input_token_group_size,
-    input_token_group_offsets, future_token_mask_size, return_logits, use_strided_kv_cache,
-    enable_filter_sharing, quantize_embeddings, embeddings_scale, quantize_kv_cache
+    input_token_group_offsets, future_token_mask_size, long_context_future_token_mask_size,
+    return_logits, use_strided_kv_cache, enable_filter_sharing, quantize_embeddings,
+    embeddings_scale, quantize_kv_cache
 )
 
 

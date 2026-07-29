@@ -1,6 +1,7 @@
 #ifndef _SIMA_LLIMA_LANGUAGE_MODEL_
 #define _SIMA_LLIMA_LANGUAGE_MODEL_
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -23,6 +24,17 @@
 
 namespace simaai {
 namespace llima {
+
+struct LogLikelihoodResult {
+    double logprob;
+    bool is_greedy;
+};
+
+struct GenerationPerformanceResult {
+    std::vector<double> token_durations;
+    uint32_t generated_tokens = 0;
+    std::optional<uint32_t> accepted_draft_tokens;
+};
 
 // Key to access the language model map: (num_tokens, layer_idx, token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
@@ -61,6 +73,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint32_t token_id,
             std::vector<Eigen::bfloat16>* logits_ptr = nullptr
         );
+        LogLikelihoodResult run_model_for_loglikelihood(
+            std::span<const uint32_t> input_token_ids,
+            size_t continuation_start,
+            std::span<const uint32_t> continuation_token_ids,
+            bool use_group_prefill = true
+        );
         // Speculative-decoding entry point: target invokes this, passing the
         // draft as a reference. Returns the newly generated token IDs, or
         // std::nullopt when generation aborted (e.g. cache full pre-init).
@@ -69,7 +87,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             LanguageModel& draft_lm,
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<ChronoTimer> timer_ttft = std::nullopt
+            std::optional<ChronoTimer> timer_ttft = std::nullopt,
+            GenerationPerformanceResult* performance_result = nullptr
         );
         void stop_model() { _is_running = false; }
 
@@ -98,6 +117,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::vector<std::vector<Eigen::bfloat16>> hidden_states;  // 3 captured layers
             uint32_t token;                                            // root token
             std::chrono::steady_clock::time_point root_ready_time;
+            double time_to_first_token;
         };
 
         // Result of topk_generate.
@@ -266,13 +286,37 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _define_per_layer_models();
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
-            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+            uint16_t num_tokens,
+            uint16_t token_idx,
+            bool use_sliding_cache
         );
         std::filesystem::path _get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
         std::filesystem::path _get_elf_path_linear(uint16_t num_tokens, uint8_t layer_idx);
+        static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
+        static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
+        uint16_t _get_cache_mask_size(
+            const std::string& layer_type, uint16_t context_length, bool is_group
+        ) const {
+            if (
+                layer_type != "sliding_attention"
+                && _cfg.pipeline_cfg.long_context_future_token_mask_size.has_value()
+                && context_length > LONG_CONTEXT_MIN_TOKENS
+            ) {
+                return _cfg.pipeline_cfg.long_context_future_token_mask_size.value();
+            }
+            return is_group
+                ? _cfg.pipeline_cfg.input_token_group_size
+                : _cfg.pipeline_cfg.future_token_mask_size;
+        }
+        uint16_t _get_max_future_token_mask_size() const {
+            return std::max(
+                _cfg.pipeline_cfg.future_token_mask_size,
+                _cfg.pipeline_cfg.long_context_future_token_mask_size.value_or(0)
+            );
+        }
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }
@@ -281,6 +325,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
                 && _cfg.vm_cfg.has_value() && _cfg.mm_cfg.has_value();
         }
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
+        void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
             size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
         );
@@ -289,6 +334,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
         void _dequantize_embedding_row(
             uint32_t token_id, MLABuffer& dst, size_t dst_row = 0
+        );
+        void _run_model_once_for_loglikelihood_logits(
+            uint16_t token_idx, uint32_t input_token_id
+        );
+        LogLikelihoodResult _run_model_once_for_loglikelihood(
+            uint16_t token_idx, uint32_t input_token_id, uint32_t target_token_id
         );
         std::vector<uint32_t> _get_per_layer_token_ids(
             std::span<const uint32_t> input_token_ids
