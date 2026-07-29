@@ -9,11 +9,17 @@ description: Make safe changes in the sima-neat/llima repository across GenAI co
 
 1. Read `AGENTS.md` and `docs/contributing.md`.
 2. Read `references/repository-map.md`, then classify the change.
-3. For runtime implementation, installed headers, bindings, CLI/HTTP/ZMQ,
+3. Diagnose one boundary at a time. Answer the scoped question first, then
+   separate independent downstream blockers instead of treating one failure as
+   proof that the whole workflow is unsupported.
+4. For runtime implementation, installed headers, bindings, CLI/HTTP/ZMQ,
    lifecycle, or runtime packages, read `references/runtime-changes.md`.
-4. For a new architecture, source layout, tokenizer, or prompt contract, also
-   use `sima-add-llima-model-support`.
-5. Search for nearby implementations, tests, CLI definitions, and docs.
+5. For external model or checkpoint compatibility, also use
+   `sima-add-llima-model-support` and read its compatibility audit before
+   classifying new implementation work.
+6. Search for nearby implementations, fallback resolvers, tests, CLI
+   definitions, and docs. When shared compiler code may affect both, trace the
+   ONNX and direct Model SDK generation paths before adding a new helper.
    Preserve unrelated work and vendored code.
 
 ## Implement
@@ -24,6 +30,8 @@ description: Make safe changes in the sima-neat/llima repository across GenAI co
 - Use `deps/manifest.json` for dependency versions.
 - Reject unsupported input explicitly; do not silently change model, revision,
   precision, format, or execution path.
+- Distinguish declared dependency constraints from the versions actually
+  installed in the supported build environment.
 - Add focused tests and update the closest official guide with user-visible
   behavior.
 

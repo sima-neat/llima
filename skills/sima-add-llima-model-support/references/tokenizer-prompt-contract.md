@@ -16,6 +16,10 @@ Use the source implementation only as the oracle:
 For identical structured messages, Minja must match reference prompt text,
 token IDs, generation suffix, and image-token placement.
 
+Host tokenization and runtime tokenization are separate boundaries. A custom
+`AutoTokenizer` that works on the compilation host is not sufficient unless
+the generated DevKit directory contains an asset that the C++ runtime can load.
+
 ## Procedure
 
 1. Inventory tokenizer, template, processor, and GGUF tokenizer metadata.
@@ -29,10 +33,23 @@ token IDs, generation suffix, and image-token placement.
 4. Define accepted system, user, assistant, image, tool-definition, tool-call,
    and tool-result messages.
 5. Compare reference and Minja rendering exactly.
-6. Fix the smallest boundary:
+6. Trace host loading in `sima_lmm/preproc/vlm_helper.py`, asset packaging in
+   `sima_lmm/model/base.py::gen_devkit_files`, and runtime loading in
+   `sima_lmm/devkit/cpp/{vlm_helper,tokenizer}.*`.
+7. Verify that the actual tokenizer file extension and representation survive
+   packaging; do not assume custom source files are copied or executable on
+   Modalix.
+8. Fix the smallest boundary:
+   - tokenizer representation: deterministic compiler-side conversion when
+     exact parity is possible;
    - asset selection: ingestion/packaging;
    - standard Jinja syntax: Minja;
    - different message protocol: model-specific runtime handling.
+
+If `AutoTokenizer` requires remote code, report whether the exact current call
+works, whether enabling remote code is approved, and whether the resulting
+tokenizer can be serialized for the existing runtime. Do not equate host
+loading success with runtime compatibility.
 
 ## Minja Ownership
 

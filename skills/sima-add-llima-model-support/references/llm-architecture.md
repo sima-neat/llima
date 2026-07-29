@@ -6,21 +6,26 @@ ingestion/source-layout handling.
 
 ## Implementation Order
 
-1. Use the matching
+1. Check the actual compiler environment and determine whether the architecture
+   is native to its installed Transformers version or supplied through model
+   repository remote code. Config loading is a separate boundary from LLiMa
+   architecture support.
+2. Use the matching
    [Transformers model implementation](https://github.com/huggingface/transformers/tree/main/src/transformers/models/)
    at a pinned commit as the architecture and numerical reference. If it is
-   absent, use the model repository's pinned remote-code implementation and
-   document that provenance.
-2. Add the LLiMa architecture identifier and source detection.
-3. Add only configuration fields required to express new behavior.
-4. Adapt existing pre/cache/post, attention, or convolution modeling files
+   absent, use the model repository's pinned remote-code implementation as the
+   oracle and document that provenance. Use vLLM, llama.cpp, or another native
+   implementation only as corroborating evidence.
+3. Add the LLiMa architecture identifier and source detection.
+4. Add only configuration fields required to express new behavior.
+5. Adapt existing pre/cache/post, attention, or convolution modeling files
    when their tensor flow and state contract already fit.
-5. Add a new layer type and modeling file only for genuinely new computation
+6. Add a new layer type and modeling file only for genuinely new computation
    or persistent state; include it in the compiler-unit matrix.
-6. Generate and compile affected units, comparing them with the reference
+7. Generate and compile affected units, comparing them with the reference
    implementation. Establish generated config, names, tensor layouts, and
    state interfaces before changing runtime code.
-7. Adapt the C++ runtime only for a new execution contract. Drive selection,
+8. Adapt the C++ runtime only for a new execution contract. Drive selection,
    dimensions, and behavior from generated configuration.
 
 ## Define the Contract

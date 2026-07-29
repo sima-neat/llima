@@ -5,6 +5,7 @@ in `docs/contributing.md` and `tests/README.md`.
 
 | Surface | Minimum evidence | Example |
 | --- | --- | --- |
+| Framework/config loader | Exact current call under the installed dependency versions | Distinguish native `CONFIG_MAPPING` support from reviewed remote code |
 | LLM configuration | Hermetic parsing and invalid-input tests | Reject a hybrid layer schedule whose length differs from `num_hidden_layers` |
 | LLM numerical behavior | Deterministic prefill/cache/post comparisons | Compare LFM2-style convolution and attention units against upstream outputs |
 | VLM preprocessing | Exact processor input comparison | Compare Qwen3-VL patch tensors for one fixed image and resolution |
@@ -12,6 +13,7 @@ in `docs/contributing.md` and `tests/README.md`.
 | Hugging Face layout | Synthetic transform plus source-ingestion case | Split a marked fused QKV tensor and assert every output slice |
 | GGUF layout | Config parity, permutation, and quantization cases | Compare Mistral HF/GGUF config and Q/K tensors |
 | Tokenizer/prompt contract | Exact rendered prompt and token IDs | Render ordinary and tool-enabled messages through the source Jinja implementation and Minja |
+| Runtime tokenizer assets | Generated DevKit files load through the C++ tokenizer | Convert a custom source tokenizer and compare host/runtime IDs |
 | Compiler integration | Required units generated without unintended skips | Generate all selected group/single or vision units |
 | Modalix runtime | Representative task succeeds and exits cleanly | Run two LLM turns or one image-grounded VLM prompt |
 

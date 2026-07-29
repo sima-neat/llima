@@ -33,3 +33,8 @@ Use:
 - `.github/PULL_REQUEST_TEMPLATE.md` for required PR evidence.
 
 Treat `dist/` as generated output. Update the closest source of truth.
+
+For checkpoint compatibility or new model support, use
+`sima-add-llima-model-support` and read its
+`references/compatibility-audit.md`; that audit owns the detailed boundary
+entry points and resolver routing.

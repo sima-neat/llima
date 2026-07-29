@@ -1,8 +1,8 @@
 id: sima-add-llima-model-support
-name: Add LLiMa Model Support
+name: Assess or Add LLiMa Model Support
 version: 0.1.0
 agents: [codex, claude]
-description: Add and validate LLM or VLM architecture, source-layout, tokenizer, and prompt-contract support in LLiMa.
+description: Assess LLM or VLM checkpoint compatibility and add architecture, source-layout, tokenizer, or prompt-contract support in LLiMa.
 compatibility:
   env_types: [host, sdk]
   env_subtypes: [linux, palette]

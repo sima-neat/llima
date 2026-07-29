@@ -1,24 +1,29 @@
 ---
 name: sima-add-llima-model-support
-description: Add LLM or VLM model support in sima-neat/llima. Use for a new language architecture, vision encoder or multimodal projector, Hugging Face or GGUF tensor layout, or tokenizer/prompt contract. Do not use for ASR architecture work, a compatible checkpoint on an existing architecture, or ordinary ONNX compilation.
+description: Assess or add LLM or VLM model support in sima-neat/llima. Use to determine whether an unassessed Hugging Face or GGUF checkpoint is compatible, or when support may require a new language architecture, vision encoder, multimodal projector, tensor layout, tokenizer, or prompt contract. Do not use for ASR architecture work, checkpoints already confirmed compatible, or ordinary ONNX compilation.
 ---
 
-# Add LLiMa Model Support
+# Assess or Add LLiMa Model Support
 
-Normalize upstream differences at ingestion/configuration boundaries before
-adding architecture-specific compiler or runtime branches.
+Assess the affected compatibility boundaries first. Normalize upstream
+differences at ingestion/configuration boundaries before adding
+architecture-specific compiler or runtime branches.
 
 ## Classify
 
 1. Read `AGENTS.md` and `docs/contributing.md`.
-2. Record model ID/revision, format, modality, config, tensor index, tokenizer,
-   template, and processor files.
-3. Compare with the closest case in `tests/compilation/cases.py`.
-4. If architecture, layout, tokenizer, and prompt contracts already match, use
+2. Record the model ID/revision and only the source artifacts relevant to the
+   question: format, modality, config, tensor index, tokenizer, template, or
+   processor files.
+3. Read `references/compatibility-audit.md`. Record evidence for affected
+   boundaries, mark the others not applicable, and inspect existing
+   compatibility hooks before proposing new machinery.
+4. Compare with the closest case in `tests/compilation/cases.py`.
+5. If architecture, layout, tokenizer, and prompt contracts already match, use
    `sima-llima-compile-run`; do not add checkpoint-specific branches. Example:
    a new size or fine-tune of an existing Llama architecture needs compilation,
    not source changes.
-5. Otherwise choose the smallest route:
+6. Otherwise choose the smallest route:
 
 | Route | Reference | Example |
 | --- | --- | --- |
@@ -34,6 +39,8 @@ Combine routes only for independently proven differences. Then read
 
 - Express the upstream contract with the smallest reusable config, ingestion,
   graph, preprocessing, or runtime change.
+- Extend existing name, tensor, graph, and packaging resolvers before adding a
+  parallel model-specific implementation.
 - Keep format-specific normalization out of shared model computation.
 - Keep ONNX and direct Model SDK graphs aligned where both apply.
 - Reject missing or ambiguous config/tensor layouts.
@@ -58,5 +65,6 @@ Combine routes only for independently proven differences. Then read
 ## Finish
 
 Report the route and analogue, model/revision, changed surfaces, source formats,
-tests and Modalix evidence, unavailable checks, limitations, and docs/cache
-changes.
+affected-boundary results, tests and Modalix evidence, unavailable checks,
+limitations, and docs/cache changes. Label evidence from mirrors or derivative
+checkpoints as provisional rather than attributing it to the pinned target.
