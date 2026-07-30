@@ -12,6 +12,7 @@ namespace {
 using simaai::llima::ToolCallFormat;
 using simaai::llima::ToolCallStreamParser;
 using simaai::llima::tool_call_format_for_model;
+using simaai::llima::tool_call_special_tokens;
 using simaai::llima::try_parse_tool_calls;
 
 int failures = 0;
@@ -407,6 +408,18 @@ void test_maps_qwen35_model_type() {
     );
 }
 
+void test_preserves_qwen35_tool_call_tokens() {
+    const auto tokens = tool_call_special_tokens(ToolCallFormat::Qwen35);
+    expect(
+        tokens == std::vector<std::string>{"<tool_call>", "</tool_call>"},
+        "Qwen3.5 opening and closing tool-call tokens must survive streaming decode"
+    );
+    expect(
+        tool_call_special_tokens(ToolCallFormat::Qwen).empty(),
+        "legacy Qwen token preservation must remain unchanged"
+    );
+}
+
 } // namespace
 
 int main() {
@@ -421,6 +434,7 @@ int main() {
     test_rejects_invalid_qwen35_xml_tool_calls();
     test_streams_qwen35_xml_tool_calls();
     test_maps_qwen35_model_type();
+    test_preserves_qwen35_tool_call_tokens();
 
     if (failures != 0) {
         std::cerr << failures << " tool-call parser assertion(s) failed\n";

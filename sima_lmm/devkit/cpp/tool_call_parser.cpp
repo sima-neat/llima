@@ -696,6 +696,8 @@ std::vector<std::string> tool_call_special_tokens(ToolCallFormat format) {
             return {std::string(gemma_open), std::string(gemma_close), R"(<|"|>)"};
         case ToolCallFormat::Mistral:
             return {std::string(mistral_prefix)};
+        case ToolCallFormat::Qwen35:
+            return {std::string(qwen_open), std::string(qwen_close)};
         default:
             return {};
     }
