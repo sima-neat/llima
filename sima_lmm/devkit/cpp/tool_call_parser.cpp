@@ -536,7 +536,11 @@ nlohmann::json parse_qwen35_tool_calls(
     const std::vector<std::string>* allowed_tool_names
 ) {
     nlohmann::json result = nlohmann::json::array();
-    size_t pos = 0;
+    // The Qwen3.5 template permits natural-language reasoning before the
+    // first call. The preamble is intentionally omitted from structured
+    // tool-call responses.
+    size_t pos = text.find(qwen_open);
+    if (pos == std::string_view::npos) return nullptr;
     while (pos < text.size()) {
         while (pos < text.size() &&
                std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
@@ -873,8 +877,14 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
         case ToolCallFormat::Mistral:
             return marker_mode(mistral_prefix);
         case ToolCallFormat::Qwen:
-        case ToolCallFormat::Qwen35:
             return marker_mode(qwen_open);
+        case ToolCallFormat::Qwen35:
+            // A valid call may follow an arbitrary natural-language preamble,
+            // so do not stream content until the complete response is known.
+            if (!done) return Mode::Undecided;
+            return _buffer.find(qwen_open) == std::string::npos
+                ? Mode::Content
+                : Mode::ToolCall;
         case ToolCallFormat::Llama:
             return stripped.front() == '{' ? Mode::ToolCall : Mode::Content;
         case ToolCallFormat::GenericJson:

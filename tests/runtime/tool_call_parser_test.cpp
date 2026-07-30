@@ -370,6 +370,60 @@ void test_rejects_invalid_qwen35_xml_tool_calls() {
     expect(trailing_prose.is_null(), "Qwen3.5 XML with trailing prose must fail closed");
 }
 
+
+void test_parses_qwen35_xml_after_preamble() {
+    const auto calls = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(I'll turn on the AC and set the temperature to 25 degrees, and check the outside temperature for you.
+
+<tool_call>
+<function=set_ac>
+<parameter=enabled>
+True
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=set_ac_temperature>
+<parameter=temperature_celsius>
+25
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=not_supported_delegate>
+<parameter=user_command>
+check temperature outside
+</parameter>
+</function>
+</tool_call>)",
+        {"set_ac", "set_ac_temperature", "not_supported_delegate"}
+    );
+    expect(!calls.is_null(), "Qwen3.5 XML after a natural-language preamble must parse");
+    if (calls.is_null()) return;
+
+    expect(calls.size() == 3, "all Qwen3.5 calls after a preamble must be preserved");
+    expect(
+        calls.at(0).at("function").at("name") == "set_ac" &&
+            arguments_from(calls).at("enabled") == true,
+        "Python-style booleans in preamble-prefixed calls must retain their type"
+    );
+    expect(
+        calls.at(1).at("function").at("name") == "set_ac_temperature" &&
+            nlohmann::json::parse(
+                calls.at(1).at("function").at("arguments").get<std::string>()
+            ).at("temperature_celsius") == 25,
+        "numeric arguments in later calls must be preserved"
+    );
+    expect(
+        calls.at(2).at("function").at("name") == "not_supported_delegate" &&
+            nlohmann::json::parse(
+                calls.at(2).at("function").at("arguments").get<std::string>()
+            ).at("user_command") == "check temperature outside",
+        "unquoted string arguments in later calls must be preserved"
+    );
+}
+
 void test_streams_qwen35_xml_tool_calls() {
     ToolCallStreamParser parser(ToolCallFormat::Qwen35, {"set_fan_speed"});
     expect(
@@ -393,6 +447,69 @@ void test_streams_qwen35_xml_tool_calls() {
             calls != nullptr && calls->calls.size() == 1 &&
                 arguments_from(calls->calls).at("level") == 3,
             "the streamed Qwen3.5 XML event must contain structured tool calls"
+        );
+    }
+}
+
+
+void test_buffers_qwen35_preamble_until_calls_are_known() {
+    ToolCallStreamParser parser(
+        ToolCallFormat::Qwen35,
+        {"set_ac", "set_ac_temperature"}
+    );
+    expect(
+        parser.add("I'll handle that.\n\n", false).empty(),
+        "a Qwen3.5 preamble must remain buffered"
+    );
+    expect(
+        parser.add(
+            "<tool_call><function=set_ac><parameter=enabled>True</parameter>",
+            false
+        ).empty(),
+        "incomplete Qwen3.5 XML after a preamble must remain buffered"
+    );
+    const auto events = parser.add(
+        "</function></tool_call>"
+        "<tool_call><function=set_ac_temperature>"
+        "<parameter=temperature_celsius>25</parameter>"
+        "</function></tool_call>",
+        true
+    );
+    expect(events.size() == 1, "valid preamble-prefixed XML must emit only tool calls");
+    if (events.size() == 1) {
+        const auto* calls = std::get_if<ToolCallStreamParser::ToolCalls>(&events[0]);
+        expect(
+            calls != nullptr && calls->calls.size() == 2,
+            "the preamble must be suppressed when structured calls are emitted"
+        );
+    }
+
+    ToolCallStreamParser content_parser(ToolCallFormat::Qwen35, {"set_ac"});
+    expect(
+        content_parser.add("Hello", false).empty(),
+        "ordinary Qwen3.5 content must remain buffered until completion"
+    );
+    const auto content_events = content_parser.add(" there", true);
+    expect(content_events.size() == 1, "completed ordinary content must be emitted");
+    if (content_events.size() == 1) {
+        const auto* content = std::get_if<ToolCallStreamParser::Content>(&content_events[0]);
+        expect(
+            content != nullptr && content->text == "Hello there",
+            "ordinary Qwen3.5 content must be preserved exactly"
+        );
+    }
+
+    ToolCallStreamParser malformed_parser(ToolCallFormat::Qwen35, {"set_ac"});
+    const std::string malformed_text =
+        "I'll handle that.\n\n<tool_call><function=set_ac>";
+    const auto malformed_events = malformed_parser.add(malformed_text, true);
+    expect(malformed_events.size() == 1, "malformed Qwen3.5 XML must fall back to content");
+    if (malformed_events.size() == 1) {
+        const auto* content =
+            std::get_if<ToolCallStreamParser::Content>(&malformed_events[0]);
+        expect(
+            content != nullptr && content->text == malformed_text,
+            "malformed Qwen3.5 XML must preserve the complete original response"
         );
     }
 }
@@ -432,7 +549,9 @@ int main() {
     test_preserves_stream_content_provenance();
     test_parses_qwen35_xml_tool_calls();
     test_rejects_invalid_qwen35_xml_tool_calls();
+    test_parses_qwen35_xml_after_preamble();
     test_streams_qwen35_xml_tool_calls();
+    test_buffers_qwen35_preamble_until_calls_are_known();
     test_maps_qwen35_model_type();
     test_preserves_qwen35_tool_call_tokens();
 
