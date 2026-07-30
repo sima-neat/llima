@@ -594,7 +594,7 @@ std::optional<Chat> WEB::_prepare_chat_context(
     std::string& model,
     bool& stream
 ) {
-    auto json_data = nlohmann::json::parse(req.body);
+    auto json_data = nlohmann::ordered_json::parse(req.body);
     model = json_data.value("model", "default-model");
     stream = json_data.value("stream", false);
 
