@@ -3,10 +3,9 @@
 LLiMa contains a host-side GenAI compiler and a C++ runtime for Modalix. The
 runtime is operated through packaged CLI/HTTP/ZMQ entry points; Python is CLI
 orchestration, not a separate public runtime API. Keep compiler and runtime
-environments and dependencies separate. The root
-[CONTRIBUTING.md](../CONTRIBUTING.md) is the quick start; this guide is the
-detailed contributor policy. Agent-specific rules are in
-[AGENTS.md](../AGENTS.md).
+environments and dependencies separate. In a repository checkout,
+`CONTRIBUTING.md` provides the quick start and `AGENTS.md` defines
+agent-specific rules; this guide is the detailed contributor policy.
 
 ## Repository Map
 
@@ -99,10 +98,9 @@ complete log-probe build.
 
 Compiler changes normally touch `sima_lmm/config/whisper_config.py`,
 `sima_lmm/model/whisper_*.py`, and the script; runtime changes touch
-`sima_lmm/devkit/cpp/whisper_*`. Validate with the packaged
-[ASR runtime test](../tests/README.md#c-runtime-tests) and representative audio
-on Modalix. This is a Whisper-specific path, not a general ASR architecture
-framework.
+`sima_lmm/devkit/cpp/whisper_*`. Validate with the packaged C++ ASR runtime
+test documented in `tests/README.md` and representative audio on Modalix. This
+is a Whisper-specific path, not a general ASR architecture framework.
 
 ## Testing
 
@@ -121,7 +119,7 @@ pytest -q <targeted-test-path>
 ### Model-backed compiler tests
 
 Compiler tests live under `tests/compilation/`. Select the affected group and
-marker from [tests/README.md](../tests/README.md). For example:
+marker described in `tests/README.md`. For example:
 
 ```bash
 export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
@@ -152,8 +150,8 @@ Build candidate packages and runtime-test extras:
 
 This builds but does not run the tests. Install matching candidate LLiMa and
 Internals packages on Modalix, extract the extras archive, and run packaged
-CTest and pytest as documented in
-[Running runtime tests on a DevKit](../tests/README.md#running-runtime-tests-on-a-devkit).
+CTest and pytest following the DevKit runtime-testing instructions in
+`tests/README.md`.
 
 Run affected hardware tests when a change reaches model loading, inference,
 tokenization, multimodal preprocessing, speculative decoding, CLI/HTTP/ZMQ, or
@@ -197,9 +195,9 @@ affected consumers, migration, and release intent; update callers, tests,
 examples, and user docs.
 
 Keep compiler, runtime, and MoLE dependencies separate. Runtime state must not
-be an input to host compilation. See
-[Runtime Changes](../skills/sima-contribute-to-llima/references/runtime-changes.md)
-for `sima-lmm-core`, `sima-lmm-dev`, `sima-lmm-cli`, and API/ABI validation.
+be an input to host compilation. Changes to runtime package boundaries must
+preserve the roles of `sima-lmm-core`, `sima-lmm-dev`, and `sima-lmm-cli` and
+include appropriate API/ABI validation.
 
 ### Implementation quality
 
