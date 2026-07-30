@@ -11,6 +11,7 @@ namespace {
 
 using simaai::llima::ToolCallFormat;
 using simaai::llima::ToolCallStreamParser;
+using simaai::llima::tool_call_format_for_model;
 using simaai::llima::try_parse_tool_calls;
 
 int failures = 0;
@@ -265,6 +266,147 @@ void test_preserves_stream_content_provenance() {
     }
 }
 
+void test_parses_qwen35_xml_tool_calls() {
+    const auto calls = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call>
+<function=set_ac_temperature>
+<parameter=temperature_celsius>
+30
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=set_ac>
+<parameter=enabled>
+true
+</parameter>
+</function>
+</tool_call>)",
+        {"set_ac_temperature", "set_ac"}
+    );
+    expect(!calls.is_null(), "Qwen3.5 function/parameter XML must parse");
+    if (calls.is_null()) return;
+
+    expect(calls.size() == 2, "all Qwen3.5 XML calls must be preserved");
+    expect(
+        calls.at(0).at("function").at("name") == "set_ac_temperature" &&
+            arguments_from(calls).at("temperature_celsius") == 30,
+        "Qwen3.5 numeric parameters must preserve their JSON type"
+    );
+    expect(
+        calls.at(1).at("function").at("name") == "set_ac" &&
+            nlohmann::json::parse(
+                calls.at(1).at("function").at("arguments").get<std::string>()
+            ).at("enabled") == true,
+        "Qwen3.5 boolean parameters must preserve their JSON type"
+    );
+
+    const auto string_call = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call>
+<function=send_message>
+<parameter=message>
+line one
+line two
+</parameter>
+</function>
+</tool_call>)",
+        {"send_message"}
+    );
+    expect(!string_call.is_null(), "Qwen3.5 multiline string parameters must parse");
+    if (!string_call.is_null()) {
+        expect(
+            arguments_from(string_call).at("message") == "line one\nline two",
+            "Qwen3.5 multiline string parameters must preserve internal newlines"
+        );
+    }
+
+    const auto no_argument_call = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call><function=get_hvac_status></function></tool_call>)",
+        {"get_hvac_status"}
+    );
+    expect(
+        !no_argument_call.is_null() && arguments_from(no_argument_call).empty(),
+        "Qwen3.5 functions without parameters must produce empty arguments"
+    );
+}
+
+void test_rejects_invalid_qwen35_xml_tool_calls() {
+    const auto unknown_tool = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call><function=delete_everything></function></tool_call>)",
+        {"set_ac"}
+    );
+    expect(unknown_tool.is_null(), "Qwen3.5 XML must enforce the tool allowlist");
+
+    const auto missing_parameter_close = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call><function=set_ac><parameter=enabled>true</function></tool_call>)",
+        {"set_ac"}
+    );
+    expect(
+        missing_parameter_close.is_null(),
+        "malformed Qwen3.5 parameter XML must fail closed"
+    );
+
+    const auto duplicate_parameter = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call><function=set_ac><parameter=enabled>true</parameter><parameter=enabled>false</parameter></function></tool_call>)",
+        {"set_ac"}
+    );
+    expect(
+        duplicate_parameter.is_null(),
+        "Qwen3.5 XML with duplicate parameters must fail closed"
+    );
+
+    const auto trailing_prose = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call><function=set_ac><parameter=enabled>true</parameter></function></tool_call> done)",
+        {"set_ac"}
+    );
+    expect(trailing_prose.is_null(), "Qwen3.5 XML with trailing prose must fail closed");
+}
+
+void test_streams_qwen35_xml_tool_calls() {
+    ToolCallStreamParser parser(ToolCallFormat::Qwen35, {"set_fan_speed"});
+    expect(
+        parser.add("<tool_", false).empty(),
+        "a partial Qwen3.5 tool marker must remain buffered"
+    );
+    const auto events = parser.add(
+        R"(call>
+<function=set_fan_speed>
+<parameter=level>
+3
+</parameter>
+</function>
+</tool_call>)",
+        true
+    );
+    expect(events.size() == 1, "a complete Qwen3.5 XML call must emit one event");
+    if (events.size() == 1) {
+        const auto* calls = std::get_if<ToolCallStreamParser::ToolCalls>(&events[0]);
+        expect(
+            calls != nullptr && calls->calls.size() == 1 &&
+                arguments_from(calls->calls).at("level") == 3,
+            "the streamed Qwen3.5 XML event must contain structured tool calls"
+        );
+    }
+}
+
+void test_maps_qwen35_model_type() {
+    expect(
+        tool_call_format_for_model("vlm-qwen3_5") == ToolCallFormat::Qwen35,
+        "vlm-qwen3_5 must use the Qwen3.5 XML parser"
+    );
+    expect(
+        tool_call_format_for_model("vlm-qwen3_vl") == ToolCallFormat::Qwen,
+        "existing Qwen model types must retain the JSON parser"
+    );
+}
+
 } // namespace
 
 int main() {
@@ -275,6 +417,10 @@ int main() {
     test_streams_gemma_json_tool_call_envelope();
     test_streams_non_tool_gemma_json_without_waiting_for_end();
     test_preserves_stream_content_provenance();
+    test_parses_qwen35_xml_tool_calls();
+    test_rejects_invalid_qwen35_xml_tool_calls();
+    test_streams_qwen35_xml_tool_calls();
+    test_maps_qwen35_model_type();
 
     if (failures != 0) {
         std::cerr << failures << " tool-call parser assertion(s) failed\n";

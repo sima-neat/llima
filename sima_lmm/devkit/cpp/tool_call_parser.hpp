@@ -21,6 +21,7 @@ enum class ToolCallFormat {
     Gemma,
     Mistral,
     Qwen,
+    Qwen35,
     Llama,
 };
 
