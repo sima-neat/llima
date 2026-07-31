@@ -1149,6 +1149,13 @@ uint32_t LanguageModel::run_model_once(
 
     // Run all the queued models.
     MLAModelWithBuffer::run_queue();
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
+                get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
+            );
+        }
+    }
 
     // If this run landed exactly on a checkpoint boundary, save the tail.
     if (!_cached_states.empty()) {
@@ -1345,6 +1352,7 @@ void LanguageModel::_initialize() {
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
             get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)).clear();
             get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).clear();
+            get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)).clear();
         } else if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
             get_buffer(fmt::format("cache_key_l{}", layer_idx)).clear();
             get_buffer(fmt::format("cache_val_l{}", layer_idx)).clear();
@@ -1534,6 +1542,11 @@ void LanguageModel::_define_buffers() {
                     1,
                     linear_cfg.get_recurrent_state_size()
                 }
+            );
+            // Ping-pong state avoids MLA read-after-write corruption during grouped prefill.
+            define_buffer(
+                fmt::format("linear_delta_state_history_alt_l{}", i),
+                {1, linear_cfg.get_recurrent_state_size()}
             );
         } else {
             if (_cfg.pipeline_cfg.use_strided_kv_cache) {
@@ -2325,7 +2338,7 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     );
     linear_ofms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)),
+            &get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)),
             {0, 0},
             {1, linear_cfg.get_recurrent_state_size()}
         }

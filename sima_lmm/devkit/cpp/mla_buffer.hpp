@@ -51,6 +51,7 @@ class MLABuffer {
         ) const;
         void flush_cache() const;
         void invalidate_cache() const;
+        void swap_storage(MLABuffer& other);
 
         const std::string& get_name() const { return _name; }
         const std::string& get_dtype() const { return _dtype; }
