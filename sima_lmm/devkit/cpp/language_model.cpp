@@ -1406,6 +1406,26 @@ void LanguageModel::_define_buffers() {
             define_buffer("decode_embedding", {1, _cfg.lm_cfg.hidden_size});
         }
     }
+    if (
+        _cfg.lm_cfg.is_spec_decode()
+        && _cfg.pipeline_cfg.quantize_embeddings
+        && !_cfg.is_multimodal()
+    ) {
+        const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+        define_buffer(
+            fmt::format("eagle3_input_embeds_n{}", single_num_tokens),
+            {single_num_tokens, _cfg.lm_cfg.hidden_size},
+            "int8"
+        );
+        const uint16_t group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
+        if (is_draft && _use_group_token_models && group_num_tokens != single_num_tokens) {
+            define_buffer(
+                fmt::format("eagle3_input_embeds_n{}", group_num_tokens),
+                {group_num_tokens, _cfg.lm_cfg.hidden_size},
+                "int8"
+            );
+        }
+    }
 
     // Frequency tables.
     _define_buffer_freq_table(
@@ -2229,51 +2249,69 @@ void LanguageModel::compact_kv_after_accept(
     const uint32_t max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
     const uint32_t num_kv_heads = _cfg.lm_cfg.attn_cfg.num_key_value_heads;
 
-    // For each layer, gather KV at select_indices and scatter to contiguous positions.
-    // Strided layout: (num_kv_heads, max_num_tokens, head_dim). Per-position chunk per
-    // head is head_dim bf16 values at byte offset (h * max_num_tokens + pos) * head_dim_bytes.
+    if (static_cast<size_t>(prev_input_len) + n > max_num_tokens) {
+        throw std::runtime_error("Accepted EAGLE3 tokens exceed the KV-cache capacity");
+    }
+    for (const auto index : select_indices) {
+        if (index >= max_num_tokens) {
+            throw std::runtime_error("EAGLE3 KV selection index exceeds the cache capacity");
+        }
+    }
+
+    auto compact_buffer = [&](const std::string& name) {
+        auto& buf = get_buffer(name);
+        const auto& shape = buf.get_shape();
+        if (
+            shape.size() != 3 || shape[0] != num_kv_heads
+            || shape[1] != max_num_tokens
+        ) {
+            throw std::runtime_error(fmt::format(
+                "Unsupported EAGLE3 KV buffer shape for {}", name
+            ));
+        }
+        const size_t row_bytes = shape[2] * buf.get_elem_size();
+        const size_t head_stride_bytes = max_num_tokens * row_bytes;
+        std::vector<uint8_t> tmp(n * row_bytes);
+
+        buf.invalidate_cache();
+        auto* data = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
+        for (uint32_t head = 0; head < num_kv_heads; ++head) {
+            auto* head_base = data + head * head_stride_bytes;
+            for (size_t row = 0; row < n; ++row) {
+                std::memcpy(
+                    tmp.data() + row * row_bytes,
+                    head_base + static_cast<size_t>(select_indices[row]) * row_bytes,
+                    row_bytes
+                );
+            }
+            for (size_t row = 0; row < n; ++row) {
+                std::memcpy(
+                    head_base + (static_cast<size_t>(prev_input_len) + row) * row_bytes,
+                    tmp.data() + row * row_bytes,
+                    row_bytes
+                );
+            }
+        }
+        buf.flush_cache();
+    };
+
+    // Gather accepted K/V rows and their quantization scales into contiguous positions.
     for (uint8_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-        // Skip non-attention layers (e.g., conv layers in some models).
-        if (layer_types[layer_idx] != "full_attention"
-            && layer_types[layer_idx] != "sliding_attention") {
+        if (
+            (layer_types[layer_idx] != "full_attention"
+             && layer_types[layer_idx] != "sliding_attention")
+            || _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
+        ) {
             continue;
         }
 
-        const uint32_t head_dim = _cfg.lm_cfg.attn_cfg.get_head_dim(layer_types[layer_idx]);
-        const size_t head_dim_bytes =
-            static_cast<size_t>(head_dim) * sizeof(Eigen::bfloat16);
-        const size_t head_stride_bytes =
-            static_cast<size_t>(max_num_tokens) * head_dim_bytes;
-
         for (const std::string& kind : {"cache_key_l", "cache_val_l"}) {
-            auto& buf = get_buffer(fmt::format("{}{}", kind, layer_idx));
-            buf.invalidate_cache();
-            uint8_t* data = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
-
-            std::vector<uint8_t> tmp(n * head_dim_bytes);
-            for (uint32_t h = 0; h < num_kv_heads; ++h) {
-                uint8_t* head_base = data + h * head_stride_bytes;
-
-                // Gather rows at select_indices into tmp (handles src/dst overlap).
-                for (size_t i = 0; i < n; ++i) {
-                    std::memcpy(
-                        tmp.data() + i * head_dim_bytes,
-                        head_base + static_cast<size_t>(select_indices[i]) * head_dim_bytes,
-                        head_dim_bytes
-                    );
-                }
-                // Scatter to contiguous positions [prev_input_len, prev_input_len + n).
-                for (size_t i = 0; i < n; ++i) {
-                    std::memcpy(
-                        head_base
-                            + (static_cast<size_t>(prev_input_len) + i) * head_dim_bytes,
-                        tmp.data() + i * head_dim_bytes,
-                        head_dim_bytes
-                    );
-                }
+            compact_buffer(fmt::format("{}{}", kind, layer_idx));
+        }
+        if (_cfg.pipeline_cfg.quantize_kv_cache) {
+            for (const std::string& kind : {"cache_key_scale_l", "cache_val_scale_l"}) {
+                compact_buffer(fmt::format("{}{}", kind, layer_idx));
             }
-
-            buf.flush_cache();
         }
     }
 
@@ -2540,6 +2578,65 @@ void LanguageModel::_dequantize_embedding_row(
     Eigen::Map<const Int8Row> src_row(src, static_cast<Eigen::Index>(hidden_size));
     Eigen::Map<ArrayXbf> dst_row_map(dst_row_ptr, static_cast<Eigen::Index>(hidden_size));
     dst_row_map = (src_row.cast<float>() * scale).cast<Eigen::bfloat16>();
+}
+
+
+void LanguageModel::_stage_embedding_rows(
+    LanguageModel& source_model,
+    std::span<const uint32_t> token_ids,
+    MLABuffer& destination
+) {
+    const auto& source = source_model.get_buffer("embeddings");
+    const auto& source_shape = source.get_shape();
+    const auto& destination_shape = destination.get_shape();
+    if (
+        source_shape.size() != 2 || destination_shape.size() != 2
+        || source_shape.back() != destination_shape.back()
+        || token_ids.size() > destination_shape.front()
+    ) {
+        throw std::runtime_error("Invalid EAGLE3 embedding staging shape");
+    }
+    for (const auto token_id : token_ids) {
+        if (token_id >= source_shape.front()) {
+            throw std::runtime_error(fmt::format(
+                "Embedding token id {} exceeds vocabulary size {}",
+                token_id,
+                source_shape.front()
+            ));
+        }
+    }
+
+    destination.clear(false);
+    const size_t hidden_size = source_shape.back();
+    if (source.get_dtype() == destination.get_dtype()) {
+        const size_t row_bytes = hidden_size * source.get_elem_size();
+        const auto* source_data = reinterpret_cast<const uint8_t*>(source.get_virtual_addr());
+        auto* destination_data = reinterpret_cast<uint8_t*>(destination.get_virtual_addr());
+        for (size_t row = 0; row < token_ids.size(); ++row) {
+            const uint32_t token_id = token_ids[row];
+            std::memcpy(
+                destination_data + row * row_bytes,
+                source_data + static_cast<size_t>(token_id) * row_bytes,
+                row_bytes
+            );
+        }
+    } else if (source.get_dtype() == "int8" && destination.get_dtype() == "bfloat16") {
+        if (!source_model._cfg.pipeline_cfg.embeddings_scale.has_value()) {
+            throw std::runtime_error(
+                "INT8 to BF16 embedding staging requires pipeline_cfg.embeddings_scale"
+            );
+        }
+        for (size_t row = 0; row < token_ids.size(); ++row) {
+            source_model._dequantize_embedding_row(token_ids[row], destination, row);
+        }
+    } else {
+        throw std::runtime_error(fmt::format(
+            "Unsupported EAGLE3 embedding staging conversion: {} to {}",
+            source.get_dtype(),
+            destination.get_dtype()
+        ));
+    }
+    destination.flush_cache();
 }
 
 

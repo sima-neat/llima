@@ -140,7 +140,7 @@ class VisionLanguageModel(BaseModel):
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
 
-        return VisionLanguageModel(
+        model = VisionLanguageModel(
             cfg=vlm_cfg,
             hf_model=hf_model,
             model_name=model_name,
@@ -148,6 +148,9 @@ class VisionLanguageModel(BaseModel):
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        if target_model is not None:
+            model.language_model.set_embedding_scale_source(target_model.language_model)
+        return model
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)

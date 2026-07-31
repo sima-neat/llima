@@ -127,19 +127,6 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     // Drafts share the target's embedding table — read rows from target's buffer.
     const auto& target_embeddings_buf = target_lm.get_buffer("embeddings");
     const uint32_t embed_size = target_embeddings_buf.get_shape().back();  // = hidden_size
-    const auto* embeddings_ptr = reinterpret_cast<const Eigen::bfloat16*>(
-        target_embeddings_buf.get_virtual_addr()
-    );
-    std::vector<Eigen::bfloat16> input_embeds(seq_length * embed_size);
-    const size_t row_bytes = embed_size * sizeof(Eigen::bfloat16);
-    for (size_t i = 0; i < seq_length; ++i) {
-        const uint32_t token_id = input_ids[i];
-        std::memcpy(
-            input_embeds.data() + i * embed_size,
-            embeddings_ptr + token_id * embed_size,
-            row_bytes
-        );
-    }
 
     // FC fusion: folds (seq_length, 3*hidden_size) stacked target captures down
     // to (seq_length, hidden_size). Skipped when input is already hidden_size wide.
@@ -191,16 +178,12 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         fc_output.upload(hidden_states_padded.data());
     }
     // Stage token embeds for pre_model IFM[0]; IFM[1] is the FC output above.
-    std::vector<Eigen::bfloat16> input_embeds_padded(
-        static_cast<size_t>(num_tokens) * embed_size, Eigen::bfloat16{0.0f}
-    );
-    std::memcpy(
-        input_embeds_padded.data(),
-        input_embeds.data(),
-        seq_length * embed_size * sizeof(Eigen::bfloat16)
-    );
-    auto& token_embeds_buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-    token_embeds_buf.upload(input_embeds_padded.data());
+    const bool use_int8_embedding_staging =
+        _cfg.pipeline_cfg.quantize_embeddings && !_cfg.is_multimodal();
+    auto& token_embeds_buf = use_int8_embedding_staging
+        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
+        : get_buffer(fmt::format("n{}_buffer1", num_tokens));
+    _stage_embedding_rows(target_lm, input_ids, token_embeds_buf);
 
     // model_key = (num_tokens, 0, past_kv_len) — picks the ELF with the right
     // KV-cache write offset, so no OFM override needed.
@@ -381,26 +364,13 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     }
     get_buffer("future_token_mask").upload(padded_mask.data());
 
-    // Stage input embeddings. The same `input_embeds` buffer is reused for both
-    // n128 prefill and n16 verify; we write the first K rows here.
-    const auto& embeddings_buf = get_buffer("embeddings");
-    const auto* embeddings_ptr = reinterpret_cast<const Eigen::bfloat16*>(
-        embeddings_buf.get_virtual_addr()
-    );
-    std::vector<Eigen::bfloat16> input_embeds_padded(
-        static_cast<size_t>(num_tokens) * hidden_size, Eigen::bfloat16{0.0f}
-    );
-    const size_t row_bytes = hidden_size * sizeof(Eigen::bfloat16);
-    for (size_t i = 0; i < seq_length; ++i) {
-        const uint32_t token_id = input_ids[i];
-        std::memcpy(
-            input_embeds_padded.data() + i * hidden_size,
-            embeddings_ptr + token_id * hidden_size,
-            row_bytes
-        );
-    }
-    auto& input_embeds_buf = get_buffer("input_embeds");
-    input_embeds_buf.upload(input_embeds_padded.data());
+    // Stage arbitrary candidate rows into the dtype expected by layer 0.
+    const bool use_int8_embedding_staging =
+        _cfg.pipeline_cfg.quantize_embeddings && !_cfg.is_multimodal();
+    auto& input_embeds_buf = use_int8_embedding_staging
+        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
+        : get_buffer("input_embeds");
+    _stage_embedding_rows(*this, input_ids, input_embeds_buf);
 
     // Per-layer loop; capture hidden states at layers {2, N/2, N-3}. model_key
     // bakes the KV write offset, so no OFM override needed.

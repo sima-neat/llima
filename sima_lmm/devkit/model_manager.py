@@ -88,6 +88,51 @@ def resolve_model_path(model: str) -> Path | None:
     return None
 
 
+def _is_runtime_model(model_dir: Path) -> bool:
+    return (
+        (model_dir / "devkit" / "vlm_config.json").is_file()
+        and (model_dir / "elf_files").is_dir()
+    )
+
+
+def _speculative_role(model_dir: Path) -> bool | None:
+    with (model_dir / "devkit" / "vlm_config.json").open() as f:
+        cfg = json.load(f)
+    spec_cfg = cfg.get("lm_cfg", {}).get("speculative_decoding_cfg")
+    if spec_cfg is None:
+        return None
+    return bool(spec_cfg.get("is_draft", False))
+
+
+def _invalid_artifact_message(model_path: Path) -> str:
+    return (
+        f"Invalid model artifact at {model_path}. Expected a deployed model or a "
+        "deployed speculative-decoding parent containing one target and one draft model."
+    )
+
+
+def resolve_target_and_draft_paths(model_path: Path) -> tuple[Path, Path | None]:
+    """Resolve a deployed model or a deployed speculative-decoding parent."""
+    if _is_runtime_model(model_path):
+        if _speculative_role(model_path) is None:
+            return model_path, None
+        raise RuntimeError(_invalid_artifact_message(model_path))
+
+    models: dict[bool, Path] = {}
+    if model_path.is_dir():
+        for model_dir in sorted(model_path.iterdir(), key=lambda path: path.name):
+            if not model_dir.is_dir() or not _is_runtime_model(model_dir):
+                continue
+            role = _speculative_role(model_dir)
+            if role is None or role in models:
+                raise RuntimeError(_invalid_artifact_message(model_path))
+            models[role] = model_dir
+
+    if set(models) == {False, True}:
+        return models[False], models[True]
+    raise RuntimeError(_invalid_artifact_message(model_path))
+
+
 def _fetch_json_with_headers(url: str) -> tuple[object, dict[str, str]]:
     with urllib.request.urlopen(url) as response:
         if response.status != 200:

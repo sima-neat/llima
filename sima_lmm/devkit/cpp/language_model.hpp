@@ -329,6 +329,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _dequantize_embedding_row(
             uint32_t token_id, MLABuffer& dst, size_t dst_row = 0
         );
+        void _stage_embedding_rows(
+            LanguageModel& source_model,
+            std::span<const uint32_t> token_ids,
+            MLABuffer& destination
+        );
         void _run_model_once_for_loglikelihood_logits(
             uint16_t token_idx, uint32_t input_token_id
         );

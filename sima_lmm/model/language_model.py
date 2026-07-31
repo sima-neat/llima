@@ -45,6 +45,7 @@ class LanguageModel(BaseModel):
     """
     _embeddings_scale: float | None = field(default=None, init=False, repr=False)
     _per_layer_embeddings_scale: float | None = field(default=None, init=False, repr=False)
+    _embedding_scale_source: "LanguageModel | None" = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.cfg.pipeline_cfg.input_token_group_offsets:
@@ -464,7 +465,15 @@ class LanguageModel(BaseModel):
         embeddings, scale = self.get_embeddings_tensor()
         if scale is not None:
             self._embeddings_scale = float(scale)
+        elif embeddings is None and self._embedding_scale_source is not None:
+            if self._embedding_scale_source._embeddings_scale is None:
+                self._embedding_scale_source.get_input_embeddings_tensor()
+            self._embeddings_scale = self._embedding_scale_source._embeddings_scale
         return embeddings, self._embeddings_scale
+
+    def set_embedding_scale_source(self, source: "LanguageModel") -> None:
+        """Use another model's embedding quantization scale."""
+        self._embedding_scale_source = source
 
     def get_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, float | None]:
         base_name = self.hf_model.language_model_param_base_name
