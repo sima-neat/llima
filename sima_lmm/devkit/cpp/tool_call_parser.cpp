@@ -59,6 +59,10 @@ constexpr std::string_view gemma_quote = R"(<|"|>)";
 constexpr std::string_view mistral_prefix = "[TOOL_CALLS]";
 constexpr std::string_view qwen_open = "<tool_call>";
 constexpr std::string_view qwen_close = "</tool_call>";
+constexpr std::string_view qwen35_function_open = "<function=";
+constexpr std::string_view qwen35_function_close = "</function>";
+constexpr std::string_view qwen35_parameter_open = "<parameter=";
+constexpr std::string_view qwen35_parameter_close = "</parameter>";
 
 nlohmann::json build_tool_call_entry(
     const nlohmann::json& parsed,
@@ -526,6 +530,85 @@ nlohmann::json parse_qwen_tool_calls(
     return result.empty() ? nullptr : result;
 }
 
+nlohmann::json parse_qwen35_tool_calls(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    const auto first_call = text.find(qwen_open);
+    if (first_call == std::string_view::npos) return nullptr;
+    text = trim_view(text.substr(first_call));
+
+    nlohmann::json result = nlohmann::json::array();
+    size_t pos = 0;
+    while (pos < text.size()) {
+        if (!text.substr(pos).starts_with(qwen_open)) return nullptr;
+        const auto body_start = pos + qwen_open.size();
+        const auto body_end = text.find(qwen_close, body_start);
+        if (body_end == std::string_view::npos) return nullptr;
+        auto body = trim_view(text.substr(body_start, body_end - body_start));
+
+        if (!body.starts_with(qwen35_function_open)) return nullptr;
+        const auto function_name_end = body.find('>', qwen35_function_open.size());
+        if (function_name_end == std::string_view::npos) return nullptr;
+        const auto function_name = trim_view(body.substr(
+            qwen35_function_open.size(),
+            function_name_end - qwen35_function_open.size()
+        ));
+        if (function_name.empty()) return nullptr;
+
+        const auto function_end = body.rfind(qwen35_function_close);
+        if (function_end == std::string_view::npos ||
+            !trim_view(body.substr(function_end + qwen35_function_close.size())).empty()) {
+            return nullptr;
+        }
+
+        nlohmann::json arguments = nlohmann::json::object();
+        auto parameters = body.substr(
+            function_name_end + 1, function_end - function_name_end - 1
+        );
+        while (!(parameters = trim_left_view(parameters)).empty()) {
+            if (!parameters.starts_with(qwen35_parameter_open)) return nullptr;
+            const auto parameter_name_end = parameters.find(
+                '>', qwen35_parameter_open.size()
+            );
+            if (parameter_name_end == std::string_view::npos) return nullptr;
+            const auto parameter_name = trim_view(parameters.substr(
+                qwen35_parameter_open.size(),
+                parameter_name_end - qwen35_parameter_open.size()
+            ));
+            if (parameter_name.empty() || arguments.contains(parameter_name)) return nullptr;
+
+            const auto parameter_end = parameters.find(
+                qwen35_parameter_close, parameter_name_end + 1
+            );
+            if (parameter_end == std::string_view::npos) return nullptr;
+            const auto value = trim_view(parameters.substr(
+                parameter_name_end + 1, parameter_end - parameter_name_end - 1
+            ));
+            const auto parsed_value = parse_python_value(value);
+            arguments[std::string(parameter_name)] = parsed_value.value_or(
+                nlohmann::json(std::string(value))
+            );
+            parameters.remove_prefix(parameter_end + qwen35_parameter_close.size());
+        }
+
+        auto entry = build_tool_call_entry(
+            {{"name", std::string(function_name)}, {"arguments", arguments}},
+            id_counter, allowed_tool_names
+        );
+        if (entry.is_null()) return nullptr;
+        result.push_back(std::move(entry));
+
+        pos = body_end + qwen_close.size();
+        while (pos < text.size() &&
+               std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+            ++pos;
+        }
+    }
+    return result.empty() ? nullptr : result;
+}
+
 nlohmann::json try_parse_tool_calls_impl(
     ToolCallFormat format,
     std::string_view text,
@@ -548,6 +631,8 @@ nlohmann::json try_parse_tool_calls_impl(
                 return parse_mistral_tool_calls(text, id_counter, allowed_tool_names);
             case ToolCallFormat::Qwen:
                 return parse_qwen_tool_calls(text, id_counter, allowed_tool_names);
+            case ToolCallFormat::Qwen35:
+                return parse_qwen35_tool_calls(text, id_counter, allowed_tool_names);
             case ToolCallFormat::Llama:
                 return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names, true);
             case ToolCallFormat::GenericJson:
@@ -586,6 +671,9 @@ ToolCallFormat tool_call_format_for_model(std::string_view model_type) {
     if (model_type == "llm-qwen2" || model_type == "llm-qwen3" ||
         model_type == "vlm-qwen2_5_vl" || model_type == "vlm-qwen3_vl") {
         return ToolCallFormat::Qwen;
+    }
+    if (model_type == "vlm-qwen3_5") {
+        return ToolCallFormat::Qwen35;
     }
     if (model_type == "llm-llama") {
         return ToolCallFormat::Llama;
@@ -777,6 +865,9 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
             return marker_mode(mistral_prefix);
         case ToolCallFormat::Qwen:
             return marker_mode(qwen_open);
+        case ToolCallFormat::Qwen35:
+            // Qwen3.5 may emit prose before XML calls, so decide only at completion.
+            return done ? Mode::ToolCall : Mode::Undecided;
         case ToolCallFormat::Llama:
             return stripped.front() == '{' ? Mode::ToolCall : Mode::Content;
         case ToolCallFormat::GenericJson:

@@ -11,6 +11,7 @@ namespace {
 
 using simaai::llima::ToolCallFormat;
 using simaai::llima::ToolCallStreamParser;
+using simaai::llima::tool_call_format_for_model;
 using simaai::llima::try_parse_tool_calls;
 
 int failures = 0;
@@ -21,10 +22,117 @@ void expect(bool condition, const std::string& message) {
     ++failures;
 }
 
-nlohmann::json arguments_from(const nlohmann::json& calls) {
+nlohmann::json arguments_from(const nlohmann::json& calls, size_t index = 0) {
     return nlohmann::json::parse(
-        calls.at(0).at("function").at("arguments").get<std::string>()
+        calls.at(index).at("function").at("arguments").get<std::string>()
     );
+}
+
+void test_parses_qwen35_xml_tool_calls() {
+    expect(
+        tool_call_format_for_model("vlm-qwen3_5") == ToolCallFormat::Qwen35,
+        "Qwen3.5 models must select the XML tool-call parser"
+    );
+
+    const auto calls = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(I'll make those changes and check for you.
+<tool_call>
+<function=set_ac>
+<parameter=enabled>
+True
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=set_ac_temperature>
+<parameter=temperature_celsius>
+25
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=not_supported_delegate>
+<parameter=user_command>
+what is the temperature outside?
+</parameter>
+</function>
+</tool_call>)",
+        {"set_ac", "set_ac_temperature", "not_supported_delegate"}
+    );
+    expect(!calls.is_null(), "Qwen3.5 XML calls with leading prose must parse");
+    if (calls.is_null()) return;
+
+    expect(calls.size() == 3, "all Qwen3.5 XML calls must be preserved");
+    expect(
+        calls.at(0).at("function").at("name") == "set_ac" &&
+            arguments_from(calls).at("enabled") == true,
+        "Qwen3.5 boolean arguments must be decoded"
+    );
+    expect(
+        calls.at(1).at("function").at("name") == "set_ac_temperature" &&
+            arguments_from(calls, 1).at("temperature_celsius") == 25,
+        "Qwen3.5 numeric arguments must be decoded"
+    );
+    expect(
+        calls.at(2).at("function").at("name") == "not_supported_delegate" &&
+            arguments_from(calls, 2).at("user_command") ==
+                "what is the temperature outside?",
+        "Qwen3.5 unquoted text arguments must remain strings"
+    );
+}
+
+void test_rejects_invalid_qwen35_xml_tool_calls() {
+    const auto unknown_tool = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call><function=delete_everything></function></tool_call>)",
+        {"set_ac"}
+    );
+    expect(unknown_tool.is_null(), "Qwen3.5 XML must enforce the tool allowlist");
+
+    const auto duplicate_parameter = try_parse_tool_calls(
+        ToolCallFormat::Qwen35,
+        R"(<tool_call><function=set_ac><parameter=enabled>True</parameter><parameter=enabled>False</parameter></function></tool_call>)",
+        {"set_ac"}
+    );
+    expect(
+        duplicate_parameter.is_null(),
+        "Qwen3.5 XML must reject duplicate parameters"
+    );
+}
+
+void test_streams_qwen35_xml_tool_calls() {
+    ToolCallStreamParser parser(ToolCallFormat::Qwen35, {"set_ac"});
+    expect(
+        parser.add("I'll turn it on.\n<tool_", false).empty(),
+        "Qwen3.5 output must remain buffered while its mode is undecided"
+    );
+    const auto events = parser.add(
+        "call><function=set_ac><parameter=enabled>True</parameter></function></tool_call>",
+        true
+    );
+    expect(events.size() == 1, "streamed Qwen3.5 XML must emit one event");
+    if (events.size() == 1) {
+        const auto* calls = std::get_if<ToolCallStreamParser::ToolCalls>(&events[0]);
+        expect(
+            calls != nullptr && calls->calls.size() == 1 &&
+                arguments_from(calls->calls).at("enabled") == true,
+            "streamed Qwen3.5 XML must emit structured calls"
+        );
+    }
+
+    ToolCallStreamParser content_parser(ToolCallFormat::Qwen35, {"set_ac"});
+    expect(content_parser.add("ordinary ", false).empty(),
+           "Qwen3.5 content remains buffered until completion");
+    const auto content_events = content_parser.add("response", true);
+    expect(content_events.size() == 1, "ordinary Qwen3.5 content must be released");
+    if (content_events.size() == 1) {
+        const auto* content = std::get_if<ToolCallStreamParser::Content>(&content_events[0]);
+        expect(
+            content != nullptr && content->text == "ordinary response",
+            "ordinary Qwen3.5 content must remain unchanged"
+        );
+    }
 }
 
 void test_rejects_premature_lfm_string_close() {
@@ -268,6 +376,9 @@ void test_preserves_stream_content_provenance() {
 } // namespace
 
 int main() {
+    test_parses_qwen35_xml_tool_calls();
+    test_rejects_invalid_qwen35_xml_tool_calls();
+    test_streams_qwen35_xml_tool_calls();
     test_rejects_premature_lfm_string_close();
     test_quotes_complete_gemma_keys();
     test_parses_gemma_json_tool_call_envelope();
