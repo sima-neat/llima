@@ -54,7 +54,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 48
+- Expected cases: 56
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -315,6 +315,7 @@ Pytest validates the installed package and external interfaces:
 |------|----------|
 | Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
 | CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
+| MLA memory cleanup | Runs Qwen four times through `llima run -> quit`, checks `/dev/simaai-mem` after every exit, and verifies that the daemon PID and allocation baseline remain stable |
 | OpenAI-compatible HTTP | Non-streaming response, SSE reconstruction, `/stop`, malformed-input recovery, and a successful request after interruption |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
 
@@ -333,6 +334,21 @@ subsequent execution:
 - Does not grow daemon thread or file-descriptor counts.
 - Reaps the `llima` process.
 - Returns CMA memory within the configured tolerance.
+
+The MLA memory cleanup regression test performs four sequential Qwen
+`llima run -> quit` cycles without restarting `simaai-appcomplex.service`.
+After every cycle it checks the allocation summary from `/dev/simaai-mem`
+against the initial baseline and reports stale 512 MiB target-2 buffers with
+their owner PIDs. The repeat count, run timeout, cleanup timeout, and log
+directory can be overridden with:
+
+- `SIMA_TEST_LLIMA_MEMORY_REPEAT_COUNT`
+- `SIMA_TEST_LLIMA_MEMORY_RUN_TIMEOUT_SECONDS`
+- `SIMA_TEST_LLIMA_MEMORY_CLEANUP_TIMEOUT_SECONDS`
+- `SIMA_TEST_LLIMA_MEMORY_LOG_DIR`
+
+When a persistent log directory is configured, each test invocation writes to
+its own `run-*` subdirectory so earlier results remain available.
 
 ### Cancellation and test isolation
 

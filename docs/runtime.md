@@ -74,3 +74,10 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `unset lora` | Revert the LoRA model to the baseline model. |
 | `quit` | Quit. |
 | `help` | Print available commands. |
+
+## Build an Application with Neat
+
+After validating your model with `llima run`, see
+[GenAI Model](/develop-apps/development-workflow/genai-model/) to serve it
+through common API endpoints or use it directly from a C++ or Python
+application.

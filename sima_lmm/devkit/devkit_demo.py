@@ -125,7 +125,13 @@ def _resolve_target_and_draft_paths(model_path: Path) -> tuple[Path, Path | None
 
 def _kill_existing_llima_session() -> None:
     result = subprocess.run(
-        ["pkill", "--older", "60", "-f", "[l]lima"],
+        [
+            "pkill",
+            "--older",
+            "60",
+            "-f",
+            "[l]lima (run|benchmark-server)( |$)",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,

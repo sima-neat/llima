@@ -10,9 +10,10 @@
 LLiMa is SiMa.ai's runtime and Model Compiler toolkit for generative AI models
 on Modalix DevKits, including LLMs, VLMs, and ASR models.
 
-It provides a C++ runtime, Python bindings, a command-line experience, and
-Model Compiler tooling for running compiled GenAI model directories on SiMa
-hardware.
+It provides a C++ runtime, Python-backed command-line orchestration, and Model
+Compiler tooling for running compiled GenAI model directories on SiMa
+hardware. The Python layer supports the CLI; it is not a separate public
+runtime API.
 
 ## Packages
 
@@ -20,7 +21,7 @@ The Modalix DevKit runtime is delivered as three Debian packages:
 
 - `sima-lmm-core`: C++ runtime library, including `libsima_lmm_runtime.so`.
 - `sima-lmm-dev`: public C++ headers and `SimaLMM` CMake package metadata.
-- `sima-lmm-cli`: lean Python runtime package, nanobind extension, and `llima`
+- `sima-lmm-cli`: Python CLI modules, internal nanobind bridge, and `llima`
   command-line entry point.
 
 The Model Compiler tooling is delivered as a Python wheel:
@@ -62,7 +63,8 @@ syntax and environment options.
 
 ## Build LLiMa
 
-For source builds, use `build.sh`:
+Build from source inside the Neat SDK. The normal full build handles required
+setup, including submodules:
 
 ```bash
 ./build.sh --all --clean
@@ -71,7 +73,6 @@ For source builds, use `build.sh`:
 Common build modes:
 
 ```bash
-./build.sh --install-deps-only   # install host build dependencies
 ./build.sh --all --clean         # build all runtime debs and artifact layouts
 ./build.sh --clean --core        # package only sima-lmm-core
 ./build.sh --clean --core --dev  # package core and development files
@@ -82,21 +83,8 @@ Build output is generated under `build-deb/`. The installable bundle is written
 to `dist/`; its download-only three-package profile and archive are written to
 `dist/debs/`.
 
-On a fresh DevKit, install the native build requirements first:
-
-```bash
-sudo apt update
-sudo apt install -y git cmake pkg-config python3-pip python3-venv python3-dev \
-  libfftw3-dev libyaml-cpp-dev cppzmq-dev libreadline-dev simaai-memory-lib-dev
-```
-
-LLiMa also builds third-party tokenizer code that uses Rust. Install Rust if
-`cargo` is not already available:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
+Install and validate those packages on Modalix; do not use the DevKit as the
+source-build environment.
 
 ## Run
 
@@ -287,3 +275,4 @@ LLiMa documentation is maintained in this repository:
 | [Model Deployment](docs/deployment.md) | Deploy compiled models to Modalix devices. |
 | [LLiMa CLI](docs/runtime.md) | Manage, run, and serve GenAI models on Modalix. |
 | [MoLE - Modalix Language Model Evaluator](docs/mole.md) | Benchmark LLM accuracy and performance on Modalix. |
+| [Contributor Guide](docs/contributing.md) | Develop, test, document, and review changes to LLiMa. |

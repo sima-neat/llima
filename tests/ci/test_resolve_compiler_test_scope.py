@@ -5,7 +5,7 @@ from pathlib import Path
 from tools.ci.resolve_compiler_test_scope import (
     COMPILER_PATHS,
     ScopeDecision,
-    classify_pr_paths,
+    classify_changed_paths,
     force_run,
     is_compiler_path,
     write_github_output,
@@ -67,13 +67,13 @@ class CompilerPathTests(unittest.TestCase):
 
 
 class ScopeDecisionTests(unittest.TestCase):
-    def test_matching_pr_runs_compiler_tests(self):
-        decision = classify_pr_paths(
+    def test_matching_branch_runs_compiler_tests(self):
+        decision = classify_changed_paths(
             [
                 "sima_lmm/devkit/cpp/chat.cpp",
                 "sima_lmm/config/vlm_config.py",
             ],
-            pr_number=125,
+            head_ref="feature/compiler-change",
             base_ref="develop",
         )
 
@@ -82,16 +82,16 @@ class ScopeDecisionTests(unittest.TestCase):
             decision.matching_paths,
             ("sima_lmm/config/vlm_config.py",),
         )
-        self.assertIn("PR #125", decision.reason)
+        self.assertIn("branch feature/compiler-change", decision.reason)
 
-    def test_runtime_only_pr_skips_compiler_tests(self):
-        decision = classify_pr_paths(
+    def test_runtime_only_branch_skips_compiler_tests(self):
+        decision = classify_changed_paths(
             [
                 "third_party/minja",
                 ".gitmodules",
                 "sima_lmm/devkit/cpp/chat.cpp",
             ],
-            pr_number=122,
+            head_ref="feature/runtime-change",
             base_ref="develop",
         )
 
@@ -99,13 +99,24 @@ class ScopeDecisionTests(unittest.TestCase):
         self.assertEqual(decision.matching_paths, ())
         self.assertIn("skipped", decision.reason)
 
+    def test_empty_branch_diff_skips_compiler_tests(self):
+        decision = classify_changed_paths(
+            [],
+            head_ref="feature/no-changes",
+            base_ref="develop",
+        )
+
+        self.assertFalse(decision.run_compiler)
+        self.assertEqual(decision.changed_paths, ())
+        self.assertIn("skipped", decision.reason)
+
     def test_renamed_compiler_source_path_runs_compiler_tests(self):
-        decision = classify_pr_paths(
+        decision = classify_changed_paths(
             [
                 "docs/language_model.py",
                 "sima_lmm/model/language_model.py",
             ],
-            pr_number=126,
+            head_ref="feature/rename",
             base_ref="develop",
         )
 
@@ -116,12 +127,12 @@ class ScopeDecisionTests(unittest.TestCase):
         )
 
     def test_force_run_is_fail_safe(self):
-        decision = force_run("GitHub PR lookup failed; running by default.")
+        decision = force_run("Branch comparison failed; running by default.")
 
         self.assertTrue(decision.run_compiler)
         self.assertEqual(
             decision.reason,
-            "GitHub PR lookup failed; running by default.",
+            "Branch comparison failed; running by default.",
         )
 
     def test_github_output_and_summary(self):

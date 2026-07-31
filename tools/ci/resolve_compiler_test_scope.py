@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Classify whether a pull request changes LLiMa compiler-related files."""
+"""Classify whether a branch changes LLiMa compiler-related files."""
 
 from __future__ import annotations
 
@@ -67,10 +67,10 @@ def is_compiler_path(raw_path: str) -> bool:
     return path in COMPILER_PATHS or path.startswith(COMPILER_PATH_PREFIXES)
 
 
-def classify_pr_paths(
+def classify_changed_paths(
     changed_paths: list[str],
     *,
-    pr_number: int,
+    head_ref: str,
     base_ref: str,
 ) -> ScopeDecision:
     normalized_paths = tuple(
@@ -86,7 +86,7 @@ def classify_pr_paths(
 
     if matching_paths:
         reason = (
-            f"Compiler tests required: PR #{pr_number} changes "
+            f"Compiler tests required: branch {head_ref} changes "
             f"{len(matching_paths)} compiler-impacting path(s) relative to {base_ref}."
         )
         return ScopeDecision(
@@ -97,7 +97,7 @@ def classify_pr_paths(
         )
 
     reason = (
-        f"Compiler tests skipped: PR #{pr_number} contains no explicitly "
+        f"Compiler tests skipped: branch {head_ref} contains no explicitly "
         f"classified compiler-impacting changes relative to {base_ref}."
     )
     return ScopeDecision(
@@ -148,13 +148,13 @@ def parse_args() -> argparse.Namespace:
     source.add_argument(
         "--changed-files",
         type=Path,
-        help="Newline-delimited PR file list to classify.",
+        help="Newline-delimited branch file list to classify.",
     )
     source.add_argument(
         "--force-run-reason",
-        help="Run compiler tests without classifying a PR file list.",
+        help="Run compiler tests without classifying a changed-file list.",
     )
-    parser.add_argument("--pr-number", type=int)
+    parser.add_argument("--head-ref")
     parser.add_argument("--base-ref", default="develop")
     parser.add_argument("--github-output", type=Path, required=True)
     parser.add_argument("--github-summary", type=Path, required=True)
@@ -164,14 +164,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.changed_files:
-        if args.pr_number is None:
-            raise SystemExit("--pr-number is required with --changed-files")
+        if args.head_ref is None:
+            raise SystemExit("--head-ref is required with --changed-files")
         changed_paths = args.changed_files.read_text(encoding="utf-8").splitlines()
-        if not changed_paths:
-            raise SystemExit("changed-file list is empty")
-        decision = classify_pr_paths(
+        decision = classify_changed_paths(
             changed_paths,
-            pr_number=args.pr_number,
+            head_ref=args.head_ref,
             base_ref=args.base_ref,
         )
     else:
