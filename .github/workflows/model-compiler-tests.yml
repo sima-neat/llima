@@ -116,30 +116,43 @@ jobs:
             exit 1
           fi
 
-          site_packages="$(
-            find "${model_compiler_dir}/lib" -maxdepth 3 -type d -name site-packages 2>/dev/null |
-              head -n 1
-          )"
-          library_path="${model_compiler_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-          if [[ -n "${site_packages}" ]]; then
-            library_path="${site_packages}:${site_packages}/tvm:${library_path}"
-          fi
+          # The packaged helper also applies the ARM64 JAX and XLA settings.
+          activation_env_path="${RUNNER_TEMP}/model-compiler-activation.sh"
+          export activation_env_path
+          bash --noprofile --rcfile "${HOME}/.bashrc" -i <<'BASH'
+          set -euo pipefail
+          type activate-model-compiler
+          activate-model-compiler
 
+          {
+            printf 'export VIRTUAL_ENV=%q\n' "${VIRTUAL_ENV}"
+            printf 'export LD_LIBRARY_PATH=%q\n' "${LD_LIBRARY_PATH}"
+            printf 'export PATH=%q\n' "${PATH}"
+            printf 'export XLA_FLAGS=%q\n' "${XLA_FLAGS}"
+            printf 'export SIMA_MLA_COMPILE_USE_JAX=%q\n' \
+              "${SIMA_MLA_COMPILE_USE_JAX}"
+          } > "${activation_env_path}"
+          BASH
+
+          source "${activation_env_path}"
           export MODEL_COMPILER_DIR="${model_compiler_dir}"
-          export VIRTUAL_ENV="${model_compiler_dir}"
-          export LD_LIBRARY_PATH="${library_path}"
-          export PATH="${model_compiler_dir}/bin:$(dirname "${sima_cli}"):${PATH}"
+          export PATH="$(dirname "${sima_cli}"):${PATH}"
+
+          test "${VIRTUAL_ENV}" = "${MODEL_COMPILER_DIR}"
+          test "${SIMA_MLA_COMPILE_USE_JAX}" = "1"
+          [[ " ${XLA_FLAGS} " == *" --xla_cpu_max_isa=NEON "* ]]
 
           {
             echo "SIMA_CLI=${sima_cli}"
             echo "MODEL_COMPILER_DIR=${model_compiler_dir}"
-            echo "VIRTUAL_ENV=${model_compiler_dir}"
-            echo "LD_LIBRARY_PATH=${library_path}"
+            echo "VIRTUAL_ENV=${VIRTUAL_ENV}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+            echo "XLA_FLAGS=${XLA_FLAGS}"
+            echo "SIMA_MLA_COMPILE_USE_JAX=${SIMA_MLA_COMPILE_USE_JAX}"
           } >> "${GITHUB_ENV}"
           echo "$(dirname "${sima_cli}")" >> "${GITHUB_PATH}"
           echo "${model_compiler_dir}/bin" >> "${GITHUB_PATH}"
 
-          test "${VIRTUAL_ENV}" = "${MODEL_COMPILER_DIR}"
           python - <<'PY'
           import importlib.metadata
 
@@ -604,8 +617,8 @@ jobs:
           compile_stage = next(
               stage for stage in report["stages"] if stage["name"] == "model_compiler"
           )
-          if compile_stage.get("skipped"):
-              print("Skipped llima-compile --compile: ARM packages are not fixed yet.")
+          if compile_stage.get("skipped") or compile_stage.get("return_code") != 0:
+              raise SystemExit(f"Model Compiler stage did not pass: {compile_stage}")
 
           with summary_path.open("a", encoding="utf-8") as summary:
               summary.write("### Selected-model full compilation E2E\n\n")
@@ -615,15 +628,9 @@ jobs:
               )
               summary.write(f"- Selection seed: {report['selection_seed']}\n")
               summary.write(f"- Candidate SHA: {report['candidate_sha']}\n")
-              if compile_stage.get("skipped"):
-                  summary.write(
-                      "- Compile step: skipped until the ARM packages are fixed.\n"
-                  )
+              summary.write("- Compilation path: direct Model SDK\n")
               summary.write("- Stages:\n")
               for stage in report["stages"]:
-                  if stage.get("skipped"):
-                      summary.write(f"  - {stage['name']}: skipped\n")
-                      continue
                   summary.write(
                       f"  - {stage['name']}: {stage['duration_seconds']} seconds\n"
                   )
