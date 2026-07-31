@@ -255,3 +255,43 @@ def test_per_layer_embedding_scale_wiring(
     per_layer_model = generated_models[0][0]
     assert per_layer_model.per_layer_embeddings_scale == PER_LAYER_SCALE
     assert per_layer_model.embeddings_scale == (None if multimodal else NORMAL_SCALE)
+
+
+def test_speculative_draft_uses_only_target_embedding_scale(
+    gemma4_model: VisionLanguageModel,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _language_model(gemma4_model, tmp_path / "target", multimodal=False)
+    draft = _language_model(gemma4_model, tmp_path / "draft", multimodal=False)
+    target._embeddings_scale = NORMAL_SCALE
+    draft.set_embedding_scale_source(target)
+    monkeypatch.setattr(
+        draft,
+        "get_embeddings_tensor",
+        lambda: (None, None),
+    )
+    monkeypatch.setattr(
+        target,
+        "get_input_embeddings_tensor",
+        lambda: pytest.fail("cached target scale should not reload the embedding table"),
+    )
+
+    embeddings, scale = draft.get_input_embeddings_tensor()
+    assert embeddings is None
+    assert scale == NORMAL_SCALE
+
+    generated_models = []
+    monkeypatch.setattr(
+        draft,
+        "gen_files_from_model_list",
+        lambda model_list, *_args: generated_models.extend(model_list),
+    )
+
+    draft.gen_files(
+        FileGenMode.SOURCE_TO_FP,
+        gen_config={"precision": {LayerID("single_pre", 0): FileGenPrecision.BF16}},
+    )
+
+    assert len(generated_models) == 1
+    assert generated_models[0][0].embeddings_scale == NORMAL_SCALE

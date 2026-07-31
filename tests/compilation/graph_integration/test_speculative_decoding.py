@@ -4,6 +4,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from afe.ir.defines import NodeName, get_expected_tensor_value
+from afe.ir.tensor_type import ScalarType
+
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.model import EvalMode, FileGenMode, FileGenPrecision
 from sima_lmm.model.language_cache_model import LanguageCacheModel
@@ -150,3 +153,36 @@ def test_speculative_staged_and_direct_generation_are_equivalent(
     direct_outputs = model.run_model(EvalMode.SDK, inputs)
 
     assert_outputs_close(staged_outputs, direct_outputs, (0.01,))
+
+
+def test_speculative_cache_graph_accepts_quantized_kv_and_scales(
+    model_inputs_path: Path,
+    tmp_path: Path,
+) -> None:
+    draft_model = load_speculative_draft_model(
+        SPECULATIVE_TARGET_MODEL,
+        SPECULATIVE_DRAFT_MODEL,
+        tmp_path,
+        model_inputs_path,
+        quantize_kv_cache=True,
+    )
+    model, _, _ = _build_component(
+        SpeculativeGraphCase("cache"), draft_model
+    )
+    net = model._build_sima_nodes(
+        f"{draft_model.hf_model.language_model_param_base_name}.token.{TOKEN_INDEX}",
+        quantizable=False,
+    )
+
+    assert get_expected_tensor_value(
+        net.nodes[NodeName("cached_keys")].get_type().output
+    ).scalar == ScalarType.int8
+    assert get_expected_tensor_value(
+        net.nodes[NodeName("cached_values")].get_type().output
+    ).scalar == ScalarType.int8
+    assert get_expected_tensor_value(
+        net.nodes[NodeName("cached_keys_scale")].get_type().output
+    ).scalar == ScalarType.bfloat16
+    assert get_expected_tensor_value(
+        net.nodes[NodeName("cached_values_scale")].get_type().output
+    ).scalar == ScalarType.bfloat16
