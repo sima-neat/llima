@@ -473,14 +473,13 @@ def list_models() -> list[Path]:
         if not root.exists():
             continue
         for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
+            if not child.is_dir() or _is_incomplete_model_dir(child):
                 continue
-            if (
-                not _is_incomplete_model_dir(child)
-                and (child / "devkit").is_dir()
-                and (child / "elf_files").is_dir()
-            ):
-                models.append(child)
+            try:
+                resolve_target_and_draft_paths(child)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            models.append(child)
     return models
 
 
