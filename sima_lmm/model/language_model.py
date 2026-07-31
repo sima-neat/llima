@@ -23,10 +23,156 @@ from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
+from sima_lmm.config.vlm_config import (
+    AttentionBlockConfig,
+    LlmArchType,
+    PipelineConfig,
+    VlmArchType,
+)
 
 
 bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
+
+
+@dataclass(frozen=True)
+class ReferenceRuntimeStep:
+    """One normal-generation invocation of the compiled language-model pipeline."""
+
+    num_tokens: int
+    token_idx: int
+    use_input_tokens: bool
+    emits_token: bool
+
+
+@dataclass(frozen=True)
+class ReferenceCachePlan:
+    """C++-equivalent cache model and input slice for one attention layer."""
+
+    token_idx_begin: int
+    aligned_context: int
+    model_token_idx: int
+    layer_type: str
+    use_future_mask: bool
+
+
+def _reference_cache_plan(
+    pipeline_cfg: PipelineConfig,
+    attention_cfg: AttentionBlockConfig,
+    layer_type: str,
+    token_idx: int,
+    num_tokens: int,
+) -> ReferenceCachePlan:
+    sliding_window = attention_cfg.sliding_window or 0
+    token_idx_begin = (
+        max(0, token_idx + num_tokens - sliding_window)
+        if layer_type == "sliding_attention"
+        else 0
+    )
+    effective_context = token_idx + num_tokens - token_idx_begin
+    separate_sliding_cache = (
+        layer_type == "sliding_attention"
+        and attention_cfg.sliding_head_dim is not None
+        and attention_cfg.sliding_head_dim != attention_cfg.head_dim
+    )
+    sliding_cache_mask_differs = (
+        layer_type == "sliding_attention"
+        and not separate_sliding_cache
+        and (
+            pipeline_cfg.get_cache_mask_size(
+                "full_attention", sliding_window, is_group=True
+            )
+            != pipeline_cfg.get_cache_mask_size(
+                "sliding_attention", sliding_window, is_group=True
+            )
+            or pipeline_cfg.get_cache_mask_size(
+                "full_attention", sliding_window, is_group=False
+            )
+            != pipeline_cfg.get_cache_mask_size(
+                "sliding_attention", sliding_window, is_group=False
+            )
+        )
+    )
+    use_sliding_cache = separate_sliding_cache or (
+        sliding_cache_mask_differs and effective_context >= sliding_window
+    )
+    cache_layer_type = (
+        "sliding_attention" if use_sliding_cache else "full_attention"
+    )
+    cache_mask_size = pipeline_cfg.get_cache_mask_size(
+        cache_layer_type, effective_context, is_group=num_tokens > 1
+    )
+    use_future_mask = cache_mask_size > num_tokens
+    aligned_context = (
+        min(
+            round_up_to(effective_context, cache_mask_size),
+            pipeline_cfg.max_num_tokens,
+        )
+        if use_future_mask
+        else effective_context
+    )
+    return ReferenceCachePlan(
+        token_idx_begin=token_idx_begin,
+        aligned_context=aligned_context,
+        model_token_idx=aligned_context - num_tokens,
+        layer_type=cache_layer_type,
+        use_future_mask=use_future_mask,
+    )
+
+
+def _reference_runtime_steps(
+    pipeline_cfg: PipelineConfig,
+    num_input_tokens: int,
+    max_new_tokens: int,
+) -> list[ReferenceRuntimeStep]:
+    """Build the same prefill/decode schedule as the normal C++ runtime."""
+    if num_input_tokens <= 0:
+        raise ValueError("At least one input token is required")
+    if num_input_tokens > pipeline_cfg.max_num_tokens:
+        raise ValueError(
+            f"Input has {num_input_tokens} tokens, but max_num_tokens is "
+            f"{pipeline_cfg.max_num_tokens}"
+        )
+    max_generated_tokens = pipeline_cfg.max_num_tokens - num_input_tokens + 1
+    if max_new_tokens < 0 or max_new_tokens > max_generated_tokens:
+        raise ValueError(
+            f"max_new_tokens must be between 0 and {max_generated_tokens}, "
+            f"got {max_new_tokens}"
+        )
+    if max_new_tokens == 0:
+        return []
+
+    prefill: list[ReferenceRuntimeStep] = []
+    offsets = pipeline_cfg.input_token_group_offsets
+    group_size = pipeline_cfg.input_token_group_size
+    if offsets and group_size > 1:
+        for token_idx in offsets:
+            if token_idx >= num_input_tokens:
+                break
+            prefill.append(
+                ReferenceRuntimeStep(group_size, token_idx, True, False)
+            )
+            if token_idx + group_size >= num_input_tokens:
+                break
+    else:
+        prefill = [
+            ReferenceRuntimeStep(1, token_idx, True, False)
+            for token_idx in range(num_input_tokens)
+        ]
+
+    if not prefill:
+        raise RuntimeError("No compiled model covers the input-token range")
+    prefill[-1] = ReferenceRuntimeStep(
+        prefill[-1].num_tokens,
+        prefill[-1].token_idx,
+        True,
+        True,
+    )
+    decode = [
+        ReferenceRuntimeStep(1, num_input_tokens + i, False, True)
+        for i in range(max_new_tokens - 1)
+    ]
+    return [*prefill, *decode]
+
 
 @dataclass
 class LanguageModel(BaseModel):
@@ -191,73 +337,97 @@ class LanguageModel(BaseModel):
         eval_mode: EvalMode,
         ifms: list[np.ndarray],
         embeddings_tensor: np.ndarray | None = None,
+        *,
+        max_new_tokens: int | None = None,
     ) -> list[np.ndarray]:
+        """Run the host reference pipeline using compiled ONNX or quantized ``.sima`` parts.
+
+        This follows the normal (non-speculative) C++ prefill/decode schedule and cache-model
+        selection. ``max_new_tokens`` limits generation without changing the compiled context
+        length.
+        """
         assert self.vlm_helper is not None
         assert len(ifms) == 1
         input_embeds = ifms[0]
         if embeddings_tensor is None:
             embeddings_tensor, _ = self.get_embeddings_tensor()
+        assert embeddings_tensor is not None
 
-        # Obtain sliding window config.
+        if self.cfg.lm_cfg.speculative_decoding_cfg is not None:
+            raise NotImplementedError(
+                "The Python reference runtime currently supports normal generation only"
+            )
+        unsupported_layer_types = set(self.cfg.lm_cfg.layer_types) - {
+            "full_attention", "sliding_attention"
+        }
+        if unsupported_layer_types:
+            raise NotImplementedError(
+                "The Python reference runtime does not yet support layer types "
+                f"{sorted(unsupported_layer_types)}"
+            )
+        if self.cfg.lm_cfg.hidden_size_per_layer_input:
+            raise NotImplementedError(
+                "The Python reference runtime does not yet support per-layer embedding inputs"
+            )
+
         swa_enable = self.cfg.lm_cfg.attn_cfg.swa_enable
-        sliding_window = self.cfg.lm_cfg.attn_cfg.sliding_window
         layer_types = self.cfg.lm_cfg.layer_types
-
-        # Initialize rope.
         global_freq_real, global_freq_imag = self.calc_freq_real_imag(False)
         if swa_enable:
             local_freq_real, local_freq_imag = self.calc_freq_real_imag(True)
 
-        # Initialize cache.
         num_kv_heads = self.cfg.lm_cfg.attn_cfg.num_key_value_heads
-        head_dim = self.cfg.lm_cfg.attn_cfg.head_dim
         quantize_kv_cache = self.cfg.pipeline_cfg.quantize_kv_cache
         kv_dtype = np.int8 if quantize_kv_cache else np.float32
         cache_key = [
-            np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, head_dim), dtype=kv_dtype)
-            for _ in range(self.cfg.lm_cfg.num_hidden_layers)
+            np.zeros(
+                (
+                    1,
+                    num_kv_heads,
+                    self.cfg.pipeline_cfg.max_num_tokens,
+                    self.cfg.lm_cfg.attn_cfg.get_head_dim(layer_type),
+                ),
+                dtype=kv_dtype,
+            )
+            for layer_type in layer_types
         ]
         cache_val = [
-            np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, head_dim), dtype=kv_dtype)
-            for _ in range(self.cfg.lm_cfg.num_hidden_layers)
+            np.zeros_like(layer_cache)
+            for layer_cache in cache_key
         ]
         if quantize_kv_cache:
             cache_key_scale = [
-                np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, 1), dtype=np.float32)
+                np.zeros(
+                    (1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, 1),
+                    dtype=np.float32,
+                )
                 for _ in range(self.cfg.lm_cfg.num_hidden_layers)
             ]
             cache_val_scale = [
-                np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, 1), dtype=np.float32)
+                np.zeros(
+                    (1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, 1),
+                    dtype=np.float32,
+                )
                 for _ in range(self.cfg.lm_cfg.num_hidden_layers)
             ]
 
-        # Determine group models.
-        token_group_offsets = self.cfg.pipeline_cfg.input_token_group_offsets
         num_input_tokens = input_embeds.shape[2]
-        group_token_idx_list = list()
-        padded_token_size = 1
-
-        token_idx_set = set(range(self.cfg.pipeline_cfg.max_num_tokens))
-        if token_group_offsets:
-            for i in token_group_offsets:
-                padded_token_size = i + self.cfg.pipeline_cfg.input_token_group_size
-                tmp_token_idx_set = (
-                    token_idx_set - set(range(i, min(num_input_tokens, padded_token_size)))
-                )
-                if len(tmp_token_idx_set) != len(token_idx_set):
-                    token_idx_set = tmp_token_idx_set
-                    token_idx_set.add(i)
-                    group_token_idx_list.append(i)
-                if num_input_tokens <= padded_token_size:
-                    break
-        token_idx_list = sorted(list(token_idx_set))
-
-        # Pad the input embedding if needed and determine which token indices to run.
+        if max_new_tokens is None:
+            max_new_tokens = self.cfg.pipeline_cfg.max_num_tokens - num_input_tokens + 1
+        steps = _reference_runtime_steps(
+            self.cfg.pipeline_cfg, num_input_tokens, max_new_tokens
+        )
+        padded_token_size = max(
+            (
+                step.token_idx + step.num_tokens
+                for step in steps
+                if step.use_input_tokens
+            ),
+            default=num_input_tokens,
+        )
         if (padding := padded_token_size - num_input_tokens) > 0:
             input_embeds = np.pad(input_embeds, ((0, 0), (0, 0), (0, padding), (0, 0)))
 
-        # For paligemma, the original implementation requires all the input tokens to be processed
-        # together (attention mask = 0) to obtain the matching output.
         if (
             self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
             and padded_token_size < num_input_tokens
@@ -268,30 +438,44 @@ class LanguageModel(BaseModel):
                 "\nPlease increase the estimated_max_num_query_tokens in config_pipeline()."
             )
 
-        # Run language model.
         perf_cnt_begin = time.perf_counter_ns()
-
         new_tokens = list()
         post_ofms = None
         new_token = None
-        for token_idx in token_idx_list:
-            if token_idx in group_token_idx_list:
-                num_tokens = self.cfg.pipeline_cfg.input_token_group_size
-                next_token_idx = min(num_input_tokens, token_idx + num_tokens)
-            else:
-                num_tokens = 1
-                next_token_idx = token_idx + 1
+        part_models: dict[tuple[str, int, int | None, int | None], BaseModel] = {}
+
+        def get_part_model(
+            part: str,
+            num_tokens: int,
+            *,
+            layer_idx: int | None = None,
+            token_idx: int | None = None,
+        ) -> BaseModel:
+            key = (part, num_tokens, layer_idx, token_idx)
+            if key not in part_models:
+                part_models[key] = self._get_part_model(
+                    part, num_tokens, layer_idx=layer_idx, token_idx=token_idx
+                )
+            return part_models[key]
+
+        for step in steps:
+            token_idx = step.token_idx
+            num_tokens = step.num_tokens
+            next_token_idx = (
+                min(num_input_tokens, token_idx + num_tokens)
+                if num_tokens > 1 else token_idx + 1
+            )
             sima_log_info("Processing token no. %d-%d", token_idx, next_token_idx)
 
-            use_input_tokens = token_idx < num_input_tokens
-            if not use_input_tokens:
+            if not step.use_input_tokens:
                 perf_cnt_begin = time.perf_counter_ns()
 
             for layer_idx in range(self.cfg.lm_cfg.num_hidden_layers):
-                is_global = (layer_types[layer_idx] == "full_attention")
+                layer_type = layer_types[layer_idx]
+                is_global = layer_type == "full_attention"
                 pre_ifms = list()
                 if layer_idx == 0:
-                    if use_input_tokens:
+                    if step.use_input_tokens:
                         pre_ifms.append(input_embeds[..., token_idx:token_idx + num_tokens, :])
                     else:
                         assert new_token is not None
@@ -307,85 +491,113 @@ class LanguageModel(BaseModel):
                 else:
                     pre_ifms.append(local_freq_real[..., token_idx:token_idx + num_tokens, :])
                     pre_ifms.append(local_freq_imag[..., token_idx:token_idx + num_tokens, :])
-                pre_model = self._get_part_model("pre", num_tokens, layer_idx=layer_idx)
+                pre_model = get_part_model("pre", num_tokens, layer_idx=layer_idx)
                 pre_ofms = pre_model.run_model(eval_mode, pre_ifms)
 
-                # Update cache.
-                if quantize_kv_cache:
-                    cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
-                    cache_key_scale[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[2]
-                    cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[3]
-                    cache_val_scale[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[4]
-                else:
-                    cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
-                    cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[2]
+                if not self.cfg.lm_cfg.is_kv_shared_layer(layer_idx):
+                    if quantize_kv_cache:
+                        cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
+                        cache_key_scale[layer_idx][..., token_idx:token_idx + num_tokens, :] = (
+                            pre_ofms[2]
+                        )
+                        cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[3]
+                        cache_val_scale[layer_idx][..., token_idx:token_idx + num_tokens, :] = (
+                            pre_ofms[4]
+                        )
+                    else:
+                        cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
+                        cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[2]
 
-                # For multi-token models, there is no need to run the cache and post models for the
-                # last hidden layer since pre model already updates the cache.
+                post_num_tokens = num_tokens
+                post_row_idx = None
                 if num_tokens > 1 and layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
                     if token_idx + num_tokens >= num_input_tokens:
-                        # The last input token is included. Run the cache and post model for the
-                        # last input token to generate the first output token.
-                        idx = num_input_tokens - 1 - token_idx
-                        pre_ifms[0] = pre_ifms[0][..., idx:idx + 1, :]
-                        pre_ofms[0] = pre_ofms[0][..., idx:idx + 1, :]
-                        num_tokens = 1
-                        token_idx = num_input_tokens - 1
+                        post_row_idx = num_input_tokens - 1 - token_idx
+                        post_num_tokens = 1
                     else:
                         break
 
-                if is_global:
-                    token_idx_begin = 0
-                else:
-                    token_idx_begin = max(0, token_idx + num_tokens - sliding_window)
-                if self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
-                    aligned_token_idx = min(
-                        round_up_to(token_idx+1, self.cfg.pipeline_cfg.future_token_mask_size) - 1,
-                        self.cfg.pipeline_cfg.max_num_tokens - 1
-                    )
-                else:
-                    aligned_token_idx = token_idx
+                cache_plan = _reference_cache_plan(
+                    self.cfg.pipeline_cfg,
+                    self.cfg.lm_cfg.attn_cfg,
+                    layer_type,
+                    token_idx,
+                    num_tokens,
+                )
+                token_idx_begin = cache_plan.token_idx_begin
+                aligned_context = cache_plan.aligned_context
+
+                kv_source_layer = self.cfg.lm_cfg.get_kv_source_layer(layer_idx)
                 cache_ifms = [
                     pre_ofms[0],
-                    cache_key[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :],
+                    cache_key[kv_source_layer][
+                        ..., token_idx_begin:token_idx_begin + aligned_context, :
+                    ],
                 ]
                 if quantize_kv_cache:
                     cache_ifms.append(
-                        cache_key_scale[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
+                        cache_key_scale[kv_source_layer][
+                            ..., token_idx_begin:token_idx_begin + aligned_context, :
+                        ]
                     )
                 if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and num_tokens > 1:
-                    assert is_global
-                    mask = np.zeros((1, 1, num_tokens, token_idx + num_tokens), dtype=np.float32)
-                    mask[0, 0, :, num_input_tokens - token_idx:] = np.finfo(np.float32).min
-                    cache_ifms.append(mask)
-                elif self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
-                    mask = np.full(
-                        (1, 1, 1, aligned_token_idx + 1 - token_idx_begin),
-                        np.finfo(np.float32).min,
-                        dtype=np.float32
+                    mask = np.zeros(
+                        (1, 1, num_tokens, aligned_context), dtype=np.float32
                     )
-                    mask[..., :token_idx + 1 - token_idx_begin] = 0
+                    mask[0, 0, :, num_input_tokens - token_idx:] = (
+                        np.finfo(np.float32).min
+                    )
+                    cache_ifms.append(mask)
+                elif cache_plan.use_future_mask:
+                    mask = np.full(
+                        (1, 1, num_tokens, aligned_context),
+                        np.finfo(np.float32).min,
+                        dtype=np.float32,
+                    )
+                    effective_token_idx = token_idx - token_idx_begin
+                    for row in range(num_tokens):
+                        mask[..., row, :effective_token_idx + row + 1] = 0
                     cache_ifms.append(mask)
                 cache_ifms.append(
-                    cache_val[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
+                    cache_val[kv_source_layer][
+                        ..., token_idx_begin:token_idx_begin + aligned_context, :
+                    ]
                 )
                 if quantize_kv_cache:
                     cache_ifms.append(
-                        cache_val_scale[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
+                        cache_val_scale[kv_source_layer][
+                            ..., token_idx_begin:token_idx_begin + aligned_context, :
+                        ]
                     )
 
-                cache_model = self._get_part_model(
-                    "cache", num_tokens, token_idx=aligned_token_idx - token_idx_begin
+                cache_model = get_part_model(
+                    (
+                        "sliding_cache"
+                        if cache_plan.layer_type == "sliding_attention"
+                        else "cache"
+                    ),
+                    num_tokens,
+                    token_idx=cache_plan.model_token_idx,
                 )
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 
                 post_ifms = [pre_ifms[0], cache_ofms[0]]
-                post_model = self._get_part_model("post", num_tokens, layer_idx=layer_idx)
+                if post_row_idx is not None:
+                    post_ifms = [
+                        ofm[..., post_row_idx:post_row_idx + 1, :]
+                        for ofm in post_ifms
+                    ]
+                post_model = get_part_model(
+                    "post", post_num_tokens, layer_idx=layer_idx
+                )
                 post_ofms = post_model.run_model(eval_mode, post_ifms)
 
-            # Download the argmax output.
-            if num_input_tokens <= next_token_idx:
-                if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
+            if step.emits_token:
+                assert post_ofms is not None
+                if (
+                    self.cfg.lm_cfg.lm_head_num_splits == 1
+                    and not self.cfg.pipeline_cfg.return_logits
+                ):
                     new_token = post_ofms[0].item()
                 else:
                     lm_output = np.concatenate(post_ofms, axis=-1)
@@ -404,7 +616,6 @@ class LanguageModel(BaseModel):
                 if new_token in self.vlm_helper.stop_tokens:
                     break
 
-        # Return the generated tokens.
         return np.array([new_tokens])
 
     def calc_freq_real_imag(self, use_swa: bool) -> tuple[np.ndarray, np.ndarray]:

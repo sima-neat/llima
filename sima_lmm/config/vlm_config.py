@@ -693,6 +693,16 @@ class LanguageModelConfig(BaseConfig):
         first_shared_layer = self.num_hidden_layers - self.num_kv_shared_layers
         return self.num_kv_shared_layers > 0 and layer_idx >= first_shared_layer
 
+    def get_kv_source_layer(self, layer_idx: int) -> int:
+        """Return the earlier layer whose KV cache is reused by ``layer_idx``."""
+        if not self.is_kv_shared_layer(layer_idx):
+            return layer_idx
+        first_shared_layer = self.num_hidden_layers - self.num_kv_shared_layers
+        for source_idx in range(first_shared_layer - 1, -1, -1):
+            if self.layer_types[source_idx] == self.layer_types[layer_idx]:
+                return source_idx
+        return layer_idx
+
     def get_effective_intermediate_size(self, layer_idx: int) -> int:
         if self.use_double_wide_mlp and self.is_kv_shared_layer(layer_idx):
             return self.mlp_cfg.intermediate_size * 2

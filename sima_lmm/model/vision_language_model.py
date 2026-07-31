@@ -221,7 +221,13 @@ class VisionLanguageModel(BaseModel):
             )
         sima_log_info("%s files generation completed.", gen_mode)
 
-    def evaluate(self, eval_mode: EvalMode, chat: Chat) -> str | np.ndarray:
+    def evaluate(
+        self,
+        eval_mode: EvalMode,
+        chat: Chat,
+        *,
+        max_new_tokens: int | None = None,
+    ) -> str | np.ndarray:
         """Evaluates the model with the input query and the image in the specified mode.
         Args:
             eval_mode: Evaluation mode.
@@ -237,14 +243,19 @@ class VisionLanguageModel(BaseModel):
 
         # Run the model to generate output text.
         if eval_mode == EvalMode.HF:
+            hf_max_new_tokens = (
+                self.cfg.pipeline_cfg.max_num_tokens
+                if max_new_tokens is None
+                else max_new_tokens
+            )
             output_dict = self.hf_model.execute_hf(
                 messages=chat.messages, images=chat.images,
-                max_new_tokens=self.cfg.pipeline_cfg.max_num_tokens, device="cpu"
+                max_new_tokens=hf_max_new_tokens, device="cpu"
             )
             num_input_tokens = output_dict["input_ids"].shape[1]
             output_tokens = output_dict["output_tokens"]
             output_tokens = np.expand_dims(
-                output_tokens[num_input_tokens:self.cfg.pipeline_cfg.max_num_tokens], axis=0
+                output_tokens[num_input_tokens:num_input_tokens + hf_max_new_tokens], axis=0
             )
             output_text = output_dict["generated_text"]
         else:
@@ -254,14 +265,24 @@ class VisionLanguageModel(BaseModel):
                     [np.expand_dims(image, axis=0).astype(np.float32) for image in images]
                 )
             if self.cfg.pipeline_cfg.return_logits:
-                return self.run_model(eval_mode, ifms)
-            output_tokens = self.run_model(eval_mode, ifms)
+                return self.run_model(
+                    eval_mode, ifms, max_new_tokens=max_new_tokens
+                )
+            output_tokens = self.run_model(
+                eval_mode, ifms, max_new_tokens=max_new_tokens
+            )
             assert output_tokens.ndim == 2 and output_tokens.shape[0] == 1
             output_text = self.vlm_helper.decode(output_tokens[0].tolist())
         sima_log_info("output text=%s", output_text)
         return output_text
 
-    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+    def run_model(
+        self,
+        eval_mode: EvalMode,
+        ifms: list[np.ndarray],
+        *,
+        max_new_tokens: int | None = None,
+    ) -> list[np.ndarray]:
         embeddings_tensor, embeddings_scale = self.language_model.get_embeddings_tensor()
         assert embeddings_scale is None or np.ndim(embeddings_scale) == 0, (
             "Per-channel embeddings quantization is not supported."
@@ -299,7 +320,10 @@ class VisionLanguageModel(BaseModel):
             input_embeds = np.expand_dims(input_embeds, axis=(0, 1))
 
         return self.language_model.run_model(
-            eval_mode, [input_embeds], embeddings_tensor=embeddings_tensor
+            eval_mode,
+            [input_embeds],
+            embeddings_tensor=embeddings_tensor,
+            max_new_tokens=max_new_tokens,
         )
 
     def get_language_embeddings_tensor(self) -> tuple[np.ndarray | None, float | None]:

@@ -181,6 +181,7 @@ class BaseModel(ABC):
     use_filter_sharing: bool = field(default=False, kw_only=True)
 
     _onnx_builder: OnnxBuilder | None = field(init=False)
+    _sdk_eval_model: SDKModel | None = field(default=None, init=False, repr=False)
 
     def gen_files(
         self, gen_mode: FileGenMode, *,
@@ -643,9 +644,11 @@ class BaseModel(ABC):
         return [x.transpose(0, 2, 3, 1) for x in ofms]
 
     def _run_model_sdk_model(self, ifms: list[np.ndarray]) -> list[np.ndarray]:
-        model = SDKModel.load(
-            self.model_name, self.sima_model_sdk_path, include_unquantized_net=False
-        )
+        if self._sdk_eval_model is None:
+            self._sdk_eval_model = SDKModel.load(
+                self.model_name, self.sima_model_sdk_path, include_unquantized_net=False
+            )
+        model = self._sdk_eval_model
         ifm_dict = {}
         for ifm_name, ifm in zip(model._net.input_node_names, ifms):
             ifm_dict[ifm_name] = ifm
@@ -670,8 +673,18 @@ class BaseModel(ABC):
         #     output = model._net.run(ifm_dict, node_callable=backend_runner.execute_node)
         #     print("output", output, flush=True)
         #     exit()
-        #TODO Change to jax again after arm bug is fixed
-        return model.execute(ifm_dict, use_jax=False)
+        # Keep NumPy as the portable default until the ARM JAX abort is fixed. Host-side
+        # reference runs can opt into the much faster JAX backend on supported machines.
+        use_jax = os.getenv("SIMA_LMM_SDK_EVAL_USE_JAX", "0") == "1"
+        # JAX 0.4.30 also fails to execute split LM-head outputs. Keep only that final post
+        # graph on NumPy so a JAX-enabled reference run can still complete.
+        is_final_language_post = (
+            "_post_layer" in self.model_name
+            and getattr(self, "layer_idx", -1)
+            == getattr(getattr(self.cfg, "lm_cfg", None), "num_hidden_layers", 0) - 1
+        )
+        use_jax = use_jax and not is_final_language_post
+        return model.execute(ifm_dict, use_jax=use_jax)
 
     def gen_files_from_model_list(
         self,

@@ -57,6 +57,17 @@ def test_embedding_scale_is_absent_without_embedding_quantization():
     assert PipelineConfig().embeddings_scale is None
 
 
+def test_gemma4_shared_kv_layers_reuse_matching_attention_type():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    lm_cfg = config.lm_cfg
+    first_shared_layer = lm_cfg.num_hidden_layers - lm_cfg.num_kv_shared_layers
+
+    for layer_idx in range(first_shared_layer, lm_cfg.num_hidden_layers):
+        source_idx = lm_cfg.get_kv_source_layer(layer_idx)
+        assert source_idx < first_shared_layer
+        assert lm_cfg.layer_types[source_idx] == lm_cfg.layer_types[layer_idx]
+
+
 def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp_path):
     config = _load_reference_config("qwen3_vl_vlm_config.json")
     hf_model = SimpleNamespace(config={})
