@@ -7,8 +7,8 @@ namespace llima {
 
 namespace {
 
-constexpr std::string_view qwen_open = "<think>";
-constexpr std::string_view qwen_close = "</think>";
+constexpr std::string_view think_open = "<think>";
+constexpr std::string_view think_close = "</think>";
 constexpr std::string_view gemma_reasoning_open = "<|channel>thought\n";
 constexpr std::string_view gemma_reasoning_close = "<channel|>";
 
@@ -21,13 +21,17 @@ ReasoningFormat reasoning_format_for_model(std::string_view model_type) {
     if (model_type == "vlm-gemma4") {
         return ReasoningFormat::Gemma4;
     }
+    if (model_type == "llm-lfm2") {
+        return ReasoningFormat::Lfm2;
+    }
     return ReasoningFormat::None;
 }
 
 std::array<std::string_view, 2> reasoning_special_tokens(ReasoningFormat format) {
     switch (format) {
         case ReasoningFormat::Qwen:
-            return {qwen_open, qwen_close};
+        case ReasoningFormat::Lfm2:
+            return {think_open, think_close};
         case ReasoningFormat::Gemma4:
             return {"<|channel>", gemma_reasoning_close};
         case ReasoningFormat::None:
@@ -41,11 +45,16 @@ ReasoningStreamParser::ReasoningStreamParser(
     bool enabled,
     bool prompt_opens_reasoning
 ) {
-    if (!enabled || format == ReasoningFormat::None) {
+    if (format == ReasoningFormat::Lfm2) {
+        // LFM2 Thinking always reasons; disabling only hides its reasoning output.
+        _start_marker = think_open;
+        _end_marker = think_close;
+        _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
+    } else if (!enabled || format == ReasoningFormat::None) {
         _mode = Mode::Content;
     } else if (format == ReasoningFormat::Qwen) {
-        _start_marker = qwen_open;
-        _end_marker = qwen_close;
+        _start_marker = think_open;
+        _end_marker = think_close;
         _mode = Mode::Reasoning;
         _optional_start = true;
     } else {
@@ -74,11 +83,12 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
             break;
         }
 
-        if (_mode == Mode::AwaitingStart) {
+        if (_mode == Mode::AwaitingStart || _mode == Mode::AwaitingHiddenStart) {
+            const bool hide_reasoning = _mode == Mode::AwaitingHiddenStart;
             if (_pending.starts_with(_start_marker)) {
                 _pending.erase(0, _start_marker.size());
                 _pending_from_draft = from_draft;
-                _mode = Mode::Reasoning;
+                _mode = hide_reasoning ? Mode::HiddenReasoning : Mode::Reasoning;
                 continue;
             }
             if (_start_marker.starts_with(_pending)) {
@@ -92,7 +102,7 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
             continue;
         }
 
-        if (_optional_start) {
+        if (_mode == Mode::Reasoning && _optional_start) {
             if (_pending.starts_with(_start_marker)) {
                 _pending.erase(0, _start_marker.size());
                 _pending_from_draft = from_draft;
@@ -110,7 +120,9 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
 
         const auto close_pos = _pending.find(_end_marker);
         if (close_pos != std::string::npos) {
-            emit(events, _pending.substr(0, close_pos), true, _pending_from_draft);
+            if (_mode == Mode::Reasoning) {
+                emit(events, _pending.substr(0, close_pos), true, _pending_from_draft);
+            }
             _pending.erase(0, close_pos + _end_marker.size());
             _pending_from_draft = from_draft;
             _mode = Mode::Content;
@@ -118,12 +130,14 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
         }
 
         const size_t retained = partial_marker_size(_end_marker);
-        emit(
-            events,
-            _pending.substr(0, _pending.size() - retained),
-            true,
-            _pending_from_draft
-        );
+        if (_mode == Mode::Reasoning) {
+            emit(
+                events,
+                _pending.substr(0, _pending.size() - retained),
+                true,
+                _pending_from_draft
+            );
+        }
         _pending.erase(0, _pending.size() - retained);
         if (!_pending.empty()) _pending_from_draft = from_draft;
         if (done) {

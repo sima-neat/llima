@@ -13,6 +13,7 @@ enum class ReasoningFormat {
     None,
     Qwen,
     Gemma4,
+    Lfm2,
 };
 
 ReasoningFormat reasoning_format_for_model(std::string_view model_type);
@@ -41,7 +42,9 @@ class ReasoningStreamParser {
     private:
         enum class Mode {
             AwaitingStart,
+            AwaitingHiddenStart,
             Reasoning,
+            HiddenReasoning,
             Content,
             Done,
         };
