@@ -412,3 +412,21 @@ def test_incomplete_model_is_hidden_but_removable(monkeypatch, tmp_path):
     assert store.iter_installed() == []
     assert store.remove(MODEL_NAME)
     assert not model_dir.exists()
+
+
+def test_artifact_matches_git_blob_checksum(tmp_path):
+    content = b"git blob content"
+    path = tmp_path / "config.json"
+    path.write_bytes(content)
+    checksum = hashlib.sha1(
+        f"blob {len(content)}\0".encode() + content,
+        usedforsecurity=False,
+    ).hexdigest()
+    artifact = ArtifactInfo(
+        filename=path.name,
+        size=len(content),
+        checksum=checksum,
+        checksum_type="git-sha1",
+    )
+
+    assert LocalModelStore.artifact_matches(path, artifact)

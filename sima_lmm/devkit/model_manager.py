@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import (
+    Any,
     Callable,
     Iterable,
     Iterator,
@@ -930,12 +931,16 @@ class LocalModelStore:
                 return False
             if path.stat().st_size != artifact.size:
                 return False
-            hasher = ArtifactDownloader.new_hasher(
-                artifact.checksum_type, artifact.size
-            )
             with open(path, "rb") as artifact_file:
-                while chunk := artifact_file.read(1024 * 1024):
-                    hasher.update(chunk)
+                hasher = hashlib.file_digest(
+                    artifact_file,
+                    lambda: cast(
+                        Any,
+                        ArtifactDownloader.new_hasher(
+                            artifact.checksum_type, artifact.size
+                        ),
+                    ),
+                )
             return hasher.hexdigest() == artifact.checksum
         except OSError:
             return False
