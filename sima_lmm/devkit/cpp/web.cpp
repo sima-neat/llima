@@ -188,12 +188,6 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
     for (const auto& msg : messages) {
         nlohmann::ordered_json internal_msg;
         internal_msg["role"] = msg.value("role", "user");
-        const nlohmann::json* reasoning = nullptr;
-        if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string()) {
-            reasoning = &msg["reasoning_content"];
-        } else if (msg.contains("thinking") && msg["thinking"].is_string()) {
-            reasoning = &msg["thinking"];
-        }
 
         // Handle Ollama's images array format first
         bool has_ollama_images = msg.contains("images") && msg["images"].is_array();
@@ -277,14 +271,10 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
             const bool has_valid_tool_calls =
                 msg.contains("tool_calls") && msg["tool_calls"].is_array() &&
                 !msg["tool_calls"].empty();
-            if (!has_valid_tool_calls && reasoning == nullptr) {
+            if (!has_valid_tool_calls) {
                 continue;
             }
             internal_msg["content"] = "";
-        }
-
-        if (reasoning != nullptr) {
-            internal_msg["reasoning_content"] = *reasoning;
         }
 
         if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
