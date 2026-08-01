@@ -77,10 +77,6 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `quit` | Quit. |
 | `help` | Print available commands. |
 
-LFM2.5 Thinking checkpoints always generate reasoning. `enable-thinking`
-exposes that reasoning separately from the final answer; `disable-thinking`
-hides it but does not reduce the generated token count or latency. Use an LFM2.5
-Instruct checkpoint when reasoning must be disabled at the model level.
 
 ## Build an Application with Neat
 
