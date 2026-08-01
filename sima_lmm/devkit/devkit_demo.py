@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import sys
@@ -58,9 +59,79 @@ def _read_text_file(path: Path, label: str) -> str:
     return path.read_text()
 
 
+def _is_draft_vlm(sima_files_dir: Path) -> bool:
+    """Return whether a sima_files directory is a speculative-decoding draft."""
+    config_file = sima_files_dir / "devkit" / "vlm_config.json"
+    with config_file.open() as f:
+        cfg = json.load(f)
+    spec_cfg = cfg.get("lm_cfg", {}).get("speculative_decoding_cfg")
+    return bool(spec_cfg and spec_cfg.get("is_draft", False))
+
+
+def _is_spec_decode_vlm(devkit_dir: Path) -> bool:
+    """Return whether a devkit directory belongs to a speculative-decoding pair."""
+    config_file = devkit_dir / "vlm_config.json"
+    if not config_file.is_file():
+        return False
+    with config_file.open() as f:
+        cfg = json.load(f)
+    return bool(cfg.get("lm_cfg", {}).get("speculative_decoding_cfg"))
+
+
+def _resolve_target_and_draft_paths(model_path: Path) -> tuple[Path, Path | None]:
+    """Resolve a normal model path or a speculative-decoding parent directory."""
+    if _is_spec_decode_vlm(devkit := model_path / "devkit") or _is_spec_decode_vlm(
+        sima_devkit := model_path / "sima_files" / "devkit"
+    ):
+        raise RuntimeError(
+            f"{model_path} is part of a speculative-decoding pair. "
+            f"Pass the parent directory ({model_path.parent}) so both the "
+            f"target and draft models are loaded together."
+        )
+    if devkit.is_dir() and (model_path / "elf_files").is_dir():
+        return model_path, None
+    if sima_devkit.is_dir():
+        return model_path / "sima_files", None
+
+    target: Path | None = None
+    draft: Path | None = None
+    for subdir in model_path.iterdir():
+        if not subdir.is_dir():
+            continue
+        sima_dir = subdir / "sima_files"
+        if not (sima_dir / "devkit" / "vlm_config.json").is_file():
+            continue
+        if _is_draft_vlm(sima_dir):
+            if draft is not None:
+                raise RuntimeError(
+                    f"Multiple draft models found under {model_path}: "
+                    f"{draft.parent.name} and {subdir.name}"
+                )
+            draft = sima_dir
+        else:
+            if target is not None:
+                raise RuntimeError(
+                    f"Multiple target models found under {model_path}: "
+                    f"{target.parent.name} and {subdir.name}"
+                )
+            target = sima_dir
+    if target is None:
+        raise RuntimeError(
+            f"No valid model directory found under {model_path}. Expected either "
+            f"a sima_files/ subdir or per-model subdirs each containing sima_files/."
+        )
+    return target, draft
+
+
 def _kill_existing_llima_session() -> None:
     result = subprocess.run(
-        ["pkill", "--older", "60", "-f", "[l]lima"],
+        [
+            "pkill",
+            "--older",
+            "60",
+            "-f",
+            "[l]lima (run|benchmark-server)( |$)",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -77,7 +148,12 @@ def _kill_existing_llima_session() -> None:
 
 def run_model(args: argparse.Namespace) -> int:
     args.mode = DemoMode(args.mode)
-    model_path = _resolve_run_model_path(args.model)
+    user_model_path = _resolve_run_model_path(args.model)
+    try:
+        model_path, draft_model_path = _resolve_target_and_draft_paths(user_model_path)
+    except RuntimeError as e:
+        print(str(e), flush=True)
+        return 1
     if not (model_path / "devkit").is_dir() or not (model_path / "elf_files").is_dir():
         print(
             "Model directory missing required 'devkit' or 'elf_files' directories.",
@@ -121,18 +197,18 @@ def run_model(args: argparse.Namespace) -> int:
             demo = CLI(
                 model_path,
                 args.stt_model_path,
+                draft_model_path,
                 system_prompt,
                 chat_template,
-                args.parallel_load,
                 args.enable_thinking,
             )
         else:
             demo = WEB(
                 model_path,
                 args.stt_model_path,
+                draft_model_path,
                 system_prompt,
                 chat_template,
-                args.parallel_load,
                 args.enable_thinking,
             )
     except Exception:
@@ -205,12 +281,13 @@ def rm_model(args: argparse.Namespace) -> int:
 
 
 def benchmark_model(args: argparse.Namespace) -> int:
-    model_path = _resolve_run_model_path(args.model)
+    user_model_path = _resolve_run_model_path(args.model)
+    model_path, draft_model_path = _resolve_target_and_draft_paths(user_model_path)
     connect(logging.INFO)
 
     # Create a ZMQServer.
     try:
-        server = ZMQServer(model_path, args.port)
+        server = ZMQServer(model_path, args.port, draft_model_path)
     except Exception:
         msg = "Failed to create server"
         print(msg, flush=True)
@@ -265,13 +342,6 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help="Path to the file with chat template.",
-    )
-    run_parser.add_argument(
-        "--parallel_load",
-        type=bool,
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Load multiple models in parallel.",
     )
     run_parser.add_argument(
         "--enable-thinking",

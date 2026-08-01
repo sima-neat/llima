@@ -27,23 +27,40 @@ struct ZMQRequestMetadata {
     std::vector<size_t> tensor_shape;
     std::optional<uint16_t> max_num_tokens;
     std::optional<std::set<uint32_t>> stop_token_ids;
+    std::optional<size_t> continuation_start;
+    std::optional<std::vector<uint32_t>> continuation_token_ids;
+    bool use_group_prefill = true;
 
-    MSGPACK_DEFINE_MAP(type, tensor_dtype, tensor_shape, max_num_tokens, stop_token_ids);
+    MSGPACK_DEFINE_MAP(
+        type, tensor_dtype, tensor_shape, max_num_tokens, stop_token_ids, continuation_start,
+        continuation_token_ids, use_group_prefill
+    );
 };
 
 
 struct ZMQResponseMetadata {
     std::string tensor_dtype;
     std::vector<size_t> tensor_shape;
-    size_t infer_time_ns;
+    size_t infer_time_ns = 0;
+    std::optional<std::string> result_type;
+    std::optional<uint32_t> generated_tokens;
+    std::optional<uint32_t> accepted_draft_tokens;
+    std::optional<std::string> error;
 
-    MSGPACK_DEFINE_MAP(tensor_dtype, tensor_shape, infer_time_ns);
+    MSGPACK_DEFINE_MAP(
+        tensor_dtype, tensor_shape, infer_time_ns, result_type, generated_tokens,
+        accepted_draft_tokens, error
+    );
 };
 
 
 class EXPORT ZMQServer {
     public:
-        ZMQServer(const std::filesystem::path& model_path, uint32_t port);
+        ZMQServer(
+            const std::filesystem::path& model_path,
+            uint32_t port,
+            std::optional<std::filesystem::path> draft_model_path = std::nullopt
+        );
         ~ZMQServer();
 
         void run();
@@ -55,6 +72,7 @@ class EXPORT ZMQServer {
         zmq::socket_t _zmq_socket;
 
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
+        std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
 
         std::shared_ptr<spdlog::logger> _logger;
         std::atomic<bool> _is_running;

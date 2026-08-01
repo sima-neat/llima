@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import time
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from afe.ir.tensor_type import ScalarType
 from afe.ir.quantization_conv import block_quantize_weight_tensor
@@ -19,6 +19,7 @@ from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
+from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.layer_id import LayerID
@@ -42,6 +43,9 @@ class LanguageModel(BaseModel):
     3. PostCacheModel: Post cache model implements the transformer layer after the self-attention
         block, including the layers after the last transformer layer.
     """
+    _embeddings_scale: float | None = field(default=None, init=False, repr=False)
+    _per_layer_embeddings_scale: float | None = field(default=None, init=False, repr=False)
+
     def __post_init__(self):
         if self.cfg.pipeline_cfg.input_token_group_offsets:
             self.cfg.pipeline_cfg.input_token_group_offsets.sort()
@@ -72,15 +76,7 @@ class LanguageModel(BaseModel):
         # Create a list of all models to compile
         model_list = list()
         num_tokens = self.cfg.pipeline_cfg.input_token_group_size
-        single_model_num_tokens = 1 if self.cfg.lm_cfg.draft_cfg is None else self.cfg.lm_cfg.draft_cfg.speculative_budget
-        if (
-            gen_mode in [FileGenMode.SOURCE_TO_FP, FileGenMode.SOURCE_TO_QUANT]
-            and self.cfg.pipeline_cfg.quantize_embeddings
-        ):
-            _, embeddings_scale = self.get_embeddings_tensor()
-        else:
-            embeddings_scale = None
-
+        single_model_num_tokens = self._single_model_num_tokens
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
 
@@ -89,23 +85,19 @@ class LanguageModel(BaseModel):
             match layer_id.part:
                 case "group_pre":
                     part_model = self._get_part_model(
-                        "pre", num_tokens, layer_idx=layer_id.part_idx,
-                        embeddings_scale=embeddings_scale
+                        "pre", num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "single_pre":
                     part_model = self._get_part_model(
-                        "pre", single_model_num_tokens, layer_idx=layer_id.part_idx,
-                        embeddings_scale=embeddings_scale
+                        "pre", single_model_num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "group_post":
                     part_model = self._get_part_model(
-                        "post", num_tokens, layer_idx=layer_id.part_idx,
-                        embeddings_scale=embeddings_scale
+                        "post", num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "single_post":
                     part_model = self._get_part_model(
-                        "post", single_model_num_tokens, layer_idx=layer_id.part_idx,
-                        embeddings_scale=embeddings_scale
+                        "post", single_model_num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "group_cache":
                     part_model = self._get_part_model(
@@ -135,6 +127,14 @@ class LanguageModel(BaseModel):
                     part_model = self._get_part_model(
                         "conv_post_final", 1, layer_idx=layer_id.part_idx
                     )
+                case "group_draft_fc":
+                    part_model = self._get_part_model(
+                        "draft_fc", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_draft_fc":
+                    part_model = self._get_part_model(
+                        "draft_fc", single_model_num_tokens, layer_idx=layer_id.part_idx
+                    )
                 case "group_per_layer":
                     part_model = self._get_part_model("per_layer", num_tokens)
                 case "single_per_layer":
@@ -147,14 +147,56 @@ class LanguageModel(BaseModel):
                 curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
 
+        direct_graph_mode = gen_mode in [FileGenMode.SOURCE_TO_FP, FileGenMode.SOURCE_TO_QUANT]
+        if direct_graph_mode and self.cfg.pipeline_cfg.quantize_embeddings:
+            models_to_generate = [
+                model for model, _ in model_list
+                if not (resume and model.get_gen_file_name(gen_mode).is_file())
+            ]
+            input_dequant_models = [
+                model for model in models_to_generate
+                if (
+                    isinstance(model, LanguagePerLayerModel)
+                    or (
+                        isinstance(model, (LanguagePreModel, LanguagePostModel))
+                        and model.layer_idx == 0
+                    )
+                )
+                and model.uses_quantized_input_embeddings
+            ]
+            if input_dequant_models:
+                if self._embeddings_scale is None:
+                    self.get_input_embeddings_tensor()
+                assert self._embeddings_scale is not None
+                self.cfg.pipeline_cfg.embeddings_scale = self._embeddings_scale
+                for model in input_dequant_models:
+                    model.embeddings_scale = self._embeddings_scale
+
+            per_layer_models = [
+                model for model in models_to_generate
+                if isinstance(model, LanguagePerLayerModel)
+            ]
+            if per_layer_models:
+                if self._per_layer_embeddings_scale is None:
+                    self.get_per_layer_embeddings_tensor()
+                assert self._per_layer_embeddings_scale is not None
+                for model in per_layer_models:
+                    model.per_layer_embeddings_scale = self._per_layer_embeddings_scale
+
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
 
-    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+    def run_model(
+        self,
+        eval_mode: EvalMode,
+        ifms: list[np.ndarray],
+        embeddings_tensor: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
         assert self.vlm_helper is not None
         assert len(ifms) == 1
         input_embeds = ifms[0]
-        embeddings_tensor, _ = self.get_embeddings_tensor()
+        if embeddings_tensor is None:
+            embeddings_tensor, _ = self.get_embeddings_tensor()
 
         # Obtain sliding window config.
         swa_enable = self.cfg.lm_cfg.attn_cfg.swa_enable
@@ -167,15 +209,27 @@ class LanguageModel(BaseModel):
             local_freq_real, local_freq_imag = self.calc_freq_real_imag(True)
 
         # Initialize cache.
-        kv_size = self.cfg.lm_cfg.attn_cfg.head_dim * self.cfg.lm_cfg.attn_cfg.num_key_value_heads
+        num_kv_heads = self.cfg.lm_cfg.attn_cfg.num_key_value_heads
+        head_dim = self.cfg.lm_cfg.attn_cfg.head_dim
+        quantize_kv_cache = self.cfg.pipeline_cfg.quantize_kv_cache
+        kv_dtype = np.int8 if quantize_kv_cache else np.float32
         cache_key = [
-            np.zeros((1, 1, self.cfg.pipeline_cfg.max_num_tokens, kv_size), dtype=np.float32)
+            np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, head_dim), dtype=kv_dtype)
             for _ in range(self.cfg.lm_cfg.num_hidden_layers)
         ]
         cache_val = [
-            np.zeros((1, 1, self.cfg.pipeline_cfg.max_num_tokens, kv_size), dtype=np.float32)
+            np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, head_dim), dtype=kv_dtype)
             for _ in range(self.cfg.lm_cfg.num_hidden_layers)
         ]
+        if quantize_kv_cache:
+            cache_key_scale = [
+                np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, 1), dtype=np.float32)
+                for _ in range(self.cfg.lm_cfg.num_hidden_layers)
+            ]
+            cache_val_scale = [
+                np.zeros((1, num_kv_heads, self.cfg.pipeline_cfg.max_num_tokens, 1), dtype=np.float32)
+                for _ in range(self.cfg.lm_cfg.num_hidden_layers)
+            ]
 
         # Determine group models.
         token_group_offsets = self.cfg.pipeline_cfg.input_token_group_offsets
@@ -234,7 +288,7 @@ class LanguageModel(BaseModel):
                 perf_cnt_begin = time.perf_counter_ns()
 
             for layer_idx in range(self.cfg.lm_cfg.num_hidden_layers):
-                is_global = (self.layer_types[layer_idx] == "full_attention")
+                is_global = (layer_types[layer_idx] == "full_attention")
                 pre_ifms = list()
                 if layer_idx == 0:
                     if use_input_tokens:
@@ -257,8 +311,14 @@ class LanguageModel(BaseModel):
                 pre_ofms = pre_model.run_model(eval_mode, pre_ifms)
 
                 # Update cache.
-                cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
-                cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[2]
+                if quantize_kv_cache:
+                    cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
+                    cache_key_scale[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[2]
+                    cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[3]
+                    cache_val_scale[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[4]
+                else:
+                    cache_key[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[1]
+                    cache_val[layer_idx][..., token_idx:token_idx + num_tokens, :] = pre_ofms[2]
 
                 # For multi-token models, there is no need to run the cache and post models for the
                 # last hidden layer since pre model already updates the cache.
@@ -288,13 +348,16 @@ class LanguageModel(BaseModel):
                 cache_ifms = [
                     pre_ofms[0],
                     cache_key[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :],
-                    cache_val[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
                 ]
+                if quantize_kv_cache:
+                    cache_ifms.append(
+                        cache_key_scale[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
+                    )
                 if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and num_tokens > 1:
                     assert is_global
                     mask = np.zeros((1, 1, num_tokens, token_idx + num_tokens), dtype=np.float32)
                     mask[0, 0, :, num_input_tokens - token_idx:] = np.finfo(np.float32).min
-                    cache_ifms.insert(2, mask)
+                    cache_ifms.append(mask)
                 elif self.cfg.pipeline_cfg.future_token_mask_size > 1 and num_tokens == 1:
                     mask = np.full(
                         (1, 1, 1, aligned_token_idx + 1 - token_idx_begin),
@@ -302,7 +365,14 @@ class LanguageModel(BaseModel):
                         dtype=np.float32
                     )
                     mask[..., :token_idx + 1 - token_idx_begin] = 0
-                    cache_ifms.insert(2, mask)
+                    cache_ifms.append(mask)
+                cache_ifms.append(
+                    cache_val[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
+                )
+                if quantize_kv_cache:
+                    cache_ifms.append(
+                        cache_val_scale[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
+                    )
 
                 cache_model = self._get_part_model(
                     "cache", num_tokens, token_idx=aligned_token_idx - token_idx_begin
@@ -356,9 +426,19 @@ class LanguageModel(BaseModel):
         self,
         weight_name: str | None = None,
         embed_scale: float = 1.0,
-    ) -> tuple[np.ndarray, float | np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, float | np.ndarray | None]:
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
-
+        if weight_name is None:
+            base_name = self.hf_model.language_model_param_base_name
+            weight_name = f"{base_name}.embed_tokens.weight"
+            if self.cfg.lm_cfg.arch == LlmArchType.GEMMA:
+                embed_scale = self.cfg.lm_cfg.hidden_size ** 0.5
+        is_draft = (
+            self.cfg.lm_cfg.speculative_decoding_cfg is not None
+            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
+        )
+        if is_draft and weight_name not in self.hf_model.weight_map:
+            return None, None
         if isinstance(self.hf_model, LocalHuggingFaceModel):
             embeddings_tensor = self.hf_model.load_np_param(weight_name)
         else:
@@ -380,9 +460,36 @@ class LanguageModel(BaseModel):
 
         return embeddings_tensor.astype(bfloat16).astype(np.float32), None
 
+    def get_input_embeddings_tensor(self) -> tuple[np.ndarray | None, float | None]:
+        embeddings, scale = self.get_embeddings_tensor()
+        if scale is not None:
+            self._embeddings_scale = float(scale)
+        return embeddings, self._embeddings_scale
+
+    def get_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, float | None]:
+        base_name = self.hf_model.language_model_param_base_name
+        embeddings, scale = self.get_embeddings_tensor(
+            weight_name=f"{base_name}.embed_tokens_per_layer.weight",
+            embed_scale=(
+                self.cfg.lm_cfg.hidden_size_per_layer_input ** 0.5
+                if self.cfg.lm_cfg.arch == LlmArchType.GEMMA
+                else 1.0
+            ),
+        )
+        assert embeddings is not None
+        if scale is not None:
+            self._per_layer_embeddings_scale = float(scale)
+        return embeddings, self._per_layer_embeddings_scale
+
+    @property
+    def _single_model_num_tokens(self) -> int:
+        if self.cfg.lm_cfg.speculative_decoding_cfg is None:
+            return 1
+        return self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
+
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,
-        token_idx: int | None = None, embeddings_scale: float | np.ndarray | None = None
+        token_idx: int | None = None,
     ) -> BaseModel:
         match part:
             case "pre":
@@ -391,7 +498,6 @@ class LanguageModel(BaseModel):
                 return LanguagePreModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
-                    embeddings_scale=embeddings_scale
                 )
             case "post":
                 model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
@@ -400,7 +506,6 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
-                    embeddings_scale=embeddings_scale
                 )
             case "cache":
                 model_name = f"{self.model_name}_n{num_tokens}_cache_token{token_idx}"
@@ -435,9 +540,15 @@ class LanguageModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
                 )
+            case "draft_fc":
+                model_name = f"{self.model_name}_n{num_tokens}_draft_fc"
+                return LanguageDraftFCModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens
+                )
             case "per_layer":
                 model_name = f"{self.model_name}_n{num_tokens}_per_layer"
                 return LanguagePerLayerModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-                    hf_model=self.hf_model, num_tokens=num_tokens
+                    hf_model=self.hf_model, num_tokens=num_tokens,
                 )

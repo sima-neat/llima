@@ -1,0 +1,4 @@
+interface:
+  display_name: "Contribute to LLiMa"
+  short_description: "Make safe, validated changes to LLiMa"
+  default_prompt: "Use $sima-contribute-to-llima to make this change safely in the LLiMa repository."

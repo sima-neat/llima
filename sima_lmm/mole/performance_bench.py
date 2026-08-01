@@ -46,11 +46,14 @@ def create_sample_data(
     tokenizer: PreTrainedTokenizer,
     max_toks: int = 1024,
     n_samples: int = 128,
+    input_lengths: tuple[int, ...] | None = None,
 ) -> TokenizedSamples:
     """
     create_sample_data Creates a dataset token sample for LLM evaluation. Data is sampled from
-    `cimec/lambada`, each sample is truncated to a given token length. This function is to be used
-    when benchmarking LLM performance only. Please do not use this for benchmarking quality metrics.
+    `cimec/lambada`. When available, the tokenizer's chat template wraps each passage in a
+    continuation request; otherwise, raw text is used. Each sample is truncated to a given token
+    length. This function is to be used when benchmarking LLM performance only. Please do not use
+    this for benchmarking quality metrics.
 
     Args:
         tokenizer: The HF Tokenizer for the model.
@@ -59,6 +62,8 @@ def create_sample_data(
             Defaults to 1024.
         n_samples: The number of unique text samples to generate
             for *each* context length bucket. Defaults to 128.
+        input_lengths: Exact input-token lengths to generate. When omitted,
+            powers-of-two buckets are generated from 128 up to max_toks.
 
     Returns:
         A dictionary where keys are integer context lengths and values are lists of tokenized
@@ -66,22 +71,87 @@ def create_sample_data(
     """
     if n_samples < 100:
         logger.warning(f"n_samples = {n_samples}. Do not use this run for benchmarking!")
-    # 128 -> max token len
-    tok_lens = [2**x for x in range(7, math.floor(math.log2(max_toks)))]
+    if input_lengths is None:
+        # 128 -> max token len
+        tok_lens = [2**x for x in range(7, math.floor(math.log2(max_toks)))]
+    else:
+        tok_lens = list(input_lengths)
+    if not tok_lens:
+        raise ValueError("No performance input lengths were generated")
+    longest_input = max(tok_lens)
+    required_samples = n_samples * len(tok_lens)
 
-    def tok_and_len(batch):
-        tok = tokenizer(batch["text"], padding=False, truncation=False)["input_ids"]
-        return {"input_ids": tok, "len": len(tok)}
+    chat_template = getattr(tokenizer, "chat_template", None)
+    chat_prefix_len = 0
+    chat_suffix_len = 0
 
-    tokenized_dataset = (
-        datasets.load_dataset("cimec/lambada", split=f"train[:{n_samples * len(tok_lens)}]")
-        .map(tok_and_len, batched=False, remove_columns=["text", "domain"])
-        .filter(lambda data: data["len"] > max_toks)
+    def tokenize_text(text: str) -> list[int]:
+        if not chat_template:
+            return tokenizer(text, padding=False, truncation=False)["input_ids"]
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": f"Continue the following passage:\n\n{text}"}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+
+    if chat_template:
+        marker_a = tokenize_text("alpha")
+        marker_b = tokenize_text("bravo")
+        chat_prefix_len = next(
+            (
+                i for i, (token_a, token_b) in enumerate(zip(marker_a, marker_b))
+                if token_a != token_b
+            ),
+            min(len(marker_a), len(marker_b)),
+        )
+        max_suffix_len = min(len(marker_a), len(marker_b)) - chat_prefix_len
+        while (
+            chat_suffix_len < max_suffix_len
+            and marker_a[-chat_suffix_len - 1] == marker_b[-chat_suffix_len - 1]
+        ):
+            chat_suffix_len += 1
+        if chat_suffix_len == 0:
+            raise RuntimeError("The chat template has no assistant-generation suffix")
+
+    def truncate_tokens(tokens: list[int], target_length: int) -> list[int]:
+        if not chat_template:
+            return tokens[:target_length]
+        content_end = len(tokens) - chat_suffix_len
+        content_length = target_length - chat_prefix_len - chat_suffix_len
+        if content_length < 0 or content_end - chat_prefix_len < content_length:
+            raise RuntimeError(
+                f"Cannot create a {target_length}-token chat prompt with this template"
+            )
+        return (
+            tokens[:chat_prefix_len]
+            + tokens[chat_prefix_len:content_end][:content_length]
+            + tokens[content_end:]
+        )
+
+    tokenized_samples = []
+    dataset = datasets.load_dataset(
+        "cimec/lambada",
+        split="train",
+        streaming=True,
     )
+    for row in dataset:
+        tokens = tokenize_text(row["text"])
+        if len(tokens) < longest_input:
+            continue
+        tokenized_samples.append(tokens)
+        if len(tokenized_samples) == required_samples:
+            break
+
+    if len(tokenized_samples) < required_samples:
+        raise RuntimeError(
+            f"LAMBADA provided {len(tokenized_samples)} samples with at least "
+            f"{longest_input} tokens; {required_samples} are required"
+        )
 
     samples = {
         tok_len: [
-            tokenized_dataset[j]["input_ids"][:tok_len]
+            truncate_tokens(tokenized_samples[j], tok_len)
             for j in range(i * n_samples, (i + 1) * n_samples)
         ]
         for i, tok_len in enumerate(sorted(tok_lens))

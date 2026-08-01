@@ -78,16 +78,16 @@ NB_MODULE(cpp_ext, m) {
             nb::init<
                 std::filesystem::path,
                 std::optional<std::filesystem::path>,
+                std::optional<std::filesystem::path>,
                 std::optional<std::string>,
                 std::optional<std::string>,
-                bool,
                 bool
             >(),
             nb::arg("model_path"),
             nb::arg("whisper_model_path") = nb::none(),
+            nb::arg("draft_model_path") = nb::none(),
             nb::arg("system_prompt") = nb::none(),
             nb::arg("chat_template") = nb::none(),
-            nb::arg("do_parallel_load") = true,
             nb::arg("enable_thinking") = false
         )
         .def("run", &CLI::run)
@@ -98,23 +98,32 @@ NB_MODULE(cpp_ext, m) {
             nb::init<
                 std::filesystem::path,
                 std::optional<std::filesystem::path>,
+                std::optional<std::filesystem::path>,
                 std::optional<std::string>,
                 std::optional<std::string>,
-                bool,
                 bool
             >(),
             nb::arg("model_path"),
             nb::arg("whisper_model_path") = nb::none(),
+            nb::arg("draft_model_path") = nb::none(),
             nb::arg("system_prompt") = nb::none(),
             nb::arg("chat_template") = nb::none(),
-            nb::arg("do_parallel_load") = true,
             nb::arg("enable_thinking") = false
         )
         .def("run", &WEB::run)
     ;
 
     nb::class_<ZMQServer>(m, "ZMQServer")
-        .def(nb::init<const std::filesystem::path&, uint32_t>())
+        .def(
+            nb::init<
+                const std::filesystem::path&,
+                uint32_t,
+                std::optional<std::filesystem::path>
+            >(),
+            nb::arg("model_path"),
+            nb::arg("port"),
+            nb::arg("draft_model_path") = nb::none()
+        )
         .def("run", &ZMQServer::run)
         .def("stop", &ZMQServer::stop)
     ;

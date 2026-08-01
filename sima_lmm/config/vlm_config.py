@@ -7,8 +7,11 @@ import numpy as np
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows
+from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows, round_up_to
 from sima_utils.logging.sima_logger import sima_log_warning
+
+LONG_CONTEXT_MIN_TOKENS = 2048
+LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE = 1024
 
 
 class ExtensibleEnum:
@@ -147,6 +150,14 @@ class GgufFileType(int, ExtensibleEnum):
 
 MLA_CONSTRAINTS: dict = {
     "max_position_embeddings": 2048,  # k-v cache size
+}
+
+# Number of tokens processed in parallel per speculative-decoding step.
+# "draft": the number of candidate tokens the draft model proposes per step (topk).
+# "target": the number of tokens the target model verifies in parallel per step.
+SPECULATIVE_BUDGET: dict = {
+    "draft": 5,
+    "target": 16,
 }
 
 
@@ -375,7 +386,14 @@ class RoPEConfig(BaseConfig):
             self.rope_scaling = RopeScalingConfig()
             self.rope_scaling.set_config(text_cfg)
             if "rope_scaling" in text_cfg:
-                self.rope_scaling.set_config(text_cfg["rope_scaling"])
+                if text_cfg["rope_scaling"] is None:
+                    # Some configs (e.g. EAGLE3 drafts) explicity set rope_scaling
+                    # to null. Defaults to RopeScalingConfig;
+                    # for drafts the actual values are inherited from the target
+                    # model in VisionLanguageModel.from_hf_cache()
+                    self.rope_scaling = RopeScalingConfig()
+                else:
+                    self.rope_scaling.set_config(text_cfg["rope_scaling"])
             self.rope_dimension_count = text_cfg.get("rope_dimension_count", 0)
             if not self.rope_dimension_count and "partial_rotary_factor" in text_cfg:
                 self.rope_dimension_count = int(head_dim * text_cfg["partial_rotary_factor"])
@@ -386,13 +404,15 @@ class RoPEConfig(BaseConfig):
             if not self.rope_scaling.original_max_position_embeddings:
                 self.rope_scaling.original_max_position_embeddings = text_cfg["original_max_position_embeddings"]
             factor = text_cfg["max_position_embeddings"] / self.rope_scaling.original_max_position_embeddings
-            self.rope_scaling.attention_factor = (
+            attention_factor = (
                 1.0
                 if factor <= 1.0
                 else math.sqrt(
                     1 + math.log(factor) / math.log(self.rope_scaling.original_max_position_embeddings)
                 )
             )
+            # Cast to match gguf fp32 attention factor
+            self.rope_scaling.attention_factor = float(np.float32(attention_factor))
 
         if not self.rope_dimension_count:
             self.rope_dimension_count = head_dim
@@ -509,18 +529,15 @@ class LoraConfig(BaseConfig):
 
 
 @dataclass
-class DraftConfig(BaseConfig):
-    """Configuration of a speculative decoding draft model.
+class SpeculativeDecodingConfig(BaseConfig):
+    """Configuration of a model in a speculative decoding setup.
 
     Attributes:
-        draft_vocab_size: The vocabulary size used by the draft model's lm_head. Smaller than the
-            target model's vocab_size.
-        num_hidden_layers: Number of transformer layers in the draft model. Always 1 for EAGLE.
-        hidden_size: Hidden dimension of the draft model. Must match the target model's hidden_size.
+        is_draft: True if the model is a draft model in a speculative decoding setup.
+        speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
+            16 for target, 5 for draft model.
     """
-    draft_vocab_size: int = 0
-    num_hidden_layers: int = 0
-    hidden_size: int = 0
+    is_draft: bool = False
     speculative_budget: int = 16
 
 
@@ -554,6 +571,10 @@ class LanguageModelConfig(BaseConfig):
         conv_L_cache: LFM2 short conv cache length; number of tokens used by conv.
         conv_bias: Whether conv layers use bias (LFM2).
         lora_cfg: The configuration of LoRA for the base model.
+        draft_vocab_size: Output dimension of the draft model's lm_head over a
+            reduced token subset. Not an input embedding size. 0 for non-draft.
+        speculative_decoding_cfg: Speculative-decoding settings; None unless this
+            model is part of a speculative-decoding pair.
     """
     model_type: str = ""
     data_type: LlmDataType = LlmDataType.BF16
@@ -575,13 +596,17 @@ class LanguageModelConfig(BaseConfig):
     final_logit_softcapping: float | None = None
     lm_head_num_splits: int = 1
     lm_head_split_dim: int = 0
+    draft_vocab_size: int = 0
     conv_L_cache: int = 3
     conv_bias: bool = False
     lora_cfg: LoraConfig | None  = None
-    draft_cfg: DraftConfig | None = None
+    speculative_decoding_cfg: SpeculativeDecodingConfig | None = None
 
     def __post_init__(self):
-        self.lm_head_split_dim = self.token_cfg.vocab_size
+        self.lm_head_split_dim = (
+            self.draft_vocab_size if self.draft_vocab_size > 0
+            else self.token_cfg.vocab_size
+        )
 
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
@@ -595,8 +620,8 @@ class LanguageModelConfig(BaseConfig):
         cfg["arch"] = LlmArchType(cfg["arch"])
         if cfg.get("lora_cfg") is not None:
             cfg["lora_cfg"] = LoraConfig(**cfg["lora_cfg"])
-        if cfg.get("draft_cfg") is not None:
-            cfg["draft_cfg"] = DraftConfig(**cfg["draft_cfg"])
+        if cfg.get("speculative_decoding_cfg") is not None:
+            cfg["speculative_decoding_cfg"] = SpeculativeDecodingConfig(**cfg["speculative_decoding_cfg"])
         lmc = LanguageModelConfig(**cfg)
         lmc._calc_lm_head_splits()
         return lmc
@@ -608,9 +633,10 @@ class LanguageModelConfig(BaseConfig):
 
         layer_types = text_cfg.get("layer_types") or []
         sliding_window = text_cfg.get("sliding_window", 0) or 0
+        use_sliding_window = text_cfg.get("use_sliding_window", True)
         num_hidden_layers = text_cfg.get("num_hidden_layers", 0)
         if not layer_types:
-            if sliding_window > 0:
+            if sliding_window > 0 and use_sliding_window:
                 layer_types = ["sliding_attention"] * num_hidden_layers
             else:
                 layer_types = ["full_attention"] * num_hidden_layers
@@ -630,6 +656,7 @@ class LanguageModelConfig(BaseConfig):
             and not self.model_type.startswith("gemma4")
         )
         self.layer_types = layer_types
+        self.draft_vocab_size = text_cfg.get("draft_vocab_size", 0)
 
         for key in (
             "attn_logit_softcapping",
@@ -678,17 +705,16 @@ class LanguageModelConfig(BaseConfig):
             self.lora_cfg = LoraConfig()
             self.lora_cfg.set_config(cfg)
 
-    def set_draft_model(self, cfg: dict | None):
+    def set_speculative_decoding_config(self, cfg: dict | None):
         if cfg is None:
-            self.draft_cfg = None
+            self.speculative_decoding_cfg = None
         else:
-            self.draft_cfg = DraftConfig()
-            self.draft_cfg.set_config(cfg)
-            if self.draft_cfg.hidden_size != self.hidden_size:
+            if self.attn_cfg.swa_enable:
                 raise ValueError(
-                    f"Draft model hidden_size ({self.draft_cfg.hidden_size}) "
-                    f"does not match target model hidden_size ({self.hidden_size})."
+                    "EAGLE3 speculative decoding does not support sliding-window attention"
                 )
+            self.speculative_decoding_cfg = SpeculativeDecodingConfig()
+            self.speculative_decoding_cfg.set_config(cfg)
 
     def is_lora_target_module(self, base_name: str, module_name: str) -> bool:
         """
@@ -758,7 +784,10 @@ class LanguageModelConfig(BaseConfig):
         max_num_channels_per_split = (
             mla_instr_max_num_channels * compiler_max_num_channel_splits // num_bytes_per_element
         )
-        num_channels = self.token_cfg.vocab_size
+        num_channels = (
+            self.draft_vocab_size if self.draft_vocab_size > 0
+            else self.token_cfg.vocab_size
+        )
 
         max_num_channel_blocks_per_split = ceil_div(
             max_num_channels_per_split, num_channels_per_block
@@ -786,23 +815,27 @@ class PipelineConfig(BaseConfig):
         max_num_tokens: The max number of tokens including the input and generated tokens.
         input_token_group_size: The group size of input token.
         input_token_group_offsets: The group offsets of input token.
+        future_token_mask_size: The normal cache-model mask bucket size.
+        long_context_future_token_mask_size: Optional full-attention override for long contexts.
         return_logits: Return logits at the last layer.
-        use_strided_kv_cache: Enables strided access to the KV cache stored in DRAM, affecting both
-            read and write operations.
         enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
+        embeddings_scale: Scale used to dequantize the normal embedding table.
+        quantize_kv_cache: Enables KV cache quantization to reduce memory consumption.
         split_mlp: Split the MLP into multiple stages in order to reduce TTFT.
     """
     system_prompt: str | None = None
     chat_template: str | None = None
-    max_num_tokens: int = 1024
+    max_num_tokens: int = 4096
     input_token_group_size: int = 1
     input_token_group_offsets: list[int] | None = None
     future_token_mask_size: int = 1
+    long_context_future_token_mask_size: int | None = None
     return_logits: bool = False
-    use_strided_kv_cache: bool = False
     enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
+    embeddings_scale: float | None = None
+    quantize_kv_cache: bool = False
     split_mlp: bool = False
 
     def set_system_prompt(self, prompt: str | None):
@@ -812,29 +845,62 @@ class PipelineConfig(BaseConfig):
         self.chat_template = chat_template
 
     def set_max_num_tokens(self, max_num_tokens: int):
-        assert max_num_tokens > 0
+        if max_num_tokens <= 0:
+            raise ValueError("max_num_tokens must be greater than zero")
+        if max_num_tokens % LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE:
+            raise ValueError("max_num_tokens must be a multiple of 1024")
         self.max_num_tokens = max_num_tokens
+        self._set_long_context_future_token_mask_size()
 
-    def set_group_size(self, size: int):
+    def set_group_size(self, size: int | None):
+        if size is None:
+            self.input_token_group_size = 1
+            self.input_token_group_offsets = None
+            return
+        if size <= 0:
+            raise ValueError("language_group_size must be greater than zero")
+
         self.input_token_group_size = size
-
-    def set_group_offsets(self, offsets: list[int]):
-        self.input_token_group_offsets = offsets
+        self.input_token_group_offsets = list(
+            range(0, self.max_num_tokens - size + 1, size)
+        )
 
     def set_future_token_mask_size(self, mask_size: int):
+        if mask_size <= 0:
+            raise ValueError("future_token_mask_size must be greater than zero")
         self.future_token_mask_size = mask_size
+        self._set_long_context_future_token_mask_size()
+
+    def _set_long_context_future_token_mask_size(self) -> None:
+        self.long_context_future_token_mask_size = (
+            LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE
+            if self.max_num_tokens > LONG_CONTEXT_MIN_TOKENS
+            else None
+        )
+
+    def get_cache_mask_size(
+        self, layer_type: str, context_length: int, *, is_group: bool
+    ) -> int:
+        """Return the cache bucket size for the model type and context."""
+        if (
+            layer_type != "sliding_attention"
+            and self.long_context_future_token_mask_size is not None
+            and context_length > LONG_CONTEXT_MIN_TOKENS
+        ):
+            return self.long_context_future_token_mask_size
+        return self.input_token_group_size if is_group else self.future_token_mask_size
 
     def set_return_logits(self, return_logits: bool):
         self.return_logits = return_logits
-
-    def set_strided_kv_cache(self, use_strided_kv_cache: bool):
-        self.use_strided_kv_cache = use_strided_kv_cache
 
     def set_enable_filter_sharing(self, enable_filter_sharing: bool):
         self.enable_filter_sharing = enable_filter_sharing
 
     def set_quantize_embeddings(self, quantize_embeddings: bool):
         self.quantize_embeddings = quantize_embeddings
+
+    def set_quantize_kv_cache(self, quantize_kv_cache: bool):
+        self.quantize_kv_cache = quantize_kv_cache
 
     def set_split_mlp(self, split_mlp: bool):
         self.split_mlp = split_mlp
@@ -1040,16 +1106,25 @@ class VlmConfig(BaseConfig):
         system_prompt: str | None,
         chat_template: str | None,
         max_num_tokens: int,
-        language_group_size: int,
-        language_group_offsets: list[int],
+        language_group_size: int | None,
         future_token_mask_size: int,
     ):
         self.pipeline_cfg.set_system_prompt(system_prompt)
         self.pipeline_cfg.set_chat_template(chat_template)
         self.pipeline_cfg.set_max_num_tokens(max_num_tokens)
         self.pipeline_cfg.set_group_size(language_group_size)
-        self.pipeline_cfg.set_group_offsets(language_group_offsets)
         self.pipeline_cfg.set_future_token_mask_size(future_token_mask_size)
+
+        if (
+            self.lm_cfg.attn_cfg.swa_enable
+            and self.pipeline_cfg.input_token_group_offsets
+            and self.pipeline_cfg.input_token_group_size
+            >= self.lm_cfg.attn_cfg.sliding_window
+        ):
+            raise ValueError(
+                "language_group_size must be smaller than sliding_window "
+                "for models with sliding attention"
+            )
 
     def get_layer_ids(self) -> list[LayerID]:
         """
@@ -1060,6 +1135,10 @@ class VlmConfig(BaseConfig):
 
         layers = []
         layer_types = getattr(lm_cfg, "layer_types", [])
+        is_speculative_draft = (
+            lm_cfg.speculative_decoding_cfg is not None
+            and lm_cfg.speculative_decoding_cfg.is_draft
+        )
 
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
@@ -1079,7 +1158,7 @@ class VlmConfig(BaseConfig):
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
                     layers.append(LayerID("group_pre", i))
-                    if i < lm_cfg.num_hidden_layers - 1 or lm_cfg.draft_cfg is not None:
+                    if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
                         layers.append(LayerID("group_post", i))
                     layers.append(LayerID("single_pre", i))
                     layers.append(LayerID("single_post", i))
@@ -1087,20 +1166,85 @@ class VlmConfig(BaseConfig):
                     raise ValueError(f"Unsupported layer type: {t}")
             # Cache models are shared across layers; include only for kinds that exist
             if has_attn:
-                layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
-                layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
-                if (lm_cfg.attn_cfg.sliding_head_dim is not None
-                        and lm_cfg.attn_cfg.sliding_head_dim != lm_cfg.attn_cfg.head_dim):
-                    layers.extend(LayerID("group_sliding_cache", n) for n in group_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
-                    layers.extend(LayerID("single_sliding_cache", n) for n in single_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
+                group_cache_indices = group_cache_model_indices(pipeline_cfg)
+                single_cache_indices = single_cache_model_indices(pipeline_cfg)
+                has_sliding_attn = "sliding_attention" in layer_types
+                separate_sliding_cache = (
+                    lm_cfg.attn_cfg.sliding_head_dim is not None
+                    and lm_cfg.attn_cfg.sliding_head_dim != lm_cfg.attn_cfg.head_dim
+                )
+                terminal_sliding_cache = False
+                if has_sliding_attn and not separate_sliding_cache:
+                    sliding_window = lm_cfg.attn_cfg.sliding_window
+                    mask_context = min(sliding_window, pipeline_cfg.max_num_tokens)
+                    sliding_cache_mask_differs = any(
+                        pipeline_cfg.get_cache_mask_size(
+                            "full_attention", mask_context, is_group=is_group
+                        )
+                        != pipeline_cfg.get_cache_mask_size(
+                            "sliding_attention", mask_context, is_group=is_group
+                        )
+                        for is_group in (False, True)
+                    )
+                    terminal_sliding_cache = (
+                        sliding_cache_mask_differs
+                        and sliding_window <= pipeline_cfg.max_num_tokens
+                    )
+                    if not sliding_cache_mask_differs:
+                        group_cache_indices = group_shared_sliding_cache_model_indices(
+                            pipeline_cfg, sliding_window
+                        )
+                        single_cache_indices = single_shared_sliding_cache_model_indices(
+                            pipeline_cfg, sliding_window
+                        )
+                layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
+                layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
+                if separate_sliding_cache:
+                    layers.extend(
+                        LayerID("group_sliding_cache", n)
+                        for n in group_sliding_cache_model_indices(
+                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                        )
+                    )
+                    layers.extend(
+                        LayerID("single_sliding_cache", n)
+                        for n in single_sliding_cache_model_indices(
+                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                        )
+                    )
+                elif terminal_sliding_cache:
+                    layers.append(LayerID(
+                        "group_sliding_cache",
+                        _cache_model_index(
+                            pipeline_cfg,
+                            "sliding_attention",
+                            sliding_window,
+                            pipeline_cfg.input_token_group_size,
+                            is_group=True,
+                        ),
+                    ))
+                    layers.append(LayerID(
+                        "single_sliding_cache",
+                        _cache_model_index(
+                            pipeline_cfg,
+                            "sliding_attention",
+                            sliding_window,
+                            1,
+                            is_group=False,
+                        ),
+                    ))
             if has_conv and layer_types[-1] == "conv":
                 layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
         else:
             # Fallback: attention-only if no layer_types
             layers.extend(LayerID("group_pre", n) for n in range(lm_cfg.num_hidden_layers))
+            num_group_post_layers = (
+                lm_cfg.num_hidden_layers
+                if is_speculative_draft
+                else lm_cfg.num_hidden_layers - 1
+            )
             layers.extend(
-                LayerID("group_post", n) 
-                for n in range(lm_cfg.num_hidden_layers - (lm_cfg.draft_cfg is None))
+                LayerID("group_post", n) for n in range(num_group_post_layers)
             )
             layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
             layers.extend(LayerID("single_pre", n) for n in range(lm_cfg.num_hidden_layers))
@@ -1108,6 +1252,9 @@ class VlmConfig(BaseConfig):
             layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
         if self.vm_cfg is not None and self.is_supported_multimodal:
             layers.extend(LayerID("vision", n) for n in range(vision_model_layer_count(self.vm_cfg)))
+        if is_speculative_draft:
+            layers.append(LayerID("group_draft_fc", 0))
+            layers.append(LayerID("single_draft_fc", 0))
 
         if (
             self.model_type == VlmArchType.VLM_GEMMA4
@@ -1254,6 +1401,38 @@ def apply_mla_constraint(vlm_cfg: VlmConfig) -> None:
                 setattr(cfg, key, value)
 
 
+def _cache_model_index(
+    cfg: PipelineConfig,
+    layer_type: str,
+    context_length: int,
+    num_tokens: int,
+    *,
+    is_group: bool,
+) -> int:
+    mask_size = cfg.get_cache_mask_size(
+        layer_type, context_length, is_group=is_group
+    )
+    if mask_size <= num_tokens:
+        return context_length - num_tokens
+    return min(round_up_to(context_length, mask_size), cfg.max_num_tokens) - num_tokens
+
+
+def _group_cache_model_indices(cfg: PipelineConfig, layer_type: str) -> list[int]:
+    if cfg.input_token_group_offsets is None:
+        raise RuntimeError("Group token offsets have not been computed")
+
+    return sorted({
+        _cache_model_index(
+            cfg,
+            layer_type,
+            offset + cfg.input_token_group_size,
+            cfg.input_token_group_size,
+            is_group=True,
+        )
+        for offset in cfg.input_token_group_offsets
+    })
+
+
 def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     """
     Get the indices of all group cache models for the pipeline configuration.
@@ -1261,10 +1440,7 @@ def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     Returns:
         Indices of group cache models in ascending order.
     """
-    if cfg.input_token_group_offsets is None:
-        raise RuntimeError("Group token offsets have not been computed")
-
-    return list(cfg.input_token_group_offsets)
+    return _group_cache_model_indices(cfg, "full_attention")
 
 
 def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
@@ -1280,10 +1456,31 @@ def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) 
         Indices of group sliding cache models in ascending order.
     """
     transition = sliding_window - cfg.input_token_group_size
-    indices = [n for n in group_cache_model_indices(cfg) if n < transition]
+    indices = [
+        n for n in _group_cache_model_indices(cfg, "sliding_attention")
+        if n < transition
+    ]
     if transition > 0:
         indices.append(transition)
     return indices
+
+
+def group_shared_sliding_cache_model_indices(
+    cfg: PipelineConfig, sliding_window: int
+) -> list[int]:
+    """Get cache indices needed by sliding attention sharing the full cache."""
+    return sorted(set(group_cache_model_indices(cfg)) | set(
+        group_sliding_cache_model_indices(cfg, sliding_window)
+    ))
+
+
+def _single_cache_model_indices(cfg: PipelineConfig, layer_type: str) -> list[int]:
+    return sorted({
+        _cache_model_index(
+            cfg, layer_type, context_length, 1, is_group=False
+        )
+        for context_length in range(1, cfg.max_num_tokens + 1)
+    })
 
 
 def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
@@ -1296,17 +1493,9 @@ def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     # A model is used for each batch of future_token_mask_size tokens.
     # The model's index is the last token's index in the batch.  The last
     # batch's index is the last token's index, even if it is not evenly
-    # spaced.  For example, given future_token_mask_size=5 and
-    # max_num_tokens=24, the indices will be 4, 9, 14, 19, 23.
-    incr = cfg.future_token_mask_size
-    single_cache_token_idx_list = list(
-        range(incr - 1, cfg.max_num_tokens, incr)
-    )
-
-    if cfg.max_num_tokens - 1 not in single_cache_token_idx_list:
-        single_cache_token_idx_list.append(cfg.max_num_tokens - 1)
-
-    return single_cache_token_idx_list
+    # spaced.  For example, given future_token_mask_size=192 and
+    # max_num_tokens=1024, the indices will be 191, 383, 575, 767, 959, 1023.
+    return _single_cache_model_indices(cfg, "full_attention")
 
 
 def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
@@ -1321,7 +1510,19 @@ def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int)
     Returns:
         Indices of single sliding cache models in ascending order.
     """
-    return [n for n in single_cache_model_indices(cfg) if n < sliding_window]
+    return [
+        n for n in _single_cache_model_indices(cfg, "sliding_attention")
+        if n < sliding_window
+    ]
+
+
+def single_shared_sliding_cache_model_indices(
+    cfg: PipelineConfig, sliding_window: int
+) -> list[int]:
+    """Get cache indices needed by single-token full and sliding attention."""
+    return sorted(set(single_cache_model_indices(cfg)) | set(
+        single_sliding_cache_model_indices(cfg, sliding_window)
+    ))
 
 
 def vision_model_layer_count(cfg: VisionModelConfig) -> int:

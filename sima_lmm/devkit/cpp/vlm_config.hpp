@@ -17,6 +17,11 @@ namespace llima {
 // Redefines the *Config python classes in sima_lmm/config/vlm_config.py here. Only the fields that
 // are used in the evaluation time is defined.
 
+struct SpeculativeBudget {
+    static constexpr uint16_t draft = 5;
+    static constexpr uint16_t target = 16;
+};
+
 struct VisionModelConfig {
     std::vector<uint16_t> image_sizes;
     bool cls_embed;
@@ -152,6 +157,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     swa_enable, swa_ratio, sliding_window
 )
 
+struct SpeculativeDecodingConfig {
+    bool is_draft = false;
+    uint16_t speculative_budget = 16;
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    SpeculativeDecodingConfig, is_draft, speculative_budget
+)
+
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
 
 struct LanguageModelConfig {
@@ -168,7 +181,8 @@ struct LanguageModelConfig {
     uint32_t num_kv_shared_layers = 0;
     double rms_norm_eps = 1e-05;
     bool rms_norm_unit_offset = false;
-
+    uint32_t draft_vocab_size = 0;
+    std::optional<SpeculativeDecodingConfig> speculative_decoding_cfg = std::nullopt;
     bool is_kv_shared_layer(uint8_t layer_idx) const {
         uint8_t first_shared_layer = num_hidden_layers - num_kv_shared_layers;
         return num_kv_shared_layers > 0 && layer_idx >= first_shared_layer;
@@ -185,12 +199,32 @@ struct LanguageModelConfig {
         }
         return layer_idx;
     }
+
+    uint16_t get_single_num_tokens() const {
+        if (speculative_decoding_cfg.has_value()) {
+            return speculative_decoding_cfg.value().speculative_budget;
+        }
+        return 1;
+    }
+
+    bool is_spec_decode() const {
+        return speculative_decoding_cfg.has_value();
+    }
+
+    uint32_t get_lm_head_output_size() const {
+        if (speculative_decoding_cfg.has_value()
+            && speculative_decoding_cfg.value().is_draft){
+            return draft_vocab_size;
+        }
+        return token_cfg.vocab_size;
+    }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     LanguageModelConfig, token_cfg, rope_cfg, attn_cfg, num_hidden_layers, hidden_size,
     lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache,
     hidden_size_per_layer_input, num_kv_shared_layers,
-    rms_norm_eps, rms_norm_unit_offset
+    rms_norm_eps, rms_norm_unit_offset,
+    draft_vocab_size, speculative_decoding_cfg
 )
 
 
@@ -215,15 +249,19 @@ struct PipelineConfig {
     uint16_t input_token_group_size;
     std::optional<std::vector<uint16_t>> input_token_group_offsets;
     uint16_t future_token_mask_size;
+    std::optional<uint16_t> long_context_future_token_mask_size = std::nullopt;
     bool return_logits;
-    bool use_strided_kv_cache;
+    bool use_strided_kv_cache = true;
     bool enable_filter_sharing;
     bool quantize_embeddings = false;
+    std::optional<double> embeddings_scale = std::nullopt;
+    bool quantize_kv_cache = false;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     PipelineConfig, system_prompt, chat_template, max_num_tokens, input_token_group_size,
-    input_token_group_offsets, future_token_mask_size, return_logits, use_strided_kv_cache,
-    enable_filter_sharing, quantize_embeddings
+    input_token_group_offsets, future_token_mask_size, long_context_future_token_mask_size,
+    return_logits, use_strided_kv_cache, enable_filter_sharing, quantize_embeddings,
+    embeddings_scale, quantize_kv_cache
 )
 
 

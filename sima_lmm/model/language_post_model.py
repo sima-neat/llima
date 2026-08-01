@@ -38,8 +38,13 @@ class LanguagePostModel(LanguagePostBaseModel):
     def split_mlp(self) -> bool:
         return self.cfg.pipeline_cfg.split_mlp
 
+    @property
+    def _layer_base_name(self) -> str:
+        base = self.hf_model.language_model_param_base_name
+        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+
     def gen_onnx_files(self):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         self.create_onnx_builder()
         self._onnx_builder.create_input_node(
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
@@ -197,7 +202,9 @@ class LanguagePostModel(LanguagePostBaseModel):
         norm = self._build_sima_rms_norm(builder, f"{base_name}.post_per_layer_input_norm", proj)
         add = builder.create_add_node(residual, norm)
         layer_scalar = builder.create_constant_node(
-            self.get_hf_param(f"{base_name}.layer_scalar").astype(np.float32).reshape(1)
+            self.get_hf_param(f"{base_name}.layer_scalar")
+            .astype(activation_dtype(quantizable))
+            .reshape(1)
         )
         return builder.create_mul_node(add, layer_scalar)
 
@@ -207,7 +214,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         log_level: int,
         quantizable: bool,
     ):
-        base_name = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
+        base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         g = self._build_sima_nodes(base_name, quantizable, merged_lora)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
@@ -224,7 +231,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         )
         per_layer_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size_per_layer_input)
 
-        if self.cfg.pipeline_cfg.quantize_embeddings and self.layer_idx == 0:
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             input_dtype = ScalarType.int8
         else:
             input_dtype = activation_type(quantizable)
@@ -284,7 +291,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         )
 
         # De-quantize embeddings table if needed.
-        if self.cfg.pipeline_cfg.quantize_embeddings and self.layer_idx == 0:
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             assert self.embeddings_scale is not None
             rms_norm_in = builder.create_dequantization_node(
                 mla_input_input.name,

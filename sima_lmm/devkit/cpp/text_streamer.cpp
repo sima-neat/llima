@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include "text_streamer.hpp"
+#include "utils.hpp"
 
 namespace simaai {
 namespace llima {
@@ -22,20 +23,30 @@ TextStreamer::TextStreamer(
     _time_to_first_token(-1),
     // Default info callback: do nothing
     _callback_info(info_callback.value_or([](const std::string&, double) {})),
-    // Default text callback: print to console
+    // Default text callback: print to console. ANSI green wrap for
+    // draft-accepted chunks when the highlight env var is set.
     _callback_finalize_text(text_callback.value_or(
-        [this](const std::string& text, bool stream_end) {
-            if (stream_end) {
-                std::cout << text << std::endl << std::flush;
+        [this](const std::string& text, bool stream_end, bool from_draft) {
+            if (from_draft && _highlight_draft_tokens && !text.empty()) {
+                std::cout << "\033[32m" << text << "\033[0m";
             } else {
-                std::cout << text << std::flush;
+                std::cout << text;
             }
+            if (stream_end) {
+                std::cout << std::endl;
+            }
+            std::cout << std::flush;
         }
     )),
     _pop_thread(&TextStreamer::pop_forever, this)
 {
     auto llima_logger = spdlog::get("llima");
     _logger = llima_logger? llima_logger->clone("STREAM") : spdlog::default_logger();
+    // Read the env var once per process — initialized on the first
+    // TextStreamer construction, reused across subsequent instances (target
+    // and draft) so the value isn't logged twice.
+    static const bool highlight = get_env_var("SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT", false);
+    _highlight_draft_tokens = highlight;
 }
 
 
@@ -66,12 +77,12 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
         
         switch (data.type) {
             case DecodeCallbackType::TTFT:
-                put(data.token_id);
+                put(data.token_id, data.from_draft);
                 _time_to_first_token = data.duration;
                 _callback_info("ttft", data.duration);
                 break;
             case DecodeCallbackType::TPS:
-                put(data.token_id);
+                put(data.token_id, data.from_draft);
                 _time_to_next_token_vec.emplace_back(data.duration);
                 _callback_info("tps", 1.0 / data.duration);
                 break;
@@ -97,7 +108,37 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
 }
 
 
-void TextStreamer::put(uint32_t token_id) {
+void TextStreamer::put(uint32_t token_id, bool from_draft) {
+    // Preserve structural markers only while this request has tools enabled.
+    if (_tool_call_enabled && !_preserved_tokens.empty()) {
+        const auto preserved = std::find_if(
+            _preserved_tokens.begin(), _preserved_tokens.end(),
+            [token_id](const auto& token) { return token.first == token_id; }
+        );
+        if (preserved != _preserved_tokens.end()) {
+            _flush_cached_text();
+            if (from_draft) {
+                ++_draft_token_count;
+            }
+            _chunk_from_draft = from_draft;
+            _on_finalized_text(preserved->second);
+            return;
+        }
+    }
+
+    // If from_draft flips mid-cache, force-flush the remaining buffered text
+    // before adopting the new color. Without this, draft-accepted tokens and
+    // the trailing bonus token end up sharing one chunk colored by whichever
+    // came first, defeating the highlight.
+    if (!_cached_token_ids.empty() && from_draft != _chunk_from_draft) {
+        _flush_cached_text();
+    }
+    if (_cached_token_ids.empty()) {
+        _chunk_from_draft = from_draft;
+    }
+    if (from_draft) {
+        ++_draft_token_count;
+    }
     // Add the new token to the cache and decodes all token ids.
     _cached_token_ids.emplace_back(token_id);
     auto text = _tokenizer_ptr->decode(_cached_token_ids, true);
@@ -128,19 +169,9 @@ void TextStreamer::put(uint32_t token_id) {
 
 
 void TextStreamer::end() {
-    std::string printable_text;
-    if (_cached_token_ids.empty()) {
-        printable_text = "";
-    } else {
-        auto text = _tokenizer_ptr->decode(_cached_token_ids, true);
-        printable_text = text.substr(_print_len);
-        _cached_token_ids.clear();
-        _print_len = 0;
-    }
-    _on_finalized_text(printable_text, true);
+    _flush_cached_text(true);
 
-    // Emit generation stats through the logger. Callers that need structured metrics receive
-    // them through the info callback.
+    // Print generation stats.
     std::vector<std::string> messages;
     messages.emplace_back("");
     if (_time_to_first_token < 0) {
@@ -167,6 +198,14 @@ void TextStreamer::end() {
         auto mid_tps = static_cast<double>(1) / _time_to_next_token_vec[mid_pos];
         auto num_gen_tokens = _time_to_next_token_vec.size() + 1;
         messages.emplace_back(fmt::format("Number of generated tokens: {}", num_gen_tokens));
+        if (_draft_token_count > 0) {
+            const double accept_rate = 100.0 * static_cast<double>(_draft_token_count)
+                                     / static_cast<double>(num_gen_tokens);
+            messages.emplace_back(fmt::format(
+                "Number of tokens contributed by EAGLE3: {} ({:.2f}%)",
+                _draft_token_count, accept_rate
+            ));
+        }
         messages.emplace_back(fmt::format("TTFT: {:.2f}s", _time_to_first_token));
         messages.emplace_back(
             fmt::format(
@@ -181,17 +220,47 @@ void TextStreamer::end() {
 
     for (const auto& message: messages) {
         _logger->info(message);
+        std::cout << message << std::endl;
     }
+    std::cout << std::flush;
 
     // Reset the stats.
     _time_to_first_token = -1;
     _time_to_next_token_vec.clear();
+    _draft_token_count = 0;
+}
+
+void TextStreamer::set_preserved_token_ids(
+    std::vector<std::pair<uint32_t, std::string>> tokens
+) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _preserved_tokens = std::move(tokens);
+}
+
+void TextStreamer::set_tool_call_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _tool_call_enabled = enabled;
 }
 
 
 void TextStreamer::_on_finalized_text(const std::string& text, bool stream_end) {
     _logger->info("Finalized text: '{}'", text);
-    _callback_finalize_text(text, stream_end);
+    // Pass the chunk-from-draft flag through; sinks decide how to render
+    // (ANSI in the CLI default, HTML/metadata in web, ignored elsewhere).
+    _callback_finalize_text(text, stream_end, _chunk_from_draft);
+}
+
+void TextStreamer::_flush_cached_text(bool stream_end) {
+    std::string printable_text;
+    if (!_cached_token_ids.empty()) {
+        auto text = _tokenizer_ptr->decode(_cached_token_ids, true);
+        printable_text = text.substr(_print_len);
+        _cached_token_ids.clear();
+        _print_len = 0;
+    }
+    if (!printable_text.empty() || stream_end) {
+        _on_finalized_text(printable_text, stream_end);
+    }
 }
 
 

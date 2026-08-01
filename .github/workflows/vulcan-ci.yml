@@ -24,14 +24,107 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  resolve-test-scope:
+    name: Resolve Test Scope
+    runs-on: ubuntu-latest
+    outputs:
+      run_compiler: ${{ steps.scope.outputs.run_compiler }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: "false"
+
+      - name: Validate compiler scope classifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest -v tests.ci.test_resolve_compiler_test_scope
+
+      - name: Resolve compiler test scope
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          resolver=(
+            python3 tools/ci/resolve_compiler_test_scope.py
+            --github-output "${GITHUB_OUTPUT}"
+            --github-summary "${GITHUB_STEP_SUMMARY}"
+          )
+
+          force_run() {
+            "${resolver[@]}" --force-run-reason "$1"
+          }
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            force_run "Compiler tests required: manual workflow dispatch."
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF_TYPE}" != "branch" ]]; then
+            force_run "Compiler tests required: ${GITHUB_REF_TYPE} ref ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" == "develop" ||
+                "${GITHUB_REF_NAME}" == "main" ||
+                "${GITHUB_REF_NAME}" == release* ]]; then
+            force_run "Compiler tests required: protected or release branch ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          base_ref="develop"
+          base_remote_ref="refs/remotes/origin/${base_ref}"
+          if ! git rev-parse --verify --quiet "${base_remote_ref}^{commit}" >/dev/null; then
+            force_run "Compiler tests required: could not resolve ${base_remote_ref}."
+            exit 0
+          fi
+
+          if ! merge_base="$(git merge-base HEAD "${base_remote_ref}")"; then
+            force_run \
+              "Compiler tests required: could not find a merge base between ${GITHUB_REF_NAME} and ${base_ref}."
+            exit 0
+          fi
+
+          changed_files="${RUNNER_TEMP}/llima-${GITHUB_REF_NAME//\//-}-changed-files.txt"
+          if ! git diff \
+            --name-only \
+            --no-renames \
+            "${merge_base}" \
+            HEAD \
+            -- \
+            > "${changed_files}"; then
+            force_run \
+              "Compiler tests required: could not compare ${GITHUB_REF_NAME} with ${base_ref}."
+            exit 0
+          fi
+
+          "${resolver[@]}" \
+            --changed-files "${changed_files}" \
+            --head-ref "${GITHUB_REF_NAME}" \
+            --base-ref "${base_ref}"
+
   resolve-vulcan-config:
     name: Resolve Vulcan Config
     uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
     with:
       vulcan_env: ${{ vars.VULCAN_ENV || 'dev' }}
 
+  resolve-model-cache-config:
+    name: Resolve Model Cache Config
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-config.yml@main
+    with:
+      vulcan_env: production
+
+  resolve-test-runner:
+    name: Resolve Test Runner
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-modalix-runner.yml@main
+
   build:
-    name: Build LLiMa on Vulcan
+    name: Build all LLiMa packages on one Vulcan instance
     needs: resolve-vulcan-config
     uses: sima-neat/.github/.github/workflows/vulcan-build.yml@main
     with:
@@ -66,8 +159,11 @@ jobs:
         docker exec \
           -e SIMA_CLI_CHECK_FOR_UPDATE=0 \
           -e GITHUB_HEAD_REF="${{ github.head_ref }}" \
+          -e GITHUB_REPOSITORY="${{ github.repository }}" \
           -e GITHUB_REF_NAME="${{ github.ref_name }}" \
           -e GITHUB_REF_TYPE="${{ github.ref_type }}" \
+          -e GITHUB_RUN_ATTEMPT="${{ github.run_attempt }}" \
+          -e GITHUB_RUN_ID="${{ github.run_id }}" \
           -e GITHUB_SHA="${{ github.sha }}" \
           -e NEAT_VULCAN_ENV="${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
           -e NEAT_INTERNALS_SOURCE="vulcan" \
@@ -77,19 +173,18 @@ jobs:
             set -euo pipefail
 
             export SIMA_CLI_CHECK_FOR_UPDATE=0
-            curl -fsSL https://artifacts.sima-neat.com/tools/sima-cli-install.py -o sima-cli-install.py
-            python3 sima-cli-install.py main latest --noninteractive
-            rm -f sima-cli-install.py
+            /workspace/scripts/ci/install_sima_cli_main.sh
             export PATH="${HOME}/.sima-cli/.venv/bin:${PATH}"
-            sima-cli version
+            sima-cli --version
             sima-cli neat install --help >/dev/null
+            sima-cli packages build --help >/dev/null
+            python3.12 --version
 
             cd /workspace
 
             if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
               version="${GITHUB_REF_NAME}"
               version="${version#v}"
-              latest_name=""
             else
               branch_raw="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
               branch_sanitized="$(printf "%s" "${branch_raw}" | tr "[:upper:]" "[:lower:]" | sed -E "s#[^a-z0-9._-]+#-#g; s/^-+//; s/-+$//")"
@@ -98,28 +193,31 @@ jobs:
               fi
               short_sha="$(printf "%s" "${GITHUB_SHA}" | cut -c1-12)"
               version="${branch_sanitized}-${short_sha}"
-              latest_name="sima-llima-${branch_sanitized}-latest.tar.gz"
             fi
 
             export ARCHIVE_NAME="sima-llima-${version}.tar.gz"
-            export LATEST_NAME="${latest_name}"
+            unset LATEST_NAME
             echo "Resolved archive name: ${ARCHIVE_NAME}"
-            if [[ -n "${LATEST_NAME}" ]]; then
-              echo "Resolved latest archive name: ${LATEST_NAME}"
-            fi
 
+            echo "::group::Build Debian packages"
             ./build.sh --install-deps-only
             ./build.sh --all --clean
+            echo "::endgroup::"
+
+            echo "::group::Build wheel packages"
+            ./build_compiler_wheel.sh
+            LLIMA_MOLE_REUSE_COMPILER_WHEEL=ON ./build_mole_package.sh
+            echo "::endgroup::"
           '
 
       post_build_command: |
         set -euo pipefail
 
-        mapfile -t ARCHIVES < <(find dist -maxdepth 1 -type f -name 'sima-llima-*.tar.gz' | sort)
-        mapfile -t SHA_FILES < <(find dist -maxdepth 1 -type f -name 'sima-llima-*.tar.gz.sha256' | sort)
+        mapfile -t ARCHIVES < <(find dist/debs -maxdepth 1 -type f -name 'sima-llima-*.tar.gz' | sort)
+        mapfile -t SHA_FILES < <(find dist/debs -maxdepth 1 -type f -name 'sima-llima-*.tar.gz.sha256' | sort)
 
-        if [[ "${#ARCHIVES[@]}" -lt 1 || "${#SHA_FILES[@]}" -lt 1 ]]; then
-          echo "Expected at least one LLiMa dist archive and sha256 file." >&2
+        if [[ "${#ARCHIVES[@]}" -ne 1 || "${#SHA_FILES[@]}" -ne 1 ]]; then
+          echo "Expected exactly one commit-addressed LLiMa dist archive and sha256 file." >&2
           echo "archives: ${#ARCHIVES[@]}" >&2
           printf '  %s\n' "${ARCHIVES[@]}" >&2 || true
           echo "sha256 files: ${#SHA_FILES[@]}" >&2
@@ -127,19 +225,17 @@ jobs:
           exit 1
         fi
 
-        primary_archive=""
-        for archive in "${ARCHIVES[@]}"; do
-          if [[ "${archive}" != *-latest.tar.gz ]]; then
-            primary_archive="${archive}"
-            break
-          fi
-        done
-        if [[ -z "${primary_archive}" ]]; then
-          primary_archive="${ARCHIVES[0]}"
+        primary_archive="${ARCHIVES[0]}"
+        if [[ "${primary_archive}" == *-latest.tar.gz ]]; then
+          echo "Mutable latest archives are not allowed; Vulcan latest.tag covers the complete artifact set." >&2
+          exit 1
         fi
 
         test -f "${primary_archive}.sha256"
-        sha256sum -c <(awk -v file="$(basename "${primary_archive}")" '{print $1 "  dist/" file}' "${primary_archive}.sha256")
+        (
+          cd dist/debs
+          sha256sum -c <(awk -v file="$(basename "${primary_archive}")" '{print $1 "  " file}' "$(basename "${primary_archive}").sha256")
+        )
         llima_version="$(bash tools/compute_package_version.sh)"
         if [[ -z "${llima_version}" ]]; then
           echo "Unable to compute LLiMa package version." >&2
@@ -148,12 +244,236 @@ jobs:
         test -f "dist/sima-lmm-${llima_version}-Linux-core.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-dev.deb"
         test -f "dist/sima-lmm-${llima_version}-Linux-cli.deb"
+        test -f "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz"
+        memory_deb="$(find dist -maxdepth 1 -type f -name 'simaai-memory-lib_*.deb' -print -quit)"
+        if [[ -z "${memory_deb}" ]]; then
+          echo "Root bundle is missing simaai-memory-lib." >&2
+          exit 1
+        fi
+        memory_version="$(dpkg-deb -f "${memory_deb}" Version)"
+        core_depends="$(dpkg-deb -f "dist/sima-lmm-${llima_version}-Linux-core.deb" Depends)"
+        expected_memory_dependency="simaai-memory-lib (= ${memory_version})"
+        if [[ ", ${core_depends}, " != *", ${expected_memory_dependency}, "* ]]; then
+          echo "sima-lmm-core does not depend on the bundled memory package." >&2
+          echo "Expected: ${expected_memory_dependency}" >&2
+          echo "Actual:   ${core_depends}" >&2
+          exit 1
+        fi
+        test -f "dist/debs/sima-lmm-${llima_version}-Linux-core.deb"
+        test -f "dist/debs/sima-lmm-${llima_version}-Linux-dev.deb"
+        test -f "dist/debs/sima-lmm-${llima_version}-Linux-cli.deb"
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-core.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-dev.deb" >/dev/null
         tar -tzf "${primary_archive}" "sima-lmm-${llima_version}-Linux-cli.deb" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/CTestTestfile.cmake" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_text_generation_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_vision_generation_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_asr_transcription_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./share/sima-lmm/tests/runtime/pytest.ini" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./share/sima-lmm/tests/runtime/test_mla_memory_cleanup.py" >/dev/null
         test -f dist/metadata.json
+        test -f dist/debs/metadata.json
+        test -x dist/install_llima.sh
+        test -f dist/llima-install-manifest.txt
+        test -f dist/resolved-deps-manifest.json
         python3 -m json.tool dist/metadata.json >/dev/null
-        ls -lh dist
+        python3 -m json.tool dist/debs/metadata.json >/dev/null
+
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+
+        dist = Path("dist")
+        llima_debs = sorted(path.name for path in dist.glob("sima-lmm-*.deb"))
+        internals_debs = sorted(
+            path.name for path in dist.glob("*.deb")
+            if not path.name.startswith("sima-lmm-")
+        )
+        if len(llima_debs) != 3:
+            raise SystemExit(f"expected three root LLiMa DEBs, got {llima_debs!r}")
+        if not internals_debs:
+            raise SystemExit("root bundle does not contain Internals DEBs")
+
+        manifest_entries = [
+            line.strip()
+            for line in (dist / "llima-install-manifest.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        expected_debs = sorted(llima_debs + internals_debs)
+        if sorted(manifest_entries) != expected_debs:
+            raise SystemExit(
+                "install manifest does not match root DEBs:\n"
+                f"  manifest={sorted(manifest_entries)!r}\n"
+                f"  expected={expected_debs!r}"
+            )
+
+        resolved = json.loads(
+            (dist / "resolved-deps-manifest.json").read_text(encoding="utf-8")
+        )
+        internals_ref = resolved.get("internals")
+        if not isinstance(internals_ref, str) or ":" not in internals_ref:
+            raise SystemExit(f"Internals ref is not exact: {internals_ref!r}")
+        source_manifest = json.loads(Path("deps/manifest.json").read_text(encoding="utf-8"))
+        platform_version = source_manifest.get("platform-version")
+
+        root_metadata = json.loads((dist / "metadata.json").read_text(encoding="utf-8"))
+        root_resources = set(root_metadata.get("resources", []))
+        expected_root_resources = {
+            path.name for path in dist.iterdir()
+            if path.is_file() and path.name != "metadata.json"
+        }
+        if root_resources != expected_root_resources:
+            raise SystemExit(
+                f"unexpected root metadata resources: {sorted(root_resources)!r}; "
+                f"expected {sorted(expected_root_resources)!r}"
+            )
+
+        debs_metadata = json.loads(
+            (dist / "debs" / "metadata.json").read_text(encoding="utf-8")
+        )
+        if set(debs_metadata.get("resources", [])) != set(llima_debs):
+            raise SystemExit("llima/debs metadata must contain only the three LLiMa DEBs")
+
+        expected_ref = os.environ.get("GITHUB_HEAD_REF") or os.environ["GITHUB_REF_NAME"]
+        for label, metadata in (("root", root_metadata), ("debs", debs_metadata)):
+            if metadata.get("commit") != os.environ["GITHUB_SHA"]:
+                raise SystemExit(f"{label} metadata commit mismatch")
+            if metadata.get("branch") != expected_ref:
+                raise SystemExit(f"{label} metadata ref mismatch")
+            if metadata.get("artifact", {}).get("internals_ref") != internals_ref:
+                raise SystemExit(f"{label} metadata Internals ref mismatch")
+            expected_platforms = (
+                {
+                    ("board", platform_version, ("modalix",)),
+                }
+                if label == "root"
+                else set()
+            )
+            actual_platforms = {
+                (
+                    platform.get("type"),
+                    platform.get("version"),
+                    tuple(platform.get("compatible_with", [])),
+                )
+                for platform in metadata.get("platforms", [])
+            }
+            if actual_platforms != expected_platforms:
+                raise SystemExit(f"{label} metadata platform compatibility mismatch")
+            for resource, checksum in metadata.get("resources-checksum", {}).items():
+                resource_path = dist / resource if label == "root" else dist / "debs" / resource
+                actual = hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                if actual != checksum:
+                    raise SystemExit(f"checksum mismatch: {label}/{resource}")
+
+        print(f"Verified {len(internals_debs)} exact Internals DEBs in root bundle")
+        PY
+
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        import zipfile
+        from email import message_from_bytes
+        from pathlib import Path
+
+        expected_layout = {
+            "compiler": {
+                "install_compiler.sh",
+                "metadata.json",
+                "metadata-wheel.json",
+            },
+            "mole": {
+                "install_mole.sh",
+                "metadata.json",
+            },
+        }
+
+        wheels = {}
+        versions = {}
+        package_metadata = {}
+        for profile, required_names in expected_layout.items():
+            directory = Path("dist") / profile
+            profile_wheels = list(directory.glob("sima_lmm-*.whl"))
+            if len(profile_wheels) != 1:
+                raise SystemExit(
+                    f"expected exactly one {profile} wheel, got {profile_wheels!r}"
+                )
+            wheel = profile_wheels[0]
+            wheels[profile] = wheel
+            required_names = set(required_names)
+            required_names.add(wheel.name)
+            actual_names = {path.name for path in directory.iterdir() if path.is_file()}
+            if actual_names != required_names:
+                raise SystemExit(
+                    f"unexpected {profile} layout: {sorted(actual_names)!r}"
+                )
+
+            with zipfile.ZipFile(wheel) as archive:
+                metadata_name = next(
+                    name for name in archive.namelist()
+                    if name.endswith(".dist-info/METADATA")
+                )
+                versions[profile] = message_from_bytes(
+                    archive.read(metadata_name)
+                )["Version"]
+
+            metadata = json.loads(
+                (directory / "metadata.json").read_text(encoding="utf-8")
+            )
+            package_metadata[profile] = metadata
+            if metadata["version"] != versions[profile]:
+                raise SystemExit(f"metadata version mismatch for {profile}")
+            for resource, checksum in metadata["resources-checksum"].items():
+                resource_path = directory / resource
+                if hashlib.sha256(resource_path.read_bytes()).hexdigest() != checksum:
+                    raise SystemExit(
+                        f"metadata resource checksum mismatch: {profile}/{resource}"
+                    )
+
+        if wheels["compiler"].read_bytes() != wheels["mole"].read_bytes():
+            raise SystemExit("compiler and MoLE wheel bytes differ")
+        if versions["compiler"] != versions["mole"]:
+            raise SystemExit("compiler and MoLE wheel versions differ")
+
+        expected_ref = os.environ.get("GITHUB_HEAD_REF") or os.environ["GITHUB_REF_NAME"]
+        for profile, metadata in package_metadata.items():
+            if metadata["commit"] != os.environ["GITHUB_SHA"]:
+                raise SystemExit(
+                    f"{profile} metadata commit does not match the workflow commit"
+                )
+            if metadata["branch"] != expected_ref:
+                raise SystemExit(
+                    f"{profile} metadata ref does not match the workflow ref"
+                )
+            if metadata["commit_folder"] != os.environ["GITHUB_SHA"][:12]:
+                raise SystemExit(
+                    f"{profile} metadata commit folder does not match the workflow commit"
+                )
+
+        print(f"Verified shared wheel: {wheels['compiler'].name}")
+        print(f"Verified wheel version: {versions['compiler']}")
+        PY
+
+        dist_file_count="$(find dist -type f | wc -l)"
+        if [[ "${dist_file_count}" -lt 20 ]]; then
+          echo "Expected at least 20 files across root, Debian, compiler, and MoLE artifacts; found ${dist_file_count}." >&2
+          find dist -type f -printf '  %p\n' | sort >&2
+          exit 1
+        fi
+
+        find dist -type f -printf '%p\n' | sort
 
   publish-vulcan-artifacts:
     name: Publish to Vulcan
@@ -170,15 +490,245 @@ jobs:
       cloudfront_distribution_id: ${{ needs.resolve-vulcan-config.outputs.artifact_cloudfront_distribution_id }}
       artifact_folder: "."
       artifact_pattern: sima-llima-dist
-      artifact_glob: "*"
-      min_artifact_count: 2
+      artifact_glob: "**/*"
+      min_artifact_count: 20
+      publish_manifest: true
+
+  test-model-compiler:
+    name: Test LLiMa Compilation on Model Compiler
+    if: ${{ needs.resolve-test-scope.outputs.run_compiler == 'true' }}
+    needs:
+      - resolve-test-scope
+      - resolve-vulcan-config
+      - resolve-model-cache-config
+      - publish-vulcan-artifacts
+    uses: ./.github/workflows/model-compiler-tests.yml
+    with:
+      vulcan_env: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      artifact_bucket: ${{ needs.resolve-model-cache-config.outputs.artifact_bucket }}
+      aws_region: ${{ needs.resolve-model-cache-config.outputs.aws_region }}
+
+  test-devkit:
+    name: Test LLiMa Runtime on DevKit
+    needs:
+      - resolve-vulcan-config
+      - resolve-test-runner
+      - publish-vulcan-artifacts
+    runs-on:
+      group: ${{ needs.resolve-test-runner.outputs.modalix_runner_group }}
+      labels: [self-hosted, Linux, ARM64, modalix, "vulcan-${{ needs.resolve-vulcan-config.outputs.vulcan_env }}"]
+    env:
+      VULCAN_ENV: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
+      SIMA_CLI_CHECK_FOR_UPDATE: "0"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Install exact root artifact
+        env:
+          DEVKIT_PASSWORD: ${{ secrets.DEVKIT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if ! command -v sima-cli >/dev/null 2>&1; then
+            echo "sima-cli not found on the Modalix test runner." >&2
+            exit 1
+          fi
+
+          rm -rf _work/llima-install
+          mkdir -p _work/llima-install
+          ref_name="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          short_sha="${GITHUB_SHA:0:12}"
+          package_spec="llima@${ref_name}:${short_sha}"
+          echo "Installing ${package_spec} from Vulcan env ${VULCAN_ENV}"
+
+          for attempt in 1 2 3 4; do
+            if sima-cli neat install \
+              --env "${VULCAN_ENV}" \
+              "${package_spec}" \
+              --json >/dev/null; then
+              break
+            fi
+            if [[ "${attempt}" -eq 4 ]]; then
+              echo "Artifact metadata resolution failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+            delay=$((attempt * 10))
+            echo "Artifact metadata resolution attempt ${attempt} failed; retrying in ${delay}s." >&2
+            sleep "${delay}"
+          done
+
+          sima-cli neat install \
+            --env "${VULCAN_ENV}" \
+            -d _work/llima-install \
+            "${package_spec}"
+
+      - name: Verify installed LLiMa runtime
+        run: |
+          set -euo pipefail
+          test -f _work/llima-install/resolved-deps-manifest.json
+          python3 -m json.tool _work/llima-install/resolved-deps-manifest.json >/dev/null
+          dpkg-query -W sima-lmm-core sima-lmm-cli sima-lmm-dev
+          llima --help >/dev/null
+          python3 -c 'import sima_lmm'
+          systemctl is-active --quiet simaai-appcomplex.service
+
+      - name: Extract packaged runtime tests
+        run: |
+          set -euo pipefail
+
+          mapfile -t extras_archives < <(
+            find _work/llima-install -maxdepth 1 -type f \
+              -name 'sima-lmm-*-Linux-extras.tar.gz' | sort
+          )
+          if [[ "${#extras_archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one LLiMa runtime-test extras archive." >&2
+            printf '  %s\n' "${extras_archives[@]}" >&2 || true
+            exit 1
+          fi
+
+          rm -rf _work/runtime-tests
+          mkdir -p _work/runtime-tests
+          tar -C _work/runtime-tests -xzf "${extras_archives[0]}"
+
+          test_dir="_work/runtime-tests/lib/sima-lmm/tests"
+          test -f "${test_dir}/CTestTestfile.cmake"
+          test -x "${test_dir}/sima_lmm_dispatcher_lifecycle_test"
+          test -x "${test_dir}/sima_lmm_text_generation_test"
+          test -x "${test_dir}/sima_lmm_vision_generation_test"
+          test -x "${test_dir}/sima_lmm_asr_transcription_test"
+          test -x "${test_dir}/sima_lmm_tool_call_parser_test"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          test_dir = Path("_work/runtime-tests/lib/sima-lmm/tests")
+          test_binaries = (
+              "sima_lmm_dispatcher_lifecycle_test",
+              "sima_lmm_text_generation_test",
+              "sima_lmm_vision_generation_test",
+              "sima_lmm_asr_transcription_test",
+              "sima_lmm_tool_call_parser_test",
+          )
+
+          for name in test_binaries:
+              header = (test_dir / name).read_bytes()[:20]
+              if len(header) < 20 or header[:4] != b"\x7fELF":
+                  raise SystemExit(f"{name} is not an ELF executable")
+              if header[4] != 2:
+                  raise SystemExit(f"{name} is not an ELF64 executable")
+              if header[5] not in (1, 2):
+                  raise SystemExit(f"{name} has an invalid ELF byte order")
+
+              byte_order = "little" if header[5] == 1 else "big"
+              machine = int.from_bytes(header[18:20], byte_order)
+              if machine != 183:
+                  raise SystemExit(
+                      f"{name} is not an AArch64 executable (ELF e_machine={machine})"
+                  )
+
+              print(f"Verified ELF64/AArch64 runtime test: {name}")
+          PY
+
+      - name: Prepare GenAI models
+        run: |
+          set -euo pipefail
+          export LLIMA_MODELS_PATH="${LLIMA_MODELS_PATH:-/media/nvme/llima/models}"
+          export SIMA_TEST_LLIMA_TEXT_MODEL="${SIMA_TEST_LLIMA_TEXT_MODEL:-Qwen2.5-0.5B-Instruct-GPTQ-a16w4}"
+          export SIMA_TEST_LLIMA_VLM_MODEL="${SIMA_TEST_LLIMA_VLM_MODEL:-LFM2.5-VL-450M-a16w4}"
+          export SIMA_TEST_LLIMA_ASR_MODEL="${SIMA_TEST_LLIMA_ASR_MODEL:-whisper-small-a16w8}"
+          prepare_models="_work/runtime-tests/share/sima-lmm/tests/runtime/prepare_genai_models.sh"
+          test -x "${prepare_models}"
+          "${prepare_models}"
+
+          {
+            printf 'LLIMA_MODELS_PATH=%s\n' "${LLIMA_MODELS_PATH}"
+            printf 'SIMA_TEST_LLIMA_TEXT_MODEL=%s\n' "${SIMA_TEST_LLIMA_TEXT_MODEL}"
+            printf 'SIMA_TEST_LLIMA_VLM_MODEL=%s\n' "${SIMA_TEST_LLIMA_VLM_MODEL}"
+            printf 'SIMA_TEST_LLIMA_ASR_MODEL=%s\n' "${SIMA_TEST_LLIMA_ASR_MODEL}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Run packaged C++ runtime tests
+        run: |
+          set -euo pipefail
+          command -v ctest >/dev/null
+          test_dir="_work/runtime-tests/lib/sima-lmm/tests"
+          cleanup_runner="_work/runtime-tests/share/sima-lmm/tests/runtime/run_with_cancellation_cleanup.sh"
+          test -x "${cleanup_runner}"
+
+          "${cleanup_runner}" ctest \
+            --test-dir "${test_dir}" \
+            --output-on-failure \
+            --no-tests=error \
+            --timeout 900 \
+            -j 1 \
+            -L devkit
+
+      - name: Run packaged Python runtime tests
+        run: |
+          set -euo pipefail
+          test_dir="_work/runtime-tests/share/sima-lmm/tests/runtime"
+          test -f "${test_dir}/test_python_runtime_lifecycle.py"
+          test -f "${test_dir}/test_mla_memory_cleanup.py"
+          test -f "${test_dir}/pytest.ini"
+
+          rm -rf _work/runtime-test-venv
+          python3 -m venv --system-site-packages _work/runtime-test-venv
+          _work/runtime-test-venv/bin/python -m pip install --no-cache-dir --upgrade pip
+          _work/runtime-test-venv/bin/python -m pip install --no-cache-dir \
+            'msgpack>=1.1,<2' \
+            'pyzmq>=27.1,<28' \
+            'pytest>=8,<9'
+
+          (
+            cd _work/runtime-tests
+            "${GITHUB_WORKSPACE}/${test_dir}/run_with_cancellation_cleanup.sh" \
+              "${GITHUB_WORKSPACE}/_work/runtime-test-venv/bin/python" \
+                -m pytest \
+                  -c share/sima-lmm/tests/runtime/pytest.ini \
+                  -q \
+                  share/sima-lmm/tests/runtime
+          )
+
+      - name: Clean runtime test workspace
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cleanup_paths=(
+            "_work/llima-install"
+            "_work/runtime-tests"
+            "_work/runtime-test-venv"
+          )
+          for cleanup_path in "${cleanup_paths[@]}"; do
+            if [[ -e "${cleanup_path}" || -L "${cleanup_path}" ]]; then
+              rm -rf -- "${cleanup_path}"
+            fi
+          done
 
   promote-latest-tag:
     name: Promote Vulcan latest tag
-    if: ${{ github.ref_type == 'branch' || github.ref_type == 'tag' }}
+    if: >-
+      ${{
+        always() &&
+        (github.ref_type == 'branch' || github.ref_type == 'tag') &&
+        needs.resolve-test-scope.result == 'success' &&
+        needs.test-devkit.result == 'success' &&
+        (
+          needs.test-model-compiler.result == 'success' ||
+          (
+            needs.resolve-test-scope.outputs.run_compiler == 'false' &&
+            needs.test-model-compiler.result == 'skipped'
+          )
+        )
+      }}
     needs:
+      - resolve-test-scope
       - resolve-vulcan-config
-      - publish-vulcan-artifacts
+      - test-model-compiler
+      - test-devkit
     uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
     with:
       aws_region: ${{ needs.resolve-vulcan-config.outputs.aws_region }}

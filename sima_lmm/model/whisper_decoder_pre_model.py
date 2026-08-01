@@ -22,6 +22,10 @@ class WhisperDecoderPreModel(BaseModel):
     def __post_init__(self):
         assert 0 <= self.layer_idx < self.cfg.decoder_layers
 
+    @property
+    def enable_filter_sharing(self) -> bool:
+        return self.use_filter_sharing
+
     def gen_onnx_files(self):
         base_name = f"model.decoder.layers.{self.layer_idx}"
         self.create_onnx_builder()

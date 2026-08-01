@@ -1,0 +1,4 @@
+interface:
+  display_name: "Assess or Add LLiMa Model Support"
+  short_description: "Assess compatibility or add LLiMa model support"
+  default_prompt: "Use $sima-add-llima-model-support to assess this model's LLiMa compatibility and add only the support that is actually missing."

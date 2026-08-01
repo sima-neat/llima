@@ -14,6 +14,7 @@
 #include "base_model.hpp"
 #include "chat.hpp"
 #include "language_model.hpp"
+#include "tool_call_parser.hpp"
 #include "vision_model.hpp"
 #include "vlm_helper.hpp"
 
@@ -25,9 +26,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         VisionLanguageModel(
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,
-            std::optional<std::string> chat_template = std::nullopt,
-            bool do_parallel_load = true,
-            bool enable_thinking = false
+            std::optional<std::string> chat_template = std::nullopt
         );
         ~VisionLanguageModel() {}
 
@@ -43,15 +42,26 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         std::vector<Eigen::bfloat16> run_model_for_logits(
             std::span<const uint32_t> input_token_ids
         );
-        std::vector<double> run_model_for_ttnt(
+        LogLikelihoodResult run_model_for_loglikelihood(
+            std::span<const uint32_t> input_token_ids,
+            size_t continuation_start,
+            std::span<const uint32_t> continuation_token_ids,
+            bool use_group_prefill = true
+        );
+        GenerationPerformanceResult run_model_for_ttnt(
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
         );
         void stop_model();
 
+        // Configure a non-owning draft VLM for speculative decoding. When set,
+        // run_model dispatches through the spec path automatically.
+        void set_draft_vlm(VisionLanguageModel* draft_vlm) { _draft_vlm_ptr = draft_vlm; }
+
         Chat create_chat() { return Chat(_vlm_helper); }
         bool support_image() const { return _cfg.support_image(); }
+        ToolCallFormat tool_call_format() const { return _tool_call_format; }
 
         void set_info_callback(TextStreamer::InfoCallback callback) {
             _text_streamer.set_info_callback(callback);
@@ -79,9 +89,13 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
     private:
         VlmHelper _vlm_helper;
         TextStreamer _text_streamer;
+        ToolCallFormat _tool_call_format = ToolCallFormat::GenericJson;
         std::unique_ptr<VisionModel> _vision_model_ptr;
         std::unique_ptr<LanguageModel> _language_model_ptr;
         std::mutex _run_mutex;  // Protects run_model from concurrent access
+        // Non-owning pointer to the draft VLM for speculative decoding;
+        // nullptr in non-spec mode. The owner (CLI) outlives this target VLM.
+        VisionLanguageModel* _draft_vlm_ptr = nullptr;
 };
 
 }

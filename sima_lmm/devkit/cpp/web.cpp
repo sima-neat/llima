@@ -1,7 +1,6 @@
-#include <cctype>
 #include <fstream>
-#include <regex>
-#include <string_view>
+#include <variant>
+#include <vector>
 
 #include "web.hpp"
 
@@ -9,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 
+#include "tool_call_parser.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -22,25 +22,28 @@ static std::string get_iso_timestamp() {
 WEB::WEB(
     std::filesystem::path vlm_model_path,
     std::optional<std::filesystem::path> whisper_model_path,
+    std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
-    bool do_parallel_load,
     bool enable_thinking
 ) : _vision_language_model_ptr(
-        std::make_unique<VisionLanguageModel>(
-            vlm_model_path, system_prompt, chat_template,
-            do_parallel_load, enable_thinking
-        )
-    )
+        std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
+    ),
+    _enable_thinking(enable_thinking)
 {
     if (_singleton_ptr)
         throw std::runtime_error("Only one WEB instance can be created");
     _singleton_ptr = this;
 
     if (whisper_model_path.has_value()) {
-        _whisper_model_ptr = std::make_unique<WhisperModel>(
-            whisper_model_path.value(), do_parallel_load
+        _whisper_model_ptr = std::make_unique<WhisperModel>(whisper_model_path.value());
+    }
+
+    if (draft_model_path.has_value()) {
+        _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
+            draft_model_path.value(), system_prompt, chat_template
         );
+        _vision_language_model_ptr->set_draft_vlm(_vision_language_draft_model_ptr.get());
     }
 
     auto llima_logger = spdlog::get("llima");
@@ -106,10 +109,15 @@ void WEB::run() {
 
     // Audio transcription endpoints (OpenAI compatible)
     auto audio_handler = [this](const httplib::Request& req, httplib::Response& res) {
-        this->_handle_audio_transcriptions(req, res);
+        this->_handle_audio_transcriptions(req, res, "transcribe");
+    };
+    auto audio_translation_handler = [this](const httplib::Request& req, httplib::Response& res) {
+        this->_handle_audio_transcriptions(req, res, "translate");
     };
     _http_server.Post("/v1/audio/transcriptions", audio_handler);
     _http_server.Post("/audio/transcriptions", audio_handler);  // Alternative route without /v1
+    _http_server.Post("/v1/audio/translations", audio_translation_handler);
+    _http_server.Post("/audio/translations", audio_translation_handler);
 
     auto cors_handler = [this](const httplib::Request& req, httplib::Response& res) {
         this->_set_cors_headers(res);
@@ -122,6 +130,8 @@ void WEB::run() {
     _http_server.Options("/v1/chat", cors_handler);
     _http_server.Options("/v1/audio/transcriptions", cors_handler);
     _http_server.Options("/audio/transcriptions", cors_handler);
+    _http_server.Options("/v1/audio/translations", cors_handler);
+    _http_server.Options("/audio/translations", cors_handler);
     _http_server.Options("/stop", cors_handler);
 
     auto msg = fmt::format("Starting the HTTP server and listening on port {}", _SERVER_PORT);
@@ -276,15 +286,18 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
 std::string WEB::_format_openai_sse_chunk(
     const std::string& content,
     const std::string& model,
+    const std::string& completion_id,
+    std::time_t created,
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
-    std::optional<double> tps
+    std::optional<double> tps,
+    bool from_draft
 ) {
     nlohmann::json chunk;
-    chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+    chunk["id"] = completion_id;
     chunk["object"] = "chat.completion.chunk";
-    chunk["created"] = std::time(nullptr);
+    chunk["created"] = created;
     chunk["model"] = model;
     chunk["system_fingerprint"] = "fp_sima_vlm";
 
@@ -303,7 +316,10 @@ std::string WEB::_format_openai_sse_chunk(
         choice["delta"] = nlohmann::json::object();
         choice["finish_reason"] = finish_reason.value_or("stop");
     } else {
-        choice["delta"] = {{"content", content}};
+        // Custom extension: mark chunks whose tokens were accepted from the
+        // draft model during speculative decoding so the client can render
+        // them differently.
+        choice["delta"] = {{"content", content}, {"from_draft", from_draft}};
         choice["finish_reason"] = nullptr;
     }
 
@@ -317,7 +333,8 @@ std::string WEB::_format_ollama_ndjson_chunk(
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
-    std::optional<double> tps
+    std::optional<double> tps,
+    bool from_draft
 ) {
     nlohmann::json chunk;
     chunk["model"] = model;
@@ -339,6 +356,8 @@ std::string WEB::_format_ollama_ndjson_chunk(
     if (!finished) {
         chunk["message"] = {{"role", "assistant"}, {"content", content}};
         chunk["response"] = content;
+        // Custom extension: flag draft-accepted chunks for client rendering.
+        chunk["from_draft"] = from_draft;
     }
 
     return chunk.dump() + "\n";
@@ -346,16 +365,36 @@ std::string WEB::_format_ollama_ndjson_chunk(
 
 std::string WEB::_format_audio_sse_chunk(
     const std::string& text,
+    const std::string& event_task,
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
-    std::optional<double> tps
+    std::optional<double> tps,
+    std::optional<std::string> language,
+    std::optional<std::string> task,
+    std::optional<float> no_speech_prob,
+    std::optional<float> avg_logprob
 ) {
     nlohmann::json chunk;
-    chunk["object"] = finished ? "audio.transcription.done" : "audio.transcription.chunk";
+    const auto object_prefix = event_task == "translate"
+        ? "audio.translation"
+        : "audio.transcription";
+    chunk["object"] = object_prefix + std::string(finished ? ".done" : ".chunk");
     chunk["text"] = text;
     if (finished) {
         chunk["finish_reason"] = finish_reason.value_or("stop");
+        if (language.has_value()) {
+            chunk["language"] = language.value();
+        }
+        if (task.has_value()) {
+            chunk["task"] = task.value();
+        }
+        if (no_speech_prob.has_value()) {
+            chunk["no_speech_prob"] = no_speech_prob.value();
+        }
+        if (avg_logprob.has_value()) {
+            chunk["avg_logprob"] = avg_logprob.value();
+        }
     }
     if (ttft.has_value()) {
         chunk["ttft"] = ttft.value();
@@ -406,7 +445,11 @@ void WEB::_handle_chat_completions(
     }
 }
 
-void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Response& res) {
+void WEB::_handle_audio_transcriptions(
+    const httplib::Request& req,
+    httplib::Response& res,
+    const std::string& task
+) {
     _set_cors_headers(res);
     try {
         if (!req.has_file("file")) {
@@ -425,7 +468,7 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
         output_file.close();
 
         // Get language from form data
-        std::string language = "en";
+        std::string language = "auto";
         // Older cpp-httplib stores plain multipart fields in params.
         if (req.has_param("language")) {
             language = req.get_param_value("language");
@@ -452,12 +495,19 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
         }
 
         if (stream) {
-            _execute_streaming_audio_transcription(res, language);
+            _execute_streaming_audio_transcription(res, language, task);
             return;
         }
 
-        auto text = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
-        nlohmann::json response = {{"text", text}};
+        auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+        nlohmann::json response = {
+            {"text", result.text},
+            {"language", result.language},
+            {"task", result.task},
+            {"no_speech_prob", result.no_speech_prob}
+        };
+        if (result.avg_logprob.has_value())
+            response["avg_logprob"] = result.avg_logprob.value();
         res.set_content(response.dump(), "application/json");
 
     } catch (const std::exception& e) {
@@ -469,7 +519,8 @@ void WEB::_handle_audio_transcriptions(const httplib::Request& req, httplib::Res
 
 void WEB::_execute_streaming_audio_transcription(
     httplib::Response& res,
-    const std::string& language
+    const std::string& language,
+    const std::string& task
 ) {
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
@@ -477,16 +528,17 @@ void WEB::_execute_streaming_audio_transcription(
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, language](size_t offset, httplib::DataSink &sink) {
+        [this, language, task](size_t offset, httplib::DataSink &sink) {
             (void)offset;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
+            std::optional<std::string> finish_reason;
 
             struct WhisperCallbackGuard {
                 WhisperModel* model;
                 ~WhisperCallbackGuard() {
                     model->set_info_callback([](const std::string&, double) {});
-                    model->set_text_callback([](const std::string&, bool) {});
+                    model->set_text_callback([](const std::string&, bool, bool) {});
                 }
             } callback_guard{_whisper_model_ptr.get()};
 
@@ -500,28 +552,31 @@ void WEB::_execute_streaming_audio_transcription(
                     return;
                 }
                 if (metric_type == "END" || metric_type == "FULL") {
-                    const std::string finish_reason = metric_type == "FULL" ? "length" : "stop";
-                    std::string chunk = _format_audio_sse_chunk(
-                        "", true, finish_reason, ttft_value, tps_value
-                    ) + "data: [DONE]\n\n";
-                    sink.write(chunk.data(), chunk.size());
+                    finish_reason = metric_type == "FULL" ? "length" : "stop";
                 }
             };
 
-            auto text_callback = [&](const std::string& text, bool stream_end) {
+            auto text_callback = [&](const std::string& text, bool stream_end, bool) {
                 if (text.empty())
                     return;
-                std::string chunk = _format_audio_sse_chunk(text, false);
+                std::string chunk = _format_audio_sse_chunk(text, task, false);
                 sink.write(chunk.data(), chunk.size());
             };
 
             try {
                 _whisper_model_ptr->set_info_callback(info_callback);
                 _whisper_model_ptr->set_text_callback(text_callback);
-                _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language);
+                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+                std::string chunk = _format_audio_sse_chunk(
+                    "", task, true, finish_reason.value_or("stop"), ttft_value, tps_value,
+                    result.language, result.task, result.no_speech_prob, result.avg_logprob
+                ) + "data: [DONE]\n\n";
+                sink.write(chunk.data(), chunk.size());
             } catch (const std::exception& e) {
                 nlohmann::json error;
-                error["object"] = "audio.transcription.error";
+                error["object"] = task == "translate"
+                    ? "audio.translation.error"
+                    : "audio.transcription.error";
                 error["error"] = e.what();
                 std::string chunk = "data: " + error.dump() + "\n\ndata: [DONE]\n\n";
                 sink.write(chunk.data(), chunk.size());
@@ -551,8 +606,10 @@ bool json_bool_or_default(
     return default_value;
 }
 
-bool request_enable_thinking(const nlohmann::json& json_data) {
-    bool enable_thinking = json_bool_or_default(json_data, "enable_thinking", false);
+bool request_enable_thinking(const nlohmann::json& json_data, bool default_value) {
+    bool enable_thinking = json_bool_or_default(
+        json_data, "enable_thinking", default_value
+    );
     if (
         json_data.contains("chat_template_kwargs")
         && json_data.at("chat_template_kwargs").is_object()
@@ -582,8 +639,35 @@ std::optional<Chat> WEB::_prepare_chat_context(
     stream = json_data.value("stream", false);
 
     Chat chat = _vision_language_model_ptr->create_chat();
-    chat.set_enable_thinking(request_enable_thinking(json_data));
-    if (json_data.contains("tools") && json_data["tools"].is_array()) {
+    chat.set_enable_thinking(request_enable_thinking(json_data, _enable_thinking));
+    bool tools_enabled = true;
+    if (json_data.contains("tool_choice") && !json_data["tool_choice"].is_null()) {
+        if (!json_data["tool_choice"].is_string()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error": "Only tool_choice 'auto' or 'none' is supported"})",
+                "application/json"
+            );
+            return std::nullopt;
+        }
+        const auto tool_choice = json_data["tool_choice"].get<std::string>();
+        if (tool_choice == "none") {
+            tools_enabled = false;
+        } else if (tool_choice != "auto") {
+            res.status = 400;
+            res.set_content(
+                R"({"error": "Only tool_choice 'auto' or 'none' is supported"})",
+                "application/json"
+            );
+            return std::nullopt;
+        }
+    }
+    if (json_data.contains("tools") && !json_data["tools"].is_array()) {
+        res.status = 400;
+        res.set_content(R"({"error": "tools must be an array"})", "application/json");
+        return std::nullopt;
+    }
+    if (tools_enabled && json_data.contains("tools")) {
         chat.set_tools(nlohmann::ordered_json(json_data["tools"]));
     }
 
@@ -600,8 +684,22 @@ std::optional<Chat> WEB::_prepare_chat_context(
     return chat;
 }
 
-static nlohmann::json try_parse_tool_call(std::string_view text);
 static nlohmann::json openai_tool_calls_to_ollama(const nlohmann::json& openai_tool_calls);
+
+static std::vector<std::string> tool_names_from_definitions(
+    const nlohmann::ordered_json& tools
+) {
+    std::vector<std::string> names;
+    if (!tools.is_array()) return names;
+
+    for (const auto& tool : tools) {
+        if (tool.is_object() && tool.contains("function") && tool["function"].is_object() &&
+            tool["function"].contains("name") && tool["function"]["name"].is_string()) {
+            names.push_back(tool["function"]["name"].get<std::string>());
+        }
+    }
+    return names;
+}
 
 void WEB::_execute_streaming_chat(
     httplib::Response& res,
@@ -616,12 +714,108 @@ void WEB::_execute_streaming_chat(
     res.set_chunked_content_provider(
         is_openai ? "text/event-stream" : "application/x-ndjson",
         [this, chat, model, is_openai](size_t offset, httplib::DataSink &sink) {
+            const auto created = std::time(nullptr);
+            const auto completion_id = "chatcmpl-" + std::to_string(created);
             const bool has_tools = chat.has_tools();
             bool sent_initial_chunk = false;
             bool ttft_sent = false;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
-            std::string buffered_text;
+            ToolCallStreamParser tool_parser(
+                _vision_language_model_ptr->tool_call_format(),
+                tool_names_from_definitions(chat.get_tools()));
+            nlohmann::json pending_ollama_tool_calls = nullptr;
+
+            auto send_openai_initial = [&]() {
+                if (sent_initial_chunk) return;
+                nlohmann::json initial_chunk;
+                initial_chunk["id"] = completion_id;
+                initial_chunk["object"] = "chat.completion.chunk";
+                initial_chunk["created"] = created;
+                initial_chunk["model"] = model;
+                initial_chunk["system_fingerprint"] = "fp_sima_vlm";
+                initial_chunk["choices"] = nlohmann::json::array({{
+                    {"index", 0},
+                    {"delta", {{"role", "assistant"}, {"content", nullptr}}},
+                    {"finish_reason", nullptr}
+                }});
+                std::string initial_output = "data: " + initial_chunk.dump() + "\n\n";
+                sink.write(initial_output.data(), initial_output.size());
+                sent_initial_chunk = true;
+            };
+
+            auto take_ttft_once = [&]() -> std::optional<double> {
+                if (!ttft_sent && ttft_value.has_value()) {
+                    ttft_sent = true;
+                    return ttft_value;
+                }
+                return std::nullopt;
+            };
+
+            auto send_content = [&](const std::string& text, bool from_draft) {
+                if (text.empty()) return;
+                if (is_openai) {
+                    send_openai_initial();
+                    auto chunk = _format_openai_sse_chunk(
+                        text, model, completion_id, created, false, std::nullopt,
+                        take_ttft_once(), tps_value, from_draft
+                    );
+                    sink.write(chunk.data(), chunk.size());
+                } else {
+                    auto chunk = _format_ollama_ndjson_chunk(
+                        text, model, false, std::nullopt, take_ttft_once(), tps_value,
+                        from_draft
+                    );
+                    sink.write(chunk.data(), chunk.size());
+                }
+            };
+
+            auto send_openai_tool_calls = [&](const nlohmann::json& parsed_tool_calls) {
+                send_openai_initial();
+                nlohmann::json delta_tool_calls = nlohmann::json::array();
+                for (size_t i = 0; i < parsed_tool_calls.size(); ++i) {
+                    nlohmann::json tool_call = parsed_tool_calls[i];
+                    tool_call["index"] = static_cast<int>(i);
+                    delta_tool_calls.push_back(tool_call);
+                }
+
+                nlohmann::json tool_chunk;
+                tool_chunk["id"] = completion_id;
+                tool_chunk["object"] = "chat.completion.chunk";
+                tool_chunk["created"] = created;
+                tool_chunk["model"] = model;
+                tool_chunk["system_fingerprint"] = "fp_sima_vlm";
+                if (auto ttft_for_chunk = take_ttft_once(); ttft_for_chunk.has_value())
+                    tool_chunk["ttft"] = ttft_for_chunk.value();
+                if (tps_value.has_value())
+                    tool_chunk["tps"] = tps_value.value();
+                tool_chunk["choices"] = nlohmann::json::array({{
+                    {"index", 0},
+                    {"delta", {{"tool_calls", delta_tool_calls}}},
+                    {"finish_reason", nullptr}
+                }});
+                std::string tool_output = "data: " + tool_chunk.dump() + "\n\n";
+                sink.write(tool_output.data(), tool_output.size());
+            };
+
+            bool saw_tool_calls = false;
+            auto handle_tool_parser_events = [&](std::vector<ToolCallStreamParser::Event> events) {
+                for (auto& event : events) {
+                    if (std::holds_alternative<ToolCallStreamParser::Content>(event)) {
+                        const auto& content =
+                            std::get<ToolCallStreamParser::Content>(event);
+                        send_content(content.text, content.from_draft);
+                    } else {
+                        const auto& calls = std::get<ToolCallStreamParser::ToolCalls>(event).calls;
+                        saw_tool_calls = true;
+                        if (is_openai) {
+                            send_openai_tool_calls(calls);
+                        } else {
+                            pending_ollama_tool_calls = calls;
+                        }
+                    }
+                }
+            };
 
             // Info callback handles timing/status information
             auto info_callback = [&](const std::string& metric_type, double metric_value) {
@@ -643,73 +837,17 @@ void WEB::_execute_streaming_chat(
                         (metric_type == "FULL") ? "length" : "stop";
 
                     if (has_tools) {
-                        auto parsed_tool_calls = try_parse_tool_call(buffered_text);
+                        handle_tool_parser_events(tool_parser.add("", true));
 
                         if (is_openai) {
-                            if (!sent_initial_chunk) {
-                                nlohmann::json initial_chunk;
-                                initial_chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
-                                initial_chunk["object"] = "chat.completion.chunk";
-                                initial_chunk["created"] = std::time(nullptr);
-                                initial_chunk["model"] = model;
-                                initial_chunk["system_fingerprint"] = "fp_sima_vlm";
-                                initial_chunk["choices"] = nlohmann::json::array({{
-                                    {"index", 0},
-                                    {"delta", {{"role", "assistant"}, {"content", nullptr}}},
-                                    {"finish_reason", nullptr}
-                                }});
-                                std::string initial_output = "data: " + initial_chunk.dump() + "\n\n";
-                                sink.write(initial_output.data(), initial_output.size());
-                                sent_initial_chunk = true;
-                            }
-
-                            std::string finish_reason;
-                            if (!parsed_tool_calls.is_null()) {
-                                nlohmann::json delta_tool_calls = nlohmann::json::array();
-                                for (size_t i = 0; i < parsed_tool_calls.size(); ++i) {
-                                    nlohmann::json tool_call = parsed_tool_calls[i];
-                                    tool_call["index"] = static_cast<int>(i);
-                                    delta_tool_calls.push_back(tool_call);
-                                }
-
-                                nlohmann::json tool_chunk;
-                                tool_chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
-                                tool_chunk["object"] = "chat.completion.chunk";
-                                tool_chunk["created"] = std::time(nullptr);
-                                tool_chunk["model"] = model;
-                                tool_chunk["system_fingerprint"] = "fp_sima_vlm";
-                                if (!ttft_sent && ttft_value.has_value()) {
-                                    tool_chunk["ttft"] = ttft_value.value();
-                                    ttft_sent = true;
-                                }
-                                if (tps_value.has_value())
-                                    tool_chunk["tps"] = tps_value.value();
-                                tool_chunk["choices"] = nlohmann::json::array({{
-                                    {"index", 0},
-                                    {"delta", {{"tool_calls", delta_tool_calls}}},
-                                    {"finish_reason", nullptr}
-                                }});
-                                std::string tool_output = "data: " + tool_chunk.dump() + "\n\n";
-                                sink.write(tool_output.data(), tool_output.size());
-                                finish_reason = "tool_calls";
-                            } else if (!buffered_text.empty()) {
-                                std::optional<double> ttft_for_chunk = std::nullopt;
-                                if (!ttft_sent && ttft_value.has_value()) {
-                                    ttft_for_chunk = ttft_value;
-                                    ttft_sent = true;
-                                }
-                                std::string content_chunk = _format_openai_sse_chunk(
-                                    buffered_text, model, false, std::nullopt,
-                                    ttft_for_chunk, tps_value
-                                );
-                                sink.write(content_chunk.data(), content_chunk.size());
-                                finish_reason = default_finish_reason;
-                            } else {
-                                finish_reason = default_finish_reason;
-                            }
+                            send_openai_initial();
+                            std::string finish_reason =
+                                saw_tool_calls ? "tool_calls" : default_finish_reason;
 
                             std::string final_chunk =
-                                _format_openai_sse_chunk("", model, true, finish_reason)
+                                _format_openai_sse_chunk(
+                                    "", model, completion_id, created, true, finish_reason
+                                )
                                 + "data: [DONE]\n\n";
                             sink.write(final_chunk.data(), final_chunk.size());
                         } else {
@@ -724,12 +862,13 @@ void WEB::_execute_streaming_chat(
                                 final_obj["tps"] = tps_value.value();
 
                             nlohmann::json message = {{"role", "assistant"}};
-                            if (!parsed_tool_calls.is_null()) {
+                            if (!pending_ollama_tool_calls.is_null()) {
                                 message["content"] = "";
                                 message["tool_calls"] =
-                                    openai_tool_calls_to_ollama(parsed_tool_calls);
+                                    openai_tool_calls_to_ollama(pending_ollama_tool_calls);
+                                final_obj["finish_reason"] = "tool_calls";
                             } else {
-                                message["content"] = buffered_text;
+                                message["content"] = "";
                             }
                             final_obj["message"] = message;
 
@@ -744,7 +883,7 @@ void WEB::_execute_streaming_chat(
 
                     if (is_openai) {
                         formatted_chunk = _format_openai_sse_chunk(
-                            "", model, true, finish_reason
+                            "", model, completion_id, created, true, finish_reason
                         ) + "data: [DONE]\n\n";
                     } else {
                         formatted_chunk = _format_ollama_ndjson_chunk(
@@ -755,19 +894,25 @@ void WEB::_execute_streaming_chat(
                 }
             };
 
-            // Text callback handles generated text chunks
-            auto text_callback = [&](const std::string& text, bool stream_end) {
+            // Text callback handles generated text chunks. from_draft is
+            // attached to each streamed chunk as a JSON field so the client
+            // can render draft-accepted text differently from target-only.
+            auto text_callback = [&](
+                const std::string& text, bool stream_end, bool from_draft
+            ) {
                 if (has_tools) {
-                    buffered_text.append(text);
+                    handle_tool_parser_events(
+                        tool_parser.add(text, stream_end, from_draft)
+                    );
                     return;
                 }
 
                 // Send initial role chunk for OpenAI (first time only)
                 if (is_openai && !sent_initial_chunk) {
                     nlohmann::json initial_chunk;
-                    initial_chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+                    initial_chunk["id"] = completion_id;
                     initial_chunk["object"] = "chat.completion.chunk";
-                    initial_chunk["created"] = std::time(nullptr);
+                    initial_chunk["created"] = created;
                     initial_chunk["model"] = model;
                     initial_chunk["system_fingerprint"] = "fp_sima_vlm";
 
@@ -793,9 +938,10 @@ void WEB::_execute_streaming_chat(
                         ttft_sent = true;
                     }
                     formatted_chunk = _format_openai_sse_chunk(
-                        text, model, false, std::nullopt,
+                        text, model, completion_id, created, false, std::nullopt,
                         ttft_for_chunk,
-                        tps_value
+                        tps_value,
+                        from_draft
                     );
                 } else {
                     std::optional<double> ttft_for_chunk = std::nullopt;
@@ -806,7 +952,8 @@ void WEB::_execute_streaming_chat(
                     formatted_chunk = _format_ollama_ndjson_chunk(
                         text, model, false, std::nullopt,
                         ttft_for_chunk,
-                        tps_value
+                        tps_value,
+                        from_draft
                     );
                 }
 
@@ -830,167 +977,6 @@ void WEB::_execute_streaming_chat(
             return true;
         }
     );
-}
-
-// Builds a single OpenAI tool_call entry from a parsed tool call object.
-// Accepts "arguments" (Qwen/Mistral) or "parameters" (Llama) as the args key.
-static nlohmann::json build_tool_call_entry(const nlohmann::json& parsed, int& id_counter) {
-    if (!parsed.contains("name") || !parsed["name"].is_string())
-        return nullptr;
-
-    // Accept object or pre-serialized string for both "arguments" and "parameters"
-    auto extract_args = [](const nlohmann::json& val) -> nlohmann::json {
-        if (val.is_object()) return val;
-        if (val.is_string()) {
-            try { return nlohmann::json::parse(val.get<std::string>()); } catch (...) {}
-        }
-        return nlohmann::json::object();
-    };
-    nlohmann::json args = nlohmann::json::object();
-    if (parsed.contains("arguments"))
-        args = extract_args(parsed["arguments"]);
-    else if (parsed.contains("parameters"))
-        args = extract_args(parsed["parameters"]);
-
-    // Reuse the model's id if present, otherwise generate one capped to 9 chars
-    // (Mistral's chat template enforces exactly 9 alphanumeric characters).
-    std::string id = parsed.contains("id") && parsed["id"].is_string()
-        ? parsed["id"].get<std::string>()
-        : std::to_string(std::time(nullptr)).substr(2) + std::to_string(id_counter++ % 10);
-
-    return {
-        {"id", id},
-        {"type", "function"},
-        {"function", {{"name", parsed["name"]}, {"arguments", args.dump()}}}
-    };
-}
-
-static size_t find_matching_brace(std::string_view text, size_t start) {
-    int depth = 0;
-    for (size_t idx = start; idx < text.size(); ++idx) {
-        if (text[idx] == '{') {
-            ++depth;
-        } else if (text[idx] == '}' && --depth == 0) {
-            return idx;
-        }
-    }
-    return std::string_view::npos;
-}
-
-static std::string gemma4_bare_to_json(const std::string& text) {
-    static const std::regex unquoted_key(R"((\w+)\s*:)");
-    static const std::regex unquoted_val(R"(:\s*([^{}\[\]",\s][^{}\[\]",]*))");
-    std::string with_quoted_keys = std::regex_replace(text, unquoted_key, "\"$1\":");
-    return std::regex_replace(with_quoted_keys, unquoted_val, ":\"$1\"");
-}
-
-static nlohmann::json parse_plain_json_tool_calls(std::string_view text, int& id_counter) {
-    nlohmann::json result = nlohmann::json::array();
-    size_t pos = 0;
-    while (pos < text.size()) {
-        while (pos < text.size() &&
-               (std::isspace(static_cast<unsigned char>(text[pos])) != 0 || text[pos] == ';')) {
-            ++pos;
-        }
-        if (pos == text.size()) break;
-        if (text[pos] != '{') return nullptr;
-        auto close = find_matching_brace(text, pos);
-        if (close == std::string_view::npos) return nullptr;
-        auto parsed = nlohmann::json::parse(std::string(text.substr(pos, close - pos + 1)));
-        auto entry = build_tool_call_entry(parsed, id_counter);
-        if (entry.is_null()) return nullptr;
-        result.push_back(entry);
-        pos = close + 1;
-    }
-    return result.empty() ? nullptr : result;
-}
-
-// Returns a tool_calls JSON array if the text is a valid tool call, otherwise null.
-// Handles four formats:
-//   Gemma4-style:   call:name{args}...  (<|tool_call>, <tool_call|>, <|"|> special tokens stripped)
-//   Mistral-style:  [{"name":...}]      ([TOOL_CALLS] special token stripped, leaving bare JSON array)
-//   Qwen-style:     <tool_call>\n{"name": "...", "arguments": {...}}\n</tool_call>
-//   Llama-style:    {"name": "...", "parameters": {...}}; {"name": "...", ...}
-static nlohmann::json try_parse_tool_call(std::string_view text) {
-    int id_counter = 0;
-    try {
-        if (text.starts_with("call:")) {
-            nlohmann::json result = nlohmann::json::array();
-            size_t pos = 0;
-            while (pos < text.size() && text.substr(pos).starts_with("call:")) {
-                pos += 5;
-                auto brace = text.find('{', pos);
-                if (brace == std::string_view::npos) return nullptr;
-                std::string_view name = text.substr(pos, brace - pos);
-                auto close = find_matching_brace(text, brace);
-                if (close == std::string_view::npos) return nullptr;
-                std::string args =
-                    gemma4_bare_to_json(std::string(text.substr(brace, close - brace + 1)));
-                auto entry = build_tool_call_entry(
-                    {{"name", std::string(name)}, {"arguments", args}}, id_counter
-                );
-                if (entry.is_null()) return nullptr;
-                result.push_back(entry);
-                pos = close + 1;
-            }
-            return result;
-        }
-
-        const std::string mistral_prefix = "[TOOL_CALLS] ";
-        auto mistral_pos = text.find(mistral_prefix);
-        if (mistral_pos != std::string::npos) {
-            auto array_start = mistral_pos + mistral_prefix.size();
-            auto parsed = nlohmann::json::parse(std::string(text.substr(array_start)));
-            if (!parsed.is_array()) return nullptr;
-            nlohmann::json result = nlohmann::json::array();
-            for (const auto& item : parsed) {
-                auto entry = build_tool_call_entry(item, id_counter);
-                if (entry.is_null()) return nullptr;
-                result.push_back(entry);
-            }
-            return result;
-        }
-
-        if (text.starts_with('[')) {
-            auto parsed = nlohmann::json::parse(std::string(text));
-            if (parsed.is_array()) {
-                nlohmann::json result = nlohmann::json::array();
-                for (const auto& item : parsed) {
-                    auto entry = build_tool_call_entry(item, id_counter);
-                    if (entry.is_null()) return nullptr;
-                    result.push_back(entry);
-                }
-                return result;
-            }
-        }
-
-        if (text.find("<tool_call>") != std::string_view::npos) {
-            nlohmann::json result = nlohmann::json::array();
-            std::size_t search_pos = 0;
-            while (true) {
-                auto tag_start = text.find("<tool_call>", search_pos);
-                auto tag_end   = text.find("</tool_call>", search_pos);
-                if (tag_start == std::string_view::npos || tag_end == std::string_view::npos)
-                    break;
-                constexpr std::size_t open_tag_len  = 11; // "<tool_call>"
-                constexpr std::size_t close_tag_len = 12; // "</tool_call>"
-                tag_start += open_tag_len;
-                auto parsed = nlohmann::json::parse(
-                    std::string(text.substr(tag_start, tag_end - tag_start))
-                );
-                auto entry = build_tool_call_entry(parsed, id_counter);
-                if (entry.is_null()) return nullptr;
-                result.push_back(entry);
-                search_pos = tag_end + close_tag_len;
-            }
-            if (!result.empty()) return result;
-        }
-
-        return parse_plain_json_tool_calls(text, id_counter);
-
-    } catch (...) {
-        return nullptr;
-    }
 }
 
 static nlohmann::json openai_tool_calls_to_ollama(const nlohmann::json& openai_tool_calls) {
@@ -1039,8 +1025,9 @@ void WEB::_execute_normal_chat(
         // Do nothing - we don't need timing info in non-streaming mode
     };
 
-    // Text callback: accumulate all text
-    auto text_callback = [&](const std::string& text, bool stream_end) {
+    // Text callback: accumulate all text. from_draft is ignored in
+    // non-streaming mode -- the whole response is returned as a single string.
+    auto text_callback = [&](const std::string& text, bool stream_end, bool) {
         full_response += text;
     };
 
@@ -1055,9 +1042,16 @@ void WEB::_execute_normal_chat(
 
     // No need to reset callbacks - they'll be overwritten on next request
 
+    nlohmann::json tool_calls = nullptr;
+    if (chat.has_tools()) {
+        tool_calls = try_parse_tool_calls(
+            _vision_language_model_ptr->tool_call_format(), full_response,
+            tool_names_from_definitions(chat.get_tools()));
+        if (!tool_calls.is_null()) full_response.clear();
+    }
+
     nlohmann::json response;
     if (is_openai) {
-        auto tool_calls = try_parse_tool_call(full_response);
         nlohmann::json message = {{"role", "assistant"}};
         std::string finish_reason;
         if (!tool_calls.is_null()) {
@@ -1080,7 +1074,6 @@ void WEB::_execute_normal_chat(
             }}}
         };
     } else {
-        auto tool_calls = try_parse_tool_call(full_response);
         nlohmann::json message = {{"role", "assistant"}};
         if (!tool_calls.is_null()) {
             message["content"] = "";

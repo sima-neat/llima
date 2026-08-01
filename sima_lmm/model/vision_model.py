@@ -6,6 +6,7 @@ import numpy as np
 from scipy.ndimage import zoom
 
 from afe.apis.defines import gen2_target, TensorDRAMLayout
+from afe.backends.backends import Backend
 from afe.ir.serializer import save_awesomenet
 from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
@@ -17,9 +18,9 @@ from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
 from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv, build_activation, activation_type,
+    SimaBuilder, build_conv, build_activation, activation_type, activation_dtype,
     build_merge_heads_and_matmul, build_matmul_and_split_heads, build_two_stage_layer_norm,
-    load_tensor_from_source
+    build_space_to_depth, load_tensor_from_source
 )
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import VisionArchType, VlmArchType
@@ -471,13 +472,20 @@ class StandardVisionLayerModel(BaseModel):
         log_level: int,
         quantizable: bool
     ):
-        base_name = "vision_model"
-        g = self._build_sima_nodes(base_name, quantizable)
+        g = self._build_sima_nodes(self.hf_model.vision_model_param_base_name, quantizable)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool):
         if self.include_embeddings:
-            input_shape = (1, self.cfg.vm_cfg.image_size, self.cfg.vm_cfg.image_size, 3)
+            if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
+                patch_dim = 3 * (self.cfg.vm_cfg.patch_size ** 2)
+                input_shape = (1, 1, self.cfg.vm_cfg.seq_len, patch_dim)
+            else:
+                if isinstance(self.cfg.vm_cfg.image_size, list):
+                    image_h, image_w = self.cfg.vm_cfg.image_size
+                else:
+                    image_h = image_w = self.cfg.vm_cfg.image_size
+                input_shape = (1, image_h, image_w, 3)
         else:
             input_shape = (1, 1, self.cfg.vm_cfg.seq_len, self.cfg.vm_cfg.hidden_size)
 
@@ -504,20 +512,24 @@ class StandardVisionLayerModel(BaseModel):
                     stride=[1, 1, 1, 1],
                     axis=[0, 1, 2, 3]
                 )
-            _ = self._build_sima_mm_projector(builder, "multi_modal_projector", vision_output)
+            if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
+                projector_base_name = "model.multi_modal_projector"
+            else:
+                projector_base_name = "multi_modal_projector"
+            _ = self._build_sima_mm_projector(builder, projector_base_name, vision_output, quantizable)
 
         mla_node = builder.finish_subnet("MLA_0")
 
         # Ensure that output type is float32
         if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32)
+            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         net = builder.finish(self.model_name)
         return net
 
     def _build_sima_vision_tower(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         if self.include_embeddings:
-            embeddings = self._build_sima_patch_embeddings(builder, f"{base_name}.embeddings", input_node)
+            embeddings = self._build_sima_patch_embeddings(builder, f"{base_name}.embeddings", input_node, quantizable)
 
             if self.cfg.vm_cfg.arch == VisionArchType.CLIP:
                 # Note that the original source code has a typo in the layer norm node name.
@@ -539,7 +551,7 @@ class StandardVisionLayerModel(BaseModel):
             encoder_output = encoder_input
         else:
             encoder_output = self._build_sima_encoder(
-                f"{base_name}.encoder.layers.{self.layer_idx}", encoder_input, quantizable
+                builder, f"{base_name}.encoder.layers.{self.layer_idx}", encoder_input, quantizable
             )
 
         if not self.include_mm_proj:
@@ -552,41 +564,64 @@ class StandardVisionLayerModel(BaseModel):
         )
         return post_layer_norm
 
-    def _build_sima_patch_embeddings(self, builder, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
+    def _build_sima_patch_embeddings(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
         node_name = f"{base_name}.patch_embedding"
-        patch_embedding = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, node_name, input_node,
-            is_fc=False, stride=(self.cfg.vm_cfg.patch_size,) * 2
-        )
 
-        # NHWC layout, split on axis H, concat on axis W
-        split_and_concat = builder.create_slice_concat_node(
-            patch_embedding, axis=2,
-            split_axis=1,
-            split_block=self.cfg.vm_cfg.image_size // self.cfg.vm_cfg.patch_size,
-            split_repeat=1
-        )
-
-        # CLIP requires class embedding while SigLIP not.
-        if self.cfg.vm_cfg.arch == VisionArchType.CLIP:
-            node_name = f"{base_name}.concat_class_embedding"
-            class_embedding_weight = load_tensor_from_source(
-                f"{base_name}.class_embedding",
-                self.get_hf_param, self.check_hf_param,
-                reshape_str="c->nhwc"
+        if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
+            # LFM2: input is already pre-patchified (1, 1, seq_len, patch_dim) — FC projection only.
+            embeddings = build_conv(
+                builder, self.get_hf_param, self.check_hf_param, node_name, input_node,
+                is_fc=True
             )
-            class_embedding = builder.create_constant_node(class_embedding_weight)
-            embeddings = builder.create_concat_node([class_embedding, split_and_concat], axis=3)
         else:
-            embeddings = split_and_concat
+            if isinstance(self.cfg.vm_cfg.image_size, list):
+                image_h = self.cfg.vm_cfg.image_size[0]
+            else:
+                image_h = self.cfg.vm_cfg.image_size
+            patch_embedding = build_conv(
+                builder, self.get_hf_param, self.check_hf_param, node_name, input_node,
+                is_fc=False, stride=(self.cfg.vm_cfg.patch_size,) * 2
+            )
+            # NHWC layout: split on axis H, concat on axis W → (1, 1, seq_len, hidden)
+            split_and_concat = builder.create_slice_concat_node(
+                patch_embedding, axis=2,
+                split_axis=1,
+                split_block=image_h // self.cfg.vm_cfg.patch_size,
+                split_repeat=1
+            )
+            # CLIP requires class embedding prepended; SigLIP does not.
+            if self.cfg.vm_cfg.arch == VisionArchType.CLIP:
+                class_embedding_weight = load_tensor_from_source(
+                    f"{base_name}.class_embedding",
+                    self.get_hf_param, self.check_hf_param,
+                    reshape_str="c->nhwc"
+                ).astype(activation_dtype(quantizable))
+                class_embedding = builder.create_constant_node(class_embedding_weight)
+                embeddings = builder.create_concat_node([class_embedding, split_and_concat], axis=2)
+            else:
+                embeddings = split_and_concat
 
-        node_name=f"{base_name}.add_position_embedding"
-        position_embedding_weight = load_tensor_from_source(
-            f"{base_name}.position_embedding.weight",
-            self.get_hf_param, self.check_hf_param,
-            reshape_str="wc->nhwc"
-        )
-        position_embedding = builder.create_constant_node(position_embedding_weight)
+        # Position embedding — LFM2 may need bilinear resize if resolution differs from pretraining.
+        position_embedding_weight = self.get_hf_param(f"{base_name}.position_embedding.weight")
+        if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
+            original_grid_size = int(position_embedding_weight.shape[0] ** 0.5)
+            if isinstance(self.cfg.vm_cfg.num_patches, list):
+                target_h, target_w = self.cfg.vm_cfg.num_patches
+            else:
+                target_h = target_w = self.cfg.vm_cfg.num_patches
+            if target_h != original_grid_size or target_w != original_grid_size:
+                pos_grid = position_embedding_weight.reshape(
+                    original_grid_size, original_grid_size, self.cfg.vm_cfg.hidden_size
+                )
+                zoomed = zoom(pos_grid.astype(np.float32),
+                              (target_h / original_grid_size, target_w / original_grid_size, 1.0),
+                              order=1)
+                position_embedding_weight = zoomed.reshape(target_h * target_w, self.cfg.vm_cfg.hidden_size)
+
+        # Reshape "wc->nhwc" and cast to the activation dtype (float32 in RELAY, bfloat16 in SIMA_QUANTIZED).
+        pos_weight = position_embedding_weight.astype(activation_dtype(quantizable))
+        pos_weight = pos_weight.reshape(1, 1, pos_weight.shape[0], pos_weight.shape[1])
+        position_embedding = builder.create_constant_node(pos_weight)
         embeddings = builder.create_add_node(embeddings, position_embedding)
         return embeddings
 
@@ -666,15 +701,45 @@ class StandardVisionLayerModel(BaseModel):
         weight_tensor += weight_offset
         return builder.create_rms_norm_node(input_node, epsilon, weight_tensor)
 
-    def _build_sima_mm_projector(self, builder, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
+    def _build_sima_mm_projector(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
         match self.cfg.model_type:
+            case VlmArchType.VLM_LFM2_VL:
+                # NHWC: (1, 1, seq_len, hidden) → (1, num_patches_h, num_patches_w, hidden)
+                if isinstance(self.cfg.vm_cfg.num_patches, list):
+                    num_patches_h = self.cfg.vm_cfg.num_patches[0]
+                else:
+                    num_patches_h = self.cfg.vm_cfg.num_patches
+                reshaped = builder.create_slice_concat_node(
+                    input_node, axis=1,
+                    split_axis=2,
+                    split_block=num_patches_h,
+                    split_repeat=1
+                )
+                factor = self.cfg.mm_cfg.downsample_factor
+                unshuffled = build_space_to_depth(builder, reshaped, factor)
+                projector_input = unshuffled
+                if self.cfg.mm_cfg.projector_use_layernorm:
+                    epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
+                    projector_input = build_two_stage_layer_norm(
+                        builder, self.get_hf_param, self.check_hf_param,
+                        f"{base_name}.layer_norm", projector_input, -1, epsilon
+                    )
+                fc1 = build_conv(
+                    builder, self.get_hf_param, self.check_hf_param,
+                    f"{base_name}.linear_1", projector_input
+                )
+                act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)
+                last = build_conv(
+                    builder, self.get_hf_param, self.check_hf_param,
+                    f"{base_name}.linear_2", act
+                )
             case VlmArchType.VLM_LLAVA:
                 fc1 = build_conv(
                     builder, self.get_hf_param, self.check_hf_param,
                     f"{base_name}.linear_1", input_node
                 )
                 act = build_activation(
-                    builder, fc1, self.cfg.mm_cfg.hidden_act
+                    builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable
                 )
                 last = build_conv(
                     builder, self.get_hf_param, self.check_hf_param,

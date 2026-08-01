@@ -25,6 +25,7 @@ from afe.apis.defines import (
     bfloat16_scheme, default_quantization, gen2_target, quantization_scheme,
     SkipCalibration
 )
+from afe.backends.backends import Backend
 from afe.apis.error_handling_variables import enable_verbose_error_messages
 from afe.apis.loaded_net import load_model, onnx_source
 from afe.apis.model import Model as SDKModel
@@ -177,6 +178,7 @@ class BaseModel(ABC):
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
+    use_filter_sharing: bool = field(default=False, kw_only=True)
 
     _onnx_builder: OnnxBuilder | None = field(init=False)
 
@@ -351,7 +353,7 @@ class BaseModel(ABC):
             quant_params
         )
         calibrate_and_quantize_net = afe.driver.passes.calibration_quantization(
-            optimization_configs
+            optimization_configs, system_backend=Backend.EV
         )
         net = calibrate_and_quantize_net(net, None).run()
         afe.ir.serializer.save_awesomenet(
@@ -446,11 +448,18 @@ class BaseModel(ABC):
             retained_temporary_directory_name = (
                     Path(retained_temporary_directory_name) / self.model_name
             )
+        # For speculative decoding, use higher effort for compilation for better results.
+        is_speculative = (
+            isinstance(self.cfg, VlmConfig)
+            and self.cfg.lm_cfg.speculative_decoding_cfg is not None
+        )
+        layout_search_effort_level = 1 if is_speculative else 0
         model.compile(
             self.sima_mpk_path, compress=True, log_level=log_level, preserve=False,
             tessellate_parameters=tessellate_parameters,
             retained_temporary_directory_name=retained_temporary_directory_name,
-            enable_filter_sharing=self.enable_filter_sharing, deployable=False
+            enable_filter_sharing=self.enable_filter_sharing,
+            layout_search_effort_level=layout_search_effort_level, deployable=False
         )
         return model
 
@@ -459,9 +468,27 @@ class BaseModel(ABC):
         assert isinstance(self.cfg, VlmConfig)
         self.sima_devkit_path.mkdir(parents=True, exist_ok=True)
 
-        # Write the config json file.
         cfg_json_file_name = self.sima_devkit_path / "vlm_config.json"
-        if not (resume and cfg_json_file_name.is_file()):
+        embeddings_file_name = self.sima_devkit_path / f"{self.language_model_name}_embeddings.bin"
+        write_embeddings = not (resume and embeddings_file_name.is_file())
+        write_cfg = (
+            not (resume and cfg_json_file_name.is_file())
+            or (write_embeddings and self.cfg.pipeline_cfg.quantize_embeddings)
+        )
+        if write_embeddings or (write_cfg and self.cfg.pipeline_cfg.quantize_embeddings):
+            embeddings, embeddings_scale = self.get_language_embeddings_tensor()
+            if embeddings_scale is not None:
+                self.cfg.pipeline_cfg.embeddings_scale = embeddings_scale
+
+            # Preserve the table dtype exactly; runtime falls back to legacy .npy packages.
+            if write_embeddings and embeddings is not None:
+                if not self.cfg.pipeline_cfg.quantize_embeddings:
+                    embeddings = embeddings.astype(bfloat16)
+                embeddings.tofile(embeddings_file_name)
+            del embeddings
+
+        # Scales must be populated before serializing the runtime config.
+        if write_cfg:
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name
             if self.cfg.vm_cfg is not None:
@@ -471,22 +498,20 @@ class BaseModel(ABC):
             with open(self.sima_devkit_path / "vlm_config.json", "w") as f:
                 json.dump(cfg_dict, f, indent=4)
 
-        # Obtain the embeddings tensor from the hf model.
-        embeddings_file_name = self.sima_devkit_path / f"{self.language_model_name}_embeddings.npy"
-        if not (resume and embeddings_file_name.is_file()):
-            embeddings = self.get_language_embeddings_tensor()
+        per_layer_embeddings_file_name = (
+            self.sima_devkit_path / f"{self.language_model_name}_per_layer_embeddings.bin"
+        )
+        write_per_layer_embeddings = (
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and not (resume and per_layer_embeddings_file_name.is_file())
+        )
+        if write_per_layer_embeddings:
+            per_layer_embeddings, _ = self.get_language_per_layer_embeddings_tensor()
+            assert per_layer_embeddings is not None
             if not self.cfg.pipeline_cfg.quantize_embeddings:
-                embeddings = embeddings.astype(bfloat16)
-            np.save(embeddings_file_name, embeddings)
-
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
-            per_layer_embeddings_file_name = (
-                self.sima_devkit_path / f"{self.language_model_name}_per_layer_embeddings.bin"
-            )
-            if not (resume and per_layer_embeddings_file_name.is_file()):
-                per_layer_embeddings = self.get_language_per_layer_embeddings_tensor()
-                per_layer_embeddings.astype(bfloat16).tofile(per_layer_embeddings_file_name)
-
+                per_layer_embeddings = per_layer_embeddings.astype(bfloat16)
+            per_layer_embeddings.tofile(per_layer_embeddings_file_name)
+            del per_layer_embeddings
 
         if isinstance(self.hf_model, LocalHuggingFaceModel):
             # Copy the HF files.
@@ -517,6 +542,15 @@ class BaseModel(ABC):
                     )
                 with open(precision_file_name, "w") as f:
                     json.dump(precision_list, f, indent=4)
+
+            # Save the EAGLE3 draft model's d2t/t2d mapping tensors if present
+            for tensor_name in ("d2t", "t2d"):
+                out_path = self.sima_devkit_path / f"{tensor_name}.npy"
+                if resume and out_path.is_file():
+                    continue
+                if tensor_name in self.hf_model.weight_map:
+                    tensor = self.hf_model.load_np_param(tensor_name)
+                    np.save(out_path, tensor)
         else:
             assert isinstance(self.hf_model, GgufModel)
             # Copy the GGUF file to construct the VlmHelper.
@@ -636,8 +670,8 @@ class BaseModel(ABC):
         #     output = model._net.run(ifm_dict, node_callable=backend_runner.execute_node)
         #     print("output", output, flush=True)
         #     exit()
-
-        return model.execute(ifm_dict, use_jax=True)
+        #TODO Change to jax again after arm bug is fixed
+        return model.execute(ifm_dict, use_jax=False)
 
     def gen_files_from_model_list(
         self,
@@ -648,6 +682,7 @@ class BaseModel(ABC):
         resume: bool
     ):
         if num_processes != 1 and len(model_list) > 1:
+            os.environ["SIMA_MLA_SIM_PARALLEL"] = "1"
             def _stop_processes(futures, msg = None):
                 if msg is not None:
                     print(msg, file=sys.stderr, flush=True)

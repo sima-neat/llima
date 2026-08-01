@@ -1,0 +1,13 @@
+id: sima-contribute-to-llima
+name: Contribute to LLiMa
+version: 0.1.0
+agents: [codex, claude]
+description: Repository guidance for safe, tested changes to LLiMa compilation, runtime, packaging, CI, tests, documentation, and skills.
+compatibility:
+  env_types: [host, sdk]
+  env_subtypes: [linux, palette]
+  min_cli_version: 2.1.2
+runtime:
+  requires:
+    - git
+    - python3

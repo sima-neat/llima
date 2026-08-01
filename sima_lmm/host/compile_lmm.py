@@ -21,7 +21,6 @@ from sima_lmm.host.configuration_helper import (
 from sima_lmm.host.compile_lora_adapter import compile_lora_adapter
 from sima_lmm.model import FileGenMode, FileGenPrecision, VisionLanguageModel
 
-
 def _print_precisions(precision: dict[LayerID, FileGenPrecision], for_quantize: bool):
     """
     Print diagnostic message about layers and precisions that will be processed.
@@ -50,89 +49,101 @@ def gen_files(
     num_processes: int, resume: bool, model_path: Path, lora_path: Path | None,
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
-    language_group_size: int, language_group_offsets: list[int] | None,
-    future_token_mask_size: int, use_strided_kv_cache: bool, enable_filter_sharing: bool,
-    quantize_embeddings: bool, split_mlp: bool, return_logits: bool, log_level: int,
-    image_resolution: list[int] | None, draft_model_path: Path | None
+    language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
+    quantize_embeddings: bool, quantize_kv_cache: bool, split_mlp: bool, return_logits: bool,
+    log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
+    draft_output_path: Path | None
 ):
     enable_verbose_error_messages()
+    models = list()
 
-    model = VisionLanguageModel.from_hf_cache(
+    base_model = VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=Path(f"{output_path}/onnx_files"),
-        sima_path=Path(f"{output_path}/sima_files"),
+        onnx_path=Path(output_path / "onnx_files"),
+        sima_path=Path(output_path / "sima_files"),
         max_num_tokens=max_num_tokens,
         system_prompt=system_prompt,
         chat_template=chat_template,
         override_language_group_size=language_group_size,
-        override_language_group_offsets=language_group_offsets,
         override_language_future_token_mask_size=future_token_mask_size,
         return_logits=return_logits,
-        use_strided_kv_cache=use_strided_kv_cache,
         enable_filter_sharing=enable_filter_sharing,
         quantize_embeddings=quantize_embeddings,
+        quantize_kv_cache=quantize_kv_cache,
         split_mlp=split_mlp,
         image_resolution=image_resolution
     )
+    models.append(base_model)
 
     # Check if LoRA adapter is needed.
     if lora_path is not None:
-        model.set_lora_adapter(lora_path)
-    
+        base_model.set_lora_adapter(lora_path)
+
     # Check if draft model is provided
     if draft_model_path is not None:
-        model.set_draft_model(draft_model_path)
+        base_model.configure_speculative_decoding(is_draft=False)
+        draft_model = VisionLanguageModel.from_hf_cache(
+            hf_cache_path=draft_model_path,
+            model_name=draft_model_path.name,
+            onnx_path=Path(draft_output_path / "onnx_files"),
+            sima_path=Path(draft_output_path / "sima_files"),
+            max_num_tokens=max_num_tokens,
+            system_prompt=system_prompt,
+            chat_template=chat_template,
+            override_language_group_size=language_group_size,
+            override_language_future_token_mask_size=future_token_mask_size,
+            return_logits=return_logits,
+            enable_filter_sharing=enable_filter_sharing,
+            quantize_embeddings=quantize_embeddings,
+            quantize_kv_cache=quantize_kv_cache,
+            split_mlp=split_mlp,
+            image_resolution=image_resolution,
+            target_model=base_model
+        )
+        models.append(draft_model)
 
-    if configuration_path is None:
-        gen_config = default_configuration(model)
-    else:
-        gen_config = read_configuration_file(model, configuration_path)
+    for model in models:
+        if configuration_path is None:
+            gen_config = default_configuration(model)
+        else:
+            gen_config = read_configuration_file(model, configuration_path)
 
-    if file_gen_mode == FileGenMode.ALL:
-        # Use different compiler stages for HF and for GGUF
-        if isinstance(model.hf_model, LocalHuggingFaceModel):
-            # Check if this is an llm-compressor quantized model (AWQ/GPTQ)
-            if model.hf_model.is_compressed_tensors_model():
-                # Pre-quantized models use MODEL_SDK_DIRECT like GGUF
+        if file_gen_mode == FileGenMode.ALL:
+            # Use different compiler stages for HF and for GGUF
+            if isinstance(model.hf_model, LocalHuggingFaceModel):
+                # Check if this is an llm-compressor quantized model (AWQ/GPTQ)
+                if model.hf_model.is_compressed_tensors_model():
+                    # Pre-quantized models use MODEL_SDK_DIRECT like GGUF
+                    modes = [
+                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
+                        FileGenMode.MODEL_SDK_COMPILE
+                    ]
+                else:
+                    # Use direct SiMa Builder graph generation for ordinary HF models.
+                    modes = [
+                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
+                        FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
+                    ]
+            else:
+                assert isinstance(model.hf_model, GgufModel)
                 modes = [
                     FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                     FileGenMode.MODEL_SDK_COMPILE
                 ]
-            elif lora_path is not None or quantize_embeddings:
-                # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
-                modes = [
-                    FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
-                    FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
-                ]
-            else:
-                # Use ONNX mode, no need to track LoRA weights
-                modes = [
-                    FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                    FileGenMode.MODEL_SDK_COMPILE
-                ]
         else:
-            assert isinstance(model.hf_model, GgufModel)
-            modes = [
-                FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
-                FileGenMode.MODEL_SDK_COMPILE
-            ]
-    else:
-        if isinstance(model.hf_model, GgufModel) and file_gen_mode == FileGenMode.SOURCE_TO_ONNX:
-            _abort("ONNX generation mode not supported for GGUF models")
-        modes = [file_gen_mode]
+            if isinstance(model.hf_model, GgufModel) and file_gen_mode == FileGenMode.SOURCE_TO_ONNX:
+                _abort("ONNX generation mode not supported for GGUF models")
+            modes = [file_gen_mode]
 
-    _print_precisions(gen_config["precision"], FileGenMode.SOURCE_TO_QUANT in modes or FileGenMode.FP_TO_QUANT in modes)
+        _print_precisions(gen_config["precision"], FileGenMode.SOURCE_TO_QUANT in modes or FileGenMode.FP_TO_QUANT in modes)
 
-    for mode in modes:
-        model.gen_files(
-            mode, gen_config=gen_config, log_level=log_level, num_processes=num_processes,
-            resume=resume
-        )
-        print(f"Generated all mode={mode.name} files", flush=True)
-
-    if model.cfg.lm_cfg.draft_cfg is not None:
-        raise NotImplementedError("Draft model generation is not implemented yet")
+        for mode in modes:
+            model.gen_files(
+                mode, gen_config=gen_config, log_level=log_level, num_processes=num_processes,
+                resume=resume
+            )
+            print(f"Generated mode={mode.name} files for {model.model_name}", flush=True)
 
 def _safe_resolve(p: Path) -> Path:
     """
@@ -224,8 +235,9 @@ def main():
 
     group = parser.add_argument_group("Model compilation parameters")
     group.add_argument(
-        "--max_num_tokens", type=int, metavar="N", default=1024,
-        help="Maximum number of input tokens that the model will support (default: 1024)"
+        "--max_num_tokens", type=int, metavar="N", default=4096,
+        help="Maximum number of input tokens that the model will support; "
+             "must be a multiple of 1024 (default: 4096)"
     )
     group.add_argument(
         "--language_group_size", type=int, metavar="N", default=128,
@@ -234,26 +246,17 @@ def main():
              "(default: 128)"
     )
     group.add_argument(
-        "--language_group_offsets", metavar="LIST",
-        help="Comma-separated list of positive integers.  "
-             "Grouped token processing will use groups starting at these indices.  "
-             "(default: derived from language_group_size)"
-    )
-    group.add_argument(
         "--future_token_mask_size", type=int, metavar="N", default=128,
         help="Size of token mask.  "
              "Token masks reduce compiled code size at the cost of redundant computation by "
              "reusing models for generating multiple tokens.  "
+             "Full attention uses 1024 at context lengths of 2048 or greater; sliding attention "
+             "continues to use this value.  "
              "(default: 128)"
     )
     group.add_argument(
         "--return_logits", action=argparse.BooleanOptionalAction, default=False,
         help="Return logits at the last layer output."
-    )
-    group.add_argument(
-        "--use_strided_kv_cache", action=argparse.BooleanOptionalAction, default=False,
-        help="Enables strided access to the KV cache stored in DRAM, affecting both read and "
-             "write operations."
     )
     group.add_argument(
         "--enable_filter_sharing", action=argparse.BooleanOptionalAction, default=False,
@@ -264,10 +267,18 @@ def main():
         )
     )
     group.add_argument(
-        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=False,
+        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=True,
         help=(
-            "Enables embedding quantization to reduce memory consumption. This may result in a loss"
-            " of accuracy."
+            "Quantizes embedding tables for LLMs and VLMs to reduce memory "
+            "consumption. This may result in a loss of accuracy. Enabled by default; disable with "
+            "--no-quantize_embeddings."
+        )
+    )
+    group.add_argument(
+        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "Enables kv_cache quantization to reduce memory consumption. This may result in a loss"
+            " of accuracy. Enabled by default; disable with --no-quantize_kv_cache."
         )
     )
     egroup = group.add_mutually_exclusive_group()
@@ -295,6 +306,10 @@ def main():
         "--input_width", type=int, metavar="N",
         help="The width of the input image (for Siglip2 based models)"
     )
+    group.add_argument(
+        "--draft_model_path", type=Path,
+        help="Path of the EAGLE3 draft model for the base (target) model."
+    )
 
     group = parser.add_argument_group("Options to compile LoRA")
     group.add_argument(
@@ -310,10 +325,6 @@ def main():
     group.add_argument(
         "--compile_lora", type=bool, action=argparse.BooleanOptionalAction, default=True,
         help="Set to compile LoRA weights."
-    )
-    group.add_argument(
-        "--draft_model_path", type=Path,
-        help="Path of the EAGLE3 draft model for the base (target) model."
     )
 
     group = parser.add_argument_group("Advanced options")
@@ -333,9 +344,19 @@ def main():
         num_processes = psutil.cpu_count(logical=False)
 
     if args.output is None:
-        output_path = Path(args.model_path.name)
+        if args.draft_model_path is not None:
+            base_output_path = Path(f"{args.model_path.name}-speculative-decoding")
+        else:
+            base_output_path = Path(args.model_path.name)
     else:
-        output_path = Path(args.output)
+        base_output_path = Path(args.output)
+
+    if args.draft_model_path is not None:
+        output_path = base_output_path / args.model_path.name
+        draft_output_path = base_output_path / args.draft_model_path.name
+    else:
+        output_path = base_output_path
+        draft_output_path = None
 
     check_output_path_conflict(args.model_path, output_path)
 
@@ -364,18 +385,6 @@ def main():
     else:
         chat_template = None
 
-    if args.language_group_offsets is not None:
-        try:
-            language_group_offsets = list(map(int, args.language_group_offsets.split(",")))
-        except:
-            _abort(
-                "Cannot parse argument value as a comma-separated list of integers: "
-                + args.language_group_offsets
-            )
-    else:
-        lgs = args.language_group_size
-        language_group_offsets = list(range(0, args.max_num_tokens - lgs + 1, lgs))
-
     # Select a compile mode.  At most one of these flags can be used on the command line.
     for compile_mode_option, mode_flag in _FILE_GEN_MODE_OPTIONS:
         if getattr(args, compile_mode_option, None):
@@ -390,9 +399,20 @@ def main():
     elif args.input_height is not None or args.input_width is not None:
         _abort("Both --input_height and --input_width must be provided.")
 
-    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_embeddings:
+    is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
+    is_speculative_decoding = args.draft_model_path is not None
+
+    if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
-            "Embedding quantization is not supported for ONNX file generation mode."
+            "ONNX generation does not support embedding or KV-cache quantization. "
+            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
+        )
+    # TODO: Enable these features for EAGLE3 once its target/draft staging and runtime
+    # paths support embedding and KV-cache quantization.
+    if is_speculative_decoding and (args.quantize_embeddings or args.quantize_kv_cache):
+        _abort(
+            "EAGLE3 does not support embedding or KV-cache quantization. "
+            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
         )
 
     lora_path_for_base_model = None
@@ -403,15 +423,16 @@ def main():
     elif args.lora_names is not None or args.lora_paths is not None:
         _abort("Number of --lora_name do not match the number of --lora_path")
 
-    # Enable mlp splitting and LoRA is not used. The feature is not implemented for LoRA.
+    # Enable MLP splitting when LoRA is not used. The feature is not implemented for LoRA.
     split_mlp = lora_path_for_base_model is None
 
     gen_files(
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
-        args.language_group_size, language_group_offsets, args.future_token_mask_size,
-        args.use_strided_kv_cache, args.enable_filter_sharing, args.quantize_embeddings,
-        split_mlp, args.return_logits, log_level, image_resolution, args.draft_model_path
+        args.language_group_size, args.future_token_mask_size,
+        args.enable_filter_sharing, args.quantize_embeddings,
+        args.quantize_kv_cache, split_mlp, args.return_logits, log_level, image_resolution,
+        args.draft_model_path, draft_output_path
     )
 
     # Compile LoRA weights if requested.
