@@ -161,13 +161,15 @@ This bounded end-to-end case:
 
 1. Selects an eligible model deterministically from the candidate commit SHA.
 2. Resolves and validates cached source provenance.
-3. Generates ONNX.
-4. Quantizes the selected model component.
+3. Generates a floating-point Model SDK graph directly from the source model.
+4. Quantizes the Model SDK graph.
 5. Invokes Model Compiler.
 6. Validates the resulting MPK archive and MLA ELF.
 
 The test selects layer 0 and INT4 quantization to cover the complete pipeline
-without compiling an entire generative model. It is serial and high-memory.
+without compiling an entire generative model. The staged commands follow the
+default direct Model SDK compilation path while preserving per-stage timings
+and diagnostics. It is serial and high-memory.
 
 ### Compiler test definitions and helpers
 
