@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 
+#include "reasoning_parser.hpp"
 #include "tool_call_parser.hpp"
 #include "utils.hpp"
 
@@ -95,17 +96,22 @@ void WEB::run() {
 
     // OpenAI protocol
     auto openai_handler = [this](const httplib::Request& req, httplib::Response& res) {
-        this->_handle_chat_completions(req, res, true);
+        this->_handle_chat_completions(req, res, ChatProtocol::OpenAI);
     };
     _http_server.Post("/v1/chat/completions", openai_handler);
     _http_server.Post("/v1/completions", openai_handler);
 
     // Ollama protocol
-    auto ollama_handler = [this](const httplib::Request& req, httplib::Response& res) {
-        this->_handle_chat_completions(req, res, false);
+    auto ollama_chat_handler = [this](const httplib::Request& req, httplib::Response& res) {
+        this->_handle_chat_completions(req, res, ChatProtocol::OllamaChat);
     };
-    _http_server.Post("/api/chat", ollama_handler);
-    _http_server.Post("/api/generate", ollama_handler);
+    auto ollama_generate_handler = [this](
+        const httplib::Request& req, httplib::Response& res
+    ) {
+        this->_handle_chat_completions(req, res, ChatProtocol::OllamaGenerate);
+    };
+    _http_server.Post("/api/chat", ollama_chat_handler);
+    _http_server.Post("/api/generate", ollama_generate_handler);
 
     // Audio transcription endpoints (OpenAI compatible)
     auto audio_handler = [this](const httplib::Request& req, httplib::Response& res) {
@@ -182,6 +188,12 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
     for (const auto& msg : messages) {
         nlohmann::ordered_json internal_msg;
         internal_msg["role"] = msg.value("role", "user");
+        const nlohmann::json* reasoning = nullptr;
+        if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string()) {
+            reasoning = &msg["reasoning_content"];
+        } else if (msg.contains("thinking") && msg["thinking"].is_string()) {
+            reasoning = &msg["thinking"];
+        }
 
         // Handle Ollama's images array format first
         bool has_ollama_images = msg.contains("images") && msg["images"].is_array();
@@ -265,10 +277,14 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
             const bool has_valid_tool_calls =
                 msg.contains("tool_calls") && msg["tool_calls"].is_array() &&
                 !msg["tool_calls"].empty();
-            if (!has_valid_tool_calls) {
+            if (!has_valid_tool_calls && reasoning == nullptr) {
                 continue;
             }
             internal_msg["content"] = "";
+        }
+
+        if (reasoning != nullptr) {
+            internal_msg["reasoning_content"] = *reasoning;
         }
 
         if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
@@ -292,7 +308,8 @@ std::string WEB::_format_openai_sse_chunk(
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
     std::optional<double> tps,
-    bool from_draft
+    bool from_draft,
+    bool reasoning
 ) {
     nlohmann::json chunk;
     chunk["id"] = completion_id;
@@ -319,7 +336,10 @@ std::string WEB::_format_openai_sse_chunk(
         // Custom extension: mark chunks whose tokens were accepted from the
         // draft model during speculative decoding so the client can render
         // them differently.
-        choice["delta"] = {{"content", content}, {"from_draft", from_draft}};
+        choice["delta"] = {
+            {reasoning ? "reasoning_content" : "content", content},
+            {"from_draft", from_draft}
+        };
         choice["finish_reason"] = nullptr;
     }
 
@@ -330,11 +350,13 @@ std::string WEB::_format_openai_sse_chunk(
 std::string WEB::_format_ollama_ndjson_chunk(
     const std::string& content,
     const std::string& model,
+    ChatProtocol protocol,
     bool finished,
     std::optional<std::string> finish_reason,
     std::optional<double> ttft,
     std::optional<double> tps,
-    bool from_draft
+    bool from_draft,
+    bool reasoning
 ) {
     nlohmann::json chunk;
     chunk["model"] = model;
@@ -353,9 +375,22 @@ std::string WEB::_format_ollama_ndjson_chunk(
         chunk["finish_reason"] = finish_reason.value();
     }
 
+    if (protocol == ChatProtocol::OllamaChat) {
+        nlohmann::json message = {{"role", "assistant"}, {"content", ""}};
+        if (!finished) {
+            if (reasoning) {
+                message["thinking"] = content;
+            } else {
+                message["content"] = content;
+            }
+        }
+        chunk["message"] = std::move(message);
+    } else {
+        chunk["response"] = reasoning || finished ? std::string("") : content;
+        if (!finished && reasoning) chunk["thinking"] = content;
+    }
+
     if (!finished) {
-        chunk["message"] = {{"role", "assistant"}, {"content", content}};
-        chunk["response"] = content;
         // Custom extension: flag draft-accepted chunks for client rendering.
         chunk["from_draft"] = from_draft;
     }
@@ -409,15 +444,18 @@ std::string WEB::_format_audio_sse_chunk(
 void WEB::_handle_chat_completions(
     const httplib::Request& req,
     httplib::Response& res,
-    bool is_openai
+    ChatProtocol protocol
 ) {
+    const bool is_openai = protocol == ChatProtocol::OpenAI;
     _set_cors_headers(res);
     try {
         std::string model;
         bool stream = false;
 
         // 1. Prepare
-        std::optional<Chat> chat_opt = _prepare_chat_context(req, res, model, stream);
+        std::optional<Chat> chat_opt = _prepare_chat_context(
+            req, res, model, stream, protocol
+        );
         if (!chat_opt.has_value()) {
             return;
         }
@@ -428,9 +466,9 @@ void WEB::_handle_chat_completions(
 
         // 3. Execution
         if (stream) {
-            _execute_streaming_chat(res, chat, model, is_openai);
+            _execute_streaming_chat(res, chat, model, protocol);
         } else {
-            _execute_normal_chat(res, chat, model, is_openai);
+            _execute_normal_chat(res, chat, model, protocol);
         }
     } catch (const std::exception& e) {
         _logger->error("Error in chat handler: {}", e.what());
@@ -606,7 +644,12 @@ bool json_bool_or_default(
     return default_value;
 }
 
-bool request_enable_thinking(const nlohmann::json& json_data, bool default_value) {
+bool request_enable_thinking(
+    const nlohmann::json& json_data, bool default_value, ChatProtocol protocol
+) {
+    if (protocol != ChatProtocol::OpenAI)
+        return json_bool_or_default(json_data, "think", default_value);
+
     bool enable_thinking = json_bool_or_default(
         json_data, "enable_thinking", default_value
     );
@@ -618,11 +661,6 @@ bool request_enable_thinking(const nlohmann::json& json_data, bool default_value
             json_data.at("chat_template_kwargs"), "enable_thinking", enable_thinking
         );
     }
-    if (json_data.contains("options") && json_data.at("options").is_object()) {
-        enable_thinking = json_bool_or_default(
-            json_data.at("options"), "enable_thinking", enable_thinking
-        );
-    }
     return enable_thinking;
 }
 
@@ -632,14 +670,17 @@ std::optional<Chat> WEB::_prepare_chat_context(
     const httplib::Request& req,
     httplib::Response& res,
     std::string& model,
-    bool& stream
+    bool& stream,
+    ChatProtocol protocol
 ) {
     auto json_data = nlohmann::json::parse(req.body);
     model = json_data.value("model", "default-model");
     stream = json_data.value("stream", false);
 
     Chat chat = _vision_language_model_ptr->create_chat();
-    chat.set_enable_thinking(request_enable_thinking(json_data, _enable_thinking));
+    chat.set_enable_thinking(
+        request_enable_thinking(json_data, _enable_thinking, protocol)
+    );
     bool tools_enabled = true;
     if (json_data.contains("tool_choice") && !json_data["tool_choice"].is_null()) {
         if (!json_data["tool_choice"].is_string()) {
@@ -665,6 +706,15 @@ std::optional<Chat> WEB::_prepare_chat_context(
     if (json_data.contains("tools") && !json_data["tools"].is_array()) {
         res.status = 400;
         res.set_content(R"({"error": "tools must be an array"})", "application/json");
+        return std::nullopt;
+    }
+    if (protocol == ChatProtocol::OllamaGenerate &&
+        json_data.contains("tools") && !json_data["tools"].empty()) {
+        res.status = 400;
+        res.set_content(
+            R"({"error": "tools are not supported by /api/generate"})",
+            "application/json"
+        );
         return std::nullopt;
     }
     if (tools_enabled && json_data.contains("tools")) {
@@ -705,15 +755,18 @@ void WEB::_execute_streaming_chat(
     httplib::Response& res,
     Chat& chat,
     const std::string& model,
-    bool is_openai
+    ChatProtocol protocol
 ) {
+    const bool is_openai = protocol == ChatProtocol::OpenAI;
     res.set_header("Content-Type", is_openai ? "text/event-stream" : "application/x-ndjson");
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
 
     res.set_chunked_content_provider(
         is_openai ? "text/event-stream" : "application/x-ndjson",
-        [this, chat, model, is_openai](size_t offset, httplib::DataSink &sink) {
+        [this, chat, model, protocol](size_t offset, httplib::DataSink &sink) {
+            (void)offset;
+            const bool is_openai = protocol == ChatProtocol::OpenAI;
             const auto created = std::time(nullptr);
             const auto completion_id = "chatcmpl-" + std::to_string(created);
             const bool has_tools = chat.has_tools();
@@ -724,6 +777,15 @@ void WEB::_execute_streaming_chat(
             ToolCallStreamParser tool_parser(
                 _vision_language_model_ptr->tool_call_format(),
                 tool_names_from_definitions(chat.get_tools()));
+            const auto reasoning_format = reasoning_format_for_model(
+                _vision_language_model_ptr->model_type()
+            );
+            const auto& messages = chat.get_messages();
+            const bool prompt_opens_reasoning = reasoning_format == ReasoningFormat::Gemma4 &&
+                !messages.empty() && messages.back().value("role", std::string{}) == "tool";
+            ReasoningStreamParser reasoning_parser(
+                reasoning_format, chat.get_enable_thinking(), prompt_opens_reasoning
+            );
             nlohmann::json pending_ollama_tool_calls = nullptr;
 
             auto send_openai_initial = [&]() {
@@ -752,19 +814,19 @@ void WEB::_execute_streaming_chat(
                 return std::nullopt;
             };
 
-            auto send_content = [&](const std::string& text, bool from_draft) {
+            auto send_text = [&](const std::string& text, bool from_draft, bool reasoning) {
                 if (text.empty()) return;
                 if (is_openai) {
                     send_openai_initial();
                     auto chunk = _format_openai_sse_chunk(
                         text, model, completion_id, created, false, std::nullopt,
-                        take_ttft_once(), tps_value, from_draft
+                        take_ttft_once(), tps_value, from_draft, reasoning
                     );
                     sink.write(chunk.data(), chunk.size());
                 } else {
                     auto chunk = _format_ollama_ndjson_chunk(
-                        text, model, false, std::nullopt, take_ttft_once(), tps_value,
-                        from_draft
+                        text, model, protocol, false, std::nullopt, take_ttft_once(),
+                        tps_value, from_draft, reasoning
                     );
                     sink.write(chunk.data(), chunk.size());
                 }
@@ -804,7 +866,7 @@ void WEB::_execute_streaming_chat(
                     if (std::holds_alternative<ToolCallStreamParser::Content>(event)) {
                         const auto& content =
                             std::get<ToolCallStreamParser::Content>(event);
-                        send_content(content.text, content.from_draft);
+                        send_text(content.text, content.from_draft, false);
                     } else {
                         const auto& calls = std::get<ToolCallStreamParser::ToolCalls>(event).calls;
                         saw_tool_calls = true;
@@ -836,128 +898,59 @@ void WEB::_execute_streaming_chat(
                     const std::string default_finish_reason =
                         (metric_type == "FULL") ? "length" : "stop";
 
-                    if (has_tools) {
-                        handle_tool_parser_events(tool_parser.add("", true));
-
-                        if (is_openai) {
-                            send_openai_initial();
-                            std::string finish_reason =
-                                saw_tool_calls ? "tool_calls" : default_finish_reason;
-
-                            std::string final_chunk =
-                                _format_openai_sse_chunk(
-                                    "", model, completion_id, created, true, finish_reason
-                                )
-                                + "data: [DONE]\n\n";
-                            sink.write(final_chunk.data(), final_chunk.size());
-                        } else {
-                            nlohmann::json final_obj;
-                            final_obj["model"] = model;
-                            final_obj["created_at"] = get_iso_timestamp();
-                            final_obj["done"] = true;
-                            final_obj["finish_reason"] = default_finish_reason;
-                            if (ttft_value.has_value())
-                                final_obj["ttft"] = ttft_value.value();
-                            if (tps_value.has_value())
-                                final_obj["tps"] = tps_value.value();
-
-                            nlohmann::json message = {{"role", "assistant"}};
-                            if (!pending_ollama_tool_calls.is_null()) {
-                                message["content"] = "";
-                                message["tool_calls"] =
-                                    openai_tool_calls_to_ollama(pending_ollama_tool_calls);
-                                final_obj["finish_reason"] = "tool_calls";
-                            } else {
-                                message["content"] = "";
-                            }
-                            final_obj["message"] = message;
-
-                            std::string final_line = final_obj.dump() + "\n";
-                            sink.write(final_line.data(), final_line.size());
-                        }
-                        return;
-                    }
-
-                    std::string finish_reason = default_finish_reason;
-                    std::string formatted_chunk;
-
+                    if (has_tools) handle_tool_parser_events(tool_parser.add("", true));
+                    const std::string finish_reason =
+                        saw_tool_calls ? "tool_calls" : default_finish_reason;
                     if (is_openai) {
-                        formatted_chunk = _format_openai_sse_chunk(
+                        send_openai_initial();
+                        auto formatted_chunk = _format_openai_sse_chunk(
                             "", model, completion_id, created, true, finish_reason
                         ) + "data: [DONE]\n\n";
+                        sink.write(formatted_chunk.data(), formatted_chunk.size());
                     } else {
-                        formatted_chunk = _format_ollama_ndjson_chunk(
-                            "", model, true, finish_reason
-                        );
+                        nlohmann::json final_obj = {
+                            {"model", model},
+                            {"created_at", get_iso_timestamp()},
+                            {"done", true},
+                            {"finish_reason", finish_reason},
+                        };
+                        if (ttft_value.has_value()) final_obj["ttft"] = *ttft_value;
+                        if (tps_value.has_value()) final_obj["tps"] = *tps_value;
+                        if (protocol == ChatProtocol::OllamaChat) {
+                            nlohmann::json message = {
+                                {"role", "assistant"}, {"content", ""}
+                            };
+                            if (!pending_ollama_tool_calls.is_null()) {
+                                message["tool_calls"] =
+                                    openai_tool_calls_to_ollama(pending_ollama_tool_calls);
+                            }
+                            final_obj["message"] = std::move(message);
+                        } else {
+                            final_obj["response"] = "";
+                        }
+                        auto formatted_chunk = final_obj.dump() + "\n";
+                        sink.write(formatted_chunk.data(), formatted_chunk.size());
                     }
-                    sink.write(formatted_chunk.data(), formatted_chunk.size());
                 }
             };
 
-            // Text callback handles generated text chunks. from_draft is
-            // attached to each streamed chunk as a JSON field so the client
-            // can render draft-accepted text differently from target-only.
             auto text_callback = [&](
                 const std::string& text, bool stream_end, bool from_draft
             ) {
-                if (has_tools) {
-                    handle_tool_parser_events(
-                        tool_parser.add(text, stream_end, from_draft)
-                    );
-                    return;
-                }
-
-                // Send initial role chunk for OpenAI (first time only)
-                if (is_openai && !sent_initial_chunk) {
-                    nlohmann::json initial_chunk;
-                    initial_chunk["id"] = completion_id;
-                    initial_chunk["object"] = "chat.completion.chunk";
-                    initial_chunk["created"] = created;
-                    initial_chunk["model"] = model;
-                    initial_chunk["system_fingerprint"] = "fp_sima_vlm";
-
-                    nlohmann::json initial_choice;
-                    initial_choice["index"] = 0;
-                    initial_choice["delta"] = {
-                        {"role", "assistant"}, {"content", nullptr}
-                    };
-                    initial_choice["finish_reason"] = nullptr;
-                    initial_chunk["choices"] = nlohmann::json::array({initial_choice});
-
-                    std::string initial_output = "data: " + initial_chunk.dump() + "\n\n";
-                    sink.write(initial_output.data(), initial_output.size());
-                    sent_initial_chunk = true;
-                }
-
-                // Regular text chunk - include metrics
-                std::string formatted_chunk;
-                if (is_openai) {
-                    std::optional<double> ttft_for_chunk = std::nullopt;
-                    if (!ttft_sent && ttft_value.has_value()) {
-                        ttft_for_chunk = ttft_value;
-                        ttft_sent = true;
+                for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
+                    if (event.reasoning) {
+                        send_text(event.text, event.from_draft, true);
+                        continue;
                     }
-                    formatted_chunk = _format_openai_sse_chunk(
-                        text, model, completion_id, created, false, std::nullopt,
-                        ttft_for_chunk,
-                        tps_value,
-                        from_draft
-                    );
-                } else {
-                    std::optional<double> ttft_for_chunk = std::nullopt;
-                    if (!ttft_sent && ttft_value.has_value()) {
-                        ttft_for_chunk = ttft_value;
-                        ttft_sent = true;
-                    }
-                    formatted_chunk = _format_ollama_ndjson_chunk(
-                        text, model, false, std::nullopt,
-                        ttft_for_chunk,
-                        tps_value,
-                        from_draft
-                    );
-                }
 
-                sink.write(formatted_chunk.data(), formatted_chunk.size());
+                    if (has_tools) {
+                        handle_tool_parser_events(
+                            tool_parser.add(event.text, false, event.from_draft)
+                        );
+                    } else {
+                        send_text(event.text, event.from_draft, false);
+                    }
+                }
             };
 
             _vision_language_model_ptr->set_info_callback(info_callback);
@@ -1016,19 +1009,31 @@ void WEB::_execute_normal_chat(
     httplib::Response& res,
     Chat& chat,
     const std::string& model,
-    bool is_openai
+    ChatProtocol protocol
 ) {
-    std::string full_response = "";
+    std::string reasoning_response;
+    std::string full_response;
+    std::string finish_reason = "stop";
+    const auto reasoning_format = reasoning_format_for_model(
+        _vision_language_model_ptr->model_type()
+    );
+    const auto& messages = chat.get_messages();
+    const bool prompt_opens_reasoning = reasoning_format == ReasoningFormat::Gemma4 &&
+        !messages.empty() && messages.back().value("role", std::string{}) == "tool";
+    ReasoningStreamParser reasoning_parser(
+        reasoning_format, chat.get_enable_thinking(), prompt_opens_reasoning
+    );
 
-    // Info callback: ignore timing/status info in non-streaming mode
-    auto info_callback = [](const std::string& metric_type, double metric_value) {
-        // Do nothing - we don't need timing info in non-streaming mode
-    };
+    auto info_callback = [](const std::string&, double) {};
 
-    // Text callback: accumulate all text. from_draft is ignored in
-    // non-streaming mode -- the whole response is returned as a single string.
-    auto text_callback = [&](const std::string& text, bool stream_end, bool) {
-        full_response += text;
+    auto text_callback = [&](const std::string& text, bool stream_end, bool from_draft) {
+        for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
+            if (event.reasoning) {
+                reasoning_response += event.text;
+            } else {
+                full_response += event.text;
+            }
+        }
     };
 
     _vision_language_model_ptr->set_info_callback(info_callback);
@@ -1047,20 +1052,23 @@ void WEB::_execute_normal_chat(
         tool_calls = try_parse_tool_calls(
             _vision_language_model_ptr->tool_call_format(), full_response,
             tool_names_from_definitions(chat.get_tools()));
-        if (!tool_calls.is_null()) full_response.clear();
+        if (!tool_calls.is_null()) {
+            full_response.clear();
+            finish_reason = "tool_calls";
+        }
     }
 
     nlohmann::json response;
-    if (is_openai) {
+    if (protocol == ChatProtocol::OpenAI) {
         nlohmann::json message = {{"role", "assistant"}};
-        std::string finish_reason;
         if (!tool_calls.is_null()) {
             message["content"] = nullptr;
             message["tool_calls"] = tool_calls;
-            finish_reason = "tool_calls";
         } else {
             message["content"] = full_response;
-            finish_reason = "stop";
+        }
+        if (!reasoning_response.empty()) {
+            message["reasoning_content"] = reasoning_response;
         }
         response = {
             {"id", "chatcmpl-" + std::to_string(std::time(nullptr))},
@@ -1073,7 +1081,7 @@ void WEB::_execute_normal_chat(
                 {"finish_reason", finish_reason}
             }}}
         };
-    } else {
+    } else if (protocol == ChatProtocol::OllamaChat) {
         nlohmann::json message = {{"role", "assistant"}};
         if (!tool_calls.is_null()) {
             message["content"] = "";
@@ -1081,13 +1089,23 @@ void WEB::_execute_normal_chat(
         } else {
             message["content"] = full_response;
         }
+        if (!reasoning_response.empty()) message["thinking"] = reasoning_response;
+        response = {
+            {"model", model},
+            {"created_at", get_iso_timestamp()},
+            {"message", message},
+            {"done", true},
+            {"finish_reason", finish_reason}
+        };
+    } else {
         response = {
             {"model", model},
             {"created_at", get_iso_timestamp()},
             {"response", tool_calls.is_null() ? full_response : std::string("")},
-            {"message", message},
-            {"done", true}
+            {"done", true},
+            {"finish_reason", finish_reason}
         };
+        if (!reasoning_response.empty()) response["thinking"] = reasoning_response;
     }
     res.set_content(response.dump(), "application/json");
 }

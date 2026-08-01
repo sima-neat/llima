@@ -21,6 +21,11 @@
 namespace simaai {
 namespace llima {
 
+enum class ChatProtocol {
+    OpenAI,
+    OllamaChat,
+    OllamaGenerate,
+};
 
 class EXPORT WEB {
     public:
@@ -47,7 +52,7 @@ class EXPORT WEB {
         void _handle_chat_completions(
             const httplib::Request& req,
             httplib::Response& res,
-            bool is_openai
+            ChatProtocol protocol
         );
         void _handle_audio_transcriptions(
             const httplib::Request& req,
@@ -67,16 +72,19 @@ class EXPORT WEB {
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
-            bool from_draft = false
+            bool from_draft = false,
+            bool reasoning = false
         );
         std::string _format_ollama_ndjson_chunk(
             const std::string& content,
             const std::string& model,
+            ChatProtocol protocol,
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
-            bool from_draft = false
+            bool from_draft = false,
+            bool reasoning = false
         );
         std::string _format_audio_sse_chunk(
             const std::string& text,
@@ -93,24 +101,25 @@ class EXPORT WEB {
 
         // Helpers for chat completion
         std::optional<Chat> _prepare_chat_context(
-            const httplib::Request& req, 
+            const httplib::Request& req,
             httplib::Response& res,
-            std::string& model, 
-            bool& stream
+            std::string& model,
+            bool& stream,
+            ChatProtocol protocol
         );
 
         void _execute_streaming_chat(
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            bool is_openai
+            ChatProtocol protocol
         );
 
         void _execute_normal_chat(
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            bool is_openai
+            ChatProtocol protocol
         );
         void _execute_streaming_audio_transcription(
             httplib::Response& res,

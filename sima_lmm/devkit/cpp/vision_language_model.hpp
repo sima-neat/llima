@@ -7,6 +7,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -20,6 +21,9 @@
 
 namespace simaai {
 namespace llima {
+
+class CLI;
+class WEB;
 
 class VisionLanguageModel : public BaseModel<VlmConfig> {
     public:
@@ -87,6 +91,10 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         }
 
     private:
+        friend class CLI;
+        friend class WEB;
+        std::string_view model_type() const { return _cfg.model_type; }
+
         VlmHelper _vlm_helper;
         TextStreamer _text_streamer;
         ToolCallFormat _tool_call_format = ToolCallFormat::GenericJson;

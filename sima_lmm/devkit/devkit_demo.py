@@ -200,7 +200,6 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
-                args.enable_thinking,
             )
         else:
             demo = WEB(
@@ -209,7 +208,6 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
-                args.enable_thinking,
             )
     except Exception:
         msg = "Failed to create VLM or STT model"
@@ -342,12 +340,6 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help="Path to the file with chat template.",
-    )
-    run_parser.add_argument(
-        "--enable-thinking",
-        action="store_true",
-        default=False,
-        help="Enable model thinking mode in chat templates that support it.",
     )
     run_parser.add_argument("--log_level", type=str, default=None, help="Logging level")
     run_parser.set_defaults(func=run_model)
