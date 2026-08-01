@@ -283,6 +283,8 @@ jobs:
           "./share/sima-lmm/tests/runtime/pytest.ini" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./share/sima-lmm/tests/runtime/test_mla_memory_cleanup.py" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./share/sima-lmm/tests/runtime/test_model_manager.py" >/dev/null
         test -f dist/metadata.json
         test -f dist/debs/metadata.json
         test -x dist/install_llima.sh

@@ -25,6 +25,11 @@ Download a model by name, without the `simaai/` organization prefix:
 modalix:~$ llima pull Qwen3-VL-4B-Instruct-GPTQ-a16w4
 ```
 
+Model artifacts download concurrently, with the largest artifacts scheduled
+first. Transient HTTP failures are retried automatically. Pulls for the same
+model are serialized, and cancelling a pull retains every artifact that was
+already downloaded and verified.
+
 List and remove locally installed models:
 
 ``` console
