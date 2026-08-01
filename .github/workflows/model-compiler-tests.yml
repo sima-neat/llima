@@ -116,30 +116,31 @@ jobs:
             exit 1
           fi
 
-          site_packages="$(
-            find "${model_compiler_dir}/lib" -maxdepth 3 -type d -name site-packages 2>/dev/null |
-              head -n 1
-          )"
-          library_path="${model_compiler_dir}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-          if [[ -n "${site_packages}" ]]; then
-            library_path="${site_packages}:${site_packages}/tvm:${library_path}"
-          fi
-
+          # Keep activation and compiler verification in the same shell. The
+          # packaged helper also applies the ARM64 JAX and XLA settings.
+          export SIMA_CLI="${sima_cli}"
           export MODEL_COMPILER_DIR="${model_compiler_dir}"
-          export VIRTUAL_ENV="${model_compiler_dir}"
-          export LD_LIBRARY_PATH="${library_path}"
-          export PATH="${model_compiler_dir}/bin:$(dirname "${sima_cli}"):${PATH}"
-
-          {
-            echo "SIMA_CLI=${sima_cli}"
-            echo "MODEL_COMPILER_DIR=${model_compiler_dir}"
-            echo "VIRTUAL_ENV=${model_compiler_dir}"
-            echo "LD_LIBRARY_PATH=${library_path}"
-          } >> "${GITHUB_ENV}"
-          echo "$(dirname "${sima_cli}")" >> "${GITHUB_PATH}"
-          echo "${model_compiler_dir}/bin" >> "${GITHUB_PATH}"
+          bash --noprofile --rcfile "${HOME}/.bashrc" -i <<'BASH'
+          set -euo pipefail
+          type activate-model-compiler
+          activate-model-compiler
 
           test "${VIRTUAL_ENV}" = "${MODEL_COMPILER_DIR}"
+          test "${SIMA_MLA_COMPILE_USE_JAX}" = "1"
+          [[ " ${XLA_FLAGS} " == *" --xla_cpu_max_isa=NEON "* ]]
+
+          {
+            echo "SIMA_CLI=${SIMA_CLI}"
+            echo "MODEL_COMPILER_DIR=${MODEL_COMPILER_DIR}"
+            echo "VIRTUAL_ENV=${VIRTUAL_ENV}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+            echo "PYTHONPATH=${PYTHONPATH:-}"
+            echo "XLA_FLAGS=${XLA_FLAGS}"
+            echo "SIMA_MLA_COMPILE_USE_JAX=${SIMA_MLA_COMPILE_USE_JAX}"
+          } >> "${GITHUB_ENV}"
+          echo "$(dirname "${SIMA_CLI}")" >> "${GITHUB_PATH}"
+          echo "${MODEL_COMPILER_DIR}/bin" >> "${GITHUB_PATH}"
+
           python - <<'PY'
           import importlib.metadata
 
@@ -159,7 +160,7 @@ jobs:
 
           echo "Installing exact artifact ${package_spec}"
           for attempt in 1 2 3 4; do
-            if "${sima_cli}" neat install \
+            if "${SIMA_CLI}" neat install \
               --env "${VULCAN_ENV}" \
               --install-dir "${install_dir}" \
               "${package_spec}"; then
@@ -204,6 +205,7 @@ jobs:
           print(f"Installed sima-lmm: {installed_version}")
           print(f"Import provenance: {module_path}")
           PY
+          BASH
 
       - name: Run fast compiler unit tests
         shell: bash
@@ -227,7 +229,6 @@ jobs:
 
           (
             cd "${test_stage}"
-            unset PYTHONPATH
             python -P -m pytest \
               -c pytest.ini \
               tests/compilation/unit \
@@ -281,7 +282,6 @@ jobs:
 
           (
             cd "${LLIMA_TEST_STAGE}"
-            unset PYTHONPATH
             python -P -m pytest \
               -c pytest.ini \
               tests/compilation/configuration \
@@ -315,7 +315,6 @@ jobs:
 
           (
             cd "${LLIMA_TEST_STAGE}"
-            unset PYTHONPATH
             python -P -m pytest \
               -c pytest.ini \
               tests/compilation/source_ingestion \
@@ -467,7 +466,6 @@ jobs:
 
           (
             cd "${LLIMA_TEST_STAGE}"
-            unset PYTHONPATH
             python -P -m pytest "${pytest_args[@]}"
           )
 
@@ -501,7 +499,6 @@ jobs:
 
           (
             cd "${LLIMA_TEST_STAGE}"
-            unset PYTHONPATH
             python -P -m pytest \
               -c pytest.ini \
               tests/compilation/graph_integration \
@@ -523,7 +520,6 @@ jobs:
 
           (
             cd "${LLIMA_TEST_STAGE}"
-            unset PYTHONPATH
             python -P -m pytest \
               -c pytest.ini \
               tests/compilation/graph_integration \
@@ -563,7 +559,6 @@ jobs:
 
           (
             cd "${LLIMA_TEST_STAGE}"
-            unset PYTHONPATH
             python -P -m pytest \
               -c pytest.ini \
               tests/compilation/e2e \
@@ -604,8 +599,8 @@ jobs:
           compile_stage = next(
               stage for stage in report["stages"] if stage["name"] == "model_compiler"
           )
-          if compile_stage.get("skipped"):
-              print("Skipped llima-compile --compile: ARM packages are not fixed yet.")
+          if compile_stage.get("skipped") or compile_stage.get("return_code") != 0:
+              raise SystemExit(f"Model Compiler stage did not pass: {compile_stage}")
 
           with summary_path.open("a", encoding="utf-8") as summary:
               summary.write("### Selected-model full compilation E2E\n\n")
@@ -615,15 +610,9 @@ jobs:
               )
               summary.write(f"- Selection seed: {report['selection_seed']}\n")
               summary.write(f"- Candidate SHA: {report['candidate_sha']}\n")
-              if compile_stage.get("skipped"):
-                  summary.write(
-                      "- Compile step: skipped until the ARM packages are fixed.\n"
-                  )
+              summary.write("- Compilation path: direct Model SDK\n")
               summary.write("- Stages:\n")
               for stage in report["stages"]:
-                  if stage.get("skipped"):
-                      summary.write(f"  - {stage['name']}: skipped\n")
-                      continue
                   summary.write(
                       f"  - {stage['name']}: {stage['duration_seconds']} seconds\n"
                   )
