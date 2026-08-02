@@ -76,6 +76,14 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
     _pending.append(text);
 
     while (_mode != Mode::Done) {
+        if (
+            _mode == Mode::AwaitingStart || _mode == Mode::AwaitingHiddenStart ||
+            (_mode == Mode::Reasoning && _optional_start)
+        ) {
+            const auto first_non_whitespace = _pending.find_first_not_of(" \t\r\n");
+            _pending.erase(0, first_non_whitespace);
+        }
+
         if (_mode == Mode::Content) {
             emit(events, std::move(_pending), false, _pending_from_draft);
             _pending.clear();

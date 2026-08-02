@@ -53,7 +53,7 @@ void test_model_mapping() {
 void test_qwen_generated_open_and_split_close() {
     ReasoningStreamParser parser(ReasoningFormat::Qwen, true);
     ParsedText parsed;
-    append_events(parsed, parser.add("<thi"));
+    append_events(parsed, parser.add("\n<thi"));
     append_events(parsed, parser.add("nk>reasoning </thi", false, true));
     append_events(parsed, parser.add("nk>final", true));
 
@@ -85,7 +85,7 @@ void test_qwen_prompt_opened_and_truncated() {
 void test_gemma_generated_and_prompt_opened_boundaries() {
     ReasoningStreamParser generated(ReasoningFormat::Gemma4, true);
     ParsedText parsed;
-    append_events(parsed, generated.add("<|channel>tho"));
+    append_events(parsed, generated.add("\n<|channel>tho"));
     append_events(parsed, generated.add("ught\nreason", false, true));
     append_events(parsed, generated.add("ing<channel"));
     append_events(parsed, generated.add("|>answer", true));
