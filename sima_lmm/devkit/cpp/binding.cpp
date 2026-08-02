@@ -80,15 +80,13 @@ NB_MODULE(cpp_ext, m) {
                 std::optional<std::filesystem::path>,
                 std::optional<std::filesystem::path>,
                 std::optional<std::string>,
-                std::optional<std::string>,
-                bool
+                std::optional<std::string>
             >(),
             nb::arg("model_path"),
             nb::arg("whisper_model_path") = nb::none(),
             nb::arg("draft_model_path") = nb::none(),
             nb::arg("system_prompt") = nb::none(),
-            nb::arg("chat_template") = nb::none(),
-            nb::arg("enable_thinking") = false
+            nb::arg("chat_template") = nb::none()
         )
         .def("run", &CLI::run)
     ;

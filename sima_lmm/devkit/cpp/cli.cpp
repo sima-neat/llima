@@ -33,12 +33,10 @@ CLI::CLI(
     std::optional<std::filesystem::path> whisper_model_path,
     std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
-    std::optional<std::string> chat_template,
-    bool enable_thinking
+    std::optional<std::string> chat_template
 ) : _vision_language_model_ptr(
         std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
-    ),
-    _enable_thinking(enable_thinking)
+    )
 {
     if (_singleton_ptr)
         throw std::runtime_error("Only one CLI instance can be created");
@@ -82,7 +80,6 @@ CLI::~CLI() {
 void CLI::run() {
     std::string language = "en";
     auto chat = _vision_language_model_ptr->create_chat();
-    chat.set_enable_thinking(_enable_thinking);
     const bool highlight_draft = []() {
         const char* value = std::getenv("SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT");
         return value != nullptr && (
