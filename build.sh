@@ -238,11 +238,6 @@ raise SystemExit(
 PY
 }
 
-sanitize_branch_key() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' |
-    sed -E 's#[^a-z0-9._-]+#-#g; s/^-+//; s/-+$//'
-}
-
 current_branch_name() {
   if [[ -n "${GITHUB_HEAD_REF:-}" ]]; then
     printf '%s\n' "${GITHUB_HEAD_REF}"
@@ -303,7 +298,7 @@ resolve_neat_internals_ref() {
     return 0
   fi
 
-  local branch branch_key tag
+  local branch tag
   tag="$(current_exact_tag)"
   if [[ -n "${tag}" ]]; then
     printf '%s\n' "${tag}:latest"
@@ -311,9 +306,8 @@ resolve_neat_internals_ref() {
   fi
 
   branch="$(current_branch_name)"
-  branch_key="$(sanitize_branch_key "${branch}")"
-  if [[ -n "${branch_key}" && "${branch_key}" != "head" ]]; then
-    printf '%s\n' "${branch_key}:latest"
+  if [[ -n "${branch}" && "${branch}" != "HEAD" ]]; then
+    printf '%s\n' "${branch}:latest"
     return 0
   fi
 
