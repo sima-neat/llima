@@ -119,6 +119,11 @@ void CLI::run() {
             std::cout << "Un-set LoRA and cleared chat history" << std::endl;
             continue;
         } else if (command == "enable-thinking") {
+            if (reasoning_format_for_model(_vision_language_model_ptr->model_type())
+                == ReasoningFormat::None) {
+                std::cout << "Thinking is not supported for this model." << std::endl;
+                continue;
+            }
             chat.set_enable_thinking(true);
             chat.clear_history();
             std::cout << "Enabled thinking and cleared chat history." << std::endl;
