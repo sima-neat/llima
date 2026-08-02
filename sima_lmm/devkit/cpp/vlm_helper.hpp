@@ -34,12 +34,15 @@ class VlmHelper {
             const VlmConfig& vlm_cfg,
             const std::filesystem::path& devkit_dir,
             std::optional<std::string> system_prompt,
-            std::optional<std::string> chat_template
+            std::optional<std::string> chat_template,
+            bool enable_thinking = false
         );
         ~VlmHelper() {};
 
         void set_system_prompt(const std::optional<std::string>& system_prompt);
         std::optional<std::string> get_system_prompt() const { return _system_prompt; }
+        void set_enable_thinking(bool enable_thinking) { _enable_thinking = enable_thinking; }
+        bool get_enable_thinking() const { return _enable_thinking; }
         PreprocessedChat preprocess(const Chat& chat);
 
         bool is_multimodal() const { return _vlm_cfg.is_multimodal(); }
@@ -65,6 +68,7 @@ class VlmHelper {
         std::unique_ptr<minja::chat_template> _chat_template_ptr;
         std::unique_ptr<ImageProcessor> _image_processor_ptr;
         std::optional<std::string> _system_prompt;
+        bool _enable_thinking;
         std::string _bos_token;
         std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;

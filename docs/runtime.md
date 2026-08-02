@@ -77,8 +77,11 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `set language <lang>` | Set the language string used for transcription. |
 | `set lora <name>` | Use LoRA weights from a `npy_files` folder. |
 | `unset lora` | Revert the LoRA model to the baseline model. |
+| `enable-thinking` | Enable thinking mode and clear chat history. |
+| `disable-thinking` | Disable thinking mode and clear chat history. |
 | `quit` | Quit. |
 | `help` | Print available commands. |
+
 
 ## Build an Application with Neat
 

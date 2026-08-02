@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "reasoning_parser.hpp"
 #include "utils.hpp"
 #include "vision_language_model.hpp"
 
@@ -17,11 +18,6 @@ VisionLanguageModel::VisionLanguageModel(
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
 {
     _tool_call_format = tool_call_format_for_model(_cfg.model_type);
-    if (auto* tokenizer = _vlm_helper.get_tokenizer()) {
-        _text_streamer.set_preserved_token_ids(
-            resolve_tool_call_special_tokens(_tool_call_format, *tokenizer)
-        );
-    }
     if (_cfg.support_image()) {
         _vision_model_ptr = std::make_unique<VisionModel>(model_path);
     }
@@ -58,7 +54,35 @@ std::optional<std::string> VisionLanguageModel::run_model(
 ) {
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
-    _text_streamer.set_tool_call_enabled(chat.has_tools());
+    std::vector<std::pair<uint32_t, std::string>> preserved_tokens;
+    auto* tokenizer = _vlm_helper.get_tokenizer();
+    if (chat.has_tools()) {
+        preserved_tokens = resolve_tool_call_special_tokens(_tool_call_format, *tokenizer);
+    }
+    const auto reasoning_format = reasoning_format_for_model(_cfg.model_type);
+    if (chat.get_enable_thinking() && reasoning_format == ReasoningFormat::None) {
+        throw std::invalid_argument(
+            "Thinking is not supported for model type '" + _cfg.model_type + "'"
+        );
+    }
+    if (chat.get_enable_thinking()) {
+        for (const auto marker : reasoning_special_tokens(reasoning_format)) {
+            try {
+                preserved_tokens.emplace_back(
+                    tokenizer->token_to_id(std::string(marker)), marker
+                );
+            } catch (const std::exception&) {
+                throw std::runtime_error(
+                    "Reasoning token '" + std::string(marker) + "' is missing from the tokenizer"
+                );
+            }
+        }
+    }
+    const bool preserve_structural_tokens = !preserved_tokens.empty();
+    _text_streamer.set_preserved_token_ids(std::move(preserved_tokens));
+    // Keep the existing setter for ABI compatibility; it now gates all
+    // request-specific structural markers, not only tool-call markers.
+    _text_streamer.set_tool_call_enabled(preserve_structural_tokens);
     
     ChronoTimer timer_ttft(true);
 

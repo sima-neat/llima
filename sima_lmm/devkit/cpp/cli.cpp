@@ -1,6 +1,9 @@
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 #include "cli.hpp"
+#include "reasoning_parser.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -18,6 +21,8 @@ set audio <fn>     : set the audio file to be transcribed as query.
 set language <lang>: set transcription language; omit <lang> or use auto to detect it.
 set lora           : set the model to use LoRA weights from a npy_files folder.
 unset lora         : revert LoRA model to baseline model.
+enable-thinking    : enable thinking mode and clear chat history.
+disable-thinking   : disable thinking mode and clear chat history.
 quit               : quit.
 help               : print this page.
 )";
@@ -75,6 +80,12 @@ CLI::~CLI() {
 void CLI::run() {
     std::string language = "en";
     auto chat = _vision_language_model_ptr->create_chat();
+    const bool highlight_draft = []() {
+        const char* value = std::getenv("SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT");
+        return value != nullptr && (
+            std::strcmp(value, "true") == 0 || std::strcmp(value, "1") == 0
+        );
+    }();
     std::string command;
     ReadlineSupport readline_support;
     while (true) {
@@ -103,6 +114,21 @@ void CLI::run() {
             _vision_language_model_ptr->unset_reloc();
             chat.clear_history();
             std::cout << "Un-set LoRA and cleared chat history" << std::endl;
+            continue;
+        } else if (command == "enable-thinking") {
+            if (reasoning_format_for_model(_vision_language_model_ptr->model_type())
+                == ReasoningFormat::None) {
+                std::cout << "Thinking is not supported for this model." << std::endl;
+                continue;
+            }
+            chat.set_enable_thinking(true);
+            chat.clear_history();
+            std::cout << "Enabled thinking and cleared chat history." << std::endl;
+            continue;
+        } else if (command == "disable-thinking") {
+            chat.set_enable_thinking(false);
+            chat.clear_history();
+            std::cout << "Disabled thinking and cleared chat history." << std::endl;
             continue;
         } else if (command == "set language") {
             language.clear();
@@ -168,13 +194,66 @@ void CLI::run() {
             std::cout << "Query: " << command << std::endl;
             chat.add_query(command);
         }
-        std::cout << "Assistant: " << std::flush;
+        ReasoningStreamParser reasoning_parser(
+            reasoning_format_for_model(_vision_language_model_ptr->model_type()),
+            chat.get_enable_thinking()
+        );
+        std::string final_response;
+        bool saw_reasoning = false;
+        bool saw_content = false;
+
+        const auto print_text = [&](const std::string& text, bool from_draft) {
+            if (from_draft && highlight_draft && !text.empty()) {
+                std::cout << "\033[32m" << text << "\033[0m";
+            } else {
+                std::cout << text;
+            }
+            std::cout << std::flush;
+        };
+
+        _vision_language_model_ptr->set_text_callback(
+            [&](const std::string& text, bool stream_end, bool from_draft) {
+                for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
+                    if (event.reasoning) {
+                        if (!saw_reasoning) {
+                            std::cout << "Thinking:\n";
+                            saw_reasoning = true;
+                        }
+                        print_text(event.text, event.from_draft);
+                        continue;
+                    }
+
+                    if (!saw_content) {
+                        std::cout << (saw_reasoning ? "\nAnswer:\n" : "Assistant: ");
+                        saw_content = true;
+                    }
+                    final_response += event.text;
+                    print_text(event.text, event.from_draft);
+                }
+                if (stream_end) {
+                    if (!saw_reasoning && !saw_content) std::cout << "Assistant: ";
+                    std::cout << std::endl;
+                }
+            }
+        );
+        struct TextCallbackGuard {
+            VisionLanguageModel* model;
+            ~TextCallbackGuard() {
+                model->set_text_callback([](const std::string&, bool, bool) {});
+            }
+        } callback_guard{_vision_language_model_ptr.get()};
 
         // run_model dispatches to speculative decoding internally when a
         // draft VLM was registered at construction time.
         auto response = _vision_language_model_ptr->run_model(chat);
         if (response.has_value()) {
-            chat.add_response(trim(std::move(response.value())));
+            auto answer = trim(std::move(final_response));
+            if (answer.empty()) {
+                chat.clear_history();
+                std::cout << "No final answer generated. Cleared chat history." << std::endl;
+            } else {
+                chat.add_response(std::move(answer));
+            }
         } else {
             chat.clear_history();
             std::cout << std::endl
