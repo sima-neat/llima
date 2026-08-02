@@ -60,7 +60,12 @@ std::optional<std::string> VisionLanguageModel::run_model(
         preserved_tokens = resolve_tool_call_special_tokens(_tool_call_format, *tokenizer);
     }
     const auto reasoning_format = reasoning_format_for_model(_cfg.model_type);
-    if (chat.get_enable_thinking() && reasoning_format != ReasoningFormat::None) {
+    if (chat.get_enable_thinking() && reasoning_format == ReasoningFormat::None) {
+        throw std::invalid_argument(
+            "Thinking is not supported for model type '" + _cfg.model_type + "'"
+        );
+    }
+    if (chat.get_enable_thinking()) {
         for (const auto marker : reasoning_special_tokens(reasoning_format)) {
             try {
                 preserved_tokens.emplace_back(
