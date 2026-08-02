@@ -668,9 +668,19 @@ std::optional<Chat> WEB::_prepare_chat_context(
     stream = json_data.value("stream", false);
 
     Chat chat = _vision_language_model_ptr->create_chat();
-    chat.set_enable_thinking(
-        request_enable_thinking(json_data, _enable_thinking, protocol)
+    const bool enable_thinking = request_enable_thinking(json_data, _enable_thinking, protocol);
+    const auto reasoning_format = reasoning_format_for_model(
+        _vision_language_model_ptr->model_type()
     );
+    if (enable_thinking && reasoning_format == ReasoningFormat::None) {
+        res.status = 400;
+        res.set_content(
+            R"({"error": "Thinking is not supported for this model"})",
+            "application/json"
+        );
+        return std::nullopt;
+    }
+    chat.set_enable_thinking(enable_thinking);
     bool tools_enabled = true;
     if (json_data.contains("tool_choice") && !json_data["tool_choice"].is_null()) {
         if (!json_data["tool_choice"].is_string()) {
