@@ -112,7 +112,7 @@ sdk_ext_require = [
     "av",  # Required for audio preprocessing
     # Model Compiler uses ml-dtypes 0.4.1 on ARM64 and 0.3.1 elsewhere.
     "ml_dtypes==0.4.1; platform_machine == 'aarch64'",
-    "ml_dtypes==0.3.1; platform_machine != 'aarch64'",
+    "ml_dtypes==0.3.1; platform_machine == 'x86_64'",
     "sentencepiece==0.2.0",  # Required for LLM tokenizer
     "tiktoken",  # Required for LLM tokenizer
     "blobfile",  # Required by tiktoken
