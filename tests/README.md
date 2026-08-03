@@ -25,8 +25,9 @@ paths fail safe by running both suites. Manual dispatches, tags, protected or
 release branches, and branch-comparison failures also force both suites.
 
 Package builds and publication remain unconditional. The scope decision only
-controls the two expensive test jobs, and an intentional skip is accepted by
-latest-tag promotion only when the corresponding resolver output is false.
+controls the two expensive test jobs. Latest-tag promotion requires successful
+artifact publication and accepts an intentional test skip only when the
+corresponding resolver output is false.
 
 ## Model compiler CI
 

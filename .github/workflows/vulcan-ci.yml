@@ -739,6 +739,7 @@ jobs:
         always() &&
         (github.ref_type == 'branch' || github.ref_type == 'tag') &&
         needs.resolve-test-scope.result == 'success' &&
+        needs.publish-vulcan-artifacts.result == 'success' &&
         (
           needs.test-model-compiler.result == 'success' ||
           (
@@ -757,6 +758,7 @@ jobs:
     needs:
       - resolve-test-scope
       - resolve-vulcan-config
+      - publish-vulcan-artifacts
       - test-model-compiler
       - test-devkit
     uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
