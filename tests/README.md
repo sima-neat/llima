@@ -15,6 +15,20 @@ Compiler tests live under `tests/compilation/`. Runtime tests live under
 `tests/runtime/`. Runtime coverage never falls back to host-only execution or
 mock hardware services.
 
+### CI test scope selection
+
+Vulcan CI compares feature branches with `develop` and independently decides
+whether to run the Model Compiler and DevKit runtime suites. Compiler-only and
+runtime-only changes run their respective suite, shared package or workflow
+changes run both, and documentation-only changes run neither. Unclassified
+paths fail safe by running both suites. Manual dispatches, tags, protected or
+release branches, and branch-comparison failures also force both suites.
+
+Package builds and publication remain unconditional. The scope decision only
+controls the two expensive test jobs. Latest-tag promotion requires successful
+artifact publication and accepts an intentional test skip only when the
+corresponding resolver output is false.
+
 ## Model compiler CI
 
 ### Purpose

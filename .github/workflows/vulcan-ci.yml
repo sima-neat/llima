@@ -29,7 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run_compiler: ${{ steps.scope.outputs.run_compiler }}
-      reason: ${{ steps.scope.outputs.reason }}
+      run_devkit: ${{ steps.scope.outputs.run_devkit }}
+      compiler_reason: ${{ steps.scope.outputs.compiler_reason }}
+      devkit_reason: ${{ steps.scope.outputs.devkit_reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -37,20 +39,20 @@ jobs:
           fetch-depth: 0
           submodules: "false"
 
-      - name: Validate compiler scope classifier
+      - name: Validate test scope classifier
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m unittest -v tests.ci.test_resolve_compiler_test_scope
+          python3 -m unittest -v tests.ci.test_resolve_test_scope
 
-      - name: Resolve compiler test scope
+      - name: Resolve test scope
         id: scope
         shell: bash
         run: |
           set -euo pipefail
 
           resolver=(
-            python3 tools/ci/resolve_compiler_test_scope.py
+            python3 tools/ci/resolve_test_scope.py
             --github-output "${GITHUB_OUTPUT}"
             --github-summary "${GITHUB_STEP_SUMMARY}"
           )
@@ -60,32 +62,32 @@ jobs:
           }
 
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            force_run "Compiler tests required: manual workflow dispatch."
+            force_run "All tests required: manual workflow dispatch."
             exit 0
           fi
 
           if [[ "${GITHUB_REF_TYPE}" != "branch" ]]; then
-            force_run "Compiler tests required: ${GITHUB_REF_TYPE} ref ${GITHUB_REF_NAME}."
+            force_run "All tests required: ${GITHUB_REF_TYPE} ref ${GITHUB_REF_NAME}."
             exit 0
           fi
 
           if [[ "${GITHUB_REF_NAME}" == "develop" ||
                 "${GITHUB_REF_NAME}" == "main" ||
                 "${GITHUB_REF_NAME}" == release* ]]; then
-            force_run "Compiler tests required: protected or release branch ${GITHUB_REF_NAME}."
+            force_run "All tests required: protected or release branch ${GITHUB_REF_NAME}."
             exit 0
           fi
 
           base_ref="develop"
           base_remote_ref="refs/remotes/origin/${base_ref}"
           if ! git rev-parse --verify --quiet "${base_remote_ref}^{commit}" >/dev/null; then
-            force_run "Compiler tests required: could not resolve ${base_remote_ref}."
+            force_run "All tests required: could not resolve ${base_remote_ref}."
             exit 0
           fi
 
           if ! merge_base="$(git merge-base HEAD "${base_remote_ref}")"; then
             force_run \
-              "Compiler tests required: could not find a merge base between ${GITHUB_REF_NAME} and ${base_ref}."
+              "All tests required: could not find a merge base between ${GITHUB_REF_NAME} and ${base_ref}."
             exit 0
           fi
 
@@ -98,7 +100,7 @@ jobs:
             -- \
             > "${changed_files}"; then
             force_run \
-              "Compiler tests required: could not compare ${GITHUB_REF_NAME} with ${base_ref}."
+              "All tests required: could not compare ${GITHUB_REF_NAME} with ${base_ref}."
             exit 0
           fi
 
@@ -514,7 +516,9 @@ jobs:
 
   test-devkit:
     name: Test LLiMa Runtime on DevKit
+    if: ${{ needs.resolve-test-scope.outputs.run_devkit == 'true' }}
     needs:
+      - resolve-test-scope
       - resolve-vulcan-config
       - resolve-test-runner
       - publish-vulcan-artifacts
@@ -735,18 +739,26 @@ jobs:
         always() &&
         (github.ref_type == 'branch' || github.ref_type == 'tag') &&
         needs.resolve-test-scope.result == 'success' &&
-        needs.test-devkit.result == 'success' &&
+        needs.publish-vulcan-artifacts.result == 'success' &&
         (
           needs.test-model-compiler.result == 'success' ||
           (
             needs.resolve-test-scope.outputs.run_compiler == 'false' &&
             needs.test-model-compiler.result == 'skipped'
           )
+        ) &&
+        (
+          needs.test-devkit.result == 'success' ||
+          (
+            needs.resolve-test-scope.outputs.run_devkit == 'false' &&
+            needs.test-devkit.result == 'skipped'
+          )
         )
       }}
     needs:
       - resolve-test-scope
       - resolve-vulcan-config
+      - publish-vulcan-artifacts
       - test-model-compiler
       - test-devkit
     uses: sima-neat/.github/.github/workflows/vulcan-update-latest-artifacts.yml@main
