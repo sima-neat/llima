@@ -13,7 +13,6 @@
 
 #include <fmt/format.h>
 #include <llama.h>
-#include <nlohmann/json.hpp>
 #include <tokenizers_c.h>
 
 namespace simaai {
@@ -60,11 +59,6 @@ class HFTokenizer : public Tokenizer {
             std::string blob(size, '\0');
             std::ifstream file(tokenizer_json_file_name, std::ios::binary);
             file.read(blob.data(), size);
-            auto tokenizer_json = nlohmann::json::parse(blob);
-            // Ignore calibration-persisted state; LLiMa handles prompt padding and truncation.
-            tokenizer_json["padding"] = nullptr;
-            tokenizer_json["truncation"] = nullptr;
-            blob = tokenizer_json.dump();
             _handle = tokenizers_new_from_str(blob.data(), blob.length());
         }
         HFTokenizer(const HFTokenizer& other) = delete;

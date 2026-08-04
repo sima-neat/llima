@@ -3,6 +3,7 @@
 #define _SIMA_LLIMA_MLA_BUFFER_
 
 #include <filesystem>
+#include <initializer_list>
 #include <istream>
 #include <optional>
 #include <string>
@@ -95,6 +96,8 @@ inline std::ostream& operator<<(std::ostream& s, const MLABuffer& buf) {
 
 
 class MLABufferSlice {
+    friend class MLAModelWithBuffer;
+
     public:
         MLABufferSlice(MLABuffer* buf_ptr = nullptr);
         MLABufferSlice(MLABuffer* buf_ptr, std::vector<uint32_t> begins);
@@ -106,12 +109,17 @@ class MLABufferSlice {
         MLABuffer* get_buf_ptr() const { return _buf_ptr; }
         uint64_t get_buf_addr() const;
         uint64_t get_buf_addr(const std::optional<std::vector<uint32_t>>& begins) const;
-        auto get_buf_begins() const { return _begins; }
-        auto get_buf_shapes() const { return _shapes; }
+        const auto& get_buf_begins() const { return _begins; }
+        const auto& get_buf_shapes() const { return _shapes; }
 
         void to_file(const std::filesystem::path& file_name) const;
 
     private:
+        void _bind(
+            MLABuffer* buf_ptr,
+            std::initializer_list<uint32_t> begins
+        );
+
         MLABuffer* _buf_ptr;
         std::optional<std::vector<uint32_t>> _begins;
         std::optional<std::vector<uint32_t>> _shapes;

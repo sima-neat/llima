@@ -12,6 +12,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -36,7 +37,8 @@ struct GenerationPerformanceResult {
     std::optional<uint32_t> accepted_draft_tokens;
 };
 
-// Key to access the language model map: (num_tokens, layer_idx, token_idx).
+// Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
+// (num_tokens, cache_kind, aligned_cache_token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
@@ -275,6 +277,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<MLABufferSlice>& ofms
         );
         void _define_attn_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
+        LanguageModelMapKey _get_cache_model_key(
+            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+        ) const;
+        LanguageModelMapKey _bind_attn_models(
+            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+        );
         void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_models();
@@ -292,7 +300,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
         static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
         uint16_t _get_cache_mask_size(
-            const std::string& layer_type, uint16_t context_length, bool is_group
+            std::string_view layer_type, uint16_t context_length, bool is_group
         ) const {
             if (
                 layer_type != "sliding_attention"

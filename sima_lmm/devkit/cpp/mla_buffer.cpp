@@ -356,6 +356,18 @@ MLABufferSlice::MLABufferSlice(
 ) : _buf_ptr(buf_ptr), _begins(std::move(begins)), _shapes(std::move(shapes)) {}
 
 
+void MLABufferSlice::_bind(
+    MLABuffer* buf_ptr,
+    std::initializer_list<uint32_t> begins
+) {
+    _buf_ptr = buf_ptr;
+    if (!_begins.has_value()) {
+        _begins.emplace();
+    }
+    _begins->assign(begins);
+}
+
+
 uint64_t MLABufferSlice::get_buf_addr() const {
     if (_buf_ptr) {
         return _buf_ptr->get_buf_addr(_begins);
