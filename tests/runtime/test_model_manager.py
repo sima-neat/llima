@@ -83,6 +83,21 @@ def _write_artifact(
     progress(len(content))
 
 
+def _write_speculative_component(
+    parent: Path,
+    name: str,
+    is_draft: bool,
+) -> Path:
+    model_dir = parent / name
+    (model_dir / "devkit").mkdir(parents=True)
+    (model_dir / "elf_files").mkdir()
+    role = "true" if is_draft else "false"
+    (model_dir / "devkit" / "vlm_config.json").write_text(
+        '{"lm_cfg":{"speculative_decoding_cfg":{"is_draft":' + role + "}}}"
+    )
+    return model_dir
+
+
 def test_pull_downloads_artifacts_concurrently(monkeypatch, tmp_path):
     contents = {
         "devkit/config.json": b"config",
@@ -412,6 +427,22 @@ def test_incomplete_model_is_hidden_but_removable(monkeypatch, tmp_path):
     assert store.iter_installed() == []
     assert store.remove(MODEL_NAME)
     assert not model_dir.exists()
+
+
+def test_speculative_parent_is_resolved_and_listed(monkeypatch, tmp_path):
+    monkeypatch.delenv(TEST_MODELS_ENV_VAR, raising=False)
+    store = LocalModelStore(tmp_path, TEST_MODELS_ENV_VAR)
+    model_dir = tmp_path / MODEL_NAME
+    target = _write_speculative_component(model_dir, "target", False)
+    draft = _write_speculative_component(model_dir, "draft", True)
+
+    assert store.resolve_runnable(MODEL_NAME) == model_dir.resolve()
+    assert store.resolve_runnable(str(model_dir)) == model_dir.resolve()
+    assert store.iter_installed() == [model_dir]
+    assert model_manager.resolve_target_and_draft_paths(model_dir) == (
+        target,
+        draft,
+    )
 
 
 def test_artifact_matches_git_blob_checksum(tmp_path):

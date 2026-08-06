@@ -106,6 +106,56 @@ class DownloadCancelled(RuntimeError):
     pass
 
 
+def _is_runtime_model(model_dir: Path) -> bool:
+    return (
+        (model_dir / "devkit").is_dir()
+        and (model_dir / "elf_files").is_dir()
+    )
+
+
+def _speculative_role(model_dir: Path) -> bool | None:
+    config_file = model_dir / "devkit" / "vlm_config.json"
+    if not config_file.is_file():
+        return None
+    with config_file.open() as config_stream:
+        config = json.load(config_stream)
+    spec_config = config.get("lm_cfg", {}).get("speculative_decoding_cfg")
+    if spec_config is None:
+        return None
+    return bool(spec_config.get("is_draft", False))
+
+
+def _invalid_artifact_message(model_path: Path) -> str:
+    return (
+        f"Invalid model artifact at {model_path}. Expected a deployed model or a "
+        "deployed speculative-decoding parent containing one target and one draft model."
+    )
+
+
+def resolve_target_and_draft_paths(
+    model_path: Path,
+) -> tuple[Path, Path | None]:
+    """Resolve a deployed model or a deployed speculative-decoding parent."""
+    if _is_runtime_model(model_path):
+        if _speculative_role(model_path) is None:
+            return model_path, None
+        raise RuntimeError(_invalid_artifact_message(model_path))
+
+    models: dict[bool, Path] = {}
+    if model_path.is_dir():
+        for model_dir in sorted(model_path.iterdir(), key=lambda path: path.name):
+            if not model_dir.is_dir() or not _is_runtime_model(model_dir):
+                continue
+            role = _speculative_role(model_dir)
+            if role is None or role in models:
+                raise RuntimeError(_invalid_artifact_message(model_path))
+            models[role] = model_dir
+
+    if set(models) == {False, True}:
+        return models[False], models[True]
+    raise RuntimeError(_invalid_artifact_message(model_path))
+
+
 @dataclass(frozen=True)
 class ModelInfo:
     model_id: str
@@ -947,13 +997,7 @@ class LocalModelStore:
 
     @staticmethod
     def validate_runnable(model_dir: Path) -> None:
-        if not (model_dir / "devkit").is_dir() or not (
-            model_dir / "elf_files"
-        ).is_dir():
-            raise RuntimeError(
-                "Model directory missing required 'devkit' or "
-                "'elf_files' directories."
-            )
+        resolve_target_and_draft_paths(model_dir)
 
     @staticmethod
     def mark_incomplete(model_dir: Path) -> None:
@@ -981,12 +1025,13 @@ class LocalModelStore:
 
     @staticmethod
     def _is_runnable(path: Path) -> bool:
-        return (
-            path.is_dir()
-            and not (path / INCOMPLETE_MARKER).exists()
-            and (path / "devkit").is_dir()
-            and (path / "elf_files").is_dir()
-        )
+        if not path.is_dir() or (path / INCOMPLETE_MARKER).exists():
+            return False
+        try:
+            resolve_target_and_draft_paths(path)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return True
 
     def _env_root(self) -> Path | None:
         value = os.getenv(self._env_var)
