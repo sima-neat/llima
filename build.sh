@@ -31,7 +31,8 @@ Options:
   --build-dir <dir>   CMake build directory (default: llima/build-deb)
   --jobs <count>      Parallel build jobs (default: nproc; env: LLIMA_DEB_BUILD_JOBS)
   --clean             Remove the build directory and stale sima-lmm*.deb outputs
-  --all               Build all packages, DevKit runtime tests, and publishable layouts (default)
+  --all               Install missing host dependencies, then build all packages,
+                      DevKit runtime tests, and publishable layouts (default build scope)
   --no-dist           Skip publishable artifact layout creation
   --core              Package only sima-lmm-core
   --dev               Package only sima-lmm-dev
@@ -46,6 +47,7 @@ EOF
 
 DO_CLEAN=0
 INSTALL_DEPS_ONLY=0
+AUTO_INSTALL_DEPS=0
 SKIP_DIST=0
 BUILD_RUNTIME_TESTS=ON
 EXTRA_CMAKE_ARGS=()
@@ -144,6 +146,15 @@ check_local_build_tools() {
     if ! command -v "$tool" >/dev/null 2>&1; then
       echo "ERROR: $tool is required" >&2
       exit 1
+    fi
+  done
+}
+
+local_build_tools_available() {
+  local tool
+  for tool in cmake cpack git python3 dpkg-architecture dpkg-deb tar; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      return 1
     fi
   done
 }
@@ -1110,6 +1121,7 @@ while [ "$#" -gt 0 ]; do
     --all)
       COMPONENTS=()
       BUILD_RUNTIME_TESTS=ON
+      AUTO_INSTALL_DEPS=1
       shift
       ;;
     --no-dist)
@@ -1179,6 +1191,10 @@ if [ "$DO_CLEAN" -eq 1 ]; then
   rm -f "$ROOT_DIR"/sima-lmm*.deb
 fi
 
+if [ "$AUTO_INSTALL_DEPS" -eq 1 ] && ! local_build_tools_available; then
+  echo "[build] Missing host build tools; installing build dependencies"
+  install_deps
+fi
 check_local_build_tools
 ensure_git_submodules
 detect_elxr_sdk
