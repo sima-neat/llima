@@ -54,6 +54,7 @@ def test_deploy_preserves_normal_destination(tmp_path: Path, monkeypatch) -> Non
     source = tmp_path / "compiled"
     sima_dir = source / "sima_files"
     (sima_dir / "devkit").mkdir(parents=True)
+    (sima_dir / "mpk").mkdir()
     destination = tmp_path / "deployed"
     calls = []
     monkeypatch.setattr(
@@ -65,6 +66,33 @@ def test_deploy_preserves_normal_destination(tmp_path: Path, monkeypatch) -> Non
     deploy_lmm.deploy(source, destination)
 
     assert calls == [(sima_dir, destination)]
+
+
+def test_deploy_validates_both_models_before_deploying(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "compiled"
+    _write_compiler_child(source, "target-model", False)
+    draft = _write_compiler_child(source, "draft-model", True)
+    (draft / "mpk").rmdir()
+    calls = []
+    monkeypatch.setattr(
+        deploy_lmm,
+        "_deploy_sima_files",
+        lambda src, dst: calls.append((src, dst)),
+    )
+
+    with pytest.raises(RuntimeError, match="mpk directory cannot be found"):
+        deploy_lmm.deploy(source, tmp_path / "deployed")
+
+    assert calls == []
+
+
+def test_deploy_rejects_invalid_source_paths(tmp_path: Path) -> None:
+    file_path = tmp_path / "model.tar.gz"
+    file_path.write_text("")
+
+    for source in (tmp_path / "missing", file_path):
+        with pytest.raises(RuntimeError, match="Source directory does not exist"):
+            deploy_lmm.deploy(source, tmp_path / "deployed")
 
 
 def test_runtime_resolves_normal_deployed_model(tmp_path: Path) -> None:
