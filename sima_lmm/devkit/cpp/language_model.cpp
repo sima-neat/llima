@@ -6,6 +6,7 @@
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 
 #include <Eigen/Dense>
 #include <cnpy.h>
@@ -645,7 +646,7 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
     }
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        LanguageModelMapKey model_key(num_tokens, layer_idx, token_idx);
+        LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
 
         std::map<uint8_t, MLABufferSlice> ifm_map;
         if (layer_idx == 0) {
@@ -663,8 +664,9 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
+            const auto cache_key = _bind_attn_models(num_tokens, token_idx, layer_idx);
             _pre_model_map.at(model_key).add_to_queue(&ifm_map);
-            _cache_model_map.at(model_key).add_to_queue();
+            _cache_model_map.at(cache_key).add_to_queue();
             _post_model_map.at(model_key).add_to_queue(&ifm_map);
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
@@ -858,7 +860,7 @@ uint32_t LanguageModel::run_model_once(
     }
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        LanguageModelMapKey model_key(num_tokens, layer_idx, token_idx);
+        LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
 
         std::map<uint8_t, MLABufferSlice> ifm_map;
         if (layer_idx == 0) {
@@ -876,6 +878,7 @@ uint32_t LanguageModel::run_model_once(
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
+            const auto cache_key = _bind_attn_models(num_tokens, token_idx, layer_idx);
             _pre_model_map.at(model_key).add_to_queue(&ifm_map);
 
             if (
@@ -885,7 +888,7 @@ uint32_t LanguageModel::run_model_once(
                 break;
             }
 
-            _cache_model_map.at(model_key).add_to_queue();
+            _cache_model_map.at(cache_key).add_to_queue();
 
             const bool is_draft = _cfg.lm_cfg.is_spec_decode()
                 && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
@@ -1648,149 +1651,22 @@ void LanguageModel::_define_buffers() {
 }
 
 
-void LanguageModel::_define_model(
-    const std::string& model_type,
-    const LanguageModelMapKey& key,
-    const std::filesystem::path& model_path,
-    const std::vector<MLABufferSlice>& ifms,
-    const std::vector<MLABufferSlice>& ofms
-) {
-    LanguageModelMap& map = get_model_map(model_type);
-    map.emplace(key, MLAModelWithBuffer(model_path, ifms, ofms));
-}
 
-
-void LanguageModel::_define_attn_models_iter(
+LanguageModelMapKey LanguageModel::_get_cache_model_key(
     uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
-) {
-    LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
+) const {
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
-    const auto& kv_layer_type = _cfg.lm_cfg.layer_types[kv_source_layer];
-    std::string freq_prefix;
-    uint16_t cache_token_idx_begin;
+    uint16_t cache_token_idx_begin = 0;
     if (layer_type == "sliding_attention") {
-        freq_prefix = "local";
         cache_token_idx_begin = std::max(
             0,
             token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
         );
-    } else {
-        freq_prefix = "global";
-        cache_token_idx_begin = 0;
     }
 
-    // Pre model.
-    std::vector<uint32_t> pre_kv_cache_shape;
-    std::vector<uint32_t> pre_kv_cache_offset;
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-        pre_kv_cache_offset = {0, token_idx, 0};
-        pre_kv_cache_shape = {
-            _cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            _cfg.pipeline_cfg.max_num_tokens,
-            _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
-        };
-    } else {
-        pre_kv_cache_offset = {token_idx, 0};
-        pre_kv_cache_shape = {num_tokens, _cfg.lm_cfg.attn_cfg.get_kv_size(layer_type)};
-    }
-
-    // Draft pre takes an extra IFM (buffer1a) for the FC fusion output / target hidden state.
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-
-    std::vector<MLABufferSlice> pre_ifms;
-    std::vector<MLABufferSlice> pre_ofms;
-    if (layer_idx) {
-        pre_ifms.emplace_back(
-            MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
-        );
-        if (is_draft) {
-            pre_ifms.emplace_back(
-                MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1a", num_tokens))}
-            );
-        }
-    } else {
-        pre_ifms.emplace_back(MLABufferSlice{});
-        if (is_draft) {
-            pre_ifms.emplace_back(MLABufferSlice{});
-        }
-    }
-    auto buf_name = fmt::format("{}_freq_real", freq_prefix);
-    pre_ifms.emplace_back(
-        MLABufferSlice{
-            &get_buffer(buf_name),
-            {token_idx, 0},
-            {num_tokens, (uint32_t)get_buffer(buf_name).get_shape().back()}
-        }
-    );
-    buf_name = fmt::format("{}_freq_imag", freq_prefix);
-    pre_ifms.emplace_back(
-        MLABufferSlice{
-            &get_buffer(buf_name),
-            {token_idx, 0},
-            {num_tokens, (uint32_t)get_buffer(buf_name).get_shape().back()}
-        }
-    );
-    pre_ofms.emplace_back(
-        MLABufferSlice{
-            &get_buffer(fmt::format("n{}_buffer2", num_tokens)),
-            {0, 0, 0},
-            {
-                _cfg.lm_cfg.attn_cfg.num_attention_heads,
-                num_tokens,
-                _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
-            }
-        }
-    );
-    if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
-        pre_ofms.emplace_back(
-            MLABufferSlice(
-                &get_buffer(fmt::format("cache_key_l{}", layer_idx)),
-                pre_kv_cache_offset,
-                pre_kv_cache_shape
-            )
-        );
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            pre_ofms.emplace_back(
-                MLABufferSlice(
-                    &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
-                    {0, token_idx, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
-                )
-            );
-        }
-        pre_ofms.emplace_back(
-            MLABufferSlice(
-                &get_buffer(fmt::format("cache_val_l{}", layer_idx)),
-                pre_kv_cache_offset,
-                pre_kv_cache_shape
-            )
-        );
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            pre_ofms.emplace_back(
-                MLABufferSlice(
-                    &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
-                    {0, token_idx, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
-                )
-            );
-        }
-    }
-    _define_model(
-        "pre",
-        model_key,
-        _get_elf_path_pre(num_tokens, layer_idx),
-        pre_ifms,
-        pre_ofms
-    );
-
-    // Cache model.
+    const uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
+    const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
-    uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
-    uint16_t aligned_eff_token_idx;
-    uint16_t aligned_eff_num_cached_tokens;
     const bool is_single_model = num_tokens == single_num_tokens;
     const uint16_t sliding_window = _cfg.lm_cfg.attn_cfg.sliding_window.value_or(0);
     const bool separate_sliding_cache = (
@@ -1810,10 +1686,7 @@ void LanguageModel::_define_attn_models_iter(
     );
     const bool use_sliding_cache = (
         separate_sliding_cache
-        || (
-            sliding_cache_mask_differs
-            && eff_num_cached_tokens >= sliding_window
-        )
+        || (sliding_cache_mask_differs && eff_num_cached_tokens >= sliding_window)
     );
     const std::string cache_layer_type = (
         use_sliding_cache ? "sliding_attention" : "full_attention"
@@ -1821,403 +1694,166 @@ void LanguageModel::_define_attn_models_iter(
     const uint16_t cache_mask_size = _get_cache_mask_size(
         cache_layer_type, eff_num_cached_tokens, !is_single_model
     );
-    const bool use_single_future_token_mask = (
-        is_single_model && cache_mask_size > 1
-    );
+    const bool use_single_future_token_mask = is_single_model && cache_mask_size > 1;
     const bool use_group_future_token_mask = (
-        !is_single_model
-        && cache_mask_size > num_tokens
+        !is_single_model && cache_mask_size > num_tokens
     );
+
+    uint16_t aligned_eff_token_idx;
     if (use_single_future_token_mask) {
-        // Round up by total context (eff_num_cached_tokens = past_kv + num_tokens),
-        // not by past_kv alone. For spec mode num_tokens=16: past_kv=114 ->
-        // total=130 -> bucket=256 (cache_token_255). The old formula used
-        // eff_token_idx + 1, which only worked when num_tokens was 1 (non-spec).
-        // For spec mode it picked cache_token_127 even when the 16 new tokens
-        // wouldn't fit, dropping mask data for the tail tree positions.
         aligned_eff_token_idx = std::min(
             round_up_to(eff_num_cached_tokens, cache_mask_size) - 1,
             _cfg.pipeline_cfg.max_num_tokens - 1
         );
-        aligned_eff_num_cached_tokens = aligned_eff_token_idx + 1;
     } else if (use_group_future_token_mask) {
-        aligned_eff_num_cached_tokens = std::min<uint16_t>(
+        const uint16_t aligned_eff_num_cached_tokens = std::min<uint16_t>(
             round_up_to(eff_num_cached_tokens, cache_mask_size),
             _cfg.pipeline_cfg.max_num_tokens
         );
         aligned_eff_token_idx = aligned_eff_num_cached_tokens - num_tokens;
     } else {
         aligned_eff_token_idx = eff_token_idx;
-        aligned_eff_num_cached_tokens = eff_num_cached_tokens;
-    }
-    std::vector<uint32_t> cache_kv_cache_shape;
-    std::vector<uint32_t> cache_kv_cache_offset;
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-        cache_kv_cache_offset = {0, cache_token_idx_begin, 0};
-        cache_kv_cache_shape = {
-            _cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            _cfg.pipeline_cfg.max_num_tokens,
-            _cfg.lm_cfg.attn_cfg.get_head_dim(kv_layer_type)
-        };
-    } else {
-        cache_kv_cache_offset = {cache_token_idx_begin, 0};
-        cache_kv_cache_shape = {
-            aligned_eff_num_cached_tokens,
-            _cfg.lm_cfg.attn_cfg.get_kv_size(kv_layer_type)
-        };
     }
 
-    std::vector<MLABufferSlice> cache_ifms{
-        MLABufferSlice{
-            &get_buffer(fmt::format("n{}_buffer2", num_tokens)),
-            {0, 0, 0},
-            {
-                _cfg.lm_cfg.attn_cfg.num_attention_heads,
-                num_tokens,
-                _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
-            }
-        },
-        MLABufferSlice{
-            &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
-            cache_kv_cache_offset,
-            cache_kv_cache_shape
-        },
+    // The second key field is a cache executable kind, not a transformer layer.
+    return LanguageModelMapKey{
+        num_tokens,
+        static_cast<uint8_t>(use_sliding_cache),
+        aligned_eff_token_idx
     };
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
-                {0, cache_token_idx_begin, 0},
-                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
-            }
+}
+
+
+LanguageModelMapKey LanguageModel::_bind_attn_models(
+    uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+) {
+    const LanguageModelMapKey pre_post_key{num_tokens, layer_idx, 0};
+    const LanguageModelMapKey cache_key = _get_cache_model_key(
+        num_tokens, token_idx, layer_idx
+    );
+    auto& pre_model = _pre_model_map.at(pre_post_key);
+    auto& cache_model = _cache_model_map.at(cache_key);
+    auto& post_model = _post_model_map.at(pre_post_key);
+
+    const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
+    const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
+    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+    const bool is_single_model = num_tokens == single_num_tokens;
+
+    uint16_t cache_token_idx_begin = 0;
+    const char* freq_prefix = "global";
+    if (layer_type == "sliding_attention") {
+        freq_prefix = "local";
+        cache_token_idx_begin = std::max(
+            0,
+            token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
         );
     }
 
-    if (use_group_future_token_mask) {
-        cache_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(
-                    cache_layer_type == "sliding_attention"
-                        ? "group_sliding_future_token_mask"
-                        : "group_future_token_mask"
-                ),
-                {0},
-                {static_cast<uint32_t>(num_tokens) * aligned_eff_num_cached_tokens}
+    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
+        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const uint8_t freq_ifm_idx = is_draft ? 2 : 1;
+    auto& freq_real = get_buffer(fmt::format("{}_freq_real", freq_prefix));
+    auto& freq_imag = get_buffer(fmt::format("{}_freq_imag", freq_prefix));
+    pre_model._bind_ifm(freq_ifm_idx, &freq_real, {token_idx, 0});
+    pre_model._bind_ifm(freq_ifm_idx + 1, &freq_imag, {token_idx, 0});
+
+    if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
+        uint8_t ofm_idx = 1;
+        auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", layer_idx));
+        auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", layer_idx));
+        if (_cfg.pipeline_cfg.use_strided_kv_cache) {
+            pre_model._bind_ofm(ofm_idx++, &key_buffer, {0, token_idx, 0});
+            if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
+                pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
             }
-        );
-    } else if (use_single_future_token_mask) {
-        if (_cfg.lm_cfg.is_spec_decode()) {
-            // Shift the col begin to cache_token_idx_begin so that buffer col
-            // p ↔ K-row p for any layer type: full (cache_token_idx_begin = 0)
-            // reads cols [0, aligned_eff); sliding reads
-            // [cache_token_idx_begin, cache_token_idx_begin + aligned_eff).
-            // The mask data layout (col c = mask for K[c]) is the same for
-            // both, so no second buffer or layout change is needed.
-            cache_ifms.emplace_back(
-                MLABufferSlice{
-                    &get_buffer("future_token_mask"),
-                    {0, cache_token_idx_begin},
-                    {num_tokens, aligned_eff_num_cached_tokens}
-                }
-            );
+            pre_model._bind_ofm(ofm_idx++, &val_buffer, {0, token_idx, 0});
         } else {
-            cache_ifms.emplace_back(
-                MLABufferSlice{
-                    &get_buffer("future_token_mask"),
-                    {(uint32_t)_cfg.pipeline_cfg.max_num_tokens - eff_num_cached_tokens},
-                    {aligned_eff_num_cached_tokens}
-                }
+            pre_model._bind_ofm(ofm_idx++, &key_buffer, {token_idx, 0});
+            if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
+                pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
+            }
+            pre_model._bind_ofm(ofm_idx++, &val_buffer, {token_idx, 0});
+        }
+        if (_cfg.pipeline_cfg.quantize_kv_cache) {
+            auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
+            pre_model._bind_ofm(ofm_idx, &scale, {0, token_idx, 0});
+        }
+    }
+
+    const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
+    const bool use_sliding_cache = std::get<1>(cache_key) != 0;
+    const char* cache_layer_type = use_sliding_cache
+        ? "sliding_attention" : "full_attention";
+    const uint16_t cache_mask_size = _get_cache_mask_size(
+        cache_layer_type, eff_num_cached_tokens, !is_single_model
+    );
+    const bool use_single_future_token_mask = is_single_model && cache_mask_size > 1;
+    const bool use_group_future_token_mask = (
+        !is_single_model && cache_mask_size > num_tokens
+    );
+    // IFM 0 is the query buffer. Its pointer, begin, and shape are invariant
+    // for a compact cache key, so only the layer-owned cache inputs are rebound.
+    uint8_t cache_ifm_idx = 1;
+    auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", kv_source_layer));
+    auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", kv_source_layer));
+    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
+        cache_model._bind_ifm(
+            cache_ifm_idx++, &key_buffer, {0, cache_token_idx_begin, 0}
+        );
+    } else {
+        cache_model._bind_ifm(cache_ifm_idx++, &key_buffer, {cache_token_idx_begin, 0});
+    }
+    if (_cfg.pipeline_cfg.quantize_kv_cache) {
+        auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer));
+        cache_model._bind_ifm(cache_ifm_idx++, &scale, {0, cache_token_idx_begin, 0});
+    }
+    if (use_group_future_token_mask) {
+        // Group-mask buffer, begin, and shape are fixed by the compact key.
+        ++cache_ifm_idx;
+    } else if (use_single_future_token_mask) {
+        auto& mask = get_buffer("future_token_mask");
+        if (_cfg.lm_cfg.is_spec_decode()) {
+            cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, cache_token_idx_begin});
+        } else {
+            cache_model._bind_ifm(
+                cache_ifm_idx++, &mask,
+                {static_cast<uint32_t>(_cfg.pipeline_cfg.max_num_tokens - eff_num_cached_tokens)}
             );
         }
     }
-    cache_ifms.emplace_back(
-        MLABufferSlice{
-            &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
-            cache_kv_cache_offset,
-            cache_kv_cache_shape
-        }
-    );
+    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
+        cache_model._bind_ifm(
+            cache_ifm_idx++, &val_buffer, {0, cache_token_idx_begin, 0}
+        );
+    } else {
+        cache_model._bind_ifm(cache_ifm_idx++, &val_buffer, {cache_token_idx_begin, 0});
+    }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
-                {0, cache_token_idx_begin, 0},
-                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
-            }
-        );
+        auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer));
+        cache_model._bind_ifm(cache_ifm_idx, &scale, {0, cache_token_idx_begin, 0});
     }
-    std::vector<MLABufferSlice> cache_ofms{
-        MLABufferSlice{
-            &get_buffer(fmt::format("n{}_buffer3", num_tokens)),
-            {0, 0},
-            {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}
-        }
-    };
-    _define_model(
-        "cache",
-        model_key,
-        _get_elf_path_cache(num_tokens, aligned_eff_token_idx, use_sliding_cache),
-        cache_ifms,
-        cache_ofms
-    );
 
-    // Post model. For draft, post IFM 0 is the FC fusion output (pre IFM 1), not the
-    // token embeddings (pre IFM 0). For target, pre IFM 0 is the hidden state directly.
-    std::vector<MLABufferSlice> post_ifms{is_draft ? pre_ifms[1] : pre_ifms[0], cache_ofms[0]};
-    const bool use_single_post_for_target_group = (
-        _cfg.lm_cfg.is_spec_decode()
-        && !is_draft
-        && num_tokens != single_num_tokens
-        && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
-    );
-    if (use_single_post_for_target_group) {
-        post_ifms[0] = MLABufferSlice{
-            post_ifms[0].get_buf_ptr(),
-            {0, 0},
-            {single_num_tokens, _cfg.lm_cfg.hidden_size}
-        };
-        post_ifms[1] = MLABufferSlice{
-            post_ifms[1].get_buf_ptr(),
-            {0, 0},
-            {single_num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}
-        };
-    }
-    if (_uses_per_layer_inputs()) {
-        post_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(fmt::format("n{}_per_layer_input", num_tokens)),
-                std::vector<uint32_t>{static_cast<uint32_t>(layer_idx) * num_tokens, 0},
-                std::vector<uint32_t>{
-                    use_single_post_for_target_group ? single_num_tokens : num_tokens,
-                    _cfg.lm_cfg.hidden_size_per_layer_input
-                }
-            }
-        );
-    }
+    // Per-layer post input is invariant because post wrappers remain per layer.
+    const uint8_t post_ifm_idx = 2 + static_cast<uint8_t>(_uses_per_layer_inputs());
     if (
         _cfg.vm_cfg.has_value()
         && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
         && num_tokens > 1
     ) {
-        buf_name = fmt::format("deepstack_feature_l{}_cache", layer_idx);
-        post_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(buf_name),
-                {token_idx, 0},
-                {
-                    use_single_post_for_target_group ? single_num_tokens : num_tokens,
-                    (uint32_t)get_buffer(buf_name).get_shape().back()
-                }
-            }
-        );
+        auto& deepstack = get_buffer(fmt::format("deepstack_feature_l{}_cache", layer_idx));
+        post_model._bind_ifm(post_ifm_idx, &deepstack, {token_idx, 0});
     }
-    std::vector<MLABufferSlice> post_ofms;
-    std::string post_elf_path;
-    if (layer_idx < _cfg.lm_cfg.num_hidden_layers - 1) {
-        post_ofms.emplace_back(
-            MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
-        );
-        post_elf_path = _get_elf_path_post(num_tokens, layer_idx);
-    } else {
-        // Target speculative prefill only needs the final valid prompt row's
-        // logits, so reuse the n16 verification post instead of loading n128.
-        const uint16_t post_num_tokens = use_single_post_for_target_group
-            ? single_num_tokens
-            : (_cfg.lm_cfg.is_spec_decode() ? num_tokens : 1);
-        post_elf_path = _get_elf_path_post(post_num_tokens, layer_idx);
 
-        if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-            const std::string buf_name = _cfg.lm_cfg.is_spec_decode()
-                ? fmt::format("n{}_buffer4", post_num_tokens)
-                : std::string("n1_buffer4");
-            post_ofms.emplace_back(MLABufferSlice{&get_buffer(buf_name)});
-        } else {
-            const auto lm_head_output_size = _cfg.lm_cfg.get_lm_head_output_size();
-            const auto& split_dim = _cfg.lm_cfg.lm_head_split_dim;
-
-            if (_cfg.lm_cfg.is_spec_decode()) {
-                uint32_t i = 0;
-                for (uint32_t split_begin = 0;
-                     split_begin < lm_head_output_size;
-                     split_begin += split_dim, ++i)
-                {
-                    post_ofms.emplace_back(
-                        MLABufferSlice{
-                            &get_buffer(fmt::format("n{}_lm_split{}", post_num_tokens, i))
-                        }
-                    );
-                }
-            } else {
-                for (uint32_t split_begin = 0;
-                     split_begin < lm_head_output_size;
-                     split_begin += split_dim)
-                {
-                    auto split_size = std::min(lm_head_output_size, split_begin + split_dim) - split_begin;
-                    post_ofms.emplace_back(
-                        MLABufferSlice{&get_buffer("n1_buffer4"), {split_begin}, {split_size}}
-                    );
-                }
-            }
-        }
-
-        // Draft post produces an additional output: hidden states for next iteration.
-        if (is_draft) {
-            post_ofms.emplace_back(
-                MLABufferSlice{&get_buffer(fmt::format("n{}_buffer5", num_tokens))}
-            );
-        }
-    }
-    _define_model("post", model_key, post_elf_path, post_ifms, post_ofms);
+    return cache_key;
 }
 
 
-void LanguageModel::_define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx) {
-    if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-        _define_conv_models_iter(num_tokens, layer_idx);
-    }
-}
 
 
-void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx) {
-    LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-    const uint16_t tail_size = std::max<uint16_t>(1, _cfg.lm_cfg.conv_L_cache - 1);
-    const uint16_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
 
-    // Conv model.
-    std::vector<MLABufferSlice> conv_ifms;
-    std::vector<MLABufferSlice> conv_ofms;
-    if (layer_idx) {
-        conv_ifms.emplace_back(
-            MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
-        );
-    } else {
-        conv_ifms.emplace_back(MLABufferSlice{});
-    }
-    conv_ifms.emplace_back(
-        MLABufferSlice{
-            &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
-            {tail_begin, 0},
-            {tail_size, _cfg.lm_cfg.hidden_size}
-        }
-    );
-    conv_ofms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))});
-    conv_ofms.emplace_back(
-        MLABufferSlice(
-            &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
-            {num_tokens > 1 ? 0 : tail_begin, 0},
-            {
-                static_cast<uint32_t>(num_tokens + tail_size - 1),
-                _cfg.lm_cfg.hidden_size
-            }
-        )
-    );
-    _define_model(
-        "conv",
-        model_key,
-        _get_elf_path_conv(num_tokens, layer_idx),
-        conv_ifms,
-        conv_ofms
-    );
-
-    // Conv final model.
-    std::vector<MLABufferSlice> conv_final_ifms{conv_ofms[0]};
-    std::vector<MLABufferSlice> conv_final_ofms;
-    std::string post_elf_path;
-    if (layer_idx < _cfg.lm_cfg.num_hidden_layers - 1) {
-        return;
-    } else if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-        conv_final_ofms.emplace_back(MLABufferSlice{&get_buffer("n1_buffer4")});
-    } else {
-        const auto& vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
-        const auto& split_dim = _cfg.lm_cfg.lm_head_split_dim;
-        for (uint32_t split_begin = 0; split_begin < vocab_size; split_begin += split_dim) {
-            auto split_size = std::min(vocab_size, split_begin + split_dim) - split_begin;
-            conv_final_ofms.emplace_back(
-                MLABufferSlice{&get_buffer("n1_buffer4"), {split_begin}, {split_size}}
-            );
-        }
-    }
-    _define_model(
-        "conv_final",
-        model_key,
-        _get_elf_path_conv_final(layer_idx),
-        conv_final_ifms,
-        conv_final_ofms
-    );
-}
-
-
-void LanguageModel::_define_models() {
-    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    std::vector<uint16_t> num_tokens_vec = {single_num_tokens};
-    if (_use_group_token_models) {
-        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
-    }
-    for (const auto& num_tokens: num_tokens_vec) {
-        const auto& max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
-        const auto& num_hidden_layers = _cfg.lm_cfg.num_hidden_layers;
-
-        if (num_tokens == single_num_tokens) {
-            for (uint16_t token_idx = 0; token_idx < max_num_tokens; ++token_idx) {
-                for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
-                    if (
-                        _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-                        || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-                    ) {
-                        _define_attn_models_iter(num_tokens, token_idx, layer_idx);
-                    }
-                }
-            }
-        } else {
-            for (const auto& token_idx: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
-                for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
-                    if (
-                        _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-                        || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-                    ) {
-                        _define_attn_models_iter(num_tokens, token_idx, layer_idx);
-                    }
-                }
-            }
-        }
-
-        for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
-            _define_state_models_iter(num_tokens, layer_idx);
-        }
-    }
-    _define_per_layer_models();
-
-    // Draft-only: FC fusion models.
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-    if (is_draft) {
-        _define_draft_fc_models();
-    }
-}
-
-
-void LanguageModel::_define_draft_fc_models() {
-    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    std::vector<uint16_t> num_tokens_vec = {single_num_tokens};
-    if (_use_group_token_models) {
-        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
-    }
-    for (const auto& num_tokens : num_tokens_vec) {
-        auto elf_path = _elf_dir / fmt::format(
-            "{}_n{}_draft_fc_stage1_mla.elf",
-            _cfg.language_model_name, num_tokens
-        );
-        std::vector<MLABufferSlice> ifms{
-            MLABufferSlice{&get_buffer(fmt::format("fc_n{}_input", num_tokens))}
-        };
-        std::vector<MLABufferSlice> ofms{
-            MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))}
-        };
-        _fc_model_map.emplace(
-            num_tokens, MLAModelWithBuffer(elf_path, ifms, ofms)
-        );
-    }
-}
 
 
 void LanguageModel::compact_kv_after_accept(
@@ -2284,27 +1920,6 @@ void LanguageModel::compact_kv_after_accept(
 // update_inference_inputs implementation moved to language_model_eagle3.cpp
 // (alongside the other EAGLE3-specific methods).
 
-
-void LanguageModel::_define_per_layer_models() {
-    if (!_uses_per_layer_inputs())
-        return;
-
-    std::vector<uint16_t> num_tokens_vec = {_cfg.lm_cfg.get_single_num_tokens()};
-    if (_use_group_token_models)
-        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
-
-    for (auto num_tokens : num_tokens_vec) {
-        LanguageModelMapKey key{num_tokens, 0, 0};
-        std::vector<MLABufferSlice> ifms{
-            MLABufferSlice{&get_buffer(fmt::format("per_layer_emb_staging_n{}", num_tokens))},
-            MLABufferSlice{}
-        };
-        std::vector<MLABufferSlice> ofms{
-            MLABufferSlice{&get_buffer(fmt::format("n{}_per_layer_input", num_tokens))}
-        };
-        _define_model("per_layer", key, _get_elf_path_per_layer(num_tokens), ifms, ofms);
-    }
-}
 
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
@@ -2424,24 +2039,6 @@ void LanguageModel::unset_reloc() {
 }
 
 
-LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) {
-    if (model_type == "pre") {
-        return _pre_model_map;
-    } else if (model_type == "cache") {
-        return _cache_model_map;
-    } else if (model_type == "post") {
-        return _post_model_map;
-    } else if (model_type == "conv") {
-        return _conv_model_map;
-    } else if (model_type == "conv_final") {
-        return _conv_final_model_map;
-    } else if (model_type == "per_layer") {
-        return _per_layer_model_map;
-    } else {
-        throw std::runtime_error(std::string("Invalid model type: ") + model_type);
-    }
-}
-
 
 uint16_t LanguageModel::set_max_num_tokens(std::optional<uint16_t> max_num_tokens) {
     auto original_max_num_tokens = _max_num_tokens;
@@ -2466,62 +2063,6 @@ std::set<uint32_t> LanguageModel::set_stop_token_ids(
     return original_stop_token_ids;
 }
 
-
-std::filesystem::path LanguageModel::_get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx) {
-    auto elf_file_name = fmt::format(
-        "{}_n{}_pre_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
-    );
-    return _elf_dir / elf_file_name;
-}
-
-
-std::filesystem::path LanguageModel::_get_elf_path_cache(
-    uint16_t num_tokens,
-    uint16_t token_idx,
-    bool use_sliding_cache
-) {
-    const std::string cache_name = use_sliding_cache ? "sliding_cache" : "cache";
-    auto elf_file_name = fmt::format(
-        "{}_n{}_{}_token{}_stage1_mla.elf",
-        _cfg.language_model_name,
-        num_tokens,
-        cache_name,
-        token_idx
-    );
-    return _elf_dir / elf_file_name;
-}
-
-
-std::filesystem::path LanguageModel::_get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx) {
-    auto elf_file_name = fmt::format(
-        "{}_n{}_post_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
-    );
-    return _elf_dir / elf_file_name;
-}
-
-
-std::filesystem::path LanguageModel::_get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx) {
-    auto elf_file_name = fmt::format(
-        "{}_n{}_layer{}_conv_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
-    );
-    return _elf_dir / elf_file_name;
-}
-
-
-std::filesystem::path LanguageModel::_get_elf_path_conv_final(uint8_t layer_idx) {
-    auto elf_file_name = fmt::format(
-        "{}_n1_post_layer{}_conv_final_stage1_mla.elf", _cfg.language_model_name, layer_idx
-    );
-    return _elf_dir / elf_file_name;
-}
-
-
-std::filesystem::path LanguageModel::_get_elf_path_per_layer(uint16_t num_tokens) {
-    auto elf_file_name = fmt::format(
-        "{}_n{}_per_layer_stage1_mla.elf", _cfg.language_model_name, num_tokens
-    );
-    return _elf_dir / elf_file_name;
-}
 
 
 void LanguageModel::_dequantize_embedding_row(

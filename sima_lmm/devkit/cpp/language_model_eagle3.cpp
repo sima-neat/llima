@@ -202,11 +202,11 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     auto& token_embeds_buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
     token_embeds_buf.upload(input_embeds_padded.data());
 
-    // model_key = (num_tokens, 0, past_kv_len) — picks the ELF with the right
-    // KV-cache write offset, so no OFM override needed.
+    // Bind the compact wrappers to this forward pass before enqueueing them.
     const uint8_t  layer_idx = 0;
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
-    const LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+    const auto cache_key = _bind_attn_models(num_tokens, token_idx, layer_idx);
     auto& fc_output_buf = get_buffer(fmt::format("fc_n{}_output", num_tokens));
 
     if (is_prefill) {
@@ -260,7 +260,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
 
     // cache_model dispatch. IFMs/OFMs are all statically wired, no overrides.
-    _cache_model_map.at(model_key).add_to_queue();
+    _cache_model_map.at(cache_key).add_to_queue();
 
     // post_model dispatch (lm_head fused in). Override IFM[0] to fc_n{N}_output
     // (same buffer pre_model used as IFM[1]); IFM[1] is statically wired.
@@ -402,8 +402,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     auto& input_embeds_buf = get_buffer("input_embeds");
     input_embeds_buf.upload(input_embeds_padded.data());
 
-    // Per-layer loop; capture hidden states at layers {2, N/2, N-3}. model_key
-    // bakes the KV write offset, so no OFM override needed.
+    // Per-layer loop; capture hidden states at layers {2, N/2, N-3}.
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
     const std::vector<uint8_t> capture_layers = {
         2,
@@ -420,7 +419,8 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             continue;
         }
 
-        const LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
+        const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+        const auto cache_key = _bind_attn_models(num_tokens, token_idx, layer_idx);
 
         // Slot 0 (input_embeds for layer 0) is shared between pre and post —
         // both have empty-placeholder bindings, so build the override once.
@@ -469,7 +469,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         );
 
         _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
-        _cache_model_map.at(model_key).add_to_queue();
+        _cache_model_map.at(cache_key).add_to_queue();
         _post_model_map.at(model_key).add_to_queue(&ifm_map);
 
         // post_model.ofms[0] writes n{N}_buffer1 (next layer's IFM[0]), so
