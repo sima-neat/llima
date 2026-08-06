@@ -1037,6 +1037,17 @@ class VlmConfig(BaseConfig):
                             f"For {vlm_cfg.vm_cfg.arch}, image dimensions ({height}x{width}) must be divisible by "
                             f"(patch_size * spatial_merge_size), which is {divisor}."
                         )
+                    # Qwen per-layer graphs do not yet support split-ELF execution.
+                    if vlm_cfg.vm_cfg.arch in (
+                        VisionArchType.QWEN2_VISION_ENCODER,
+                        VisionArchType.QWEN3_VISION_ENCODER,
+                    ):
+                        seq_len = (height // vlm_cfg.vm_cfg.patch_size) * (width // vlm_cfg.vm_cfg.patch_size)
+                        if seq_len * ceil_div_row(seq_len) * 2 > mla_max_num_rows:
+                            raise RuntimeError(
+                                f"Input image resolution ({height}x{width}) exceeds the maximum allowed for "
+                                f"single-ELF vision encoding for {vlm_cfg.vm_cfg.arch} "
+                            )
                     vlm_cfg.vm_cfg.image_size = image_resolution
                 else:
                     sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2, Qwen-VL, or Gemma4 based.")
