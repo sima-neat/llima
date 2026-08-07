@@ -50,17 +50,6 @@ from sima_utils.logging.sima_logger import (
 )
 
 
-def _should_write_embedding_artifacts(
-    resume: bool, embeddings_file: Path, scales_file: Path | None = None
-) -> bool:
-    """Return whether an embedding table and its optional scales must be written."""
-    return (
-        not resume
-        or not embeddings_file.is_file()
-        or (scales_file is not None and not scales_file.is_file())
-    )
-
-
 class FileGenMode(Enum):
     """
     File generation mode.
@@ -486,14 +475,13 @@ class BaseModel(ABC):
         embeddings_scale_file_name = (
             self.sima_devkit_path / f"{self.language_model_name}_embedding_scales.bin"
         )
-        embedding_scales_file = (
-            embeddings_scale_file_name if self.cfg.pipeline_cfg.quantize_embeddings else None
-        )
-        write_embeddings = _should_write_embedding_artifacts(
-            resume, embeddings_file_name, embedding_scales_file
-        )
         write_embedding_scales = (
-            self.cfg.pipeline_cfg.quantize_embeddings and write_embeddings
+            self.cfg.pipeline_cfg.quantize_embeddings
+            and not (resume and embeddings_scale_file_name.is_file())
+        )
+        write_embeddings = (
+            not (resume and embeddings_file_name.is_file())
+            or write_embedding_scales
         )
         write_cfg = not (resume and cfg_json_file_name.is_file())
         if write_embeddings or write_embedding_scales:
@@ -532,17 +520,17 @@ class BaseModel(ABC):
             self.sima_devkit_path
             / f"{self.language_model_name}_per_layer_embedding_scales.bin"
         )
-        is_gemma4 = self.cfg.model_type == VlmArchType.VLM_GEMMA4
-        per_layer_scales_file = (
-            per_layer_embeddings_scale_file_name
-            if self.cfg.pipeline_cfg.quantize_embeddings else None
-        )
-        write_per_layer_embeddings = is_gemma4 and _should_write_embedding_artifacts(
-            resume, per_layer_embeddings_file_name, per_layer_scales_file
-        )
         write_per_layer_embedding_scales = (
-            is_gemma4 and self.cfg.pipeline_cfg.quantize_embeddings
-            and write_per_layer_embeddings
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.cfg.pipeline_cfg.quantize_embeddings
+            and not (resume and per_layer_embeddings_scale_file_name.is_file())
+        )
+        write_per_layer_embeddings = (
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and (
+                not (resume and per_layer_embeddings_file_name.is_file())
+                or write_per_layer_embedding_scales
+            )
         )
         if write_per_layer_embeddings or write_per_layer_embedding_scales:
             per_layer_embeddings, per_layer_embeddings_scale = (
