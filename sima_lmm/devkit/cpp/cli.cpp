@@ -265,7 +265,6 @@ void CLI::run() {
 
 
 void CLI::stop() {
-    _logger->info("User interrupt received. Stopping the model.");
     _vision_language_model_ptr->stop_model();
 }
 

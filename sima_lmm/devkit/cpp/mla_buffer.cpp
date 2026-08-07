@@ -218,8 +218,12 @@ void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bo
     } else {
         std::memcpy(_virtual_addr, data, _size);
     }
-    if (flush)
-        flush_cache();
+    if (flush) {
+        if (data_size > 0 && data_size < _size)
+            flush_cache(data_begin, data_size);
+        else
+            flush_cache();
+    }
 }
 
 

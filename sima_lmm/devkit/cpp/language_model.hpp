@@ -160,7 +160,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         // Result of run_eagle3_target_verify.
         struct TargetVerifyResult {
-            std::vector<Eigen::bfloat16> logits;                       // (num_tokens, lm_head_output)
+            std::vector<uint32_t> next_token_ids;                     // target argmax per node
             std::vector<std::vector<Eigen::bfloat16>> hidden_states;   // 3 captures, each (num_tokens, hidden_size)
         };
 
@@ -173,8 +173,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         // Result of tree_decoding.
         struct TreeDecodingResult {
-            std::vector<Eigen::bfloat16> logits;          // flat (n_paths × max_depth × vocab_size)
-            size_t vocab_size;
+            std::vector<int32_t> next_token_ids;          // flat (n_paths × max_depth)
             std::vector<Eigen::bfloat16> hidden_states;   // flat (K × 3 × hidden_size)
         };
 
@@ -205,7 +204,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
 
         // Per-iter update after target verify + accept/reject: compacts KV to the
-        // accepted path, samples bonus_token from sample_p, builds next tree.
+        // accepted path and builds the next tree from the target bonus token.
         struct UpdateInferenceInputsResult {
             std::vector<uint32_t> input_ids;                       // old + accepted + bonus
             std::vector<uint32_t> draft_tokens;                    // next round's tree tokens
@@ -213,7 +212,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             eagle_helpers::EagleTreeMask tree_mask;                // next round
             std::vector<int32_t> tree_position_ids;                // next round
             int32_t new_token;                                     // accumulated generated-token count
-            uint32_t bonus_token;                                  // = argmax(sample_p)
+            uint32_t bonus_token;
         };
 
         UpdateInferenceInputsResult update_inference_inputs(
@@ -225,7 +224,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<std::vector<int32_t>>& retrieve_indices,
             int32_t new_token,
             const std::vector<Eigen::bfloat16>& hidden_state_new,
-            const std::vector<Eigen::bfloat16>& sample_p
+            uint32_t bonus_token
         );
 
         // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
