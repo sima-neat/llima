@@ -18,16 +18,19 @@ def _speculative_role(sima_files_dir: Path) -> bool | None:
     config_file = sima_files_dir / "devkit" / "vlm_config.json"
     if not config_file.is_file():
         return None
-    with config_file.open() as f:
-        cfg = json.load(f)
-    spec_cfg = cfg.get("lm_cfg", {}).get("speculative_decoding_cfg")
-    if spec_cfg is None:
+    with config_file.open() as config_stream:
+        config = json.load(config_stream)
+    spec_config = config.get("lm_cfg", {}).get("speculative_decoding_cfg")
+    if spec_config is None:
         return None
-    return bool(spec_cfg.get("is_draft", False))
+    return bool(spec_config.get("is_draft", False))
 
 
 def _resolve_deploy_sources(src_dir: Path) -> list[tuple[str | None, Path]]:
     """Resolve one normal compiler output or a speculative target/draft parent."""
+    if not src_dir.is_dir():
+        raise RuntimeError(f"Source directory does not exist or is not a directory: {src_dir}")
+
     direct_sima_dir = src_dir if src_dir.name == "sima_files" else src_dir / "sima_files"
     if (direct_sima_dir / "devkit").is_dir():
         return [(None, direct_sima_dir)]
@@ -67,15 +70,17 @@ def _resolve_deploy_sources(src_dir: Path) -> list[tuple[str | None, Path]]:
     return [target, draft]
 
 
+def _validate_sima_files(src_sima_dir: Path) -> None:
+    if not (src_sima_dir / "devkit").is_dir():
+        raise RuntimeError(f"devkit directory cannot be found in {src_sima_dir}")
+    if not (src_sima_dir / "mpk").is_dir():
+        raise RuntimeError(f"mpk directory cannot be found in {src_sima_dir}")
+
+
 def _deploy_sima_files(src_sima_dir: Path, dst_dir: Path) -> None:
     """Deploy one direct sima_files directory to a runtime model directory."""
     src_devkit_dir = src_sima_dir / "devkit"
-    if not src_devkit_dir.is_dir():
-        raise RuntimeError(f"devkit directory cannot be found in {src_sima_dir}")
-
     src_mpk_dir = src_sima_dir / "mpk"
-    if not src_mpk_dir.is_dir():
-        raise RuntimeError(f"mpk directory cannot be found in {src_sima_dir}")
 
     # Extract the elf_files.
     src_elf_dir = src_sima_dir / "elf_files"
@@ -117,6 +122,8 @@ def _deploy_sima_files(src_sima_dir: Path, dst_dir: Path) -> None:
 
 def deploy(src_dir: Path, dst_dir: Path) -> None:
     sources = _resolve_deploy_sources(src_dir)
+    for _, src_sima_dir in sources:
+        _validate_sima_files(src_sima_dir)
     for model_name, src_sima_dir in sources:
         model_dst = dst_dir if model_name is None else dst_dir / model_name
         _deploy_sima_files(src_sima_dir, model_dst)
@@ -135,8 +142,8 @@ def main():
 
     try:
         deploy(args.src_dir, args.dst_dir)
-    except RuntimeError as e:
-        _abort(str(e))
+    except RuntimeError as error:
+        _abort(str(error))
 
 
 if __name__ == "__main__":

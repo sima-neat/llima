@@ -55,7 +55,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     compile_lmm.main()
 
     args = calls[0]
-    assert args[12:17] == expected
+    assert (args[12], args[13], args[14], args[15], args[16]) == expected
 
 
 @pytest.mark.parametrize(

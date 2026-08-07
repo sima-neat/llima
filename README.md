@@ -146,6 +146,8 @@ Inside `llima run --mode cli`:
 - `set language <lang>`: set transcription language.
 - `set lora <name>`: load LoRA weights if present in the model package.
 - `unset lora`: clear LoRA weights.
+- `enable-thinking`: enable thinking mode and clear chat history.
+- `disable-thinking`: disable thinking mode and clear chat history.
 - `help`: print available commands.
 
 Set `SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT=1` to highlight tokens accepted from the

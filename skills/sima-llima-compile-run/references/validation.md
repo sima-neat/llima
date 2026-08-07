@@ -20,18 +20,20 @@ is the individual model repository.
 
 ## Compiled Output
 
-Require both `sima_files/devkit/` and `sima_files/mpk/`. Treat missing
-directories, unexpected partial output, or compiler errors as failure.
+Require both `sima_files/devkit/` and `sima_files/mpk/` in every compiled model
+tree. Treat missing directories, unexpected partial output, or compiler errors
+as failure.
 
-This validation covers one complete model tree. Speculative decoding is
-unsupported by this workflow until issue #128 lands because target and draft
-compilation produce separate artifact trees.
+For speculative decoding, validate that the output parent contains one target
+tree and one draft tree, each with its own `sima_files/` directory. Keep the two
+trees separate and deploy their parent in one command. See
+[Model Deployment](../../../docs/deployment.md#speculative-decoding-models).
 
 ## Deploy
 
 ```bash
 llima-deploy \
-  <compiled-output> \
+  <compiled-output-or-speculative-parent> \
   <user@modalix:/media/nvme/llima/models/model-name>
 ```
 

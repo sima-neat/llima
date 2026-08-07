@@ -109,7 +109,7 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
 
 
 void TextStreamer::put(uint32_t token_id, bool from_draft) {
-    // Preserve structural markers only while this request has tools enabled.
+    // Preserve structural markers only while the current request needs them.
     if (_tool_call_enabled && !_preserved_tokens.empty()) {
         const auto preserved = std::find_if(
             _preserved_tokens.begin(), _preserved_tokens.end(),

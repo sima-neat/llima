@@ -441,6 +441,7 @@ set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/mla_buffer.hpp
     sima_lmm/devkit/cpp/mla_model.hpp
     sima_lmm/devkit/cpp/nlohmann_optional.hpp
+    sima_lmm/devkit/cpp/reasoning_parser.hpp
     sima_lmm/devkit/cpp/rope_utils.hpp
     sima_lmm/devkit/cpp/setup.hpp
     sima_lmm/devkit/cpp/text_streamer.hpp

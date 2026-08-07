@@ -1037,11 +1037,17 @@ class VlmConfig(BaseConfig):
                             f"For {vlm_cfg.vm_cfg.arch}, image dimensions ({height}x{width}) must be divisible by "
                             f"(patch_size * spatial_merge_size), which is {divisor}."
                         )
-                    seq_len = (height // vlm_cfg.vm_cfg.patch_size) * (width // vlm_cfg.vm_cfg.patch_size)
-                    if seq_len * ceil_div_row(seq_len) * 2 > mla_max_num_rows:
-                        raise RuntimeError(
-                            f"Input image resolution ({height}x{width}) exceeds the maximum allowed for "
-                            f"single-ELF vision encoding for {vlm_cfg.vm_cfg.arch} ")
+                    # Qwen per-layer graphs do not yet support split-ELF execution.
+                    if vlm_cfg.vm_cfg.arch in (
+                        VisionArchType.QWEN2_VISION_ENCODER,
+                        VisionArchType.QWEN3_VISION_ENCODER,
+                    ):
+                        seq_len = (height // vlm_cfg.vm_cfg.patch_size) * (width // vlm_cfg.vm_cfg.patch_size)
+                        if seq_len * ceil_div_row(seq_len) * 2 > mla_max_num_rows:
+                            raise RuntimeError(
+                                f"Input image resolution ({height}x{width}) exceeds the maximum allowed for "
+                                f"single-ELF vision encoding for {vlm_cfg.vm_cfg.arch} "
+                            )
                     vlm_cfg.vm_cfg.image_size = image_resolution
                 else:
                     sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2, Qwen-VL, or Gemma4 based.")
@@ -1541,6 +1547,14 @@ def vision_model_layer_count(cfg: VisionModelConfig) -> int:
         return cfg.num_hidden_layers - 1
     else:
         return cfg.num_hidden_layers
+
+
+def vision_model_names(cfg: VisionModelConfig, model_name: str) -> list[str]:
+    """Get the generated vision model artifact names in execution order."""
+    num_models = vision_model_layer_count(cfg)
+    if num_models == 1:
+        return [model_name]
+    return [f"{model_name}_layer{layer_idx}" for layer_idx in range(num_models)]
 
 
 if __name__ == "__main__":

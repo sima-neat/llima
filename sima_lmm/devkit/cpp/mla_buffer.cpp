@@ -1,4 +1,5 @@
 #include <fstream>
+#include <limits>
 #include <set>
 
 #include <fmt/ranges.h>
@@ -110,8 +111,50 @@ void MLABuffer::flush_cache() const {
     simaai_memory_flush_cache(_simaai_mem_ptr);
 }
 
+void MLABuffer::flush_cache(size_t offset, size_t size) const {
+    if (offset > _size_padded || size > _size_padded - offset) {
+        throw std::out_of_range(fmt::format(
+            "Cache flush range [{}, {}) exceeds buffer {} size {}",
+            offset, offset + size, _name, _size_padded
+        ));
+    }
+    if (size == 0) return;
+    const auto api_max = std::numeric_limits<unsigned int>::max();
+    if (offset > api_max || size > api_max - offset) {
+        throw std::overflow_error(fmt::format(
+            "Cache flush range for {} exceeds simaai-memory API limits", _name
+        ));
+    }
+    simaai_memory_flush_cache_part(
+        _simaai_mem_ptr,
+        static_cast<unsigned int>(offset),
+        static_cast<unsigned int>(size)
+    );
+}
+
 void MLABuffer::invalidate_cache() const {
     simaai_memory_invalidate_cache(_simaai_mem_ptr);
+}
+
+void MLABuffer::invalidate_cache(size_t offset, size_t size) const {
+    if (offset > _size_padded || size > _size_padded - offset) {
+        throw std::out_of_range(fmt::format(
+            "Cache invalidate range [{}, {}) exceeds buffer {} size {}",
+            offset, offset + size, _name, _size_padded
+        ));
+    }
+    if (size == 0) return;
+    const auto api_max = std::numeric_limits<unsigned int>::max();
+    if (offset > api_max || size > api_max - offset) {
+        throw std::overflow_error(fmt::format(
+            "Cache invalidate range for {} exceeds simaai-memory API limits", _name
+        ));
+    }
+    simaai_memory_invalidate_cache_part(
+        _simaai_mem_ptr,
+        static_cast<unsigned int>(offset),
+        static_cast<unsigned int>(size)
+    );
 }
 
 void MLABuffer::clear(bool flush) {
@@ -354,6 +397,18 @@ MLABufferSlice::MLABufferSlice(
 MLABufferSlice::MLABufferSlice(
     MLABuffer* buf_ptr, std::vector<uint32_t> begins, std::vector<uint32_t> shapes
 ) : _buf_ptr(buf_ptr), _begins(std::move(begins)), _shapes(std::move(shapes)) {}
+
+
+void MLABufferSlice::_bind(
+    MLABuffer* buf_ptr,
+    std::initializer_list<uint32_t> begins
+) {
+    _buf_ptr = buf_ptr;
+    if (!_begins.has_value()) {
+        _begins.emplace();
+    }
+    _begins->assign(begins);
+}
 
 
 uint64_t MLABufferSlice::get_buf_addr() const {

@@ -32,7 +32,7 @@ class VisionModel : public BaseModel<VlmConfig> {
 
         const VisionModelConfig& _vm_cfg;
         const MMConnectionConfig& _mm_cfg;
-        std::unique_ptr<MLAModelWithBuffer> _model_ptr;
+        std::vector<std::unique_ptr<MLAModelWithBuffer>> _model_ptrs;
 };
 
 }

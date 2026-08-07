@@ -11,6 +11,7 @@ from sima_lmm.config.vlm_config import (
     VlmConfig,
     group_cache_model_indices,
     single_cache_model_indices,
+    vision_model_names,
 )
 from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.model import VisionLanguageModel
@@ -94,6 +95,20 @@ def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp
 
 def test_default_max_num_tokens():
     assert PipelineConfig().max_num_tokens == 4096
+
+
+def test_vision_model_names_describe_single_and_per_layer_artifacts():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    model_name = "gemma4_vision"
+
+    config.vm_cfg.image_size = [224, 224]
+    assert vision_model_names(config.vm_cfg, model_name) == [model_name]
+
+    config.vm_cfg.image_size = [960, 672]
+    assert vision_model_names(config.vm_cfg, model_name) == [
+        f"{model_name}_layer{layer_idx}"
+        for layer_idx in range(config.vm_cfg.num_hidden_layers)
+    ]
 
 
 @pytest.mark.parametrize(

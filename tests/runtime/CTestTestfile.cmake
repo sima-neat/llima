@@ -64,3 +64,14 @@ set_tests_properties(
         LABELS "devkit;runtime;unit"
         TIMEOUT 30
 )
+
+add_test(
+    runtime.reasoning_parser
+    "./sima_lmm_reasoning_parser_test"
+)
+set_tests_properties(
+    runtime.reasoning_parser
+    PROPERTIES
+        LABELS "devkit;runtime;unit"
+        TIMEOUT 30
+)

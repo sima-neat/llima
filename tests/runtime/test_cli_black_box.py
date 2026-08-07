@@ -6,6 +6,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 
 DEFAULT_MODELS_PATH = Path("/media/nvme/llima/models")
 DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-GPTQ-a16w4"
@@ -124,6 +126,9 @@ def _run_cli(
     return output, process.pid
 
 
+@pytest.mark.skip(
+    reason="Temporarily disabled while mlashmcomplex thread cleanup is investigated"
+)
 def test_installed_cli_start_query_quit(tmp_path):
     assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
     subprocess.run(

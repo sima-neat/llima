@@ -12,6 +12,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -36,7 +37,8 @@ struct GenerationPerformanceResult {
     std::optional<uint32_t> accepted_draft_tokens;
 };
 
-// Key to access the language model map: (num_tokens, layer_idx, token_idx).
+// Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
+// (num_tokens, cache_kind, aligned_cache_token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
@@ -158,7 +160,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         // Result of run_eagle3_target_verify.
         struct TargetVerifyResult {
-            std::vector<Eigen::bfloat16> logits;                       // (num_tokens, lm_head_output)
+            std::vector<uint32_t> next_token_ids;                     // target argmax per node
             std::vector<std::vector<Eigen::bfloat16>> hidden_states;   // 3 captures, each (num_tokens, hidden_size)
         };
 
@@ -171,8 +173,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         // Result of tree_decoding.
         struct TreeDecodingResult {
-            std::vector<Eigen::bfloat16> logits;          // flat (n_paths × max_depth × vocab_size)
-            size_t vocab_size;
+            std::vector<int32_t> next_token_ids;          // flat (n_paths × max_depth)
             std::vector<Eigen::bfloat16> hidden_states;   // flat (K × 3 × hidden_size)
         };
 
@@ -203,7 +204,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
 
         // Per-iter update after target verify + accept/reject: compacts KV to the
-        // accepted path, samples bonus_token from sample_p, builds next tree.
+        // accepted path and builds the next tree from the target bonus token.
         struct UpdateInferenceInputsResult {
             std::vector<uint32_t> input_ids;                       // old + accepted + bonus
             std::vector<uint32_t> draft_tokens;                    // next round's tree tokens
@@ -211,7 +212,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             eagle_helpers::EagleTreeMask tree_mask;                // next round
             std::vector<int32_t> tree_position_ids;                // next round
             int32_t new_token;                                     // accumulated generated-token count
-            uint32_t bonus_token;                                  // = argmax(sample_p)
+            uint32_t bonus_token;
         };
 
         UpdateInferenceInputsResult update_inference_inputs(
@@ -223,7 +224,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<std::vector<int32_t>>& retrieve_indices,
             int32_t new_token,
             const std::vector<Eigen::bfloat16>& hidden_state_new,
-            const std::vector<Eigen::bfloat16>& sample_p
+            uint32_t bonus_token
         );
 
         // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
@@ -275,6 +276,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<MLABufferSlice>& ofms
         );
         void _define_attn_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
+        LanguageModelMapKey _get_cache_model_key(
+            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+        ) const;
+        LanguageModelMapKey _bind_attn_models(
+            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+        );
         void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_models();
@@ -292,7 +299,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
         static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
         uint16_t _get_cache_mask_size(
-            const std::string& layer_type, uint16_t context_length, bool is_group
+            std::string_view layer_type, uint16_t context_length, bool is_group
         ) const {
             if (
                 layer_type != "sliding_attention"
