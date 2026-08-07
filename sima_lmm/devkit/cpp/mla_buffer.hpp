@@ -51,7 +51,9 @@ class MLABuffer {
             const std::optional<std::vector<uint32_t>>& shape = std::nullopt
         ) const;
         void flush_cache() const;
+        void flush_cache(size_t offset, size_t size) const;
         void invalidate_cache() const;
+        void invalidate_cache(size_t offset, size_t size) const;
 
         const std::string& get_name() const { return _name; }
         const std::string& get_dtype() const { return _dtype; }

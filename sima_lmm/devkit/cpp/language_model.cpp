@@ -1865,6 +1865,17 @@ void LanguageModel::compact_kv_after_accept(
     const uint32_t max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
     const uint32_t num_kv_heads = _cfg.lm_cfg.attn_cfg.num_key_value_heads;
 
+    if (n == 0) {
+        _kv_cache_len = prev_input_len;
+        return;
+    }
+
+    const auto [min_src_it, max_src_it] = std::minmax_element(
+        select_indices.begin(), select_indices.end()
+    );
+    const size_t min_src_pos = *min_src_it;
+    const size_t max_src_pos = *max_src_it;
+
     // For each layer, gather KV at select_indices and scatter to contiguous positions.
     // Strided layout: (num_kv_heads, max_num_tokens, head_dim). Per-position chunk per
     // head is head_dim bf16 values at byte offset (h * max_num_tokens + pos) * head_dim_bytes.
@@ -1883,12 +1894,20 @@ void LanguageModel::compact_kv_after_accept(
 
         for (const std::string& kind : {"cache_key_l", "cache_val_l"}) {
             auto& buf = get_buffer(fmt::format("{}{}", kind, layer_idx));
-            buf.invalidate_cache();
             uint8_t* data = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
 
             std::vector<uint8_t> tmp(n * head_dim_bytes);
             for (uint32_t h = 0; h < num_kv_heads; ++h) {
                 uint8_t* head_base = data + h * head_stride_bytes;
+
+                // MLA populated the selected tree rows. Synchronize only the
+                // compact span containing them rather than the complete KV
+                // allocation, whose size scales with max_num_tokens.
+                const size_t head_offset = static_cast<size_t>(h) * head_stride_bytes;
+                const size_t source_offset = head_offset + min_src_pos * head_dim_bytes;
+                const size_t source_size =
+                    (max_src_pos - min_src_pos + 1) * head_dim_bytes;
+                buf.invalidate_cache(source_offset, source_size);
 
                 // Gather rows at select_indices into tmp (handles src/dst overlap).
                 for (size_t i = 0; i < n; ++i) {
@@ -1907,9 +1926,12 @@ void LanguageModel::compact_kv_after_accept(
                         head_dim_bytes
                     );
                 }
-            }
 
-            buf.flush_cache();
+                // Only the accepted contiguous rows were modified by the CPU.
+                const size_t destination_offset =
+                    head_offset + static_cast<size_t>(prev_input_len) * head_dim_bytes;
+                buf.flush_cache(destination_offset, n * head_dim_bytes);
+            }
         }
     }
 

@@ -401,6 +401,7 @@ def main():
 
     is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
     is_speculative_decoding = args.draft_model_path is not None
+    return_logits = args.return_logits or is_speculative_decoding
 
     if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
@@ -431,7 +432,7 @@ def main():
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
         args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
-        args.quantize_kv_cache, split_mlp, args.return_logits, log_level, image_resolution,
+        args.quantize_kv_cache, split_mlp, return_logits, log_level, image_resolution,
         args.draft_model_path, draft_output_path
     )
 

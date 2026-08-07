@@ -55,6 +55,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     bool is_prefill
 ) {
     const size_t seq_length = input_ids.size();
+    const uint16_t num_tokens = is_prefill ? 128 : 5;
     size_t seq_len_with_past = seq_length;
     int past_key_values_length = 0;
     if (num_cached_tokens > 0) {
@@ -68,13 +69,11 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     if (position_ids.has_value()) {
         const auto& positions = position_ids.value();
         const uint32_t freq_dim = freq_real_buf.get_shape().back();
-        const uint16_t max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
-
         std::vector<Eigen::bfloat16> freq_real_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         std::vector<Eigen::bfloat16> freq_imag_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         for (size_t i = 0; i < positions.size(); ++i) {
             const size_t pos = static_cast<size_t>(positions[i]);
@@ -83,11 +82,15 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
                 freq_imag_padded[i * freq_dim + k] = _global_freq_host.im[pos * freq_dim + k];
             }
         }
-        freq_real_buf.upload(freq_real_padded.data());
-        freq_imag_buf.upload(freq_imag_padded.data());
+        const size_t freq_bytes = freq_real_padded.size() * sizeof(Eigen::bfloat16);
+        freq_real_buf.upload(freq_real_padded.data(), 0, freq_bytes);
+        freq_imag_buf.upload(freq_imag_padded.data(), 0, freq_bytes);
     } else {
-        freq_real_buf.upload(_global_freq_host.re.data());
-        freq_imag_buf.upload(_global_freq_host.im.data());
+        const size_t freq_bytes =
+            static_cast<size_t>(num_tokens) * freq_real_buf.get_shape().back()
+            * sizeof(Eigen::bfloat16);
+        freq_real_buf.upload(_global_freq_host.re.data(), 0, freq_bytes);
+        freq_imag_buf.upload(_global_freq_host.im.data(), 0, freq_bytes);
     }
 
     // Default mask is all-ones; tree overlay applied by prepare_attention_mask.
@@ -101,7 +104,6 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     // Decode mask stride must match the cache ELF's compiled bucket; a wider
     // stride misaligns rows >= 1 and collapses the tree. Prefill group masks
     // are prepared separately before cache dispatch, so this local buffer is unused.
-    const uint16_t num_tokens = is_prefill ? 128 : 5;
     const uint16_t mask_bucket = _get_cache_mask_size(
         "full_attention", seq_len_with_past, false
     );
@@ -121,7 +123,9 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
 
     // Decode (n5) uses this runtime mask; prefill (n128) uses the group-mask buffer.
     if (!is_prefill) {
-        get_buffer("future_token_mask").upload(padded_mask.data());
+        get_buffer("future_token_mask").upload(
+            padded_mask.data(), 0, padded_mask.size() * sizeof(Eigen::bfloat16)
+        );
     }
 
     // Drafts share the target's embedding table — read rows from target's buffer.
@@ -275,7 +279,6 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     DraftForwardResult result;
     {
         auto& hidden_buf = get_buffer(fmt::format("n{}_buffer5", num_tokens));
-        hidden_buf.invalidate_cache();
         const size_t hidden_elems = static_cast<size_t>(num_tokens) * embed_size;
         result.hidden_states.resize(hidden_elems);
         hidden_buf.download(result.hidden_states.data());
@@ -284,7 +287,6 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     }
     {
         auto& logits_buf = get_buffer(fmt::format("n{}_buffer4", num_tokens));
-        logits_buf.invalidate_cache();
         const size_t logits_elems = static_cast<size_t>(num_tokens) * draft_vocab_size;
         result.logits.resize(logits_elems);
         logits_buf.download(result.logits.data());
@@ -302,6 +304,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     std::vector<uint32_t> input_ids,
     std::vector<int32_t> position_ids
 ) {
+    if (!_is_running.load(std::memory_order_relaxed))
+        return {};
+
     const int num_cached_tokens = static_cast<int>(_eagle3_stable_kv);
 
     // num_tokens = 16 for target verify; seq_length is the valid candidate count.
@@ -321,7 +326,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     }
 
     // Freq upload: gather rows at position_ids from pristine host, zero-pad to
-    // (max_num_tokens, freq_dim), upload to row 0. When SWA is enabled, do the
+    // (num_tokens, freq_dim), upload to row 0. When SWA is enabled, do the
     // same for the local freq table so sliding-attention layers see the right
     // rotary base.
     auto upload_freq_rows = [&](
@@ -330,12 +335,11 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         auto& real_buf = get_buffer(real_name);
         auto& imag_buf = get_buffer(imag_name);
         const uint32_t freq_dim = real_buf.get_shape().back();
-        const uint16_t max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
         std::vector<Eigen::bfloat16> real_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         std::vector<Eigen::bfloat16> imag_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         for (size_t i = 0; i < seq_length; ++i) {
             const size_t pos = static_cast<size_t>(position_ids[i]);
@@ -344,8 +348,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
                 imag_padded[i * freq_dim + k] = host.im[pos * freq_dim + k];
             }
         }
-        real_buf.upload(real_padded.data());
-        imag_buf.upload(imag_padded.data());
+        const size_t freq_bytes = real_padded.size() * sizeof(Eigen::bfloat16);
+        real_buf.upload(real_padded.data(), 0, freq_bytes);
+        imag_buf.upload(imag_padded.data(), 0, freq_bytes);
     };
     upload_freq_rows(_global_freq_host, "global_freq_real", "global_freq_imag");
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
@@ -379,7 +384,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             padded_mask[r * pad_cols + c] = mask[r * seq_len_with_past + c];
         }
     }
-    get_buffer("future_token_mask").upload(padded_mask.data());
+    get_buffer("future_token_mask").upload(
+        padded_mask.data(), 0, padded_mask.size() * sizeof(Eigen::bfloat16)
+    );
 
     // Stage input embeddings. The same `input_embeds` buffer is reused for both
     // n128 prefill and n16 verify; we write the first K rows here.
@@ -477,9 +484,10 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
         if (it != capture_layers.end()) {
             MLAModelWithBuffer::run_queue();
+            if (!_is_running.load(std::memory_order_relaxed))
+                return result;
             const size_t cap_idx = std::distance(capture_layers.begin(), it);
             auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-            buf.invalidate_cache();
             const size_t num_elems = static_cast<size_t>(num_tokens) * hidden_size;
             std::vector<Eigen::bfloat16> full_cap(num_elems);
             buf.download(full_cap.data());
@@ -495,15 +503,19 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     const uint32_t lm_head_output_size = _cfg.lm_cfg.get_lm_head_output_size();
     const auto num_splits = _cfg.lm_cfg.lm_head_num_splits;
     const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
-    result.logits.resize(static_cast<size_t>(num_tokens) * lm_head_output_size);
+    result.next_token_ids.resize(num_tokens, 0);
+    std::vector<float> best_logits(
+        num_tokens, -std::numeric_limits<float>::infinity()
+    );
 
     MLAModelWithBuffer::run_queue();
+    if (!_is_running.load(std::memory_order_relaxed))
+        return result;
     for (uint32_t s = 0; s < num_splits; ++s) {
         const std::string buf_name = (num_splits == 1)
             ? fmt::format("n{}_buffer4", num_tokens)
             : fmt::format("n{}_lm_split{}", num_tokens, s);
         auto& buf = get_buffer(buf_name);
-        buf.invalidate_cache();
         const uint32_t this_split_dim = (num_splits == 1)
             ? lm_head_output_size
             : std::min<uint32_t>(split_dim, lm_head_output_size - s * split_dim);
@@ -512,11 +524,15 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         );
         buf.download(split_data.data());
         for (uint16_t r = 0; r < num_tokens; ++r) {
-            std::memcpy(
-                result.logits.data() + r * lm_head_output_size + s * split_dim,
-                split_data.data() + r * this_split_dim,
-                this_split_dim * sizeof(Eigen::bfloat16)
-            );
+            for (uint32_t j = 0; j < this_split_dim; ++j) {
+                const float value = static_cast<float>(
+                    split_data[static_cast<size_t>(r) * this_split_dim + j]
+                );
+                if (value > best_logits[r]) {
+                    best_logits[r] = value;
+                    result.next_token_ids[r] = s * split_dim + j;
+                }
+            }
         }
     }
 
@@ -544,25 +560,23 @@ LanguageModel::TreeDecodingResult LanguageModel::tree_decoding(
         std::move(tree_candidates),
         std::move(position_ids)
     );
+    if (!_is_running.load(std::memory_order_relaxed))
+        return {};
 
-    // Gather logits[p][d] = tree_logits[retrieve_indices[p][d]]. -1 entries
-    // (path-padding) map to the last row of tree_logits.
-    const uint32_t vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
+    // Gather target predictions for each candidate path. -1 entries
+    // (path-padding) map to the last tree row.
     const uint16_t K = _cfg.lm_cfg.get_single_num_tokens();
     const size_t n_paths   = retrieve_indices.size();
     const size_t max_depth = n_paths ? retrieve_indices[0].size() : 0;
 
     TreeDecodingResult result;
-    result.vocab_size = vocab_size;
-    result.logits.resize(n_paths * max_depth * vocab_size);
+    result.next_token_ids.resize(n_paths * max_depth);
     for (size_t p = 0; p < n_paths; ++p) {
         for (size_t d = 0; d < max_depth; ++d) {
             int32_t idx = retrieve_indices[p][d];
             if (idx < 0) idx = static_cast<int32_t>(K) - 1;
-            std::memcpy(
-                result.logits.data() + (p * max_depth + d) * vocab_size,
-                target_out.logits.data() + static_cast<size_t>(idx) * vocab_size,
-                vocab_size * sizeof(Eigen::bfloat16)
+            result.next_token_ids[p * max_depth + d] = static_cast<int32_t>(
+                target_out.next_token_ids[static_cast<size_t>(idx)]
             );
         }
     }
@@ -599,7 +613,7 @@ LanguageModel::UpdateInferenceInputsResult LanguageModel::update_inference_input
     const std::vector<std::vector<int32_t>>& retrieve_indices,
     int32_t new_token,
     const std::vector<Eigen::bfloat16>& hidden_state_new,
-    const std::vector<Eigen::bfloat16>& sample_p
+    uint32_t bonus_token
 ) {
     const uint32_t hidden_size = _cfg.lm_cfg.hidden_size;
     const size_t prev_input_len = input_ids.size();
@@ -636,14 +650,6 @@ LanguageModel::UpdateInferenceInputsResult LanguageModel::update_inference_input
             3 * hidden_size * sizeof(Eigen::bfloat16)
         );
     }
-
-    auto bonus_it = std::max_element(sample_p.begin(), sample_p.end(),
-        [](const Eigen::bfloat16& a, const Eigen::bfloat16& b) {
-            return static_cast<float>(a) < static_cast<float>(b);
-        });
-    const uint32_t bonus_token = static_cast<uint32_t>(
-        std::distance(sample_p.begin(), bonus_it)
-    );
 
     // Inject bonus_token into topk_generate only; persisting it in input_ids
     // would shift next tree_decoding's RoPE and break topk_generate's slice.
@@ -691,6 +697,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     bool is_prefill
 ) {
     TopkGenerateResult result;
+    if (!target_lm._is_running.load(std::memory_order_relaxed))
+        return result;
 
     // total_tokens = target's speculative_budget - 1 (typically 15 from 16).
     // topk = draft's speculative_budget (typically 5). depth is hardcoded for now.
@@ -775,6 +783,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
                 /*num_cached_tokens=*/static_cast<int>(offset),
                 /*is_prefill=*/true
             );
+            if (!target_lm._is_running.load(std::memory_order_relaxed))
+                return result;
             last_valid_in_chunk = valid;
         }
 
@@ -801,6 +811,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*num_cached_tokens=*/static_cast<int>(_eagle3_stable_kv),
             /*is_prefill=*/false
         );
+        if (!target_lm._is_running.load(std::memory_order_relaxed))
+            return result;
         hidden_states = std::move(draft_out.hidden_states);
         // Trim trailing bonus_token row (zero-FC slot, uninformative).
         hidden_states.resize(hidden_rows * embed_size_for_kv);
@@ -826,14 +838,6 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         topk_p[r] = logsoftmax<Eigen::bfloat16>(
             topk_p_raw[r].data(), topk_p_raw[r].size()
         );
-    }
-
-    // Log topk values (convert bf16 → float for fmt).
-    std::vector<std::vector<float>> topk_p_raw_f(topk_p_raw.size());
-    for (size_t r = 0; r < topk_p_raw.size(); ++r) {
-        topk_p_raw_f[r].resize(topk_p_raw[r].size());
-        for (size_t i = 0; i < topk_p_raw[r].size(); ++i)
-            topk_p_raw_f[r][i] = static_cast<float>(topk_p_raw[r][i]);
     }
 
     // scores must be a copy, not a reference: the depth loop rebinds it later
@@ -901,6 +905,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*num_cached_tokens=*/static_cast<int>(num_cached_tokens),
             /*is_prefill=*/false
         );
+        if (!target_lm._is_running.load(std::memory_order_relaxed))
+            return result;
         auto out_hidden = std::move(draft_out_d.hidden_states);
 
         len_posi += 1;
@@ -934,14 +940,6 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             topk_p_d[r] = logsoftmax<Eigen::bfloat16>(
                 topk_p_raw_d[r].data(), topk_p_raw_d[r].size()
             );
-        }
-
-        // Log (convert bf16 → float for fmt).
-        std::vector<std::vector<float>> topk_p_raw_d_f(topk_p_raw_d.size());
-        for (size_t r = 0; r < topk_p_raw_d.size(); ++r) {
-            topk_p_raw_d_f[r].resize(topk_p_raw_d[r].size());
-            for (size_t k = 0; k < topk_p_raw_d[r].size(); ++k)
-                topk_p_raw_d_f[r][k] = static_cast<float>(topk_p_raw_d[r][k]);
         }
 
         // cu_scores[r][k] = topk_p_d[r][k] + scores[r]. Shape (topk, topk).
@@ -1037,10 +1035,10 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         }
     }
 
-    // Tree finalization. Flatten scores_list and ss_token to 1D arrays of size
-    // K + (depth-1)*K*K (= 55 for K=5, depth=3).
+    // Tree finalization. Flatten scores_list and ss_token to 1D arrays.
+    const size_t flattened_size = topk + (depth - 1) * topk * topk;
     std::vector<float> scores_list_flat;
-    scores_list_flat.reserve(topk + 2 * topk * topk);  // = 55
+    scores_list_flat.reserve(flattened_size);
     for (const auto& entry : scores_list) {
         for (const auto& row : entry) {
             scores_list_flat.insert(scores_list_flat.end(), row.begin(), row.end());
@@ -1048,7 +1046,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     }
 
     std::vector<uint32_t> ss_token_list;
-    ss_token_list.reserve(topk + 2 * topk * topk);
+    ss_token_list.reserve(flattened_size);
     for (const auto& entry : ss_token) {
         for (const auto& row : entry) {
             ss_token_list.insert(ss_token_list.end(), row.begin(), row.end());
@@ -1252,6 +1250,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         // result.token is only meaningful at the LAST group; earlier ones get
         // overwritten by subsequent dispatches.
         result.token = run_model_once(num_tokens, offset, num_input_tokens, 0);
+        if (!_is_running.load(std::memory_order_relaxed))
+            return result;
 
         // Copy this group's captures into the accumulator before next dispatch.
         for (size_t cap_idx = 0; cap_idx < result.hidden_states.size(); ++cap_idx) {
@@ -1298,6 +1298,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         *this, std::move(input_ids), std::move(hidden_states_concat),
         static_cast<int>(prefix_cached), /*is_prefill=*/true
     );
+    if (!_is_running.load(std::memory_order_relaxed))
+        return result;
     result.draft_tokens       = std::move(topk_result.draft_tokens);
     result.retrieve_indices   = std::move(topk_result.retrieve_indices);
     result.tree_mask          = std::move(topk_result.tree_mask);
@@ -1327,6 +1329,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result
 ) {
+    _is_running = true;
+
     if (performance_result != nullptr) {
         *performance_result = GenerationPerformanceResult{};
         performance_result->accepted_draft_tokens = 0;
@@ -1355,9 +1359,11 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         );
         _cached_token_ids.clear();
         draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
         _cached_eagle3_prompt_len = 0;
         _text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
         _text_streamer.wait_streaming();
+        _is_running = false;
         return std::nullopt;
     }
 
@@ -1373,6 +1379,16 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     auto init = initialize_tree(
         draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
     );
+    if (!_is_running.load(std::memory_order_relaxed)) {
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
+        _cached_eagle3_prompt_len = 0;
+        _notify_interrupt();
+        _text_streamer.wait_streaming();
+        return std::nullopt;
+    }
+
     if (performance_result != nullptr) {
         performance_result->token_durations.emplace_back(init.time_to_first_token);
         performance_result->generated_tokens = 1;
@@ -1416,6 +1432,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         auto td = tree_decoding(
             draft_tokens, tree_position_ids, input_ids, retrieve_indices
         );
+        if (!_is_running.load(std::memory_order_relaxed))
+            break;
 
         // candidates[p][d] = draft_tokens[retrieve_indices[p][d]]; -1 entries
         // mean "path padding" and stay as -1 in the output.
@@ -1438,11 +1456,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         }
 
         auto post = eagle_helpers::evaluate_posterior(
-            td.logits.data(),
+            td.next_token_ids.data(),
             candidates_flat.data(),
             n_paths,
-            max_depth,
-            td.vocab_size
+            max_depth
         );
         const size_t accepted_count = static_cast<size_t>(post.accept_length) + 1;
         const bool final_batch = input_ids.size() + accepted_count + spec_budget > max_length;
@@ -1471,8 +1488,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
                 retrieve_indices,
                 new_token,
                 td.hidden_states,
-                post.sample_p
+                post.bonus_token
             );
+            if (!_is_running.load(std::memory_order_relaxed))
+                break;
 
             // Sync target's stable_kv with draft's — same pattern as after
             // initialize_tree.
@@ -1531,6 +1550,16 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         }
     }
 
+    if (!_is_running.load(std::memory_order_relaxed)) {
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
+        _cached_eagle3_prompt_len = 0;
+        _notify_interrupt();
+        _text_streamer.wait_streaming();
+        return std::nullopt;
+    }
+
     // TPS summary.
     const auto run_model_duration = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - run_model_begin
@@ -1559,6 +1588,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     if (cache_full) {
         _cached_token_ids.clear();
         draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
         _cached_eagle3_prompt_len = 0;
     }
     _text_streamer.push(
@@ -1566,7 +1596,12 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     );
     _text_streamer.wait_streaming();
 
-    return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
+    if (_is_running) {
+        _is_running = false;
+        return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
+    } else {
+        return std::nullopt;
+    }
 }
 
 
