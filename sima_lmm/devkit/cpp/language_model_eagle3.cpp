@@ -1596,8 +1596,12 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     );
     _text_streamer.wait_streaming();
 
-    _is_running = false;
-    return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
+    if (_is_running) {
+        _is_running = false;
+        return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
+    } else {
+        return std::nullopt;
+    }
 }
 
 
