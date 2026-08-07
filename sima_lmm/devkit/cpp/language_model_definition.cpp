@@ -72,6 +72,9 @@ void LanguageModel::_define_attn_models_iter(
     // Draft pre takes an extra IFM (buffer1a) for the FC fusion output / target hidden state.
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool uses_embedding_scale = (
+        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
+    );
 
     std::vector<MLABufferSlice> pre_ifms;
     std::vector<MLABufferSlice> pre_ofms;
@@ -86,6 +89,9 @@ void LanguageModel::_define_attn_models_iter(
         }
     } else {
         pre_ifms.emplace_back(MLABufferSlice{});
+        if (uses_embedding_scale) {
+            pre_ifms.emplace_back(MLABufferSlice{});
+        }
         if (is_draft) {
             pre_ifms.emplace_back(MLABufferSlice{});
         }
@@ -130,7 +136,7 @@ void LanguageModel::_define_attn_models_iter(
                 MLABufferSlice(
                     &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
             );
         }
@@ -146,7 +152,7 @@ void LanguageModel::_define_attn_models_iter(
                 MLABufferSlice(
                     &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
             );
         }
@@ -222,7 +228,7 @@ void LanguageModel::_define_attn_models_iter(
             MLABufferSlice{
                 &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
                 {0, cache_token_idx_begin, 0},
-                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             }
         );
     }
@@ -276,7 +282,7 @@ void LanguageModel::_define_attn_models_iter(
             MLABufferSlice{
                 &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
                 {0, cache_token_idx_begin, 0},
-                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 8}
+                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             }
         );
     }
@@ -297,9 +303,17 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
 
-    // Post model. For draft, post IFM 0 is the FC fusion output (pre IFM 1), not the
-    // token embeddings (pre IFM 0). For target, pre IFM 0 is the hidden state directly.
-    std::vector<MLABufferSlice> post_ifms{is_draft ? pre_ifms[1] : pre_ifms[0], cache_ofms[0]};
+    // Draft post consumes the pre model's hidden-state input; target post consumes its
+    // embedding/hidden-state input. Keep an embedding scale directly after that input.
+    const size_t pre_hidden_state_idx = 1 + static_cast<size_t>(uses_embedding_scale);
+    std::vector<MLABufferSlice> post_ifms{
+        is_draft ? pre_ifms[pre_hidden_state_idx] : pre_ifms[0]
+    };
+    if (uses_embedding_scale) {
+        post_ifms.emplace_back(MLABufferSlice{});
+    }
+    const size_t post_self_attn_idx = post_ifms.size();
+    post_ifms.emplace_back(cache_ofms[0]);
     const bool use_single_post_for_target_group = (
         _cfg.lm_cfg.is_spec_decode()
         && !is_draft
@@ -312,8 +326,8 @@ void LanguageModel::_define_attn_models_iter(
             {0, 0},
             {single_num_tokens, _cfg.lm_cfg.hidden_size}
         };
-        post_ifms[1] = MLABufferSlice{
-            post_ifms[1].get_buf_ptr(),
+        post_ifms[post_self_attn_idx] = MLABufferSlice{
+            post_ifms[post_self_attn_idx].get_buf_ptr(),
             {0, 0},
             {single_num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}
         };
@@ -430,6 +444,9 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
         );
     } else {
         conv_ifms.emplace_back(MLABufferSlice{});
+        if (_cfg.pipeline_cfg.quantize_embeddings) {
+            conv_ifms.emplace_back(MLABufferSlice{});
+        }
     }
     conv_ifms.emplace_back(
         MLABufferSlice{
@@ -569,9 +586,21 @@ void LanguageModel::_define_per_layer_models() {
     for (auto num_tokens : num_tokens_vec) {
         LanguageModelMapKey key{num_tokens, 0, 0};
         std::vector<MLABufferSlice> ifms{
-            MLABufferSlice{&get_buffer(fmt::format("per_layer_emb_staging_n{}", num_tokens))},
-            MLABufferSlice{}
+            MLABufferSlice{&get_buffer(fmt::format("per_layer_emb_staging_n{}", num_tokens))}
         };
+        if (_cfg.pipeline_cfg.quantize_embeddings) {
+            ifms.emplace_back(
+                MLABufferSlice{
+                    &get_buffer(
+                        fmt::format("per_layer_emb_staging_scale_n{}", num_tokens)
+                    )
+                }
+            );
+        }
+        ifms.emplace_back(MLABufferSlice{});
+        if (_cfg.pipeline_cfg.quantize_embeddings) {
+            ifms.emplace_back(MLABufferSlice{});
+        }
         std::vector<MLABufferSlice> ofms{
             MLABufferSlice{&get_buffer(fmt::format("n{}_per_layer_input", num_tokens))}
         };
@@ -658,4 +687,3 @@ std::filesystem::path LanguageModel::_get_elf_path_per_layer(uint16_t num_tokens
 
 } // namespace llima
 } // namespace simaai
-

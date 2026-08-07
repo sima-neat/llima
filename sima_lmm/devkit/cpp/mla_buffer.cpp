@@ -248,7 +248,7 @@ uint32_t MLABuffer::get_buf_addr_offset(const std::optional<std::vector<uint32_t
     if (begin.has_value()) {
         uint32_t offset = 0;
         for (uint32_t i = 0; i < _shape.size(); ++i) {
-            offset = offset * _shape[i] + begin.value()[i];
+            offset += begin.value()[i] * _stride[i];
         }
         return offset * _elem_size;
     } else {
@@ -264,8 +264,10 @@ uint64_t MLABuffer::get_buf_addr(const std::optional<std::vector<uint32_t>>& beg
 
 uint64_t MLABuffer::get_buf_len(const std::optional<std::vector<uint32_t>>& shape) const {
     if (shape.has_value()) {
-        uint32_t size = _elem_size;
-        for (uint32_t i = 0; i < shape->size(); ++i) {
+        uint64_t size = _align_last_dim
+            ? round_up_to_row(shape->back() * _elem_size)
+            : shape->back() * _elem_size;
+        for (uint32_t i = 0; i + 1 < shape->size(); ++i) {
             size *= shape.value()[i];
         }
         return size;
