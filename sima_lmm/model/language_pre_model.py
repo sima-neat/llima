@@ -29,12 +29,9 @@ class LanguagePreModel(LanguagePartBaseModel):
         num_tokens: Number of tokens. Set to a value greater than 1 to consume multiple input tokens
             in one model.
         layer_idx: Transformer layer index.
-        embeddings_scale: Scale factor used for de-quantization when embeddings quantization is
-            enabled, None otherwise.
     """
     num_tokens: int
     layer_idx: int
-    embeddings_scale: float | np.ndarray | None = None
 
     def __post_init__(self):
         assert self.num_tokens >= 1
@@ -348,6 +345,7 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        scale_shape = (1, 1, self.num_tokens, 1)
         freq_shape = (
             1,
             1,
@@ -363,6 +361,10 @@ class LanguagePreModel(LanguagePartBaseModel):
         model_input_input = builder.create_placeholder_node(
             "input", TensorType(input_dtype, input_shape)
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            model_input_scale = builder.create_placeholder_node(
+                "input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         # EAGLE3 draft model has an extra hidden_states input
         if self.is_draft:
             model_input_hidden_states = builder.create_placeholder_node(
@@ -376,13 +378,20 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
 
         # MLA subgraph inputs are the same as the model inputs, except the node names are different
-        subnet_inputs = [model_input_input, model_input_freq_real, model_input_freq_imag]
+        subnet_inputs = [model_input_input]
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            subnet_inputs.append(model_input_scale)
         if self.is_draft:
-            subnet_inputs.insert(1, model_input_hidden_states)
+            subnet_inputs.append(model_input_hidden_states)
+        subnet_inputs.extend([model_input_freq_real, model_input_freq_imag])
         builder.begin_subnet(subnet_inputs)
         mla_input_input = builder.create_placeholder_node(
             "MLA_0/input", TensorType(input_dtype, input_shape)
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            mla_input_scale = builder.create_placeholder_node(
+                "MLA_0/input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         # EAGLE3 draft model has an extra hidden_states input
         if self.is_draft:
             mla_input_hidden_states = builder.create_placeholder_node(
@@ -395,14 +404,10 @@ class LanguagePreModel(LanguagePartBaseModel):
             "MLA_0/freq_imag", TensorType(activation_type(quantizable), freq_shape)
         )
 
-        # De-quantize embeddings table if needed.
+        # Dequantize the selected embedding rows before the first layer consumes them.
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            assert self.embeddings_scale is not None
-            rms_norm_in = builder.create_dequantization_node(
-                "MLA_0/input",
-                input_shape,
-                1 / self.embeddings_scale,
-                output_dtype=activation_dtype(quantizable)
+            rms_norm_in = builder.create_dynamic_dequant_node(
+                mla_input_input, mla_input_scale
             )
         else:
             rms_norm_in = mla_input_input

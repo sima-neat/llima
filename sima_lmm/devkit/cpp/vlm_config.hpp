@@ -257,14 +257,13 @@ struct PipelineConfig {
     bool use_strided_kv_cache = true;
     bool enable_filter_sharing;
     bool quantize_embeddings = false;
-    std::optional<double> embeddings_scale = std::nullopt;
     bool quantize_kv_cache = false;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     PipelineConfig, system_prompt, chat_template, max_num_tokens, input_token_group_size,
     input_token_group_offsets, future_token_mask_size, long_context_future_token_mask_size,
     return_logits, use_strided_kv_cache, enable_filter_sharing, quantize_embeddings,
-    embeddings_scale, quantize_kv_cache
+    quantize_kv_cache
 )
 
 

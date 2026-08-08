@@ -54,10 +54,6 @@ def test_whisper_finds_generation_config_in_cache_root(tmp_path):
     assert config.num_languages == 2
 
 
-def test_embedding_scale_is_absent_without_embedding_quantization():
-    assert PipelineConfig().embeddings_scale is None
-
-
 def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp_path):
     config = _load_reference_config("qwen3_vl_vlm_config.json")
     hf_model = SimpleNamespace(config={})

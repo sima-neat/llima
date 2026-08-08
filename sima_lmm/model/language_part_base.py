@@ -229,7 +229,7 @@ class LanguagePartBaseModel(BaseModel):
 
     @property
     def uses_quantized_input_embeddings(self) -> bool:
-        return self.cfg.pipeline_cfg.quantize_embeddings and not self.cfg.is_multimodal
+        return self.cfg.pipeline_cfg.quantize_embeddings
 
 
 @dataclass
@@ -244,13 +244,10 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             in one model.
         layer_idx: Transformer layer index.
         final_softcapping: Final logit soft capping for gemma 2.
-        embeddings_scale: Scale factor used for de-quantization when embeddings quantization is
-            enabled, None otherwise.
     """
     num_tokens: int
     layer_idx: int
     final_softcapping: float | None
-    embeddings_scale: float | np.ndarray | None = None
 
     def _create_final_layer_output_nodes(self, output_nodes: list[OnnxNode]):
         """Create output nodes for the final transformer layer."""
