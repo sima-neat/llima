@@ -72,9 +72,10 @@ void LanguageModel::_define_attn_models_iter(
     // Draft pre takes an extra IFM (buffer1a) for the FC fusion output / target hidden state.
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-    const bool uses_embedding_scale = (
+    const bool pre_uses_embedding_scale = (
         _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
     );
+    const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_draft;
 
     std::vector<MLABufferSlice> pre_ifms;
     std::vector<MLABufferSlice> pre_ofms;
@@ -89,7 +90,7 @@ void LanguageModel::_define_attn_models_iter(
         }
     } else {
         pre_ifms.emplace_back(MLABufferSlice{});
-        if (uses_embedding_scale) {
+        if (pre_uses_embedding_scale) {
             pre_ifms.emplace_back(
                 MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
             );
@@ -305,13 +306,13 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
 
-    // Draft post consumes the pre model's hidden-state input; target post consumes its
-    // embedding/hidden-state input. Keep an embedding scale directly after that input.
-    const size_t pre_hidden_state_idx = 1 + static_cast<size_t>(uses_embedding_scale);
+    // Draft post consumes the BF16 FC-fused hidden state. Target post consumes the same
+    // embedding input as pre and therefore also needs its per-row scale.
+    const size_t pre_hidden_state_idx = 1 + static_cast<size_t>(pre_uses_embedding_scale);
     std::vector<MLABufferSlice> post_ifms{
         is_draft ? pre_ifms[pre_hidden_state_idx] : pre_ifms[0]
     };
-    if (uses_embedding_scale) {
+    if (post_uses_embedding_scale) {
         post_ifms.emplace_back(
             MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
         );

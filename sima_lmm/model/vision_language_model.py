@@ -92,7 +92,7 @@ class VisionLanguageModel(BaseModel):
             quantize_kv_cache: True if KV cache is quantized.
             split_mlp: True if mlp is being split into multiple parts.
             target_model: Target VisionLanguageModel when constructing a draft model.
-                Copies tokenizer and embeddings (if missing) from it. None for non-draft models.
+                Reuses its tokenizer when the draft has none. None for non-draft models.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -140,7 +140,7 @@ class VisionLanguageModel(BaseModel):
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
 
-        return VisionLanguageModel(
+        model = VisionLanguageModel(
             cfg=vlm_cfg,
             hf_model=hf_model,
             model_name=model_name,
@@ -148,6 +148,7 @@ class VisionLanguageModel(BaseModel):
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        return model
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)

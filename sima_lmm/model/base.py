@@ -490,14 +490,22 @@ class BaseModel(ABC):
         if write_embeddings or write_embedding_scales:
             embeddings, embeddings_scale = self.get_language_embeddings_tensor()
 
-            # Preserve the table dtype exactly; runtime falls back to legacy .npy packages.
-            if write_embeddings and embeddings is not None:
-                if not self.cfg.pipeline_cfg.quantize_embeddings:
-                    embeddings = embeddings.astype(bfloat16)
-                embeddings.tofile(embeddings_file_name)
-            if write_embedding_scales:
-                assert embeddings_scale is not None
-                embeddings_scale.astype(bfloat16).tofile(embeddings_scale_file_name)
+            # Speculative drafts use the target embedding table and therefore have no local
+            # embedding artifacts. Preserve the table dtype exactly for models that own one.
+            if embeddings is None:
+                assert embeddings_scale is None
+            else:
+                assert (
+                    embeddings_scale is not None
+                    or not self.cfg.pipeline_cfg.quantize_embeddings
+                )
+                if write_embeddings:
+                    if not self.cfg.pipeline_cfg.quantize_embeddings:
+                        embeddings = embeddings.astype(bfloat16)
+                    embeddings.tofile(embeddings_file_name)
+                if write_embedding_scales:
+                    assert embeddings_scale is not None
+                    embeddings_scale.astype(bfloat16).tofile(embeddings_scale_file_name)
             del embeddings
             del embeddings_scale
 

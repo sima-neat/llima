@@ -17,13 +17,8 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
             (False, False, False, True, False),
         ),
         (
-            [
-                "--draft_model_path",
-                "draft",
-                "--no-quantize_embeddings",
-                "--no-quantize_kv_cache",
-            ],
-            (False, False, False, True, True),
+            ["--draft_model_path", "draft"],
+            (False, True, True, True, True),
         ),
         (
             [
@@ -68,10 +63,6 @@ def test_memory_optimization_cli_defaults_and_overrides(
     [
         (
             ["--onnx"],
-            "Pass --no-quantize_embeddings --no-quantize_kv_cache.",
-        ),
-        (
-            ["--draft_model_path", "draft"],
             "Pass --no-quantize_embeddings --no-quantize_kv_cache.",
         ),
     ],

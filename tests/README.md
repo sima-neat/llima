@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 64
+- Expected cases: 63
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -153,7 +153,7 @@ stored in the repository or artifact cache.
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 24 standard and 4 high-memory
+- Expected cases: 22 standard and 6 high-memory
 
 This group validates:
 
@@ -162,8 +162,8 @@ This group validates:
 - GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
 - Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are serial and high-memory. CI runs the 24
-standard cases first and the 4 high-memory cases separately.
+The speculative-decoding cases are serial and high-memory. CI runs the 22
+standard cases first and the 6 high-memory cases separately.
 
 #### Selected-model full compilation E2E
 

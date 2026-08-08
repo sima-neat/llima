@@ -256,7 +256,10 @@ def main():
     )
     group.add_argument(
         "--return_logits", action=argparse.BooleanOptionalAction, default=False,
-        help="Return logits at the last layer output."
+        help=(
+            "Return logits at the last layer output. Automatically enabled when compiling "
+            "for speculative decoding."
+        )
     )
     group.add_argument(
         "--enable_filter_sharing", action=argparse.BooleanOptionalAction, default=False,
@@ -400,22 +403,11 @@ def main():
         _abort("Both --input_height and --input_width must be provided.")
 
     is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
-    is_speculative_decoding = args.draft_model_path is not None
-    return_logits = args.return_logits or is_speculative_decoding
-
     if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
             "ONNX generation does not support embedding or KV-cache quantization. "
             "Pass --no-quantize_embeddings --no-quantize_kv_cache."
         )
-    # TODO: Enable these features for EAGLE3 once its target/draft staging and runtime
-    # paths support embedding and KV-cache quantization.
-    if is_speculative_decoding and (args.quantize_embeddings or args.quantize_kv_cache):
-        _abort(
-            "EAGLE3 does not support embedding or KV-cache quantization. "
-            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
-        )
-
     lora_path_for_base_model = None
     if args.lora_names is not None and args.lora_paths is not None:
         if len(args.lora_names) != len(args.lora_paths):
@@ -426,6 +418,7 @@ def main():
 
     # Enable MLP splitting when LoRA is not used. The feature is not implemented for LoRA.
     split_mlp = lora_path_for_base_model is None
+    return_logits = args.return_logits or args.draft_model_path is not None
 
     gen_files(
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,

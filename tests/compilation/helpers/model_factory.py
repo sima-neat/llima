@@ -37,6 +37,8 @@ def load_speculative_draft_model(
     model_inputs_path: Path,
     *,
     max_num_tokens: int = 1024,
+    quantize_embeddings: bool = False,
+    quantize_kv_cache: bool = False,
 ) -> VisionLanguageModel:
     target_path = require_readable_path(
         model_inputs_path / target_model_folder,
@@ -54,6 +56,8 @@ def load_speculative_draft_model(
         sima_path=output_path / "target" / "sima",
         max_num_tokens=max_num_tokens,
         system_prompt=None,
+        quantize_embeddings=quantize_embeddings,
+        quantize_kv_cache=quantize_kv_cache,
     )
     target_model.configure_speculative_decoding(is_draft=False)
 
@@ -65,6 +69,8 @@ def load_speculative_draft_model(
         target_model=target_model,
         max_num_tokens=max_num_tokens,
         system_prompt=None,
+        quantize_embeddings=quantize_embeddings,
+        quantize_kv_cache=quantize_kv_cache,
     )
 
     del target_model

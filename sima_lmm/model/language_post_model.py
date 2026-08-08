@@ -39,6 +39,11 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.pipeline_cfg.split_mlp
 
     @property
+    def uses_quantized_input_embeddings(self) -> bool:
+        # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
+        return super().uses_quantized_input_embeddings and not self.is_draft
+
+    @property
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
         return base if self.is_draft else f"{base}.layers.{self.layer_idx}"

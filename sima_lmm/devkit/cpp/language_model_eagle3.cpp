@@ -131,19 +131,6 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     // Drafts share the target's embedding table — read rows from target's buffer.
     const auto& target_embeddings_buf = target_lm.get_buffer("embeddings");
     const uint32_t embed_size = target_embeddings_buf.get_shape().back();  // = hidden_size
-    const auto* embeddings_ptr = reinterpret_cast<const Eigen::bfloat16*>(
-        target_embeddings_buf.get_virtual_addr()
-    );
-    std::vector<Eigen::bfloat16> input_embeds(seq_length * embed_size);
-    const size_t row_bytes = embed_size * sizeof(Eigen::bfloat16);
-    for (size_t i = 0; i < seq_length; ++i) {
-        const uint32_t token_id = input_ids[i];
-        std::memcpy(
-            input_embeds.data() + i * embed_size,
-            embeddings_ptr + token_id * embed_size,
-            row_bytes
-        );
-    }
 
     // FC fusion: folds (seq_length, 3*hidden_size) stacked target captures down
     // to (seq_length, hidden_size). Skipped when input is already hidden_size wide.
@@ -194,31 +181,33 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         auto& fc_output = get_buffer(fmt::format("fc_n{}_output", num_tokens));
         fc_output.upload(hidden_states_padded.data());
     }
-    // Stage token embeds for pre_model IFM[0]; IFM[1] is the FC output above.
-    std::vector<Eigen::bfloat16> input_embeds_padded(
-        static_cast<size_t>(num_tokens) * embed_size, Eigen::bfloat16{0.0f}
+    // Stage token embeds and, when quantized, their per-row dynamic-dequant scales.
+    const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
+    auto& token_embeds_buf = use_int8_embedding_staging
+        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
+        : get_buffer(fmt::format("n{}_buffer1", num_tokens));
+    MLABuffer* token_embedding_scales_buf = use_int8_embedding_staging
+        ? &get_buffer(fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
+        : nullptr;
+    _stage_embedding_rows(
+        target_lm, input_ids, token_embeds_buf, token_embedding_scales_buf
     );
-    std::memcpy(
-        input_embeds_padded.data(),
-        input_embeds.data(),
-        seq_length * embed_size * sizeof(Eigen::bfloat16)
-    );
-    auto& token_embeds_buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-    token_embeds_buf.upload(input_embeds_padded.data());
 
     // Bind the compact wrappers to this forward pass before enqueueing them.
     const uint8_t  layer_idx = 0;
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
     const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-    const auto cache_key = _bind_attn_models(num_tokens, token_idx, layer_idx);
+    const auto cache_key = _bind_attn_models(
+        num_tokens, token_idx, layer_idx, token_embedding_scales_buf
+    );
     auto& fc_output_buf = get_buffer(fmt::format("fc_n{}_output", num_tokens));
 
     if (is_prefill) {
         _upload_group_future_token_masks(num_tokens, token_idx);
     }
 
-    // pre_model dispatch with explicit IFM begins/shapes for token embeds
-    // (IFM[0]) and FC output (IFM[1]).
+    // pre_model dispatch with explicit IFM begins/shapes for token embeds and FC output.
+    // Quantized models insert the embedding scale between those two inputs.
     std::map<uint8_t, MLABufferSlice> pre_ifm_map;
     pre_ifm_map.emplace(
         std::piecewise_construct,
@@ -231,20 +220,21 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     );
     pre_ifm_map.emplace(
         std::piecewise_construct,
-        std::forward_as_tuple(1),
+        std::forward_as_tuple(use_int8_embedding_staging ? 2 : 1),
         std::forward_as_tuple(
             &fc_output_buf,
             std::vector<uint32_t>{0, 0},
             std::vector<uint32_t>{num_tokens, embed_size}
         )
     );
-    // Override freq IFMs (2, 3) to read from row 0 — both the sliced and the
-    // pristine linear paths upload starting at row 0.
+    // Override freq IFMs to read from row 0 — both the sliced and the pristine
+    // linear paths upload starting at row 0.
     {
+        const uint8_t freq_ifm_idx = use_int8_embedding_staging ? 3 : 2;
         const uint32_t freq_dim = freq_real_buf.get_shape().back();
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(2),
+            std::forward_as_tuple(freq_ifm_idx),
             std::forward_as_tuple(
                 &freq_real_buf,
                 std::vector<uint32_t>{0, 0},
@@ -253,7 +243,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         );
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(3),
+            std::forward_as_tuple(freq_ifm_idx + 1),
             std::forward_as_tuple(
                 &freq_imag_buf,
                 std::vector<uint32_t>{0, 0},
@@ -388,26 +378,17 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         padded_mask.data(), 0, padded_mask.size() * sizeof(Eigen::bfloat16)
     );
 
-    // Stage input embeddings. The same `input_embeds` buffer is reused for both
-    // n128 prefill and n16 verify; we write the first K rows here.
-    const auto& embeddings_buf = get_buffer("embeddings");
-    const auto* embeddings_ptr = reinterpret_cast<const Eigen::bfloat16*>(
-        embeddings_buf.get_virtual_addr()
+    // Stage arbitrary candidate rows into the dtype expected by layer 0.
+    const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
+    auto& input_embeds_buf = use_int8_embedding_staging
+        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
+        : get_buffer("input_embeds");
+    MLABuffer* input_embedding_scales_buf = use_int8_embedding_staging
+        ? &get_buffer(fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
+        : nullptr;
+    _stage_embedding_rows(
+        *this, input_ids, input_embeds_buf, input_embedding_scales_buf
     );
-    std::vector<Eigen::bfloat16> input_embeds_padded(
-        static_cast<size_t>(num_tokens) * hidden_size, Eigen::bfloat16{0.0f}
-    );
-    const size_t row_bytes = hidden_size * sizeof(Eigen::bfloat16);
-    for (size_t i = 0; i < seq_length; ++i) {
-        const uint32_t token_id = input_ids[i];
-        std::memcpy(
-            input_embeds_padded.data() + i * hidden_size,
-            embeddings_ptr + token_id * hidden_size,
-            row_bytes
-        );
-    }
-    auto& input_embeds_buf = get_buffer("input_embeds");
-    input_embeds_buf.upload(input_embeds_padded.data());
 
     // Per-layer loop; capture hidden states at layers {2, N/2, N-3}.
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
@@ -427,7 +408,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         }
 
         const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-        const auto cache_key = _bind_attn_models(num_tokens, token_idx, layer_idx);
+        const auto cache_key = _bind_attn_models(
+            num_tokens, token_idx, layer_idx, input_embedding_scales_buf
+        );
 
         // Slot 0 (input_embeds for layer 0) is shared between pre and post —
         // both have empty-placeholder bindings, so build the override once.
@@ -444,9 +427,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             );
         }
 
-        // Freq IFMs (slots 1, 2) need pre-only overrides — redirect static
+        // Freq IFMs need pre-only overrides — redirect static
         // (past_kv_len, 0) read to row 0. Leaking these into post would
-        // corrupt its slots 1, 2 (cache_ofms / per_layer_input).
+        // corrupt its scale/cache/per-layer inputs.
         // Pick local vs global freq buffers based on layer type so sliding
         // layers consume rope_local_base_freq and full layers consume rope_theta.
         const bool is_sliding = layer_types[layer_idx] == "sliding_attention";
@@ -454,11 +437,14 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             ? get_buffer("local_freq_real") : freq_real_buf;
         auto& layer_freq_imag = is_sliding
             ? get_buffer("local_freq_imag") : freq_imag_buf;
+        const uint8_t freq_ifm_idx = (
+            use_int8_embedding_staging && layer_idx == 0 ? 2 : 1
+        );
         const uint32_t layer_freq_dim = layer_freq_real.get_shape().back();
         auto pre_ifm_map = ifm_map;
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(1),
+            std::forward_as_tuple(freq_ifm_idx),
             std::forward_as_tuple(
                 &layer_freq_real,
                 std::vector<uint32_t>{0, 0},
@@ -467,7 +453,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         );
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(2),
+            std::forward_as_tuple(freq_ifm_idx + 1),
             std::forward_as_tuple(
                 &layer_freq_imag,
                 std::vector<uint32_t>{0, 0},
