@@ -199,11 +199,14 @@ void MLABuffer::load_stream(std::istream& stream) {
 
 
 void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bool flush) {
-    if (_align_last_dim && (_shape.back() % MLA_ROW_SIZE != 0)) {
-        assert(data_begin == 0);
-        assert(data_size == 0 || data_size == _size);
-        uint32_t last_dim = _shape.back() * _elem_size;
-        uint32_t last_dim_padded = round_up_to_row(last_dim);
+    if (data_begin != 0 || (data_size != 0 && data_size != _size)) {
+        upload_slice(data, data_begin, data_size, flush);
+        return;
+    }
+
+    const uint32_t last_dim = _shape.back() * _elem_size;
+    const uint32_t last_dim_padded = round_up_to_row(last_dim);
+    if (_align_last_dim && last_dim != last_dim_padded) {
         uint32_t num_last_dims = _size_padded / last_dim_padded;
 
         for (uint32_t i = 0; i < num_last_dims; ++i) {
@@ -213,13 +216,27 @@ void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bo
                 last_dim
             );
         }
-    } else if (data_size > 0 && data_size < _size) {
-        std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + data_begin, data, data_size);
     } else {
         std::memcpy(_virtual_addr, data, _size);
     }
     if (flush)
         flush_cache();
+}
+
+
+void MLABuffer::upload_slice(
+    const void* data, size_t data_begin, size_t data_size, bool flush
+) {
+    if (data_begin > _size_padded || data_size > _size_padded - data_begin) {
+        throw std::out_of_range(fmt::format(
+            "Upload range [{}, {}) exceeds buffer {} size {}",
+            data_begin, data_begin + data_size, _name, _size_padded
+        ));
+    }
+    if (data_size == 0) return;
+    std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + data_begin, data, data_size);
+    if (flush)
+        flush_cache(data_begin, data_size);
 }
 
 

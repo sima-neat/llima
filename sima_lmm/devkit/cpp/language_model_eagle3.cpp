@@ -83,14 +83,14 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
             }
         }
         const size_t freq_bytes = freq_real_padded.size() * sizeof(Eigen::bfloat16);
-        freq_real_buf.upload(freq_real_padded.data(), 0, freq_bytes);
-        freq_imag_buf.upload(freq_imag_padded.data(), 0, freq_bytes);
+        freq_real_buf.upload_slice(freq_real_padded.data(), 0, freq_bytes);
+        freq_imag_buf.upload_slice(freq_imag_padded.data(), 0, freq_bytes);
     } else {
         const size_t freq_bytes =
             static_cast<size_t>(num_tokens) * freq_real_buf.get_shape().back()
             * sizeof(Eigen::bfloat16);
-        freq_real_buf.upload(_global_freq_host.re.data(), 0, freq_bytes);
-        freq_imag_buf.upload(_global_freq_host.im.data(), 0, freq_bytes);
+        freq_real_buf.upload_slice(_global_freq_host.re.data(), 0, freq_bytes);
+        freq_imag_buf.upload_slice(_global_freq_host.im.data(), 0, freq_bytes);
     }
 
     // Default mask is all-ones; tree overlay applied by prepare_attention_mask.
@@ -123,7 +123,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
 
     // Decode (n5) uses this runtime mask; prefill (n128) uses the group-mask buffer.
     if (!is_prefill) {
-        get_buffer("future_token_mask").upload(
+        get_buffer("future_token_mask").upload_slice(
             padded_mask.data(), 0, padded_mask.size() * sizeof(Eigen::bfloat16)
         );
     }
@@ -349,8 +349,8 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             }
         }
         const size_t freq_bytes = real_padded.size() * sizeof(Eigen::bfloat16);
-        real_buf.upload(real_padded.data(), 0, freq_bytes);
-        imag_buf.upload(imag_padded.data(), 0, freq_bytes);
+        real_buf.upload_slice(real_padded.data(), 0, freq_bytes);
+        imag_buf.upload_slice(imag_padded.data(), 0, freq_bytes);
     };
     upload_freq_rows(_global_freq_host, "global_freq_real", "global_freq_imag");
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
@@ -384,7 +384,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             padded_mask[r * pad_cols + c] = mask[r * seq_len_with_past + c];
         }
     }
-    get_buffer("future_token_mask").upload(
+    get_buffer("future_token_mask").upload_slice(
         padded_mask.data(), 0, padded_mask.size() * sizeof(Eigen::bfloat16)
     );
 

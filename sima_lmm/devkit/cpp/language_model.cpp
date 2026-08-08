@@ -793,7 +793,7 @@ void LanguageModel::_upload_group_future_token_masks(
                 Eigen::bfloat16{0.0f}
             );
         }
-        get_buffer(name).upload(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
+        get_buffer(name).upload_slice(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
     };
 
     upload_group_mask(
@@ -1326,7 +1326,7 @@ void LanguageModel::_initialize() {
         );
         MLABuffer& future_token_mask_buf = get_buffer("future_token_mask");
         future_token_mask_buf.clear(false);
-        future_token_mask_buf.upload(
+        future_token_mask_buf.upload_slice(
             future_token_mask.data(),
             _cfg.pipeline_cfg.max_num_tokens * 2,
             future_token_mask.size() * 2,
@@ -1385,7 +1385,7 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
             auto layer_idx = state.layer_indices[layer_slot];
             auto& checkpoints = state.checkpoints[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.upload(
+            buf.upload_slice(
                 checkpoints[requested_boundary].data(),
                 dst_offset,
                 state.tail_bytes,
@@ -2223,7 +2223,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
             token_idx = next_token_idx;
         } else {
             auto next_token_idx = token_idx + 1;
-            buf.upload(
+            buf.upload_slice(
                 embeddings_ptr + token_id * embeddings_row_size,
                 token_idx * input_row_size,
                 input_row_size,
@@ -2233,10 +2233,12 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
                 const auto* scale_src = reinterpret_cast<const uint8_t*>(
                     embedding_scales_buf->get_virtual_addr()
                 ) + static_cast<size_t>(token_id) * scale_row_size;
-                auto* scale_dst = reinterpret_cast<uint8_t*>(
-                    scales_buf->get_virtual_addr()
-                ) + static_cast<size_t>(token_idx) * scale_row_size;
-                std::memcpy(scale_dst, scale_src, scale_row_size);
+                scales_buf->upload_slice(
+                    scale_src,
+                    static_cast<size_t>(token_idx) * scale_row_size,
+                    scale_row_size,
+                    false
+                );
             }
             if (
                 num_images == 0

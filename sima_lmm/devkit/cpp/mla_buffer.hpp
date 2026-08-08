@@ -37,8 +37,12 @@ class MLABuffer {
         // Load the next raw, unpadded tensor payload from a stream.
         // MLA row padding is inserted when this buffer requires it.
         void load_stream(std::istream& stream);
+        // upload() copies a full logical tensor; upload_slice() copies MLA-layout bytes.
         void upload(
             const void* data, size_t data_begin = 0, size_t data_size = 0, bool flush = true
+        );
+        void upload_slice(
+            const void* data, size_t data_begin, size_t data_size, bool flush = true
         );
         void download(void* data) const;
         uint32_t get_buf_addr_offset(
