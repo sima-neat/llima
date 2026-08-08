@@ -437,7 +437,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             ? get_buffer("local_freq_real") : freq_real_buf;
         auto& layer_freq_imag = is_sliding
             ? get_buffer("local_freq_imag") : freq_imag_buf;
-        const uint8_t freq_ifm_idx = use_int8_embedding_staging ? 2 : 1;
+        const uint8_t freq_ifm_idx = (
+            use_int8_embedding_staging && layer_idx == 0 ? 2 : 1
+        );
         const uint32_t layer_freq_dim = layer_freq_real.get_shape().back();
         auto pre_ifm_map = ifm_map;
         pre_ifm_map.emplace(

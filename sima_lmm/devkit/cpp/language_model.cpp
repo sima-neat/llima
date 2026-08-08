@@ -2025,7 +2025,9 @@ void LanguageModel::compact_kv_after_accept(
                 "Unsupported EAGLE3 KV buffer shape for {}", name
             ));
         }
-        const size_t row_bytes = shape[2] * buf.get_elem_size();
+        const size_t row_bytes = buf.get_buf_len(
+            std::vector<uint32_t>{1, 1, static_cast<uint32_t>(shape[2])}
+        );
         const size_t head_stride_bytes = max_num_tokens * row_bytes;
         std::vector<uint8_t> tmp(n * row_bytes);
 
