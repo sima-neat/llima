@@ -2014,6 +2014,7 @@ void LanguageModel::compact_kv_after_accept(
     const size_t min_src_pos = *min_src_it;
     const size_t max_src_pos = *max_src_it;
 
+    std::vector<uint8_t> tmp;
     auto compact_buffer = [&](const std::string& name) {
         auto& buf = get_buffer(name);
         const auto& shape = buf.get_shape();
@@ -2029,7 +2030,7 @@ void LanguageModel::compact_kv_after_accept(
             std::vector<uint32_t>{1, 1, static_cast<uint32_t>(shape[2])}
         );
         const size_t head_stride_bytes = max_num_tokens * row_bytes;
-        std::vector<uint8_t> tmp(n * row_bytes);
+        tmp.resize(n * row_bytes);
 
         auto* data = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
         for (uint32_t head = 0; head < num_kv_heads; ++head) {
