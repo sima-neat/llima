@@ -199,8 +199,9 @@ void MLABuffer::load_stream(std::istream& stream) {
 
 
 void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bool flush) {
+    // Upload a full logical tensor, inserting physical MLA row padding when needed.
     if (data_begin != 0 || (data_size != 0 && data_size != _size)) {
-        upload_slice(data, data_begin, data_size, flush);
+        upload_raw(data, data_begin, data_size, flush);
         return;
     }
 
@@ -224,19 +225,20 @@ void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bo
 }
 
 
-void MLABuffer::upload_slice(
-    const void* data, size_t data_begin, size_t data_size, bool flush
+void MLABuffer::upload_raw(
+    const void* data, size_t destination_offset, size_t size, bool flush
 ) {
-    if (data_begin > _size_padded || data_size > _size_padded - data_begin) {
+    // Copy bytes verbatim into a physical MLA buffer offset.
+    if (destination_offset > _size_padded || size > _size_padded - destination_offset) {
         throw std::out_of_range(fmt::format(
             "Upload range [{}, {}) exceeds buffer {} size {}",
-            data_begin, data_begin + data_size, _name, _size_padded
+            destination_offset, destination_offset + size, _name, _size_padded
         ));
     }
-    if (data_size == 0) return;
-    std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + data_begin, data, data_size);
+    if (size == 0) return;
+    std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + destination_offset, data, size);
     if (flush)
-        flush_cache(data_begin, data_size);
+        flush_cache(destination_offset, size);
 }
 
 
