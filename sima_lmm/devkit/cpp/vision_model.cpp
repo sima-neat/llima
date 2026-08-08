@@ -15,26 +15,6 @@ VisionModel::VisionModel(
 }
 
 
-std::vector<Eigen::bfloat16> VisionModel::run_model(
-    const std::vector<Eigen::bfloat16>& ifm_tensor
-) {
-    // Upload the ifm.
-    get_buffer("vision_ifm").upload(ifm_tensor.data());
-
-    // Run the models.
-    for (auto& model_ptr: _model_ptrs) {
-        model_ptr->add_to_queue();
-    }
-    MLAModelWithBuffer::run_queue();
-
-    // Download the ofm.
-    auto& ofm_buf = get_buffer("vision_ofm");
-    std::vector<Eigen::bfloat16> ofm_tensor(ofm_buf.get_num_elems());
-    ofm_buf.download(ofm_tensor.data());
-    return ofm_tensor;
-}
-
-
 void VisionModel::run_model(
     const std::vector<Eigen::bfloat16>& ifm_tensor, std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
@@ -102,7 +82,14 @@ void VisionModel::_define_buffers() {
         );
     }
 
-    define_buffer("vision_ofm", {_mm_cfg.mm_tokens_per_image, _cfg.lm_cfg.hidden_size});
+    define_buffer(
+        "vision_ofm",
+        {_mm_cfg.mm_tokens_per_image, _cfg.lm_cfg.hidden_size},
+        _cfg.pipeline_cfg.quantize_embeddings ? "int8" : "bfloat16"
+    );
+    if (_cfg.pipeline_cfg.quantize_embeddings) {
+        define_buffer("vision_ofm_scale", {_mm_cfg.mm_tokens_per_image, 1});
+    }
     if (_cfg.vision_model_name.size() > 1) {
         uint32_t seq_len = (
             _vm_cfg.num_spatial_patches[0] * _vm_cfg.num_spatial_patches[1] + _vm_cfg.cls_embed
@@ -126,6 +113,9 @@ void VisionModel::_define_models() {
     }
 
     std::vector<MLABufferSlice> final_ofms{&get_buffer("vision_ofm")};
+    if (_cfg.pipeline_cfg.quantize_embeddings) {
+        final_ofms.emplace_back(&get_buffer("vision_ofm_scale"));
+    }
     for (size_t i = 0; i < _vm_cfg.deepstack_visual_indexes.size(); ++i) {
         final_ofms.emplace_back(&get_buffer(fmt::format("deepstack_feature_l{}", i)));
     }

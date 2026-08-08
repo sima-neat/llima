@@ -17,7 +17,6 @@ class VisionModel : public BaseModel<VlmConfig> {
         VisionModel(std::filesystem::path model_path);
         virtual ~VisionModel() { _finalize(); };
 
-        std::vector<Eigen::bfloat16> run_model(const std::vector<Eigen::bfloat16>& ifm_tensor);
         void run_model(
             const std::vector<Eigen::bfloat16>& ifm_tensor,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr

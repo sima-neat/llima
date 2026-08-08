@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import time
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 
 from afe.ir.tensor_type import ScalarType
 from afe.ir.quantization_conv import block_quantize_weight_tensor
@@ -28,6 +28,26 @@ from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
 
 bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
 
+
+def quantize_embedding_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize each vocabulary row and return MLA dynamic-dequant scales."""
+    assert embeddings.ndim == 2
+    vocab_size, hidden_size = embeddings.shape
+
+    # The weight quantizer treats the final flattened axis as output channels. Put the
+    # vocabulary axis there so per-channel quantization becomes per-vocabulary-row.
+    channel_layout = embeddings.T.reshape(1, 1, hidden_size, 1, vocab_size)
+    quantized, dequant_steps = block_quantize_weight_tensor(
+        channel_layout, per_channel=True, bits=8, c_block_size=None
+    )
+    quantized = quantized.reshape(hidden_size, vocab_size).T
+
+    # block_quantize_weight_tensor returns absmax / 127. DynamicDequant expects absmax.
+    scales = np.asarray(dequant_steps, dtype=np.float32).reshape(vocab_size) * 127.0
+    scales[np.count_nonzero(embeddings, axis=1) == 0] = 0.0
+    return quantized, scales.reshape(vocab_size, 1).astype(bfloat16)
+
+
 @dataclass
 class LanguageModel(BaseModel):
     """Language model implementation.
@@ -43,10 +63,6 @@ class LanguageModel(BaseModel):
     3. PostCacheModel: Post cache model implements the transformer layer after the self-attention
         block, including the layers after the last transformer layer.
     """
-    _embeddings_scale: float | None = field(default=None, init=False, repr=False)
-    _per_layer_embeddings_scale: float | None = field(default=None, init=False, repr=False)
-    _embedding_scale_source: "LanguageModel | None" = field(default=None, init=False, repr=False)
-
     def __post_init__(self):
         if self.cfg.pipeline_cfg.input_token_group_offsets:
             self.cfg.pipeline_cfg.input_token_group_offsets.sort()
@@ -148,42 +164,6 @@ class LanguageModel(BaseModel):
                 curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
 
-        direct_graph_mode = gen_mode in [FileGenMode.SOURCE_TO_FP, FileGenMode.SOURCE_TO_QUANT]
-        if direct_graph_mode and self.cfg.pipeline_cfg.quantize_embeddings:
-            models_to_generate = [
-                model for model, _ in model_list
-                if not (resume and model.get_gen_file_name(gen_mode).is_file())
-            ]
-            input_dequant_models = [
-                model for model in models_to_generate
-                if (
-                    isinstance(model, LanguagePerLayerModel)
-                    or (
-                        isinstance(model, (LanguagePreModel, LanguagePostModel))
-                        and model.layer_idx == 0
-                    )
-                )
-                and model.uses_quantized_input_embeddings
-            ]
-            if input_dequant_models:
-                if self._embeddings_scale is None:
-                    self.get_input_embeddings_tensor()
-                assert self._embeddings_scale is not None
-                self.cfg.pipeline_cfg.embeddings_scale = self._embeddings_scale
-                for model in input_dequant_models:
-                    model.embeddings_scale = self._embeddings_scale
-
-            per_layer_models = [
-                model for model in models_to_generate
-                if isinstance(model, LanguagePerLayerModel)
-            ]
-            if per_layer_models:
-                if self._per_layer_embeddings_scale is None:
-                    self.get_per_layer_embeddings_tensor()
-                assert self._per_layer_embeddings_scale is not None
-                for model in per_layer_models:
-                    model.per_layer_embeddings_scale = self._per_layer_embeddings_scale
-
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
 
@@ -192,12 +172,17 @@ class LanguageModel(BaseModel):
         eval_mode: EvalMode,
         ifms: list[np.ndarray],
         embeddings_tensor: np.ndarray | None = None,
+        embedding_scales: np.ndarray | None = None,
     ) -> list[np.ndarray]:
         assert self.vlm_helper is not None
-        assert len(ifms) == 1
+        expected_num_ifms = 2 if self.cfg.pipeline_cfg.quantize_embeddings else 1
+        assert len(ifms) == expected_num_ifms
         input_embeds = ifms[0]
         if embeddings_tensor is None:
-            embeddings_tensor, _ = self.get_embeddings_tensor()
+            embeddings_tensor, embedding_scales = self.get_embeddings_tensor()
+        if self.cfg.pipeline_cfg.quantize_embeddings:
+            assert embedding_scales is not None
+            input_embedding_scales = ifms[1]
 
         # Obtain sliding window config.
         swa_enable = self.cfg.lm_cfg.attn_cfg.swa_enable
@@ -256,6 +241,10 @@ class LanguageModel(BaseModel):
         # Pad the input embedding if needed and determine which token indices to run.
         if (padding := padded_token_size - num_input_tokens) > 0:
             input_embeds = np.pad(input_embeds, ((0, 0), (0, 0), (0, padding), (0, 0)))
+            if self.cfg.pipeline_cfg.quantize_embeddings:
+                input_embedding_scales = np.pad(
+                    input_embedding_scales, ((0, 0), (0, 0), (0, padding), (0, 0))
+                )
 
         # For paligemma, the original implementation requires all the input tokens to be processed
         # together (attention mask = 0) to obtain the matching output.
@@ -302,6 +291,17 @@ class LanguageModel(BaseModel):
                 else:
                     assert post_ofms is not None
                     pre_ifms.append(post_ofms[0])
+                if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
+                    if use_input_tokens:
+                        pre_ifms.append(
+                            input_embedding_scales[
+                                ..., token_idx:token_idx + num_tokens, :
+                            ]
+                        )
+                    else:
+                        pre_ifms.append(
+                            np.expand_dims(embedding_scales[new_token], axis=(0, 1, 2))
+                        )
                 if is_global:
                     pre_ifms.append(global_freq_real[..., token_idx:token_idx + num_tokens, :])
                     pre_ifms.append(global_freq_imag[..., token_idx:token_idx + num_tokens, :])
@@ -329,6 +329,8 @@ class LanguageModel(BaseModel):
                         # last input token to generate the first output token.
                         idx = num_input_tokens - 1 - token_idx
                         pre_ifms[0] = pre_ifms[0][..., idx:idx + 1, :]
+                        if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
+                            pre_ifms[1] = pre_ifms[1][..., idx:idx + 1, :]
                         pre_ofms[0] = pre_ofms[0][..., idx:idx + 1, :]
                         num_tokens = 1
                         token_idx = num_input_tokens - 1
@@ -380,7 +382,10 @@ class LanguageModel(BaseModel):
                 )
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 
-                post_ifms = [pre_ifms[0], cache_ofms[0]]
+                post_ifms = [pre_ifms[0]]
+                if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
+                    post_ifms.append(pre_ifms[1])
+                post_ifms.append(cache_ofms[0])
                 post_model = self._get_part_model("post", num_tokens, layer_idx=layer_idx)
                 post_ofms = post_model.run_model(eval_mode, post_ifms)
 
@@ -427,7 +432,7 @@ class LanguageModel(BaseModel):
         self,
         weight_name: str | None = None,
         embed_scale: float = 1.0,
-    ) -> tuple[np.ndarray | None, float | np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
         if weight_name is None:
             base_name = self.hf_model.language_model_param_base_name
@@ -449,33 +454,15 @@ class LanguageModel(BaseModel):
         embeddings_tensor *= embed_scale
 
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            # Reshape to (1, 1, vocab_size, 1, hidden_size)
-            embeddings_tensor = embeddings_tensor.reshape(
-                1, 1, embeddings_tensor.shape[0], 1, embeddings_tensor.shape[1]
-            )
-            q_embeddings, scale = block_quantize_weight_tensor(
-                embeddings_tensor, per_channel=False, bits=8, c_block_size=None
-            )
-            q_embeddings = q_embeddings.reshape(q_embeddings.shape[-3], q_embeddings.shape[-1])
-            return q_embeddings, scale
+            embeddings_tensor = embeddings_tensor.astype(bfloat16).astype(np.float32)
+            return quantize_embedding_rows(embeddings_tensor)
 
         return embeddings_tensor.astype(bfloat16).astype(np.float32), None
 
-    def get_input_embeddings_tensor(self) -> tuple[np.ndarray | None, float | None]:
-        embeddings, scale = self.get_embeddings_tensor()
-        if scale is not None:
-            self._embeddings_scale = float(scale)
-        elif embeddings is None and self._embedding_scale_source is not None:
-            if self._embedding_scale_source._embeddings_scale is None:
-                self._embedding_scale_source.get_input_embeddings_tensor()
-            self._embeddings_scale = self._embedding_scale_source._embeddings_scale
-        return embeddings, self._embeddings_scale
+    def get_input_embeddings_tensor(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        return self.get_embeddings_tensor()
 
-    def set_embedding_scale_source(self, source: "LanguageModel") -> None:
-        """Use another model's embedding quantization scale."""
-        self._embedding_scale_source = source
-
-    def get_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, float | None]:
+    def get_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, np.ndarray | None]:
         base_name = self.hf_model.language_model_param_base_name
         embeddings, scale = self.get_embeddings_tensor(
             weight_name=f"{base_name}.embed_tokens_per_layer.weight",
@@ -486,9 +473,7 @@ class LanguageModel(BaseModel):
             ),
         )
         assert embeddings is not None
-        if scale is not None:
-            self._per_layer_embeddings_scale = float(scale)
-        return embeddings, self._per_layer_embeddings_scale
+        return embeddings, scale
 
     @property
     def _single_model_num_tokens(self) -> int:

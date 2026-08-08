@@ -186,3 +186,41 @@ def test_speculative_cache_graph_accepts_quantized_kv_and_scales(
     assert get_expected_tensor_value(
         net.nodes[NodeName("cached_values_scale")].get_type().output
     ).scalar == ScalarType.bfloat16
+
+
+def test_speculative_embedding_graph_uses_target_rows_and_scales(
+    model_inputs_path: Path,
+    tmp_path: Path,
+) -> None:
+    draft_model = load_speculative_draft_model(
+        SPECULATIVE_TARGET_MODEL,
+        SPECULATIVE_DRAFT_MODEL,
+        tmp_path,
+        model_inputs_path,
+        quantize_embeddings=True,
+    )
+    pre_model, _, _ = _build_component(SpeculativeGraphCase("pre"), draft_model)
+    post_model, _, _ = _build_component(SpeculativeGraphCase("post"), draft_model)
+
+    pre_net = pre_model._build_sima_nodes(
+        draft_model.hf_model.language_model_param_base_name,
+        quantizable=False,
+    )
+    assert [str(name) for name in pre_net.input_node_names] == [
+        "input", "input_scale", "hidden_states", "freq_real", "freq_imag",
+    ]
+    assert get_expected_tensor_value(
+        pre_net.nodes[NodeName("input")].get_type().output
+    ).scalar == ScalarType.int8
+    assert get_expected_tensor_value(
+        pre_net.nodes[NodeName("input_scale")].get_type().output
+    ).scalar == ScalarType.bfloat16
+
+    post_net = post_model._build_sima_nodes(
+        draft_model.hf_model.language_model_param_base_name,
+        quantizable=False,
+    )
+    assert [str(name) for name in post_net.input_node_names] == ["input", "self_attn"]
+    assert get_expected_tensor_value(
+        post_net.nodes[NodeName("input")].get_type().output
+    ).scalar == ScalarType.bfloat16

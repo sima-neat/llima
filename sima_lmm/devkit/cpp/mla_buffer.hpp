@@ -40,6 +40,9 @@ class MLABuffer {
         void upload(
             const void* data, size_t data_begin = 0, size_t data_size = 0, bool flush = true
         );
+        void upload_raw(
+            const void* data, size_t destination_offset, size_t size, bool flush = true
+        );
         void download(void* data) const;
         uint32_t get_buf_addr_offset(
             const std::optional<std::vector<uint32_t>>& begin = std::nullopt

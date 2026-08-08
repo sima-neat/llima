@@ -332,11 +332,10 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     auto token_embed_size = _cfg.d_model * 2;
     auto& decoder_init_buf = get_buffer("decoder_init");
     for (uint32_t i = 0; i < _input_token_ids.size(); ++i) {
-        decoder_init_buf.upload(
+        decoder_init_buf.upload_raw(
             token_embeddings_ptr + _input_token_ids[i] * token_embed_size,
             i * token_embed_size,
-            token_embed_size,
-            i + 1 == _input_token_ids.size()
+            token_embed_size
         );
     }
 
@@ -477,12 +476,11 @@ void WhisperModel::_initialize() {
         _cfg.max_target_positions, std::numeric_limits<Eigen::bfloat16>::lowest()
     );
     auto& future_token_mask_buf = get_buffer("decoder_future_token_mask");
-    future_token_mask_buf.clear(false);
-    future_token_mask_buf.upload(
+    future_token_mask_buf.clear();
+    future_token_mask_buf.upload_raw(
         decoder_future_token_mask.data(),
         _cfg.max_target_positions * 2,
-        decoder_future_token_mask.size() * 2,
-        true
+        decoder_future_token_mask.size() * 2
     );
 
     // Clear the KV caches.

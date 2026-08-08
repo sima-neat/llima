@@ -820,7 +820,6 @@ class PipelineConfig(BaseConfig):
         return_logits: Return logits at the last layer.
         enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
-        embeddings_scale: Scale used to dequantize the normal embedding table.
         quantize_kv_cache: Enables KV cache quantization to reduce memory consumption.
         split_mlp: Split the MLP into multiple stages in order to reduce TTFT.
     """
@@ -834,7 +833,6 @@ class PipelineConfig(BaseConfig):
     return_logits: bool = False
     enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
-    embeddings_scale: float | None = None
     quantize_kv_cache: bool = False
     split_mlp: bool = False
 

@@ -178,28 +178,59 @@ class LanguageConvModel(LanguagePartBaseModel):
         hidden_size = self.cfg.lm_cfg.hidden_size
 
         input_shape = (1, 1, self.num_tokens, hidden_size)
+        scale_shape = (1, 1, self.num_tokens, 1)
         cache_shape = (1, 1, self.cfg.lm_cfg.conv_L_cache - 1, hidden_size)
 
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
 
         model_input_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
+            "input",
+            TensorType(
+                ScalarType.int8
+                if self.uses_quantized_input_embeddings and self.layer_idx == 0
+                else activation_type(quantizable),
+                input_shape,
+            ),
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            model_input_scale = builder.create_placeholder_node(
+                "input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         model_input_conv_cache = builder.create_placeholder_node(
             "conv_cache", TensorType(activation_type(quantizable), cache_shape)
         )
 
-        builder.begin_subnet([model_input_input, model_input_conv_cache])
+        subnet_inputs = [model_input_input]
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            subnet_inputs.append(model_input_scale)
+        subnet_inputs.append(model_input_conv_cache)
+        builder.begin_subnet(subnet_inputs)
 
         mla_input_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
+            "input",
+            TensorType(
+                ScalarType.int8
+                if self.uses_quantized_input_embeddings and self.layer_idx == 0
+                else activation_type(quantizable),
+                input_shape,
+            ),
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            mla_input_scale = builder.create_placeholder_node(
+                "input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         mla_input_conv_cache = builder.create_placeholder_node(
             "conv_cache", TensorType(activation_type(quantizable), cache_shape)
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            residual = builder.create_dynamic_dequant_node(
+                mla_input_input, mla_input_scale
+            )
+        else:
+            residual = mla_input_input
 
         norm_input = self._build_sima_rms_norm(
-            builder, f"{base_layer}.operator_norm", mla_input_input
+            builder, f"{base_layer}.operator_norm", residual
         )
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
@@ -235,7 +266,7 @@ class LanguageConvModel(LanguagePartBaseModel):
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.out_proj", gated, lora_rank=lora_rank, merged_lora=merged_lora
         )
 
-        add1 = builder.create_add_node(mla_input_input, out_proj)
+        add1 = builder.create_add_node(residual, out_proj)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
             _ = builder.create_tuple_node([add1, conv_cache_out])

@@ -7,7 +7,7 @@ import numpy as np
 from afe.apis.defines import TensorDRAMLayout, gen2_target
 from afe.backends.backends import Backend
 from afe.ir.serializer import save_awesomenet
-from afe.ir.defines import Status, TensorValue, TupleValue
+from afe.ir.defines import Status, TensorValue, TupleValue, get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import BaseModel, TensorTessellateParameters, LayerConfiguration
@@ -734,9 +734,21 @@ class QwenVisionLayerModel(BaseModel):
 
         if self.cfg.model_type == VlmArchType.VLM_QWEN3_VL:
             output_nodes = self._build_sima_qwen3_vision_model(builder, base_name, mla_input, quantizable)
-            builder.create_tuple_node(output_nodes)
         else:
-            self._build_sima_qwen2_vision_model(builder, base_name, mla_input, quantizable)
+            output_nodes = [
+                self._build_sima_qwen2_vision_model(builder, base_name, mla_input, quantizable)
+            ]
+
+        if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
+            vision_scale = builder.create_dynamic_quant_scale_node(
+                output_nodes[0], per_token_quant=True
+            )
+            quantized_vision_output = builder.create_dynamic_quant_node(
+                output_nodes[0], vision_scale
+            )
+            output_nodes = [quantized_vision_output, vision_scale, *output_nodes[1:]]
+        if len(output_nodes) > 1:
+            builder.create_tuple_node(output_nodes)
 
         mla_node = builder.finish_subnet("MLA_0")
         if activation_type(quantizable) != ScalarType.float32:
@@ -755,6 +767,9 @@ class QwenVisionLayerModel(BaseModel):
                 builder.create_tuple_node(
                     [
                         builder.create_cast_node(item, ScalarType.float32, backend=Backend.EV)
+                        if get_expected_tensor_value(item.get_type().output).scalar
+                        == ScalarType.bfloat16
+                        else item
                         for item in tuple_items
                     ]
                 )

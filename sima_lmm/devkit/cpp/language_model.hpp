@@ -280,7 +280,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
         ) const;
         LanguageModelMapKey _bind_attn_models(
-            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+            uint16_t num_tokens,
+            uint16_t token_idx,
+            uint8_t layer_idx,
+            MLABuffer* embedding_scale_buf = nullptr,
+            uint32_t embedding_scale_row = 0
         );
         void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
@@ -321,10 +325,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }
-        bool _uses_cpu_dequantized_embeddings() const {
-            return _cfg.pipeline_cfg.quantize_embeddings
-                && _cfg.vm_cfg.has_value() && _cfg.mm_cfg.has_value();
-        }
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
         void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
@@ -333,13 +333,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
-        void _dequantize_embedding_row(
-            uint32_t token_id, MLABuffer& dst, size_t dst_row = 0
-        );
         void _stage_embedding_rows(
             LanguageModel& source_model,
             std::span<const uint32_t> token_ids,
-            MLABuffer& destination
+            MLABuffer& destination,
+            MLABuffer* destination_scales = nullptr
         );
         void _run_model_once_for_loglikelihood_logits(
             uint16_t token_idx, uint32_t input_token_id
