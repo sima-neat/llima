@@ -90,7 +90,9 @@ void LanguageModel::_define_attn_models_iter(
     } else {
         pre_ifms.emplace_back(MLABufferSlice{});
         if (uses_embedding_scale) {
-            pre_ifms.emplace_back(MLABufferSlice{});
+            pre_ifms.emplace_back(
+                MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
+            );
         }
         if (is_draft) {
             pre_ifms.emplace_back(MLABufferSlice{});
@@ -310,7 +312,9 @@ void LanguageModel::_define_attn_models_iter(
         is_draft ? pre_ifms[pre_hidden_state_idx] : pre_ifms[0]
     };
     if (uses_embedding_scale) {
-        post_ifms.emplace_back(MLABufferSlice{});
+        post_ifms.emplace_back(
+            MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
+        );
     }
     const size_t post_self_attn_idx = post_ifms.size();
     post_ifms.emplace_back(cache_ofms[0]);
@@ -445,7 +449,9 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
     } else {
         conv_ifms.emplace_back(MLABufferSlice{});
         if (_cfg.pipeline_cfg.quantize_embeddings) {
-            conv_ifms.emplace_back(MLABufferSlice{});
+            conv_ifms.emplace_back(
+                MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
+            );
         }
     }
     conv_ifms.emplace_back(
