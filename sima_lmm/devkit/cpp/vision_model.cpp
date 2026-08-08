@@ -15,26 +15,6 @@ VisionModel::VisionModel(
 }
 
 
-std::vector<Eigen::bfloat16> VisionModel::run_model(
-    const std::vector<Eigen::bfloat16>& ifm_tensor
-) {
-    // Upload the ifm.
-    get_buffer("vision_ifm").upload(ifm_tensor.data());
-
-    // Run the models.
-    for (auto& model_ptr: _model_ptrs) {
-        model_ptr->add_to_queue();
-    }
-    MLAModelWithBuffer::run_queue();
-
-    // Download the ofm.
-    auto& ofm_buf = get_buffer("vision_ofm");
-    std::vector<Eigen::bfloat16> ofm_tensor(ofm_buf.get_num_elems());
-    ofm_buf.download(ofm_tensor.data());
-    return ofm_tensor;
-}
-
-
 void VisionModel::run_model(
     const std::vector<Eigen::bfloat16>& ifm_tensor, std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
