@@ -1325,12 +1325,11 @@ void LanguageModel::_initialize() {
             std::numeric_limits<Eigen::bfloat16>::lowest()
         );
         MLABuffer& future_token_mask_buf = get_buffer("future_token_mask");
-        future_token_mask_buf.clear(false);
+        future_token_mask_buf.clear();
         future_token_mask_buf.upload_raw(
             future_token_mask.data(),
             _cfg.pipeline_cfg.max_num_tokens * 2,
-            future_token_mask.size() * 2,
-            true
+            future_token_mask.size() * 2
         );
     }
     // Clear the KV caches and caches states.

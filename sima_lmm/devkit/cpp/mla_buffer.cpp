@@ -201,7 +201,9 @@ void MLABuffer::load_stream(std::istream& stream) {
 void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bool flush) {
     // Upload a full logical tensor, inserting physical MLA row padding when needed.
     if (data_begin != 0 || (data_size != 0 && data_size != _size)) {
-        upload_raw(data, data_begin, data_size, flush);
+        upload_raw(data, data_begin, data_size, false);
+        if (flush)
+            flush_cache();
         return;
     }
 
