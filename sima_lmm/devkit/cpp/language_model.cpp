@@ -2418,6 +2418,10 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
 std::vector<uint32_t> LanguageModel::_get_per_layer_token_ids(
     std::span<const uint32_t> input_token_ids
 ) const {
+    // Text-only Gemma4 uses per-layer inputs without defining an image token.
+    if (!_image_token_id.has_value())
+        return std::vector<uint32_t>(input_token_ids.begin(), input_token_ids.end());
+
     const uint32_t img_id = _image_token_id.value();
     if (std::find(input_token_ids.begin(), input_token_ids.end(), img_id) == input_token_ids.end()) {
         return std::vector<uint32_t>(input_token_ids.begin(), input_token_ids.end());
