@@ -14,6 +14,7 @@ from afe.ir.tensor_type import ScalarType, TensorType
 import afe.ir.build_node as build_node
 from afe.ir.build_node import NodeHandle, NodeOrHandle
 from afe.ir.sima_builder import SimaBuilder
+from ml_kernels.types import is_integer_type
 
 from sima_lmm.model.onnx_builder import find_alternate_weight
 from sima_lmm.utils import (
@@ -627,7 +628,7 @@ def build_matmul_and_split_heads(
                 pad_width[1] = (0, rounded_head_dim - head_dim)
                 x = np.pad(x, pad_width)
                 x = x.reshape(-1, *x.shape[2:])
-            return x * post_matmul_scale
+            return x if is_integer_type(x.dtype) else x * post_matmul_scale
         matmul = build_conv(
             builder, get_param_func, check_param_func,
             f"{base_name}.matmul", input_node, weight_process_func=param_process_func,
@@ -648,7 +649,8 @@ def build_matmul_and_split_heads(
                 head_dim = x.shape[0] // num_heads
                 begin = i * head_dim
                 end = begin + head_dim
-                return x[begin:end] * post_matmul_scale
+                x = x[begin:end]
+                return x if is_integer_type(x.dtype) else x * post_matmul_scale
             matmul = build_conv(
                 builder, get_param_func, check_param_func,
                 f"{base_name}.matmul.{i}", input_node, weight_process_func=param_process_func,
