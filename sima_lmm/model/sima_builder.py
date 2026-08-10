@@ -62,6 +62,8 @@ def build_conv(
     reshape_str = kwargs.pop("reshape_str", "oi->oihw" if is_fc else None)
     src_weight_name = kwargs.pop("src_weight_name", potential_weight_name)
     src_bias_name = kwargs.pop("src_bias_name", potential_bias_name)
+    has_weight_process_func = "weight_process_func" in kwargs
+    has_scale_process_func = "scale_process_func" in kwargs
     weight_process_func = kwargs.pop("weight_process_func", lambda x: x)
     scale_process_func = kwargs.pop("scale_process_func", lambda x: x)
     bias_process_func = kwargs.pop("bias_process_func", lambda x: x)
@@ -76,6 +78,7 @@ def build_conv(
         )
         src_bias_name = src_weight_name.replace("weight", "bias")
         scale_process_func = weight_process_func
+        has_scale_process_func = True
         bias_process_func = weight_process_func
 
     params = get_param_func(src_weight_name)
@@ -84,6 +87,12 @@ def build_conv(
     # SiMaIR expects weights in the scales shape (num_c_blocks, out_channels)
     if scales is not None:
         scales = np.reshape(scales, newshape=[weight_tensor.shape[0], -1])
+        if scales.shape[1] > 1 and has_weight_process_func and not has_scale_process_func:
+            raise ValueError(
+                f"{base_name} has {scales.shape[1]} input-channel scale blocks and a custom "
+                "weight transform, but no scale_process_func was provided. Use per-output-channel "
+                "quantization or provide a matching scale transform."
+            )
         scales = scale_process_func(scales)
         scales = np.transpose(scales, axes=[1, 0])
 
