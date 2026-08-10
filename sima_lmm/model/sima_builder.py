@@ -63,6 +63,7 @@ def build_conv(
     src_weight_name = kwargs.pop("src_weight_name", potential_weight_name)
     src_bias_name = kwargs.pop("src_bias_name", potential_bias_name)
     weight_process_func = kwargs.pop("weight_process_func", lambda x: x)
+    scale_process_func = kwargs.pop("scale_process_func", lambda x: x)
     bias_process_func = kwargs.pop("bias_process_func", lambda x: x)
     q_size = kwargs.pop("q_size", None)
     kv_size = kwargs.pop("kv_size", None)
@@ -74,6 +75,7 @@ def build_conv(
             get_param_func, src_weight_name, q_size, kv_size
         )
         src_bias_name = src_weight_name.replace("weight", "bias")
+        scale_process_func = weight_process_func
         bias_process_func = weight_process_func
 
     params = get_param_func(src_weight_name)
@@ -82,7 +84,7 @@ def build_conv(
     # SiMaIR expects weights in the scales shape (num_c_blocks, out_channels)
     if scales is not None:
         scales = np.reshape(scales, newshape=[weight_tensor.shape[0], -1])
-        scales = weight_process_func(scales)
+        scales = scale_process_func(scales)
         scales = np.transpose(scales, axes=[1, 0])
 
     if is_depthwise:
@@ -620,7 +622,8 @@ def build_matmul_and_split_heads(
         matmul = build_conv(
             builder, get_param_func, check_param_func,
             f"{base_name}.matmul", input_node, weight_process_func=param_process_func,
-            bias_process_func=param_process_func, src_weight_name=f"{base_name}.weight",
+            scale_process_func=param_process_func, bias_process_func=param_process_func,
+            src_weight_name=f"{base_name}.weight",
             src_bias_name=f"{base_name}.bias"
         )
         # NHWC layout: split on axis C and concat on axis H
@@ -640,7 +643,8 @@ def build_matmul_and_split_heads(
             matmul = build_conv(
                 builder, get_param_func, check_param_func,
                 f"{base_name}.matmul.{i}", input_node, weight_process_func=param_process_func,
-                bias_process_func=param_process_func, src_weight_name=f"{base_name}.weight",
+                scale_process_func=param_process_func, bias_process_func=param_process_func,
+                src_weight_name=f"{base_name}.weight",
                 src_bias_name=f"{base_name}.bias"
             )
             heads.append(matmul)

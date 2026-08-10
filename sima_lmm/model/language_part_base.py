@@ -374,6 +374,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             def param_process_func(x: np.ndarray) -> np.ndarray:
                 return x[split_begin:split_end]
             kwargs["weight_process_func"] = param_process_func
+            kwargs["scale_process_func"] = param_process_func
             kwargs["bias_process_func"] = param_process_func
             lm_head = build_conv(builder, self.get_hf_param, self.check_hf_param,
                                  f"lm_head.{i}", rms_norm, **kwargs)
