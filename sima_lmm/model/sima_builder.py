@@ -14,6 +14,7 @@ from afe.ir.tensor_type import ScalarType, TensorType
 import afe.ir.build_node as build_node
 from afe.ir.build_node import NodeHandle, NodeOrHandle
 from afe.ir.sima_builder import SimaBuilder
+from ml_kernels.types import is_integer_type
 
 from sima_lmm.model.onnx_builder import find_alternate_weight
 from sima_lmm.utils import (
@@ -62,7 +63,10 @@ def build_conv(
     reshape_str = kwargs.pop("reshape_str", "oi->oihw" if is_fc else None)
     src_weight_name = kwargs.pop("src_weight_name", potential_weight_name)
     src_bias_name = kwargs.pop("src_bias_name", potential_bias_name)
+    has_weight_process_func = "weight_process_func" in kwargs
+    has_scale_process_func = "scale_process_func" in kwargs
     weight_process_func = kwargs.pop("weight_process_func", lambda x: x)
+    scale_process_func = kwargs.pop("scale_process_func", lambda x: x)
     bias_process_func = kwargs.pop("bias_process_func", lambda x: x)
     q_size = kwargs.pop("q_size", None)
     kv_size = kwargs.pop("kv_size", None)
@@ -74,6 +78,8 @@ def build_conv(
             get_param_func, src_weight_name, q_size, kv_size
         )
         src_bias_name = src_weight_name.replace("weight", "bias")
+        scale_process_func = weight_process_func
+        has_scale_process_func = True
         bias_process_func = weight_process_func
 
     params = get_param_func(src_weight_name)
@@ -82,7 +88,13 @@ def build_conv(
     # SiMaIR expects weights in the scales shape (num_c_blocks, out_channels)
     if scales is not None:
         scales = np.reshape(scales, newshape=[weight_tensor.shape[0], -1])
-        scales = weight_process_func(scales)
+        if scales.shape[1] > 1 and has_weight_process_func and not has_scale_process_func:
+            raise ValueError(
+                f"{base_name} has {scales.shape[1]} input-channel scale blocks and a custom "
+                "weight transform, but no scale_process_func was provided. Use per-output-channel "
+                "quantization or provide a matching scale transform."
+            )
+        scales = scale_process_func(scales)
         scales = np.transpose(scales, axes=[1, 0])
 
     if is_depthwise:
@@ -616,11 +628,12 @@ def build_matmul_and_split_heads(
                 pad_width[1] = (0, rounded_head_dim - head_dim)
                 x = np.pad(x, pad_width)
                 x = x.reshape(-1, *x.shape[2:])
-            return x * post_matmul_scale
+            return x if is_integer_type(x.dtype) else x * post_matmul_scale
         matmul = build_conv(
             builder, get_param_func, check_param_func,
             f"{base_name}.matmul", input_node, weight_process_func=param_process_func,
-            bias_process_func=param_process_func, src_weight_name=f"{base_name}.weight",
+            scale_process_func=param_process_func, bias_process_func=param_process_func,
+            src_weight_name=f"{base_name}.weight",
             src_bias_name=f"{base_name}.bias"
         )
         # NHWC layout: split on axis C and concat on axis H
@@ -636,11 +649,13 @@ def build_matmul_and_split_heads(
                 head_dim = x.shape[0] // num_heads
                 begin = i * head_dim
                 end = begin + head_dim
-                return x[begin:end] * post_matmul_scale
+                x = x[begin:end]
+                return x if is_integer_type(x.dtype) else x * post_matmul_scale
             matmul = build_conv(
                 builder, get_param_func, check_param_func,
                 f"{base_name}.matmul.{i}", input_node, weight_process_func=param_process_func,
-                bias_process_func=param_process_func, src_weight_name=f"{base_name}.weight",
+                scale_process_func=param_process_func, bias_process_func=param_process_func,
+                src_weight_name=f"{base_name}.weight",
                 src_bias_name=f"{base_name}.bias"
             )
             heads.append(matmul)
