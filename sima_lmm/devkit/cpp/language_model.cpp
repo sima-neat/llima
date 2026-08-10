@@ -426,6 +426,7 @@ uint32_t LanguageModel::run_model_prefill(
                 _cached_token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx
                 );
+                _kv_cache_len = static_cast<uint16_t>(_cached_token_ids.size());
                 return next_token_id;
             }
         }
@@ -447,11 +448,13 @@ uint32_t LanguageModel::run_model_prefill(
                 _cached_token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx + 1
                 );
+                _kv_cache_len = static_cast<uint16_t>(_cached_token_ids.size());
                 return next_token_id;
             }
         }
     }
     _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
+    _kv_cache_len = static_cast<uint16_t>(_cached_token_ids.size());
     auto duration = timer_ttft.value().stop();
     _notify_first_token(next_token_id, duration);
     _cached_first_generated_token = next_token_id;
@@ -467,6 +470,7 @@ void LanguageModel::run_model_decode(
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
         _cached_token_ids.emplace_back(token_id);
+        _kv_cache_len = static_cast<uint16_t>(_cached_token_ids.size());
         token_id = next_token_id;
 
         auto duration = timer_tps.stop(true);
