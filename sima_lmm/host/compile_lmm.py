@@ -402,6 +402,14 @@ def main():
     elif args.input_height is not None or args.input_width is not None:
         _abort("Both --input_height and --input_width must be provided.")
 
+    if args.enable_filter_sharing and mode_flag in (
+        FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT
+    ):
+        _abort(
+            "Filter sharing is not supported for the ONNX compilation path. "
+            "Use the Model SDK path (--source_to_fp / --fp_to_quant / --compile)."
+        )
+
     is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
     if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(

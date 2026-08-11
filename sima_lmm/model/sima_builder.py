@@ -71,6 +71,7 @@ def build_conv(
     q_size = kwargs.pop("q_size", None)
     kv_size = kwargs.pop("kv_size", None)
     activation = kwargs.pop("activation", None)
+    share_filter = kwargs.pop("share_filter", False)
 
     # Some models have bundled weights with a different name for a layer.
     if not check_param_func(src_weight_name):
@@ -118,26 +119,56 @@ def build_conv(
         weight_tensor = layout_array(weight_tensor, "oihw", "hwigo")
 
     # Take part of weight tensor if slice is defined.
+    filter_slice = None
     if weight_slice is not None:
         num_in_channels = weight_tensor.shape[2]
         start, size, axis, idx = weight_slice
         # Normalize axis (e.g., -1 means last axis)
         axis = np.core.numeric.normalize_axis_index(axis, weight_tensor.ndim)
-        weight_tensor = np.take(weight_tensor, np.arange(start, start + size), axis=axis)
+        # hwigo layout: output channels = last axis (4), input channels = axis 2
+        is_output_channel_slice = axis == weight_tensor.ndim - 1
+        is_input_channel_slice = axis == 2
 
-        # Split scale if exists.
+        # For filter sharing across the split and unsplit models, keep the full weight tensor and
+        # record which channel sub-range this convolution uses via filter_slice. The backend emits
+        # the full weight to DRAM so both models reference one shared section.
+        materialize_full = share_filter and (is_output_channel_slice or is_input_channel_slice)
+        if materialize_full:
+            # Normalize axis to the backend's convention: -1 for output-channel, -3 for input-channel
+            backend_axis = -1 if is_output_channel_slice else -3
+            filter_slice = (start, size, backend_axis)
+        else:
+            weight_tensor = np.take(weight_tensor, np.arange(start, start + size), axis=axis)
+
+        # Split scale if exists (SOURCE_TO_QUANT path with pre-quantized weights, e.g. GGUF or
+        # llm-compressor AWQ/GPTQ). scales has shape (num_c_blocks, out_channels).
         if scales is not None:
-            if axis == 2 and scales.shape[1] > 1:
-                # Split scale by input channels axis (number of blocks).
-                num_blocks = scales.shape[0]
-                block_size = num_in_channels // num_blocks
-
-                # Adjust start/size into block indices.
-                start = start // block_size
-                size = size // block_size
-                scales = np.take(scales, np.arange(start, start + size), axis=0)
-            else:
-                # Split scale by output channels axis.
+            num_blocks = scales.shape[0]
+            block_size = num_in_channels // num_blocks
+            if materialize_full:
+                # Shared full filter: the weight tensor stays full and filter_slice records the
+                # sub-range this convolution uses. Keep the scales FULL as well.
+                if not is_output_channel_slice:
+                    assert start % block_size == 0, (
+                        f"C-slice offset {start} is not a multiple of the weight quantization block "
+                        f"size {block_size}; a per-block scale would straddle two split parts."
+                    )
+            elif is_input_channel_slice:
+                # Physically sliced weight, C-slice: slice scales by input-channel blocks to match.
+                # A per-block scale must not straddle a split boundary, so the offset has to land on
+                # a block boundary; convert the channel range into block indices.
+                assert start % block_size == 0, (
+                    f"C-slice offset {start} is not a multiple of the weight quantization block "
+                    f"size {block_size}; a per-block scale would straddle two split parts."
+                )
+                block_start = start // block_size
+                num_slice_blocks = -(-size // block_size)  # ceil: a trailing part may be partial
+                scales = np.take(
+                    scales, np.arange(block_start, block_start + num_slice_blocks), axis=0
+                )
+            elif scales.shape[1] > 1:
+                # Physically sliced weight, K-slice: split a per-output-channel scale by the output
+                # axis. A per-tensor scale (length-1 output axis) applies to every channel unchanged.
                 scales = np.take(scales, np.arange(start, start + size), axis=1)
 
     if weight_tensor.dtype in [bfloat16, np.float16]:
@@ -148,6 +179,16 @@ def build_conv(
         bias_tensor = bias_process_func(bias_tensor)
         if bias_tensor.dtype in (bfloat16, np.float16):
             bias_tensor = bias_tensor.astype(np.float32)
+        # Match the bias to what this convolution actually produces:
+        # - Shared full filter (materialize_full): the weight and scale are kept full and
+        #   filter_slice records the sub-range, so keep the bias full too -- AFE/n2a slice it at
+        #   runtime from filter_slice, exactly as they slice the weight and scale.
+        # - Physically sliced K-slice (output-channel, no sharing): the weight was trimmed to
+        #   `size` output channels, so trim the bias to the same output sub-range to match.
+        # - C-slice (input-channel), shared or physical: the conv produces the full output range
+        #   (partial results are summed by add nodes), so the bias stays full-length.
+        if weight_slice is not None and not materialize_full and is_output_channel_slice:
+            bias_tensor = np.take(bias_tensor, np.arange(start, start + size), axis=0)
     else:
         bias_tensor = None
 
@@ -161,7 +202,8 @@ def build_conv(
         reloc_name=src_weight_name if relocatable else None,
         input_spatial_shape=ifm_type.shape[1:-1],
         batch_size=1,
-        input_type=ifm_type.scalar
+        input_type=ifm_type.scalar,
+        filter_slice=filter_slice
     )
     conv = builder.create_conv_node(ifm, weight_tensor, bias_tensor, conv_attrs, activation, scales=scales)
     return conv
