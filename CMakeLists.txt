@@ -5,22 +5,17 @@ if(NOT DEFINED SKBUILD_PROJECT_NAME)
 endif()
 
 set(SIMA_LMM_PACKAGE_BASE_VERSION "")
-set(SIMA_LMM_PLATFORM_VERSION "")
 execute_process(
-    COMMAND python3 -c "import json; data=json.load(open('deps/manifest.json', encoding='utf-8')); print(data['package-version']); print(data['platform-version'])"
+    COMMAND python3 -c "import json; print(json.load(open('deps/manifest.json', encoding='utf-8'))['package-version'])"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     RESULT_VARIABLE MANIFEST_VERSION_RESULT
-    OUTPUT_VARIABLE SIMA_LMM_MANIFEST_VERSIONS
+    OUTPUT_VARIABLE SIMA_LMM_PACKAGE_BASE_VERSION
     ERROR_QUIET
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-if(NOT MANIFEST_VERSION_RESULT EQUAL 0 OR SIMA_LMM_MANIFEST_VERSIONS STREQUAL "")
-    message(FATAL_ERROR
-        "Failed to read package-version and platform-version from deps/manifest.json")
+if(NOT MANIFEST_VERSION_RESULT EQUAL 0 OR SIMA_LMM_PACKAGE_BASE_VERSION STREQUAL "")
+    message(FATAL_ERROR "Failed to read package-version from deps/manifest.json")
 endif()
-string(REPLACE "\n" ";" SIMA_LMM_MANIFEST_VERSION_LIST "${SIMA_LMM_MANIFEST_VERSIONS}")
-list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PACKAGE_BASE_VERSION)
-list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PLATFORM_VERSION)
 
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
     set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
@@ -28,12 +23,6 @@ endif()
 
 project(${SKBUILD_PROJECT_NAME} VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX)
 set(SIMA_LMM_PACKAGE_VERSION "${PROJECT_VERSION}" CACHE STRING "Debian package version for sima-lmm artifacts.")
-
-# LLiMa compiles against exactly one selected Internals release and does not
-# reinterpret its version or package policy.  Internals owns its package
-# names and relationships; memory comes from the platform.  Dependencies that
-# Debian tooling derives from the actual ELF links are kept, because those are
-# package correctness rather than a policy of ours.
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -398,8 +387,7 @@ target_link_libraries(
     llama
     PkgConfig::Readline
 )
-# For simaai headers. Currently this is for simaai-memory-lib. Add it to the end so that it can
-# search other paths first.
+# Search project headers before the platform sysroot.
 target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
     $<BUILD_INTERFACE:${SYSROOT}/usr/include/simaai>
     $<BUILD_INTERFACE:${SYSROOT}/usr/include>
@@ -496,7 +484,7 @@ configure_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfigVersion.cmake"
-    VERSION ${SIMA_LMM_PLATFORM_VERSION}
+    VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 install(
