@@ -28,19 +28,12 @@ endif()
 
 project(${SKBUILD_PROJECT_NAME} VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX)
 set(SIMA_LMM_PACKAGE_VERSION "${PROJECT_VERSION}" CACHE STRING "Debian package version for sima-lmm artifacts.")
-string(REPLACE "." ";" SIMA_LMM_PACKAGE_BASE_VERSION_PARTS "${SIMA_LMM_PACKAGE_BASE_VERSION}")
-list(GET SIMA_LMM_PACKAGE_BASE_VERSION_PARTS 0 SIMA_LMM_PACKAGE_BASE_VERSION_MAJOR)
-list(GET SIMA_LMM_PACKAGE_BASE_VERSION_PARTS 1 SIMA_LMM_PACKAGE_BASE_VERSION_MINOR)
-math(EXPR SIMA_LMM_NEXT_PACKAGE_MINOR "${SIMA_LMM_PACKAGE_BASE_VERSION_MINOR} + 1")
-set(SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
-set(SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION_MAJOR}.${SIMA_LMM_NEXT_PACKAGE_MINOR}.0")
-set(SIMA_LMM_MEMORY_LIB_VERSION "" CACHE STRING
-    "Exact Debian version of the simaai-memory-lib package supplied by the resolved Internals artifact.")
-set(SIMA_LMM_MEMORY_LIB_DEPENDENCY "")
-if(NOT SIMA_LMM_MEMORY_LIB_VERSION STREQUAL "")
-    set(SIMA_LMM_MEMORY_LIB_DEPENDENCY
-        "simaai-memory-lib (= ${SIMA_LMM_MEMORY_LIB_VERSION}), ")
-endif()
+
+# LLiMa compiles against exactly one selected Internals release and does not
+# reinterpret its version or package policy.  Internals owns its package
+# names and relationships; memory comes from the platform.  Dependencies that
+# Debian tooling derives from the actual ELF links are kept, because those are
+# package correctness rather than a policy of ours.
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -104,7 +97,7 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
-find_package(NeatInternals ${SIMA_LMM_PLATFORM_VERSION} CONFIG REQUIRED)
+find_package(NeatInternals CONFIG REQUIRED)
 find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
@@ -589,9 +582,7 @@ set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
-    "neat-runtime (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
-    "${SIMA_LMM_MEMORY_LIB_DEPENDENCY}"
+    "neat-runtime, "
     "libcpp-httplib0.11, libfftw3-double3, "
     "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
     "libavcodec59, libavformat59, libavutil57, libswresample4, "
@@ -599,8 +590,7 @@ string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "libfmt9, libspdlog1.10")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
-    "neat-internals-dev (>= ${SIMA_LMM_INTERNALS_PACKAGE_MIN_VERSION}), "
-    "neat-internals-dev (<< ${SIMA_LMM_INTERNALS_PACKAGE_MAX_VERSION}), "
+    "neat-internals-dev, "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
