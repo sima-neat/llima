@@ -72,6 +72,8 @@ def test_selected_internals_payload_is_validated_before_sysroot_overlay() -> Non
     )
 
     assert 'payload_root="$(mktemp -d ' in text
+    assert "NeatInternals/NeatInternalsConfig.cmake" in text
+    assert "NeatInternals/NeatInternalsTargets.cmake" in text
     assert validate < overlay
 
 

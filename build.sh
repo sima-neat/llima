@@ -555,7 +555,8 @@ validate_neat_internals_payload() {
   local path
   local -a missing=()
   local -a required=(
-    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
+    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsConfig.cmake"
+    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsTargets.cmake"
     "/usr/include/dispatcherfactory.hh"
     "/usr/include/dispatcherbase.hh"
     "/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
