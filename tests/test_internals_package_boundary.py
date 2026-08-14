@@ -33,6 +33,8 @@ def test_no_manually_constructed_internals_version_ranges() -> None:
 
     assert "neat-runtime, " in text
     assert "neat-internals-dev, " in text
+    assert "simaai-memory-lib, " in text
+    assert "simaai-memory-lib (= " not in text
     assert "neat-runtime (>=" not in text
     assert "neat-runtime (<<" not in text
     assert "neat-internals-dev (>=" not in text
