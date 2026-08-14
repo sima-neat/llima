@@ -5,9 +5,8 @@ if(NOT DEFINED SKBUILD_PROJECT_NAME)
 endif()
 
 set(SIMA_LMM_PACKAGE_BASE_VERSION "")
-set(SIMA_LMM_PLATFORM_VERSION "")
 execute_process(
-    COMMAND python3 -c "import json; data=json.load(open('deps/manifest.json', encoding='utf-8')); print(data['package-version']); print(data['platform-version'])"
+    COMMAND python3 -c "import json; data=json.load(open('deps/manifest.json', encoding='utf-8')); print(data['package-version'])"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     RESULT_VARIABLE MANIFEST_VERSION_RESULT
     OUTPUT_VARIABLE SIMA_LMM_MANIFEST_VERSIONS
@@ -16,11 +15,9 @@ execute_process(
 )
 if(NOT MANIFEST_VERSION_RESULT EQUAL 0 OR SIMA_LMM_MANIFEST_VERSIONS STREQUAL "")
     message(FATAL_ERROR
-        "Failed to read package-version and platform-version from deps/manifest.json")
+        "Failed to read package-version from deps/manifest.json")
 endif()
-string(REPLACE "\n" ";" SIMA_LMM_MANIFEST_VERSION_LIST "${SIMA_LMM_MANIFEST_VERSIONS}")
-list(GET SIMA_LMM_MANIFEST_VERSION_LIST 0 SIMA_LMM_PACKAGE_BASE_VERSION)
-list(GET SIMA_LMM_MANIFEST_VERSION_LIST 1 SIMA_LMM_PLATFORM_VERSION)
+set(SIMA_LMM_PACKAGE_BASE_VERSION "${SIMA_LMM_MANIFEST_VERSIONS}")
 
 if(NOT DEFINED SKBUILD_PROJECT_VERSION)
     set(SKBUILD_PROJECT_VERSION "${SIMA_LMM_PACKAGE_BASE_VERSION}")
@@ -489,7 +486,7 @@ configure_file(
 )
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/SimaLMMConfigVersion.cmake"
-    VERSION ${SIMA_LMM_PLATFORM_VERSION}
+    VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
 install(
