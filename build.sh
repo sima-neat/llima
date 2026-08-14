@@ -549,11 +549,38 @@ path_exists_any() {
   return 1
 }
 
+validate_neat_internals_payload() {
+  local root="${1%/}"
+  local source_name="$2"
+  local path
+  local -a missing=()
+  local -a required=(
+    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
+    "/usr/include/dispatcherfactory.hh"
+    "/usr/include/dispatcherbase.hh"
+    "/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
+  )
+
+  for path in "${required[@]}"; do
+    [[ -e "${root}${path}" ]] || missing+=("${path}")
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "ERROR: ${source_name} is incomplete." >&2
+  echo "Missing:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  return 1
+}
+
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local tmp_dir
   tmp_dir=""
   local extract_dir
+  local payload_root
   local archive_name="Vulcan internals artifact"
   local -a all_debs=()
 
@@ -606,6 +633,18 @@ ensure_neat_internals() {
       echo "ERROR: SYSROOT does not exist: ${sysroot}" >&2
       exit 1
     fi
+
+    payload_root="$(mktemp -d /tmp/llima-neat-internals-payload.XXXXXX)"
+    for deb in "${debs[@]}"; do
+      dpkg-deb -x "${deb}" "${payload_root}"
+    done
+    if ! validate_neat_internals_payload "${payload_root}" "${archive_name}"; then
+      rm -rf "${payload_root}"
+      [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
+      exit 1
+    fi
+    rm -rf "${payload_root}"
+
     echo "[build] Installing NEAT internals deb payloads into SDK sysroot:"
     echo "[build]   ${sysroot}"
     for deb in "${debs[@]}"; do
@@ -619,33 +658,7 @@ ensure_neat_internals() {
     fi
     echo "[build] Installing NEAT internals deb packages into host system"
     run_as_root apt install -y --allow-downgrades "${debs[@]}"
-  fi
-
-  local config_dir dispatcher_factory_header dispatcher_base_header runtime_lib
-  local missing=()
-
-  if [[ "${ELXR_SDK}" == "ON" ]]; then
-    config_dir="${sysroot}/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_factory_header="${sysroot}/usr/include/dispatcherfactory.hh"
-    dispatcher_base_header="${sysroot}/usr/include/dispatcherbase.hh"
-    runtime_lib="${sysroot}/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
-  else
-    config_dir="/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_factory_header="/usr/include/dispatcherfactory.hh"
-    dispatcher_base_header="/usr/include/dispatcherbase.hh"
-    runtime_lib="/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
-  fi
-
-  [[ -d "${config_dir}" ]] || missing+=("${config_dir}")
-  [[ -f "${dispatcher_factory_header}" ]] || missing+=("${dispatcher_factory_header}")
-  [[ -f "${dispatcher_base_header}" ]] || missing+=("${dispatcher_base_header}")
-  [[ -f "${runtime_lib}" ]] || missing+=("${runtime_lib}")
-
-  if [[ "${#missing[@]}" -gt 0 ]]; then
-    echo "ERROR: NEAT internals artifact install is incomplete." >&2
-    echo "Missing:" >&2
-    printf '  %s\n' "${missing[@]}" >&2
-    exit 1
+    validate_neat_internals_payload "" "installed NEAT internals packages"
   fi
 
   if [[ -n "${tmp_dir}" ]]; then

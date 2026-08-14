@@ -62,6 +62,19 @@ def test_every_delivered_internals_package_is_installed_and_forwarded() -> None:
     )
 
 
+def test_selected_internals_payload_is_validated_before_sysroot_overlay() -> None:
+    text = build_script()
+    validate = text.index(
+        'validate_neat_internals_payload "${payload_root}" "${archive_name}"'
+    )
+    overlay = text.index(
+        'run_as_root dpkg-deb -x "${deb}" "${sysroot}"', validate
+    )
+
+    assert 'payload_root="$(mktemp -d ' in text
+    assert validate < overlay
+
+
 def test_llima_has_no_recovery_or_libcamera_branch() -> None:
     text = build_script()
     assert "recovery" not in text.lower()
