@@ -15,6 +15,7 @@ import afe.ir.build_node as build_node
 from afe.ir.build_node import NodeHandle, NodeOrHandle
 from afe.ir.sima_builder import SimaBuilder
 from ml_kernels.types import is_integer_type
+from mlc.compiler.globals import FilterSlice, FilterSliceAxis
 
 from sima_lmm.model.onnx_builder import find_alternate_weight
 from sima_lmm.utils import (
@@ -134,9 +135,10 @@ def build_conv(
         # the full weight to DRAM so both models reference one shared section.
         materialize_full = share_filter and (is_output_channel_slice or is_input_channel_slice)
         if materialize_full:
-            # Normalize axis to the backend's convention: -1 for output-channel, -3 for input-channel
-            backend_axis = -1 if is_output_channel_slice else -3
-            filter_slice = (start, size, backend_axis)
+            filter_slice = FilterSlice(
+                start, size,
+                FilterSliceAxis.CH_OUT if is_output_channel_slice else FilterSliceAxis.CH_IN
+            )
         else:
             weight_tensor = np.take(weight_tensor, np.arange(start, start + size), axis=axis)
 
