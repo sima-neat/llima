@@ -88,12 +88,18 @@ class InternalsSysrootSyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, [])
 
+    def test_empty_receipt_keeps_the_existing_sysroot(self) -> None:
+        result, calls = run_sync({"sysroot-version": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [])
+
     def test_rejects_invalid_artifact_receipts(self) -> None:
         base = "2.1.3"
         receipt = f"{base}~pre9999"
         cases = (
             (None, base, "missing internals-manifest.json"),
             ("{", base, "Cannot read Internals build receipt"),
+            ({}, base, "Cannot read Internals build receipt"),
             ({"sysroot-version": "latest"}, base, "invalid platform receipt"),
             ({"sysroot-version": receipt}, "2.1.4", "but LLiMa declares"),
         )
