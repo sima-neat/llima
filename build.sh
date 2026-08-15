@@ -576,6 +576,47 @@ validate_neat_internals_payload() {
   return 1
 }
 
+sync_sysroot_from_internals_manifest() {
+  local artifact_dir="$1"
+  [[ "${NEAT_SYNC_SYSROOT:-OFF}" == "ON" ]] || return 0
+
+  if [[ "${ELXR_SDK}" != "ON" ]]; then
+    echo "ERROR: NEAT_SYNC_SYSROOT requires an eLxr SDK." >&2
+    exit 1
+  fi
+
+  local artifact_manifest="${artifact_dir}/internals-manifest.json"
+  if [[ ! -f "${artifact_manifest}" ]]; then
+    echo "ERROR: Internals artifact is missing internals-manifest.json." >&2
+    exit 1
+  fi
+
+  local values receipt consumer_base
+  if ! values="$(python3 -c '
+import json, sys
+artifact = json.load(open(sys.argv[1], encoding="utf-8"))
+consumer = json.load(open(sys.argv[2], encoding="utf-8"))
+print(artifact.get("sysroot-version", ""), consumer.get("platform-version", ""), sep="\t")
+' "${artifact_manifest}" "${NEAT_INTERNALS_MANIFEST}")"; then
+    echo "ERROR: Cannot read Internals build receipt." >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r receipt consumer_base <<< "${values}"
+  if [[ ! "${receipt}" =~ ^[0-9]+\.[0-9]+\.[0-9]+~pre[0-9]+$ ]]; then
+    echo "ERROR: Internals artifact has an invalid platform receipt." >&2
+    exit 1
+  fi
+  if [[ ! "${consumer_base}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
+        "${consumer_base}" != "${receipt%%~pre*}" ]]; then
+    echo "ERROR: Internals requires platform ${receipt%%~pre*}, but LLiMa declares ${consumer_base}." >&2
+    exit 1
+  fi
+
+  echo "[build] Updating SDK sysroot to Internals receipt ${receipt}"
+  run_as_root sysroot update "${receipt}"
+  sysroot status
+}
+
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local tmp_dir
@@ -609,6 +650,8 @@ ensure_neat_internals() {
     [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
     exit 1
   fi
+
+  sync_sysroot_from_internals_manifest "${extract_dir}"
 
   mkdir -p "${NEAT_INTERNALS_DEB_DIR}"
   rm -f "${NEAT_INTERNALS_DEB_DIR}"/*.deb

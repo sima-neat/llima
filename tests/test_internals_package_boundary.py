@@ -1,6 +1,7 @@
 """Tests for the LLiMa-to-Internals package boundary."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -67,14 +68,32 @@ def test_selected_internals_payload_is_validated_before_sysroot_overlay() -> Non
     validate = text.index(
         'validate_neat_internals_payload "${payload_root}" "${archive_name}"'
     )
-    overlay = text.index(
-        'run_as_root dpkg-deb -x "${deb}" "${sysroot}"', validate
-    )
+    overlay = text.index('run_as_root dpkg-deb -x "${deb}" "${sysroot}"', validate)
 
     assert 'payload_root="$(mktemp -d ' in text
     assert "NeatInternals/NeatInternalsConfig.cmake" in text
     assert "NeatInternals/NeatInternalsTargets.cmake" in text
     assert validate < overlay
+
+
+def test_vulcan_build_uses_the_internals_sysroot_receipt() -> None:
+    text = build_script()
+    workflow = (ROOT / ".github/workflows/vulcan-ci.yml").read_text(encoding="utf-8")
+    manifest = json.loads((ROOT / "deps/manifest.json").read_text(encoding="utf-8"))
+    sync = text.index('sync_sysroot_from_internals_manifest "${extract_dir}"')
+    extract = text.index('dpkg-deb -x "${deb}" "${payload_root}"', sync)
+
+    assert '[[ "${NEAT_SYNC_SYSROOT:-OFF}" == "ON" ]] || return 0' in text
+    assert '-e NEAT_SYNC_SYSROOT="ON"' in workflow
+    assert "internals-manifest.json" in text
+    assert 'sysroot update "${receipt}"' in text
+    assert "Internals artifact is missing internals-manifest.json" in text
+    assert "has an invalid platform receipt" in text
+    assert "but LLiMa declares" in text
+    assert "sysroot-version" not in manifest
+    assert not re.search(r"\b[0-9]+(?:\.[0-9]+){2}~pre[0-9]+\b", text)
+    assert not re.search(r"\b[0-9]+(?:\.[0-9]+){2}~pre[0-9]+\b", workflow)
+    assert sync < extract
 
 
 def test_llima_has_no_recovery_or_libcamera_branch() -> None:

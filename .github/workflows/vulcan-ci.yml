@@ -170,6 +170,7 @@ jobs:
           -e NEAT_VULCAN_ENV="${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
           -e NEAT_INTERNALS_SOURCE="vulcan" \
           -e NEAT_INTERNALS_VULCAN_REPOSITORY="internals" \
+          -e NEAT_SYNC_SYSROOT="ON" \
           "${sdk_container}" \
           bash -lc '
             set -euo pipefail
