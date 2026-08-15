@@ -206,3 +206,18 @@ def test_ci_has_no_bundled_memory_policy() -> None:
     workflow = (ROOT / ".github/workflows/vulcan-ci.yml").read_text(encoding="utf-8")
     assert "memory_deb" not in workflow
     assert "bundled memory" not in workflow.lower()
+
+
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    del loader, pattern
+    functions = [
+        value
+        for name, value in globals().items()
+        if name.startswith("test_") and callable(value)
+    ]
+    tests.addTests(unittest.FunctionTestCase(function) for function in functions)
+    return tests
