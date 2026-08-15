@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m unittest -v tests.ci.test_resolve_test_scope tests.ci.test_internals_sysroot_sync
+          python3 -m unittest -v tests.ci.test_resolve_test_scope tests.test_internals_package_boundary
 
       - name: Resolve test scope
         id: scope
