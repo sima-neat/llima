@@ -66,31 +66,19 @@ set_target_properties(
 
 add_test(
     NAME runtime.dispatcher_lifecycle
-    COMMAND
-        bash
-        "${CMAKE_CURRENT_SOURCE_DIR}/restart_appcomplex_before_test.sh"
-        "$<TARGET_FILE:sima_lmm_dispatcher_lifecycle_test>"
+    COMMAND "$<TARGET_FILE:sima_lmm_dispatcher_lifecycle_test>"
 )
 add_test(
     NAME runtime.text_generation
-    COMMAND
-        bash
-        "${CMAKE_CURRENT_SOURCE_DIR}/restart_appcomplex_before_test.sh"
-        "$<TARGET_FILE:sima_lmm_text_generation_test>"
+    COMMAND "$<TARGET_FILE:sima_lmm_text_generation_test>"
 )
 add_test(
     NAME runtime.vision_generation
-    COMMAND
-        bash
-        "${CMAKE_CURRENT_SOURCE_DIR}/restart_appcomplex_before_test.sh"
-        "$<TARGET_FILE:sima_lmm_vision_generation_test>"
+    COMMAND "$<TARGET_FILE:sima_lmm_vision_generation_test>"
 )
 add_test(
     NAME runtime.asr_transcription
-    COMMAND
-        bash
-        "${CMAKE_CURRENT_SOURCE_DIR}/restart_appcomplex_before_test.sh"
-        "$<TARGET_FILE:sima_lmm_asr_transcription_test>"
+    COMMAND "$<TARGET_FILE:sima_lmm_asr_transcription_test>"
 )
 add_test(
     NAME runtime.tool_call_parser
@@ -165,7 +153,6 @@ install(
     FILES
         CMakeLists.txt
         asr_transcription_test.cpp
-        conftest.py
         dispatcher_lifecycle_test.cpp
         pytest.ini
         runtime_test_utils.hpp
@@ -187,7 +174,6 @@ install(
 install(
     PROGRAMS
         prepare_genai_models.sh
-        restart_appcomplex_before_test.sh
         run_with_cancellation_cleanup.sh
     DESTINATION share/sima-lmm/tests/runtime
     COMPONENT extras

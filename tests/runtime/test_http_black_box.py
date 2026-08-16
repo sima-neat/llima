@@ -17,11 +17,11 @@ import pytest
 DEFAULT_MODELS_PATH = Path("/media/nvme/llima/models")
 DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-GPTQ-a16w4"
 DEFAULT_REASONING_QWEN_MODEL = "Qwen3-0.6B-GPTQ-a16w4"
-DEFAULT_REASONING_GEMMA_MODEL = "Gemma-4-E2B-it-GPTQ-a16w4"
+DEFAULT_REASONING_GEMMA_MODEL = "Gemma-4-E2B-it-TextOnly-GPTQ-a16w4"
 HOST = "127.0.0.1"
 PORT = 9998
 QUERY = "What is the capital of Germany? Answer in one sentence."
-REASONING_QUERY = "Think briefly: what is 2 plus 3? Give the final answer."
+REASONING_QUERY = "Solve x + 7 = 12. Think briefly, then give x."
 REASONING_MARKERS = ("<think>", "</think>", "<|channel>", "<channel|>")
 TOOL_MARKERS = ("<tool_call>", "</tool_call>", "<|tool_call>", "<tool_call|>")
 TOOL_QUERY = (
