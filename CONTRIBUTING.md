@@ -13,6 +13,18 @@ Requirements:
 - Python 3.12 and Model Compiler for compiler work
 - Modalix for hardware-dependent runtime validation
 
+Install both LLiMa contributor skills. These skills are intentionally not part
+of the default Neat SDK playbook installation:
+
+```bash
+sima-cli playbooks install gh:sima-neat/llima/skills/sima-contribute-to-llima
+sima-cli playbooks install gh:sima-neat/llima/skills/sima-add-llima-model-support
+```
+
+The first provides repository-wide contribution guidance. The second provides
+additional compatibility and implementation guidance when work reaches LLM or
+VLM model support.
+
 In the Neat SDK, build runtime packages and tests with:
 
 ```bash
