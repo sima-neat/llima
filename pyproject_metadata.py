@@ -110,9 +110,7 @@ sdk_ext_require = [
     "safetensors",  # Required for HF LLM models
     "torch==2.8.0",  # Required to load GGUF file to transformers.
     "av",  # Required for audio preprocessing
-    # Model Compiler uses ml-dtypes 0.4.1 on ARM64 and 0.3.1 elsewhere.
-    "ml_dtypes==0.4.1; platform_machine == 'aarch64'",
-    "ml_dtypes==0.3.1; platform_machine == 'x86_64'",
+    "ml_dtypes==0.4.1",  # Required for Model Compiler SDK compatibility.
     "sentencepiece==0.2.0",  # Required for LLM tokenizer
     "tiktoken",  # Required for LLM tokenizer
     "blobfile",  # Required by tiktoken
