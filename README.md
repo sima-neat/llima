@@ -2,6 +2,8 @@
 
 # LLiMa
 
+**Documentation:** [English](docs/index.md) | [한국어](docs/i18n/ko/index.md) | [日本語](docs/i18n/ja/index.md) | [繁體中文](docs/i18n/zh-Hant/index.md) | [Українська](docs/i18n/uk/index.md)
+
 [![Vulcan CI](https://github.com/sima-neat/llima/actions/workflows/vulcan-ci.yml/badge.svg)](https://github.com/sima-neat/llima/actions/workflows/vulcan-ci.yml)
 ![Runtime](https://img.shields.io/badge/runtime-LLM%20%7C%20VLM%20%7C%20ASR-green)
 ![Language](https://img.shields.io/badge/C%2B%2B-20-informational)
