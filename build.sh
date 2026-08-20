@@ -8,9 +8,13 @@ NEAT_INTERNALS_VULCAN_REPOSITORY="${NEAT_INTERNALS_VULCAN_REPOSITORY:-internals}
 NEAT_INTERNALS_SNAP_POLICY="${NEAT_INTERNALS_SNAP_POLICY:-ON}"
 NEAT_INTERNALS_MANIFEST="${NEAT_INTERNALS_MANIFEST:-${ROOT_DIR}/deps/manifest.json}"
 NEAT_INTERNALS_PACKAGE_DIR="${NEAT_INTERNALS_PACKAGE_DIR:-}"
-NEAT_INTERNALS_RESOLVED_REF=""
+NEAT_INTERNALS_RESOLVED_REF="${NEAT_INTERNALS_RESOLVED_REF:-}"
+NEAT_INTERNALS_DEB_DIR="${NEAT_INTERNALS_DEB_DIR:-}"
+NEAT_INTERNALS_RESOLVED_MANIFEST="${NEAT_INTERNALS_RESOLVED_MANIFEST:-}"
 NEAT_VULCAN_ENV="${NEAT_VULCAN_ENV:-prod}"
 NEAT_VULCAN_BASE_URL="${NEAT_VULCAN_BASE_URL:-}"
+LLIMA_INSTALL_SCRIPT="install_llima.sh"
+LLIMA_INSTALL_MANIFEST="llima-install-manifest.txt"
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 ARCH=arm64
 ELXR_SDK=OFF
@@ -27,8 +31,8 @@ Options:
   --build-dir <dir>   CMake build directory (default: llima/build-deb)
   --jobs <count>      Parallel build jobs (default: nproc; env: LLIMA_DEB_BUILD_JOBS)
   --clean             Remove the build directory and stale sima-lmm*.deb outputs
-  --all               Build all sima-lmm binary packages and create dist archive (default)
-  --no-dist           Skip dist tarball creation
+  --all               Build all packages, DevKit runtime tests, and publishable layouts (default)
+  --no-dist           Skip publishable artifact layout creation
   --core              Package only sima-lmm-core
   --dev               Package only sima-lmm-dev
   --cli               Package only sima-lmm-cli
@@ -43,6 +47,7 @@ EOF
 DO_CLEAN=0
 INSTALL_DEPS_ONLY=0
 SKIP_DIST=0
+BUILD_RUNTIME_TESTS=ON
 EXTRA_CMAKE_ARGS=()
 COMPONENTS=()
 
@@ -233,11 +238,6 @@ raise SystemExit(
 PY
 }
 
-sanitize_branch_key() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' |
-    sed -E 's#[^a-z0-9._-]+#-#g; s/^-+//; s/-+$//'
-}
-
 current_branch_name() {
   if [[ -n "${GITHUB_HEAD_REF:-}" ]]; then
     printf '%s\n' "${GITHUB_HEAD_REF}"
@@ -298,7 +298,7 @@ resolve_neat_internals_ref() {
     return 0
   fi
 
-  local branch branch_key tag
+  local branch tag
   tag="$(current_exact_tag)"
   if [[ -n "${tag}" ]]; then
     printf '%s\n' "${tag}:latest"
@@ -306,9 +306,8 @@ resolve_neat_internals_ref() {
   fi
 
   branch="$(current_branch_name)"
-  branch_key="$(sanitize_branch_key "${branch}")"
-  if [[ -n "${branch_key}" && "${branch_key}" != "head" ]]; then
-    printf '%s\n' "${branch_key}:latest"
+  if [[ -n "${branch}" && "${branch}" != "HEAD" ]]; then
+    printf '%s\n' "${branch}:latest"
     return 0
   fi
 
@@ -405,6 +404,8 @@ ensure_git_submodules() {
   fi
 
   if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "[build] Synchronizing git submodule URLs"
+    git -C "$ROOT_DIR" submodule sync --recursive
     echo "[build] Updating git submodules"
     git -C "$ROOT_DIR" submodule update --init --recursive
   else
@@ -548,12 +549,98 @@ path_exists_any() {
   return 1
 }
 
+validate_neat_internals_payload() {
+  local root="${1%/}"
+  local source_name="$2"
+  local path
+  local -a missing=()
+  local -a required=(
+    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsConfig.cmake"
+    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsTargets.cmake"
+    "/usr/include/dispatcherfactory.hh"
+    "/usr/include/dispatcherbase.hh"
+    "/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
+  )
+
+  for path in "${required[@]}"; do
+    [[ -e "${root}${path}" ]] || missing+=("${path}")
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "ERROR: ${source_name} is incomplete." >&2
+  echo "Missing:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  return 1
+}
+
+sync_sysroot_from_internals_manifest() {
+  local artifact_dir="$1"
+  [[ "${NEAT_SYNC_SYSROOT:-OFF}" == "ON" ]] || return 0
+
+  if [[ "${ELXR_SDK}" != "ON" ]]; then
+    echo "ERROR: NEAT_SYNC_SYSROOT requires an eLxr SDK." >&2
+    exit 1
+  fi
+
+  local artifact_manifest="${artifact_dir}/internals-manifest.json"
+  if [[ ! -f "${artifact_manifest}" ]]; then
+    echo "ERROR: Internals artifact is missing internals-manifest.json." >&2
+    exit 1
+  fi
+
+  local receipt
+  if ! receipt="$(python3 -c '
+import json, re, sys
+artifact = json.load(open(sys.argv[1], encoding="utf-8"))
+consumer = json.load(open(sys.argv[2], encoding="utf-8"))
+receipt = artifact["sysroot-version"]
+consumer_base = consumer["platform-version"]
+if not isinstance(receipt, str) or (
+    receipt
+    and not re.fullmatch(r"[0-9]+(?:[.][0-9]+){2}(?:~pre[0-9]+)?", receipt)
+):
+    raise ValueError("invalid sysroot-version")
+if receipt and consumer_base != receipt.split("~pre", 1)[0]:
+    raise ValueError("platform-version does not match the Internals receipt")
+print(receipt)
+' "${artifact_manifest}" "${NEAT_INTERNALS_MANIFEST}")"; then
+    echo "ERROR: Cannot read Internals build receipt." >&2
+    exit 1
+  fi
+  if [[ -z "${receipt}" ]]; then
+    echo "LLiMa is using the existing SDK sysroot."
+    return 0
+  fi
+
+  if [[ "${receipt}" == *"~pre"* ]]; then
+    echo "[build] Updating SDK sysroot to Internals receipt ${receipt}"
+    run_as_root sysroot update "${receipt}"
+    sysroot status
+    return 0
+  fi
+
+  local sdk_platform_version
+  sdk_platform_version="$(sed -nE \
+    's/^Platform Version[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\1/p' \
+    "${ELXR_SDK_RELEASE_FILE}" 2>/dev/null | head -n1 || true)"
+  if [[ "${sdk_platform_version}" != "${receipt}" ]]; then
+    echo "ERROR: SDK platform ${sdk_platform_version:-unknown} does not match required stable platform ${receipt}." >&2
+    exit 1
+  fi
+  echo "[build] Using stable SDK sysroot ${sdk_platform_version} without updating it."
+}
+
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local tmp_dir
   tmp_dir=""
   local extract_dir
+  local payload_root
   local archive_name="Vulcan internals artifact"
+  local -a all_debs=()
 
   if [[ -n "${NEAT_INTERNALS_PACKAGE_DIR}" ]]; then
     if [[ ! -d "${NEAT_INTERNALS_PACKAGE_DIR}" ]]; then
@@ -573,34 +660,51 @@ ensure_neat_internals() {
     fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
   fi
 
-  local deb_pattern_groups=(
-    'neat-common_*_all.deb simaai-common_*_all.deb'
-    'neat-runtime_*_arm64.deb'
-    'neat-gst-plugins_*_arm64.deb'
-    'neat-internals-dev_*_arm64.deb'
-  )
-  local debs=()
-  local pattern_group pattern deb
-  for pattern_group in "${deb_pattern_groups[@]}"; do
-    deb=""
-    for pattern in ${pattern_group}; do
-      deb="$(find "${extract_dir}" -maxdepth 3 -type f -name "${pattern}" | sort | head -n 1)"
-      if [[ -n "${deb}" ]]; then
-        break
-      fi
-    done
-    if [[ -z "${deb}" ]]; then
-      echo "ERROR: No matching deb found in ${archive_name}; expected one of: ${pattern_group}" >&2
+  mapfile -t all_debs < <(find "${extract_dir}" -type f -name '*.deb' | sort)
+  if [[ "${#all_debs[@]}" -eq 0 ]]; then
+    echo "ERROR: ${archive_name} did not contain any Debian packages." >&2
+    [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
+    exit 1
+  fi
+
+  sync_sysroot_from_internals_manifest "${extract_dir}"
+
+  mkdir -p "${NEAT_INTERNALS_DEB_DIR}"
+  rm -f "${NEAT_INTERNALS_DEB_DIR}"/*.deb
+  local source_deb cached_deb
+  for source_deb in "${all_debs[@]}"; do
+    cached_deb="${NEAT_INTERNALS_DEB_DIR}/$(basename "${source_deb}")"
+    if [[ -e "${cached_deb}" ]]; then
+      echo "ERROR: Duplicate Internals package basename: $(basename "${source_deb}")" >&2
+      [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
       exit 1
     fi
-    debs+=("${deb}")
+    cp -f "${source_deb}" "${cached_deb}"
   done
+  echo "[build] Cached ${#all_debs[@]} NEAT internals Debian package(s):"
+  find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' -printf '[build]   %f\n' | sort
+
+  local debs=()
+  local deb
+  mapfile -t debs < <(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' | sort)
 
   if [[ "${ELXR_SDK}" == "ON" ]]; then
     if [[ ! -d "${sysroot}" ]]; then
       echo "ERROR: SYSROOT does not exist: ${sysroot}" >&2
       exit 1
     fi
+
+    payload_root="$(mktemp -d /tmp/llima-neat-internals-payload.XXXXXX)"
+    for deb in "${debs[@]}"; do
+      dpkg-deb -x "${deb}" "${payload_root}"
+    done
+    if ! validate_neat_internals_payload "${payload_root}" "${archive_name}"; then
+      rm -rf "${payload_root}"
+      [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
+      exit 1
+    fi
+    rm -rf "${payload_root}"
+
     echo "[build] Installing NEAT internals deb payloads into SDK sysroot:"
     echo "[build]   ${sysroot}"
     for deb in "${debs[@]}"; do
@@ -614,33 +718,7 @@ ensure_neat_internals() {
     fi
     echo "[build] Installing NEAT internals deb packages into host system"
     run_as_root apt install -y --allow-downgrades "${debs[@]}"
-  fi
-
-  local config_dir dispatcher_factory_header dispatcher_base_header runtime_lib
-  local missing=()
-
-  if [[ "${ELXR_SDK}" == "ON" ]]; then
-    config_dir="${sysroot}/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_factory_header="${sysroot}/usr/include/dispatcherfactory.hh"
-    dispatcher_base_header="${sysroot}/usr/include/dispatcherbase.hh"
-    runtime_lib="${sysroot}/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
-  else
-    config_dir="/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_factory_header="/usr/include/dispatcherfactory.hh"
-    dispatcher_base_header="/usr/include/dispatcherbase.hh"
-    runtime_lib="/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
-  fi
-
-  [[ -d "${config_dir}" ]] || missing+=("${config_dir}")
-  [[ -f "${dispatcher_factory_header}" ]] || missing+=("${dispatcher_factory_header}")
-  [[ -f "${dispatcher_base_header}" ]] || missing+=("${dispatcher_base_header}")
-  [[ -f "${runtime_lib}" ]] || missing+=("${runtime_lib}")
-
-  if [[ "${#missing[@]}" -gt 0 ]]; then
-    echo "ERROR: NEAT internals artifact install is incomplete." >&2
-    echo "Missing:" >&2
-    printf '  %s\n' "${missing[@]}" >&2
-    exit 1
+    validate_neat_internals_payload "" "installed NEAT internals packages"
   fi
 
   if [[ -n "${tmp_dir}" ]]; then
@@ -689,44 +767,255 @@ ensure_writable_cargo_home() {
   echo "[build] Using Cargo home: ${CARGO_HOME}"
 }
 
+write_resolved_deps_manifest() {
+  mkdir -p "$(dirname "${NEAT_INTERNALS_RESOLVED_MANIFEST}")"
+  python3 - \
+    "${NEAT_INTERNALS_MANIFEST}" \
+    "${NEAT_INTERNALS_RESOLVED_REF}" \
+    "${NEAT_INTERNALS_RESOLVED_MANIFEST}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1])
+resolved_ref = sys.argv[2].strip()
+output_path = Path(sys.argv[3])
+
+manifest = json.loads(source_path.read_text(encoding="utf-8"))
+if resolved_ref:
+    manifest["internals"] = resolved_ref
+output_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+  echo "[build] Resolved dependency manifest: ${NEAT_INTERNALS_RESOLVED_MANIFEST}"
+}
+
+required_llima_debs() {
+  local version="$1"
+  printf '%s\n' \
+    "sima-lmm-${version}-Linux-cli.deb" \
+    "sima-lmm-${version}-Linux-core.deb" \
+    "sima-lmm-${version}-Linux-dev.deb"
+}
+
+verify_required_llima_debs() {
+  local version="$1"
+  local directory="$2"
+  local deb
+  while IFS= read -r deb; do
+    if [[ ! -f "${directory}/${deb}" ]]; then
+      echo "Expected Debian package not found: ${directory}/${deb}" >&2
+      find "${directory}" -maxdepth 1 -type f -name 'sima-lmm*.deb' -printf '  %p\n' | sort >&2
+      return 1
+    fi
+  done < <(required_llima_debs "${version}")
+}
+
+write_install_manifest() {
+  local manifest_path="${ROOT_DIR}/dist/${LLIMA_INSTALL_MANIFEST}"
+  local file
+  {
+    echo "# Generated by build.sh. The installer only consumes files listed here."
+    echo "# Keep this file next to ${LLIMA_INSTALL_SCRIPT}."
+  } > "${manifest_path}"
+
+  while IFS= read -r file; do
+    basename "${file}" >> "${manifest_path}"
+  done < <(find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name '*.deb' | sort)
+  echo "[build] Install manifest: ${manifest_path}"
+}
+
+stage_package_artifacts() {
+  if [ "${#COMPONENTS[@]}" -gt 0 ]; then
+    echo "[build] Skipping publishable artifact layouts because a subset of components was selected"
+    return
+  fi
+
+  if [[ -n "${NEAT_INTERNALS_PACKAGE_DIR}" &&
+        ! "${NEAT_INTERNALS_RESOLVED_REF}" =~ ^[^:[:space:]]+:[^:[:space:]]+$ ]]; then
+    echo "ERROR: NEAT_INTERNALS_RESOLVED_REF must be an exact branch:spec reference when NEAT_INTERNALS_PACKAGE_DIR is used for a publishable artifact." >&2
+    return 1
+  fi
+
+  local version="$1"
+  local deb
+  local -a internals_debs=()
+
+  verify_required_llima_debs "${version}" "${ROOT_DIR}/dist"
+  mapfile -t internals_debs < <(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' | sort)
+  if [[ "${#internals_debs[@]}" -eq 0 ]]; then
+    echo "ERROR: No cached Internals Debian packages found in ${NEAT_INTERNALS_DEB_DIR}." >&2
+    return 1
+  fi
+
+  find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name '*.deb' ! -name 'sima-lmm-*.deb' -delete
+  rm -f \
+    "${ROOT_DIR}/dist/${LLIMA_INSTALL_SCRIPT}" \
+    "${ROOT_DIR}/dist/${LLIMA_INSTALL_MANIFEST}" \
+    "${ROOT_DIR}/dist/resolved-deps-manifest.json" \
+    "${ROOT_DIR}/dist/metadata.json"
+  rm -rf "${ROOT_DIR}/dist/debs"
+
+  for deb in "${internals_debs[@]}"; do
+    cp -f "${deb}" "${ROOT_DIR}/dist/$(basename "${deb}")"
+  done
+  install -m 0755 "${ROOT_DIR}/tools/${LLIMA_INSTALL_SCRIPT}" "${ROOT_DIR}/dist/${LLIMA_INSTALL_SCRIPT}"
+  install -m 0644 "${NEAT_INTERNALS_RESOLVED_MANIFEST}" "${ROOT_DIR}/dist/resolved-deps-manifest.json"
+  write_install_manifest
+
+  mkdir -p "${ROOT_DIR}/dist/debs"
+  while IFS= read -r deb; do
+    cp -f "${ROOT_DIR}/dist/${deb}" "${ROOT_DIR}/dist/debs/${deb}"
+  done < <(required_llima_debs "${version}")
+
+  echo "[build] Staged installable root bundle with ${#internals_debs[@]} Internals package(s)."
+  echo "[build] Staged download-only Debian profile: dist/debs/"
+}
+
 package_dist_archive() {
   if [ "${#COMPONENTS[@]}" -gt 0 ]; then
     echo "[build] Skipping dist archive because a subset of components was selected"
     return
   fi
 
-  local version archive_name latest_name
+  local version archive_name latest_name output_dir
+  local -a required_debs=()
   version="$1"
   archive_name="${ARCHIVE_NAME:-sima-llima-${version}.tar.gz}"
   latest_name="${LATEST_NAME:-}"
+  output_dir="${ROOT_DIR}/dist/debs"
 
-  local required_debs=(
-    "sima-lmm-${version}-Linux-cli.deb"
-    "sima-lmm-${version}-Linux-core.deb"
-    "sima-lmm-${version}-Linux-dev.deb"
-  )
+  verify_required_llima_debs "${version}" "${output_dir}"
+  mapfile -t required_debs < <(required_llima_debs "${version}")
 
-  mkdir -p "${ROOT_DIR}/dist"
-
-  for deb in "${required_debs[@]}"; do
-    if [[ ! -f "${ROOT_DIR}/dist/${deb}" ]]; then
-      echo "Expected Debian package not found: ${ROOT_DIR}/dist/${deb}" >&2
-      find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name 'sima-lmm*.deb' -printf '  %p\n' | sort >&2
-      return 1
-    fi
-  done
-
-  tar -C "${ROOT_DIR}/dist" -czf "${ROOT_DIR}/dist/${archive_name}" "${required_debs[@]}"
-  sha256sum "${ROOT_DIR}/dist/${archive_name}" | awk '{print $1}' > "${ROOT_DIR}/dist/${archive_name}.sha256"
-  ls -lh "${ROOT_DIR}/dist/${archive_name}"
-  cat "${ROOT_DIR}/dist/${archive_name}.sha256"
+  tar -C "${output_dir}" -czf "${output_dir}/${archive_name}" "${required_debs[@]}"
+  sha256sum "${output_dir}/${archive_name}" | awk '{print $1}' > "${output_dir}/${archive_name}.sha256"
+  ls -lh "${output_dir}/${archive_name}"
 
   if [[ -n "${latest_name}" ]]; then
-    cp "${ROOT_DIR}/dist/${archive_name}" "${ROOT_DIR}/dist/${latest_name}"
-    sha256sum "${ROOT_DIR}/dist/${latest_name}" | awk '{print $1}' > "${ROOT_DIR}/dist/${latest_name}.sha256"
-    ls -lh "${ROOT_DIR}/dist/${latest_name}"
-    cat "${ROOT_DIR}/dist/${latest_name}.sha256"
+    cp "${output_dir}/${archive_name}" "${output_dir}/${latest_name}"
+    sha256sum "${output_dir}/${latest_name}" | awk '{print $1}' > "${output_dir}/${latest_name}.sha256"
   fi
+}
+
+build_extras_archive() {
+  if [[ "${BUILD_RUNTIME_TESTS}" != "ON" ]]; then
+    echo "[build] Skipping runtime test extras archive because tests are disabled"
+    return
+  fi
+  if [[ "${SKIP_DIST}" -eq 1 ]]; then
+    echo "[build] Skipping runtime test extras archive (--no-dist)"
+    return
+  fi
+
+  local stage_root install_prefix archive_path
+  stage_root="$(mktemp -d /tmp/sima-lmm-extras-stage.XXXXXX)"
+  install_prefix="${stage_root}/prefix"
+  archive_path="${ROOT_DIR}/dist/sima-lmm-${LLIMA_VERSION}-Linux-extras.tar.gz"
+
+  (
+    trap 'rm -rf "${stage_root}"' EXIT
+    mkdir -p "${install_prefix}"
+    cmake --install "${BUILD_DIR}" --component extras --prefix "${install_prefix}"
+
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the dispatcher lifecycle executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_text_generation_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the text generation executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_vision_generation_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the vision generation executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_asr_transcription_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the ASR transcription executable." >&2
+      exit 1
+    fi
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_tool_call_parser_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the tool-call parser executable." >&2
+      exit 1
+    fi
+    if [[ ! -f "${install_prefix}/lib/sima-lmm/tests/CTestTestfile.cmake" ]]; then
+      echo "ERROR: Runtime test extras are missing CTestTestfile.cmake." >&2
+      exit 1
+    fi
+
+    find "${ROOT_DIR}/dist" -maxdepth 1 -type f \
+      -name 'sima-lmm-*-Linux-extras.tar.gz' -delete
+    tar -C "${install_prefix}" -czf "${archive_path}" .
+  )
+
+  echo "[build] Built runtime test extras archive: ${archive_path}"
+}
+
+read_package_compatibility_args() {
+  local -n out_ref="$1"
+  local compatibility_args
+  if ! compatibility_args="$(python3 - "${NEAT_INTERNALS_MANIFEST}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+platform_version = str(manifest.get("platform-version", "")).strip()
+if not platform_version:
+    raise SystemExit(f"Missing or empty platform-version in {manifest_path}")
+
+for argument in ("--board-platform", f"modalix@{platform_version}"):
+    print(argument)
+PY
+  )"; then
+    echo "ERROR: Failed to read package compatibility from ${NEAT_INTERNALS_MANIFEST}." >&2
+    return 1
+  fi
+  mapfile -t out_ref <<< "${compatibility_args}"
+}
+
+add_package_source_metadata() {
+  local metadata_path="$1"
+  local package_path="$2"
+  local profile="$3"
+  local source_repository source_ref source_sha
+  source_repository="${GITHUB_REPOSITORY:-sima-neat/llima}"
+  source_ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-}}"
+  if [[ -z "${source_ref}" ]]; then
+    source_ref="$(git -C "${ROOT_DIR}" branch --show-current 2>/dev/null || true)"
+  fi
+  source_ref="${source_ref:-detached}"
+  source_sha="${GITHUB_SHA:-$(git -C "${ROOT_DIR}" rev-parse HEAD)}"
+
+  python3 - "${metadata_path}" "${package_path}" "${profile}" \
+    "${source_repository}" "${source_ref}" "${source_sha}" \
+    "${NEAT_INTERNALS_RESOLVED_REF}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+metadata_path = Path(sys.argv[1])
+package_path, profile, repository, ref, commit, internals_ref = sys.argv[2:]
+metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+metadata.update(
+    {
+        "artifact": {
+            "type": "debian-packages",
+            "repository": "llima",
+            "package_path": package_path,
+            "profile": profile,
+            "internals_ref": internals_ref,
+        },
+        "repository": repository,
+        "branch": ref,
+        "commit": commit,
+        "commit_folder": commit[:12],
+        "published_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+)
+metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+PY
 }
 
 generate_package_metadata() {
@@ -735,53 +1024,53 @@ generate_package_metadata() {
     return
   fi
 
-  local version package_dir metadata_tmp
+  local version root_package_dir debs_package_dir file deb
+  local -a package_compatibility_args=()
   version="$1"
-  package_dir="$(mktemp -d /tmp/llima-package-metadata.XXXXXX)"
-  metadata_tmp="${package_dir}/metadata.json"
-
-  local required_debs=(
-    "sima-lmm-${version}-Linux-cli.deb"
-    "sima-lmm-${version}-Linux-core.deb"
-    "sima-lmm-${version}-Linux-dev.deb"
-  )
-
-  for deb in "${required_debs[@]}"; do
-    if [[ ! -f "${ROOT_DIR}/dist/${deb}" ]]; then
-      echo "Expected Debian package not found for metadata: ${ROOT_DIR}/dist/${deb}" >&2
-      rm -rf "${package_dir}"
-      return 1
-    fi
-    cp -f "${ROOT_DIR}/dist/${deb}" "${package_dir}/"
-  done
+  root_package_dir="$(mktemp -d /tmp/llima-root-package-metadata.XXXXXX)"
+  debs_package_dir="$(mktemp -d /tmp/llima-debs-package-metadata.XXXXXX)"
 
   if ! command -v sima-cli >/dev/null 2>&1; then
-    echo "[build] sima-cli not found; skipping package metadata generation."
-    rm -rf "${package_dir}"
-    return
-  fi
-  if ! sima-cli packages build --help >/dev/null 2>&1; then
-    echo "[build] sima-cli packages build is unavailable; skipping package metadata generation."
-    rm -rf "${package_dir}"
-    return
-  fi
-
-  echo "[build] Building package metadata: dist/metadata.json"
-  SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli packages build "${package_dir}" \
-    --name "gh:sima-neat/llima" \
-    --version "${version}" \
-    --description "SiMa.ai Lean Language and Image Modalix Application packages" \
-    --install-script 'echo "llima package downloaded"'
-
-  if [[ ! -f "${metadata_tmp}" ]]; then
-    echo "Expected metadata not generated: ${metadata_tmp}" >&2
-    rm -rf "${package_dir}"
+    echo "ERROR: sima-cli is required to generate package metadata." >&2
     return 1
   fi
+  if ! sima-cli packages build --help >/dev/null 2>&1; then
+    echo "ERROR: sima-cli packages build is required to generate package metadata." >&2
+    return 1
+  fi
+  read_package_compatibility_args package_compatibility_args
 
-  cp -f "${metadata_tmp}" "${ROOT_DIR}/dist/metadata.json"
-  rm -rf "${package_dir}"
-  ls -lh "${ROOT_DIR}/dist/metadata.json"
+  while IFS= read -r file; do
+    cp -f "${file}" "${root_package_dir}/"
+  done < <(find "${ROOT_DIR}/dist" -maxdepth 1 -type f ! -name 'metadata.json' | sort)
+
+  echo "[build] Building installable root package metadata: dist/metadata.json"
+  SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli packages build "${root_package_dir}" \
+    --name "gh:sima-neat/llima" \
+    --version "${version}" \
+    --description "Installable SiMa.ai LLiMa runtime and exact Internals dependencies" \
+    --install-script "bash ./${LLIMA_INSTALL_SCRIPT}" \
+    "${package_compatibility_args[@]}"
+
+  cp -f "${root_package_dir}/metadata.json" "${ROOT_DIR}/dist/metadata.json"
+  add_package_source_metadata "${ROOT_DIR}/dist/metadata.json" "." "devkit-install"
+
+  while IFS= read -r deb; do
+    cp -f "${ROOT_DIR}/dist/debs/${deb}" "${debs_package_dir}/${deb}"
+  done < <(required_llima_debs "${version}")
+
+  echo "[build] Building download-only Debian profile metadata: dist/debs/metadata.json"
+  SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli packages build "${debs_package_dir}" \
+    --name "gh:sima-neat/llima/debs" \
+    --version "${version}" \
+    --description "Download-only SiMa.ai LLiMa Debian packages" \
+    --install-script 'echo "LLiMa Debian packages downloaded."'
+
+  cp -f "${debs_package_dir}/metadata.json" "${ROOT_DIR}/dist/debs/metadata.json"
+  add_package_source_metadata "${ROOT_DIR}/dist/debs/metadata.json" "debs" "download-only"
+
+  rm -rf "${root_package_dir}" "${debs_package_dir}"
+  ls -lh "${ROOT_DIR}/dist/metadata.json" "${ROOT_DIR}/dist/debs/metadata.json"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -804,6 +1093,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --all)
       COMPONENTS=()
+      BUILD_RUNTIME_TESTS=ON
       shift
       ;;
     --no-dist)
@@ -812,18 +1102,22 @@ while [ "$#" -gt 0 ]; do
       ;;
     --core)
       add_component core
+      BUILD_RUNTIME_TESTS=OFF
       shift
       ;;
     --dev)
       add_component dev
+      BUILD_RUNTIME_TESTS=OFF
       shift
       ;;
     --cli)
       add_component cli
+      BUILD_RUNTIME_TESTS=OFF
       shift
       ;;
     --package)
       add_component "${2:-}"
+      BUILD_RUNTIME_TESTS=OFF
       shift 2
       ;;
     --)
@@ -842,6 +1136,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+NEAT_INTERNALS_DEB_DIR="${NEAT_INTERNALS_DEB_DIR:-${BUILD_DIR}/internals-debs}"
+NEAT_INTERNALS_RESOLVED_MANIFEST="${NEAT_INTERNALS_RESOLVED_MANIFEST:-${BUILD_DIR}/resolved-deps-manifest.json}"
 BUILD_VENV="$BUILD_DIR/.deb-build-venv"
 
 if [ "$INSTALL_DEPS_ONLY" -eq 1 ]; then
@@ -860,10 +1156,18 @@ if [ "${#COMPONENTS[@]}" -gt 0 ]; then
   mapfile -t COMPONENTS < <(printf '%s\n' "${COMPONENTS[@]}" | sort -u)
 fi
 
+if [ "$DO_CLEAN" -eq 1 ]; then
+  echo "[build] Removing build directory: $BUILD_DIR"
+  rm -rf "$BUILD_DIR"
+  rm -rf "$ROOT_DIR/dist"
+  rm -f "$ROOT_DIR"/sima-lmm*.deb
+fi
+
 check_local_build_tools
 ensure_git_submodules
 detect_elxr_sdk
 ensure_neat_internals
+write_resolved_deps_manifest
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
 
@@ -875,13 +1179,6 @@ if [ -z "$MULTIARCH" ]; then
 fi
 PYTHON_ABI_TAG="cpython-311"
 PYTHON_TARGET_SOABI="${PYTHON_ABI_TAG}-${MULTIARCH}"
-
-if [ "$DO_CLEAN" -eq 1 ]; then
-  echo "[build] Removing build directory: $BUILD_DIR"
-  rm -rf "$BUILD_DIR"
-  rm -rf "$ROOT_DIR/dist"
-  rm -f "$ROOT_DIR"/sima-lmm*.deb
-fi
 
 ensure_writable_cargo_home
 ensure_python_build_env
@@ -927,6 +1224,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DCMAKE_INSTALL_LIBDIR="lib/$MULTIARCH" \
   -DSKBUILD_SOABI="$PYTHON_TARGET_SOABI" \
   -DSIMA_LMM_BUILD_PYTHON=ON \
+  -DSIMA_LMM_BUILD_TESTS="$BUILD_RUNTIME_TESTS" \
   -DSIMA_LMM_INSTALL_PYTHON_PACKAGE=ON \
   -DSIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR="lib/python3/dist-packages/sima_lmm/devkit" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
@@ -973,6 +1271,8 @@ else
 fi
 
 if [ "$SKIP_DIST" -eq 0 ]; then
-  generate_package_metadata "$LLIMA_VERSION"
+  build_extras_archive
+  stage_package_artifacts "$LLIMA_VERSION"
   package_dist_archive "$LLIMA_VERSION"
+  generate_package_metadata "$LLIMA_VERSION"
 fi

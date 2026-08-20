@@ -13,9 +13,16 @@ import torch
 import transformers
 import zmq
 from lm_eval.api.instance import Instance
-from lm_eval.models.huggingface import HFLM
-from lm_eval.models.utils_hf import MultiTokenEOSCriteria, stop_sequences_criteria
+from lm_eval.api.model import TemplateLM
+from lm_eval.models.huggingface import HFLM, TOKENIZER_INFINITY
+from lm_eval.models.utils import configure_pad_token
+from lm_eval.models.utils_hf import (
+    MultiTokenEOSCriteria,
+    get_dtype,
+    stop_sequences_criteria,
+)
 from loguru import logger
+from tqdm import tqdm
 
 from sima_lmm.mole import performance_bench
 from sima_lmm.mole.modalixboard import ModalixBoard
@@ -58,13 +65,101 @@ class ModalixLM(HFLM):
 
     def __init__(self, board: ModalixBoard, *args, **kwargs) -> None:
         logger.info(f"Instantiating {self.__class__.__name__}")
-        assert int(kwargs.get("batch_size", -1)) == 1, "batch_size must be set to 1!"
-        super().__init__(*args, **kwargs)
+        if args:
+            pretrained = args[0]
+            if len(args) > 1:
+                raise TypeError("ModalixLM only accepts pretrained as a positional argument")
+        else:
+            pretrained = kwargs.pop("pretrained")
+
+        backend = kwargs.pop("backend", "default")
+        revision = str(kwargs.pop("revision", "main"))
+        subfolder = kwargs.pop("subfolder", "")
+        tokenizer = kwargs.pop("tokenizer", None)
+        max_length = kwargs.pop("max_length", None)
+        device = kwargs.pop("device", "cuda")
+        softmax_dtype = kwargs.pop("softmax_dtype", None)
+        mixed_precision_dtype = kwargs.pop("mixed_precision_dtype", None)
+        batch_size = kwargs.pop("batch_size", 1)
+        max_batch_size = kwargs.pop("max_batch_size", 64)
+        trust_remote_code = kwargs.pop("trust_remote_code", False)
+        use_fast_tokenizer = kwargs.pop("use_fast_tokenizer", True)
+        add_bos_token = kwargs.pop("add_bos_token", None)
+        prefix_token_id = kwargs.pop("prefix_token_id", None)
+        gguf_file = kwargs.pop("gguf_file", None)
+        truncation = kwargs.pop("truncation", False)
+        logits_cache = kwargs.pop("logits_cache", True)
+        chat_template_args = kwargs.pop("chat_template_args", None)
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        think_end_token = kwargs.pop("think_end_token", None)
+
+        if kwargs:
+            logger.warning(f"Ignoring unused ModalixLM arguments: {sorted(kwargs)}")
+
+        assert int(batch_size) == 1, "batch_size must be set to 1!"
+        assert isinstance(device, str)
+        assert isinstance(pretrained, str), "Modalix backend requires a tokenizer/config model ID"
+
+        TemplateLM.__init__(self)
+        self.board = board
+        self._device = torch.device(device)
+        self._get_config(
+            pretrained,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            gguf_file=gguf_file,
+            subfolder=subfolder,
+        )
+        self._get_backend(config=self.config, backend=backend, trust_remote_code=trust_remote_code)
+        self._create_tokenizer(
+            pretrained,
+            tokenizer,
+            revision=revision,
+            subfolder=subfolder,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+            gguf_file=gguf_file,
+            add_bos_token=add_bos_token,
+        )
 
         assert self.AUTO_MODEL_CLASS in self._supported_hf_lms, (
             f"Model <{self.AUTO_MODEL_CLASS}> is not supported!"
             f" This evaluation suite only supports {self._supported_hf_lms}"
         )
+
+        self.think_end_token = (
+            int(think_end_token)
+            if (isinstance(think_end_token, str) and think_end_token.isdigit())
+            else think_end_token
+        )
+        self.truncation = truncation
+        self.logits_cache = logits_cache
+        self.vocab_size = self.tokenizer.vocab_size
+        self.tokenizer = configure_pad_token(self.tokenizer, model_config=self.config)
+        self.chat_template_args = (
+            (chat_template_args or {}) | dict(enable_thinking=enable_thinking)
+            if enable_thinking is not None else (chat_template_args or {})
+        )
+        self.enable_thinking = enable_thinking
+        if enable_thinking and think_end_token is None:
+            raise ValueError(
+                "think_end_token is required when using enable_thinking=True"
+            )
+        self.add_bos_token = add_bos_token
+        self._max_length = max_length
+        self.pretrained = pretrained
+        self.delta = None
+        self.peft = None
+        self.revision = revision
+        self.batch_schedule = 1
+        self.batch_sizes = {}
+        self.batch_size_per_gpu = int(batch_size)
+        self.max_batch_size = max_batch_size
+        self.softmax_dtype = get_dtype(softmax_dtype) if softmax_dtype is not None else None
+        self.mixed_precision_dtype = (
+            get_dtype(mixed_precision_dtype) if mixed_precision_dtype is not None else None
+        )
+        self.custom_prefix_token_id = prefix_token_id
 
         self.profile_data = []
         self.last_profile_data: dict = {}
@@ -77,6 +172,46 @@ class ModalixLM(HFLM):
         self.zmq_socket.setsockopt(zmq.SNDTIMEO, 10 * 60 * 1000)  # 10mins.
         self.zmq_socket.connect(addr=board.tcp_uri)
         logger.info(f"ZMQ Client connected to: {board.tcp_uri}")
+
+    def get_model_info(self) -> dict:
+        """Return reproducibility metadata without requiring local HF model weights."""
+
+        def get_model_sha(pretrained: str, revision: str) -> str:
+            if Path(pretrained).is_dir():
+                return ""
+            try:
+                from huggingface_hub import HfApi
+
+                return HfApi().model_info(repo_id=pretrained, revision=revision).sha
+            except Exception as exc:
+                logger.debug(
+                    "Failed to get model SHA for {} at revision {}. Error: {}",
+                    pretrained,
+                    revision,
+                    exc,
+                )
+                return ""
+
+        return {
+            "model_num_parameters": -1,
+            "model_dtype": "modalix",
+            "model_revision": self.revision,
+            "model_sha": get_model_sha(self.pretrained, self.revision),
+        }
+
+    @property
+    def max_length(self) -> int:
+        if self._max_length:
+            return self._max_length
+        seqlen_config_attrs = ("n_positions", "max_position_embeddings", "n_ctx")
+        for attr in seqlen_config_attrs:
+            if hasattr(self.config, attr):
+                return getattr(self.config, attr)
+        if hasattr(self.tokenizer, "model_max_length"):
+            if self.tokenizer.model_max_length == TOKENIZER_INFINITY:
+                return self._DEFAULT_MAX_LENGTH
+            return self.tokenizer.model_max_length
+        return self._DEFAULT_MAX_LENGTH
 
     def _model_call(
         self,
@@ -103,7 +238,7 @@ class ModalixLM(HFLM):
     def _zmq_infer(
         self,
         tensor: torch.Tensor,
-        request_type: Literal["model_call", "generate"],
+        request_type: Literal["model_call", "generate", "generate_for_perf"],
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -128,11 +263,11 @@ class ModalixLM(HFLM):
             "type": request_type,
             "tensor_dtype": np_tensor.dtype.name,
             "tensor_shape": np_tensor.shape,
-            **kwargs
+            **kwargs,
         }
         request_messages = [
             msgpack.packb(request_metadata, use_bin_type=True),
-            np_tensor.tobytes()
+            np_tensor.tobytes(),
         ]
 
         # ZMQ Step
@@ -140,11 +275,15 @@ class ModalixLM(HFLM):
         self.zmq_socket.send_multipart(request_messages)
         response_messages = self.zmq_socket.recv_multipart(track=True)
         zmq_t1 = time.perf_counter_ns()
-        assert len(response_messages) == 2
+        if len(response_messages) != 2:
+            raise RuntimeError(f"Expected 2 ZMQ response frames, got {len(response_messages)}")
 
         # ZMQ Post-Proc
         response_metadata = msgpack.unpackb(response_messages[0], raw=False)
-        assert "tensor_dtype" in response_metadata and "tensor_shape" in response_metadata
+        if response_metadata.get("error"):
+            raise RuntimeError(response_metadata["error"])
+        if "tensor_dtype" not in response_metadata or "tensor_shape" not in response_metadata:
+            raise RuntimeError(f"Malformed response metadata: {response_metadata}")
         match response_metadata["tensor_dtype"]:
             case "uint32":
                 out_dtype = torch.uint32
@@ -155,14 +294,107 @@ class ModalixLM(HFLM):
             case _:
                 raise RuntimeError(f"Unexpected dtype: {response_metadata['tensor_dtype']}")
         out_shape = response_metadata["tensor_shape"]
-        out_tensor = torch.frombuffer(response_messages[1], dtype=out_dtype).view(*out_shape)
+        out_tensor = torch.frombuffer(bytearray(response_messages[1]), dtype=out_dtype).view(
+            *out_shape
+        )
         out_tensor = out_tensor.to(device=device)
 
-        profile_data["in_tokens"] = tensor.size(1)
-        profile_data["out_tokens"] = out_tensor.size(1)
-        profile_data["zmq_infer_time"] = zmq_t1 - zmq_t0
-        self.profile_data.append({**profile_data, **response_metadata, "tensor_data": out_tensor})
+        roundtrip_time_ns = zmq_t1 - zmq_t0
+        board_infer_time_ns = response_metadata.get("infer_time_ns")
+        network_time_ns = (
+            max(0, roundtrip_time_ns - board_infer_time_ns)
+            if isinstance(board_infer_time_ns, int) else None
+        )
+        profile_data.update({
+            "request_type": request_type,
+            "in_tokens": int(tensor.size(1)),
+            "out_tokens": int(out_tensor.size(1)) if out_tensor.ndim > 1 else int(out_tensor.numel()),
+            "request_bytes": len(request_messages[1]),
+            "response_bytes": len(response_messages[1]),
+            "zmq_roundtrip_time_ns": roundtrip_time_ns,
+            "board_infer_time_ns": board_infer_time_ns,
+            "network_time_ns": network_time_ns,
+        })
+        safe_metadata = {
+            key: value for key, value in response_metadata.items()
+            if key != "error"
+        }
+        profile_entry = {**profile_data, **safe_metadata}
+        self.last_profile_data = profile_entry
+        self.profile_data.append(profile_entry)
         return out_tensor
+
+    def _zmq_loglikelihood(
+        self,
+        input_tokens: list[int],
+        continuation_start: int,
+        continuation_tokens: list[int],
+    ) -> tuple[float, bool]:
+        tensor = torch.tensor([input_tokens], dtype=torch.long, device=self.device)
+        metadata = {
+            "continuation_start": continuation_start,
+            "continuation_token_ids": continuation_tokens,
+        }
+        result = self._zmq_infer(
+            tensor=tensor,
+            request_type="model_call",
+            **metadata,
+        )
+        if tuple(result.shape) != (1, 2):
+            raise RuntimeError(
+                f"Expected loglikelihood response with shape [1, 2], got {tuple(result.shape)}"
+            )
+        return float(result[0, 0].item()), bool(result[0, 1].item())
+
+    def _loglikelihood_tokens(
+        self,
+        requests: list[tuple[tuple[str, str] | None, list[int], list[int]]],
+        disable_tqdm: bool = False,
+        override_bs: int | None = None,
+    ) -> list[tuple[float, bool]]:
+        del override_bs
+        if self.backend != "causal":
+            raise RuntimeError("Modalix loglikelihood currently supports causal models only")
+
+        results = []
+        for request_str, context_enc, continuation_enc in tqdm(
+            requests,
+            disable=(disable_tqdm or (self.rank != 0)),
+            desc="Running Modalix loglikelihood requests",
+        ):
+            assert len(context_enc) > 0
+            assert len(continuation_enc) > 0
+            assert len(continuation_enc) <= self.max_length
+
+            total_length = len(context_enc) + len(continuation_enc)
+            if total_length > self.max_length + 1:
+                logger.warning(
+                    "Combined length of context ({}) and continuation ({}) exceeds "
+                    "model maximum length ({}). Truncating {} tokens from the left.",
+                    len(context_enc),
+                    len(continuation_enc),
+                    self.max_length,
+                    total_length - self.max_length + 1,
+                )
+
+            input_tokens = (context_enc + continuation_enc)[-(self.max_length + 1):][:-1]
+            if len(input_tokens) < len(continuation_enc):
+                raise RuntimeError(
+                    "Truncated input is shorter than the continuation; cannot score request"
+                )
+            continuation_start = len(input_tokens) - len(continuation_enc)
+
+            answer = self._zmq_loglikelihood(
+                input_tokens=input_tokens,
+                continuation_start=continuation_start,
+                continuation_tokens=continuation_enc,
+            )
+            results.append(answer)
+
+            if request_str is not None:
+                self.cache_hook.add_partial("loglikelihood", request_str, answer)
+
+        return results
 
     def _calc_dump_profile(self, filename: str = "profile-dump"):
         dumpfile = Path("profiling") / (f"profile-{filename}.json")
@@ -170,23 +402,33 @@ class ModalixLM(HFLM):
         if len(self.profile_data) == 0:
             logger.debug("Nothing to profile!")
             return
+        dumpfile.parent.mkdir(exist_ok=True, parents=True)
         with dumpfile.open("w") as fp:
             json.dump(self.profile_data, fp, sort_keys=True)
 
-    def perf_bench(self, n_samples: int = 128, max_new_tokens: int = 256):
+    def perf_bench(
+        self,
+        n_samples: int = 128,
+        max_new_tokens: int = 256,
+        input_lengths: tuple[int, ...] | None = None,
+    ):
         """
         perf_bench Run performance benchmark using LAMBADA (cimec/lambada) dataset.
 
         Args:
             n_samples: The number of unique text samples to generate for each context length bucket.
             max_new_tokens: The maximum number of new tokens to generate.
+            input_lengths: Exact input-token lengths to benchmark. When omitted,
+                power-of-two buckets are generated automatically.
         """
         logger.info("Starting performance benchmark using sample data from cimec/lambada")
         sample_data = performance_bench.create_sample_data(
             tokenizer=self.tokenizer,
             max_toks=self.max_length,
             n_samples=n_samples,
+            input_lengths=input_lengths,
         )
+        speculative_stats: dict[int, dict[str, list[float]]] = {}
 
         def inference_fn(tokens: list[int]) -> list[float]:
             context = torch.tensor([tokens], device=self.device)
@@ -195,6 +437,24 @@ class ModalixLM(HFLM):
                 request_type="generate_for_perf",
                 max_num_tokens=min(self.max_length, len(tokens) + max_new_tokens)
             )
+            generated_tokens = self.last_profile_data.get("generated_tokens")
+            accepted_draft_tokens = self.last_profile_data.get("accepted_draft_tokens")
+            if isinstance(generated_tokens, int) and isinstance(accepted_draft_tokens, int):
+                bucket = speculative_stats.setdefault(
+                    len(tokens),
+                    {
+                        "generated_tokens": [],
+                        "accepted_draft_tokens": [],
+                        "acceptance_rate_pct": [],
+                    },
+                )
+                bucket["generated_tokens"].append(float(generated_tokens))
+                bucket["accepted_draft_tokens"].append(float(accepted_draft_tokens))
+                acceptance_rate = (
+                    100.0 * accepted_draft_tokens / generated_tokens
+                    if generated_tokens > 0 else 0.0
+                )
+                bucket["acceptance_rate_pct"].append(acceptance_rate)
             return generate_time_tensor.cpu().tolist()[0]
 
         logger.info('Running Performance Benchmark')
@@ -202,10 +462,12 @@ class ModalixLM(HFLM):
             data=sample_data,
             inference_fn=inference_fn
         )
+        for input_length, metrics in speculative_stats.items():
+            perf_stats[input_length].update(metrics)
 
         logger.info("Summarizing Results")
         summary = performance_bench.summarize(
-            data=perf_stats, model_name=self._model.config.name_or_path
+            data=perf_stats, model_name=self.config.name_or_path
         )
         return summary
 
@@ -255,7 +517,12 @@ class ModalixLM(HFLM):
             tensor=context, request_type="generate", max_num_tokens=max_length,
             stop_token_ids=stop_tokens
         )
-        return generation
+        # HFLM.generate_until expects causal generation to include the input context and removes it
+        # before decoding. The Modalix server returns the final context token followed by newly
+        # generated tokens, so discard that echoed context token before rebuilding the sequence.
+        generation = generation[:, 1:]
+        generation = generation.to(device=context.device, dtype=context.dtype)
+        return torch.cat((context, generation), dim=1)
 
     def _generate_torch(
         self,

@@ -6,7 +6,8 @@ namespace simaai {
 namespace llima {
 
 
-Chat::Chat(VlmHelper& vlm_helper) : _vlm_helper(vlm_helper) {
+Chat::Chat(VlmHelper& vlm_helper) : _vlm_helper(vlm_helper),
+    _enable_thinking(vlm_helper.get_enable_thinking()) {
     auto system_prompt = vlm_helper.get_system_prompt().value_or("");
     if (!system_prompt.empty())
         set_system_prompt(system_prompt);

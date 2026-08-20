@@ -28,6 +28,7 @@ struct VisionModelConfig {
     uint16_t temporal_patch_size;
     uint16_t spatial_patch_size;
     uint16_t spatial_merge_size;
+    uint32_t hidden_size;
     std::vector<uint8_t> deepstack_visual_indexes;
 
     std::vector<uint16_t> num_spatial_patches;
@@ -42,6 +43,7 @@ inline void to_json(nlohmann::json& j, const VisionModelConfig& v) {
     }
     j["patch_size"] = v.spatial_patch_size;
     j["temporal_patch_size"] = v.temporal_patch_size;
+    j["hidden_size"] = v.hidden_size;
     j["deepstack_visual_indexes"] = v.deepstack_visual_indexes;
 }
 
@@ -68,6 +70,7 @@ inline void from_json(const nlohmann::json& j, VisionModelConfig& v) {
     v.temporal_patch_size = j.value("temporal_patch_size", 1);
     v.cls_embed = j.value("cls_embed", false);
     v.spatial_merge_size = j.value("spatial_merge_size", 1);
+    v.hidden_size = j.value("hidden_size", 0);
 
     if (j.contains("deepstack_visual_indexes"))
         v.deepstack_visual_indexes = j["deepstack_visual_indexes"].get<std::vector<uint8_t>>();
@@ -249,6 +252,7 @@ struct PipelineConfig {
     uint16_t input_token_group_size;
     std::optional<std::vector<uint16_t>> input_token_group_offsets;
     uint16_t future_token_mask_size;
+    std::optional<uint16_t> long_context_future_token_mask_size = std::nullopt;
     bool return_logits;
     bool use_strided_kv_cache = true;
     bool enable_filter_sharing;
@@ -257,9 +261,37 @@ struct PipelineConfig {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     PipelineConfig, system_prompt, chat_template, max_num_tokens, input_token_group_size,
-    input_token_group_offsets, future_token_mask_size, return_logits, use_strided_kv_cache,
-    enable_filter_sharing, quantize_embeddings, quantize_kv_cache
+    input_token_group_offsets, future_token_mask_size, long_context_future_token_mask_size,
+    return_logits, use_strided_kv_cache, enable_filter_sharing, quantize_embeddings,
+    quantize_kv_cache
 )
+
+
+struct VisionModelNames : std::vector<std::string> {
+    using std::vector<std::string>::vector;
+};
+
+
+inline void to_json(nlohmann::json& j, const VisionModelNames& names) {
+    if (names.size() == 1) {
+        j = names.front();
+    } else {
+        j = static_cast<const std::vector<std::string>&>(names);
+    }
+}
+
+
+inline void from_json(const nlohmann::json& j, VisionModelNames& names) {
+    if (j.is_string()) {
+        names = VisionModelNames{j.get<std::string>()};
+    } else if (j.is_array()) {
+        j.get_to(static_cast<std::vector<std::string>&>(names));
+    } else {
+        throw std::runtime_error(
+            "vision_model_name must be a string or an array of strings"
+        );
+    }
+}
 
 
 struct VlmConfig {
@@ -269,7 +301,7 @@ struct VlmConfig {
     std::optional<MMConnectionConfig> mm_cfg;
     LanguageModelConfig lm_cfg;
     PipelineConfig pipeline_cfg;
-    std::string vision_model_name = "";
+    VisionModelNames vision_model_name = {};
     std::string language_model_name;
     std::string gguf_file_name = "";
 

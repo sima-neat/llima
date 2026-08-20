@@ -54,6 +54,10 @@ def main():
     perf_parser.add_argument(
         "--max_new_tokens", type=int, default=256, help="Max number of new tokens"
     )
+    perf_parser.add_argument(
+        "--input_lengths", type=int, nargs="+",
+        help="Exact input-token lengths to benchmark; omit for automatic buckets"
+    )
     args = parser.parse_args()
 
     # Create and validate mole config.
@@ -75,7 +79,8 @@ def main():
         do_start_server=args.board_start_server,
         do_perf=args.command == "perf",
         max_num_tokens=args.max_num_tokens,
-        max_new_tokens=args.max_new_tokens
+        max_new_tokens=args.max_new_tokens,
+        input_lengths=getattr(args, "input_lengths", None),
     )
     if config is None:
         parser.error("Invalid argument combinations")

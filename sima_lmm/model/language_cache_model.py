@@ -15,6 +15,21 @@ from sima_lmm.model.sima_builder import SimaBuilder, activation_type
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
+_BMM2_REDUCTION_SPLIT_THRESHOLD = 2048
+_BMM2_REDUCTION_CHUNK_SIZE = 1024
+
+
+def _get_bmm2_reduction_ranges(context_length: int) -> list[tuple[int, int]]:
+    """Return contiguous cache ranges for the second attention BMM."""
+    assert context_length > 0
+    if context_length <= _BMM2_REDUCTION_SPLIT_THRESHOLD:
+        return [(0, context_length)]
+    return [
+        (start, min(start + _BMM2_REDUCTION_CHUNK_SIZE, context_length))
+        for start in range(0, context_length, _BMM2_REDUCTION_CHUNK_SIZE)
+    ]
+
+
 @dataclass
 class LanguageCacheModel(LanguagePartBaseModel):
     """Base implementation for the cache model of the language model.
@@ -42,6 +57,31 @@ class LanguageCacheModel(LanguagePartBaseModel):
     def _is_speculative_decoding(self) -> bool:
         return (self.cfg.lm_cfg.speculative_decoding_cfg is not None
                 and self.num_tokens == self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget)
+
+    @property
+    def _is_group_model(self) -> bool:
+        speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        single_num_tokens = (
+            speculative_cfg.speculative_budget if speculative_cfg is not None else 1
+        )
+        return (
+            bool(self.cfg.pipeline_cfg.input_token_group_offsets)
+            and self.num_tokens == self.cfg.pipeline_cfg.input_token_group_size
+            and self.num_tokens != single_num_tokens
+        )
+
+    @property
+    def _cache_mask_size(self) -> int:
+        return self.cfg.pipeline_cfg.get_cache_mask_size(
+            self.layer_type, self.context_length, is_group=self._is_group_model
+        )
+
+    @property
+    def _uses_group_future_token_mask(self) -> bool:
+        return (
+            self._is_group_model
+            and self._cache_mask_size > self.cfg.pipeline_cfg.input_token_group_size
+        )
 
     @property
     def context_length(self) -> int:
@@ -86,13 +126,14 @@ class LanguageCacheModel(LanguagePartBaseModel):
         if (
             (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
             or self._is_speculative_decoding
+            or self._uses_group_future_token_mask
         ):
             # For paligemma, the attention mask is dynamically determined.
             # For speculative decoding, the attention mask is dynamically determined during decode time.
             self._onnx_builder.create_input_node(
                 "attn_mask", (1, self.context_length, 1, self.num_tokens)
             )
-        elif self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1:
+        elif self._cache_mask_size > 1 and self.num_tokens == 1:
             # Enable the future attention mask to reduce the total number of cache models.
             self._onnx_builder.create_input_node("attn_mask", (1, self.token_idx + 1, 1, 1))
         self._onnx_builder.create_input_node(f"cached_values", kv_cache_shape)
@@ -149,7 +190,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
             )
 
         if self.num_tokens > 1:
-            if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA or self._is_speculative_decoding:
+            if (
+                self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+                or self._is_speculative_decoding
+                or self._uses_group_future_token_mask
+            ):
                 # For paligemma, the attention mask is dynamically determined.
                 # Speculative decoding uses num_tokens > 1 during decoding.
                 bmm1 = self._onnx_builder.build_op(
@@ -161,15 +206,60 @@ class LanguageCacheModel(LanguagePartBaseModel):
                     for j in range(self.token_idx + i + 1, self.context_length):
                         mask[0, j, 0, i] = np.finfo(np.float32).min
                 bmm1 = self._onnx_builder.build_op(f"{base_name}.masked_bmm1", [bmm1, mask], "Add")
-        elif self.cfg.pipeline_cfg.future_token_mask_size > 1:
+        elif self._cache_mask_size > 1:
             bmm1 = self._onnx_builder.build_op(
                 f"{base_name}.masked_bmm1", [bmm1, input_nodes[2]], "Add"
             )
         softmax = self._onnx_builder.build_op(f"{base_name}.softmax", [bmm1], "Softmax", axis=1)
-        bmm2 = self._onnx_builder.build_op(
-            f"{base_name}.bmm2", [softmax, values[0]], "Einsum",
-            equation="nchw,nqhc->nqhw"
-        )
+        reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
+        if len(reduction_ranges) == 1:
+            bmm2 = self._onnx_builder.build_op(
+                f"{base_name}.bmm2", [softmax, values[0]], "Einsum",
+                equation="nchw,nqhc->nqhw"
+            )
+        else:
+            partial_bmm2 = []
+            for range_idx, (start, end) in enumerate(reduction_ranges):
+                slice_args = [
+                    np.array([start], dtype=np.int64),
+                    np.array([end], dtype=np.int64),
+                ]
+                softmax_slice = self._onnx_builder.build_op(
+                    f"{base_name}.bmm2.softmax_slice{range_idx}",
+                    [softmax, *slice_args, np.array([1], dtype=np.int64)],
+                    "Slice",
+                )
+                values_slice = self._onnx_builder.build_op(
+                    f"{base_name}.bmm2.values_slice{range_idx}",
+                    [values[0], *slice_args, np.array([3], dtype=np.int64)],
+                    "Slice",
+                )
+                partial_bmm2.append(
+                    self._onnx_builder.build_op(
+                        f"{base_name}.bmm2.partial{range_idx}",
+                        [softmax_slice, values_slice],
+                        "Einsum",
+                        equation="nchw,nqhc->nqhw",
+                    )
+                )
+
+            add_level = 0
+            while len(partial_bmm2) > 1:
+                next_level = [
+                    self._onnx_builder.build_op(
+                        f"{base_name}.bmm2.add_level{add_level}_pair{pair_idx}",
+                        [lhs, rhs],
+                        "Add",
+                    )
+                    for pair_idx, (lhs, rhs) in enumerate(
+                        zip(partial_bmm2[::2], partial_bmm2[1::2])
+                    )
+                ]
+                if len(partial_bmm2) % 2:
+                    next_level.append(partial_bmm2[-1])
+                partial_bmm2 = next_level
+                add_level += 1
+            bmm2 = partial_bmm2[0]
 
         reshape_bmm2 = self._onnx_builder.build_split_and_concat(
             f"{base_name}.bmm2.reshape", bmm2,
@@ -236,7 +326,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
         )
 
         # Shape of the attention mask
-        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or self._is_speculative_decoding:
+        if (
+            (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
+            or self._is_speculative_decoding
+            or self._uses_group_future_token_mask
+        ):
             # Paligemma uses a special attention mask
             # Speculative decoding uses num_tokens > 1 for the target model during decoding.
             attn_shape = (1, 1, self.num_tokens, self.context_length)
@@ -262,8 +356,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
         else:
             model_input_cached_keys_scale = None
         if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1 or
-            self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1 or
-            self._is_speculative_decoding):
+            self._cache_mask_size > 1 and self.num_tokens == 1 or
+            self._is_speculative_decoding or self._uses_group_future_token_mask):
             # Dynamically computed attention mask for paligemma
             # Dynamically computed attention mask for speculative decoding
             # or the model runner's mask to remove the influence of future tokens
@@ -352,7 +446,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
             bmm1 = last
 
         if self.num_tokens > 1:
-            if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA or self._is_speculative_decoding:
+            if (
+                self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+                or self._is_speculative_decoding
+                or self._uses_group_future_token_mask
+            ):
                 # For paligemma, the attention mask is dynamically determined.
                 # Speculative decoding uses num_tokens > 1 during decode time.
                 assert mla_input_attn_mask is not None
@@ -367,16 +465,40 @@ class LanguageCacheModel(LanguagePartBaseModel):
                     mask.astype(ScalarType.numpy_type(activation_type(quantizable)))
                 )
                 bmm1 = builder.create_add_node(bmm1, mask_const)
-        elif self.cfg.pipeline_cfg.future_token_mask_size > 1:
+        elif self._cache_mask_size > 1:
             assert mla_input_attn_mask is not None
             bmm1 = builder.create_add_node(bmm1, mla_input_attn_mask)
 
         softmax = builder.create_softmax_node(bmm1, 3)
 
         # Second multiply ((input * key) * value)
-        bmm2 = builder.create_batch_matmul_node(
-            softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
-        )
+        reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
+        if len(reduction_ranges) == 1:
+            bmm2 = builder.create_batch_matmul_node(
+                softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
+            )
+        else:
+            partial_bmm2 = []
+            for start, end in reduction_ranges:
+                softmax_slice = builder.create_slice_node(softmax, [start], [end], [1], [3])
+                values_slice = builder.create_slice_node(
+                    mla_input_cached_values, [start], [end], [1], [2]
+                )
+                partial_bmm2.append(
+                    builder.create_batch_matmul_node(
+                        softmax_slice, values_slice, transpose_a=False, transpose_b=False
+                    )
+                )
+
+            while len(partial_bmm2) > 1:
+                next_level = [
+                    builder.create_add_node(lhs, rhs)
+                    for lhs, rhs in zip(partial_bmm2[::2], partial_bmm2[1::2])
+                ]
+                if len(partial_bmm2) % 2:
+                    next_level.append(partial_bmm2[-1])
+                partial_bmm2 = next_level
+            bmm2 = partial_bmm2[0]
         assert get_expected_tensor_value(bmm2.get_type().output).shape == value_shape
         output = builder.create_slice_concat_node(
             bmm2, axis=3, split_axis=1,
@@ -439,8 +561,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         # attn_mask
         if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or \
-                (self.cfg.pipeline_cfg.future_token_mask_size > 1 and self.num_tokens == 1) or \
-                self._is_speculative_decoding:
+                (self._cache_mask_size > 1 and self.num_tokens == 1) or \
+                self._is_speculative_decoding or self._uses_group_future_token_mask:
             attn_mask_tessellate_params = TensorTessellateParameters(
                 tile_shape=(0, 0, 0, 0),
                 enable_mla=True,

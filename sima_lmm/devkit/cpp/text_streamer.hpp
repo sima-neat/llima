@@ -11,6 +11,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -82,6 +83,11 @@ class TextStreamer {
             _callback_finalize_text = callback;
         }
 
+        void set_preserved_token_ids(
+            std::vector<std::pair<uint32_t, std::string>> tokens
+        );
+        void set_tool_call_enabled(bool enabled);
+
         void put(uint32_t token_id, bool from_draft = false);
         void end();
 
@@ -93,6 +99,7 @@ class TextStreamer {
 
     private:
         void _on_finalized_text(const std::string& text, bool stream_end = false);
+        void _flush_cached_text(bool stream_end = false);
         bool _ends_with_chinese_char(const std::string& text);
 
         Tokenizer* _tokenizer_ptr;
@@ -121,6 +128,8 @@ class TextStreamer {
 
         InfoCallback _callback_info;
         TextCallback _callback_finalize_text;
+        std::vector<std::pair<uint32_t, std::string>> _preserved_tokens;
+        bool _tool_call_enabled = false;
         std::jthread _pop_thread;
         std::atomic<bool> _is_streaming;
 

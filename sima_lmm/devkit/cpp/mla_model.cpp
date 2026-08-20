@@ -143,6 +143,10 @@ std::vector<std::filesystem::path> MLAModelWithBuffer::_unique_model_paths;
 std::vector<mla_model_p> MLAModelWithBuffer::_unique_model_ptrs;
 thread_local simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest
     MLAModelWithBuffer::_queue_request;
+thread_local std::vector<simaaidispatcher::PreparedMlaPlan>
+    MLAModelWithBuffer::_queued_plans;
+thread_local std::vector<mla_model_p> MLAModelWithBuffer::_queued_handles;
+thread_local std::size_t MLAModelWithBuffer::_queued_plan_count = 0;
 simaaidispatcher::DispatcherBase* MLAModelWithBuffer::_dispatcher = nullptr;
 
 
@@ -218,7 +222,8 @@ simaaidispatcher::DispatcherBase* MLAModelWithBuffer::_get_dispatcher() {
 }
 
 
-simaaidispatcher::PreparedMlaRunRef MLAModelWithBuffer::_prepare_run_ref(
+void MLAModelWithBuffer::_prepare_run(
+    simaaidispatcher::PreparedMlaPlan& plan,
     std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
     std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
@@ -246,18 +251,52 @@ simaaidispatcher::PreparedMlaRunRef MLAModelWithBuffer::_prepare_run_ref(
         }
     };
 
-    patch_io(_ifms, ifm_map_ptr, _prepared_plan.ifm_paddr, _prepared_plan.ifm_len);
-    patch_io(_ofms, ofm_map_ptr, _prepared_plan.ofm_paddr, _prepared_plan.ofm_len);
+    plan.mode = simaaidispatcher::PreparedMlaPlan::DispatchMode::MultiIoSingleBatch;
+    plan.ifm_count = static_cast<int>(_ifms.size());
+    plan.ofm_count = static_cast<int>(_ofms.size());
+    plan.batch_size = 1;
+    plan.batch_model = 1;
+    plan.ifm_len.resize(_ifms.size());
+    plan.ofm_len.resize(_ofms.size());
+    plan.ifm_paddr.resize(_ifms.size());
+    plan.ofm_paddr.resize(_ofms.size());
 
+    patch_io(_ifms, ifm_map_ptr, plan.ifm_paddr, plan.ifm_len);
+    patch_io(_ofms, ofm_map_ptr, plan.ofm_paddr, plan.ofm_len);
+}
+
+
+simaaidispatcher::PreparedMlaRunRef MLAModelWithBuffer::_make_run_ref(
+    simaaidispatcher::PreparedMlaPlan& plan,
+    mla_model_p handle
+) {
     simaaidispatcher::PreparedMlaRunRef run;
-    run.handle = _unique_model_ptrs[_model_idx];
-    run.ifm_paddr = _prepared_plan.ifm_paddr.data();
-    run.ifm_len = _prepared_plan.ifm_len.data();
-    run.ifm_count = static_cast<uint16_t>(_prepared_plan.ifm_paddr.size());
-    run.ofm_paddr = _prepared_plan.ofm_paddr.data();
-    run.ofm_len = _prepared_plan.ofm_len.data();
-    run.ofm_count = static_cast<uint16_t>(_prepared_plan.ofm_paddr.size());
+    run.handle = handle;
+    run.ifm_paddr = plan.ifm_paddr.data();
+    run.ifm_len = plan.ifm_len.data();
+    run.ifm_count = static_cast<uint16_t>(plan.ifm_paddr.size());
+    run.ofm_paddr = plan.ofm_paddr.data();
+    run.ofm_len = plan.ofm_len.data();
+    run.ofm_count = static_cast<uint16_t>(plan.ofm_paddr.size());
     return run;
+}
+
+
+void MLAModelWithBuffer::_bind_ifm(
+    uint8_t index,
+    MLABuffer* buffer,
+    std::initializer_list<uint32_t> begins
+) {
+    _ifms.at(index)._bind(buffer, begins);
+}
+
+
+void MLAModelWithBuffer::_bind_ofm(
+    uint8_t index,
+    MLABuffer* buffer,
+    std::initializer_list<uint32_t> begins
+) {
+    _ofms.at(index)._bind(buffer, begins);
 }
 
 
@@ -270,7 +309,8 @@ void MLAModelWithBuffer::run(
     _debug_inouts("ifm", ifm_map_ptr);
 
     auto* dispatcher = _get_dispatcher();
-    const auto run_ref = _prepare_run_ref(ifm_map_ptr, ofm_map_ptr);
+    _prepare_run(_prepared_plan, ifm_map_ptr, ofm_map_ptr);
+    const auto run_ref = _make_run_ref(_prepared_plan, _unique_model_ptrs[_model_idx]);
 
     simaaidispatcher::JobMLA job;
     job.handle = run_ref.handle;
@@ -301,18 +341,34 @@ void MLAModelWithBuffer::add_to_queue(
     }
 
     load();
-    if (MLAModelWithBuffer::_queue_request.runs.empty()) {
-        MLAModelWithBuffer::_queue_request.runs.reserve(64);
+    const std::size_t slot = MLAModelWithBuffer::_queued_plan_count;
+    if (slot == MLAModelWithBuffer::_queued_plans.size()) {
+        MLAModelWithBuffer::_queued_plans.emplace_back();
+        MLAModelWithBuffer::_queued_handles.emplace_back(nullptr);
     }
-    MLAModelWithBuffer::_queue_request.runs.push_back(_prepare_run_ref(ifm_map_ptr, ofm_map_ptr));
+    _prepare_run(MLAModelWithBuffer::_queued_plans[slot], ifm_map_ptr, ofm_map_ptr);
+    MLAModelWithBuffer::_queued_handles[slot] = _unique_model_ptrs[_model_idx];
+    ++MLAModelWithBuffer::_queued_plan_count;
 }
 
 
 void MLAModelWithBuffer::run_queue() {
-    if (!MLAModelWithBuffer::_enable_queue || MLAModelWithBuffer::_queue_request.runs.empty()) return;
+    if (!MLAModelWithBuffer::_enable_queue || MLAModelWithBuffer::_queued_plan_count == 0) return;
 
     auto* dispatcher = _get_dispatcher();
     try {
+        MLAModelWithBuffer::_queue_request.runs.clear();
+        MLAModelWithBuffer::_queue_request.runs.reserve(
+            MLAModelWithBuffer::_queued_plan_count
+        );
+        for (std::size_t i = 0; i < MLAModelWithBuffer::_queued_plan_count; ++i) {
+            MLAModelWithBuffer::_queue_request.runs.push_back(
+                _make_run_ref(
+                    MLAModelWithBuffer::_queued_plans[i],
+                    MLAModelWithBuffer::_queued_handles[i]
+                )
+            );
+        }
         auto result = submit_queue_and_wait(
             dispatcher,
             std::move(MLAModelWithBuffer::_queue_request)
@@ -327,9 +383,11 @@ void MLAModelWithBuffer::run_queue() {
         }
     } catch (...) {
         MLAModelWithBuffer::_queue_request = {};
+        MLAModelWithBuffer::_queued_plan_count = 0;
         throw;
     }
     MLAModelWithBuffer::_queue_request = {};
+    MLAModelWithBuffer::_queued_plan_count = 0;
 }
 
 
@@ -358,7 +416,7 @@ void MLAModelWithBuffer::update_reloc(const std::map<std::string, uint64_t>& rel
 
 
 void MLAModelWithBuffer::load_all_models(
-    bool do_parallel_load, std::optional<std::filesystem::path> relative_dir
+    std::optional<std::filesystem::path> relative_dir
 ) {
     auto* dispatcher = _get_dispatcher();
     std::vector<std::filesystem::path> file_names;
@@ -378,7 +436,7 @@ void MLAModelWithBuffer::load_all_models(
         return;
     }
 
-    if (do_parallel_load) {
+    if (!_disable_parallel_load) {
         std::vector<std::string> paths;
         paths.reserve(file_names.size());
         for (const auto& file_name: file_names) {

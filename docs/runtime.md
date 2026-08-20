@@ -25,6 +25,11 @@ Download a model by name, without the `simaai/` organization prefix:
 modalix:~$ llima pull Qwen3-VL-4B-Instruct-GPTQ-a16w4
 ```
 
+Model artifacts download concurrently, with the largest artifacts scheduled
+first. Transient HTTP failures are retried automatically. Pulls for the same
+model are serialized, and cancelling a pull retains every artifact that was
+already downloaded and verified.
+
 List and remove locally installed models:
 
 ``` console
@@ -72,5 +77,15 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `set language <lang>` | Set the language string used for transcription. |
 | `set lora <name>` | Use LoRA weights from a `npy_files` folder. |
 | `unset lora` | Revert the LoRA model to the baseline model. |
+| `enable-thinking` | Enable thinking mode and clear chat history. |
+| `disable-thinking` | Disable thinking mode and clear chat history. |
 | `quit` | Quit. |
 | `help` | Print available commands. |
+
+
+## Build an Application with Neat
+
+After validating your model with `llima run`, see
+[GenAI Model](/develop-apps/development-workflow/genai-model/) to serve it
+through common API endpoints or use it directly from a C++ or Python
+application.

@@ -37,7 +37,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <omp.h>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -152,48 +151,24 @@ inline std::vector<Eigen::bfloat16> prepare_attention_mask(
 
 
 // Greedy accept/reject for spec decoding. Per path, finds the longest prefix
-// where target's argmax[i] == candidate[i+1]. Best path wins; sample_p is the
-// target's logits row at the rejection (or last) position — caller takes its
-// argmax for the bonus token.
-//   logits:     (num_paths × candidate_len × vocab_size) bf16
-//   candidates: (num_paths × candidate_len) int32; -1 marks path padding
+// where target's next_token_ids[i] == candidate[i+1]. Best path wins and the
+// target prediction at the rejection (or last) position is the bonus token.
 struct EvaluatePosteriorResult {
     size_t best_candidate;
     int32_t accept_length;
-    std::vector<Eigen::bfloat16> sample_p;  // bonus-position logits, length = vocab_size
+    uint32_t bonus_token;
 };
 
-// Argmax is OMP-parallel across rows; inline bf16→fp32 (shl 16) keeps the inner
-// loop vectorizable. sample_p is the target's logits row at the rejection (or
-// last) position — caller takes its argmax for the bonus token.
 inline EvaluatePosteriorResult evaluate_posterior(
-    const Eigen::bfloat16* logits,
+    const int32_t* next_token_ids,
     const int32_t* candidates,
     size_t num_paths,
-    size_t candidate_len,
-    size_t vocab_size
+    size_t candidate_len
 ) {
-    const size_t total_rows = num_paths * candidate_len;
-    std::vector<int32_t> logits_argmax(total_rows);
-    #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < total_rows; ++i) {
-        const Eigen::bfloat16* row = logits + i * vocab_size;
-        float best_val = -std::numeric_limits<float>::infinity();
-        int32_t best_idx = 0;
-        for (size_t j = 0; j < vocab_size; ++j) {
-            const float v = static_cast<float>(row[j]);
-            if (v > best_val) {
-                best_val = v;
-                best_idx = static_cast<int32_t>(j);
-            }
-        }
-        logits_argmax[i] = best_idx;
-    }
-
     std::vector<int32_t> accept_lengths(num_paths, 0);
     for (size_t c = 0; c < num_paths; ++c) {
         for (size_t i = 0; i + 1 < candidate_len; ++i) {
-            const int32_t arg = logits_argmax[c * candidate_len + i];
+            const int32_t arg = next_token_ids[c * candidate_len + i];
             const int32_t cand_next = candidates[c * candidate_len + (i + 1)];
             // -1 in candidates means "this path ends here" — treat as mismatch.
             if (cand_next < 0 || arg != cand_next) break;
@@ -213,9 +188,9 @@ inline EvaluatePosteriorResult evaluate_posterior(
     EvaluatePosteriorResult result;
     result.best_candidate = best_c;
     result.accept_length = max_accept;
-    const Eigen::bfloat16* sample_row =
-        logits + (best_c * candidate_len + max_accept) * vocab_size;
-    result.sample_p.assign(sample_row, sample_row + vocab_size);
+    result.bonus_token = static_cast<uint32_t>(
+        next_token_ids[best_c * candidate_len + max_accept]
+    );
     return result;
 }
 

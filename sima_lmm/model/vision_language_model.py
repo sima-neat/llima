@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
-    LlmArchType, ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
+    ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
 )
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
@@ -66,7 +66,6 @@ class VisionLanguageModel(BaseModel):
         system_prompt: str | None = None,
         chat_template: str | None = None,
         override_language_group_size: int | None = None,
-        override_language_group_offsets: list[int] | None = None,
         override_language_future_token_mask_size: int = 1,
         return_logits: bool = False,
         enable_filter_sharing: bool = False,
@@ -93,7 +92,7 @@ class VisionLanguageModel(BaseModel):
             quantize_kv_cache: True if KV cache is quantized.
             split_mlp: True if mlp is being split into multiple parts.
             target_model: Target VisionLanguageModel when constructing a draft model.
-                Copies tokenizer and embeddings (if missing) from it. None for non-draft models.
+                Reuses its tokenizer when the draft has none. None for non-draft models.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -112,18 +111,13 @@ class VisionLanguageModel(BaseModel):
         # Set the token size and offsets for group processing.
         vlm_cfg.config_pipeline(
             system_prompt, chat_template, max_num_tokens, override_language_group_size,
-            override_language_group_offsets, override_language_future_token_mask_size
+            override_language_future_token_mask_size
         )
 
         vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)
         vlm_cfg.pipeline_cfg.set_split_mlp(split_mlp)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)
 
-        # Embeddings quantization is only supported for LLMs.
-        if quantize_embeddings and vlm_cfg.is_supported_multimodal:
-            raise NotImplementedError(
-                f"Embeddings quantization is only supported for LLMs."
-            )
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
@@ -146,7 +140,7 @@ class VisionLanguageModel(BaseModel):
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
 
-        return VisionLanguageModel(
+        model = VisionLanguageModel(
             cfg=vlm_cfg,
             hf_model=hf_model,
             model_name=model_name,
@@ -154,6 +148,7 @@ class VisionLanguageModel(BaseModel):
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        return model
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
@@ -269,9 +264,6 @@ class VisionLanguageModel(BaseModel):
 
     def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
         embeddings_tensor, embeddings_scale = self.language_model.get_embeddings_tensor()
-        assert embeddings_scale is None or np.isscalar(embeddings_scale), (
-            "Per-channel embeddings quantization is not supported."
-        )
         if len(ifms) == 1:
             text_token_idxs = ifms[0]
             num_queries = text_token_idxs.shape[0]
@@ -281,6 +273,8 @@ class VisionLanguageModel(BaseModel):
                 [[[embeddings_tensor[x] for x in text_token_idxs[0]]]],
                 dtype=embeddings_tensor.dtype
             )
+            if embeddings_scale is not None:
+                input_embedding_scales = embeddings_scale[text_token_idxs[0]][None, None]
         else:
             assert self.cfg.vm_cfg is not None
             assert len(ifms) == 2
@@ -296,34 +290,33 @@ class VisionLanguageModel(BaseModel):
             vision_model = VisionModel(
                 self.cfg, self.vision_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path
             )
-            vision_proj, = vision_model.run_model(eval_mode, [image_tensor])
+            vision_outputs = vision_model.run_model(eval_mode, [image_tensor])
+            vision_proj = vision_outputs[0]
             input_embeds = self.vlm_helper.multimodal_concat(
                 text_token_idxs[0], [vision_proj], embeddings_tensor
             )
             input_embeds = np.expand_dims(input_embeds, axis=(0, 1))
+            if embeddings_scale is not None:
+                vision_scale = vision_outputs[1]
+                input_embedding_scales = self.vlm_helper.multimodal_concat(
+                    text_token_idxs[0], [vision_scale], embeddings_scale
+                )
+                input_embedding_scales = np.expand_dims(
+                    input_embedding_scales, axis=(0, 1)
+                )
 
-        return self.language_model.run_model(eval_mode, [input_embeds])
-
-    def get_language_embeddings_tensor(self) -> np.ndarray:
-        base_name = self.hf_model.language_model_param_base_name
-        embeddings_tensor, _ = self.language_model.get_embeddings_tensor(
-            weight_name=f"{base_name}.embed_tokens.weight",
-            embed_scale=(
-                self.cfg.lm_cfg.hidden_size ** 0.5
-                if self.cfg.lm_cfg.arch == LlmArchType.GEMMA
-                else 1.0
-            )
+        language_ifms = [input_embeds]
+        if embeddings_scale is not None:
+            language_ifms.append(input_embedding_scales)
+        return self.language_model.run_model(
+            eval_mode,
+            language_ifms,
+            embeddings_tensor=embeddings_tensor,
+            embedding_scales=embeddings_scale,
         )
-        return embeddings_tensor
 
-    def get_language_per_layer_embeddings_tensor(self) -> np.ndarray:
-        base_name = self.hf_model.language_model_param_base_name
-        per_layer_embeddings, _ = self.language_model.get_embeddings_tensor(
-            weight_name=f"{base_name}.embed_tokens_per_layer.weight",
-            embed_scale=(
-                self.cfg.lm_cfg.hidden_size_per_layer_input ** 0.5
-                if self.cfg.lm_cfg.arch == LlmArchType.GEMMA
-                else 1.0
-            ),
-        )
-        return per_layer_embeddings
+    def get_language_embeddings_tensor(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        return self.language_model.get_input_embeddings_tensor()
+
+    def get_language_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, np.ndarray | None]:
+        return self.language_model.get_per_layer_embeddings_tensor()

@@ -3,6 +3,7 @@
 #define _SIMA_LLIMA_WEB_
 
 #include <csignal>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -20,6 +21,11 @@
 namespace simaai {
 namespace llima {
 
+enum class ChatProtocol {
+    OpenAI,
+    OllamaChat,
+    OllamaGenerate,
+};
 
 class EXPORT WEB {
     public:
@@ -29,7 +35,7 @@ class EXPORT WEB {
             std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template,
-            bool do_parallel_load
+            bool enable_thinking = false
         );
         ~WEB();
 
@@ -46,9 +52,13 @@ class EXPORT WEB {
         void _handle_chat_completions(
             const httplib::Request& req,
             httplib::Response& res,
-            bool is_openai
+            ChatProtocol protocol
         );
-        void _handle_audio_transcriptions(const httplib::Request& req, httplib::Response& res);
+        void _handle_audio_transcriptions(
+            const httplib::Request& req,
+            httplib::Response& res,
+            const std::string& task
+        );
 
         // Helpers
         void _set_cors_headers(httplib::Response& res);
@@ -56,58 +66,70 @@ class EXPORT WEB {
         std::string _format_openai_sse_chunk(
             const std::string& content,
             const std::string& model,
+            const std::string& completion_id,
+            std::time_t created,
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
-            bool from_draft = false
+            bool from_draft = false,
+            bool reasoning = false
         );
         std::string _format_ollama_ndjson_chunk(
             const std::string& content,
             const std::string& model,
+            ChatProtocol protocol,
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
-            bool from_draft = false
+            bool from_draft = false,
+            bool reasoning = false
         );
         std::string _format_audio_sse_chunk(
             const std::string& text,
+            const std::string& event_task,
             bool finished,
             std::optional<std::string> finish_reason = std::nullopt,
             std::optional<double> ttft = std::nullopt,
-            std::optional<double> tps = std::nullopt
+            std::optional<double> tps = std::nullopt,
+            std::optional<std::string> language = std::nullopt,
+            std::optional<std::string> task = std::nullopt,
+            std::optional<float> no_speech_prob = std::nullopt,
+            std::optional<float> avg_logprob = std::nullopt
         );
 
         // Helpers for chat completion
         std::optional<Chat> _prepare_chat_context(
-            const httplib::Request& req, 
+            const httplib::Request& req,
             httplib::Response& res,
-            std::string& model, 
-            bool& stream
+            std::string& model,
+            bool& stream,
+            ChatProtocol protocol
         );
 
         void _execute_streaming_chat(
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            bool is_openai
+            ChatProtocol protocol
         );
 
         void _execute_normal_chat(
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            bool is_openai
+            ChatProtocol protocol
         );
         void _execute_streaming_audio_transcription(
             httplib::Response& res,
-            const std::string& language
+            const std::string& language,
+            const std::string& task
         );
-
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
+        bool _enable_thinking;
         std::jthread _vlm_thread;
 
         // HTTP server. For HTTPS, use SSLServer and define CPPHTTPLIB_OPENSSL_SUPPORT before

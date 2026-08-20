@@ -29,8 +29,9 @@ VlmHelper::VlmHelper(
     const VlmConfig& vlm_cfg,
     const std::filesystem::path& devkit_dir,
     std::optional<std::string> system_prompt,
-    std::optional<std::string> chat_template
-) : _vlm_cfg(vlm_cfg) {
+    std::optional<std::string> chat_template,
+    bool enable_thinking
+) : _vlm_cfg(vlm_cfg), _enable_thinking(enable_thinking) {
     if (system_prompt.has_value())
         _system_prompt = system_prompt;
     else
@@ -82,6 +83,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     minja::chat_template_inputs inputs;
     inputs.messages = chat.get_messages();
     inputs.tools = chat.get_tools();
+    inputs.extra_context["enable_thinking"] = chat.get_enable_thinking();
     auto formatted_prompt = _chat_template_ptr->apply(inputs);
 
     // Construct the actual prompt with full image tokens. Manually process the prompt because there

@@ -1,7 +1,9 @@
 #ifndef _SIMA_LLIMA_LANGUAGE_MODEL_
 #define _SIMA_LLIMA_LANGUAGE_MODEL_
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -10,6 +12,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -23,7 +26,19 @@
 namespace simaai {
 namespace llima {
 
-// Key to access the language model map: (num_tokens, layer_idx, token_idx).
+struct LogLikelihoodResult {
+    double logprob;
+    bool is_greedy;
+};
+
+struct GenerationPerformanceResult {
+    std::vector<double> token_durations;
+    uint32_t generated_tokens = 0;
+    std::optional<uint32_t> accepted_draft_tokens;
+};
+
+// Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
+// (num_tokens, cache_kind, aligned_cache_token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
@@ -34,8 +49,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::set<uint32_t> stop_token_ids,
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
-            TextStreamer& text_streamer,
-            bool do_parallel_load
+            TextStreamer& text_streamer
         );
         virtual ~LanguageModel() override { _finalize(); }
 
@@ -61,6 +75,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint32_t token_id,
             std::vector<Eigen::bfloat16>* logits_ptr = nullptr
         );
+        LogLikelihoodResult run_model_for_loglikelihood(
+            std::span<const uint32_t> input_token_ids,
+            size_t continuation_start,
+            std::span<const uint32_t> continuation_token_ids,
+            bool use_group_prefill = true
+        );
         // Speculative-decoding entry point: target invokes this, passing the
         // draft as a reference. Returns the newly generated token IDs, or
         // std::nullopt when generation aborted (e.g. cache full pre-init).
@@ -68,7 +88,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
             LanguageModel& draft_lm,
             std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt
+            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
+            std::optional<ChronoTimer> timer_ttft = std::nullopt,
+            GenerationPerformanceResult* performance_result = nullptr
         );
         void stop_model() { _is_running = false; }
 
@@ -96,6 +118,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::vector<int32_t> tree_position_ids;
             std::vector<std::vector<Eigen::bfloat16>> hidden_states;  // 3 captured layers
             uint32_t token;                                            // root token
+            std::chrono::steady_clock::time_point root_ready_time;
+            double time_to_first_token;
         };
 
         // Result of topk_generate.
@@ -136,7 +160,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         // Result of run_eagle3_target_verify.
         struct TargetVerifyResult {
-            std::vector<Eigen::bfloat16> logits;                       // (num_tokens, lm_head_output)
+            std::vector<uint32_t> next_token_ids;                     // target argmax per node
             std::vector<std::vector<Eigen::bfloat16>> hidden_states;   // 3 captures, each (num_tokens, hidden_size)
         };
 
@@ -149,8 +173,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         // Result of tree_decoding.
         struct TreeDecodingResult {
-            std::vector<Eigen::bfloat16> logits;          // flat (n_paths × max_depth × vocab_size)
-            size_t vocab_size;
+            std::vector<int32_t> next_token_ids;          // flat (n_paths × max_depth)
             std::vector<Eigen::bfloat16> hidden_states;   // flat (K × 3 × hidden_size)
         };
 
@@ -168,7 +191,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         InitTreeResult initialize_tree(
             LanguageModel& draft_lm,
             std::vector<uint32_t> input_ids,
-            int num_cached_tokens
+            int num_cached_tokens,
+            ChronoTimer timer_ttft
         );
 
         // Gather the accepted path's scattered KVs (at select_indices) and move
@@ -180,7 +204,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
 
         // Per-iter update after target verify + accept/reject: compacts KV to the
-        // accepted path, samples bonus_token from sample_p, builds next tree.
+        // accepted path and builds the next tree from the target bonus token.
         struct UpdateInferenceInputsResult {
             std::vector<uint32_t> input_ids;                       // old + accepted + bonus
             std::vector<uint32_t> draft_tokens;                    // next round's tree tokens
@@ -188,7 +212,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             eagle_helpers::EagleTreeMask tree_mask;                // next round
             std::vector<int32_t> tree_position_ids;                // next round
             int32_t new_token;                                     // accumulated generated-token count
-            uint32_t bonus_token;                                  // = argmax(sample_p)
+            uint32_t bonus_token;
         };
 
         UpdateInferenceInputsResult update_inference_inputs(
@@ -200,7 +224,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<std::vector<int32_t>>& retrieve_indices,
             int32_t new_token,
             const std::vector<Eigen::bfloat16>& hidden_state_new,
-            const std::vector<Eigen::bfloat16>& sample_p
+            uint32_t bonus_token
         );
 
         // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
@@ -252,34 +276,82 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<MLABufferSlice>& ofms
         );
         void _define_attn_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
+        LanguageModelMapKey _get_cache_model_key(
+            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+        ) const;
+        LanguageModelMapKey _bind_attn_models(
+            uint16_t num_tokens,
+            uint16_t token_idx,
+            uint8_t layer_idx,
+            MLABuffer* embedding_scale_buf = nullptr,
+            uint32_t embedding_scale_row = 0
+        );
         void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_models();
         void _define_per_layer_models();
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
-            uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
+            uint16_t num_tokens,
+            uint16_t token_idx,
+            bool use_sliding_cache
         );
         std::filesystem::path _get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
+        static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
+        static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
+        uint16_t _get_cache_mask_size(
+            std::string_view layer_type, uint16_t context_length, bool is_group
+        ) const {
+            if (
+                layer_type != "sliding_attention"
+                && _cfg.pipeline_cfg.long_context_future_token_mask_size.has_value()
+                && context_length > LONG_CONTEXT_MIN_TOKENS
+            ) {
+                return _cfg.pipeline_cfg.long_context_future_token_mask_size.value();
+            }
+            return is_group
+                ? _cfg.pipeline_cfg.input_token_group_size
+                : _cfg.pipeline_cfg.future_token_mask_size;
+        }
+        uint16_t _get_max_future_token_mask_size() const {
+            return std::max(
+                _cfg.pipeline_cfg.future_token_mask_size,
+                _cfg.pipeline_cfg.long_context_future_token_mask_size.value_or(0)
+            );
+        }
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
+        void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
             size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
         );
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
+        void _stage_embedding_rows(
+            LanguageModel& source_model,
+            std::span<const uint32_t> token_ids,
+            MLABuffer& destination,
+            MLABuffer* destination_scales = nullptr
+        );
+        void _run_model_once_for_loglikelihood_logits(
+            uint16_t token_idx, uint32_t input_token_id
+        );
+        LogLikelihoodResult _run_model_once_for_loglikelihood(
+            uint16_t token_idx, uint32_t input_token_id, uint32_t target_token_id
+        );
         std::vector<uint32_t> _get_per_layer_token_ids(
             std::span<const uint32_t> input_token_ids
         ) const;
         void _upload_per_layer_embedding_rows(
             std::span<const uint32_t> token_ids, uint16_t num_tokens
         );
+        void _load_per_layer_embeddings();
         void _compute_and_upload_per_layer_inputs_prefill(
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
@@ -296,7 +368,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::optional<uint32_t> _pad_token_id;
         uint16_t _max_num_tokens;
         TextStreamer& _text_streamer;
-        bool _do_parallel_load;
         bool _use_group_token_models;
         bool _need_argmax;
 
@@ -316,16 +387,18 @@ class LanguageModel : public BaseModel<VlmConfig> {
         bool _has_image_token;
 
         Eigen::bfloat16* _embeddings_tensor_ptr;
-        std::vector<Eigen::bfloat16> _per_layer_embeddings_tensor;
+        size_t _per_layer_embedding_rows_per_shard = 0;
+        std::vector<MLABuffer*> _per_layer_embedding_shards;
         std::vector<uint32_t> _prompt_per_layer_token_ids;
         std::vector<uint32_t> _cached_token_ids;
         uint32_t _cached_first_generated_token;
-        // Full-match cache: prior turn's tree state. Restored when
-        // prefix_cached == input_ids.size() to skip prefill + topk_generate entirely.
+        // Full-match cache: prior turn's tree state. Restored only when the
+        // matching token prefix also has the same prompt length.
         std::vector<uint32_t> _cached_draft_tokens;
         std::vector<std::vector<int32_t>> _cached_retrieve_indices;
         eagle_helpers::EagleTreeMask _cached_tree_mask;
         std::vector<int32_t> _cached_tree_position_ids;
+        uint16_t _cached_eagle3_prompt_len = 0;
         size_t _cached_eagle3_stable_kv = 0;
         uint16_t _kv_cache_len = 0;  // tokens in KV cache; set by prefill, advanced by decode
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)

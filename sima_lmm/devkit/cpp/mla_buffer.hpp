@@ -3,6 +3,8 @@
 #define _SIMA_LLIMA_MLA_BUFFER_
 
 #include <filesystem>
+#include <initializer_list>
+#include <istream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,8 +32,16 @@ class MLABuffer {
         void try_allocate() { if (!_simaai_mem_ptr) allocate(); }
         void free();
         void clear(bool flush = true);
+        // Load exactly one raw, unpadded tensor payload from a file.
+        void load_file(const std::filesystem::path& file_name);
+        // Load the next raw, unpadded tensor payload from a stream.
+        // MLA row padding is inserted when this buffer requires it.
+        void load_stream(std::istream& stream);
         void upload(
             const void* data, size_t data_begin = 0, size_t data_size = 0, bool flush = true
+        );
+        void upload_raw(
+            const void* data, size_t destination_offset, size_t size, bool flush = true
         );
         void download(void* data) const;
         uint32_t get_buf_addr_offset(
@@ -44,7 +54,9 @@ class MLABuffer {
             const std::optional<std::vector<uint32_t>>& shape = std::nullopt
         ) const;
         void flush_cache() const;
+        void flush_cache(size_t offset, size_t size) const;
         void invalidate_cache() const;
+        void invalidate_cache(size_t offset, size_t size) const;
 
         const std::string& get_name() const { return _name; }
         const std::string& get_dtype() const { return _dtype; }
@@ -89,6 +101,8 @@ inline std::ostream& operator<<(std::ostream& s, const MLABuffer& buf) {
 
 
 class MLABufferSlice {
+    friend class MLAModelWithBuffer;
+
     public:
         MLABufferSlice(MLABuffer* buf_ptr = nullptr);
         MLABufferSlice(MLABuffer* buf_ptr, std::vector<uint32_t> begins);
@@ -100,12 +114,17 @@ class MLABufferSlice {
         MLABuffer* get_buf_ptr() const { return _buf_ptr; }
         uint64_t get_buf_addr() const;
         uint64_t get_buf_addr(const std::optional<std::vector<uint32_t>>& begins) const;
-        auto get_buf_begins() const { return _begins; }
-        auto get_buf_shapes() const { return _shapes; }
+        const auto& get_buf_begins() const { return _begins; }
+        const auto& get_buf_shapes() const { return _shapes; }
 
         void to_file(const std::filesystem::path& file_name) const;
 
     private:
+        void _bind(
+            MLABuffer* buf_ptr,
+            std::initializer_list<uint32_t> begins
+        );
+
         MLABuffer* _buf_ptr;
         std::optional<std::vector<uint32_t>> _begins;
         std::optional<std::vector<uint32_t>> _shapes;

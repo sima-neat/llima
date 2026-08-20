@@ -3,7 +3,6 @@
 requires = [
     "scikit-build-core",
     "pyyaml",
-    "nanobind>=2.12.0",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -56,12 +55,3 @@ provider-path = "."
 [tool.scikit-build.metadata.optional-dependencies]
 provider = "pyproject_metadata"
 provider-path = "."
-
-[[tool.scikit-build.overrides]]
-if.env.CROSS_COMPILE = "aarch64-linux-gnu-"
-wheel.cmake = true
-cmake.define.CMAKE_TOOLCHAIN_FILE = "toolchain-sima.cmake"
-
-[[tool.scikit-build.overrides]]
-if.platform-machine = "aarch64"
-wheel.cmake = true

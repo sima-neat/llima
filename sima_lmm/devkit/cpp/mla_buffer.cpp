@@ -1,4 +1,5 @@
 #include <fstream>
+#include <limits>
 #include <set>
 
 #include <fmt/ranges.h>
@@ -110,8 +111,50 @@ void MLABuffer::flush_cache() const {
     simaai_memory_flush_cache(_simaai_mem_ptr);
 }
 
+void MLABuffer::flush_cache(size_t offset, size_t size) const {
+    if (offset > _size_padded || size > _size_padded - offset) {
+        throw std::out_of_range(fmt::format(
+            "Cache flush range [{}, {}) exceeds buffer {} size {}",
+            offset, offset + size, _name, _size_padded
+        ));
+    }
+    if (size == 0) return;
+    const auto api_max = std::numeric_limits<unsigned int>::max();
+    if (offset > api_max || size > api_max - offset) {
+        throw std::overflow_error(fmt::format(
+            "Cache flush range for {} exceeds simaai-memory API limits", _name
+        ));
+    }
+    simaai_memory_flush_cache_part(
+        _simaai_mem_ptr,
+        static_cast<unsigned int>(offset),
+        static_cast<unsigned int>(size)
+    );
+}
+
 void MLABuffer::invalidate_cache() const {
     simaai_memory_invalidate_cache(_simaai_mem_ptr);
+}
+
+void MLABuffer::invalidate_cache(size_t offset, size_t size) const {
+    if (offset > _size_padded || size > _size_padded - offset) {
+        throw std::out_of_range(fmt::format(
+            "Cache invalidate range [{}, {}) exceeds buffer {} size {}",
+            offset, offset + size, _name, _size_padded
+        ));
+    }
+    if (size == 0) return;
+    const auto api_max = std::numeric_limits<unsigned int>::max();
+    if (offset > api_max || size > api_max - offset) {
+        throw std::overflow_error(fmt::format(
+            "Cache invalidate range for {} exceeds simaai-memory API limits", _name
+        ));
+    }
+    simaai_memory_invalidate_cache_part(
+        _simaai_mem_ptr,
+        static_cast<unsigned int>(offset),
+        static_cast<unsigned int>(size)
+    );
 }
 
 void MLABuffer::clear(bool flush) {
@@ -121,12 +164,52 @@ void MLABuffer::clear(bool flush) {
 }
 
 
+void MLABuffer::load_file(const std::filesystem::path& file_name) {
+    const size_t file_size = std::filesystem::file_size(file_name);
+    if (file_size != _size) {
+        throw std::runtime_error(fmt::format(
+            "Invalid size for {}: expected {} bytes, got {}",
+            file_name.string(), _size, file_size
+        ));
+    }
+    std::ifstream stream(file_name, std::ios::binary);
+    load_stream(stream);
+}
+
+
+void MLABuffer::load_stream(std::istream& stream) {
+    const size_t row_size = _shape.back() * _elem_size;
+    const size_t padded_row_size = round_up_to_row(row_size);
+    if (_align_last_dim && row_size != padded_row_size) {
+        const size_t num_rows = _size / row_size;
+        for (size_t i = 0; i < num_rows; ++i) {
+            stream.read(
+                reinterpret_cast<char*>(_virtual_addr) + i * padded_row_size,
+                row_size
+            );
+        }
+    } else {
+        stream.read(reinterpret_cast<char*>(_virtual_addr), _size);
+    }
+    if (!stream) {
+        throw std::runtime_error(fmt::format("Failed to load buffer {}", _name));
+    }
+    flush_cache();
+}
+
+
 void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bool flush) {
-    if (_align_last_dim && (_shape.back() % MLA_ROW_SIZE != 0)) {
-        assert(data_begin == 0);
-        assert(data_size == 0 || data_size == _size);
-        uint32_t last_dim = _shape.back() * _elem_size;
-        uint32_t last_dim_padded = round_up_to_row(last_dim);
+    // Upload a full logical tensor, inserting physical MLA row padding when needed.
+    if (data_begin != 0 || (data_size != 0 && data_size != _size)) {
+        upload_raw(data, data_begin, data_size, false);
+        if (flush)
+            flush_cache();
+        return;
+    }
+
+    const uint32_t last_dim = _shape.back() * _elem_size;
+    const uint32_t last_dim_padded = round_up_to_row(last_dim);
+    if (_align_last_dim && last_dim != last_dim_padded) {
         uint32_t num_last_dims = _size_padded / last_dim_padded;
 
         for (uint32_t i = 0; i < num_last_dims; ++i) {
@@ -136,13 +219,28 @@ void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bo
                 last_dim
             );
         }
-    } else if (data_size > 0 && data_size < _size) {
-        std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + data_begin, data, data_size);
     } else {
         std::memcpy(_virtual_addr, data, _size);
     }
     if (flush)
         flush_cache();
+}
+
+
+void MLABuffer::upload_raw(
+    const void* data, size_t destination_offset, size_t size, bool flush
+) {
+    // Copy bytes verbatim into a physical MLA buffer offset.
+    if (destination_offset > _size_padded || size > _size_padded - destination_offset) {
+        throw std::out_of_range(fmt::format(
+            "Upload range [{}, {}) exceeds buffer {} size {}",
+            destination_offset, destination_offset + size, _name, _size_padded
+        ));
+    }
+    if (size == 0) return;
+    std::memcpy(reinterpret_cast<uint8_t*>(_virtual_addr) + destination_offset, data, size);
+    if (flush)
+        flush_cache(destination_offset, size);
 }
 
 
@@ -171,7 +269,7 @@ uint32_t MLABuffer::get_buf_addr_offset(const std::optional<std::vector<uint32_t
     if (begin.has_value()) {
         uint32_t offset = 0;
         for (uint32_t i = 0; i < _shape.size(); ++i) {
-            offset = offset * _shape[i] + begin.value()[i];
+            offset += begin.value()[i] * _stride[i];
         }
         return offset * _elem_size;
     } else {
@@ -187,8 +285,10 @@ uint64_t MLABuffer::get_buf_addr(const std::optional<std::vector<uint32_t>>& beg
 
 uint64_t MLABuffer::get_buf_len(const std::optional<std::vector<uint32_t>>& shape) const {
     if (shape.has_value()) {
-        uint32_t size = _elem_size;
-        for (uint32_t i = 0; i < shape->size(); ++i) {
+        uint64_t size = _align_last_dim
+            ? round_up_to_row(shape->back() * _elem_size)
+            : shape->back() * _elem_size;
+        for (uint32_t i = 0; i + 1 < shape->size(); ++i) {
             size *= shape.value()[i];
         }
         return size;
@@ -320,6 +420,18 @@ MLABufferSlice::MLABufferSlice(
 MLABufferSlice::MLABufferSlice(
     MLABuffer* buf_ptr, std::vector<uint32_t> begins, std::vector<uint32_t> shapes
 ) : _buf_ptr(buf_ptr), _begins(std::move(begins)), _shapes(std::move(shapes)) {}
+
+
+void MLABufferSlice::_bind(
+    MLABuffer* buf_ptr,
+    std::initializer_list<uint32_t> begins
+) {
+    _buf_ptr = buf_ptr;
+    if (!_begins.has_value()) {
+        _begins.emplace();
+    }
+    _begins->assign(begins);
+}
 
 
 uint64_t MLABufferSlice::get_buf_addr() const {

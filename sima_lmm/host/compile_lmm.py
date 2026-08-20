@@ -49,8 +49,7 @@ def gen_files(
     num_processes: int, resume: bool, model_path: Path, lora_path: Path | None,
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
-    language_group_size: int, language_group_offsets: list[int] | None,
-    future_token_mask_size: int, enable_filter_sharing: bool,
+    language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
     quantize_embeddings: bool, quantize_kv_cache: bool, split_mlp: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None
@@ -67,7 +66,6 @@ def gen_files(
         system_prompt=system_prompt,
         chat_template=chat_template,
         override_language_group_size=language_group_size,
-        override_language_group_offsets=language_group_offsets,
         override_language_future_token_mask_size=future_token_mask_size,
         return_logits=return_logits,
         enable_filter_sharing=enable_filter_sharing,
@@ -94,7 +92,6 @@ def gen_files(
             system_prompt=system_prompt,
             chat_template=chat_template,
             override_language_group_size=language_group_size,
-            override_language_group_offsets=language_group_offsets,
             override_language_future_token_mask_size=future_token_mask_size,
             return_logits=return_logits,
             enable_filter_sharing=enable_filter_sharing,
@@ -122,17 +119,11 @@ def gen_files(
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
-                elif lora_path is not None or quantize_embeddings or quantize_kv_cache:
-                    # Use SOURCE_TO_FP mode, which keeps track of LoRA weights
+                else:
+                    # Use direct SiMa Builder graph generation for ordinary HF models.
                     modes = [
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
                         FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
-                    ]
-                else:
-                    # Use ONNX mode, no need to track LoRA weights
-                    modes = [
-                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                        FileGenMode.MODEL_SDK_COMPILE
                     ]
             else:
                 assert isinstance(model.hf_model, GgufModel)
@@ -244,8 +235,9 @@ def main():
 
     group = parser.add_argument_group("Model compilation parameters")
     group.add_argument(
-        "--max_num_tokens", type=int, metavar="N", default=1024,
-        help="Maximum number of input tokens that the model will support (default: 1024)"
+        "--max_num_tokens", type=int, metavar="N", default=4096,
+        help="Maximum number of input tokens that the model will support; "
+             "must be a multiple of 1024 (default: 4096)"
     )
     group.add_argument(
         "--language_group_size", type=int, metavar="N", default=128,
@@ -254,21 +246,20 @@ def main():
              "(default: 128)"
     )
     group.add_argument(
-        "--language_group_offsets", metavar="LIST",
-        help="Comma-separated list of positive integers.  "
-             "Grouped token processing will use groups starting at these indices.  "
-             "(default: derived from language_group_size)"
-    )
-    group.add_argument(
         "--future_token_mask_size", type=int, metavar="N", default=128,
         help="Size of token mask.  "
              "Token masks reduce compiled code size at the cost of redundant computation by "
              "reusing models for generating multiple tokens.  "
+             "Full attention uses 1024 at context lengths of 2048 or greater; sliding attention "
+             "continues to use this value.  "
              "(default: 128)"
     )
     group.add_argument(
         "--return_logits", action=argparse.BooleanOptionalAction, default=False,
-        help="Return logits at the last layer output."
+        help=(
+            "Return logits at the last layer output. Automatically enabled when compiling "
+            "for speculative decoding."
+        )
     )
     group.add_argument(
         "--enable_filter_sharing", action=argparse.BooleanOptionalAction, default=False,
@@ -279,17 +270,18 @@ def main():
         )
     )
     group.add_argument(
-        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=False,
+        "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=True,
         help=(
-            "Enables embedding quantization to reduce memory consumption. This may result in a loss"
-            " of accuracy."
+            "Quantizes embedding tables for LLMs and VLMs to reduce memory "
+            "consumption. This may result in a loss of accuracy. Enabled by default; disable with "
+            "--no-quantize_embeddings."
         )
     )
     group.add_argument(
-        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=False,
+        "--quantize_kv_cache", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "Enables kv_cache quantization to reduce memory consumption. This may result in a loss"
-            " of accuracy."
+            " of accuracy. Enabled by default; disable with --no-quantize_kv_cache."
         )
     )
     egroup = group.add_mutually_exclusive_group()
@@ -396,18 +388,6 @@ def main():
     else:
         chat_template = None
 
-    if args.language_group_offsets is not None:
-        try:
-            language_group_offsets = list(map(int, args.language_group_offsets.split(",")))
-        except:
-            _abort(
-                "Cannot parse argument value as a comma-separated list of integers: "
-                + args.language_group_offsets
-            )
-    else:
-        lgs = args.language_group_size
-        language_group_offsets = list(range(0, args.max_num_tokens - lgs + 1, lgs))
-
     # Select a compile mode.  At most one of these flags can be used on the command line.
     for compile_mode_option, mode_flag in _FILE_GEN_MODE_OPTIONS:
         if getattr(args, compile_mode_option, None):
@@ -422,20 +402,12 @@ def main():
     elif args.input_height is not None or args.input_width is not None:
         _abort("Both --input_height and --input_width must be provided.")
 
-    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_embeddings:
+    is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
+    if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
         _abort(
-            "Embedding quantization is not supported for ONNX file generation mode."
+            "ONNX generation does not support embedding or KV-cache quantization. "
+            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
         )
-    if mode_flag == FileGenMode.SOURCE_TO_ONNX and args.quantize_kv_cache:
-        _abort(
-            "KV cache quantization is not supported for ONNX file generation mode."
-        )
-    if args.draft_model_path is not None and args.quantize_kv_cache:
-        _abort(
-            "KV cache quantization with speculative decoding is not currently supported. "
-            "Please disable either --quantize_kv_cache or --draft_model_path."
-        )
-
     lora_path_for_base_model = None
     if args.lora_names is not None and args.lora_paths is not None:
         if len(args.lora_names) != len(args.lora_paths):
@@ -444,15 +416,16 @@ def main():
     elif args.lora_names is not None or args.lora_paths is not None:
         _abort("Number of --lora_name do not match the number of --lora_path")
 
-    # Enable mlp splitting and LoRA is not used. The feature is not implemented for LoRA.
+    # Enable MLP splitting when LoRA is not used. The feature is not implemented for LoRA.
     split_mlp = lora_path_for_base_model is None
+    return_logits = args.return_logits or args.draft_model_path is not None
 
     gen_files(
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
-        args.language_group_size, language_group_offsets, args.future_token_mask_size,
+        args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
-        args.quantize_kv_cache, split_mlp, args.return_logits, log_level, image_resolution,
+        args.quantize_kv_cache, split_mlp, return_logits, log_level, image_resolution,
         args.draft_model_path, draft_output_path
     )
 

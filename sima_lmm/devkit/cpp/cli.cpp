@@ -1,9 +1,9 @@
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
-#include <optional>
-
-#include <fmt/format.h>
 
 #include "cli.hpp"
+#include "reasoning_parser.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -18,9 +18,11 @@ clear system       : clear system prompt, chat history and images.
 clear history      : clear chat history and images.
 print history      : print chat history.
 set audio <fn>     : set the audio file to be transcribed as query.
-set language <lang>: set the language string to be used for transcription.
+set language <lang>: set transcription language; omit <lang> or use auto to detect it.
 set lora           : set the model to use LoRA weights from a npy_files folder.
 unset lora         : revert LoRA model to baseline model.
+enable-thinking    : enable thinking mode and clear chat history.
+disable-thinking   : disable thinking mode and clear chat history.
 quit               : quit.
 help               : print this page.
 )";
@@ -31,12 +33,9 @@ CLI::CLI(
     std::optional<std::filesystem::path> whisper_model_path,
     std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
-    std::optional<std::string> chat_template,
-    bool do_parallel_load
+    std::optional<std::string> chat_template
 ) : _vision_language_model_ptr(
-        std::make_unique<VisionLanguageModel>(
-            vlm_model_path, system_prompt, chat_template, do_parallel_load
-        )
+        std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
     )
 {
     if (_singleton_ptr)
@@ -44,14 +43,12 @@ CLI::CLI(
     _singleton_ptr = this;
 
     if (whisper_model_path.has_value()) {
-        _whisper_model_ptr = std::make_unique<WhisperModel>(
-            whisper_model_path.value(), do_parallel_load
-        );
+        _whisper_model_ptr = std::make_unique<WhisperModel>(whisper_model_path.value());
     }
 
     if (draft_model_path.has_value()) {
         _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
-            draft_model_path.value(), system_prompt, chat_template, do_parallel_load
+            draft_model_path.value(), system_prompt, chat_template
         );
         // Hand the draft to the target so VLM::run_model dispatches to
         // speculative decoding automatically.
@@ -83,19 +80,14 @@ CLI::~CLI() {
 void CLI::run() {
     std::string language = "en";
     auto chat = _vision_language_model_ptr->create_chat();
+    const bool highlight_draft = []() {
+        const char* value = std::getenv("SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT");
+        return value != nullptr && (
+            std::strcmp(value, "true") == 0 || std::strcmp(value, "1") == 0
+        );
+    }();
     std::string command;
     ReadlineSupport readline_support;
-    std::optional<double> last_ttft;
-    std::optional<double> last_tps;
-    _vision_language_model_ptr->set_info_callback(
-        [&](const std::string& metric_type, double metric_value) {
-            if (metric_type == "ttft") {
-                last_ttft = metric_value;
-            } else if (metric_type == "tps") {
-                last_tps = metric_value;
-            }
-        }
-    );
     while (true) {
         auto maybe_command = ReadlineSupport::read_line(">>> ");
         if (!maybe_command) break;
@@ -123,8 +115,23 @@ void CLI::run() {
             chat.clear_history();
             std::cout << "Un-set LoRA and cleared chat history" << std::endl;
             continue;
+        } else if (command == "enable-thinking") {
+            if (reasoning_format_for_model(_vision_language_model_ptr->model_type())
+                == ReasoningFormat::None) {
+                std::cout << "Thinking is not supported for this model." << std::endl;
+                continue;
+            }
+            chat.set_enable_thinking(true);
+            chat.clear_history();
+            std::cout << "Enabled thinking and cleared chat history." << std::endl;
+            continue;
+        } else if (command == "disable-thinking") {
+            chat.set_enable_thinking(false);
+            chat.clear_history();
+            std::cout << "Disabled thinking and cleared chat history." << std::endl;
+            continue;
         } else if (command == "set language") {
-            language = "en";
+            language.clear();
             continue;
         } else if (command.starts_with("set language ")) {
             constexpr auto pos = std::string("set language ").length();
@@ -181,26 +188,71 @@ void CLI::run() {
                     model->set_text_callback([](const std::string&, bool, bool) {});
                 }
             } callback_guard{_whisper_model_ptr.get()};
-            auto query = _whisper_model_ptr->run_model(audio_file_name, language);
-            chat.add_query(query);
+            auto result = _whisper_model_ptr->run_model(audio_file_name, language);
+            chat.add_query(result.text);
         } else {
             std::cout << "Query: " << command << std::endl;
             chat.add_query(command);
         }
-        std::cout << "Assistant: " << std::flush;
+        ReasoningStreamParser reasoning_parser(
+            reasoning_format_for_model(_vision_language_model_ptr->model_type()),
+            chat.get_enable_thinking()
+        );
+        std::string final_response;
+        bool saw_reasoning = false;
+        bool saw_content = false;
 
-        last_ttft.reset();
-        last_tps.reset();
+        const auto print_text = [&](const std::string& text, bool from_draft) {
+            if (from_draft && highlight_draft && !text.empty()) {
+                std::cout << "\033[32m" << text << "\033[0m";
+            } else {
+                std::cout << text;
+            }
+            std::cout << std::flush;
+        };
+
+        _vision_language_model_ptr->set_text_callback(
+            [&](const std::string& text, bool stream_end, bool from_draft) {
+                for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
+                    if (event.reasoning) {
+                        if (!saw_reasoning) {
+                            std::cout << "Thinking:\n";
+                            saw_reasoning = true;
+                        }
+                        print_text(event.text, event.from_draft);
+                        continue;
+                    }
+
+                    if (!saw_content) {
+                        std::cout << (saw_reasoning ? "\nAnswer:\n" : "Assistant: ");
+                        saw_content = true;
+                    }
+                    final_response += event.text;
+                    print_text(event.text, event.from_draft);
+                }
+                if (stream_end) {
+                    if (!saw_reasoning && !saw_content) std::cout << "Assistant: ";
+                    std::cout << std::endl;
+                }
+            }
+        );
+        struct TextCallbackGuard {
+            VisionLanguageModel* model;
+            ~TextCallbackGuard() {
+                model->set_text_callback([](const std::string&, bool, bool) {});
+            }
+        } callback_guard{_vision_language_model_ptr.get()};
+
         // run_model dispatches to speculative decoding internally when a
         // draft VLM was registered at construction time.
         auto response = _vision_language_model_ptr->run_model(chat);
         if (response.has_value()) {
-            chat.add_response(trim(std::move(response.value())));
-            if (last_ttft.has_value()) {
-                std::cout << "TTFT: " << fmt::format("{:.2f}s", *last_ttft) << std::endl;
-            }
-            if (last_tps.has_value()) {
-                std::cout << "TPS: " << fmt::format("{:.2f}", *last_tps) << std::endl;
+            auto answer = trim(std::move(final_response));
+            if (answer.empty()) {
+                chat.clear_history();
+                std::cout << "No final answer generated. Cleared chat history." << std::endl;
+            } else {
+                chat.add_response(std::move(answer));
             }
         } else {
             chat.clear_history();
@@ -213,7 +265,6 @@ void CLI::run() {
 
 
 void CLI::stop() {
-    _logger->info("User interrupt received. Stopping the model.");
     _vision_language_model_ptr->stop_model();
 }
 

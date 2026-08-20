@@ -55,6 +55,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     bool is_prefill
 ) {
     const size_t seq_length = input_ids.size();
+    const uint16_t num_tokens = is_prefill ? 128 : 5;
     size_t seq_len_with_past = seq_length;
     int past_key_values_length = 0;
     if (num_cached_tokens > 0) {
@@ -68,13 +69,11 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     if (position_ids.has_value()) {
         const auto& positions = position_ids.value();
         const uint32_t freq_dim = freq_real_buf.get_shape().back();
-        const uint16_t max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
-
         std::vector<Eigen::bfloat16> freq_real_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         std::vector<Eigen::bfloat16> freq_imag_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         for (size_t i = 0; i < positions.size(); ++i) {
             const size_t pos = static_cast<size_t>(positions[i]);
@@ -83,11 +82,15 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
                 freq_imag_padded[i * freq_dim + k] = _global_freq_host.im[pos * freq_dim + k];
             }
         }
-        freq_real_buf.upload(freq_real_padded.data());
-        freq_imag_buf.upload(freq_imag_padded.data());
+        const size_t freq_bytes = freq_real_padded.size() * sizeof(Eigen::bfloat16);
+        freq_real_buf.upload_raw(freq_real_padded.data(), 0, freq_bytes);
+        freq_imag_buf.upload_raw(freq_imag_padded.data(), 0, freq_bytes);
     } else {
-        freq_real_buf.upload(_global_freq_host.re.data());
-        freq_imag_buf.upload(_global_freq_host.im.data());
+        const size_t freq_bytes =
+            static_cast<size_t>(num_tokens) * freq_real_buf.get_shape().back()
+            * sizeof(Eigen::bfloat16);
+        freq_real_buf.upload_raw(_global_freq_host.re.data(), 0, freq_bytes);
+        freq_imag_buf.upload_raw(_global_freq_host.im.data(), 0, freq_bytes);
     }
 
     // Default mask is all-ones; tree overlay applied by prepare_attention_mask.
@@ -99,10 +102,11 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     );
 
     // Decode mask stride must match the cache ELF's compiled bucket; a wider
-    // stride misaligns rows >= 1 and collapses the tree. Prefill mask is baked
-    // into the ELF, so this local buffer is unused.
-    const uint16_t num_tokens = is_prefill ? 128 : 5;
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    // stride misaligns rows >= 1 and collapses the tree. Prefill group masks
+    // are prepared separately before cache dispatch, so this local buffer is unused.
+    const uint16_t mask_bucket = _get_cache_mask_size(
+        "full_attention", seq_len_with_past, false
+    );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = is_prefill
         ? static_cast<size_t>(num_tokens)
@@ -117,35 +121,22 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         }
     }
 
-    // Decode (n5) needs a runtime mask upload; prefill (n128) has its mask
-    // baked into the graph.
+    // Decode (n5) uses this runtime mask; prefill (n128) uses the group-mask buffer.
     if (!is_prefill) {
-        get_buffer("future_token_mask").upload(padded_mask.data());
+        get_buffer("future_token_mask").upload_raw(
+            padded_mask.data(), 0, padded_mask.size() * sizeof(Eigen::bfloat16)
+        );
     }
 
     // Drafts share the target's embedding table — read rows from target's buffer.
     const auto& target_embeddings_buf = target_lm.get_buffer("embeddings");
     const uint32_t embed_size = target_embeddings_buf.get_shape().back();  // = hidden_size
-    const auto* embeddings_ptr = reinterpret_cast<const Eigen::bfloat16*>(
-        target_embeddings_buf.get_virtual_addr()
-    );
-    std::vector<Eigen::bfloat16> input_embeds(seq_length * embed_size);
-    const size_t row_bytes = embed_size * sizeof(Eigen::bfloat16);
-    for (size_t i = 0; i < seq_length; ++i) {
-        const uint32_t token_id = input_ids[i];
-        std::memcpy(
-            input_embeds.data() + i * embed_size,
-            embeddings_ptr + token_id * embed_size,
-            row_bytes
-        );
-    }
 
     // FC fusion: folds (seq_length, 3*hidden_size) stacked target captures down
     // to (seq_length, hidden_size). Skipped when input is already hidden_size wide.
     const size_t hidden_cols = hidden_states.size() / seq_length;
     if (hidden_cols != embed_size) {
         const size_t fc_in_elems  = static_cast<size_t>(num_tokens) * 3 * embed_size;
-        const size_t fc_out_elems = static_cast<size_t>(num_tokens) * embed_size;
         // Copy only what hidden_states holds — cross-round has fewer rows than
         // input_ids (trailing bonus_token's FC input row stays zero-padded).
         const size_t valid_bytes = hidden_states.size() * sizeof(Eigen::bfloat16);
@@ -175,17 +166,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
             )
         );
 
-        // add_to_queue runs synchronously when SIMA_LLIMA_RUN_DISABLE_QUEUE=1.
         it->second.add_to_queue(&ifm_map);
-
-        auto& fc_output = get_buffer(fmt::format("fc_n{}_output", num_tokens));
-        fc_output.invalidate_cache();
-        std::vector<Eigen::bfloat16> fc_out_full(fc_out_elems);
-        fc_output.download(fc_out_full.data());
-        hidden_states.assign(
-            fc_out_full.begin(),
-            fc_out_full.begin() + seq_length * embed_size
-        );
     } else {
         // FC skipped, but pre_model IFM[1] is statically wired to
         // fc_n{N}_output — upload hidden_states there to overwrite stale data.
@@ -200,27 +181,33 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         auto& fc_output = get_buffer(fmt::format("fc_n{}_output", num_tokens));
         fc_output.upload(hidden_states_padded.data());
     }
-    // Stage token embeds for pre_model IFM[0]; IFM[1] is the FC output above.
-    std::vector<Eigen::bfloat16> input_embeds_padded(
-        static_cast<size_t>(num_tokens) * embed_size, Eigen::bfloat16{0.0f}
+    // Stage token embeds and, when quantized, their per-row dynamic-dequant scales.
+    const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
+    auto& token_embeds_buf = use_int8_embedding_staging
+        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
+        : get_buffer(fmt::format("n{}_buffer1", num_tokens));
+    MLABuffer* token_embedding_scales_buf = use_int8_embedding_staging
+        ? &get_buffer(fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
+        : nullptr;
+    _stage_embedding_rows(
+        target_lm, input_ids, token_embeds_buf, token_embedding_scales_buf
     );
-    std::memcpy(
-        input_embeds_padded.data(),
-        input_embeds.data(),
-        seq_length * embed_size * sizeof(Eigen::bfloat16)
-    );
-    auto& token_embeds_buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-    token_embeds_buf.upload(input_embeds_padded.data());
 
-    // model_key = (num_tokens, 0, past_kv_len) — picks the ELF with the right
-    // KV-cache write offset, so no OFM override needed.
+    // Bind the compact wrappers to this forward pass before enqueueing them.
     const uint8_t  layer_idx = 0;
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
-    const LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+    const auto cache_key = _bind_attn_models(
+        num_tokens, token_idx, layer_idx, token_embedding_scales_buf
+    );
     auto& fc_output_buf = get_buffer(fmt::format("fc_n{}_output", num_tokens));
 
-    // pre_model dispatch with explicit IFM begins/shapes for token embeds
-    // (IFM[0]) and FC output (IFM[1]).
+    if (is_prefill) {
+        _upload_group_future_token_masks(num_tokens, token_idx);
+    }
+
+    // pre_model dispatch with explicit IFM begins/shapes for token embeds and FC output.
+    // Quantized models insert the embedding scale between those two inputs.
     std::map<uint8_t, MLABufferSlice> pre_ifm_map;
     pre_ifm_map.emplace(
         std::piecewise_construct,
@@ -233,20 +220,21 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     );
     pre_ifm_map.emplace(
         std::piecewise_construct,
-        std::forward_as_tuple(1),
+        std::forward_as_tuple(use_int8_embedding_staging ? 2 : 1),
         std::forward_as_tuple(
             &fc_output_buf,
             std::vector<uint32_t>{0, 0},
             std::vector<uint32_t>{num_tokens, embed_size}
         )
     );
-    // Override freq IFMs (2, 3) to read from row 0 — both the sliced and the
-    // pristine linear paths upload starting at row 0.
+    // Override freq IFMs to read from row 0 — both the sliced and the pristine
+    // linear paths upload starting at row 0.
     {
+        const uint8_t freq_ifm_idx = use_int8_embedding_staging ? 3 : 2;
         const uint32_t freq_dim = freq_real_buf.get_shape().back();
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(2),
+            std::forward_as_tuple(freq_ifm_idx),
             std::forward_as_tuple(
                 &freq_real_buf,
                 std::vector<uint32_t>{0, 0},
@@ -255,7 +243,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         );
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(3),
+            std::forward_as_tuple(freq_ifm_idx + 1),
             std::forward_as_tuple(
                 &freq_imag_buf,
                 std::vector<uint32_t>{0, 0},
@@ -266,7 +254,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
 
     // cache_model dispatch. IFMs/OFMs are all statically wired, no overrides.
-    _cache_model_map.at(model_key).add_to_queue();
+    _cache_model_map.at(cache_key).add_to_queue();
 
     // post_model dispatch (lm_head fused in). Override IFM[0] to fc_n{N}_output
     // (same buffer pre_model used as IFM[1]); IFM[1] is statically wired.
@@ -276,11 +264,11 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
 
     // Download both outputs: hidden_states (n{N}_buffer5) and logits
     // (n{N}_buffer4, lm_head fused into post_model; single split for draft).
+    MLAModelWithBuffer::run_queue();
     const uint32_t draft_vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
     DraftForwardResult result;
     {
         auto& hidden_buf = get_buffer(fmt::format("n{}_buffer5", num_tokens));
-        hidden_buf.invalidate_cache();
         const size_t hidden_elems = static_cast<size_t>(num_tokens) * embed_size;
         result.hidden_states.resize(hidden_elems);
         hidden_buf.download(result.hidden_states.data());
@@ -289,7 +277,6 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     }
     {
         auto& logits_buf = get_buffer(fmt::format("n{}_buffer4", num_tokens));
-        logits_buf.invalidate_cache();
         const size_t logits_elems = static_cast<size_t>(num_tokens) * draft_vocab_size;
         result.logits.resize(logits_elems);
         logits_buf.download(result.logits.data());
@@ -307,6 +294,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     std::vector<uint32_t> input_ids,
     std::vector<int32_t> position_ids
 ) {
+    if (!_is_running.load(std::memory_order_relaxed))
+        return {};
+
     const int num_cached_tokens = static_cast<int>(_eagle3_stable_kv);
 
     // num_tokens = 16 for target verify; seq_length is the valid candidate count.
@@ -326,7 +316,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     }
 
     // Freq upload: gather rows at position_ids from pristine host, zero-pad to
-    // (max_num_tokens, freq_dim), upload to row 0. When SWA is enabled, do the
+    // (num_tokens, freq_dim), upload to row 0. When SWA is enabled, do the
     // same for the local freq table so sliding-attention layers see the right
     // rotary base.
     auto upload_freq_rows = [&](
@@ -335,12 +325,11 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         auto& real_buf = get_buffer(real_name);
         auto& imag_buf = get_buffer(imag_name);
         const uint32_t freq_dim = real_buf.get_shape().back();
-        const uint16_t max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
         std::vector<Eigen::bfloat16> real_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         std::vector<Eigen::bfloat16> imag_padded(
-            static_cast<size_t>(max_num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
+            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
         );
         for (size_t i = 0; i < seq_length; ++i) {
             const size_t pos = static_cast<size_t>(position_ids[i]);
@@ -349,8 +338,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
                 imag_padded[i * freq_dim + k] = host.im[pos * freq_dim + k];
             }
         }
-        real_buf.upload(real_padded.data());
-        imag_buf.upload(imag_padded.data());
+        const size_t freq_bytes = real_padded.size() * sizeof(Eigen::bfloat16);
+        real_buf.upload_raw(real_padded.data(), 0, freq_bytes);
+        imag_buf.upload_raw(imag_padded.data(), 0, freq_bytes);
     };
     upload_freq_rows(_global_freq_host, "global_freq_real", "global_freq_imag");
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
@@ -370,7 +360,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
 
     // pad_cols must match the cache ELF's compiled stride: rounding up
     // seq_len_with_past to mask_bucket. Wider strides misalign rows >= 1.
-    const uint16_t mask_bucket = _cfg.pipeline_cfg.future_token_mask_size;
+    const uint16_t mask_bucket = _get_cache_mask_size(
+        "full_attention", seq_len_with_past, false
+    );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = static_cast<size_t>(
         round_up_to(static_cast<uint32_t>(seq_len_with_past), mask_bucket)
@@ -382,31 +374,23 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             padded_mask[r * pad_cols + c] = mask[r * seq_len_with_past + c];
         }
     }
-    get_buffer("future_token_mask").upload(padded_mask.data());
-
-    // Stage input embeddings. The same `input_embeds` buffer is reused for both
-    // n128 prefill and n16 verify; we write the first K rows here.
-    const auto& embeddings_buf = get_buffer("embeddings");
-    const auto* embeddings_ptr = reinterpret_cast<const Eigen::bfloat16*>(
-        embeddings_buf.get_virtual_addr()
+    get_buffer("future_token_mask").upload_raw(
+        padded_mask.data(), 0, padded_mask.size() * sizeof(Eigen::bfloat16)
     );
-    std::vector<Eigen::bfloat16> input_embeds_padded(
-        static_cast<size_t>(num_tokens) * hidden_size, Eigen::bfloat16{0.0f}
-    );
-    const size_t row_bytes = hidden_size * sizeof(Eigen::bfloat16);
-    for (size_t i = 0; i < seq_length; ++i) {
-        const uint32_t token_id = input_ids[i];
-        std::memcpy(
-            input_embeds_padded.data() + i * hidden_size,
-            embeddings_ptr + token_id * hidden_size,
-            row_bytes
-        );
-    }
-    auto& input_embeds_buf = get_buffer("input_embeds");
-    input_embeds_buf.upload(input_embeds_padded.data());
 
-    // Per-layer loop; capture hidden states at layers {2, N/2, N-3}. model_key
-    // bakes the KV write offset, so no OFM override needed.
+    // Stage arbitrary candidate rows into the dtype expected by layer 0.
+    const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
+    auto& input_embeds_buf = use_int8_embedding_staging
+        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
+        : get_buffer("input_embeds");
+    MLABuffer* input_embedding_scales_buf = use_int8_embedding_staging
+        ? &get_buffer(fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
+        : nullptr;
+    _stage_embedding_rows(
+        *this, input_ids, input_embeds_buf, input_embedding_scales_buf
+    );
+
+    // Per-layer loop; capture hidden states at layers {2, N/2, N-3}.
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
     const std::vector<uint8_t> capture_layers = {
         2,
@@ -423,7 +407,10 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             continue;
         }
 
-        const LanguageModelMapKey model_key{num_tokens, layer_idx, token_idx};
+        const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+        const auto cache_key = _bind_attn_models(
+            num_tokens, token_idx, layer_idx, input_embedding_scales_buf
+        );
 
         // Slot 0 (input_embeds for layer 0) is shared between pre and post —
         // both have empty-placeholder bindings, so build the override once.
@@ -440,9 +427,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             );
         }
 
-        // Freq IFMs (slots 1, 2) need pre-only overrides — redirect static
+        // Freq IFMs need pre-only overrides — redirect static
         // (past_kv_len, 0) read to row 0. Leaking these into post would
-        // corrupt its slots 1, 2 (cache_ofms / per_layer_input).
+        // corrupt its scale/cache/per-layer inputs.
         // Pick local vs global freq buffers based on layer type so sliding
         // layers consume rope_local_base_freq and full layers consume rope_theta.
         const bool is_sliding = layer_types[layer_idx] == "sliding_attention";
@@ -450,11 +437,14 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             ? get_buffer("local_freq_real") : freq_real_buf;
         auto& layer_freq_imag = is_sliding
             ? get_buffer("local_freq_imag") : freq_imag_buf;
+        const uint8_t freq_ifm_idx = (
+            use_int8_embedding_staging && layer_idx == 0 ? 2 : 1
+        );
         const uint32_t layer_freq_dim = layer_freq_real.get_shape().back();
         auto pre_ifm_map = ifm_map;
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(1),
+            std::forward_as_tuple(freq_ifm_idx),
             std::forward_as_tuple(
                 &layer_freq_real,
                 std::vector<uint32_t>{0, 0},
@@ -463,7 +453,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         );
         pre_ifm_map.emplace(
             std::piecewise_construct,
-            std::forward_as_tuple(2),
+            std::forward_as_tuple(freq_ifm_idx + 1),
             std::forward_as_tuple(
                 &layer_freq_imag,
                 std::vector<uint32_t>{0, 0},
@@ -472,16 +462,18 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         );
 
         _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
-        _cache_model_map.at(model_key).add_to_queue();
+        _cache_model_map.at(cache_key).add_to_queue();
         _post_model_map.at(model_key).add_to_queue(&ifm_map);
 
         // post_model.ofms[0] writes n{N}_buffer1 (next layer's IFM[0]), so
         // reading it here yields this layer's output.
         auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
         if (it != capture_layers.end()) {
+            MLAModelWithBuffer::run_queue();
+            if (!_is_running.load(std::memory_order_relaxed))
+                return result;
             const size_t cap_idx = std::distance(capture_layers.begin(), it);
             auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-            buf.invalidate_cache();
             const size_t num_elems = static_cast<size_t>(num_tokens) * hidden_size;
             std::vector<Eigen::bfloat16> full_cap(num_elems);
             buf.download(full_cap.data());
@@ -497,14 +489,19 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     const uint32_t lm_head_output_size = _cfg.lm_cfg.get_lm_head_output_size();
     const auto num_splits = _cfg.lm_cfg.lm_head_num_splits;
     const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
-    result.logits.resize(static_cast<size_t>(num_tokens) * lm_head_output_size);
+    result.next_token_ids.resize(num_tokens, 0);
+    std::vector<float> best_logits(
+        num_tokens, -std::numeric_limits<float>::infinity()
+    );
 
+    MLAModelWithBuffer::run_queue();
+    if (!_is_running.load(std::memory_order_relaxed))
+        return result;
     for (uint32_t s = 0; s < num_splits; ++s) {
         const std::string buf_name = (num_splits == 1)
             ? fmt::format("n{}_buffer4", num_tokens)
             : fmt::format("n{}_lm_split{}", num_tokens, s);
         auto& buf = get_buffer(buf_name);
-        buf.invalidate_cache();
         const uint32_t this_split_dim = (num_splits == 1)
             ? lm_head_output_size
             : std::min<uint32_t>(split_dim, lm_head_output_size - s * split_dim);
@@ -513,11 +510,15 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         );
         buf.download(split_data.data());
         for (uint16_t r = 0; r < num_tokens; ++r) {
-            std::memcpy(
-                result.logits.data() + r * lm_head_output_size + s * split_dim,
-                split_data.data() + r * this_split_dim,
-                this_split_dim * sizeof(Eigen::bfloat16)
-            );
+            for (uint32_t j = 0; j < this_split_dim; ++j) {
+                const float value = static_cast<float>(
+                    split_data[static_cast<size_t>(r) * this_split_dim + j]
+                );
+                if (value > best_logits[r]) {
+                    best_logits[r] = value;
+                    result.next_token_ids[r] = s * split_dim + j;
+                }
+            }
         }
     }
 
@@ -545,25 +546,23 @@ LanguageModel::TreeDecodingResult LanguageModel::tree_decoding(
         std::move(tree_candidates),
         std::move(position_ids)
     );
+    if (!_is_running.load(std::memory_order_relaxed))
+        return {};
 
-    // Gather logits[p][d] = tree_logits[retrieve_indices[p][d]]. -1 entries
-    // (path-padding) map to the last row of tree_logits.
-    const uint32_t vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
+    // Gather target predictions for each candidate path. -1 entries
+    // (path-padding) map to the last tree row.
     const uint16_t K = _cfg.lm_cfg.get_single_num_tokens();
     const size_t n_paths   = retrieve_indices.size();
     const size_t max_depth = n_paths ? retrieve_indices[0].size() : 0;
 
     TreeDecodingResult result;
-    result.vocab_size = vocab_size;
-    result.logits.resize(n_paths * max_depth * vocab_size);
+    result.next_token_ids.resize(n_paths * max_depth);
     for (size_t p = 0; p < n_paths; ++p) {
         for (size_t d = 0; d < max_depth; ++d) {
             int32_t idx = retrieve_indices[p][d];
             if (idx < 0) idx = static_cast<int32_t>(K) - 1;
-            std::memcpy(
-                result.logits.data() + (p * max_depth + d) * vocab_size,
-                target_out.logits.data() + static_cast<size_t>(idx) * vocab_size,
-                vocab_size * sizeof(Eigen::bfloat16)
+            result.next_token_ids[p * max_depth + d] = static_cast<int32_t>(
+                target_out.next_token_ids[static_cast<size_t>(idx)]
             );
         }
     }
@@ -600,7 +599,7 @@ LanguageModel::UpdateInferenceInputsResult LanguageModel::update_inference_input
     const std::vector<std::vector<int32_t>>& retrieve_indices,
     int32_t new_token,
     const std::vector<Eigen::bfloat16>& hidden_state_new,
-    const std::vector<Eigen::bfloat16>& sample_p
+    uint32_t bonus_token
 ) {
     const uint32_t hidden_size = _cfg.lm_cfg.hidden_size;
     const size_t prev_input_len = input_ids.size();
@@ -637,14 +636,6 @@ LanguageModel::UpdateInferenceInputsResult LanguageModel::update_inference_input
             3 * hidden_size * sizeof(Eigen::bfloat16)
         );
     }
-
-    auto bonus_it = std::max_element(sample_p.begin(), sample_p.end(),
-        [](const Eigen::bfloat16& a, const Eigen::bfloat16& b) {
-            return static_cast<float>(a) < static_cast<float>(b);
-        });
-    const uint32_t bonus_token = static_cast<uint32_t>(
-        std::distance(sample_p.begin(), bonus_it)
-    );
 
     // Inject bonus_token into topk_generate only; persisting it in input_ids
     // would shift next tree_decoding's RoPE and break topk_generate's slice.
@@ -692,6 +683,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     bool is_prefill
 ) {
     TopkGenerateResult result;
+    if (!target_lm._is_running.load(std::memory_order_relaxed))
+        return result;
 
     // total_tokens = target's speculative_budget - 1 (typically 15 from 16).
     // topk = draft's speculative_budget (typically 5). depth is hardcoded for now.
@@ -776,6 +769,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
                 /*num_cached_tokens=*/static_cast<int>(offset),
                 /*is_prefill=*/true
             );
+            if (!target_lm._is_running.load(std::memory_order_relaxed))
+                return result;
             last_valid_in_chunk = valid;
         }
 
@@ -802,6 +797,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*num_cached_tokens=*/static_cast<int>(_eagle3_stable_kv),
             /*is_prefill=*/false
         );
+        if (!target_lm._is_running.load(std::memory_order_relaxed))
+            return result;
         hidden_states = std::move(draft_out.hidden_states);
         // Trim trailing bonus_token row (zero-FC slot, uninformative).
         hidden_states.resize(hidden_rows * embed_size_for_kv);
@@ -827,14 +824,6 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         topk_p[r] = logsoftmax<Eigen::bfloat16>(
             topk_p_raw[r].data(), topk_p_raw[r].size()
         );
-    }
-
-    // Log topk values (convert bf16 → float for fmt).
-    std::vector<std::vector<float>> topk_p_raw_f(topk_p_raw.size());
-    for (size_t r = 0; r < topk_p_raw.size(); ++r) {
-        topk_p_raw_f[r].resize(topk_p_raw[r].size());
-        for (size_t i = 0; i < topk_p_raw[r].size(); ++i)
-            topk_p_raw_f[r][i] = static_cast<float>(topk_p_raw[r][i]);
     }
 
     // scores must be a copy, not a reference: the depth loop rebinds it later
@@ -902,6 +891,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*num_cached_tokens=*/static_cast<int>(num_cached_tokens),
             /*is_prefill=*/false
         );
+        if (!target_lm._is_running.load(std::memory_order_relaxed))
+            return result;
         auto out_hidden = std::move(draft_out_d.hidden_states);
 
         len_posi += 1;
@@ -935,14 +926,6 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             topk_p_d[r] = logsoftmax<Eigen::bfloat16>(
                 topk_p_raw_d[r].data(), topk_p_raw_d[r].size()
             );
-        }
-
-        // Log (convert bf16 → float for fmt).
-        std::vector<std::vector<float>> topk_p_raw_d_f(topk_p_raw_d.size());
-        for (size_t r = 0; r < topk_p_raw_d.size(); ++r) {
-            topk_p_raw_d_f[r].resize(topk_p_raw_d[r].size());
-            for (size_t k = 0; k < topk_p_raw_d[r].size(); ++k)
-                topk_p_raw_d_f[r][k] = static_cast<float>(topk_p_raw_d[r][k]);
         }
 
         // cu_scores[r][k] = topk_p_d[r][k] + scores[r]. Shape (topk, topk).
@@ -1038,10 +1021,10 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         }
     }
 
-    // Tree finalization. Flatten scores_list and ss_token to 1D arrays of size
-    // K + (depth-1)*K*K (= 55 for K=5, depth=3).
+    // Tree finalization. Flatten scores_list and ss_token to 1D arrays.
+    const size_t flattened_size = topk + (depth - 1) * topk * topk;
     std::vector<float> scores_list_flat;
-    scores_list_flat.reserve(topk + 2 * topk * topk);  // = 55
+    scores_list_flat.reserve(flattened_size);
     for (const auto& entry : scores_list) {
         for (const auto& row : entry) {
             scores_list_flat.insert(scores_list_flat.end(), row.begin(), row.end());
@@ -1049,7 +1032,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     }
 
     std::vector<uint32_t> ss_token_list;
-    ss_token_list.reserve(topk + 2 * topk * topk);
+    ss_token_list.reserve(flattened_size);
     for (const auto& entry : ss_token) {
         for (const auto& row : entry) {
             ss_token_list.insert(ss_token_list.end(), row.begin(), row.end());
@@ -1188,7 +1171,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
 LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     LanguageModel& draft_lm,
     std::vector<uint32_t> input_ids,
-    int num_cached_tokens
+    int num_cached_tokens,
+    ChronoTimer timer_ttft
 ) {
     InitTreeResult result;
 
@@ -1200,11 +1184,13 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 
     // Uploads token embeds and returns the prefix-match length against
     // _cached_token_ids.
-    const uint16_t prefix_cached = _set_input_text_embeds(input_ids);
+    uint16_t prefix_cached = _set_input_text_embeds(input_ids);
 
-    // Full-match early-out: every input token is already cached on both target
-    // and draft sides — restore the tree state saved last turn.
-    if (prefix_cached == num_input_tokens && !_cached_draft_tokens.empty()) {
+    // Full-match early-out: every input token and the prompt length match the
+    // tree state saved last turn.
+    if (prefix_cached == num_input_tokens
+        && _cached_eagle3_prompt_len == num_input_tokens
+        && !_cached_draft_tokens.empty()) {
         result.token              = _cached_first_generated_token;
         result.draft_tokens       = _cached_draft_tokens;
         result.retrieve_indices   = _cached_retrieve_indices;
@@ -1212,12 +1198,20 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         result.tree_position_ids  = _cached_tree_position_ids;
         _eagle3_stable_kv          = _cached_eagle3_stable_kv;
         draft_lm._eagle3_stable_kv = draft_lm._cached_eagle3_stable_kv;
+        result.root_ready_time = std::chrono::steady_clock::now();
+        result.time_to_first_token = timer_ttft.stop();
+        _notify_first_token(result.token, result.time_to_first_token);
         return result;
     }
 
+    // A token-prefix match alone does not validate the cached EAGLE tree.
+    // Back up one token so the final prefill group rebuilds the root and tree.
+    if (prefix_cached == num_input_tokens && prefix_cached > 0)
+        --prefix_cached;
+
     // Multi-group target prefill. Per-group capture of intermediate hidden
     // states (layers 2, N/2, N-3) must be copied out before the next dispatch
-    // overwrites the buffer — queue disabled for synchronous per-layer download.
+    // overwrites the buffer.
     const uint32_t hidden_size = _cfg.lm_cfg.hidden_size;
     const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
 
@@ -1242,6 +1236,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         // result.token is only meaningful at the LAST group; earlier ones get
         // overwritten by subsequent dispatches.
         result.token = run_model_once(num_tokens, offset, num_input_tokens, 0);
+        if (!_is_running.load(std::memory_order_relaxed))
+            return result;
 
         // Copy this group's captures into the accumulator before next dispatch.
         for (size_t cap_idx = 0; cap_idx < result.hidden_states.size(); ++cap_idx) {
@@ -1255,6 +1251,9 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     }
 
     _logger->info("root token: {}", result.token);
+    result.root_ready_time = std::chrono::steady_clock::now();
+    result.time_to_first_token = timer_ttft.stop();
+    _notify_first_token(result.token, result.time_to_first_token);
 
     // Cache for next-turn prefix matching. Must run BEFORE push_back so
     // input_ids still matches the pre-root-token prefill length.
@@ -1285,6 +1284,8 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         *this, std::move(input_ids), std::move(hidden_states_concat),
         static_cast<int>(prefix_cached), /*is_prefill=*/true
     );
+    if (!_is_running.load(std::memory_order_relaxed))
+        return result;
     result.draft_tokens       = std::move(topk_result.draft_tokens);
     result.retrieve_indices   = std::move(topk_result.retrieve_indices);
     result.tree_mask          = std::move(topk_result.tree_mask);
@@ -1296,6 +1297,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     _cached_retrieve_indices   = result.retrieve_indices;
     _cached_tree_mask          = result.tree_mask;
     _cached_tree_position_ids  = result.tree_position_ids;
+    _cached_eagle3_prompt_len  = num_input_tokens;
     _cached_eagle3_stable_kv          = _eagle3_stable_kv;
     draft_lm._cached_eagle3_stable_kv = draft_lm._eagle3_stable_kv;
 
@@ -1309,8 +1311,19 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
     LanguageModel& draft_lm,
     std::span<const uint32_t> input_token_ids,
-    std::optional<uint16_t> override_max_num_tokens
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result
 ) {
+    _is_running = true;
+
+    if (performance_result != nullptr) {
+        *performance_result = GenerationPerformanceResult{};
+        performance_result->accepted_draft_tokens = 0;
+    }
+    if (!timer_ttft.has_value())
+        timer_ttft = ChronoTimer{true};
+
     std::vector<uint32_t> input_ids(input_token_ids.begin(), input_token_ids.end());
     const size_t input_len = input_ids.size();
     const int num_cached_tokens = 0;
@@ -1330,8 +1343,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             "stop (pre-init): input_len {} + spec_budget {} > max_length {}",
             input_len, spec_budget, max_length
         );
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
+        _cached_eagle3_prompt_len = 0;
         _text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
         _text_streamer.wait_streaming();
+        _is_running = false;
         return std::nullopt;
     }
 
@@ -1344,7 +1362,23 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
 
     std::vector<uint16_t> total_generated_tokens;
 
-    auto init = initialize_tree(draft_lm, input_ids, num_cached_tokens);
+    auto init = initialize_tree(
+        draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
+    );
+    if (!_is_running.load(std::memory_order_relaxed)) {
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
+        _cached_eagle3_prompt_len = 0;
+        _notify_interrupt();
+        _text_streamer.wait_streaming();
+        return std::nullopt;
+    }
+
+    if (performance_result != nullptr) {
+        performance_result->token_durations.emplace_back(init.time_to_first_token);
+        performance_result->generated_tokens = 1;
+    }
 
     // Sync target's _eagle3_stable_kv with draft's — the draft incremented it
     // inside initialize_tree's first topk_generate, and tree_decoding reads it.
@@ -1358,10 +1392,11 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     auto tree_mask          = std::move(init.tree_mask);
     int32_t new_token       = 0;
 
-    // TPS timer starts here, after all prefill work.
-    const auto run_model_begin = std::chrono::steady_clock::now();
+    // The root was already streamed by initialize_tree. Include the initial
+    // draft-tree construction in the time to the next streamed token.
+    const auto run_model_begin = init.root_ready_time;
     auto iter_begin = run_model_begin;
-    bool first_token = true;
+    bool first_round = true;
     bool cache_full = false;
 
     size_t idx = 0;
@@ -1383,6 +1418,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         auto td = tree_decoding(
             draft_tokens, tree_position_ids, input_ids, retrieve_indices
         );
+        if (!_is_running.load(std::memory_order_relaxed))
+            break;
 
         // candidates[p][d] = draft_tokens[retrieve_indices[p][d]]; -1 entries
         // mean "path padding" and stay as -1 in the output.
@@ -1405,62 +1442,87 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         }
 
         auto post = eagle_helpers::evaluate_posterior(
-            td.logits.data(),
+            td.next_token_ids.data(),
             candidates_flat.data(),
             n_paths,
-            max_depth,
-            td.vocab_size
+            max_depth
         );
-        total_generated_tokens.push_back(static_cast<uint16_t>(post.accept_length + 1));
-
-        auto upd = update_inference_inputs(
-            draft_lm,
-            input_ids,
-            candidates_2d,
-            post.best_candidate,
-            post.accept_length,
-            retrieve_indices,
-            new_token,
-            td.hidden_states,
-            post.sample_p
-        );
-
-        // Sync target's stable_kv with draft's — same pattern as after
-        // initialize_tree.
-        _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+        const size_t accepted_count = static_cast<size_t>(post.accept_length) + 1;
+        const bool final_batch = input_ids.size() + accepted_count + spec_budget > max_length;
+        if (final_batch) {
+            _logger->info(
+                "[iter {}] commit accepted path and stop: no room for next tree", idx
+            );
+            cache_full = true;
+        }
+        total_generated_tokens.push_back(static_cast<uint16_t>(accepted_count));
 
         const size_t prev_size = input_ids.size();
-        input_ids          = std::move(upd.input_ids);
-        draft_tokens       = std::move(upd.draft_tokens);
-        retrieve_indices   = std::move(upd.retrieve_indices);
-        tree_mask          = std::move(upd.tree_mask);
-        tree_position_ids  = std::move(upd.tree_position_ids);
-        new_token          = upd.new_token;
+        if (final_batch) {
+            for (size_t i = 0; i < accepted_count; ++i) {
+                input_ids.push_back(
+                    static_cast<uint32_t>(candidates_2d[post.best_candidate][i])
+                );
+            }
+        } else {
+            auto upd = update_inference_inputs(
+                draft_lm,
+                input_ids,
+                candidates_2d,
+                post.best_candidate,
+                post.accept_length,
+                retrieve_indices,
+                new_token,
+                td.hidden_states,
+                post.bonus_token
+            );
+            if (!_is_running.load(std::memory_order_relaxed))
+                break;
 
-        // Stream the newly-accepted tokens. Per-token duration = iter time /
-        // accepted count; first emitted token gets TTFT, rest get TPS.
+            // Sync target's stable_kv with draft's — same pattern as after
+            // initialize_tree.
+            _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+
+            input_ids          = std::move(upd.input_ids);
+            draft_tokens       = std::move(upd.draft_tokens);
+            retrieve_indices   = std::move(upd.retrieve_indices);
+            tree_mask          = std::move(upd.tree_mask);
+            tree_position_ids  = std::move(upd.tree_position_ids);
+            new_token          = upd.new_token;
+        }
+
+        // Stream the newly-accepted tokens. The first round's root was already
+        // emitted by initialize_tree, so skip it here.
         const auto iter_end = std::chrono::steady_clock::now();
         const double iter_duration = std::chrono::duration<double>(
             iter_end - iter_begin
         ).count();
-        const size_t accepted = input_ids.size() - prev_size;
-        const double per_token = accepted > 0
-            ? iter_duration / static_cast<double>(accepted)
+        const size_t stream_begin = prev_size + (first_round ? 1 : 0);
+        const size_t streamed = input_ids.size() - stream_begin;
+        const double per_token = streamed > 0
+            ? iter_duration / static_cast<double>(streamed)
             : 0.0;
-        for (size_t i = prev_size; i < input_ids.size(); ++i) {
-            const auto type = first_token
-                ? DecodeCallbackType::TTFT
-                : DecodeCallbackType::TPS;
-            // The first emitted token per round (offset 0) is the tree's seed
-            // — initialize_tree's root in round 1, or the previous round's
-            // bonus in later rounds — and is target-generated, not from draft.
-            // Offsets 1..accept_length are the draft-accepted path.
+        for (size_t i = stream_begin; i < input_ids.size(); ++i) {
+            // Offset 0 is the target-generated tree seed. It is skipped in
+            // round 1 because initialize_tree already emitted that root;
+            // offsets 1..accept_length are draft-accepted tokens.
             const size_t offset = i - prev_size;
             const bool from_draft = (offset > 0) && (offset <= post.accept_length);
-            _text_streamer.push(type, input_ids[i], per_token, from_draft);
-            first_token = false;
+            _text_streamer.push(DecodeCallbackType::TPS, input_ids[i], per_token, from_draft);
+            if (performance_result != nullptr) {
+                performance_result->token_durations.emplace_back(per_token);
+                ++performance_result->generated_tokens;
+                if (from_draft) {
+                    ++performance_result->accepted_draft_tokens.value();
+                }
+            }
         }
-        iter_begin = iter_end;
+        if (streamed > 0)
+            iter_begin = iter_end;
+        first_round = false;
+
+        if (final_batch)
+            break;
 
         // Stop when any configured stop token appears in the generated tail.
         // Cache-overflow is checked at the top of the next iteration.
@@ -1472,6 +1534,16 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             _logger->info("[iter {}] stop: stop token in generated tokens", idx);
             break;
         }
+    }
+
+    if (!_is_running.load(std::memory_order_relaxed)) {
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
+        _cached_eagle3_prompt_len = 0;
+        _notify_interrupt();
+        _text_streamer.wait_streaming();
+        return std::nullopt;
     }
 
     // TPS summary.
@@ -1499,12 +1571,23 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     // Signal end-of-stream and wait for the streamer thread to flush.
     // Use CACHE_FULL when generation stopped because the K-cache was exhausted,
     // mirroring non-spec; the streamer prints the "Cache full" notice.
+    if (cache_full) {
+        _cached_token_ids.clear();
+        draft_lm._cached_token_ids.clear();
+        _cached_draft_tokens.clear();
+        _cached_eagle3_prompt_len = 0;
+    }
     _text_streamer.push(
         cache_full ? DecodeCallbackType::CACHE_FULL : DecodeCallbackType::STOP, 0, 0
     );
     _text_streamer.wait_streaming();
 
-    return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
+    if (_is_running) {
+        _is_running = false;
+        return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
+    } else {
+        return std::nullopt;
+    }
 }
 
 

@@ -22,6 +22,13 @@ The LLiMa runtime is installed natively on Modalix as part of the Neat runtime.
 See [Neat Framework installation](/getting-started/neat-library/)
 for the runtime installation flow.
 
+## Contributing
+
+Contributors changing LLiMa itself should follow the
+[LLiMa Contributor Guide](contributing.md) for repository structure,
+development environments, test tiers, model-input policy, and pull-request
+requirements.
+
 ## Supported Models
 
 The following table shows the supported model architectures and their
@@ -36,8 +43,9 @@ capabilities:
 | [Gemma 2](https://huggingface.co/collections/google/gemma-2-release) | LLM | 2b, 9b |
 | [Gemma 3](https://huggingface.co/collections/google/gemma-3-release) | LLM | [1b](https://huggingface.co/simaai/gemma-3-1b-it-a16w4), [4b](https://huggingface.co/simaai/gemma-3-4b-it-a16w4) |
 | [Phi 3.5 mini](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) | LLM | [3.8b](https://huggingface.co/simaai/Phi-3.5-mini-instruct-a16w4) |
-| [Qwen 2.5](https://huggingface.co/collections/Qwen/qwen25) | LLM | [0.5b](https://huggingface.co/simaai/Qwen2.5-0.5B-Instruct-GPTQ-a16w4), [1.5b](https://huggingface.co/simaai/Qwen2.5-1.5B-Instruct-GPTQ-a16w4), [3b](https://huggingface.co/simaai/Qwen2.5-3B-Instruct-GPTQ-a16w4), [7b](https://huggingface.co/simaai/Qwen2.5-7B-Instruct-GPTQ-a16w4) |
-| [Qwen 3](https://huggingface.co/collections/Qwen/qwen3) | LLM | [0.6b](https://huggingface.co/simaai/Qwen3-0.6B-GPTQ-a16w4), [1.7b](https://huggingface.co/simaai/Qwen3-1.7B-GPTQ-a16w4), [4b](https://huggingface.co/simaai/Qwen3-4B-Instruct-2507-GPTQ-a16w4), [8b](https://huggingface.co/simaai/Qwen3-8B-GPTQ-a16w4) |
+| [Phi 4 mini](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | [3.8b](https://huggingface.co/simaai/Phi-4-mini-instruct-Autoround-a16w4) |
+| [Qwen 2.5](https://huggingface.co/collections/Qwen/qwen25) | LLM | [0.5b](https://huggingface.co/simaai/Qwen2.5-0.5B-Instruct-Autoround-a16w4), [1.5b](https://huggingface.co/simaai/Qwen2.5-1.5B-Instruct-GPTQ-a16w4), [3b](https://huggingface.co/simaai/Qwen2.5-3B-Instruct-GPTQ-a16w4), [7b](https://huggingface.co/simaai/Qwen2.5-7B-Instruct-GPTQ-a16w4) |
+| [Qwen 3](https://huggingface.co/collections/Qwen/qwen3) | LLM | [0.6b](https://huggingface.co/simaai/Qwen3-0.6B-Autoround-a16w4), [1.7b](https://huggingface.co/simaai/Qwen3-1.7B-GPTQ-a16w4), [4b](https://huggingface.co/simaai/Qwen3-4B-Instruct-2507-GPTQ-a16w4), [8b](https://huggingface.co/simaai/Qwen3-8B-GPTQ-a16w4) |
 | [Mistral 1](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) | LLM | [7b](https://huggingface.co/simaai/Mistral-7B-Instruct-v0.3-a16w4) |
 | [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2) | LLM | [350m](https://huggingface.co/simaai/LFM2-350M-a16w4), [1.2b](https://huggingface.co/simaai/LFM2-1.2B-a16w4), [2.6b](https://huggingface.co/simaai/LFM2-2.6B-a16w4) |
 | [Llava 1.5](https://huggingface.co/llava-hf/llava-1.5-7b-hf) | VLM | [7b](https://huggingface.co/simaai/llava-1.5-7b-hf-a16w4) |
@@ -55,8 +63,8 @@ capabilities:
 |----|----|
 | Model Architecture | Only models based on the architectures listed above are supported. |
 | Model Parameters | Only models with parameter count less than 10B are supported. |
-| HF Models | Models must be downloaded from Hugging Face and contain: `config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json` and weights in safetensors format |
+| HF Models | Models must be available as a local Hugging Face directory containing `config.json`, safetensor weights, and the tokenizer and processor files required by the architecture. `generation_config.json` is optional. |
 | GGUF Models | GGUF format is supported for LLMs only. VLMs must be compiled from the Hugging Face safetensors format. Note that performance may decrease compared to Hugging Face safetensor compilation. |
-| Compressed Tensor Models | Pre-quantized safetensor models (GPTQ/AWQ) created with llm-compressor are supported for LLMs only. The model must use symmetric quantization. These models can achieve better accuracy than standard INT4 quantization while maintaining high performance. |
+| Compressed Tensor Models | Supported LLMs and VLMs can use pre-quantized safetensor models (GPTQ/AWQ) created with llm-compressor. The model must use symmetric quantization and a supported compressed-tensors layout. These models can achieve better accuracy than standard INT4 quantization while maintaining high performance. |
 | Gemma3 VLM | Supported with modified SigLip 448 vision encoder |
 | LLAMA 3.2 Vision | Vision models are not supported |
