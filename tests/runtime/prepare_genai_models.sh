@@ -5,9 +5,12 @@ set -euo pipefail
 # The Qwen3 and Gemma4 fixtures provide LLiMa-specific reasoning coverage.
 DEFAULT_LLIMA_MODELS_PATH="/media/nvme/llima/models"
 DEFAULT_TEXT_MODEL="Qwen2.5-0.5B-Instruct-Autoround-a16w4"
+DEFAULT_TEXT_REVISION="0b47c65d41d5f457458746796966ca031fd7d608"
 DEFAULT_VLM_MODEL="LFM2.5-VL-450M-Autoround-a16w4"
+DEFAULT_VLM_REVISION="228bfc6d0a4b3f354367a012f6fe7bec00c4625e"
 DEFAULT_ASR_MODEL="whisper-small-a16w8"
 DEFAULT_ASR_REPO="simaai/whisper-small-a16w8"
+DEFAULT_ASR_REVISION="9957d9d561023f0ad7c466ac57dd1b40fe76e6fd"
 DEFAULT_REASONING_QWEN_MODEL="Qwen3-0.6B-Autoround-a16w4"
 DEFAULT_REASONING_QWEN_REPO="simaai/Qwen3-0.6B-Autoround-a16w4"
 DEFAULT_REASONING_QWEN_REVISION="bfe4a547a56d94fb4474cbc7e8fcbc1e4ee276ac"
@@ -78,13 +81,13 @@ validate_model_name \
 mkdir -p "${LLIMA_MODELS_PATH}"
 download_model \
   "text" "simaai/${SIMA_TEST_LLIMA_TEXT_MODEL}" "${SIMA_TEST_LLIMA_TEXT_MODEL}" \
-  "devkit/vlm_config.json"
+  "devkit/vlm_config.json" "${DEFAULT_TEXT_REVISION}"
 download_model \
   "vlm" "simaai/${SIMA_TEST_LLIMA_VLM_MODEL}" "${SIMA_TEST_LLIMA_VLM_MODEL}" \
-  "devkit/vlm_config.json"
+  "devkit/vlm_config.json" "${DEFAULT_VLM_REVISION}"
 download_model \
   "asr" "${SIMA_TEST_LLIMA_ASR_REPO}" "${SIMA_TEST_LLIMA_ASR_MODEL}" \
-  "devkit/whisper_config.json"
+  "devkit/whisper_config.json" "${DEFAULT_ASR_REVISION}"
 download_model \
   "Qwen reasoning" "${DEFAULT_REASONING_QWEN_REPO}" \
   "${SIMA_TEST_LLIMA_REASONING_QWEN_MODEL}" "devkit/vlm_config.json" \
