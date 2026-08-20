@@ -774,6 +774,14 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
 
             ifm_map.clear();
             _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            LanguageModelMapKey linear_model_key(num_tokens, layer_idx, 0);
+            if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
+                _linear_model_map.at(linear_model_key)._bind_ifm(
+                    1, normal_scale_buf, {normal_input_row, 0}
+                );
+            }
+            _linear_model_map.at(linear_model_key).add_to_queue(&ifm_map);
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
@@ -782,6 +790,13 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
     }
 
     MLAModelWithBuffer::run_queue();
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
+                get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
+            );
+        }
+    }
 
     if (!_cached_states.empty()) {
         for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
@@ -1250,6 +1265,11 @@ uint32_t LanguageModel::run_model_once(
             _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
             LanguageModelMapKey linear_model_key(num_tokens, layer_idx, 0);
+            if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
+                _linear_model_map.at(linear_model_key)._bind_ifm(
+                    1, normal_scale_buf, {normal_input_row, 0}
+                );
+            }
             _linear_model_map.at(linear_model_key).add_to_queue(&ifm_map);
         } else {
             throw std::runtime_error(

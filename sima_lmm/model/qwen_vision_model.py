@@ -696,6 +696,15 @@ class QwenVisionLayerModel(BaseModel):
         flattened_weight = weight.reshape(out_features, in_features)
         return flattened_weight.reshape(out_features, in_features, 1, 1)
 
+    def _reshape_qwen_patch_embed_scales(self, scales: np.ndarray) -> np.ndarray:
+        """Preserve grouped scales while the matching kernel flattens input dimensions."""
+        if scales.ndim != 2 or scales.shape[0] != self.cfg.vm_cfg.hidden_size:
+            raise ValueError(
+                "Qwen patch-embedding scales must have shape "
+                f"({self.cfg.vm_cfg.hidden_size}, num_input_blocks), got {scales.shape}"
+            )
+        return scales
+
     def _reshape_merger_kernel(self, weight_linear: np.ndarray) -> np.ndarray:
         """
         Converts nn.Linear weight into a strided Conv kernel for patch merging.
@@ -784,6 +793,7 @@ class QwenVisionLayerModel(BaseModel):
             builder, self.get_hf_param, self.check_hf_param,
             f"{base_name}.patch_embed.proj", input_node,
             is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
+            scale_process_func=self._reshape_qwen_patch_embed_scales,
             src_bias_name=f"{base_name}.patch_embed.proj.bias",
         )
         hidden_states = builder.create_add_node(hidden_states, pos_embed)
@@ -813,6 +823,7 @@ class QwenVisionLayerModel(BaseModel):
             builder, self.get_hf_param, self.check_hf_param,
             f"{base_name}.patch_embed.proj", input_node,
             is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
+            scale_process_func=self._reshape_qwen_patch_embed_scales,
         )
         cos_table, sin_table, global_mask, windowed_mask = self._prepare_sima_qwen2_static_inputs(builder, quantizable)
 

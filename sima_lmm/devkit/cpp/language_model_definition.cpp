@@ -535,6 +535,11 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
         );
     } else {
         linear_ifms.emplace_back(MLABufferSlice{});
+        if (_cfg.pipeline_cfg.quantize_embeddings) {
+            linear_ifms.emplace_back(
+                MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
+            );
+        }
     }
     linear_ifms.emplace_back(
         MLABufferSlice{

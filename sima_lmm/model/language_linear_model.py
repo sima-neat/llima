@@ -43,6 +43,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
     Direct SimaBuilder inputs are NHWC:
         - input: (1, 1, num_tokens, hidden)
+        - input_scale layer 0 with quantized embeddings: (1, 1, num_tokens, 1)
         - linear_conv_state: (1, 1, linear_conv_kernel_dim - 1, linear_conv_dim)
         - linear_valid_mask group only: (1, 1, num_tokens, 1)
         - linear_delta_state: (1, num_value_heads, key_head_dim, value_head_dim)
@@ -591,6 +592,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
             // self.cfg.lm_cfg.linear_attn_cfg.num_key_heads
         )
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        scale_shape = (1, 1, self.num_tokens, 1)
         conv_state_shape = (
             1,
             1,
@@ -606,13 +608,25 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
 
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        model_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
+        input_dtype = (
+            ScalarType.int8
+            if self.uses_quantized_input_embeddings and self.layer_idx == 0
+            else activation_type(quantizable)
         )
+        model_input = builder.create_placeholder_node(
+            "input", TensorType(input_dtype, input_shape)
+        )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            model_input_scale = builder.create_placeholder_node(
+                "input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         model_conv_state = builder.create_placeholder_node(
             "linear_conv_state", TensorType(activation_type(quantizable), conv_state_shape)
         )
-        model_inputs = [model_input, model_conv_state]
+        model_inputs = [model_input]
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            model_inputs.append(model_input_scale)
+        model_inputs.append(model_conv_state)
         if self.num_tokens > 1:
             model_valid_mask = builder.create_placeholder_node(
                 "linear_valid_mask", TensorType(activation_type(quantizable), valid_mask_shape)
@@ -628,8 +642,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
         builder.begin_subnet(model_inputs)
 
         mla_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
+            "input", TensorType(input_dtype, input_shape)
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            mla_input_scale = builder.create_placeholder_node(
+                "input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         mla_conv_state = builder.create_placeholder_node(
             "linear_conv_state", TensorType(activation_type(quantizable), conv_state_shape)
         )
@@ -643,7 +661,14 @@ class LanguageLinearModel(LanguagePartBaseModel):
             "linear_delta_state", TensorType(activation_type(quantizable), state_shape)
         )
 
-        norm_input = self._build_sima_rms_norm(builder, f"{base_layer}.input_layernorm", mla_input)
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            residual = builder.create_dynamic_dequant_node(mla_input, mla_input_scale)
+        else:
+            residual = mla_input
+
+        norm_input = self._build_sima_rms_norm(
+            builder, f"{base_layer}.input_layernorm", residual
+        )
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_qkv")
@@ -839,7 +864,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
             lora_rank=lora_rank,
             merged_lora=merged_lora,
         )
-        add1 = builder.create_add_node(mla_input, out_proj)
+        add1 = builder.create_add_node(residual, out_proj)
         rms_norm2 = self._build_sima_rms_norm(builder, f"{base_layer}.post_attention_layernorm", add1)
         mlp = self._build_sima_mlp(
             builder,
@@ -1766,19 +1791,9 @@ class LanguageLinearModel(LanguagePartBaseModel):
         return output_nodes
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        tess = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=None,
-        )
-        if self.num_tokens > 1:
-            return {0: tess, 1: tess, 2: tess, 3: tess}
-        return {0: tess, 1: tess, 2: tess}
+        """Use default HWC16 tessellation for hidden, scale, mask, and state inputs."""
+        return {}
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        tess = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=None,
-        )
-        return {0: tess, 1: tess, 2: tess}
+        """Use default HWC16 tessellation for hidden and recurrent-state outputs."""
+        return {}
