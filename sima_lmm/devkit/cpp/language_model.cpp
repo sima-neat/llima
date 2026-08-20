@@ -2351,6 +2351,8 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
         scales_buf = &get_buffer("input_embedding_scales");
         embedding_scales_buf = &get_buffer("embedding_scales");
         scale_row_size = scales_buf->get_buf_len(std::vector<uint32_t>{1, 1});
+        if (_cfg.vm_cfg.has_value())
+            scales_buf->invalidate_cache();
     }
     uint32_t token_idx = 0;
     uint32_t num_images = 0;
