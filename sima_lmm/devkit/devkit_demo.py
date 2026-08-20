@@ -1,5 +1,4 @@
 import argparse
-import json
 import logging
 import os
 import sys
@@ -9,14 +8,18 @@ import subprocess
 from enum import Enum
 from pathlib import Path
 
-from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
 from sima_lmm.devkit import model_manager
+from sima_lmm.devkit.model_manager import ModelManager
+from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
 from sima_utils.logging.sima_logger import (
     _get_logging_config as sima_get_logging_config,
     _initialize_logger as sima_initialize_logger,
     sima_log_exception,
     sima_log_info,
 )
+
+
+MODEL_MANAGER = ModelManager()
 
 
 # Common codes for both CLI and WEB modes.
@@ -40,10 +43,10 @@ def _init_logging(mode: DemoMode, log_level: str | None) -> None:
 
 
 def _resolve_run_model_path(model: str) -> Path:
-    resolved = model_manager.resolve_model_path(model)
+    resolved = MODEL_MANAGER.resolve(model)
     if resolved is None:
         print("Model not found.", flush=True)
-        available = model_manager.list_models()
+        available = MODEL_MANAGER.list()
         if available:
             print("Available local models:", flush=True)
             for model_dir in available:
@@ -57,70 +60,6 @@ def _read_text_file(path: Path, label: str) -> str:
     if not path.is_file():
         raise FileNotFoundError(f"Cannot open the {label} file: {path}")
     return path.read_text()
-
-
-def _is_draft_vlm(sima_files_dir: Path) -> bool:
-    """Return whether a sima_files directory is a speculative-decoding draft."""
-    config_file = sima_files_dir / "devkit" / "vlm_config.json"
-    with config_file.open() as f:
-        cfg = json.load(f)
-    spec_cfg = cfg.get("lm_cfg", {}).get("speculative_decoding_cfg")
-    return bool(spec_cfg and spec_cfg.get("is_draft", False))
-
-
-def _is_spec_decode_vlm(devkit_dir: Path) -> bool:
-    """Return whether a devkit directory belongs to a speculative-decoding pair."""
-    config_file = devkit_dir / "vlm_config.json"
-    if not config_file.is_file():
-        return False
-    with config_file.open() as f:
-        cfg = json.load(f)
-    return bool(cfg.get("lm_cfg", {}).get("speculative_decoding_cfg"))
-
-
-def _resolve_target_and_draft_paths(model_path: Path) -> tuple[Path, Path | None]:
-    """Resolve a normal model path or a speculative-decoding parent directory."""
-    if _is_spec_decode_vlm(devkit := model_path / "devkit") or _is_spec_decode_vlm(
-        sima_devkit := model_path / "sima_files" / "devkit"
-    ):
-        raise RuntimeError(
-            f"{model_path} is part of a speculative-decoding pair. "
-            f"Pass the parent directory ({model_path.parent}) so both the "
-            f"target and draft models are loaded together."
-        )
-    if devkit.is_dir() and (model_path / "elf_files").is_dir():
-        return model_path, None
-    if sima_devkit.is_dir():
-        return model_path / "sima_files", None
-
-    target: Path | None = None
-    draft: Path | None = None
-    for subdir in model_path.iterdir():
-        if not subdir.is_dir():
-            continue
-        sima_dir = subdir / "sima_files"
-        if not (sima_dir / "devkit" / "vlm_config.json").is_file():
-            continue
-        if _is_draft_vlm(sima_dir):
-            if draft is not None:
-                raise RuntimeError(
-                    f"Multiple draft models found under {model_path}: "
-                    f"{draft.parent.name} and {subdir.name}"
-                )
-            draft = sima_dir
-        else:
-            if target is not None:
-                raise RuntimeError(
-                    f"Multiple target models found under {model_path}: "
-                    f"{target.parent.name} and {subdir.name}"
-                )
-            target = sima_dir
-    if target is None:
-        raise RuntimeError(
-            f"No valid model directory found under {model_path}. Expected either "
-            f"a sima_files/ subdir or per-model subdirs each containing sima_files/."
-        )
-    return target, draft
 
 
 def _kill_existing_llima_session() -> None:
@@ -150,7 +89,9 @@ def run_model(args: argparse.Namespace) -> int:
     args.mode = DemoMode(args.mode)
     user_model_path = _resolve_run_model_path(args.model)
     try:
-        model_path, draft_model_path = _resolve_target_and_draft_paths(user_model_path)
+        model_path, draft_model_path = model_manager.resolve_target_and_draft_paths(
+            user_model_path
+        )
     except RuntimeError as e:
         print(str(e), flush=True)
         return 1
@@ -243,7 +184,7 @@ def run_model(args: argparse.Namespace) -> int:
 
 
 def search_models(args: argparse.Namespace) -> int:
-    results = model_manager.search_models(args.term)
+    results = MODEL_MANAGER.search(args.term)
     if not results:
         print("No models found.", flush=True)
     else:
@@ -253,14 +194,14 @@ def search_models(args: argparse.Namespace) -> int:
 
 
 def pull_model(args: argparse.Namespace) -> int:
-    model_dir = model_manager.pull_model(args.model)
+    model_dir = MODEL_MANAGER.pull(args.model)
     print(f"Downloaded to {model_dir}", flush=True)
     return 0
 
 
 def list_models(args: argparse.Namespace) -> int:
     del args
-    models = model_manager.list_models()
+    models = MODEL_MANAGER.list()
     if not models:
         print("No models found.", flush=True)
     else:
@@ -270,7 +211,7 @@ def list_models(args: argparse.Namespace) -> int:
 
 
 def rm_model(args: argparse.Namespace) -> int:
-    removed = model_manager.rm_model(args.model)
+    removed = MODEL_MANAGER.remove(args.model)
     if not removed:
         print(f"Model not found: {args.model}", flush=True)
         return 1
@@ -280,7 +221,7 @@ def rm_model(args: argparse.Namespace) -> int:
 
 def benchmark_model(args: argparse.Namespace) -> int:
     user_model_path = _resolve_run_model_path(args.model)
-    model_path, draft_model_path = _resolve_target_and_draft_paths(user_model_path)
+    model_path, draft_model_path = model_manager.resolve_target_and_draft_paths(user_model_path)
     connect(logging.INFO)
 
     # Create a ZMQServer.

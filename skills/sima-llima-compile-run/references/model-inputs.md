@@ -85,18 +85,33 @@ with a generic mixed-precision policy. Add context length, group size, vision
 size, or LoRA only for a stated need; record choices because they affect
 accuracy, size, compilation time, TTFT, and TPS.
 
-Speculative decoding is unsupported by this workflow until issue #128 lands.
-Do not pass a draft model or validate speculative output as one
-`sima_files/` tree: target and draft compilation produce separate artifact
-trees.
+For speculative decoding, pass the supported draft model with
+`--draft_model_path`. Compilation produces separate target and draft artifact
+trees under one output parent. Keep those trees separate and pass their parent
+to `llima-deploy`; see
+[Model Deployment](../../../docs/deployment.md#speculative-decoding-models).
 
-A deployable output contains:
+A normal deployable output contains:
 
 ```text
 <output>/sima_files/
 ├── devkit/
 ├── mpk/
 └── npy_files/  # optional LoRA material
+```
+
+A speculative output contains the same structure for both roles:
+
+```text
+<output>/
+├── <target-model>/sima_files/
+│   ├── devkit/
+│   ├── mpk/
+│   └── npy_files/  # optional LoRA material
+└── <draft-model>/sima_files/
+    ├── devkit/
+    ├── mpk/
+    └── npy_files/  # optional LoRA material
 ```
 
 Keep `onnx_files/` and compiler intermediates on the host. Deploy with

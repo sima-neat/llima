@@ -28,10 +28,6 @@ def get_layer_configuration(model_properties, layer):
     return {"precision": "A_BF16_W_INT4"}
 """
 
-# TODO: Add --compile again once the ARM packages are fixed.
-RUN_COMPILE_STAGE = False
-
-
 def _select_model(candidate_sha: str) -> tuple[str, int]:
     if not E2E_ELIGIBLE_MODELS:
         raise RuntimeError("The E2E eligible-model set is empty.")
@@ -184,32 +180,28 @@ def test_selected_model_full_compilation(
             "-o",
             str(output_path),
             str(model_path),
-            "--no-quantize_embeddings",
-            "--no-quantize_kv_cache",
         ]
-        _run_stage("onnx", base_command + ["--onnx"], report)
-        _run_stage("quantization", base_command + ["--quantize"], report)
-        if RUN_COMPILE_STAGE:
-            _run_stage("model_compiler", base_command + ["--compile"], report)
+        _run_stage(
+            "model_sdk_fp_generation",
+            base_command + ["--source_to_fp"],
+            report,
+        )
+        _run_stage(
+            "model_sdk_quantization",
+            base_command + ["--fp_to_quant"],
+            report,
+        )
+        _run_stage("model_compiler", base_command + ["--compile"], report)
 
-            started = time.monotonic()
-            report["artifacts"] = _validate_compiled_artifacts(output_path)
-            report["stages"].append(
-                {
-                    "name": "artifact_validation",
-                    "duration_seconds": round(time.monotonic() - started, 3),
-                    "return_code": 0,
-                }
-            )
-        else:
-            report["stages"].append(
-                {
-                    "name": "model_compiler",
-                    "duration_seconds": 0,
-                    "return_code": 0,
-                    "skipped": True,
-                }
-            )
+        started = time.monotonic()
+        report["artifacts"] = _validate_compiled_artifacts(output_path)
+        report["stages"].append(
+            {
+                "name": "artifact_validation",
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "return_code": 0,
+            }
+        )
         report["status"] = "passed"
     finally:
         e2e_report_path.write_text(

@@ -71,6 +71,34 @@ Then run the model using the `llima` CLI. See [LLiMa CLI](runtime.md) for detail
 modalix:~$ llima run <model_name>
 ```
 
+## Speculative decoding models
+
+When `llima-compile` is given `--draft_model_path`, its output contains target and
+draft compiler outputs under one parent. Deploy the parent in one command:
+
+``` console
+llima-deploy compiled-eagle3 spec-decoding-output
+```
+
+The deployed package contains two ordinary runtime model directories:
+
+``` text
+spec-decoding-output/
+├── <target-model>/
+│   ├── devkit/
+│   └── elf_files/
+└── <draft-model>/
+    ├── devkit/
+    └── elf_files/
+```
+
+Run the parent directory so LLiMa can identify and load both models from their
+serialized speculative-decoding configuration:
+
+``` console
+llima run spec-decoding-output
+```
+
 ## Troubleshooting
 
 **Error: "devkit directory cannot be found"**

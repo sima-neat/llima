@@ -85,5 +85,6 @@ Verify:
 - appcomplex PID, thread/descriptor counts, and CMA memory remain near
   baseline.
 
-Until mla-rt 2.1.3, restart appcomplex before each case to isolate retained
-buffers. Still assert dispatcher stability within the case.
+Run runtime cases serially without restarting appcomplex between them. Assert
+dispatcher stability and buffer cleanup within each case so retained state is
+visible to subsequent tests.

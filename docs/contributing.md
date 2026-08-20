@@ -7,6 +7,26 @@ environments and dependencies separate. In a repository checkout,
 `CONTRIBUTING.md` provides the quick start and `AGENTS.md` defines
 agent-specific rules; this guide is the detailed contributor policy.
 
+## Coding-Agent Skills
+
+Install both LLiMa contributor skills as part of standard contributor setup.
+They are intentionally not installed by the default Neat SDK playbook index:
+
+```bash
+sima-cli playbooks install \
+  gh:sima-neat/llima/skills/sima-contribute-to-llima
+sima-cli playbooks install \
+  gh:sima-neat/llima/skills/sima-add-llima-model-support
+```
+
+The general contributor skill covers repository-wide compiler, runtime,
+packaging, test, documentation, and skill changes. The model-support skill adds
+the compatibility and implementation workflow for LLM and VLM architectures,
+checkpoints, tensor layouts, tokenizers, and prompt contracts. Keep both
+installed so the appropriate guidance is available when a contribution crosses
+those boundaries.
+
+
 ## Repository Map
 
 | Area | Paths | Responsibility |

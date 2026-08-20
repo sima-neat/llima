@@ -15,6 +15,20 @@ Compiler tests live under `tests/compilation/`. Runtime tests live under
 `tests/runtime/`. Runtime coverage never falls back to host-only execution or
 mock hardware services.
 
+### CI test scope selection
+
+Vulcan CI compares feature branches with `develop` and independently decides
+whether to run the Model Compiler and DevKit runtime suites. Compiler-only and
+runtime-only changes run their respective suite, shared package or workflow
+changes run both, and documentation-only changes run neither. Unclassified
+paths fail safe by running both suites. Manual dispatches, tags, protected or
+release branches, and branch-comparison failures also force both suites.
+
+Package builds and publication remain unconditional. The scope decision only
+controls the two expensive test jobs. Latest-tag promotion requires successful
+artifact publication and accepts an intentional test skip only when the
+corresponding resolver output is false.
+
 ## Model compiler CI
 
 ### Purpose
@@ -54,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 56
+- Expected cases: 63
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -139,7 +153,7 @@ stored in the repository or artifact cache.
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 24 standard and 4 high-memory
+- Expected cases: 22 standard and 6 high-memory
 
 This group validates:
 
@@ -148,8 +162,8 @@ This group validates:
 - GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
 - Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are serial and high-memory. CI runs the 24
-standard cases first and the 4 high-memory cases separately.
+The speculative-decoding cases are serial and high-memory. CI runs the 22
+standard cases first and the 6 high-memory cases separately.
 
 #### Selected-model full compilation E2E
 
@@ -161,13 +175,15 @@ This bounded end-to-end case:
 
 1. Selects an eligible model deterministically from the candidate commit SHA.
 2. Resolves and validates cached source provenance.
-3. Generates ONNX.
-4. Quantizes the selected model component.
+3. Generates a floating-point Model SDK graph directly from the source model.
+4. Quantizes the Model SDK graph.
 5. Invokes Model Compiler.
 6. Validates the resulting MPK archive and MLA ELF.
 
 The test selects layer 0 and INT4 quantization to cover the complete pipeline
-without compiling an entire generative model. It is serial and high-memory.
+without compiling an entire generative model. The staged commands follow the
+default direct Model SDK compilation path while preserving per-stage timings
+and diagnostics. It is serial and high-memory.
 
 ### Compiler test definitions and helpers
 
@@ -275,12 +291,14 @@ the installed runtime and use the image and audio assets installed by
 
 ### GenAI model preparation
 
-The dedicated `Prepare GenAI models` step keeps the runtime fixtures aligned
-with Core:
+The dedicated `Prepare GenAI models` step keeps the shared runtime fixtures
+aligned with Core and adds two LLiMa-specific reasoning fixtures:
 
 - `Qwen2.5-0.5B-Instruct-GPTQ-a16w4`
 - `LFM2.5-VL-450M-a16w4`
 - `whisper-small-a16w8`
+- `Qwen3-0.6B-GPTQ-a16w4`
+- `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`
 
 The shared environment contract is:
 
@@ -288,6 +306,8 @@ The shared environment contract is:
 - `SIMA_TEST_LLIMA_TEXT_MODEL`
 - `SIMA_TEST_LLIMA_VLM_MODEL`
 - `SIMA_TEST_LLIMA_ASR_MODEL`
+- `SIMA_TEST_LLIMA_REASONING_QWEN_MODEL`
+- `SIMA_TEST_LLIMA_REASONING_GEMMA_MODEL`
 
 Models are retained on the runner between CI runs.
 
@@ -302,6 +322,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.vision_generation` | LFM2 image-conditioned generation using the installed sample image |
 | `runtime.asr_transcription` | Whisper transcription using the installed sample audio |
 | `runtime.tool_call_parser` | Tool-call parsing safety and streaming provenance without model inference |
+| `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
 
 The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on
@@ -316,7 +337,8 @@ Pytest validates the installed package and external interfaces:
 | Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
 | CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
 | MLA memory cleanup | Runs Qwen four times through `llima run -> quit`, checks `/dev/simaai-mem` after every exit, and verifies that the daemon PID and allocation baseline remain stable |
-| OpenAI-compatible HTTP | Non-streaming response, SSE reconstruction, `/stop`, malformed-input recovery, and a successful request after interruption |
+| Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
+| OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
 
 `tests/runtime/pytest.ini` is packaged with these tests and prevents compiler
@@ -356,10 +378,9 @@ CTest and pytest run in dedicated process groups. Cancellation sends only
 `SIGINT` to active inference and waits for graceful shutdown; it never
 escalates to `SIGTERM` or `SIGKILL`.
 
-mla-rt versions before 2.1.3 can retain MLA buffers between processes. Until
-mla-rt 2.1.3 is available, every runtime case restarts
-`simaai-appcomplex.service` before loading its model. Remove this workaround
-when the fixed runtime is adopted.
+Runtime cases run serially against the same `simaai-appcomplex.service`
+process. They do not restart the service between cases, so retained dispatcher
+or MLA state is visible to subsequent tests.
 
 ### Cleanup and retained state
 

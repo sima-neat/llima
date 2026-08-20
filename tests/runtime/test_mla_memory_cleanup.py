@@ -168,8 +168,8 @@ def _wait_for_stable_baseline(
         previous = current
 
     raise AssertionError(
-        "MLA memory did not reach a stable baseline after restarting "
-        f"simaai-appcomplex.service:\n{previous.raw}"
+        "MLA memory did not reach a stable baseline before the repeated "
+        f"LLiMa runs:\n{previous.raw}"
     )
 
 

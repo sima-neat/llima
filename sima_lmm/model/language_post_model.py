@@ -39,6 +39,11 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.pipeline_cfg.split_mlp
 
     @property
+    def uses_quantized_input_embeddings(self) -> bool:
+        # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
+        return super().uses_quantized_input_embeddings and not self.is_draft
+
+    @property
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
         return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
@@ -247,6 +252,7 @@ class LanguagePostModel(LanguagePostBaseModel):
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        scale_shape = (1, 1, self.num_tokens, 1)
         self_attn_shape = (
             1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type),
         )
@@ -266,10 +272,17 @@ class LanguagePostModel(LanguagePostBaseModel):
         model_input_input = builder.create_placeholder_node(
             "input", TensorType(input_dtype, input_shape)
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            model_input_scale = builder.create_placeholder_node(
+                "input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         model_input_self_attn = builder.create_placeholder_node(
             "self_attn", TensorType(activation_type(quantizable), self_attn_shape)
         )
-        subnet_inputs = [model_input_input, model_input_self_attn]
+        subnet_inputs = [model_input_input]
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            subnet_inputs.append(model_input_scale)
+        subnet_inputs.append(model_input_self_attn)
         model_input_per_layer = None
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             model_input_per_layer = builder.create_placeholder_node(
@@ -287,12 +300,15 @@ class LanguagePostModel(LanguagePostBaseModel):
                 "deepstack_features", TensorType(activation_type(quantizable), input_shape)
             )
             subnet_inputs.append(model_input_deepstack)
-
         # MLA subgraph inputs are the same as the model inputs, except the node names are different
         builder.begin_subnet(subnet_inputs)
         mla_input_input = builder.create_placeholder_node(
             "MLA_0/input", TensorType(input_dtype, input_shape)
         )
+        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
+            mla_input_scale = builder.create_placeholder_node(
+                "MLA_0/input_scale", TensorType(activation_type(quantizable), scale_shape)
+            )
         mla_input_self_attn = builder.create_placeholder_node(
             "MLA_0/self_attn", TensorType(activation_type(quantizable), self_attn_shape)
         )
@@ -312,7 +328,6 @@ class LanguagePostModel(LanguagePostBaseModel):
             mla_input_deepstack = builder.create_placeholder_node(
                 "MLA_0/deepstack_features", TensorType(activation_type(quantizable), input_shape)
             )
-
         attn_out_name = ("out_proj" if self.check_hf_param(f"{base_name}.self_attn.out_proj.weight") else "o_proj")
         attn_out_full_name = f"{base_name}.self_attn.{attn_out_name}"
 
@@ -329,14 +344,10 @@ class LanguagePostModel(LanguagePostBaseModel):
             attn_in, lora_rank, merged_lora=merged_lora
         )
 
-        # De-quantize embeddings table if needed.
+        # Dequantize the selected embedding rows before the residual path consumes them.
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            assert self.embeddings_scale is not None
-            rms_norm_in = builder.create_dequantization_node(
-                mla_input_input.name,
-                input_shape,
-                1 / self.embeddings_scale,
-                output_dtype=activation_dtype(quantizable)
+            rms_norm_in = builder.create_dynamic_dequant_node(
+                mla_input_input, mla_input_scale
             )
         else:
             rms_norm_in = mla_input_input

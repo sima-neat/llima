@@ -92,7 +92,7 @@ class VisionLanguageModel(BaseModel):
             quantize_kv_cache: True if KV cache is quantized.
             split_mlp: True if mlp is being split into multiple parts.
             target_model: Target VisionLanguageModel when constructing a draft model.
-                Copies tokenizer and embeddings (if missing) from it. None for non-draft models.
+                Reuses its tokenizer when the draft has none. None for non-draft models.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -140,7 +140,7 @@ class VisionLanguageModel(BaseModel):
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
 
-        return VisionLanguageModel(
+        model = VisionLanguageModel(
             cfg=vlm_cfg,
             hf_model=hf_model,
             model_name=model_name,
@@ -148,6 +148,7 @@ class VisionLanguageModel(BaseModel):
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        return model
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
@@ -263,11 +264,6 @@ class VisionLanguageModel(BaseModel):
 
     def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
         embeddings_tensor, embeddings_scale = self.language_model.get_embeddings_tensor()
-        assert embeddings_scale is None or np.ndim(embeddings_scale) == 0, (
-            "Per-channel embeddings quantization is not supported."
-        )
-        if embeddings_scale is not None and self.cfg.is_multimodal:
-            embeddings_tensor = embeddings_tensor.astype(np.float32) * float(embeddings_scale)
         if len(ifms) == 1:
             text_token_idxs = ifms[0]
             num_queries = text_token_idxs.shape[0]
@@ -277,6 +273,8 @@ class VisionLanguageModel(BaseModel):
                 [[[embeddings_tensor[x] for x in text_token_idxs[0]]]],
                 dtype=embeddings_tensor.dtype
             )
+            if embeddings_scale is not None:
+                input_embedding_scales = embeddings_scale[text_token_idxs[0]][None, None]
         else:
             assert self.cfg.vm_cfg is not None
             assert len(ifms) == 2
@@ -292,18 +290,33 @@ class VisionLanguageModel(BaseModel):
             vision_model = VisionModel(
                 self.cfg, self.vision_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path
             )
-            vision_proj, = vision_model.run_model(eval_mode, [image_tensor])
+            vision_outputs = vision_model.run_model(eval_mode, [image_tensor])
+            vision_proj = vision_outputs[0]
             input_embeds = self.vlm_helper.multimodal_concat(
                 text_token_idxs[0], [vision_proj], embeddings_tensor
             )
             input_embeds = np.expand_dims(input_embeds, axis=(0, 1))
+            if embeddings_scale is not None:
+                vision_scale = vision_outputs[1]
+                input_embedding_scales = self.vlm_helper.multimodal_concat(
+                    text_token_idxs[0], [vision_scale], embeddings_scale
+                )
+                input_embedding_scales = np.expand_dims(
+                    input_embedding_scales, axis=(0, 1)
+                )
 
+        language_ifms = [input_embeds]
+        if embeddings_scale is not None:
+            language_ifms.append(input_embedding_scales)
         return self.language_model.run_model(
-            eval_mode, [input_embeds], embeddings_tensor=embeddings_tensor
+            eval_mode,
+            language_ifms,
+            embeddings_tensor=embeddings_tensor,
+            embedding_scales=embeddings_scale,
         )
 
-    def get_language_embeddings_tensor(self) -> tuple[np.ndarray | None, float | None]:
+    def get_language_embeddings_tensor(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         return self.language_model.get_input_embeddings_tensor()
 
-    def get_language_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, float | None]:
+    def get_language_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, np.ndarray | None]:
         return self.language_model.get_per_layer_embeddings_tensor()

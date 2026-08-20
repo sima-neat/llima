@@ -520,13 +520,29 @@ class StandardVisionLayerModel(BaseModel):
                 projector_base_name = "model.multi_modal_projector"
             else:
                 projector_base_name = "multi_modal_projector"
-            _ = self._build_sima_mm_projector(builder, projector_base_name, vision_output, quantizable)
+            vision_output = self._build_sima_mm_projector(
+                builder, projector_base_name, vision_output, quantizable
+            )
+
+        if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
+            vision_scale = builder.create_dynamic_quant_scale_node(
+                vision_output, per_token_quant=True
+            )
+            vision_output = builder.create_dynamic_quant_node(vision_output, vision_scale)
+            builder.create_tuple_node([vision_output, vision_scale])
 
         mla_node = builder.finish_subnet("MLA_0")
 
         # Ensure that output type is float32
         if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
+            if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
+                quantized_output, scale_output = builder.create_tuple_get_item_nodes(mla_node)
+                scale_output = builder.create_cast_node(
+                    scale_output, ScalarType.float32, backend=Backend.EV
+                )
+                builder.create_tuple_node([quantized_output, scale_output])
+            else:
+                _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
         net = builder.finish(self.model_name)
         return net
 
