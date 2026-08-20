@@ -432,7 +432,6 @@ ensure_git_submodules() {
 
 ensure_sdk_sysroot_packages() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
-  local overlay_script="/usr/local/bin/install-sysroot-overlay.sh"
 
   if [[ "${ELXR_SDK}" != "ON" ]]; then
     return
@@ -440,10 +439,6 @@ ensure_sdk_sysroot_packages() {
   if [[ "${LLIMA_SKIP_SYSROOT_OVERLAY:-0}" == "1" ]]; then
     echo "[build] Skipping SDK sysroot package overlay"
     return
-  fi
-  if [[ ! -x "${overlay_script}" ]]; then
-    echo "ERROR: SDK sysroot overlay installer not found: ${overlay_script}" >&2
-    exit 1
   fi
 
   ensure_sdk_sysroot_header_package "${sysroot}" "libeigen3-dev" "Eigen" \
@@ -490,15 +485,95 @@ ensure_sdk_sysroot_packages() {
   path_exists_any "${libdir}/libcpp-httplib.so.0.11*" ||
     packages+=(libcpp-httplib0.11:arm64)
   path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" ||
-    packages+=(libpgm-dev:arm64)
+    packages+=(libpgm-5.3-0:arm64 libpgm-dev:arm64)
 
   if [[ "${#packages[@]}" -eq 0 ]]; then
     echo "[build] llima SDK sysroot package overlay already present"
     return
   fi
 
-  echo "[build] Installing missing llima SDK sysroot package overlay payloads"
-  run_as_root "${overlay_script}" "${sysroot}" "${packages[@]}"
+  # The SDK should eventually provide this complete dependency contract:
+  # https://github.com/sima-neat/sdk/issues/164
+  # Until then, install only the missing package payloads. The SDK overlay
+  # installer performs whole-sysroot repair work that is unnecessary here.
+  echo "[build] Installing missing LLiMa SDK sysroot package payloads"
+  install_sdk_sysroot_package_payloads "${sysroot}" "${packages[@]}"
+
+  if ! path_exists_any "${libdir}/libopencv_flann.so.406*" ||
+     ! path_exists_any "${libdir}/libopencv_dnn.so.406*" ||
+     ! path_exists_any "${libdir}/libopencv_features2d.so.406*" ||
+     ! path_exists_any "${libdir}/libopencv_objdetect.so.406*" ||
+     ! path_exists_any "${libdir}/libopencv_video.so.406*" ||
+     [[ ! -f "${sysroot}/usr/include/openssl/ssl.h" ]] ||
+     [[ ! -e "${libdir}/libcrypto.so" ]] ||
+     ! path_exists_any "${libdir}/libfmt.so.9.1.0" ||
+     ! path_exists_any "${libdir}/libspdlog.so.1.10.0" ||
+     ! path_exists_any "${libdir}/libcpp-httplib.so.0.11*" ||
+     ! path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*"; then
+    echo "ERROR: LLiMa SDK sysroot package payloads are incomplete after install." >&2
+    exit 1
+  fi
+}
+
+install_sdk_sysroot_package_payloads() {
+  local sysroot="$1"
+  shift
+
+  if [[ "$#" -eq 0 ]]; then
+    return
+  fi
+  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "ERROR: apt-get and dpkg-deb are required to install packages into the SDK sysroot." >&2
+    exit 1
+  fi
+
+  local tmp_dir
+  local payload_root
+  tmp_dir="$(mktemp -d /tmp/llima-sysroot-packages.XXXXXX)"
+  payload_root="${tmp_dir}/payload"
+  mkdir -p "${payload_root}"
+
+  if ! (
+    cd "${tmp_dir}"
+    apt-get download "$@"
+  ); then
+    echo "ERROR: Failed to download SDK sysroot package payloads." >&2
+    rm -rf "${tmp_dir}"
+    exit 1
+  fi
+
+  local -a debs=()
+  local deb
+  while IFS= read -r deb; do
+    debs+=("${deb}")
+  done < <(find "${tmp_dir}" -maxdepth 1 -type f -name '*.deb' | sort)
+  if [[ "${#debs[@]}" -eq 0 ]]; then
+    echo "ERROR: SDK sysroot package download produced no Debian packages." >&2
+    rm -rf "${tmp_dir}"
+    exit 1
+  fi
+
+  for deb in "${debs[@]}"; do
+    echo "[build]   $(basename "${deb}")"
+    if ! dpkg-deb -x "${deb}" "${payload_root}"; then
+      echo "ERROR: Failed to extract $(basename "${deb}")." >&2
+      rm -rf "${tmp_dir}"
+      exit 1
+    fi
+  done
+
+  # Normalize only the payload being added. Do not traverse or chmod the
+  # existing SDK sysroot.
+  chmod -R a+rX "${payload_root}"
+  if ! cp -a "${payload_root}/." "${sysroot}/" 2>/dev/null; then
+    if ! run_as_root cp -a "${payload_root}/." "${sysroot}/"; then
+      echo "ERROR: Failed to install package payloads into SYSROOT=${sysroot}." >&2
+      rm -rf "${tmp_dir}"
+      exit 1
+    fi
+  fi
+
+  rm -rf "${tmp_dir}"
 }
 
 ensure_sdk_sysroot_header_package() {
@@ -511,32 +586,8 @@ ensure_sdk_sysroot_header_package() {
     return
   fi
 
-  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg-deb >/dev/null 2>&1; then
-    echo "ERROR: apt-get and dpkg-deb are required to install ${package} into the SDK sysroot." >&2
-    exit 1
-  fi
-
-  local tmp_dir
-  tmp_dir="$(mktemp -d /tmp/llima-sysroot-header.XXXXXX)"
-
   echo "[build] Installing SDK sysroot header package: ${package} (${label})"
-  (
-    cd "${tmp_dir}"
-    apt-get download "${package}"
-  )
-
-  local deb
-  local package_deb_name
-  package_deb_name="${package%%:*}"
-  deb="$(find "${tmp_dir}" -maxdepth 1 -type f -name "${package_deb_name}_*.deb" | sort | head -n 1)"
-  if [[ -z "${deb}" ]]; then
-    echo "ERROR: Failed to download ${package}." >&2
-    rm -rf "${tmp_dir}"
-    exit 1
-  fi
-
-  run_as_root dpkg-deb -x "${deb}" "${sysroot}"
-  rm -rf "${tmp_dir}"
+  install_sdk_sysroot_package_payloads "${sysroot}" "${package}"
 }
 
 path_exists_any() {
