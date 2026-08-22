@@ -73,7 +73,7 @@ modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
 | `help` | 列印可用的指令。 |
 
 
-## 使用 Neat 建立應用程式。
+## 使用 Neat 建立應用程式
 
 在用 `llima run` 驗證您的模型後，請參閱
 [GenAI 模型 ](/develop-apps/development-workflow/genai-model/)，以便透過通用的 API 端點來部署它，或直接從 C++ 或 Python 應用程式中使用它。
