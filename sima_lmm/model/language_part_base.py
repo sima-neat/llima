@@ -9,13 +9,6 @@ from sima_lmm.model.base import BaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import SimaBuilder, build_conv, build_logit_softcapping
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
-from sima_lmm.utils import ceil_div
-
-# The MLP split point must be a multiple of the block-dynamic weight quantization block size,
-# because down_proj is split along its input channels — the same axis the weight is block-quantized
-# along. The largest block size in use is 256 (INT4-blocked weights; INT8-blocked uses 32, which
-# divides 256), so aligning to 256 keeps every part on a block boundary for all precisions.
-MLP_SPLIT_CHANNEL_ALIGNMENT = 256
 
 
 @dataclass
@@ -65,19 +58,10 @@ class LanguagePartBaseModel(BaseModel):
             gate_name, up_name, down_name = "gate_proj", "up_proj", "down_proj"
 
         max_ch = self.cfg.lm_cfg.hidden_size
-        if (
-            self.split_mlp
-            and self.num_tokens != 1
-            and (self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1 or self.cfg.lm_cfg.speculative_decoding_cfg is not None)
-        ):
-            # Split MLP into multiple parts if intermediate_size is larger than max ch number
-            # in order to prevent Large Tensor Helper activation in n2a compiler.
-            # Only the group/prefill model (num_tokens != 1) splits, for better TTFT.
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            num_parts = ceil_div(intermediate_size, max_ch)
-        else:
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            num_parts = 1
+        # The MLP is built unsplit; the n2a compiler auto-splits infeasible conv-bounded regions and,
+        # with filter sharing, references the same full weight section as the unsplit conv.
+        intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
+        num_parts = 1
 
         for part in range(num_parts):
             part_idx = f".{part}" if num_parts > 1 else ""
@@ -150,27 +134,10 @@ class LanguagePartBaseModel(BaseModel):
             gate_name, up_name, down_name = "gate_proj", "up_proj", "down_proj"
 
         max_ch = self.cfg.lm_cfg.hidden_size
-        if self.split_mlp and self.num_tokens != 1:
-            # Split MLP into multiple parts if intermediate_size is larger than max ch number
-            # in order to prevent Large Tensor Helper activation in n2a compiler.
-            # Only the group/prefill model (num_tokens != 1) splits, for better TTFT. The
-            # single/decode model stays unsplit for better TPS; when filter sharing is enabled the
-            # split convolutions still reference the same full weight section as the unsplit conv.
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            # down_proj is split along its INPUT channels (C-slice), which is also the axis that
-            # block-dynamic weight quantization blocks along. Each part must therefore cover a whole
-            # number of quantization blocks, otherwise a single per-block scale would straddle two
-            # parts and the partial sums could not be requantized correctly (e.g. gemma-3-1b:
-            # hidden_size=1152 is 4.5 blocks of 256). max_ch is an upper bound that keeps tensors
-            # small enough to avoid the Large Tensor Helper, so round DOWN to a block multiple.
-            max_ch = max(
-                MLP_SPLIT_CHANNEL_ALIGNMENT,
-                (max_ch // MLP_SPLIT_CHANNEL_ALIGNMENT) * MLP_SPLIT_CHANNEL_ALIGNMENT
-            )
-            num_parts = ceil_div(intermediate_size, max_ch)
-        else:
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            num_parts = 1
+        # The MLP is built unsplit; the n2a compiler auto-splits infeasible conv-bounded regions and,
+        # with filter sharing, references the same full weight section as the unsplit conv.
+        intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
+        num_parts = 1
 
         share_filter = self.enable_filter_sharing
 

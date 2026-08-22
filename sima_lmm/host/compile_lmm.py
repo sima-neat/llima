@@ -50,7 +50,7 @@ def gen_files(
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
     language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
-    quantize_embeddings: bool, quantize_kv_cache: bool, split_mlp: bool, return_logits: bool,
+    quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None
 ):
@@ -71,7 +71,6 @@ def gen_files(
         enable_filter_sharing=enable_filter_sharing,
         quantize_embeddings=quantize_embeddings,
         quantize_kv_cache=quantize_kv_cache,
-        split_mlp=split_mlp,
         image_resolution=image_resolution
     )
     models.append(base_model)
@@ -97,7 +96,6 @@ def gen_files(
             enable_filter_sharing=enable_filter_sharing,
             quantize_embeddings=quantize_embeddings,
             quantize_kv_cache=quantize_kv_cache,
-            split_mlp=split_mlp,
             image_resolution=image_resolution,
             target_model=base_model
         )
@@ -424,8 +422,6 @@ def main():
     elif args.lora_names is not None or args.lora_paths is not None:
         _abort("Number of --lora_name do not match the number of --lora_path")
 
-    # Enable MLP splitting when LoRA is not used. The feature is not implemented for LoRA.
-    split_mlp = lora_path_for_base_model is None
     return_logits = args.return_logits or args.draft_model_path is not None
 
     gen_files(
@@ -433,7 +429,7 @@ def main():
         mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
         args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
-        args.quantize_kv_cache, split_mlp, return_logits, log_level, image_resolution,
+        args.quantize_kv_cache, return_logits, log_level, image_resolution,
         args.draft_model_path, draft_output_path
     )
 
