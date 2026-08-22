@@ -10,7 +10,7 @@ import pytest
 
 
 DEFAULT_MODELS_PATH = Path("/media/nvme/llima/models")
-DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-GPTQ-a16w4"
+DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-Autoround-a16w4"
 QUERY = "What is the capital of Germany? Answer in one sentence."
 CMA_TOLERANCE_KB = 128 * 1024
 
