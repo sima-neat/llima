@@ -1,7 +1,5 @@
 add_test(
     runtime.dispatcher_lifecycle
-    bash
-    "../../../share/sima-lmm/tests/runtime/restart_appcomplex_before_test.sh"
     "./sima_lmm_dispatcher_lifecycle_test"
 )
 set_tests_properties(
@@ -14,8 +12,6 @@ set_tests_properties(
 
 add_test(
     runtime.text_generation
-    bash
-    "../../../share/sima-lmm/tests/runtime/restart_appcomplex_before_test.sh"
     "./sima_lmm_text_generation_test"
 )
 set_tests_properties(
@@ -28,8 +24,6 @@ set_tests_properties(
 
 add_test(
     runtime.vision_generation
-    bash
-    "../../../share/sima-lmm/tests/runtime/restart_appcomplex_before_test.sh"
     "./sima_lmm_vision_generation_test"
 )
 set_tests_properties(
@@ -42,8 +36,6 @@ set_tests_properties(
 
 add_test(
     runtime.asr_transcription
-    bash
-    "../../../share/sima-lmm/tests/runtime/restart_appcomplex_before_test.sh"
     "./sima_lmm_asr_transcription_test"
 )
 set_tests_properties(

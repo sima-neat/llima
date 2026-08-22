@@ -291,30 +291,9 @@ class LanguageConvModel(LanguagePartBaseModel):
         return net
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        """Provide tessellation for fused conv inputs to satisfy MLA alignment."""
-        input_tess = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=None,
-        )
-        cache_tess = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=None,
-        )
-        return {0: input_tess, 1: cache_tess}
+        """Use the default HWC16 tessellation for every fused conv input."""
+        return {}
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        """Provide tessellation for fused conv outputs to satisfy MLA alignment."""
-        main_out = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=None,
-        )
-        cache_out = TensorTessellateParameters(
-            tile_shape=(0, 0, 0, 0),
-            enable_mla=True,
-            dram_layout=None,
-        )
-        # Outputs order: [main, conv_cache_out]
-        return {0: main_out, 1: cache_out}
+        """Use the default HWC16 tessellation for every fused conv output."""
+        return {}

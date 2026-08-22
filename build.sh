@@ -549,11 +549,96 @@ path_exists_any() {
   return 1
 }
 
+validate_neat_internals_payload() {
+  local root="${1%/}"
+  local source_name="$2"
+  local path
+  local -a missing=()
+  local -a required=(
+    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsConfig.cmake"
+    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsTargets.cmake"
+    "/usr/include/dispatcherfactory.hh"
+    "/usr/include/dispatcherbase.hh"
+    "/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
+  )
+
+  for path in "${required[@]}"; do
+    [[ -e "${root}${path}" ]] || missing+=("${path}")
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "ERROR: ${source_name} is incomplete." >&2
+  echo "Missing:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  return 1
+}
+
+sync_sysroot_from_internals_manifest() {
+  local artifact_dir="$1"
+  [[ "${NEAT_SYNC_SYSROOT:-OFF}" == "ON" ]] || return 0
+
+  if [[ "${ELXR_SDK}" != "ON" ]]; then
+    echo "ERROR: NEAT_SYNC_SYSROOT requires an eLxr SDK." >&2
+    exit 1
+  fi
+
+  local artifact_manifest="${artifact_dir}/internals-manifest.json"
+  if [[ ! -f "${artifact_manifest}" ]]; then
+    echo "ERROR: Internals artifact is missing internals-manifest.json." >&2
+    exit 1
+  fi
+
+  local receipt
+  if ! receipt="$(python3 -c '
+import json, re, sys
+artifact = json.load(open(sys.argv[1], encoding="utf-8"))
+consumer = json.load(open(sys.argv[2], encoding="utf-8"))
+receipt = artifact["sysroot-version"]
+consumer_base = consumer["platform-version"]
+if not isinstance(receipt, str) or (
+    receipt
+    and not re.fullmatch(r"[0-9]+(?:[.][0-9]+){2}(?:~pre[0-9]+)?", receipt)
+):
+    raise ValueError("invalid sysroot-version")
+if receipt and consumer_base != receipt.split("~pre", 1)[0]:
+    raise ValueError("platform-version does not match the Internals receipt")
+print(receipt)
+' "${artifact_manifest}" "${NEAT_INTERNALS_MANIFEST}")"; then
+    echo "ERROR: Cannot read Internals build receipt." >&2
+    exit 1
+  fi
+  if [[ -z "${receipt}" ]]; then
+    echo "LLiMa is using the existing SDK sysroot."
+    return 0
+  fi
+
+  if [[ "${receipt}" == *"~pre"* ]]; then
+    echo "[build] Updating SDK sysroot to Internals receipt ${receipt}"
+    run_as_root sysroot update "${receipt}"
+    sysroot status
+    return 0
+  fi
+
+  local sdk_platform_version
+  sdk_platform_version="$(sed -nE \
+    's/^Platform Version[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\1/p' \
+    "${ELXR_SDK_RELEASE_FILE}" 2>/dev/null | head -n1 || true)"
+  if [[ "${sdk_platform_version}" != "${receipt}" ]]; then
+    echo "ERROR: SDK platform ${sdk_platform_version:-unknown} does not match required stable platform ${receipt}." >&2
+    exit 1
+  fi
+  echo "[build] Using stable SDK sysroot ${sdk_platform_version} without updating it."
+}
+
 ensure_neat_internals() {
   local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
   local tmp_dir
   tmp_dir=""
   local extract_dir
+  local payload_root
   local archive_name="Vulcan internals artifact"
   local -a all_debs=()
 
@@ -582,6 +667,8 @@ ensure_neat_internals() {
     exit 1
   fi
 
+  sync_sysroot_from_internals_manifest "${extract_dir}"
+
   mkdir -p "${NEAT_INTERNALS_DEB_DIR}"
   rm -f "${NEAT_INTERNALS_DEB_DIR}"/*.deb
   local source_deb cached_deb
@@ -597,34 +684,27 @@ ensure_neat_internals() {
   echo "[build] Cached ${#all_debs[@]} NEAT internals Debian package(s):"
   find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' -printf '[build]   %f\n' | sort
 
-  local deb_pattern_groups=(
-    'neat-common_*_all.deb simaai-common_*_all.deb'
-    'neat-runtime_*_arm64.deb'
-    'neat-gst-plugins_*_arm64.deb'
-    'neat-internals-dev_*_arm64.deb'
-  )
   local debs=()
-  local pattern_group pattern deb
-  for pattern_group in "${deb_pattern_groups[@]}"; do
-    deb=""
-    for pattern in ${pattern_group}; do
-      deb="$(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name "${pattern}" | sort | head -n 1)"
-      if [[ -n "${deb}" ]]; then
-        break
-      fi
-    done
-    if [[ -z "${deb}" ]]; then
-      echo "ERROR: No matching deb found in ${archive_name}; expected one of: ${pattern_group}" >&2
-      exit 1
-    fi
-    debs+=("${deb}")
-  done
+  local deb
+  mapfile -t debs < <(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' | sort)
 
   if [[ "${ELXR_SDK}" == "ON" ]]; then
     if [[ ! -d "${sysroot}" ]]; then
       echo "ERROR: SYSROOT does not exist: ${sysroot}" >&2
       exit 1
     fi
+
+    payload_root="$(mktemp -d /tmp/llima-neat-internals-payload.XXXXXX)"
+    for deb in "${debs[@]}"; do
+      dpkg-deb -x "${deb}" "${payload_root}"
+    done
+    if ! validate_neat_internals_payload "${payload_root}" "${archive_name}"; then
+      rm -rf "${payload_root}"
+      [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
+      exit 1
+    fi
+    rm -rf "${payload_root}"
+
     echo "[build] Installing NEAT internals deb payloads into SDK sysroot:"
     echo "[build]   ${sysroot}"
     for deb in "${debs[@]}"; do
@@ -638,65 +718,13 @@ ensure_neat_internals() {
     fi
     echo "[build] Installing NEAT internals deb packages into host system"
     run_as_root apt install -y --allow-downgrades "${debs[@]}"
-  fi
-
-  local config_dir dispatcher_factory_header dispatcher_base_header runtime_lib
-  local missing=()
-
-  if [[ "${ELXR_SDK}" == "ON" ]]; then
-    config_dir="${sysroot}/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_factory_header="${sysroot}/usr/include/dispatcherfactory.hh"
-    dispatcher_base_header="${sysroot}/usr/include/dispatcherbase.hh"
-    runtime_lib="${sysroot}/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
-  else
-    config_dir="/usr/lib/aarch64-linux-gnu/cmake/NeatInternals"
-    dispatcher_factory_header="/usr/include/dispatcherfactory.hh"
-    dispatcher_base_header="/usr/include/dispatcherbase.hh"
-    runtime_lib="/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
-  fi
-
-  [[ -d "${config_dir}" ]] || missing+=("${config_dir}")
-  [[ -f "${dispatcher_factory_header}" ]] || missing+=("${dispatcher_factory_header}")
-  [[ -f "${dispatcher_base_header}" ]] || missing+=("${dispatcher_base_header}")
-  [[ -f "${runtime_lib}" ]] || missing+=("${runtime_lib}")
-
-  if [[ "${#missing[@]}" -gt 0 ]]; then
-    echo "ERROR: NEAT internals artifact install is incomplete." >&2
-    echo "Missing:" >&2
-    printf '  %s\n' "${missing[@]}" >&2
-    exit 1
+    validate_neat_internals_payload "" "installed NEAT internals packages"
   fi
 
   if [[ -n "${tmp_dir}" ]]; then
     rm -rf "${tmp_dir}"
   fi
   echo "[build] NEAT internals are ready."
-}
-
-resolve_neat_internals_memory_version() {
-  local deb package version
-  local -a runtime_debs=()
-
-  while IFS= read -r deb; do
-    package="$(dpkg-deb -f "${deb}" Package 2>/dev/null || true)"
-    if [[ "${package}" == "simaai-memory-lib" ]]; then
-      runtime_debs+=("${deb}")
-    fi
-  done < <(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' | sort)
-
-  if [[ "${#runtime_debs[@]}" -ne 1 ]]; then
-    echo "ERROR: Expected exactly one simaai-memory-lib package in the resolved Internals artifact; found ${#runtime_debs[@]}." >&2
-    printf '  %s\n' "${runtime_debs[@]}" >&2
-    return 1
-  fi
-
-  version="$(dpkg-deb -f "${runtime_debs[0]}" Version 2>/dev/null || true)"
-  if [[ -z "${version}" ]]; then
-    echo "ERROR: Unable to read the Debian version from ${runtime_debs[0]}." >&2
-    return 1
-  fi
-
-  printf '%s\n' "${version}"
 }
 
 detect_build_jobs() {
@@ -782,61 +810,17 @@ verify_required_llima_debs() {
   done < <(required_llima_debs "${version}")
 }
 
-append_install_manifest_matches() {
-  local manifest_path="$1"
-  local pattern="$2"
-  local seen_name="$3"
-  local -n seen_ref="${seen_name}"
-  local file basename_file
-
-  while IFS= read -r file; do
-    basename_file="$(basename "${file}")"
-    [[ -n "${seen_ref["${basename_file}"]+x}" ]] && continue
-    printf '%s\n' "${basename_file}" >> "${manifest_path}"
-    seen_ref["${basename_file}"]=1
-  done < <(find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name "${pattern}" | sort)
-}
-
 write_install_manifest() {
   local manifest_path="${ROOT_DIR}/dist/${LLIMA_INSTALL_MANIFEST}"
-  local -A seen=()
-  local pattern file basename_file
-  local -a internals_patterns=(
-    'simaai-common*.deb'
-    'simaai-memory-lib_*.deb'
-    'simaai-memory-lib-dev_*.deb'
-    'libcamera_*.deb'
-    'libcamera-dev_*.deb'
-    'libcamera-tools_*.deb'
-    'neat-common_*.deb'
-    'neat-appcomplex_*.deb'
-    'appcomplex_*.deb'
-    'neat-ev74-firmware_*.deb'
-    'neat-runtime_*.deb'
-    'neat-gst-plugins_*.deb'
-    'neat-internals-dev_*.deb'
-  )
-
+  local file
   {
     echo "# Generated by build.sh. The installer only consumes files listed here."
     echo "# Keep this file next to ${LLIMA_INSTALL_SCRIPT}."
   } > "${manifest_path}"
 
-  for pattern in "${internals_patterns[@]}"; do
-    append_install_manifest_matches "${manifest_path}" "${pattern}" seen
-  done
-
-  # Preserve any new Internals packages that are not yet represented by a
-  # known ordering pattern. They still precede the LLiMa packages.
   while IFS= read -r file; do
-    basename_file="$(basename "${file}")"
-    [[ "${basename_file}" == sima-lmm-*.deb ]] && continue
-    [[ -n "${seen["${basename_file}"]+x}" ]] && continue
-    printf '%s\n' "${basename_file}" >> "${manifest_path}"
-    seen["${basename_file}"]=1
+    basename "${file}" >> "${manifest_path}"
   done < <(find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name '*.deb' | sort)
-
-  append_install_manifest_matches "${manifest_path}" 'sima-lmm-*.deb' seen
   echo "[build] Install manifest: ${manifest_path}"
 }
 
@@ -1183,8 +1167,6 @@ check_local_build_tools
 ensure_git_submodules
 detect_elxr_sdk
 ensure_neat_internals
-SIMA_LMM_MEMORY_LIB_VERSION="$(resolve_neat_internals_memory_version)"
-echo "[build] Using Internals simaai-memory-lib version: ${SIMA_LMM_MEMORY_LIB_VERSION}"
 write_resolved_deps_manifest
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
@@ -1248,7 +1230,6 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DSIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR="lib/python3/dist-packages/sima_lmm" \
   -DSKBUILD_PROJECT_VERSION="$LLIMA_PROJECT_VERSION" \
   -DSIMA_LMM_PACKAGE_VERSION="$LLIMA_VERSION" \
-  -DSIMA_LMM_MEMORY_LIB_VERSION="$SIMA_LMM_MEMORY_LIB_VERSION" \
   -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$ARCH" \
   "${CMAKE_SOABI_ARGS[@]}" \
   "${CMAKE_PYTHON_ARGS[@]}" \

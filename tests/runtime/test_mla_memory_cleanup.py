@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 DEFAULT_MODELS_PATH = Path("/media/nvme/llima/models")
-DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-GPTQ-a16w4"
+DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-Autoround-a16w4"
 DEFAULT_REPEAT_COUNT = 4
 DEFAULT_RUN_TIMEOUT_SECONDS = 180
 DEFAULT_CLEANUP_TIMEOUT_SECONDS = 30
@@ -168,8 +168,8 @@ def _wait_for_stable_baseline(
         previous = current
 
     raise AssertionError(
-        "MLA memory did not reach a stable baseline after restarting "
-        f"simaai-appcomplex.service:\n{previous.raw}"
+        "MLA memory did not reach a stable baseline before the repeated "
+        f"LLiMa runs:\n{previous.raw}"
     )
 
 

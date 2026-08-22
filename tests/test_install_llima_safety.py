@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.premerge
 BASH_MAJOR = int(
@@ -63,7 +62,9 @@ def write_command(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def run_installer(tmp_path: Path, replacement_version: str) -> subprocess.CompletedProcess:
+def run_installer(
+    tmp_path: Path, replacement_version: str
+) -> subprocess.CompletedProcess:
     bundle = tmp_path / "bundle"
     commands = tmp_path / "commands"
     bundle.mkdir()
@@ -89,7 +90,7 @@ def run_installer(tmp_path: Path, replacement_version: str) -> subprocess.Comple
         commands / "apt-get",
         """
 if [[ " $* " == *" --simulate "* ]]; then
-  echo "Remv simaai-common [2.1.3~pre4040]"
+  echo "Remv simaai-common [2.1.3~pre4678]"
 fi
 exit 0
 """,
@@ -99,7 +100,7 @@ exit 0
         """
 package="${!#}"
 case "${package}" in
-  simaai-common) echo "2.1.3~pre4040" ;;
+  simaai-common) echo "2.1.3~pre4678" ;;
   neat-common|sima-lmm-core|sima-lmm-cli|sima-lmm-dev) echo "0.4.0" ;;
   *) exit 1 ;;
 esac
@@ -134,11 +135,11 @@ exec "$@"
 
 @requires_associative_arrays
 def test_installer_allows_exact_identity_preserving_replacement(tmp_path: Path) -> None:
-    result = run_installer(tmp_path, "2.1.3~pre4040")
+    result = run_installer(tmp_path, "2.1.3~pre4678")
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Verified platform package replacements" in result.stdout
-    assert "simaai-common=2.1.3~pre4040" in result.stdout
+    assert "simaai-common=2.1.3~pre4678" in result.stdout
 
 
 @requires_associative_arrays
