@@ -89,7 +89,7 @@ output_directory/
 | `--max_num_tokens` | 최대 컨텍스트 길이입니다. 1024의 배수여야 합니다. 기본값: 4096. |
 | `--resume` | 기존 파일을 건너뛰어 빌드를 재개하여 중단된 빌드를 이어갑니다. |
 | `-j, --jobs` | 동시에 실행되는 컴파일 작업의 수입니다. 기본값: 실제 CPU 코어의 수입니다. |
-| `--log_level` | 로그 기록 수준(디버그, 정보, 경고, 오류). 기본값: 경고. |
+| `--log_level` | 로그 기록 수준(`DEBUG`, `INFO`, `WARNING`, `ERROR`). 기본값: `WARNING`. |
 | `--input_height` | 픽셀 단위의 입력 이미지 높이입니다. `--input_width`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
 | `--input_width` | 픽셀 단위의 입력 이미지 너비입니다. `--input_height`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
 | `--system_prompt` | CLI 모드와 모델 초기화를 위해 저장할 시스템 프롬프트입니다. |
