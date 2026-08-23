@@ -34,8 +34,8 @@ LLiMa runtime встановлюється нативно в Modalix як час
 | [Llama 2](https://huggingface.co/collections/meta-llama/llama-2-family) | LLM | [7b](https://huggingface.co/simaai/Llama-2-7b-chat-hf-a16w4) |
 | [Llama 3.1](https://huggingface.co/collections/meta-llama/llama-31) | LLM | [8b](https://huggingface.co/simaai/Llama-3.1-8B-Instruct-a16w4) |
 | [Llama 3.2](https://huggingface.co/collections/meta-llama/llama-32) | LLM | [1b](https://huggingface.co/simaai/Llama-3.2-1B-Instruct-GPTQ-a16w4), [3b](https://huggingface.co/simaai/Llama-3.2-3B-Instruct-a16w4) |
-| [Gemma 1](https://huggingface.co/collections/google/gemma-release) | LLM | 2б, 7б |
-| [Gemma 2](https://huggingface.co/collections/google/gemma-2-release) | LLM | 2б, 9б |
+| [Gemma 1](https://huggingface.co/collections/google/gemma-release) | LLM | 2b, 7b |
+| [Gemma 2](https://huggingface.co/collections/google/gemma-2-release) | LLM | 2b, 9b |
 | [Gemma 3](https://huggingface.co/collections/google/gemma-3-release) | LLM | [1b](https://huggingface.co/simaai/gemma-3-1b-it-a16w4), [4b](https://huggingface.co/simaai/gemma-3-4b-it-a16w4) |
 | [ Phi 3.5 mini ](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) | LLM | [3.8b](https://huggingface.co/simaai/Phi-3.5-mini-instruct-a16w4) |
 | [ Phi 4 mini ](https://huggingface.co/microsoft/Phi-4-mini-instruct) | LLM | [3.8b](https://huggingface.co/simaai/Phi-4-mini-instruct-Autoround-a16w4) |
