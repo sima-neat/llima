@@ -1,6 +1,6 @@
 # GenAI와 LLiMa
 
-LLiMa는 Model Compiler 내의 GenAI 도구 모음으로, LLM, VLM 및 ASR 모델을 컴파일, 테스트, 벤치마크, 배포 및 실행하는 데 사용됩니다. 이 모든 작업은 Modalix에서 수행됩니다.
+LLiMa는 Model Compiler 내의 GenAI 도구 모음으로, LLM, VLM 및 ASR 모델을 컴파일, 테스트, 벤치마크 및 배포하고 Modalix에서 실행하는 데 사용됩니다.
 
 LLiMa는 세 가지 입력 형식을 지원합니다.
 
