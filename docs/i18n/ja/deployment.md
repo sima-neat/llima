@@ -97,11 +97,11 @@ llima run spec-decoding-output
 
 ## トラブルシューティング
 
-**エラー：「devkit ディレクトリが見つかりません」**
+**エラー：「devkit directory cannot be found」**
 
 ソースディレクトリが、`llima-compile` の出力ディレクトリであることを確認してください。このディレクトリには、`sima_files` というサブディレクトリが含まれている必要があります。
 
-**エラー：「mpk ディレクトリが見つかりません」**
+**エラー：「mpk directory cannot be found」**
 
 コンパイルが正常に完了したことを確認してください。`sima_files/mpk/` ディレクトリには、`.tar.gz` ファイルが含まれている必要があります。
 

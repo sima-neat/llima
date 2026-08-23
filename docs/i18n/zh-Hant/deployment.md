@@ -97,11 +97,11 @@ llima run spec-decoding-output
 
 ## 疑難排解
 
-**錯誤：「無法找到 devkit 目錄」**
+**錯誤：「devkit directory cannot be found」**
 
 請確認原始目錄是 `llima-compile` 的輸出目錄，該目錄應包含 `sima_files` 子目錄。
 
-**錯誤：「無法找到 mpk 目錄」**
+**錯誤：「mpk directory cannot be found」**
 
 請確認編譯已成功完成。`sima_files/mpk/` 目錄應包含 `.tar.gz` 檔案。
 
