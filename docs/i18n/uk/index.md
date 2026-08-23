@@ -42,14 +42,14 @@ LLiMa runtime встановлюється нативно в Modalix як час
 | [Qwen 2.5](https://huggingface.co/collections/Qwen/qwen25) | LLM | [0.5b](https://huggingface.co/simaai/Qwen2.5-0.5B-Instruct-Autoround-a16w4), [1.5b](https://huggingface.co/simaai/Qwen2.5-1.5B-Instruct-GPTQ-a16w4), [3b](https://huggingface.co/simaai/Qwen2.5-3B-Instruct-GPTQ-a16w4), [7b](https://huggingface.co/simaai/Qwen2.5-7B-Instruct-GPTQ-a16w4) |
 | [Qwen 3](https://huggingface.co/collections/Qwen/qwen3) | LLM | [0.6b](https://huggingface.co/simaai/Qwen3-0.6B-Autoround-a16w4), [1.7b](https://huggingface.co/simaai/Qwen3-1.7B-GPTQ-a16w4), [4b](https://huggingface.co/simaai/Qwen3-4B-Instruct-2507-GPTQ-a16w4), [8b](https://huggingface.co/simaai/Qwen3-8B-GPTQ-a16w4) |
 | [Mistral 1](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3) | LLM | [7b](https://huggingface.co/simaai/Mistral-7B-Instruct-v0.3-a16w4) |
-| [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2) | LLM | [350 м, ](https://huggingface.co/simaai/LFM2-350M-a16w4), [1,2 млрд, ](https://huggingface.co/simaai/LFM2-1.2B-a16w4), [2,6 млрд, ](https://huggingface.co/simaai/LFM2-2.6B-a16w4). |
+| [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2) | LLM | [350m](https://huggingface.co/simaai/LFM2-350M-a16w4), [1.2b](https://huggingface.co/simaai/LFM2-1.2B-a16w4), [2.6b](https://huggingface.co/simaai/LFM2-2.6B-a16w4). |
 | [Llava 1.5](https://huggingface.co/llava-hf/llava-1.5-7b-hf) | VLM | [7b](https://huggingface.co/simaai/llava-1.5-7b-hf-a16w4) |
 | [PaliGemma](https://huggingface.co/google/paligemma-3b-pt-224) | VLM | [3b](https://huggingface.co/simaai/paligemma-3b-pt-224-a16w8) |
 | [Gemma 3](https://huggingface.co/simaai/gemma3-siglip448-a16w4) | VLM | [4b](https://huggingface.co/simaai/gemma3-siglip448-a16w4) |
 | [Gemma 4](https://huggingface.co/collections/google/gemma-4) | VLM | [E2B](https://huggingface.co/simaai/gemma4-E2B-it), [E4B](https://huggingface.co/simaai/gemma4-E4B-it) |
 | [ Qwen 2.5 VL ](https://huggingface.co/collections/Qwen/qwen25-vl) | VLM | [3b](https://huggingface.co/simaai/Qwen2.5-VL-3B-Instruct-GPTQ-a16w4), [7b](https://huggingface.co/simaai/Qwen2.5-VL-7B-Instruct-GPTQ-a16w4) |
 | [ Qwen 3 VL ](https://huggingface.co/collections/Qwen/qwen3-vl) | VLM | [2b](https://huggingface.co/simaai/Qwen3-VL-2B-Instruct-GPTQ-a16w4), [4b](https://huggingface.co/simaai/Qwen3-VL-4B-Instruct-GPTQ-a16w4), [8b](https://huggingface.co/simaai/Qwen3-VL-8B-Instruct-GPTQ-a16w4) |
-| [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2-vl) | VLM | [450 м, ](https://huggingface.co/simaai/LFM2-VL-450M-a16w4), [1,6 млрд, ](https://huggingface.co/simaai/LFM2-VL-1.6B-a16w4), [3 млрд, ](https://huggingface.co/simaai/LFM2-VL-3B-a16w4). |
+| [LFM 2](https://huggingface.co/collections/LiquidAI/lfm2-vl) | VLM | [450m](https://huggingface.co/simaai/LFM2-VL-450M-a16w4), [1.6b](https://huggingface.co/simaai/LFM2-VL-1.6B-a16w4), [3b](https://huggingface.co/simaai/LFM2-VL-3B-a16w4). |
 | [Whisper](https://huggingface.co/openai/whisper-small) | ASR | [small](https://huggingface.co/simaai/whisper-small-a16w8) |
 
 ## Обмеження
