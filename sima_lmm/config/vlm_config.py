@@ -681,7 +681,9 @@ class LanguageModelConfig(BaseConfig):
         self.attn_cfg.set_config(text_cfg, layer_types)
         self.mlp_cfg.set_config(text_cfg, lm_arch)
         # gpt_oss/Mixtral advertise experts via "num_local_experts"; OLMoE via "num_experts".
-        if "num_local_experts" in text_cfg or "num_experts" in text_cfg:
+        # Dense models (e.g. Gemma) may still declare these keys with a null/0 value, so
+        # gate on a positive expert count rather than mere key presence.
+        if text_cfg.get("num_local_experts") or text_cfg.get("num_experts"):
             self.moe_cfg = MixtureOfExpertsConfig()
             self.moe_cfg.set_config(text_cfg)
 
