@@ -1,0 +1,66 @@
+{
+  "sourceDir": "docs",
+  "translationDir": "docs/i18n/{locale}",
+  "manifest": "docs/i18n/translation-sources.json",
+  "excludedPrefixes": ["docs/i18n/"],
+  "canonicalTerms": [
+    "SiMa.ai", "LLiMa", "MoLE", "Model Compiler", "Neat", "Neat SDK",
+    "Neat Framework", "Modalix", "MLSoC", "Hugging Face", "HuggingFace",
+    "GGUF", "GPTQ", "AutoRound", "AWQ", "LLM", "VLM", "ASR", "LoRA",
+    "ONNX", "PyTorch", "TensorFlow", "Python", "C++", "HTTP", "ZMQ",
+    "JSON", "YAML", "Linux", "Ubuntu", "Windows", "MacOS", "Docker",
+    "GitHub", "EleutherAI", "Flask", "MLA", "GenAI", "Llama", "Gemma",
+    "Phi", "Qwen", "Mistral", "LFM", "Llava", "PaliGemma", "Whisper",
+    "SigLip", "safetensors", "compressed-tensors", "llm-compressor", "INT4",
+    "rsync", "sima-cli"
+  ],
+  "locales": {
+    "ko": {
+      "name": "Korean",
+      "code": "ko",
+      "terms": {
+        "model": "모델", "compilation": "컴파일", "deployment": "배포",
+        "runtime": "런타임", "benchmark": "벤치마크", "quantization": "양자화",
+        "tokenizer": "토크나이저", "artifact": "아티팩트"
+      }
+    },
+    "ja": {
+      "name": "Japanese",
+      "code": "ja",
+      "terms": {
+        "model": "モデル", "compilation": "コンパイル", "deployment": "デプロイ",
+        "runtime": "ランタイム", "benchmark": "ベンチマーク", "quantization": "量子化",
+        "tokenizer": "トークナイザー", "artifact": "アーティファクト"
+      }
+    },
+    "zh-Hant": {
+      "name": "Traditional Chinese (Taiwan)",
+      "code": "zh-Hant-TW",
+      "terms": {
+        "model": "模型", "compilation": "編譯", "deployment": "部署",
+        "runtime": "執行階段", "benchmark": "基準測試", "quantization": "量化",
+        "tokenizer": "權杖化器", "artifact": "成品"
+      },
+      "proseReplacements": [
+        ["默認", "預設"], ["配置", "設定"], ["構建", "建置"], ["加載", "載入"],
+        ["支持", "支援"], ["數據", "資料"], ["鏈接", "連結"], ["用戶", "使用者"],
+        ["信息", "資訊"], ["創建", "建立"], ["文件", "檔案"], ["線程", "執行緒"]
+      ]
+    },
+    "uk": {
+      "name": "Ukrainian (Ukraine)",
+      "code": "uk-UA",
+      "terms": {
+        "model": "модель", "compilation": "компіляція", "deployment": "розгортання",
+        "runtime": "середовище виконання", "benchmark": "тест продуктивності",
+        "quantization": "квантування", "tokenizer": "токенізатор", "artifact": "артефакт"
+      }
+    }
+  },
+  "provider": {
+    "type": "ollama",
+    "model": "translategemma:27b",
+    "endpoint": "http://127.0.0.1:11434/api/chat",
+    "timeoutMs": 300000
+  }
+}
