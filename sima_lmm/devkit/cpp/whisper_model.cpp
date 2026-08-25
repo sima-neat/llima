@@ -531,7 +531,7 @@ void WhisperModel::_define_buffers() {
     define_buffer("decoder_future_token_mask", {2 * _cfg.max_target_positions});
     define_buffer("decoder_init", {_input_token_ids.size(), _cfg.d_model});
 
-    // Pre input (for layer_idx > 0 or init), post input and post output.
+    // Layer 0 positioned residual, pre input for later layers, and post input/output.
     define_buffer("decoder_n1_buffer1", {1, _cfg.d_model});
     // Pre output and cache input.
     define_buffer(
@@ -590,6 +590,8 @@ void WhisperModel::_define_model(
 
 
 void WhisperModel::_define_models() {
+    constexpr size_t positioned_residual_output_idx = 3;
+
     // Encoder model.
     _define_model(
         "encoder",
@@ -686,6 +688,8 @@ void WhisperModel::_define_models() {
                 std::vector<uint32_t>{token_idx, 0},
                 std::vector<uint32_t>{1, _cfg.d_model}
             );
+            if (layer_idx == 0)
+                pre_ofms.emplace_back(&get_buffer("decoder_n1_buffer1"));
             _define_model(
                 "decoder_pre", model_key, _get_elf_path_decoder_pre(layer_idx), pre_ifms, pre_ofms
             );
@@ -741,7 +745,9 @@ void WhisperModel::_define_models() {
             }
 
             std::vector<MLABufferSlice> post_ifms{
-                pre_ifms[0],
+                layer_idx == 0
+                    ? pre_ofms.at(positioned_residual_output_idx)
+                    : pre_ifms[0],
                 cache_ofms[0],
                 {&get_buffer(fmt::format("encoder_cache_key{}", layer_idx))},
                 {&get_buffer(fmt::format("encoder_cache_val{}", layer_idx))},

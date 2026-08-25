@@ -376,6 +376,11 @@ class WhisperModel(BaseModel):
                     pre_ifms = [post_ofms[0]]
                 pre_model = self._get_part_model("pre", layer_idx=layer_idx)
                 pre_ofms = pre_model.run_model(eval_mode, pre_ifms)
+                residual_ifm = (
+                    pre_ofms[WhisperDecoderPreModel.positioned_residual_output_idx]
+                    if layer_idx == 0
+                    else pre_ifms[0]
+                )
 
                 # Update cache.
                 decoder_cache_key[layer_idx][..., token_idx:next_token_idx, :] = pre_ofms[1]
@@ -402,7 +407,7 @@ class WhisperModel(BaseModel):
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 
                 post_ifms = [
-                    pre_ifms[0],
+                    residual_ifm,
                     cache_ofms[0],
                     encoder_cache_key[layer_idx],
                     encoder_cache_value[layer_idx],
