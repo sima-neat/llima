@@ -1389,7 +1389,7 @@ def get_model_arch_gen(
     """
     lm_arch = None
     t_reg = re.fullmatch(
-        r"(?P<arch>[a-zA-Z]+)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
+        r"(?P<arch>[a-zA-Z]+(?:_[a-zA-Z]+)*?)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
         text_type,
     )
     for arch in LlmArchType.values():
