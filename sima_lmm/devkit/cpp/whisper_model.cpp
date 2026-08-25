@@ -398,7 +398,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
             }
             _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
             _decoder_cache_model_map.at(model_key).add_to_queue();
-            _decoder_post_model_map.at(model_key).add_to_queue(&ifm_map);
+            _decoder_post_model_map.at(model_key).add_to_queue();
         }
 
         MLAModelWithBuffer::run_queue();
