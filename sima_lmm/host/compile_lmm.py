@@ -8,11 +8,13 @@ except ImportError:
     )
     sys.exit(-1)
 import argparse
+import importlib
 import logging
 from pathlib import Path
 import psutil
 
 from sima_lmm.config.layer_id import LayerID
+from sima_lmm.config.vlm_config import LlmArchType
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.host.configuration_helper import (
@@ -52,7 +54,8 @@ def gen_files(
     language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
     quantize_embeddings: bool, quantize_kv_cache: bool, split_mlp: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None
+    draft_output_path: Path | None,
+    qwen3tts_tail_wrapper: object | None,
 ):
     enable_verbose_error_messages()
     models = list()
@@ -72,7 +75,8 @@ def gen_files(
         quantize_embeddings=quantize_embeddings,
         quantize_kv_cache=quantize_kv_cache,
         split_mlp=split_mlp,
-        image_resolution=image_resolution
+        image_resolution=image_resolution,
+        qwen3tts_tail_wrapper=qwen3tts_tail_wrapper,
     )
     models.append(base_model)
 
@@ -119,6 +123,13 @@ def gen_files(
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
+                elif model.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL:
+                    # This component is exported as fixed-shape ONNX micro stages,
+                    # then uses the standard ONNX quantizer and MPK compiler.
+                    modes = [
+                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX,
+                        FileGenMode.ONNX_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
+                    ]
                 else:
                     # Use direct SiMa Builder graph generation for ordinary HF models.
                     modes = [
@@ -144,6 +155,22 @@ def gen_files(
                 resume=resume
             )
             print(f"Generated mode={mode.name} files for {model.model_name}", flush=True)
+
+def _resolve_qwen3tts_tail_wrapper(specification: str | None) -> object | None:
+    """Resolve the Qwen3-TTS-only 4D tail wrapper supplied by the caller."""
+    if specification is None:
+        return None
+    module_name, separator, attribute_name = specification.partition(":")
+    if not separator or not module_name or not attribute_name:
+        _abort("--qwen3tts-tail-wrapper must be MODULE:ATTRIBUTE")
+    try:
+        wrapper = getattr(importlib.import_module(module_name), attribute_name)
+    except (ImportError, AttributeError) as exc:
+        _abort(f"Cannot resolve Qwen3-TTS tail wrapper {specification!r}: {exc}")
+    if not callable(wrapper):
+        _abort(f"Qwen3-TTS tail wrapper {specification!r} is not callable")
+    return wrapper
+
 
 def _safe_resolve(p: Path) -> Path:
     """
@@ -313,6 +340,13 @@ def main():
         "--draft_model_path", type=Path,
         help="Path of the EAGLE3 draft model for the base (target) model."
     )
+    group.add_argument(
+        "--qwen3tts-tail-wrapper", metavar="MODULE:ATTRIBUTE",
+        help=(
+            "Qwen3-TTS Tail4DWrapper factory used only when compiling "
+            "qwen3_tts_tokenizer_v2_decoder_tail."
+        ),
+    )
 
     group = parser.add_argument_group("Options to compile LoRA")
     group.add_argument(
@@ -419,6 +453,7 @@ def main():
     # Enable MLP splitting when LoRA is not used. The feature is not implemented for LoRA.
     split_mlp = lora_path_for_base_model is None
     return_logits = args.return_logits or args.draft_model_path is not None
+    qwen3tts_tail_wrapper = _resolve_qwen3tts_tail_wrapper(args.qwen3tts_tail_wrapper)
 
     gen_files(
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
@@ -426,7 +461,7 @@ def main():
         args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
         args.quantize_kv_cache, split_mlp, return_logits, log_level, image_resolution,
-        args.draft_model_path, draft_output_path
+        args.draft_model_path, draft_output_path, qwen3tts_tail_wrapper
     )
 
     # Compile LoRA weights if requested.

@@ -11,7 +11,7 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora,
+    SimaBuilder, build_conv, build_conv_from_dense_with_lora,
     build_activation, activation_type, activation_dtype
 )
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
@@ -22,9 +22,16 @@ from sima_lmm.utils import ceil_div
 class LanguagePostModel(LanguagePostBaseModel):
     """Implementation for the post cache model of transformer-based language models."""
 
+    code_predictor_head_idx: int | None = None
+
     def __post_init__(self):
         assert self.num_tokens >= 1
         assert 0 <= self.layer_idx < self.cfg.lm_cfg.num_hidden_layers
+        if self.code_predictor_head_idx is not None:
+            assert self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODE_PREDICTOR
+            assert self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1
+            assert self.num_tokens == 1
+            assert self.code_predictor_head_idx >= 0
 
     @property
     def layer_type(self) -> str:
@@ -300,9 +307,19 @@ class LanguagePostModel(LanguagePostBaseModel):
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, attn_out_name)
+        attn_scale = self._get_sima_layer_scale(base_name, "self_attn_layer_scale")
+        attn_kwargs = {}
+        if attn_scale is not None:
+            assert lora_rank is None, "LayerScale folding with LoRA is unsupported"
+            scale_oi = attn_scale.astype(np.float32).reshape(-1, 1, 1, 1)
+            scale_bias = attn_scale.astype(np.float32)
+            attn_kwargs = {
+                "weight_process_func": lambda weight, s=scale_oi: weight * s,
+                "bias_process_func": lambda bias, s=scale_bias: bias * s,
+            }
         o_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, attn_out_full_name,
-            mla_input_self_attn, lora_rank, merged_lora=merged_lora
+            mla_input_self_attn, lora_rank, merged_lora=merged_lora, **attn_kwargs
         )
 
         # Dequantize the selected embedding rows before the residual path consumes them.
@@ -343,6 +360,12 @@ class LanguagePostModel(LanguagePostBaseModel):
             mlp = self._build_sima_mlp(builder, mlp_base, [rms_norm2], quantizable, merged_lora)
             mlp = self._build_sima_rms_norm(builder, f"{base_name}.post_feedforward_layernorm", mlp)
             add2 = builder.create_add_node(add1, mlp)
+        elif self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER:
+            mlp_scale = self._get_sima_layer_scale(base_name, "mlp_layer_scale")
+            mlp = self._build_sima_mlp(
+                builder, mlp_base, [rms_norm2], quantizable, merged_lora, output_scale=mlp_scale
+            )
+            add2 = builder.create_add_node(add1, mlp)
         else:
             add2 = self._build_sima_mlp(
                 builder, mlp_base, [rms_norm2, add1], quantizable, merged_lora,
@@ -375,7 +398,90 @@ class LanguagePostModel(LanguagePostBaseModel):
         net = builder.finish(self.model_name)
         return net
 
-    def get_mla_input_tessellate_params(self) ->  dict[int, TensorTessellateParameters]:
+    def _get_sima_layer_scale(self, base_name: str, scale_module_name: str) -> np.ndarray | None:
+        """Return a codec-decoder LayerScale to fold into the preceding projection."""
+        if self.cfg.lm_cfg.arch != LlmArchType.QWEN3_TTS_CODEC_DECODER:
+            return None
+        scale_name = f"{base_name}.{scale_module_name}.scale"
+        return self.get_hf_param(scale_name) if self.check_hf_param(scale_name) else None
+
+    def _build_sima_post_qwen3_code_predictor(
+        self, builder: SimaBuilder, input_node: NodeOrHandle, quantizable: bool
+    ) -> list[NodeOrHandle]:
+        base_prefix = self.hf_model.language_model_param_base_name
+        final_norm_name = (
+            "embedding_norm"
+            if self.check_hf_param(f"{base_prefix}.embedding_norm.weight")
+            else "norm"
+        )
+        rms_norm = self._build_sima_rms_norm(
+            builder, f"{base_prefix}.{final_norm_name}", input_node
+        )
+        if not self.check_hf_param("lm_head.0.weight"):
+            raise RuntimeError(
+                "Qwen3 code predictor requires top-level lm_head.0.weight in its Safetensors checkpoint."
+            )
+        num_heads = 0
+        while self.check_hf_param(f"lm_head.{num_heads}.weight"):
+            num_heads += 1
+        head_indices = range(num_heads)
+        if self.code_predictor_head_idx is not None:
+            if self.code_predictor_head_idx >= num_heads:
+                raise RuntimeError(
+                    f"Requested code-predictor head {self.code_predictor_head_idx}, "
+                    f"but checkpoint contains only {num_heads} heads."
+                )
+            head_indices = [self.code_predictor_head_idx]
+        logits = [
+            build_conv(
+                builder, self.get_hf_param, self.check_hf_param,
+                f"qwen3_code_predictor.lm_head.{head_idx}", rms_norm,
+                src_weight_name=f"lm_head.{head_idx}.weight",
+            )
+            for head_idx in head_indices
+        ]
+        if self.cfg.pipeline_cfg.return_logits:
+            return [builder.create_concat_node(logits, 3)]
+        return logits
+
+    def _build_post_transformer(
+        self, builder: SimaBuilder, input_node: NodeOrHandle, quantizable: bool
+    ) -> list[NodeOrHandle]:
+        if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_TALKER:
+            base_prefix = self.hf_model.language_model_param_base_name
+            return [self._build_sima_rms_norm(builder, f"{base_prefix}.norm", input_node)]
+        if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODE_PREDICTOR:
+            return self._build_sima_post_qwen3_code_predictor(builder, input_node, quantizable)
+        return super()._build_post_transformer(builder, input_node, quantizable)
+
+    def _get_output_embed_name(self) -> str:
+        try:
+            return super()._get_output_embed_name()
+        except RuntimeError:
+            if self.cfg.lm_cfg.arch not in (
+                LlmArchType.QWEN3_TTS_TALKER,
+                LlmArchType.QWEN3_TTS_CODE_PREDICTOR,
+                LlmArchType.QWEN3_TTS_CODEC_DECODER,
+            ):
+                raise
+
+        base_prefix = self.hf_model.language_model_param_base_name
+        candidates: list[str] = []
+        if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_TALKER:
+            candidates += [f"{base_prefix}.codec_head.weight", "codec_head.weight"]
+        elif self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODE_PREDICTOR:
+            candidates += [f"{base_prefix}.lm_head.0.weight", "lm_head.0.weight"]
+        elif self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER:
+            candidates += [
+                f"{base_prefix}.pre_transformer.output_proj.weight",
+                "pre_transformer.output_proj.weight",
+            ]
+        for name in candidates:
+            if self.check_hf_param(name):
+                return name
+        raise RuntimeError(f"Cannot determine Qwen3-TTS output projection; tried {candidates}")
+
+    def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """
         Get the custom tessellate params for model's inputs on the MLA.
         """

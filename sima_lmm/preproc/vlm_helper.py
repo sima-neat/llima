@@ -17,7 +17,7 @@ from transformers import (
 from transformers.image_utils import load_images
 from transformers.utils import GENERATION_CONFIG_NAME
 
-from sima_lmm.config.vlm_config import VlmConfig,VisionArchType
+from sima_lmm.config.vlm_config import LlmArchType, VlmConfig,VisionArchType
 from sima_utils.logging.sima_logger import sima_log_warning, sima_log_info
 
 class VlmHelper:
@@ -40,6 +40,15 @@ class VlmHelper:
                     model_path=str(hf_path), vocab_only=True, verbose=False
                 )
                 self.hf_processor = None
+            elif vlm_cfg.lm_cfg.arch in (
+                LlmArchType.QWEN3_TTS_CODEC_DECODER,
+                LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL,
+            ):
+                # The standalone codec decoder has no text tokenizer or generation config.
+                self.hf_processor = None
+                self.hf_tokenizer = None
+                self.stop_tokens = [0]
+                return
             else:
                 # Use tokenizer_config.json to find the actual directory with the HuggingFace files.
                 # Assuming all the files are in the same directory.

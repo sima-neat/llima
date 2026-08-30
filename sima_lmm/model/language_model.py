@@ -2,7 +2,8 @@ import logging
 import numpy as np
 import time
 
-from dataclasses import asdict, dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 
 from afe.ir.tensor_type import ScalarType
 from afe.ir.quantization_conv import block_quantize_weight_tensor
@@ -63,6 +64,8 @@ class LanguageModel(BaseModel):
     3. PostCacheModel: Post cache model implements the transformer layer after the self-attention
         block, including the layers after the last transformer layer.
     """
+    qwen3tts_tail_wrapper: Callable[..., object] | None = field(default=None, kw_only=True)
+
     def __post_init__(self):
         if self.cfg.pipeline_cfg.input_token_group_offsets:
             self.cfg.pipeline_cfg.input_token_group_offsets.sort()
@@ -96,8 +99,73 @@ class LanguageModel(BaseModel):
         single_model_num_tokens = self._single_model_num_tokens
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
+        if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL:
+            from sima_lmm.model.qwen3tts_codec_tail_model import Qwen3TTSCodecTailModel
 
+            if gen_mode not in (
+                FileGenMode.SOURCE_TO_ONNX,
+                FileGenMode.ONNX_TO_QUANT,
+                FileGenMode.MODEL_SDK_COMPILE,
+            ):
+                raise ValueError(
+                    "Qwen3-TTS codec tail uses the normal ONNX, quantize, and compile stages."
+                )
+            if self.qwen3tts_tail_wrapper is None:
+                raise RuntimeError(
+                    "Qwen3-TTS codec-tail compilation requires "
+                    "--qwen3tts-tail-wrapper MODULE:ATTRIBUTE."
+                )
+            for layer_id, curr_precision in precision.items():
+                if layer_id.part != "qwen3tts_tail":
+                    continue
+                model_list.append((
+                    Qwen3TTSCodecTailModel(
+                        self.cfg,
+                        f"{self.model_name}_tail_part{layer_id.part_idx:02d}",
+                        onnx_path=self.onnx_path,
+                        sima_path=self.sima_path,
+                        hf_model=self.hf_model,
+                        part_idx=layer_id.part_idx,
+                        qwen3tts_tail_wrapper=self.qwen3tts_tail_wrapper,
+                    ),
+                    {"precision": curr_precision},
+                ))
+            self.gen_files_from_model_list(
+                model_list, gen_mode, num_processes, log_level, resume
+            )
+            return
+        split_code_predictor_final_heads = (
+            self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODE_PREDICTOR
+            and gen_mode in (
+                FileGenMode.SOURCE_TO_FP,
+                FileGenMode.FP_TO_QUANT,
+                FileGenMode.MODEL_SDK_COMPILE,
+            )
+        )
         for layer_id, curr_precision in precision.items():
+            curr_cfg = {"precision": curr_precision}
+            if lora_mode:
+                curr_cfg["lora"] = lora_mode[layer_id]
+
+            # Split during normal language-model graph construction. Each model has
+            # the shared final trunk plus exactly one lm_head.N projection, so
+            # it is independently generated, quantized, and compiled.
+            if (
+                split_code_predictor_final_heads
+                and layer_id.part == "single_post"
+                and layer_id.part_idx == self.cfg.lm_cfg.num_hidden_layers - 1
+            ):
+                for head_idx in range(self._code_predictor_head_count()):
+                    model_list.append((
+                        self._get_part_model(
+                            "post",
+                            single_model_num_tokens,
+                            layer_idx=layer_id.part_idx,
+                            code_predictor_head_idx=head_idx,
+                        ),
+                        curr_cfg,
+                    ))
+                continue
             part_model = None
             match layer_id.part:
                 case "group_pre":
@@ -159,12 +227,9 @@ class LanguageModel(BaseModel):
                 case _:
                     # Not a part of this model
                     continue
-            curr_cfg = {"precision": curr_precision}
-            if lora_mode:
-                curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
 
-        # Finished creating model_list.  Compile these models.
+        # Finished creating the direct graph list.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
 
     def run_model(
@@ -436,7 +501,14 @@ class LanguageModel(BaseModel):
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
         if weight_name is None:
             base_name = self.hf_model.language_model_param_base_name
-            weight_name = f"{base_name}.embed_tokens.weight"
+            candidates = [f"{base_name}.embed_tokens.weight"]
+            if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_TALKER:
+                candidates += [f"{base_name}.codec_embedding.weight", "codec_embedding.weight"]
+            elif self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODE_PREDICTOR:
+                candidates += [f"{base_name}.codec_embedding.0.weight", "codec_embedding.0.weight"]
+            weight_name = next((candidate for candidate in candidates if self.hf_model.param_exists(candidate)), None)
+            if weight_name is None:
+                raise ValueError(f"Could not find an embedding tensor; checked {candidates}.")
             if self.cfg.lm_cfg.arch == LlmArchType.GEMMA:
                 embed_scale = self.cfg.lm_cfg.hidden_size ** 0.5
         is_draft = (
@@ -481,9 +553,19 @@ class LanguageModel(BaseModel):
             return 1
         return self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
 
+    def _code_predictor_head_count(self) -> int:
+        """Return the number of independently projected codec codebooks."""
+        count = 0
+        while self.check_hf_param(f"lm_head.{count}.weight"):
+            count += 1
+        if count == 0:
+            raise RuntimeError("Qwen3 code predictor checkpoint has no lm_head.N weights")
+        return count
+
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,
         token_idx: int | None = None,
+        code_predictor_head_idx: int | None = None,
     ) -> BaseModel:
         match part:
             case "pre":
@@ -494,12 +576,18 @@ class LanguageModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                 )
             case "post":
-                model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
                 assert layer_idx is not None
+                head_suffix = (
+                    f"_head{code_predictor_head_idx}"
+                    if code_predictor_head_idx is not None
+                    else ""
+                )
+                model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}{head_suffix}"
                 return LanguagePostModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
+                    code_predictor_head_idx=code_predictor_head_idx,
                 )
             case "cache":
                 model_name = f"{self.model_name}_n{num_tokens}_cache_token{token_idx}"

@@ -10,6 +10,11 @@ from pathlib import Path
 
 from sima_lmm.devkit import model_manager
 from sima_lmm.devkit.model_manager import ModelManager
+from sima_lmm.devkit.qwen3tts import (
+    is_qwen3tts_package,
+    resolve_qwen3tts_package,
+    run_qwen3tts,
+)
 from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
 from sima_utils.logging.sima_logger import (
     _get_logging_config as sima_get_logging_config,
@@ -85,9 +90,36 @@ def _kill_existing_llima_session() -> None:
         raise RuntimeError("Failed to kill existing llima sessions.")
 
 
+def _configure_qwen3_tts_interactive(args: argparse.Namespace) -> None:
+    """Collect a complete TTS request when ``llima run`` has no prompt flag."""
+    if args.prompt is not None:
+        return
+    prompt = input("Prompt: ").strip()
+    if not prompt:
+        raise RuntimeError("Qwen3-TTS prompt must not be empty")
+    args.prompt = prompt
+
+    speaker = input(f"Speaker [{args.speaker}]: ").strip()
+    if speaker:
+        args.speaker = speaker
+    language = input(f"Language [{args.language}]: ").strip()
+    if language:
+        args.language = language
+
+
+def _run_qwen3tts(args: argparse.Namespace, package_path: Path) -> int:
+    if args.mode != DemoMode.CLI.value:
+        raise RuntimeError("Qwen3-TTS supports --mode cli only")
+    _configure_qwen3_tts_interactive(args)
+    package = resolve_qwen3tts_package(package_path)
+    return run_qwen3tts(package, args)
+
+
 def run_model(args: argparse.Namespace) -> int:
     args.mode = DemoMode(args.mode)
     user_model_path = _resolve_run_model_path(args.model)
+    if is_qwen3tts_package(user_model_path):
+        return _run_qwen3tts(args, user_model_path)
     try:
         model_path, draft_model_path = model_manager.resolve_target_and_draft_paths(
             user_model_path
@@ -283,6 +315,36 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Path to the file with chat template.",
     )
     run_parser.add_argument("--log_level", type=str, default=None, help="Logging level")
+    run_parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Qwen3-TTS text. Omit to use interactive TTS prompting.",
+    )
+    run_parser.add_argument("--speaker", type=str, default="Vivian", help="Qwen3-TTS speaker")
+    run_parser.add_argument("--language", type=str, default="English", help="Qwen3-TTS language")
+    run_parser.add_argument("--seed", type=int, default=1, help="Qwen3-TTS RNG seed")
+    run_parser.add_argument(
+        "--max-frames", type=int, default=512, help="Qwen3-TTS maximum codec frames"
+    )
+    run_parser.add_argument(
+        "--output-wav",
+        type=Path,
+        default=Path("qwen3_tts.wav"),
+        help="Qwen3-TTS output WAV path",
+    )
+    run_parser.add_argument(
+        "--do-sample",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Qwen3-TTS codebook-0 sampling",
+    )
+    run_parser.add_argument(
+        "--subtalker-do-sample",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Qwen3-TTS codebook 1-15 sampling",
+    )
     run_parser.set_defaults(func=run_model)
 
 

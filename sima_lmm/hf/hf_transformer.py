@@ -120,9 +120,9 @@ def unpack_compressed_tensor(
     if num_bits not in (4, 8):
          raise ValueError(f"num_bits must be 4 or 8, got {num_bits}")
 
-    packed = packed.astype(np.int32)    
+    packed = packed.astype(np.int32)
     packed_tensor = torch.from_numpy(packed)
-    
+
     unpacked_tensor = unpack_from_int32(
         value=packed_tensor,
         num_bits=num_bits,
@@ -271,8 +271,16 @@ class LocalHuggingFaceModel:
         # Load model config
         config_file = find_file(directory=directory, filename="config.json", resolve=False)
         assert config_file
-        hf_config = AutoConfig.from_pretrained(config_file.parent)
-        config = hf_config.to_dict()
+        config = json.loads(config_file.read_text())
+        # Qwen3-TTS split components are built from raw config JSON and
+        # Safetensors directly; importing qwen_tts or exporting ONNX is not
+        # part of this compiler path.
+        if not config.get("model_type", "").startswith("qwen3_tts"):
+
+            hf_config = AutoConfig.from_pretrained(config_file.parent)
+            config = hf_config.to_dict()
+        else:
+            hf_config = None
 
         # HF has head_dim to be None for Mistral model
         if isinstance(hf_config, MistralConfig) and config["head_dim"] is None:
@@ -332,6 +340,41 @@ class LocalHuggingFaceModel:
     def is_gguf(self) -> bool:
         return False
 
+
+    @property
+    def is_qwen3_tts_model(self) -> bool:
+        """Whether this is a flat Qwen3-TTS split-component checkpoint."""
+        return self.config.get("model_type", "").startswith("qwen3_tts")
+
+
+    @property
+    def needs_model_root_prefix(self) -> bool:
+        """Checkpoints without a model/language_model prefix need a synthetic root."""
+        return self.is_qwen3_tts_model
+
+    def _param_aliases(self, param_name: str) -> list[str]:
+        aliases = [param_name]
+        if self.needs_model_root_prefix:
+            # Codec decoder stores its transformer under pre_transformer while
+            # generic language builders address layers/norm from the root.
+            for old, new in (
+                ("model_root.layers.", "model_root.pre_transformer.layers."),
+                ("model_root.norm.", "model_root.pre_transformer.norm."),
+                ("layers.", "pre_transformer.layers."),
+                ("norm.", "pre_transformer.norm."),
+            ):
+                if param_name.startswith(old):
+                    aliases.append(new + param_name[len(old):])
+        return aliases
+
+    def _resolve_param_name(self, param_name: str) -> str:
+        for name in self._param_aliases(param_name):
+            if self.params and name in self.params:
+                return name
+            if self.weight_map.get(name) is not None:
+                return name
+        return param_name
+
     def is_compressed_tensors_model(self) -> bool:
         """Check if this is an llm-compressor quantized model."""
         return self.compressed_tensors_config is not None
@@ -347,9 +390,10 @@ class LocalHuggingFaceModel:
 
     def param_exists(self, param_name: str) -> bool:
         """Check if a parameter exists in the model.
-        
+
         For llm-compressor models, also checks for packed weight versions.
         """
+        param_name = self._resolve_param_name(param_name)
         if self.params and param_name in self.params:
             return True
         if self.weight_map.get(param_name) is not None:
@@ -371,6 +415,7 @@ class LocalHuggingFaceModel:
         Returns:
             The parameter as an numpy array, or a tuple of (scales, weights) if quantized.
         """
+        param_name = self._resolve_param_name(param_name)
         if self.params and param_name in self.params:
             return self.params[param_name]
 
@@ -411,8 +456,11 @@ class LocalHuggingFaceModel:
         model_shard = self.weight_map.get(param_name)
         assert model_shard, f'Could not find {param_name} in the model cache.'
 
+        file_key = param_name
+        if self.needs_model_root_prefix and file_key.startswith("model_root."):
+            file_key = file_key[len("model_root."):]
         safetensors_file = self.weights[model_shard]
-        return self._load_safetensors_tensor(safetensors_file, param_name)
+        return self._load_safetensors_tensor(safetensors_file, file_key)
 
     def _load_raw_tensor(self, tensor_name: str) -> np.ndarray:
         """Load a raw tensor from safetensors files by exact name."""
@@ -447,7 +495,7 @@ class LocalHuggingFaceModel:
     def vision_model_param_base_name(self) -> str:
         # Known vision model base name segments (extensible for future models).
         vision_base_names = ("vision_tower", "visual")
-        
+
         # Filter for keys that have a known vision base name as a path segment.
         vision_keys = [
             name for name in self.weight_map.keys()
@@ -489,6 +537,20 @@ class LocalHuggingFaceModel:
                     return ".".join(base_names)
             if base_names:
                 break
+
+        if self.needs_model_root_prefix:
+            flat_indicators = (
+                "layers.", "embed_tokens.", "norm.", "codec_embedding.", "text_embedding.",
+                "pre_transformer.", "quantizer.", "pre_conv.", "upsample.", "decoder.",
+            )
+            if any(key.startswith(prefix) for key in self.weight_map for prefix in flat_indicators):
+                for key in list(self.weight_map):
+                    self.weight_map[f"model_root.{key}"] = self.weight_map[key]
+                if self.params:
+                    for key, value in list(self.params.items()):
+                        self.params[f"model_root.{key}"] = value
+                return "model_root"
+
         raise RuntimeError(
             "Cannot determine the param base name for language model from the weight names:"
             f" {self.weight_map.keys()}."
@@ -689,7 +751,7 @@ def find_file(directory: Path, filename: str, resolve: bool = True) -> Path | No
     for x in directory.rglob(filename):
         if '.no_exist' not in str(x) and "sima_files" not in str(x):
             matches.append(x.resolve() if resolve else x)
-            
+
     # These need to be unique, they will be stored under a unique hash.
     if len(matches) == 0:
         return None

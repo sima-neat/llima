@@ -126,7 +126,8 @@ class LanguagePartBaseModel(BaseModel):
 
     def _build_sima_mlp(
         self, builder, base_name: str, input_nodes: list[NodeOrHandle], quantizable: bool,
-        merged_lora: bool = False, with_residual_add: bool =  False
+        merged_lora: bool = False, with_residual_add: bool =  False,
+        output_scale: np.ndarray | None = None,
     ) -> NodeOrHandle:
         """Build SiMa nodes for the MLP block with optional splitting.
 
@@ -185,9 +186,21 @@ class LanguagePartBaseModel(BaseModel):
             lora_rank = None
             if self.cfg.lm_cfg.lora_cfg is not None:
                 lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
+            if output_scale is not None:
+                assert lora_rank is None, "LayerScale folding with LoRA is unsupported"
+                scale_oi = output_scale.astype(np.float32).reshape(-1, 1, 1, 1)
+                scale_bias = output_scale.astype(np.float32)
+                weight_process_func = lambda weight, s=scale_oi: weight * s
+                bias_process_func = lambda bias, s=scale_bias: bias * s
+            else:
+                weight_process_func = None
+                bias_process_func = None
+            down_kwargs = {}
+            if weight_process_func is not None:
+                down_kwargs = {"weight_process_func": weight_process_func, "bias_process_func": bias_process_func}
             down_proj = build_conv_from_dense_with_lora(
                 builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{down_name}", mul2,
-                lora_rank, merged_lora=merged_lora, weight_slice=weight_slice_by_output_ch
+                lora_rank, merged_lora=merged_lora, weight_slice=weight_slice_by_output_ch, **down_kwargs
             )
 
             if with_residual_add and part == 0:
@@ -304,6 +317,10 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         lm_heads = list()
         kwargs = dict()
         kwargs["src_weight_name"] = output_embed_name
+        if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER:
+            bias_name = output_embed_name.removesuffix(".weight") + ".bias"
+            if self.check_hf_param(bias_name):
+                kwargs["src_bias_name"] = bias_name
         for i in range(self.cfg.lm_cfg.lm_head_num_splits):
             split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
             split_end = min(
@@ -326,6 +343,8 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
 
         if self.is_draft:
             lm_heads.append(input_node)
+            return lm_heads
+        if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER:
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             argmax = self._onnx_builder.build_op(
@@ -390,6 +409,10 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
 
         if self.is_draft:
             lm_heads.append(input_node)
+            return lm_heads
+        # The codec decoder feeds logits to following codec stages; retain the
+        # legacy SWML/ONNX logits contract instead of producing ArgMax IDs.
+        if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER:
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             argmax = builder.create_argmax_node(lm_heads[0], ScalarType.int32)

@@ -422,8 +422,33 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 mla_input_cached_values, mla_input_cached_values_scale
             )
 
+        # Expand grouped-query K/V heads explicitly for the MLA BatchMatMul.
+        # The cache stays compact (num_key_value_heads) at its model boundary;
+        # only these local BMM operands are repeated, matching the established
+        # SWML graph: [B, n_kv, T, D] -> [B, n_heads, T, D].
+        if self.cfg.lm_cfg.arch in (
+            LlmArchType.QWEN3_TTS_TALKER,
+            LlmArchType.QWEN3_TTS_CODE_PREDICTOR,
+            LlmArchType.QWEN3_TTS_CODEC_DECODER,
+        ):
+            attn_heads = self.cfg.lm_cfg.attn_cfg.num_attention_heads
+            kv_heads = self.cfg.lm_cfg.attn_cfg.num_key_value_heads
+            assert attn_heads % kv_heads == 0
+            if attn_heads != kv_heads:
+                gqa_repeat = attn_heads // kv_heads
+                mla_input_cached_keys = builder.create_slice_concat_node(
+                    mla_input_cached_keys, axis=1, split_axis=1,
+                    split_block=kv_heads, split_repeat=gqa_repeat
+                )
+                mla_input_cached_values = builder.create_slice_concat_node(
+                    mla_input_cached_values, axis=1, split_axis=1,
+                    split_block=kv_heads, split_repeat=gqa_repeat
+                )
+                expanded_kv_shape = (1, attn_heads, self.context_length, self._head_dim)
+                assert get_expected_tensor_value(mla_input_cached_keys.get_type().output).shape == expanded_kv_shape
+                assert get_expected_tensor_value(mla_input_cached_values.get_type().output).shape == expanded_kv_shape
+
         # First multiply (input * key)
-        # BatchMatMul repeats the smaller H dimension for GQA.
         bmm1 = builder.create_batch_matmul_node(
             mla_input_input, mla_input_cached_keys, transpose_a=False, transpose_b=True
         )

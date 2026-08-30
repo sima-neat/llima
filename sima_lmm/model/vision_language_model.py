@@ -1,12 +1,13 @@
 import copy
 import logging
 import numpy as np
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
-    ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
+    LlmArchType, ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
 )
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
@@ -49,11 +50,13 @@ class _LoadParamsContextManager:
 class VisionLanguageModel(BaseModel):
     """Vision-language model implementation."""
     language_model: LanguageModel = field(init=False)
+    qwen3tts_tail_wrapper: Callable[..., object] | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         self.language_model = LanguageModel(
             self.cfg, self.language_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
             hf_model=self.hf_model, vlm_helper=self.vlm_helper,
+            qwen3tts_tail_wrapper=self.qwen3tts_tail_wrapper,
         )
 
     @staticmethod
@@ -73,6 +76,7 @@ class VisionLanguageModel(BaseModel):
         quantize_kv_cache: bool = False,
         split_mlp: bool = False,
         image_resolution: list[int] | None = None,
+        qwen3tts_tail_wrapper: Callable[..., object] | None = None,
         target_model: "VisionLanguageModel | None" = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
@@ -147,6 +151,7 @@ class VisionLanguageModel(BaseModel):
             onnx_path=Path(onnx_path),
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
+            qwen3tts_tail_wrapper=qwen3tts_tail_wrapper,
         )
         return model
 
@@ -192,7 +197,10 @@ class VisionLanguageModel(BaseModel):
         elif not (self.sima_devkit_path / "vlm_config.json").is_file():
             self.gen_devkit_files(precision=precision, resume=False)
 
-        if gen_mode == FileGenMode.SOURCE_TO_ONNX:
+        if (
+            gen_mode == FileGenMode.SOURCE_TO_ONNX
+            and self.cfg.lm_cfg.arch != LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL
+        ):
             num_processes = 1
             gen_context = _LoadParamsContextManager(self.hf_model)
         else:

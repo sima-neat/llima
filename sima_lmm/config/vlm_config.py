@@ -100,6 +100,10 @@ class LlmArchType(str, ExtensibleEnum):
     PHI = "phi"
     QWEN = "qwen"
     MISTRAL = "mistral"
+    QWEN3_TTS_TALKER = "qwen3_tts_talker"
+    QWEN3_TTS_CODE_PREDICTOR = "qwen3_tts_talker_code_predictor"
+    QWEN3_TTS_CODEC_DECODER = "qwen3_tts_tokenizer_v2_decoder"
+    QWEN3_TTS_CODEC_DECODER_TAIL = "qwen3_tts_tokenizer_v2_decoder_tail"
 
 
 class LlmDataType(str, ExtensibleEnum):
@@ -599,6 +603,7 @@ class LanguageModelConfig(BaseConfig):
     draft_vocab_size: int = 0
     conv_L_cache: int = 3
     conv_bias: bool = False
+    qwen3tts_tail_parts: int = 27
     lora_cfg: LoraConfig | None  = None
     speculative_decoding_cfg: SpeculativeDecodingConfig | None = None
 
@@ -657,6 +662,13 @@ class LanguageModelConfig(BaseConfig):
         )
         self.layer_types = layer_types
         self.draft_vocab_size = text_cfg.get("draft_vocab_size", 0)
+        if lm_arch == LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL:
+            configured_tail_parts = len(text_cfg.get("tail_parts", ()))
+            if configured_tail_parts not in (0, 27):
+                raise ValueError(
+                    "Qwen3-TTS codec tail must preserve the raw runtime's 27-stage contract"
+                )
+            self.qwen3tts_tail_parts = 27
 
         for key in (
             "attn_logit_softcapping",
@@ -1079,7 +1091,16 @@ class VlmConfig(BaseConfig):
                     vlm_cfg.vm_cfg.temporal_patch_size = 1
         else:
             # Keep GGUF Gemma4 naming consistent with the existing VLM_GEMMA4 language path.
-            if lm_arch == LlmArchType.GEMMA and gen == "4":
+            if lm_arch in (
+                LlmArchType.QWEN3_TTS_TALKER,
+                LlmArchType.QWEN3_TTS_CODE_PREDICTOR,
+                LlmArchType.QWEN3_TTS_CODEC_DECODER,
+                LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL,
+            ):
+                # These are standalone Qwen3-TTS checkpoints, but generic paths
+                # retain their Qwen3 family type.
+                vlm_cfg.model_type = VlmArchType.LLM_QWEN3
+            elif lm_arch == LlmArchType.GEMMA and gen == "4":
                 vlm_cfg.model_type = VlmArchType.VLM_GEMMA4
             else:
                 vlm_cfg.model_type = VlmArchType(f"llm-{lm_arch}{gen or ''}")
@@ -1136,6 +1157,12 @@ class VlmConfig(BaseConfig):
         """
         lm_cfg = self.lm_cfg
         pipeline_cfg = self.pipeline_cfg
+
+        if lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL:
+            return [
+                LayerID("qwen3tts_tail", part_idx)
+                for part_idx in range(lm_cfg.qwen3tts_tail_parts)
+            ]
 
         layers = []
         layer_types = getattr(lm_cfg, "layer_types", [])
@@ -1325,6 +1352,17 @@ def get_model_arch_gen(
         Tuple of vision architecture, LLM architecture and version.
     """
     lm_arch = None
+    if text_type in (LlmArchType.QWEN3_TTS_TALKER, "qwen3_tts_talker"):
+        return None, LlmArchType.QWEN3_TTS_TALKER, "3"
+    if text_type in (LlmArchType.QWEN3_TTS_CODE_PREDICTOR, "qwen3_tts_talker_code_predictor"):
+        return None, LlmArchType.QWEN3_TTS_CODE_PREDICTOR, "3"
+    if text_type in (LlmArchType.QWEN3_TTS_CODEC_DECODER, "qwen3_tts_tokenizer_v2_decoder"):
+        return None, LlmArchType.QWEN3_TTS_CODEC_DECODER, ""
+    if text_type in (
+        LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL,
+        "qwen3_tts_tokenizer_v2_decoder_tail",
+    ):
+        return None, LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL, ""
     t_reg = re.fullmatch(
         r"(?P<arch>[a-zA-Z]+)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
         text_type,

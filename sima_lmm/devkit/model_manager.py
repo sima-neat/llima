@@ -27,6 +27,8 @@ from typing import (
 )
 
 
+from sima_lmm.devkit.qwen3tts import is_qwen3tts_package
+
 DEFAULT_HF_ORG = "simaai"
 DEFAULT_HF_API_BASE = "https://huggingface.co/api"
 DEFAULT_HF_RESOLVE_BASE = "https://huggingface.co"
@@ -997,6 +999,8 @@ class LocalModelStore:
 
     @staticmethod
     def validate_runnable(model_dir: Path) -> None:
+        if is_qwen3tts_package(model_dir):
+            return
         resolve_target_and_draft_paths(model_dir)
 
     @staticmethod
@@ -1027,6 +1031,8 @@ class LocalModelStore:
     def _is_runnable(path: Path) -> bool:
         if not path.is_dir() or (path / INCOMPLETE_MARKER).exists():
             return False
+        if is_qwen3tts_package(path):
+            return True
         try:
             resolve_target_and_draft_paths(path)
         except (OSError, RuntimeError, ValueError):
