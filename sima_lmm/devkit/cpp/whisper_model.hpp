@@ -118,11 +118,13 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         void _define_models();
 
         std::filesystem::path _get_elf_path_encoder() const;
+        std::filesystem::path _get_elf_path_encoder_layer(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_init(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_pre(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_cache(uint16_t token_idx) const;
         std::filesystem::path _get_elf_path_decoder_post(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_language_detect() const;
+        void _run_encoder();
         bool _is_auto_language(const std::string& language) const;
         struct LanguageDetectResult {
             uint32_t language_index;
@@ -145,6 +147,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::atomic<bool> _is_running;
 
         std::unique_ptr<MLAModelWithBuffer> _encoder_model_ptr;
+        std::map<uint8_t, MLAModelWithBuffer> _encoder_layer_model_map;
         std::unique_ptr<MLAModelWithBuffer> _decoder_language_detect_model_ptr;
         std::map<uint8_t, MLAModelWithBuffer> _decoder_init_model_map;
         WhisperDecoderModelMap _decoder_pre_model_map;

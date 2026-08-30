@@ -85,8 +85,8 @@ class WhisperModel(BaseModel):
             precision: Layer configuration to be used for Model SDK quantization mode.
             log_level: Logging level.
             part: Name of the part to be generated.
-            part_idx: Specific index of the part to be generated. For pre/post model, the index is
-                the layer index; for cache model, the index is the token index.
+            part_idx: Specific index of the part to be generated. For encoder, pre, post, and init
+                models, the index is the layer index; for cache model, it is the token index.
             resume: Generate the files if missing.
         """
         if gen_mode == FileGenMode.ALL:
@@ -106,7 +106,7 @@ class WhisperModel(BaseModel):
             self.gen_devkit_files(resume=resume)
             return
 
-        encoder = False
+        encoder_layer_idx_list = list()
         language_detect = False
         init_layer_idx_list = list()
         single_pre_layer_idx_list = list()
@@ -116,7 +116,7 @@ class WhisperModel(BaseModel):
             if part == "all":
                 part = None
             if part in ("encoder", None):
-                encoder = True
+                encoder_layer_idx_list = list(range(self.cfg.encoder_layers))
             if part in ("language_detect", None):
                 language_detect = True
             if part in ("init", None):
@@ -134,6 +134,9 @@ class WhisperModel(BaseModel):
                     )
         else:
             match part:
+                case "encoder":
+                    assert 0 <= part_idx < self.cfg.encoder_layers
+                    encoder_layer_idx_list.append(part_idx)
                 case "init":
                     assert 0 <= part_idx < self.cfg.decoder_layers
                     init_layer_idx_list.append(part_idx)
@@ -188,8 +191,13 @@ class WhisperModel(BaseModel):
                 sima_log_info("  Single post  = %s", single_post_precision)
 
         model_list = list()
-        if encoder:
-            model_list.append((self._get_part_model("encoder"), encoder_precision))
+        for layer_idx in encoder_layer_idx_list:
+            model_list.append(
+                (
+                    self._get_part_model("encoder", layer_idx=layer_idx),
+                    encoder_precision,
+                )
+            )
         if language_detect:
             model_list.append(
                 (self._get_part_model("language_detect"), language_detect_precision)
@@ -300,9 +308,10 @@ class WhisperModel(BaseModel):
         ]
 
         # Encoder.
-        encoder_ifms = [ifms[1]]
-        encoder_model = self._get_part_model("encoder")
-        encoder_ofms = encoder_model.run_model(eval_mode, encoder_ifms)
+        encoder_ofms = [ifms[1]]
+        for layer_idx in range(self.cfg.encoder_layers):
+            encoder_model = self._get_part_model("encoder", layer_idx=layer_idx)
+            encoder_ofms = encoder_model.run_model(eval_mode, encoder_ofms)
 
         if detect_language:
             language_detect_model = self._get_part_model("language_detect")
@@ -539,10 +548,14 @@ class WhisperModel(BaseModel):
     ) -> BaseModel:
         match part:
             case "encoder":
-                model_name = f"{self.model_name}_encoder"
+                model_name = (
+                    f"{self.model_name}_encoder"
+                    if layer_idx is None
+                    else f"{self.model_name}_encoder_layer{layer_idx}"
+                )
                 return WhisperEncoderModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
-                    hf_model=self.hf_model
+                    hf_model=self.hf_model, layer_idx=layer_idx
                 )
             case "language_detect":
                 model_name = f"{self.model_name}_decoder_language_detect"

@@ -82,7 +82,9 @@ if __name__ == "__main__":
         "--part_idx",
         type=int,
         default=None,
-        help="Optional layer or token index for a single Whisper part.",
+        help=(
+            "Optional layer index for encoder/init/pre/post, or token index for cache."
+        ),
     )
     parser.add_argument("--enable_log_probe", action="store_true", default=False)
     args = parser.parse_args()
