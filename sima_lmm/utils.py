@@ -105,6 +105,32 @@ def _rope_scaling_longrope(
     return inv_freq, attention_factor
 
 
+def _rope_scaling_yarn(inv_freq, factor, beta_fast, beta_slow,
+                       original_max_position_embeddings, base, dim, truncate):
+    """YaRN: ramp inv_freq between extrapolation and interpolation; returns (inv_freq, mscale)."""
+    def find_correction_dim(num_rotations):
+        return (dim * np.log(original_max_position_embeddings / (num_rotations * 2 * np.pi))) \
+            / (2 * np.log(base))
+
+    low = find_correction_dim(beta_fast)
+    high = find_correction_dim(beta_slow)
+    if truncate:
+        low, high = np.floor(low), np.ceil(high)
+    low = max(low, 0.0)
+    high = min(high, dim - 1)
+    if high == low:
+        high += 0.001
+
+    n = len(inv_freq)  # dim // 2
+    ramp = np.clip((np.arange(n, dtype=np.float32) - low) / (high - low), 0.0, 1.0)
+    extrapolation_factor = 1.0 - ramp
+    interpolation = inv_freq / factor
+    scaled = interpolation * (1.0 - extrapolation_factor) + inv_freq * extrapolation_factor
+
+    attention_factor = 1.0 if factor <= 1.0 else 0.1 * np.log(factor) + 1.0
+    return scaled.astype(np.float32), attention_factor
+
+
 def calc_freq_real_imag(
     max_num_tokens: int, rope_type: str, theta: float, head_dim: int, scaling_cfg: dict,
     idx_base: int = 0
@@ -112,6 +138,7 @@ def calc_freq_real_imag(
     inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
     inv_freq = inv_freq.astype(np.float32)
     factor = scaling_cfg.get("factor")
+    attention_factor = 1.0  # YaRN scales cos/sin by mscale; 1.0 for every other type.
     match rope_type:
         case "" | "default":
             pass
@@ -132,6 +159,15 @@ def calc_freq_real_imag(
                 max_num_tokens + idx_base,
                 scaling_cfg.get("original_max_position_embeddings")
             )
+        case "yarn":
+            inv_freq, attention_factor = _rope_scaling_yarn(
+                inv_freq, factor,
+                scaling_cfg.get("beta_fast", 32.0),
+                scaling_cfg.get("beta_slow", 1.0),
+                scaling_cfg.get("original_max_position_embeddings"),
+                theta, head_dim,
+                scaling_cfg.get("truncate", True),
+            )
         case _:
             raise ValueError(f"{rope_type} rope type is not supported.")
 
@@ -141,8 +177,8 @@ def calc_freq_real_imag(
 
     # Return in HWC layout. Perform a copy so that the last dimension is contiguous.
     inv_freq = np.expand_dims(inv_freq.transpose(1, 0), axis=(0, 1)).copy()
-    re = np.cos(inv_freq, dtype=np.float64).astype(np.float32)
-    im = np.sin(inv_freq, dtype=np.float64).astype(np.float32)
+    re = (np.cos(inv_freq, dtype=np.float64) * attention_factor).astype(np.float32)
+    im = (np.sin(inv_freq, dtype=np.float64) * attention_factor).astype(np.float32)
 
     # Insert 1 for indices that are not scaled
     if n_scaled_freq < head_dim // 2:

@@ -101,6 +101,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
     def _kv_size(self) -> int:
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
+    @property
+    def _use_attention_sinks(self) -> bool:
+        # gpt_oss adds a per-head learned sink logit to the attention softmax.
+        return self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
+
     def gen_onnx_files(self):
         base_name = f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
 
@@ -136,6 +141,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
         elif self._cache_mask_size > 1 and self.num_tokens == 1:
             # Enable the future attention mask to reduce the total number of cache models.
             self._onnx_builder.create_input_node("attn_mask", (1, self.token_idx + 1, 1, 1))
+        if self._use_attention_sinks:
+            # Per-head sink logit (input_nodes[-2]), fed per layer at runtime.
+            self._onnx_builder.create_input_node(
+                "sinks", (1, self.cfg.lm_cfg.attn_cfg.num_attention_heads, 1, self.num_tokens)
+            )
         self._onnx_builder.create_input_node(f"cached_values", kv_cache_shape)
 
         output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
@@ -210,7 +220,28 @@ class LanguageCacheModel(LanguagePartBaseModel):
             bmm1 = self._onnx_builder.build_op(
                 f"{base_name}.masked_bmm1", [bmm1, input_nodes[2]], "Add"
             )
-        softmax = self._onnx_builder.build_op(f"{base_name}.softmax", [bmm1], "Softmax", axis=1)
+        if self._use_attention_sinks:
+            # Sink as an extra key position: concat, softmax over context+1, drop it.
+            sinks = self._onnx_builder.build_split_and_concat(
+                f"{base_name}.sink_reshape", input_nodes[-2],
+                self.cfg.lm_cfg.attn_cfg.num_attention_heads,
+                split_axis=1, concat_axis=2,
+            )
+            combined = self._onnx_builder.build_op(
+                f"{base_name}.sink_concat", [bmm1, sinks], "Concat", axis=1
+            )
+            softmax = self._onnx_builder.build_op(
+                f"{base_name}.softmax", [combined], "Softmax", axis=1
+            )
+            softmax = self._onnx_builder.build_op(
+                f"{base_name}.sink_slice",
+                [softmax, np.array([0], dtype=np.int64),
+                 np.array([self.context_length], dtype=np.int64),
+                 np.array([1], dtype=np.int64)],
+                "Slice",
+            )
+        else:
+            softmax = self._onnx_builder.build_op(f"{base_name}.softmax", [bmm1], "Softmax", axis=1)
         reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
         if len(reduction_ranges) == 1:
             bmm2 = self._onnx_builder.build_op(
@@ -569,6 +600,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 dram_layout=TensorDRAMLayout.HWC
             )
             tessellate_params[idx] = attn_mask_tessellate_params
+            idx += 1
+
+        # Skip the sinks input's index so the strided cached_values tessellation lands
+        # on cached_values, not on sinks.
+        if self._use_attention_sinks:
             idx += 1
 
         # cached_values

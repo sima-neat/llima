@@ -52,6 +52,30 @@ class LanguagePartBaseModel(BaseModel):
         # Make sure that there is residual add input if needed.
         assert len(input_nodes) == (2 if with_residual_add else 1)
 
+        expert_idx = getattr(self, "expert_idx", -1)
+        swiglu_limit = self.cfg.lm_cfg.mlp_cfg.swiglu_limit
+        if swiglu_limit is not None:
+            # Clamped gated SwiGLU. de_interleave (gpt_oss only) splits the fused
+            # interleaved gate_up into two projection convs at load time.
+            de_interleave = self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
+            gate = self._onnx_builder.build_conv_from_dense_with_lora(
+                f"{base_name}.gate_proj", input_nodes[0], None,
+                expert_idx=expert_idx, de_interleave=de_interleave,
+            )
+            up = self._onnx_builder.build_conv_from_dense_with_lora(
+                f"{base_name}.up_proj", input_nodes[0], None,
+                expert_idx=expert_idx, de_interleave=de_interleave,
+            )
+            act = self._onnx_builder.build_swiglu(f"{base_name}.act", gate, up, swiglu_limit)
+            down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
+                f"{base_name}.down_proj", act, None, expert_idx=expert_idx
+            )
+            if with_residual_add:
+                down_proj = self._onnx_builder.build_op(
+                    f"{base_name}.add2", [input_nodes[1], down_proj], "Add"
+                )
+            return down_proj
+
         # Determine weight naming convention based on what exists in the model.
         if self.check_hf_param(f"{base_name}.w2.weight"):
             gate_name, up_name, down_name = "w1", "w3", "w2"
@@ -244,10 +268,12 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             in one model.
         layer_idx: Transformer layer index.
         final_softcapping: Final logit soft capping for gemma 2.
+        expert_idx: MoE expert this post model builds; -1 for a non-expert post model.
     """
     num_tokens: int
     layer_idx: int
     final_softcapping: float | None
+    expert_idx: int = -1
 
     def _create_final_layer_output_nodes(self, output_nodes: list[OnnxNode]):
         """Create output nodes for the final transformer layer."""
