@@ -57,6 +57,12 @@ ReasoningStreamParser::ReasoningStreamParser(
         _start_marker = think_open;
         _end_marker = think_close;
         _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
+    } else if (format == ReasoningFormat::GptOss) {
+        // Harmony always emits channels; analysis = reasoning, final = answer.
+        // Parse even when thinking is off so only the final channel shows.
+        _start_marker = gptoss_reasoning_open;
+        _end_marker = gptoss_reasoning_close;
+        _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
     } else if (!enabled || format == ReasoningFormat::None) {
         _mode = Mode::Content;
     } else if (format == ReasoningFormat::Qwen) {
@@ -64,11 +70,6 @@ ReasoningStreamParser::ReasoningStreamParser(
         _end_marker = think_close;
         _mode = Mode::Reasoning;
         _optional_start = true;
-    } else if (format == ReasoningFormat::GptOss) {
-        // Harmony: analysis channel is reasoning, final channel is the answer.
-        _start_marker = gptoss_reasoning_open;
-        _end_marker = gptoss_reasoning_close;
-        _mode = prompt_opens_reasoning ? Mode::Reasoning : Mode::AwaitingStart;
     } else {
         _start_marker = gemma_reasoning_open;
         _end_marker = gemma_reasoning_close;
