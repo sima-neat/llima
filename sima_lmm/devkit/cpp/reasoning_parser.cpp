@@ -11,6 +11,8 @@ constexpr std::string_view think_open = "<think>";
 constexpr std::string_view think_close = "</think>";
 constexpr std::string_view gemma_reasoning_open = "<|channel>thought\n";
 constexpr std::string_view gemma_reasoning_close = "<channel|>";
+constexpr std::string_view gptoss_reasoning_open = "<|channel|>analysis<|message|>";
+constexpr std::string_view gptoss_reasoning_close = "<|channel|>final<|message|>";
 
 } // namespace
 
@@ -24,6 +26,9 @@ ReasoningFormat reasoning_format_for_model(std::string_view model_type) {
     if (model_type == "llm-lfm2") {
         return ReasoningFormat::Lfm2;
     }
+    if (model_type == "llm-gpt_oss") {
+        return ReasoningFormat::GptOss;
+    }
     return ReasoningFormat::None;
 }
 
@@ -34,6 +39,8 @@ std::array<std::string_view, 2> reasoning_special_tokens(ReasoningFormat format)
             return {think_open, think_close};
         case ReasoningFormat::Gemma4:
             return {"<|channel>", gemma_reasoning_close};
+        case ReasoningFormat::GptOss:
+            return {"<|channel|>", "<|message|>"};
         case ReasoningFormat::None:
             return {"", ""};
     }
@@ -57,6 +64,11 @@ ReasoningStreamParser::ReasoningStreamParser(
         _end_marker = think_close;
         _mode = Mode::Reasoning;
         _optional_start = true;
+    } else if (format == ReasoningFormat::GptOss) {
+        // Harmony: analysis channel is reasoning, final channel is the answer.
+        _start_marker = gptoss_reasoning_open;
+        _end_marker = gptoss_reasoning_close;
+        _mode = prompt_opens_reasoning ? Mode::Reasoning : Mode::AwaitingStart;
     } else {
         _start_marker = gemma_reasoning_open;
         _end_marker = gemma_reasoning_close;
