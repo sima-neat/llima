@@ -106,8 +106,12 @@ def _rope_scaling_longrope(
 
 
 def _rope_scaling_yarn(inv_freq, factor, beta_fast, beta_slow,
-                       original_max_position_embeddings, base, dim, truncate):
-    """YaRN: ramp inv_freq between extrapolation and interpolation; returns (inv_freq, mscale)."""
+                       original_max_position_embeddings, base, dim, truncate,
+                       attention_factor=None):
+    """YaRN: ramp inv_freq between extrapolation and interpolation; returns (inv_freq, mscale).
+
+    attention_factor overrides the default mscale when the config declares one.
+    """
     def find_correction_dim(num_rotations):
         return (dim * np.log(original_max_position_embeddings / (num_rotations * 2 * np.pi))) \
             / (2 * np.log(base))
@@ -127,7 +131,8 @@ def _rope_scaling_yarn(inv_freq, factor, beta_fast, beta_slow,
     interpolation = inv_freq / factor
     scaled = interpolation * (1.0 - extrapolation_factor) + inv_freq * extrapolation_factor
 
-    attention_factor = 1.0 if factor <= 1.0 else 0.1 * np.log(factor) + 1.0
+    if attention_factor is None:
+        attention_factor = 1.0 if factor <= 1.0 else 0.1 * np.log(factor) + 1.0
     return scaled.astype(np.float32), attention_factor
 
 
@@ -167,6 +172,7 @@ def calc_freq_real_imag(
                 scaling_cfg.get("original_max_position_embeddings"),
                 theta, head_dim,
                 scaling_cfg.get("truncate", True),
+                scaling_cfg.get("attention_factor"),
             )
         case _:
             raise ValueError(f"{rope_type} rope type is not supported.")
