@@ -459,12 +459,10 @@ void LanguageModel::run_model_decode(
         auto duration = timer_tps.stop(true);
         _notify_new_token(next_token_id, duration);
         if (_stop_token_ids.contains(token_id)) {
-            _dump_moe_timing();
             _notify_stop();
             return;
         }
         if (!_is_running.load(std::memory_order_relaxed)) {
-            _dump_moe_timing();
             _notify_interrupt();
             return;
         }
@@ -474,7 +472,6 @@ void LanguageModel::run_model_decode(
     if (token_idx == _max_num_tokens) {
         _notify_cache_full();
     }
-    _dump_moe_timing();
 }
 
 
@@ -2142,32 +2139,6 @@ LanguageModel::MoeHostCache& LanguageModel::_get_moe_host(uint16_t moe_nt) {
 }
 
 
-void LanguageModel::_dump_moe_timing() {
-    if (_dbg_q_tokens == 0) return;
-    const uint32_t n = _dbg_q_tokens;
-    MoeLayerTiming tot;
-    for (const auto& t: _dbg_q_layers) {
-        tot.flush += t.flush; tot.a65 += t.a65; tot.router += t.router;
-        tot.experts += t.experts; tot.ws += t.ws;
-    }
-    auto us = [n](uint64_t total_ns) { return total_ns / n / 1000; };  // avg us/token
-    spdlog::info("==== MoE decode timing: {} tokens (avg us/token) ====", n);
-    spdlog::info(
-        "per-token: router={} flush={} a65={} experts={} ws={} | sum={}",
-        us(tot.router), us(tot.flush), us(tot.a65), us(tot.experts), us(tot.ws),
-        us(tot.router + tot.flush + tot.a65 + tot.experts + tot.ws));
-    spdlog::info("per-layer (avg us/token):  L | router flush a65 experts ws");
-    for (size_t L = 0; L < _dbg_q_layers.size(); ++L) {
-        const auto& t = _dbg_q_layers[L];
-        spdlog::info("  L{:>2} | {} {} {} {} {}",
-            L, t.router / n / 1000, t.flush / n / 1000, t.a65 / n / 1000,
-            t.experts / n / 1000, t.ws / n / 1000);
-    }
-    _dbg_q_layers.clear();
-    _dbg_q_tokens = 0;
-}
-
-
 void LanguageModel::_run_moe_post(
     const LanguageModelMapKey& model_key,
     std::map<uint8_t, MLABufferSlice>* ifm_map,
@@ -2184,15 +2155,11 @@ void LanguageModel::_run_moe_post(
     const LanguageModelMapKey router_key{num_tokens, layer_idx, 0};
     const LanguageModelMapKey ws_key{num_tokens, layer_idx, 0};
 
-    using _clk = std::chrono::steady_clock;
-    const auto _t0 = _clk::now();
     // Router -> values + indices + residual + norm(h) (TopK+softmax on MLA).
     _router_model_map.at(router_key).add_to_queue(ifm_map);
-    const auto _t_router = _clk::now();
 
     // Flush this layer's pre+cache+router (+ prev layer's experts+ws) so indices are ready.
     MLAModelWithBuffer::run_queue();
-    const auto _t_flush = _clk::now();
 
     // Host: scatter the k weights into dense router_weights (indices are int32 from the MLA).
     MoeHostCache& mh = _get_moe_host(moe_nt);
@@ -2231,7 +2198,6 @@ void LanguageModel::_run_moe_post(
         }
     }
     mh.weights->upload(weights.data());
-    const auto _t_a65 = _clk::now();
 
     // Experts. Prefill runs the selected experts (rest zeroed); decode runs the top-k,
     // routing each into the first combine slots.
@@ -2257,29 +2223,8 @@ void LanguageModel::_run_moe_post(
         }
     }
 
-    const auto _t_expert = _clk::now();
-
     // Weighted sum -> layer output. No flush: experts+ws ride to the next router flush.
     _weightedsum_model_map.at(ws_key).add_to_queue();
-    const auto _t_ws = _clk::now();
-
-    // DEBUG (decode only): per-layer MoE timing, averaged per token at dump.
-    if (num_tokens == 1) {
-        if (_dbg_q_layers.size() < _cfg.lm_cfg.num_hidden_layers) {
-            _dbg_q_layers.resize(_cfg.lm_cfg.num_hidden_layers);
-        }
-        auto ns = [](const _clk::time_point& a, const _clk::time_point& b) {
-            return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
-        };
-        auto& t = _dbg_q_layers[layer_idx];
-        t.router  += ns(_t0, _t_router);
-        t.flush   += ns(_t_router, _t_flush);
-        t.a65     += ns(_t_flush, _t_a65);
-        t.experts += ns(_t_a65, _t_expert);
-        t.ws      += ns(_t_expert, _t_ws);
-        if (is_last) ++_dbg_q_tokens;
-    }
 }
 
 
