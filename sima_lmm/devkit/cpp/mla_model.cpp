@@ -43,6 +43,13 @@ MlaRunCompletion wait_for_result(
     simaaidispatcher::DispatcherBase* dispatcher,
     std::future<MlaRunCompletion>& future
 ) {
+    // The completion fires as a callback on the dispatcher thread, so future.get() pays a
+    // cross-thread wakeup (block + context switch) every flush. On the hot decode path the
+    // main thread has nothing else to do while the MLA runs, so busy-wait for the result
+    // instead -- avoids the wakeup latency, matching a synchronous mla_rt call.
+    while (future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        // spin
+    }
     MlaRunCompletion result = future.get();
     if (result.rc != 0) {
         result.detail = dispatcher->lastErrorString();
