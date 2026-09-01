@@ -316,6 +316,9 @@ class RopeScalingConfig(BaseConfig):
         original_max_position_embeddings: The original context length used in model training with
             the given RoPS settings.
         attention_factor: The post-processing scale applied to LongRoPE cos/sin tables.
+        beta_fast: The number of rotations for the fast (extrapolated) boundary (yarn).
+        beta_slow: The number of rotations for the slow (interpolated) boundary (yarn).
+        truncate: Whether to floor/ceil the correction dimensions (yarn). GPT-OSS sets it False.
         long_factor: List of scaling factors for long context (longrope).
         short_factor: List of scaling factors for short context (longrope).
         rope_type: The type of RoPE scaling method. Supported types are "linear" or "default",
@@ -328,6 +331,9 @@ class RopeScalingConfig(BaseConfig):
     high_freq_factor: float = 0
     original_max_position_embeddings: int = 0
     attention_factor: float | None = None
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    truncate: bool = True
     long_factor: list[float] | None = None
     short_factor: list[float] | None = None
     rope_type: str = "default"
