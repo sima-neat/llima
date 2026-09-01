@@ -464,7 +464,6 @@ class LanguageModel(BaseModel):
         moe = self.cfg.lm_cfg.moe_cfg
         num_experts = moe.num_experts
 
-        sima_log_info("  layer %d: router", layer_idx)  # TEMP test log
         router_model = self._get_part_model("router", num_tokens, layer_idx=layer_idx)
         values, indices, residual, norm_hidden = router_model.run_model(
             eval_mode, [hidden, self_attn]
@@ -482,7 +481,6 @@ class LanguageModel(BaseModel):
         activated = set(int(e) for e in idxs.flatten())
 
         def run_expert(e):
-            sima_log_info("  layer %d: expert %d", layer_idx, e)  # TEMP test log
             ex_model = self._get_part_model(
                 "post", num_tokens, layer_idx=layer_idx, expert_idx=e
             )
@@ -500,7 +498,6 @@ class LanguageModel(BaseModel):
             for e in sorted(activated):
                 expert_outs.append(run_expert(e))
 
-        sima_log_info("  layer %d: weighted-sum", layer_idx)  # TEMP test log
         ws_model = self._get_part_model("moe_weightedsum", num_tokens, layer_idx=layer_idx)
         return ws_model.run_model(eval_mode, expert_outs + [residual])
 
