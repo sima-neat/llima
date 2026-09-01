@@ -422,6 +422,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<MoeHostCache> _moe_host;
         void _init_moe_host_cache();
         MoeHostCache& _get_moe_host(uint16_t moe_nt);
+        // DEBUG (decode only): per-layer MoE timing, averaged per token by _dump_moe_timing.
+        // flush = run_queue() device batch; a65 = host router round-trip (download+scatter+upload).
+        struct MoeLayerTiming {
+            uint64_t flush = 0, a65 = 0, router = 0, experts = 0, ws = 0;
+        };
+        std::vector<MoeLayerTiming> _dbg_q_layers;
+        uint32_t _dbg_q_tokens = 0;
+        void _dump_moe_timing();
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
 
