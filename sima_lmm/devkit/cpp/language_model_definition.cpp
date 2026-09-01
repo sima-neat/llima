@@ -273,6 +273,17 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
     }
+    // gpt_oss attention sinks: per-layer sink logit fed to the (layer-shared) cache model,
+    // slotted right before cached_values. Rebound per layer at runtime in _bind_attn_models.
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        cache_ifms.emplace_back(
+            MLABufferSlice{
+                &get_buffer(fmt::format("sinks_l{}", layer_idx)),
+                {0, 0},
+                {num_tokens, _cfg.lm_cfg.attn_cfg.num_attention_heads}
+            }
+        );
+    }
     cache_ifms.emplace_back(
         MLABufferSlice{
             &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
