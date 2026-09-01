@@ -273,8 +273,7 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
     }
-    // gpt_oss attention sinks: per-layer sink logit fed to the (layer-shared) cache model,
-    // slotted right before cached_values. Rebound per layer at runtime in _bind_attn_models.
+    // gpt_oss attention sinks slot, right before cached_values (rebound per layer at runtime).
     if (_cfg.lm_cfg.uses_attention_sinks()) {
         cache_ifms.emplace_back(
             MLABufferSlice{
@@ -457,16 +456,14 @@ void LanguageModel::_define_moe_post_models(
     const uint16_t top_k = moe.num_experts_per_tok;
     const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
 
-    // Last layer runs single-token only (like the dense post): router/experts/combine use
-    // the n1 ELFs and n1 buffers; the group inputs are remapped to the last token at runtime.
+    // Last layer runs single-token (n1 ELFs/buffers), like the dense post.
     const uint16_t moe_nt = (is_last && !_cfg.lm_cfg.is_spec_decode()) ? 1 : num_tokens;
 
     // Shared attention-block inputs: the residual-stream hidden state and self_attn.
     const MLABufferSlice hidden = is_draft ? pre_ifms[1] : pre_ifms[0];
     const MLABufferSlice self_attn = cache_ofms[0];
 
-    // Router -> top-k routing weights + selected expert indices (TopK+softmax on the MLA)
-    // + residual h + norm(h). Order matches the router ONNX outputs.
+    // Router -> top-k weights + indices (TopK+softmax on MLA) + residual h + norm(h).
     std::vector<MLABufferSlice> router_ifms{hidden, self_attn};
     std::vector<MLABufferSlice> router_ofms{
         MLABufferSlice{&get_buffer(fmt::format("n{}_router_values", moe_nt))},
@@ -479,8 +476,7 @@ void LanguageModel::_define_moe_post_models(
         "router", router_key, _get_elf_path_router(moe_nt, layer_idx), router_ifms, router_ofms
     );
 
-    // Experts consume norm(h) directly and scale their MLP output by their routing-weight
-    // column. Every expert is defined; the runtime runs the top-k.
+    // Experts consume norm(h), scaled by their routing-weight column (runtime runs the top-k).
     for (uint16_t e = 0; e < num_experts; ++e) {
         std::vector<MLABufferSlice> expert_ifms{
             MLABufferSlice{&get_buffer(fmt::format("n{}_norm_hidden", moe_nt))},
@@ -496,8 +492,7 @@ void LanguageModel::_define_moe_post_models(
         );
     }
 
-    // Weighted sum: sum the (already routing-weighted) expert outputs, then add the residual.
-    // Prefill sums all experts; decode (moe_nt == 1) sums the top-k written into the first slots.
+    // Weighted sum of the routing-weighted expert outputs + residual (decode sums the top-k).
     const uint16_t n_combine = (moe_nt == 1) ? top_k : num_experts;
     std::vector<MLABufferSlice> ws_ifms;
     for (uint16_t e = 0; e < n_combine; ++e) {

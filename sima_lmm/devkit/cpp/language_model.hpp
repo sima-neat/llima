@@ -401,17 +401,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _router_model_map;
         LanguageModelMap _expert_model_map;
         LanguageModelMap _weightedsum_model_map;
-        // Preresolved handles + reusable staging for the MoE host round-trip, one entry per
-        // compiled MoE variant. Fixed once buffers + MoE models are defined, so the per-layer
-        // round-trip does no format, no name lookup, no heap allocation.
+        // Preresolved handles + staging for the MoE host round-trip, one per MoE variant.
         struct MoeHostCache {
             uint16_t num_tokens = 0;             // the moe_nt this entry serves
             MLABuffer* values = nullptr;         // n{nt}_router_values
             MLABuffer* indices = nullptr;        // n{nt}_router_indices
             MLABuffer* weights = nullptr;        // n{nt}_router_weights
             std::vector<MLABuffer*> expert_out;  // n{nt}_expert{e}, e < num_experts
-            // Decode only (nt == 1): the top_k OFM overrides that route each selected
-            // expert's output into the combine slot the weighted-sum reads.
+            // Decode only: top_k OFM overrides routing each expert into its combine slot.
             std::vector<std::map<uint8_t, MLABufferSlice>> slot_ofm;
             // Host staging, sized once; never reallocated on the critical path.
             std::vector<Eigen::bfloat16> values_scratch;   // nt * top_k

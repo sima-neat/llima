@@ -1258,8 +1258,7 @@ void LanguageModel::_initialize() {
     _define_models();
     MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
 
-    // Resolve the MoE host round-trip handles once (buffers are allocated above), so the
-    // per-layer round-trip stays allocation-free.
+    // Resolve the MoE host round-trip handles once (buffers allocated above).
     if (_cfg.lm_cfg.is_moe()) {
         _init_moe_host_cache();
     }
@@ -1296,8 +1295,8 @@ void LanguageModel::_initialize() {
         _logger->info("Loaded d2t mapping with {} entries", _d2t.size());
     }
 
-    // Upload attention sinks (gpt_oss): broadcast each layer's per-head sink vector across
-    // all rows of its per-layer buffer. Stored as raw bfloat16, shape (num_layers, num_heads).
+    // Upload attention sinks (gpt_oss): broadcast each layer's per-head vector across its
+    // buffer rows. Raw bf16, shape (num_layers, num_heads).
     if (_cfg.lm_cfg.uses_attention_sinks()) {
         const auto sinks_file_name = _devkit_dir / (_cfg.language_model_name + "_sinks.bin");
         std::ifstream sinks_file(sinks_file_name, std::ios::binary);
@@ -1600,9 +1599,8 @@ void LanguageModel::_define_buffers() {
         }
     }
 
-    // gpt_oss attention sinks: a per-head logit fed to the (shared) cache model. The value
-    // is constant across tokens, so each per-layer buffer holds that layer's sink vector
-    // broadcast across the largest token count; the cache model slices num_tokens rows.
+    // gpt_oss attention sinks: per-head logit for the (shared) cache model, one buffer per
+    // layer broadcast across tokens; the cache model slices num_tokens rows.
     if (_cfg.lm_cfg.uses_attention_sinks()) {
         uint16_t max_sink_tokens = _cfg.lm_cfg.get_single_num_tokens();
         if (_use_group_token_models) {
@@ -1710,13 +1708,9 @@ void LanguageModel::_define_buffers() {
         if (_cfg.lm_cfg.is_moe()) {
             const uint16_t num_experts = _cfg.lm_cfg.moe_cfg.value().num_experts;
             const uint16_t top_k = _cfg.lm_cfg.moe_cfg.value().num_experts_per_tok;
-            // Router outputs: top-k routing weights (softmax over the k selected) and the
-            // selected expert indices (TopK + softmax run on the MLA). Plus residual
-            // h = input + o_proj and norm(h); norm(h) is the shared expert input computed
-            // once by the router so experts don't take hidden.
+            // Router outputs: top-k weights + selected indices (int32 from the MLA), residual
+            // h, and norm(h) (computed once by the router; every expert consumes it).
             define_buffer(fmt::format("n{}_router_values", num_tokens), {num_tokens, top_k});
-            // int32: the MLA emits the TopK indices as int32 (its native index dtype); the
-            // ONNX output is typed int64 per spec, but the compiled ELF writes int32.
             define_buffer(
                 fmt::format("n{}_router_indices", num_tokens), {num_tokens, top_k}, "int32"
             );
@@ -1726,11 +1720,9 @@ void LanguageModel::_define_buffers() {
             define_buffer(
                 fmt::format("n{}_norm_hidden", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
             );
-            // Dense per-expert routing weights: the host scatters the k router_values at
-            // router_indices here, and every expert scales its output by its column.
+            // Dense per-expert routing weights (host scatters the k values here).
             define_buffer(fmt::format("n{}_router_weights", num_tokens), {num_tokens, num_experts});
-            // Per-expert (already routing-weighted) outputs, summed by the combine. In decode
-            // only top_k run, writing into the first slots.
+            // Per-expert outputs, summed by the combine (decode fills only the first top_k).
             for (uint16_t e = 0; e < num_experts; ++e) {
                 define_buffer(
                     fmt::format("n{}_expert{}", num_tokens, e),
@@ -1941,8 +1933,7 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     );
     auto& pre_model = _pre_model_map.at(pre_post_key);
     auto& cache_model = _cache_model_map.at(cache_key);
-    // MoE has no dense post model; the router is the sub-model that consumes the raw hidden
-    // state (and its layer-0 embedding scale when quantized), so bind those inputs to it.
+    // MoE has no post model; bind these inputs to the router (it consumes the raw hidden).
     auto& post_model = _cfg.lm_cfg.is_moe()
         ? _router_model_map.at(pre_post_key)
         : _post_model_map.at(pre_post_key);
@@ -2048,8 +2039,7 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
             );
         }
     }
-    // gpt_oss sinks: the cache model is shared across layers, so bind this layer's sink
-    // vector before cached_values (matching the define-time slot order).
+    // gpt_oss sinks: cache model is layer-shared, so bind this layer's sinks before cached_values.
     if (_cfg.lm_cfg.uses_attention_sinks()) {
         auto& sinks_buf = get_buffer(fmt::format("sinks_l{}", layer_idx));
         cache_model._bind_ifm(cache_ifm_idx++, &sinks_buf, {0, 0});
@@ -2196,20 +2186,15 @@ void LanguageModel::_run_moe_post(
 
     using _clk = std::chrono::steady_clock;
     const auto _t0 = _clk::now();
-    // 1. Router -> router_values (top-k softmax weights) + router_indices + residual +
-    //    norm(h); TopK + softmax run on the MLA. ifm_map carries the forward loop's input
-    //    remap (layer-0 embeddings, last-layer last token).
+    // Router -> values + indices + residual + norm(h) (TopK+softmax on MLA).
     _router_model_map.at(router_key).add_to_queue(ifm_map);
     const auto _t_router = _clk::now();
 
-    // Pipelined flush: runs this layer's pre+cache+router plus the previous layer's
-    // experts+ws that rode along, so the router's indices are on the device to read below.
+    // Flush this layer's pre+cache+router (+ prev layer's experts+ws) so indices are ready.
     MLAModelWithBuffer::run_queue();
     const auto _t_flush = _clk::now();
 
-    // 2. Host: scatter the k routing weights into the dense per-expert router_weights (zero
-    //    elsewhere). indices are int32 (the MLA emits the TopK indices as int32). Handles +
-    //    staging come preresolved from the MoE host cache (allocation-/lookup-free).
+    // Host: scatter the k weights into dense router_weights (indices are int32 from the MLA).
     MoeHostCache& mh = _get_moe_host(moe_nt);
     auto& values = mh.values_scratch;
     auto& indices = mh.indices_scratch;
@@ -2248,10 +2233,8 @@ void LanguageModel::_run_moe_post(
     mh.weights->upload(weights.data());
     const auto _t_a65 = _clk::now();
 
-    // 3. Experts. Prefill runs only the experts some token selected (unselected -> zero its
-    //    slot, skip the run). Single-token runs the top-k, routing each into the first slots
-    //    so the k-input combine reads them in order. Experts read norm_hidden + router_weights
-    //    (full device buffers), so they take NO ifm_map remap.
+    // Experts. Prefill runs the selected experts (rest zeroed); decode runs the top-k,
+    // routing each into the first combine slots.
     if (moe_nt > 1) {
         auto& activated = mh.activated_scratch;
         std::fill(activated.begin(), activated.end(), uint8_t{0});
@@ -2268,8 +2251,7 @@ void LanguageModel::_run_moe_post(
     } else {
         for (uint16_t slot = 0; slot < top_k; ++slot) {
             const uint16_t e = static_cast<uint16_t>(indices[slot]);  // moe_nt==1 row 0
-            // Route this selected expert's output into slot `slot` (the k-input combine
-            // reads expert0..expert{k-1}); the override slices are prebuilt per slot.
+            // Route this expert's output into combine slot `slot` (prebuilt override).
             _expert_model_map.at({num_tokens, layer_idx, e})
                 .add_to_queue(nullptr, &mh.slot_ofm[slot]);
         }
@@ -2277,13 +2259,11 @@ void LanguageModel::_run_moe_post(
 
     const auto _t_expert = _clk::now();
 
-    // 4. Weighted sum -> layer output (hidden into n{nt}_buffer1, or logits at the last
-    //    layer). No flush: experts + ws ride to the next layer's router flush (or the final
-    //    run_queue for the last layer).
+    // Weighted sum -> layer output. No flush: experts+ws ride to the next router flush.
     _weightedsum_model_map.at(ws_key).add_to_queue();
     const auto _t_ws = _clk::now();
 
-    // DEBUG (decode only): accumulate this layer's MoE timing; averaged per token at dump.
+    // DEBUG (decode only): per-layer MoE timing, averaged per token at dump.
     if (num_tokens == 1) {
         if (_dbg_q_layers.size() < _cfg.lm_cfg.num_hidden_layers) {
             _dbg_q_layers.resize(_cfg.lm_cfg.num_hidden_layers);
