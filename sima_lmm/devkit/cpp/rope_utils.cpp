@@ -72,6 +72,54 @@ static Eigen::ArrayXf calc_rope_scaling_longrope(
 // rope_dimension_count controls the active width of the rotary table.
 // Proportional RoPE spaces the active frequencies over the full layer head dim;
 // other RoPE variants space them over the active rotary dim itself.
+// YaRN attention factor (mscale): scales cos/sin so attention magnitude is preserved
+// after frequency interpolation. Matches HF get_mscale in _compute_yarn_parameters.
+static double get_yarn_attention_factor(double factor) {
+    if (factor <= 1.0) {
+        return 1.0;
+    }
+    return 0.1 * std::log(factor) + 1.0;
+}
+
+// YaRN inv_freq: ramp between extrapolation (unscaled inv_freq) and interpolation
+// (inv_freq / factor) across the rotary dimensions; `base` is rope_theta.
+// Mirrors HF _compute_yarn_parameters (find_correction_range + ramp).
+static Eigen::ArrayXf calc_rope_scaling_yarn(
+    const Eigen::ArrayXf& inv_freq, const RopeScalingConfig& cfg,
+    double base, uint16_t rope_dimension_count
+) {
+    const double factor = cfg.factor;
+    const double orig_max = static_cast<double>(cfg.original_max_position_embeddings);
+    const int dim = rope_dimension_count;
+
+    auto find_correction_dim = [&](double num_rotations) {
+        return (dim * std::log(orig_max / (num_rotations * 2.0 * std::numbers::pi)))
+               / (2.0 * std::log(base));
+    };
+    double low = find_correction_dim(cfg.beta_fast);
+    double high = find_correction_dim(cfg.beta_slow);
+    if (cfg.truncate) {
+        low = std::floor(low);
+        high = std::ceil(high);
+    }
+    low = std::max(low, 0.0);
+    high = std::min(high, static_cast<double>(dim - 1));
+    if (high == low) {
+        high += 0.001;
+    }
+
+    const Eigen::Index n = inv_freq.size();  // = dim / 2
+    Eigen::ArrayXf ramp =
+        ((Eigen::ArrayXf::LinSpaced(n, 0, static_cast<float>(n - 1)) - static_cast<float>(low))
+             / static_cast<float>(high - low))
+            .cwiseMax(0.0f).cwiseMin(1.0f);
+    Eigen::ArrayXf extrapolation_factor = 1.0f - ramp;
+
+    Eigen::ArrayXf interpolation = inv_freq / static_cast<float>(factor);
+    return interpolation * (1.0f - extrapolation_factor) + inv_freq * extrapolation_factor;
+}
+
+
 RopeTable calc_freq_real_imag(
     uint16_t max_num_tokens,
     const std::string& rope_type,
@@ -89,6 +137,8 @@ RopeTable calc_freq_real_imag(
     auto inv_freq_seq = Eigen::ArrayXd::LinSpaced(freq_dim, 0, rope_dimension_count - 2);
     Eigen::ArrayXf inv_freq = Eigen::pow(theta, inv_freq_seq / frequency_denominator).inverse().cast<float>();
     Eigen::ArrayXf scaled_inv_freq;
+    // YaRN scales cos/sin by an attention factor (mscale); 1.0 for every other type.
+    float yarn_attention_factor = 1.0f;
     if (rope_type == "" || rope_type == "default" || rope_type == "mrope" || rope_type == "proportional") {
         scaled_inv_freq = inv_freq;
     } else if (rope_type == "linear") {
@@ -97,6 +147,9 @@ RopeTable calc_freq_real_imag(
         scaled_inv_freq = calc_rope_scaling_llama3(inv_freq, rope_scaling_cfg);
     } else if (rope_type == "longrope") {
         scaled_inv_freq = calc_rope_scaling_longrope(inv_freq, rope_scaling_cfg, max_num_tokens);
+    } else if (rope_type == "yarn") {
+        scaled_inv_freq = calc_rope_scaling_yarn(inv_freq, rope_scaling_cfg, theta, rope_dimension_count);
+        yarn_attention_factor = static_cast<float>(get_yarn_attention_factor(rope_scaling_cfg.factor));
     } else {
         throw std::runtime_error(fmt::format("{} rope type is not supported", rope_type));
     }
@@ -113,6 +166,10 @@ RopeTable calc_freq_real_imag(
     if (rope_type == "longrope" && rope_scaling_cfg.attention_factor.has_value()) {
         re_float *= rope_scaling_cfg.attention_factor.value();
         im_float *= rope_scaling_cfg.attention_factor.value();
+    } else if (rope_type == "yarn") {
+        // YaRN mscale: scale cos/sin to preserve attention magnitude.
+        re_float *= yarn_attention_factor;
+        im_float *= yarn_attention_factor;
     }
     MatrixXXbf re = re_float.cast<Eigen::bfloat16>();
     MatrixXXbf im = im_float.cast<Eigen::bfloat16>();

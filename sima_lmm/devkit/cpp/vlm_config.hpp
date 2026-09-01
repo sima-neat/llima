@@ -105,10 +105,15 @@ struct RopeScalingConfig {
     std::string rope_type;
     std::optional<std::vector<size_t>> mrope_section;
     bool mrope_interleaved = false;
+    // YaRN parameters (rope_type == "yarn"). Defaults match the HF fallbacks.
+    double beta_fast = 32.0;
+    double beta_slow = 1.0;
+    bool truncate = false;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     RopeScalingConfig, factor, low_freq_factor, high_freq_factor, original_max_position_embeddings,
-    attention_factor, long_factor, short_factor, rope_type, mrope_section, mrope_interleaved
+    attention_factor, long_factor, short_factor, rope_type, mrope_section, mrope_interleaved,
+    beta_fast, beta_slow, truncate
 )
 
 
