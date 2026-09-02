@@ -40,6 +40,10 @@ class ReasoningStreamParser {
             bool from_draft = false
         );
 
+        // True while reasoning tokens are being consumed without being emitted,
+        // i.e. the caller sees no output even though the model is generating.
+        bool in_hidden_reasoning() const { return _mode == Mode::HiddenReasoning; }
+
     private:
         enum class Mode {
             AwaitingStart,

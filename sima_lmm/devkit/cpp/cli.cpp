@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <unistd.h>
 
 #include "cli.hpp"
 #include "reasoning_parser.hpp"
@@ -214,6 +215,23 @@ void CLI::run() {
         std::string final_response;
         bool saw_reasoning = false;
         bool saw_content = false;
+        size_t spinner_frame = 0;
+
+        // Hidden reasoning emits no text, so animate a spinner on the tokens it
+        // consumes to show the model is working. Skipped when stdout is not a
+        // terminal so redirected output stays free of escape sequences.
+        const bool animate_thinking = isatty(STDOUT_FILENO) != 0;
+        const auto draw_spinner = [&]() {
+            constexpr std::string_view frames = "|/-\\";
+            std::cout << "\rThinking " << frames[spinner_frame++ % frames.size()]
+                      << std::flush;
+        };
+        const auto clear_spinner = [&]() {
+            if (spinner_frame > 0) {
+                std::cout << "\r\033[K" << std::flush;
+                spinner_frame = 0;
+            }
+        };
 
         const auto print_text = [&](const std::string& text, bool from_draft) {
             if (from_draft && highlight_draft && !text.empty()) {
@@ -226,7 +244,10 @@ void CLI::run() {
 
         _vision_language_model_ptr->set_text_callback(
             [&](const std::string& text, bool stream_end, bool from_draft) {
-                for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
+                auto events = reasoning_parser.add(text, stream_end, from_draft);
+                if (!events.empty()) clear_spinner();
+
+                for (auto& event : events) {
                     if (event.reasoning) {
                         if (!saw_reasoning) {
                             std::cout << "Thinking:\n";
@@ -243,7 +264,11 @@ void CLI::run() {
                     final_response += event.text;
                     print_text(event.text, event.from_draft);
                 }
+                if (animate_thinking && reasoning_parser.in_hidden_reasoning()) {
+                    draw_spinner();
+                }
                 if (stream_end) {
+                    clear_spinner();
                     if (!saw_reasoning && !saw_content) std::cout << "Assistant: ";
                     std::cout << std::endl;
                 }
@@ -259,6 +284,7 @@ void CLI::run() {
         // run_model dispatches to speculative decoding internally when a
         // draft VLM was registered at construction time.
         auto response = _vision_language_model_ptr->run_model(chat);
+        clear_spinner();
         if (response.has_value()) {
             auto answer = trim(std::move(final_response));
             if (answer.empty()) {
