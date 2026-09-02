@@ -504,7 +504,12 @@ class LanguageModel(BaseModel):
     def calc_freq_real_imag(self, use_swa: bool) -> tuple[np.ndarray, np.ndarray]:
         if use_swa:
             theta = self.cfg.lm_cfg.rope_cfg.rope_local_base_freq
-            rope_type = "default"
+            # A distinct local base freq (Gemma3) means an unscaled local rope; when it
+            # matches rope_theta the sliding layers share the global scaling (gpt-oss YaRN).
+            rope_type = (
+                "default" if theta != self.cfg.lm_cfg.rope_cfg.rope_theta
+                else self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
+            )
         else:
             theta = self.cfg.lm_cfg.rope_cfg.rope_theta
             rope_type = self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type

@@ -1339,9 +1339,14 @@ void LanguageModel::_initialize() {
     // the (mutated) device buffer.
     _global_freq_host = rope_table;
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        // A distinct local base freq (Gemma3) means an unscaled local rope; when it
+        // matches rope_theta the sliding layers share the global scaling (gpt-oss YaRN).
+        const std::string local_rope_type =
+            _cfg.lm_cfg.rope_cfg.rope_local_base_freq != _cfg.lm_cfg.rope_cfg.rope_theta
+            ? "default" : _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type;
         rope_table = calc_freq_real_imag(
             _cfg.pipeline_cfg.max_num_tokens,
-            "default",
+            local_rope_type,
             _cfg.lm_cfg.rope_cfg.rope_local_base_freq,
             _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention"),
             _cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention"),
