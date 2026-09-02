@@ -151,6 +151,12 @@ class VisionLanguageModel(BaseModel):
         return model
 
     def set_lora_adapter(self, lora_path: Path):
+        if self.cfg.lm_cfg.moe_cfg is not None:
+            raise NotImplementedError(
+                "LoRA adapters are not supported for Mixture-of-Experts models: "
+                "the MoE router ignores adapter targets and would silently produce "
+                "base-model results."
+            )
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
         self.cfg.lm_cfg.set_lora_adapter(lora_config)
 

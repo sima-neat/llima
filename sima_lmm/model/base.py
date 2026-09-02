@@ -599,7 +599,12 @@ class BaseModel(ABC):
                 precision_list = list()
                 for layer_id, layer_p in precision.items():
                     precision_list.append(
-                        {"part": layer_id.part, "idx": layer_id.part_idx, "precision": layer_p}
+                        {
+                            "part": layer_id.part,
+                            "idx": layer_id.part_idx,
+                            "expert_idx": layer_id.expert_idx,
+                            "precision": layer_p,
+                        }
                     )
                 with open(precision_file_name, "w") as f:
                     json.dump(precision_list, f, indent=4)
