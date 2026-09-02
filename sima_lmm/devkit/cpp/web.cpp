@@ -654,29 +654,39 @@ bool request_enable_thinking(
     return enable_thinking;
 }
 
-std::string json_string_or_default(
-    const nlohmann::json& json_data, const std::string& key, const std::string& default_value
+// Overwrites value when the key holds a string; leaves it alone when the key is absent or null.
+// Returns false when the key is present with any other type, so the caller can reject the request
+// instead of silently falling back to the default.
+bool json_read_string(
+    const nlohmann::json& json_data, const std::string& key, std::string& value
 ) {
     if (!json_data.contains(key))
-        return default_value;
-    const auto& value = json_data.at(key);
-    if (value.is_string())
-        return value.get<std::string>();
-    return default_value;
+        return true;
+    const auto& json_value = json_data.at(key);
+    if (json_value.is_null())
+        return true;
+    if (!json_value.is_string())
+        return false;
+    value = json_value.get<std::string>();
+    return true;
 }
 
 // OpenAI exposes reasoning_effort at the top level; also honor chat_template_kwargs.
-std::string request_reasoning_effort(
+// Returns nullopt when either location holds a non-string value.
+std::optional<std::string> request_reasoning_effort(
     const nlohmann::json& json_data, const std::string& default_value
 ) {
-    auto reasoning_effort = json_string_or_default(json_data, "reasoning_effort", default_value);
+    std::string reasoning_effort = default_value;
+    if (!json_read_string(json_data, "reasoning_effort", reasoning_effort))
+        return std::nullopt;
     if (
         json_data.contains("chat_template_kwargs")
         && json_data.at("chat_template_kwargs").is_object()
     ) {
-        reasoning_effort = json_string_or_default(
+        if (!json_read_string(
             json_data.at("chat_template_kwargs"), "reasoning_effort", reasoning_effort
-        );
+        ))
+            return std::nullopt;
     }
     return reasoning_effort;
 }
@@ -711,7 +721,18 @@ std::optional<Chat> WEB::_prepare_chat_context(
     const auto reasoning_effort = request_reasoning_effort(
         json_data, chat.get_reasoning_effort()
     );
-    if (reasoning_effort != "low" && reasoning_effort != "medium" && reasoning_effort != "high") {
+    if (!reasoning_effort.has_value()) {
+        res.status = 400;
+        res.set_content(
+            R"({"error": "reasoning_effort must be a string"})",
+            "application/json"
+        );
+        return std::nullopt;
+    }
+    if (
+        *reasoning_effort != "low" && *reasoning_effort != "medium"
+        && *reasoning_effort != "high"
+    ) {
         res.status = 400;
         res.set_content(
             R"({"error": "reasoning_effort must be 'low', 'medium' or 'high'"})",
@@ -719,7 +740,7 @@ std::optional<Chat> WEB::_prepare_chat_context(
         );
         return std::nullopt;
     }
-    chat.set_reasoning_effort(reasoning_effort);
+    chat.set_reasoning_effort(*reasoning_effort);
     bool tools_enabled = true;
     if (json_data.contains("tool_choice") && !json_data["tool_choice"].is_null()) {
         if (!json_data["tool_choice"].is_string()) {

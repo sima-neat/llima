@@ -1306,9 +1306,21 @@ void LanguageModel::_initialize() {
         std::vector<uint16_t> sinks(  // raw bf16, 2 bytes/elem
             static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers) * num_heads
         );
+        // A stale or truncated file would leave entries zeroed, and a zero sink is not neutral:
+        // it is a logit in the softmax, so it silently reweights attention. Require an exact match.
+        const auto expected_bytes = static_cast<std::uintmax_t>(sinks.size() * sizeof(uint16_t));
+        const auto actual_bytes = std::filesystem::file_size(sinks_file_name);
+        if (actual_bytes != expected_bytes) {
+            throw std::runtime_error(fmt::format(
+                "Attention sinks file {} has {} bytes, expected {} for {} layers x {} heads. "
+                "The file is stale or truncated; recompile the model.",
+                sinks_file_name.string(), actual_bytes, expected_bytes,
+                static_cast<unsigned>(_cfg.lm_cfg.num_hidden_layers), num_heads
+            ));
+        }
         sinks_file.read(
             reinterpret_cast<char*>(sinks.data()),
-            static_cast<std::streamsize>(sinks.size() * sizeof(uint16_t))
+            static_cast<std::streamsize>(expected_bytes)
         );
         for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
             auto& buf = get_buffer(fmt::format("sinks_l{}", layer));
