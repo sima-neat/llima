@@ -149,7 +149,10 @@ RopeTable calc_freq_real_imag(
         scaled_inv_freq = calc_rope_scaling_longrope(inv_freq, rope_scaling_cfg, max_num_tokens);
     } else if (rope_type == "yarn") {
         scaled_inv_freq = calc_rope_scaling_yarn(inv_freq, rope_scaling_cfg, theta, rope_dimension_count);
-        yarn_attention_factor = static_cast<float>(get_yarn_attention_factor(rope_scaling_cfg.factor));
+        // An explicitly configured attention_factor overrides the derived mscale.
+        yarn_attention_factor = static_cast<float>(rope_scaling_cfg.attention_factor.value_or(
+            get_yarn_attention_factor(rope_scaling_cfg.factor)
+        ));
     } else {
         throw std::runtime_error(fmt::format("{} rope type is not supported", rope_type));
     }

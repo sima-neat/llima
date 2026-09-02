@@ -108,7 +108,7 @@ struct RopeScalingConfig {
     // YaRN parameters (rope_type == "yarn"). Defaults match the HF fallbacks.
     double beta_fast = 32.0;
     double beta_slow = 1.0;
-    bool truncate = false;
+    bool truncate = true;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     RopeScalingConfig, factor, low_freq_factor, high_freq_factor, original_max_position_embeddings,
