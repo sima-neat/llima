@@ -501,14 +501,30 @@ class LanguageModel(BaseModel):
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
         if weight_name is None:
             base_name = self.hf_model.language_model_param_base_name
-            candidates = [f"{base_name}.embed_tokens.weight"]
             if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_TALKER:
-                candidates += [f"{base_name}.codec_embedding.weight", "codec_embedding.weight"]
+                candidates = [
+                    f"{base_name}.embed_tokens.weight",
+                    f"{base_name}.codec_embedding.weight",
+                    "codec_embedding.weight",
+                ]
             elif self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODE_PREDICTOR:
-                candidates += [f"{base_name}.codec_embedding.0.weight", "codec_embedding.0.weight"]
-            weight_name = next((candidate for candidate in candidates if self.hf_model.param_exists(candidate)), None)
-            if weight_name is None:
-                raise ValueError(f"Could not find an embedding tensor; checked {candidates}.")
+                candidates = [
+                    f"{base_name}.embed_tokens.weight",
+                    f"{base_name}.codec_embedding.0.weight",
+                    "codec_embedding.0.weight",
+                ]
+            else:
+                candidates = []
+
+            if candidates:
+                weight_name = next(
+                    (candidate for candidate in candidates if self.hf_model.param_exists(candidate)),
+                    None,
+                )
+                if weight_name is None:
+                    raise ValueError(f"Could not find an embedding tensor; checked {candidates}.")
+            else:
+                weight_name = f"{base_name}.embed_tokens.weight"
             if self.cfg.lm_cfg.arch == LlmArchType.GEMMA:
                 embed_scale = self.cfg.lm_cfg.hidden_size ** 0.5
         is_draft = (
