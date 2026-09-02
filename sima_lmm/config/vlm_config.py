@@ -65,6 +65,7 @@ class VlmArchType(str, ExtensibleEnum):
     LLM_GEMMA = "llm-gemma"
     LLM_GEMMA2 = "llm-gemma2"
     LLM_GEMMA3 = "llm-gemma3"
+    LLM_GPT_OSS = "llm-gpt_oss"
     LLM_LFM2 = "llm-lfm2"
     LLM_LLAMA = "llm-llama"
     LLM_MISTRAL = "llm-mistral"
@@ -97,9 +98,11 @@ class LlmArchType(str, ExtensibleEnum):
     LLAMA = "llama"
     LFM = "lfm"
     GEMMA = "gemma"
+    GPT_OSS = "gpt_oss"
     PHI = "phi"
     QWEN = "qwen"
     MISTRAL = "mistral"
+    OLMOE = "olmoe"
 
 
 class LlmDataType(str, ExtensibleEnum):
@@ -483,17 +486,45 @@ class MlpBlockConfig(BaseConfig):
         act: The type of activation.
         num_layers: The number of layers in MLP.
         mlp_bias: Reserved for future use.
+        swiglu_limit: Clamp limit for the gated SwiGLU activation (gpt_oss); None when
+            the model's activation is not clamped. Read from the model config.
     """
     intermediate_size: int = 0
     act: str = "silu"
     num_layers: int = 3
     mlp_bias: bool = False
+    swiglu_limit: float | None = None
 
     def set_config(self, text_cfg: dict, lm_arch: "LlmArchType"):
         super().set_config(text_cfg)
         self.act = (
             text_cfg.get("hidden_act") or text_cfg.get("hidden_activation")
             or ("gelu_pytorch_tanh" if lm_arch == LlmArchType.GEMMA else "silu")
+        )
+
+
+@dataclass
+class MixtureOfExpertsConfig(BaseConfig):
+    """Configuration of a Mixture-of-Experts (MoE) feed-forward block.
+
+    For MoE models the dense MLP is replaced by a bank of expert MLPs plus a
+    router that activates a subset of experts per token. The per-expert MLP
+    dimensions and activation are described by the accompanying MlpBlockConfig.
+
+    Attributes:
+        num_experts: Total number of experts in each MoE layer.
+        num_experts_per_tok: Number of experts the router activates per token (top-k).
+    """
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+
+    def set_config(self, text_cfg: dict):
+        # gpt_oss/Mixtral use "num_local_experts"; OLMoE uses "num_experts".
+        self.num_experts = text_cfg.get(
+            "num_local_experts", text_cfg.get("num_experts", 0)
+        )
+        self.num_experts_per_tok = text_cfg.get(
+            "num_experts_per_tok", text_cfg.get("experts_per_token", 0)
         )
 
 
@@ -553,6 +584,7 @@ class LanguageModelConfig(BaseConfig):
         rope_cfg: The settings of RoPE.
         attn_cfg: The settings of attention block.
         mlp_cfg: The settings of MLP block.
+        moe_cfg: The Mixture-of-Experts routing settings; None for dense models.
         hidden_size: The dimension of the embedding.
         num_hidden_layers: The number of transformer blocks.
         max_position_embeddings: The context length.
@@ -583,6 +615,7 @@ class LanguageModelConfig(BaseConfig):
     rope_cfg: RoPEConfig = field(default_factory=RoPEConfig)
     attn_cfg: AttentionBlockConfig = field(default_factory=AttentionBlockConfig)
     mlp_cfg: MlpBlockConfig = field(default_factory=MlpBlockConfig)
+    moe_cfg: MixtureOfExpertsConfig | None = None
     hidden_size: int = 0
     num_hidden_layers: int = 0
     max_position_embeddings: int = 0
@@ -616,6 +649,8 @@ class LanguageModelConfig(BaseConfig):
         cfg["rope_cfg"] = RoPEConfig(**cfg["rope_cfg"])
         cfg["attn_cfg"] = AttentionBlockConfig(**cfg["attn_cfg"])
         cfg["mlp_cfg"] = MlpBlockConfig(**cfg["mlp_cfg"])
+        if cfg.get("moe_cfg") is not None:
+            cfg["moe_cfg"] = MixtureOfExpertsConfig(**cfg["moe_cfg"])
         cfg["data_type"] = LlmDataType(cfg["data_type"])
         cfg["arch"] = LlmArchType(cfg["arch"])
         if cfg.get("lora_cfg") is not None:
@@ -645,6 +680,12 @@ class LanguageModelConfig(BaseConfig):
         self.rope_cfg.set_config(text_cfg)
         self.attn_cfg.set_config(text_cfg, layer_types)
         self.mlp_cfg.set_config(text_cfg, lm_arch)
+        # gpt_oss/Mixtral advertise experts via "num_local_experts"; OLMoE via "num_experts".
+        # Dense models (e.g. Gemma) may still declare these keys with a null/0 value, so
+        # gate on a positive expert count rather than mere key presence.
+        if text_cfg.get("num_local_experts") or text_cfg.get("num_experts"):
+            self.moe_cfg = MixtureOfExpertsConfig()
+            self.moe_cfg.set_config(text_cfg)
 
         self.hidden_size = text_cfg.get("hidden_size", 0)
         self.num_hidden_layers = num_hidden_layers
@@ -1161,11 +1202,33 @@ class VlmConfig(BaseConfig):
                     layers.append(LayerID("single_conv", i))
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
-                    layers.append(LayerID("group_pre", i))
-                    if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
-                        layers.append(LayerID("group_post", i))
-                    layers.append(LayerID("single_pre", i))
-                    layers.append(LayerID("single_post", i))
+                    if lm_cfg.moe_cfg is not None:
+                        # MoE layers replace the single post (MLP) part with a router
+                        # plus one model per expert, for both group and single paths.
+                        num_experts = lm_cfg.moe_cfg.num_experts
+                        layers.append(LayerID("group_pre", i))
+                        # The last layer's post (router/experts/combine, and the
+                        # combine's folded-in lm_head) runs single-token only,
+                        # mirroring the non-MoE path which skips group_post on the
+                        # last layer. So skip the group router/experts/combine there.
+                        if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
+                            layers.append(LayerID("group_router", i))
+                            layers.extend(
+                                LayerID("group_expert", i, e) for e in range(num_experts)
+                            )
+                            layers.append(LayerID("group_weightedsum", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_router", i))
+                        layers.extend(
+                            LayerID("single_expert", i, e) for e in range(num_experts)
+                        )
+                        layers.append(LayerID("single_weightedsum", i))
+                    else:
+                        layers.append(LayerID("group_pre", i))
+                        if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
+                            layers.append(LayerID("group_post", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_post", i))
                 else:
                     raise ValueError(f"Unsupported layer type: {t}")
             # Cache models are shared across layers; include only for kinds that exist
@@ -1326,7 +1389,7 @@ def get_model_arch_gen(
     """
     lm_arch = None
     t_reg = re.fullmatch(
-        r"(?P<arch>[a-zA-Z]+)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
+        r"(?P<arch>[a-zA-Z]+(?:_[a-zA-Z]+)*?)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
         text_type,
     )
     for arch in LlmArchType.values():

@@ -43,8 +43,10 @@
             "intermediate_size": 6912,
             "act": "gelu_pytorch_tanh",
             "num_layers": 3,
-            "mlp_bias": false
+            "mlp_bias": false,
+            "swiglu_limit": null
         },
+        "moe_cfg": null,
         "hidden_size": 1152,
         "num_hidden_layers": 26,
         "max_position_embeddings": 2048,
