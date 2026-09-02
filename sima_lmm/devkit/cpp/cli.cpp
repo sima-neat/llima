@@ -23,6 +23,7 @@ set lora           : set the model to use LoRA weights from a npy_files folder.
 unset lora         : revert LoRA model to baseline model.
 enable-thinking    : enable thinking mode and clear chat history.
 disable-thinking   : disable thinking mode and clear chat history.
+set effort <level> : set reasoning effort to low, medium or high (gpt-oss).
 quit               : quit.
 help               : print this page.
 )";
@@ -129,6 +130,18 @@ void CLI::run() {
             chat.set_enable_thinking(false);
             chat.clear_history();
             std::cout << "Disabled thinking and cleared chat history." << std::endl;
+            continue;
+        } else if (command.starts_with("set effort ")) {
+            constexpr auto pos = std::string("set effort ").length();
+            std::string effort = command.substr(pos);
+            if (effort != "low" && effort != "medium" && effort != "high") {
+                std::cout << "Reasoning effort must be low, medium or high." << std::endl;
+                continue;
+            }
+            chat.set_reasoning_effort(effort);
+            chat.clear_history();
+            std::cout << "Set reasoning effort to " << effort << " and cleared chat history."
+                      << std::endl;
             continue;
         } else if (command == "set language") {
             language.clear();

@@ -654,6 +654,33 @@ bool request_enable_thinking(
     return enable_thinking;
 }
 
+std::string json_string_or_default(
+    const nlohmann::json& json_data, const std::string& key, const std::string& default_value
+) {
+    if (!json_data.contains(key))
+        return default_value;
+    const auto& value = json_data.at(key);
+    if (value.is_string())
+        return value.get<std::string>();
+    return default_value;
+}
+
+// OpenAI exposes reasoning_effort at the top level; also honor chat_template_kwargs.
+std::string request_reasoning_effort(
+    const nlohmann::json& json_data, const std::string& default_value
+) {
+    auto reasoning_effort = json_string_or_default(json_data, "reasoning_effort", default_value);
+    if (
+        json_data.contains("chat_template_kwargs")
+        && json_data.at("chat_template_kwargs").is_object()
+    ) {
+        reasoning_effort = json_string_or_default(
+            json_data.at("chat_template_kwargs"), "reasoning_effort", reasoning_effort
+        );
+    }
+    return reasoning_effort;
+}
+
 }
 
 std::optional<Chat> WEB::_prepare_chat_context(
@@ -681,6 +708,18 @@ std::optional<Chat> WEB::_prepare_chat_context(
         return std::nullopt;
     }
     chat.set_enable_thinking(enable_thinking);
+    const auto reasoning_effort = request_reasoning_effort(
+        json_data, chat.get_reasoning_effort()
+    );
+    if (reasoning_effort != "low" && reasoning_effort != "medium" && reasoning_effort != "high") {
+        res.status = 400;
+        res.set_content(
+            R"({"error": "reasoning_effort must be 'low', 'medium' or 'high'"})",
+            "application/json"
+        );
+        return std::nullopt;
+    }
+    chat.set_reasoning_effort(reasoning_effort);
     bool tools_enabled = true;
     if (json_data.contains("tool_choice") && !json_data["tool_choice"].is_null()) {
         if (!json_data["tool_choice"].is_string()) {

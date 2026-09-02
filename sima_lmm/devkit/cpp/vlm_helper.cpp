@@ -30,8 +30,10 @@ VlmHelper::VlmHelper(
     const std::filesystem::path& devkit_dir,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
-    bool enable_thinking
-) : _vlm_cfg(vlm_cfg), _enable_thinking(enable_thinking) {
+    bool enable_thinking,
+    std::string reasoning_effort
+) : _vlm_cfg(vlm_cfg), _enable_thinking(enable_thinking),
+    _reasoning_effort(std::move(reasoning_effort)) {
     if (system_prompt.has_value())
         _system_prompt = system_prompt;
     else
@@ -84,6 +86,10 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     inputs.messages = chat.get_messages();
     inputs.tools = chat.get_tools();
     inputs.extra_context["enable_thinking"] = chat.get_enable_thinking();
+    // gpt-oss (harmony) renders this into the system block as "Reasoning: <effort>".
+    // Leave it unset when empty so the template keeps its own default.
+    if (!chat.get_reasoning_effort().empty())
+        inputs.extra_context["reasoning_effort"] = chat.get_reasoning_effort();
     auto formatted_prompt = _chat_template_ptr->apply(inputs);
 
     // Construct the actual prompt with full image tokens. Manually process the prompt because there
