@@ -1,12 +1,13 @@
 """Qwen3-TTS model-directory support for ``llima run``.
 
 The downloaded directory contains model assets only. The matching ARM64 raw-ELF
-runner is supplied by the installed ``sima-lmm-qwen3tts-runtime`` package.
+runner is supplied by the installed ``sima-lmm-cli`` package.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,8 +15,7 @@ from pathlib import Path
 
 _EXECUTABLE = "qwen3tts"
 _MANIFEST = "devkit/qwen3_tts_config.json"
-_RUNTIME_ENV = "SIMA_LMM_QWEN3TTS_RUNTIME_ROOT"
-_SYSTEM_RUNTIME_ROOT = Path("/usr/lib/aarch64-linux-gnu/sima-lmm/qwen3tts")
+_EXECUTABLE_ENV = "SIMA_LMM_QWEN3TTS_EXECUTABLE"
 
 
 @dataclass(frozen=True)
@@ -25,16 +25,12 @@ class Qwen3TTSPackage:
     root: Path
 
     @property
-    def runtime_root(self) -> Path:
-        return Path(os.environ.get(_RUNTIME_ENV, _SYSTEM_RUNTIME_ROOT))
-
-    @property
     def executable(self) -> Path:
-        return self.runtime_root / "bin" / _EXECUTABLE
-
-    @property
-    def runtime_lib_dir(self) -> Path:
-        return self.runtime_root / "lib"
+        configured = os.environ.get(_EXECUTABLE_ENV)
+        if configured:
+            return Path(configured)
+        resolved = shutil.which(_EXECUTABLE)
+        return Path(resolved) if resolved else Path(_EXECUTABLE)
 
     @property
     def model_dir(self) -> Path:
@@ -68,10 +64,10 @@ def resolve_qwen3tts_package(path: Path) -> Qwen3TTSPackage:
     if root is None:
         raise RuntimeError(f"Not a Qwen3-TTS model directory: {path}")
     package = Qwen3TTSPackage(root=root)
-    if not package.executable.is_file() or not package.runtime_lib_dir.is_dir():
+    if not package.executable.is_file():
         raise RuntimeError(
-            "Qwen3-TTS runtime is not installed. Install sima-lmm-qwen3tts-runtime "
-            f"or set {_RUNTIME_ENV} for a development runtime."
+            "Qwen3-TTS runner is not installed. Install sima-lmm-cli "
+            f"or set {_EXECUTABLE_ENV} for a development runner."
         )
     return package
 
@@ -112,18 +108,6 @@ def run_qwen3tts(package: Qwen3TTSPackage, args: object) -> int:
 
     print(f"Running Qwen3-TTS model: {package.root}", flush=True)
     environment = os.environ.copy()
-    runtime_library_dirs = (
-        package.runtime_lib_dir,
-        package.runtime_lib_dir / "torch" / "lib",
-        package.runtime_lib_dir / "numpy.libs",
-    )
-    bundled_library_path = ":".join(str(path) for path in runtime_library_dirs)
-    existing_library_path = environment.get("LD_LIBRARY_PATH")
-    environment["LD_LIBRARY_PATH"] = (
-        bundled_library_path
-        if not existing_library_path
-        else f"{bundled_library_path}:{existing_library_path}"
-    )
     subprocess.run(command, env=environment, check=True)
     print(f"WAV written to {output_wav}", flush=True)
     return 0

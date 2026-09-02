@@ -311,12 +311,6 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     "sima_lmm/devkit/cpp/*.cpp"
 )
 list(FILTER SOURCES EXCLUDE REGEX "sima_lmm/devkit/cpp/binding.cpp")
-# The model-only Qwen3-TTS runner does not use the interactive LLiMa CLI.
-# Excluding it lets this isolated ABI-0 libtorch build coexist with the
-# ordinary ABI-1 LLiMa package build.
-if(SIMA_LMM_BUILD_QWEN3TTS_RUNNER)
-    list(FILTER SOURCES EXCLUDE REGEX "sima_lmm/devkit/cpp/cli.cpp")
-endif()
 
 add_library(${TARGET_RUNTIME} SHARED ${SOURCES})
 set_target_properties(
@@ -326,11 +320,6 @@ set_target_properties(
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
 )
-# GCC cross-LTO can fail when the installed Qwen3-TTS runner pulls in
-# libtorch. Keep the normal runtime setting for every other build.
-if(SIMA_LMM_BUILD_QWEN3TTS_RUNNER)
-    set_property(TARGET ${TARGET_RUNTIME} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
-endif()
 message(STATUS "Using MLA dispatcher library: ${SIMAAI_DISPATCHER_LIB}")
 set_target_properties(
     ${TARGET_RUNTIME} PROPERTIES
@@ -406,10 +395,9 @@ target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
     $<BUILD_INTERFACE:${SYSROOT}/usr/include>
 )
 
-# Qwen3-TTS is an optional installed runtime component. Enable it only in an
-# ARM64 environment with the matching target libtorch development package;
-# ordinary LLiMa builds stay free of a Torch dependency.
-option(SIMA_LMM_BUILD_QWEN3TTS_RUNNER "Build the installed Qwen3-TTS raw-ELF runtime." OFF)
+# Qwen3-TTS uses only the SDK runtime, native safetensors views, and Eigen.
+# It is installed as part of sima-lmm-cli; no model-specific host bootstrap is required.
+option(SIMA_LMM_BUILD_QWEN3TTS_RUNNER "Build the native Qwen3-TTS runner." ON)
 if(SIMA_LMM_BUILD_QWEN3TTS_RUNNER)
     add_subdirectory(sima_lmm/qwen3tts_runner)
 endif()
@@ -574,9 +562,6 @@ set(CPACK_PACKAGE_VERSION "${SIMA_LMM_PACKAGE_VERSION}")
 set(CPACK_PACKAGE_CONTACT "SiMa.ai Build Team <build@sima.ai>")
 set(CPACK_GENERATOR "DEB")
 set(CPACK_COMPONENTS_ALL core dev cli)
-if(SIMA_LMM_BUILD_QWEN3TTS_RUNNER)
-    list(APPEND CPACK_COMPONENTS_ALL qwen3tts)
-endif()
 set(CPACK_DEB_COMPONENT_INSTALL ON)
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "SiMa.ai Build Team <build@sima.ai>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "libs")
@@ -588,13 +573,10 @@ set(CPACK_COMPONENT_DEV_DESCRIPTION
     "SiMa LMM C++ development headers and CMake package")
 set(CPACK_COMPONENT_CLI_DESCRIPTION
     "SiMa LMM Python runtime CLI")
-set(CPACK_COMPONENT_QWEN3TTS_DESCRIPTION
-    "SiMa LMM Qwen3-TTS raw-ELF runner and native dependency closure")
 
 set(CPACK_DEBIAN_CORE_PACKAGE_NAME "sima-lmm-core")
 set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
-set(CPACK_DEBIAN_QWEN3TTS_PACKAGE_NAME "sima-lmm-qwen3tts-runtime")
 
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "neat-runtime, "
@@ -613,8 +595,6 @@ string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "libssl-dev, cppzmq-dev, libzmq3-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), simaai-utils, python3")
-set(CPACK_DEBIAN_QWEN3TTS_PACKAGE_DEPENDS
-    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION})")
 
 set(CPACK_INSTALL_CMAKE_PROJECTS
     "${CMAKE_BINARY_DIR};${PROJECT_NAME};ALL;/"

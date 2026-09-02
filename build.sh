@@ -37,14 +37,8 @@ Options:
   --dev               Package only sima-lmm-dev
   --cli               Package only sima-lmm-cli
   --package <name>    Package one component; repeatable. Accepts core, dev, cli,
-                      qwen3tts, or the full Debian package name.
+                      or the full Debian package name.
   -h, --help          Show this help
-
-Environment:
-  Qwen3-TTS runner dependencies are downloaded automatically into the local
-                      build directory. They are packaged in
-                      sima-lmm-qwen3tts-runtime, never in the Hugging Face
-                      model repository.
 
 Extra arguments after -- are passed to cmake configure.
 EOF
@@ -133,15 +127,12 @@ add_component() {
     cli|sima-lmm-cli)
       COMPONENTS+=("cli")
       ;;
-    qwen3tts|sima-lmm-qwen3tts-runtime)
-      COMPONENTS+=("qwen3tts")
-      ;;
     all)
       COMPONENTS=()
       ;;
     *)
       echo "ERROR: Unknown package selector: $1" >&2
-      echo "       Expected core, dev, cli, qwen3tts, sima-lmm-core, sima-lmm-dev, sima-lmm-cli, or sima-lmm-qwen3tts-runtime." >&2
+      echo "       Expected core, dev, cli, sima-lmm-core, sima-lmm-dev, or sima-lmm-cli." >&2
       exit 2
       ;;
   esac
@@ -764,57 +755,6 @@ ensure_python_build_env() {
   fi
 }
 
-ensure_qwen3tts_runner_deps() {
-  QWEN3TTS_DEPS_DIR="${BUILD_DIR}/qwen3tts-deps"
-  QWEN3TTS_TORCH_ROOT="${QWEN3TTS_DEPS_DIR}/libtorch-2.3.1-aarch64"
-  QWEN3TTS_NUMPY_ROOT="${QWEN3TTS_DEPS_DIR}/numpy-1.26.4-aarch64"
-  local torch_package_dir="${QWEN3TTS_DEPS_DIR}/packages"
-  local micromamba_dir="${QWEN3TTS_DEPS_DIR}/micromamba"
-  local micromamba="${micromamba_dir}/bin/micromamba"
-  local micromamba_archive="${micromamba_dir}/micromamba-linux-64.tar.bz2"
-
-  mkdir -p "${torch_package_dir}"
-  if [[ ! -x "${micromamba}" ]]; then
-    echo "[build] Downloading micromamba for ARM64 Qwen3-TTS dependency resolution"
-    mkdir -p "${micromamba_dir}"
-    curl --fail --location --retry 2 --output "${micromamba_archive}" \
-      "https://micro.mamba.pm/api/micromamba/linux-64/latest"
-    tar -xjf "${micromamba_archive}" -C "${micromamba_dir}" bin/micromamba
-  fi
-  if [[ ! -f "${QWEN3TTS_TORCH_ROOT}/lib/libtorch.so" || \
-        ! -f "${QWEN3TTS_TORCH_ROOT}/lib/libprotobuf.so.25.3.0" ]]; then
-    echo "[build] Resolving complete ARM64 libtorch 2.3.1 runtime closure"
-    rm -rf "${QWEN3TTS_TORCH_ROOT}"
-    "${micromamba}" create --yes --platform linux-aarch64 \
-      --root-prefix "${micromamba_dir}/root" \
-      --prefix "${QWEN3TTS_TORCH_ROOT}" \
-      --channel conda-forge \
-      "libtorch=2.3.1=cpu_generic_had9af4b_0"
-  fi
-
-  if [[ ! -f "${QWEN3TTS_NUMPY_ROOT}/numpy.libs/libopenblas64_p-r0-17488984.3.23.dev.so" ]]; then
-    echo "[build] Downloading ARM64 NumPy 1.26.4 OpenBLAS runtime"
-    mkdir -p "${QWEN3TTS_NUMPY_ROOT}"
-    "${BUILD_VENV}/bin/python" -m pip download --only-binary=:all: --no-deps \
-      --platform manylinux2014_aarch64 --implementation cp --python-version 311 --abi cp311 \
-      --dest "${torch_package_dir}" "numpy==1.26.4"
-    local numpy_wheel
-    numpy_wheel="$(find "${torch_package_dir}" -maxdepth 1 -name 'numpy-1.26.4-*.whl' -print -quit)"
-    if [[ -z "${numpy_wheel}" ]]; then
-      echo "ERROR: ARM64 NumPy 1.26.4 wheel download failed." >&2
-      exit 1
-    fi
-    unzip -q "${numpy_wheel}" -d "${QWEN3TTS_NUMPY_ROOT}"
-  fi
-
-  QWEN3TTS_NUMPY_OPENBLAS="${QWEN3TTS_NUMPY_ROOT}/numpy.libs/libopenblas64_p-r0-17488984.3.23.dev.so"
-  if [[ ! -f "${QWEN3TTS_TORCH_ROOT}/share/cmake/Torch/TorchConfig.cmake" || ! -f "${QWEN3TTS_NUMPY_OPENBLAS}" ]]; then
-    echo "ERROR: Qwen3-TTS runner dependency bootstrap is incomplete." >&2
-    exit 1
-  fi
-  echo "[build] Qwen3-TTS runner dependencies ready."
-}
-
 ensure_writable_cargo_home() {
   local cargo_home="${LLIMA_CARGO_HOME:-${CARGO_HOME:-}}"
 
@@ -1242,13 +1182,7 @@ PYTHON_TARGET_SOABI="${PYTHON_ABI_TAG}-${MULTIARCH}"
 
 ensure_writable_cargo_home
 ensure_python_build_env
-ensure_qwen3tts_runner_deps
 CMAKE_SOABI_ARGS=()
-CMAKE_QWEN3TTS_ARGS=(
-  "-DSIMA_LMM_BUILD_QWEN3TTS_RUNNER=ON"
-  "-DTorch_DIR=${QWEN3TTS_TORCH_ROOT}/share/cmake/Torch"
-  "-DSIMA_LMM_QWEN3TTS_NUMPY_OPENBLAS_LIBRARY=${QWEN3TTS_NUMPY_OPENBLAS}"
-)
 CMAKE_PYTHON_ARGS=("-DPython_EXECUTABLE=$BUILD_VENV/bin/python")
 if [[ "${ELXR_SDK}" == "ON" ]]; then
   CMAKE_SOABI_ARGS+=("-DSKBUILD_SOABI=cpython-311-${MULTIARCH}")
@@ -1290,6 +1224,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DCMAKE_INSTALL_LIBDIR="lib/$MULTIARCH" \
   -DSKBUILD_SOABI="$PYTHON_TARGET_SOABI" \
   -DSIMA_LMM_BUILD_PYTHON=ON \
+  -DSIMA_LMM_BUILD_QWEN3TTS_RUNNER=ON \
   -DSIMA_LMM_BUILD_TESTS="$BUILD_RUNTIME_TESTS" \
   -DSIMA_LMM_INSTALL_PYTHON_PACKAGE=ON \
   -DSIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR="lib/python3/dist-packages/sima_lmm/devkit" \
@@ -1298,7 +1233,6 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" \
   -DSIMA_LMM_PACKAGE_VERSION="$LLIMA_VERSION" \
   -DCPACK_DEBIAN_PACKAGE_ARCHITECTURE="$ARCH" \
   "${CMAKE_SOABI_ARGS[@]}" \
-  "${CMAKE_QWEN3TTS_ARGS[@]}" \
   "${CMAKE_PYTHON_ARGS[@]}" \
   "${EXTRA_CMAKE_ARGS[@]}"
 
