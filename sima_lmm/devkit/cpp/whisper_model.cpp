@@ -870,9 +870,10 @@ bool WhisperModel::_is_auto_language(const std::string& language) const {
 
 void WhisperModel::_run_encoder() {
     for (auto& [layer_idx, encoder_layer_model] : _encoder_layer_model_map) {
-        _logger->debug("Running Whisper encoder layer {}", layer_idx);
-        encoder_layer_model.run();
+        _logger->debug("Queueing Whisper encoder layer {}", layer_idx);
+        encoder_layer_model.add_to_queue();
     }
+    MLAModelWithBuffer::run_queue();
 }
 
 
