@@ -352,6 +352,11 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Qwen3-TTS trailing endpoint frames retained in the WAV",
     )
     run_parser.add_argument(
+        "--endpoint-enable",
+        action="store_true",
+        help="Enable Qwen3-TTS streaming endpoint detection (disabled by default)",
+    )
+    run_parser.add_argument(
         "--do-sample",
         action=argparse.BooleanOptionalAction,
         default=False,

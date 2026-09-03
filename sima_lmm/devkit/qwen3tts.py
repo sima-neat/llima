@@ -99,6 +99,8 @@ def run_qwen3tts(package: Qwen3TTSPackage, args: object) -> int:
     ]
     command.append("--sample" if args.do_sample else "--no-sample")
     command.append("--subtalker-sample" if args.subtalker_do_sample else "--subtalker-no-sample")
+    if not args.endpoint_enable:
+        command.append("--endpoint-disable")
     if args.endpoint_silence_rms is not None:
         command.extend(("--endpoint-silence-rms", str(args.endpoint_silence_rms)))
     if args.endpoint_silence_frames is not None:
