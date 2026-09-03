@@ -334,6 +334,24 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Qwen3-TTS output WAV path",
     )
     run_parser.add_argument(
+        "--endpoint-silence-rms",
+        type=float,
+        default=None,
+        help="Qwen3-TTS endpoint RMS threshold; omit to use the model-package default",
+    )
+    run_parser.add_argument(
+        "--endpoint-silence-frames",
+        type=int,
+        default=None,
+        help="Qwen3-TTS consecutive below-threshold frames required for endpointing",
+    )
+    run_parser.add_argument(
+        "--endpoint-end-pad-frames",
+        type=int,
+        default=None,
+        help="Qwen3-TTS trailing endpoint frames retained in the WAV",
+    )
+    run_parser.add_argument(
         "--do-sample",
         action=argparse.BooleanOptionalAction,
         default=False,
