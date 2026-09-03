@@ -68,11 +68,12 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 63
+- Expected cases: 77
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
 - Configuration parsing and validation.
+- Per-layer vision partitioning, tensor shapes, and deepstack routing.
 - Quantization configuration and precision selection.
 - Weight-name mapping.
 - Small pure-Python compiler checks.

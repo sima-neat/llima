@@ -1,4 +1,6 @@
 
+#include <fstream>
+
 #include "vision_model.hpp"
 
 
@@ -21,17 +23,18 @@ void VisionModel::run_model(
     // Upload the ifm.
     get_buffer("vision_ifm").upload(ifm_tensor.data());
 
-    // Run the models.
+    // Each layer is a separate dispatcher job so other MLA workloads can run
+    // between dependent vision layers.
     for (size_t i = 0; i + 1 < _model_ptrs.size(); ++i) {
-        _model_ptrs[i]->add_to_queue();
+        _model_ptrs[i]->run();
     }
-    _model_ptrs.back()->add_to_queue(nullptr, ofm_map_ptr);
-    MLAModelWithBuffer::run_queue();
+    _model_ptrs.back()->run(nullptr, ofm_map_ptr);
 }
 
 
 void VisionModel::_initialize() {
     _logger->info("Vision model initialize starting ...");
+    _validate_model_names();
     BaseModel::_initialize();
     _define_models();
     for (const auto& model_name: _cfg.vision_model_name) {
@@ -108,35 +111,97 @@ void VisionModel::_define_buffers() {
 
 
 void VisionModel::_define_models() {
-    if (_cfg.vision_model_name.empty()) {
-        throw std::runtime_error("vision_model_name must contain at least one model");
-    }
-
-    std::vector<MLABufferSlice> final_ofms{&get_buffer("vision_ofm")};
-    if (_cfg.pipeline_cfg.quantize_embeddings) {
-        final_ofms.emplace_back(&get_buffer("vision_ofm_scale"));
-    }
-    for (size_t i = 0; i < _vm_cfg.deepstack_visual_indexes.size(); ++i) {
-        final_ofms.emplace_back(&get_buffer(fmt::format("deepstack_feature_l{}", i)));
-    }
-
     for (size_t i = 0; i < _cfg.vision_model_name.size(); ++i) {
         const bool is_first = i == 0;
         const bool is_last = i + 1 == _cfg.vision_model_name.size();
         auto& ifm = get_buffer(
             is_first ? "vision_ifm" : fmt::format("vision_hidden_{}", (i - 1) % 2)
         );
-        std::vector<MLABufferSlice> ofms = is_last
-            ? final_ofms
-            : std::vector<MLABufferSlice>{
-                &get_buffer(fmt::format("vision_hidden_{}", i % 2))
-            };
+        std::vector<MLABufferSlice> ofms;
+        if (is_last) {
+            ofms.emplace_back(&get_buffer("vision_ofm"));
+            if (_cfg.pipeline_cfg.quantize_embeddings) {
+                ofms.emplace_back(&get_buffer("vision_ofm_scale"));
+            }
+        } else {
+            ofms.emplace_back(&get_buffer(fmt::format("vision_hidden_{}", i % 2)));
+        }
+        for (size_t deepstack_idx = 0;
+             deepstack_idx < _vm_cfg.deepstack_visual_indexes.size();
+             ++deepstack_idx) {
+            if (_cfg.vision_model_name.size() == 1
+                || _vm_cfg.deepstack_visual_indexes[deepstack_idx] == i) {
+                ofms.emplace_back(
+                    &get_buffer(fmt::format("deepstack_feature_l{}", deepstack_idx))
+                );
+                if (_cfg.vision_model_name.size() > 1) {
+                    break;
+                }
+            }
+        }
         auto elf_file_name = fmt::format("{}_stage1_mla.elf", _cfg.vision_model_name[i]);
         _model_ptrs.emplace_back(std::make_unique<MLAModelWithBuffer>(
             _elf_dir / elf_file_name,
             std::vector<MLABufferSlice>{&ifm},
             std::move(ofms)
         ));
+    }
+}
+
+
+void VisionModel::_validate_model_names() const {
+    if (_cfg.vision_model_name.empty()) {
+        throw std::runtime_error("vision_model_name must contain at least one model");
+    }
+
+    const auto config_path = _devkit_dir / "vlm_config.json";
+    const auto config_json = nlohmann::json::parse(std::ifstream(config_path));
+    if (!config_json.contains("vm_cfg")
+        || !config_json["vm_cfg"].contains("num_hidden_layers")) {
+        throw std::runtime_error(fmt::format(
+            "Cannot find vm_cfg.num_hidden_layers in {}", config_path.string()
+        ));
+    }
+    size_t expected_layers = config_json["vm_cfg"]["num_hidden_layers"].get<size_t>();
+    if (_cfg.model_type == "vlm-llava") {
+        if (expected_layers == 0) {
+            throw std::runtime_error("LLaVA vision model must contain at least one layer");
+        }
+        --expected_layers;
+    }
+    if (_cfg.vision_model_name.size() == 1) {
+        // Preserve compatibility with existing monolithic vision repositories.
+        return;
+    }
+    if (_cfg.vision_model_name.size() != expected_layers) {
+        throw std::runtime_error(fmt::format(
+            "Layered vision model requires {} ordered artifacts, but vision_model_name "
+            "contains {}",
+            expected_layers,
+            _cfg.vision_model_name.size()
+        ));
+    }
+
+    const std::string first_suffix = "_layer0";
+    const auto& first_name = _cfg.vision_model_name.front();
+    if (!first_name.ends_with(first_suffix)) {
+        throw std::runtime_error(fmt::format(
+            "Layered vision model must start with an artifact named '*{}', got '{}'",
+            first_suffix,
+            first_name
+        ));
+    }
+    const auto base_name = first_name.substr(0, first_name.size() - first_suffix.size());
+    for (size_t layer_idx = 0; layer_idx < expected_layers; ++layer_idx) {
+        const auto expected_name = fmt::format("{}_layer{}", base_name, layer_idx);
+        if (_cfg.vision_model_name[layer_idx] != expected_name) {
+            throw std::runtime_error(fmt::format(
+                "Layered vision artifact {} must be '{}', got '{}'",
+                layer_idx,
+                expected_name,
+                _cfg.vision_model_name[layer_idx]
+            ));
+        }
     }
 }
 

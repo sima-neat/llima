@@ -37,9 +37,7 @@ from afe.ir.operations import PlaceholderOp
 from afe.ir.tensor_type import ScalarType
 import afe.ir.serializer
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import (
-    BaseConfig, VlmConfig, VlmArchType, vision_model_names
-)
+from sima_lmm.config.vlm_config import BaseConfig, VlmConfig, VlmArchType
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.model.onnx_builder import OnnxBuilder
@@ -513,11 +511,8 @@ class BaseModel(ABC):
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name
             if self.cfg.vm_cfg is not None:
-                model_names = vision_model_names(
-                    self.cfg.vm_cfg, self.vision_model_name
-                )
-                cfg_dict["vision_model_name"] = (
-                    model_names[0] if len(model_names) == 1 else model_names
+                cfg_dict["vision_model_name"] = self.cfg.get_vision_model_names(
+                    self.vision_model_name
                 )
             if isinstance(self.hf_model, GgufModel):
                 cfg_dict["gguf_file_name"] = self.hf_model.file_path.name

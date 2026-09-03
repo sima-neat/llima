@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows, round_up_to
+from sima_lmm.utils import ceil_div, round_up_to
 from sima_utils.logging.sima_logger import sima_log_warning
 
 LONG_CONTEXT_MIN_TOKENS = 2048
@@ -1076,17 +1076,6 @@ class VlmConfig(BaseConfig):
                             f"For {vlm_cfg.vm_cfg.arch}, image dimensions ({height}x{width}) must be divisible by "
                             f"(patch_size * spatial_merge_size), which is {divisor}."
                         )
-                    # Qwen per-layer graphs do not yet support split-ELF execution.
-                    if vlm_cfg.vm_cfg.arch in (
-                        VisionArchType.QWEN2_VISION_ENCODER,
-                        VisionArchType.QWEN3_VISION_ENCODER,
-                    ):
-                        seq_len = (height // vlm_cfg.vm_cfg.patch_size) * (width // vlm_cfg.vm_cfg.patch_size)
-                        if seq_len * ceil_div_row(seq_len) * 2 > mla_max_num_rows:
-                            raise RuntimeError(
-                                f"Input image resolution ({height}x{width}) exceeds the maximum allowed for "
-                                f"single-ELF vision encoding for {vlm_cfg.vm_cfg.arch} "
-                            )
                     vlm_cfg.vm_cfg.image_size = image_resolution
                 else:
                     sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2, Qwen-VL, or Gemma4 based.")
@@ -1145,6 +1134,21 @@ class VlmConfig(BaseConfig):
             self.is_multimodal
             and not (self.model_type == VlmArchType.VLM_GEMMA3 and self.vm_cfg.image_size > 448)
         )
+
+    @property
+    def num_vision_layers(self) -> int:
+        if self.vm_cfg is None:
+            return 0
+        # LLaVA consumes the penultimate vision hidden state.
+        return self.vm_cfg.num_hidden_layers - int(
+            self.model_type == VlmArchType.VLM_LLAVA
+        )
+
+    def get_vision_model_names(self, model_name: str) -> list[str]:
+        return [
+            f"{model_name}_layer{layer_idx}"
+            for layer_idx in range(self.num_vision_layers)
+        ]
 
     def config_pipeline(
         self,
@@ -1318,7 +1322,10 @@ class VlmConfig(BaseConfig):
             layers.extend(LayerID("single_post", n) for n in range(lm_cfg.num_hidden_layers))
             layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
         if self.vm_cfg is not None and self.is_supported_multimodal:
-            layers.extend(LayerID("vision", n) for n in range(vision_model_layer_count(self.vm_cfg)))
+            layers.extend(
+                LayerID("vision", n)
+                for n in range(self.num_vision_layers)
+            )
         if is_speculative_draft:
             layers.append(LayerID("group_draft_fc", 0))
             layers.append(LayerID("single_draft_fc", 0))
@@ -1590,32 +1597,6 @@ def single_shared_sliding_cache_model_indices(
     return sorted(set(single_cache_model_indices(cfg)) | set(
         single_sliding_cache_model_indices(cfg, sliding_window)
     ))
-
-
-def vision_model_layer_count(cfg: VisionModelConfig) -> int:
-    """
-    Get the number of layers in the vision model.
-    """
-    elem_size = 2
-    seq_len = cfg.seq_len
-    num_mla_rows_per_head = seq_len * ceil_div_row(seq_len) * elem_size
-    is_single_vision_model = num_mla_rows_per_head <= mla_max_num_rows
-
-    if is_single_vision_model:
-        return 1
-    elif cfg.model_type == VlmArchType.VLM_LLAVA:
-        # Last vision layer of LLAVA is unused
-        return cfg.num_hidden_layers - 1
-    else:
-        return cfg.num_hidden_layers
-
-
-def vision_model_names(cfg: VisionModelConfig, model_name: str) -> list[str]:
-    """Get the generated vision model artifact names in execution order."""
-    num_models = vision_model_layer_count(cfg)
-    if num_models == 1:
-        return [model_name]
-    return [f"{model_name}_layer{layer_idx}" for layer_idx in range(num_models)]
 
 
 if __name__ == "__main__":
