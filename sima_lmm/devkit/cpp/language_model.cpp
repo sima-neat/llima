@@ -71,16 +71,36 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer
+) : LanguageModel(
+    std::move(model_path),
+    std::move(stop_token_ids),
+    image_token_id,
+    pad_token_id,
+    text_streamer,
+    1
+) {}
+
+
+LanguageModel::LanguageModel(
+    std::filesystem::path model_path,
+    std::set<uint32_t> stop_token_ids,
+    std::optional<uint32_t> image_token_id,
+    std::optional<uint32_t> pad_token_id,
+    TextStreamer& text_streamer,
+    size_t max_kv_cache_slots
 ) : BaseModel(model_path),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id),
     _max_num_tokens(_cfg.pipeline_cfg.max_num_tokens),
     _text_streamer(text_streamer),
-    _has_image_token(false),
+    _max_kv_cache_slots(max_kv_cache_slots),
     _is_running(false),
     _reloc_name(std::nullopt)
 {
+    if (_max_kv_cache_slots == 0) {
+        throw std::invalid_argument("max_kv_cache_slots must be at least 1");
+    }
     if (
         _cfg.pipeline_cfg.max_num_tokens == 0
         || _cfg.pipeline_cfg.max_num_tokens % MAX_NUM_TOKENS_ALIGNMENT
@@ -149,9 +169,9 @@ LanguageModel::LanguageModel(
             }
         }
 
-        //Per-family CachedState init. Each stateful layer family gets its own block.
+        // Per-family cache-state layout initialization. Each stateful layer family gets its own block.
         if (!conv_layer_indices.empty()) {
-            LanguageModel::CachedState conv_state;
+            LanguageModel::CacheStateLayout conv_state;
             conv_state.buffer_name_prefix = "conv_cache_history_l";
             conv_state.tail_len = std::max<uint16_t>(1, _cfg.lm_cfg.conv_L_cache - 1);
             conv_state.num_elems = _cfg.lm_cfg.hidden_size;
@@ -161,12 +181,7 @@ LanguageModel::LanguageModel(
             );
             conv_state.layer_indices = std::move(conv_layer_indices);
 
-            const auto num_boundaries = _checkpoint_boundaries.size();
-            conv_state.checkpoints.resize(conv_state.layer_indices.size());
-            for (auto& checkpoints: conv_state.checkpoints) {
-                checkpoints.resize(num_boundaries, std::vector<uint8_t>(conv_state.tail_bytes));
-            }
-            _cached_states.emplace_back(std::move(conv_state));
+            _cache_state_layouts.emplace_back(std::move(conv_state));
         }
         // Future: similar block for mamba/Deltanet families.
     }
@@ -189,6 +204,333 @@ LanguageModel::LanguageModel(
     }
 
     _initialize();
+}
+
+
+LanguageModel::KVCacheLease::KVCacheLease(
+    LanguageModel& owner, size_t slot_index, bool cache_created
+) : _owner(&owner), _slot_index(slot_index), _cache_created(cache_created) {}
+
+
+LanguageModel::KVCacheLease::~KVCacheLease() {
+    reset();
+}
+
+
+LanguageModel::KVCacheLease::KVCacheLease(KVCacheLease&& other) noexcept
+  : _owner(other._owner),
+    _slot_index(other._slot_index),
+    _cache_created(other._cache_created)
+{
+    other._owner = nullptr;
+}
+
+
+LanguageModel::KVCacheLease& LanguageModel::KVCacheLease::operator=(
+    KVCacheLease&& other
+) noexcept {
+    if (this != &other) {
+        reset();
+        _owner = other._owner;
+        _slot_index = other._slot_index;
+        _cache_created = other._cache_created;
+        other._owner = nullptr;
+    }
+    return *this;
+}
+
+
+LanguageModel::KVCacheSlot& LanguageModel::KVCacheLease::slot() const {
+    if (_owner == nullptr) {
+        throw std::logic_error("KV cache lease is not active");
+    }
+    return *_owner->_kv_cache_slots.at(_slot_index);
+}
+
+
+void LanguageModel::KVCacheLease::reset() noexcept {
+    if (_owner == nullptr) {
+        return;
+    }
+    _owner->_release_kv_cache(_slot_index);
+    _owner = nullptr;
+}
+
+
+LanguageModel::ScopedActiveCache::ScopedActiveCache(
+    LanguageModel& owner, KVCacheSlot& slot
+) : _owner(owner), _previous(owner._active_cache_slot) {
+    _owner._active_cache_slot = &slot;
+}
+
+
+LanguageModel::ScopedActiveCache::~ScopedActiveCache() {
+    _owner._active_cache_slot = _previous;
+}
+
+
+void LanguageModel::_define_cache_buffer(
+    std::string name,
+    std::vector<size_t> shape,
+    std::string dtype,
+    bool align_last_dim
+) {
+    const auto duplicate = std::find_if(
+        _cache_buffer_specs.begin(),
+        _cache_buffer_specs.end(),
+        [&](const auto& spec) { return spec.name == name; }
+    );
+    if (duplicate != _cache_buffer_specs.end()) {
+        throw std::logic_error("Duplicate KV cache buffer definition: " + name);
+    }
+    _cache_buffer_specs.push_back({
+        std::move(name), std::move(shape), std::move(dtype), align_last_dim
+    });
+}
+
+
+LanguageModel::KVCacheMetadata LanguageModel::_make_cache_metadata() const {
+    KVCacheMetadata metadata;
+    metadata.checkpoints.reserve(_cache_state_layouts.size());
+    for (const auto& layout: _cache_state_layouts) {
+        CacheCheckpointSet checkpoint_set;
+        checkpoint_set.checkpoints.resize(layout.layer_indices.size());
+        for (auto& layer_checkpoints: checkpoint_set.checkpoints) {
+            layer_checkpoints.resize(
+                _checkpoint_boundaries.size(),
+                std::vector<uint8_t>(layout.tail_bytes)
+            );
+        }
+        metadata.checkpoints.emplace_back(std::move(checkpoint_set));
+    }
+    return metadata;
+}
+
+
+std::unique_ptr<LanguageModel::KVCacheSlot> LanguageModel::_allocate_cache_slot(
+    size_t slot_index
+) const {
+    auto slot = std::make_unique<KVCacheSlot>();
+    slot->metadata = _make_cache_metadata();
+    for (const auto& spec: _cache_buffer_specs) {
+        auto buffer = std::make_unique<MLABuffer>(
+            fmt::format("{}_slot{}", spec.name, slot_index),
+            spec.shape,
+            spec.dtype,
+            spec.align_last_dim
+        );
+        buffer->allocate();
+        buffer->clear();
+        slot->buffers.emplace(spec.name, std::move(buffer));
+    }
+    return slot;
+}
+
+
+LanguageModel::KVCacheLease LanguageModel::_acquire_kv_cache(
+    const std::optional<std::string>& cache_id
+) {
+    if (cache_id.has_value() && cache_id->empty()) {
+        throw std::invalid_argument("cache_id must not be empty");
+    }
+
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    const auto existing = _kv_cache_assignments.find(cache_id);
+    if (existing != _kv_cache_assignments.end()) {
+        auto& slot = *_kv_cache_slots.at(existing->second);
+        ++slot.pin_count;
+        return KVCacheLease(*this, existing->second, false);
+    }
+    if (_kv_cache_assignments.size() >= _max_kv_cache_slots) {
+        throw KVCacheCapacityError(fmt::format(
+            "KV cache capacity exhausted: {} cache slot(s) are configured",
+            _max_kv_cache_slots
+        ));
+    }
+
+    std::vector<bool> assigned(_kv_cache_slots.size(), false);
+    for (const auto& [_, slot_index]: _kv_cache_assignments) {
+        assigned.at(slot_index) = true;
+    }
+    size_t slot_index = 0;
+    while (slot_index < assigned.size() && assigned[slot_index]) {
+        ++slot_index;
+    }
+    if (slot_index == _kv_cache_slots.size()) {
+        if (_kv_cache_slots.size() >= _max_kv_cache_slots) {
+            throw std::logic_error("KV cache pool has no reusable physical slot");
+        }
+        auto slot = _allocate_cache_slot(slot_index);
+        _kv_cache_slots.emplace_back(std::move(slot));
+    }
+
+    auto& slot = *_kv_cache_slots.at(slot_index);
+    slot.metadata = _make_cache_metadata();
+    slot.pin_count = 1;
+    try {
+        _kv_cache_assignments.emplace(cache_id, slot_index);
+    } catch (...) {
+        slot.pin_count = 0;
+        slot.metadata = _make_cache_metadata();
+        throw;
+    }
+    return KVCacheLease(*this, slot_index, true);
+}
+
+
+void LanguageModel::_release_kv_cache(size_t slot_index) noexcept {
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    assert(slot_index < _kv_cache_slots.size());
+    auto& slot = *_kv_cache_slots[slot_index];
+    assert(slot.pin_count > 0);
+    --slot.pin_count;
+}
+
+
+bool LanguageModel::_remove_kv_cache(const std::optional<std::string>& cache_id) {
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    const auto assignment = _kv_cache_assignments.find(cache_id);
+    if (assignment == _kv_cache_assignments.end()) {
+        return false;
+    }
+
+    auto& slot = *_kv_cache_slots.at(assignment->second);
+    if (slot.pin_count != 0) {
+        throw std::runtime_error("Cannot remove a KV cache while it is in use");
+    }
+    for (auto& [_, buffer]: slot.buffers) {
+        buffer->clear();
+    }
+    slot.metadata = _make_cache_metadata();
+    _kv_cache_assignments.erase(assignment);
+    return true;
+}
+
+
+void LanguageModel::_invalidate_all_kv_caches() {
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    for (const auto& [_, slot_index]: _kv_cache_assignments) {
+        _kv_cache_slots.at(slot_index)->metadata = _make_cache_metadata();
+    }
+}
+
+
+void LanguageModel::_invalidate_active_kv_cache() {
+    _active_cache().metadata = _make_cache_metadata();
+}
+
+
+LanguageModel::KVCacheSlot& LanguageModel::_active_cache() {
+    if (_active_cache_slot == nullptr) {
+        throw std::logic_error("No KV cache slot is selected for inference");
+    }
+    return *_active_cache_slot;
+}
+
+
+const LanguageModel::KVCacheSlot& LanguageModel::_active_cache() const {
+    if (_active_cache_slot == nullptr) {
+        throw std::logic_error("No KV cache slot is selected for inference");
+    }
+    return *_active_cache_slot;
+}
+
+
+MLABuffer& LanguageModel::_cache_buffer(const std::string& name) {
+    if (_active_cache_slot != nullptr) {
+        return *_active_cache_slot->buffers.at(name);
+    }
+    if (_kv_cache_slots.empty()) {
+        throw std::logic_error("KV cache buffers have not been allocated");
+    }
+    return *_kv_cache_slots.front()->buffers.at(name);
+}
+
+
+const MLABuffer& LanguageModel::_cache_buffer(const std::string& name) const {
+    if (_active_cache_slot != nullptr) {
+        return *_active_cache_slot->buffers.at(name);
+    }
+    if (_kv_cache_slots.empty()) {
+        throw std::logic_error("KV cache buffers have not been allocated");
+    }
+    return *_kv_cache_slots.front()->buffers.at(name);
+}
+
+
+size_t LanguageModel::kv_cache_count() const {
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    return _kv_cache_assignments.size();
+}
+
+
+bool LanguageModel::remove_kv_cache(const std::string& cache_id) {
+    if (cache_id.empty()) {
+        throw std::invalid_argument("cache_id must not be empty");
+    }
+    return _remove_kv_cache(cache_id);
+}
+
+
+void LanguageModel::clear_kv_caches() {
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    for (const auto& slot: _kv_cache_slots) {
+        if (slot->pin_count != 0) {
+            throw std::runtime_error("Cannot clear KV caches while inference is in progress");
+        }
+    }
+    for (const auto& slot: _kv_cache_slots) {
+        for (auto& [_, buffer]: slot->buffers) {
+            buffer->clear();
+        }
+        slot->metadata = _make_cache_metadata();
+    }
+    _kv_cache_assignments.clear();
+}
+
+
+void LanguageModel::clear_cached_token_ids() {
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    const auto legacy = _kv_cache_assignments.find(std::nullopt);
+    if (legacy != _kv_cache_assignments.end()) {
+        _kv_cache_slots.at(legacy->second)->metadata.token_ids.clear();
+    }
+}
+
+
+size_t LanguageModel::kv_cache_bytes_per_slot() const {
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    if (_kv_cache_slots.empty()) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (const auto& [_, buffer]: _kv_cache_slots.front()->buffers) {
+        bytes += buffer->get_buf_len();
+    }
+    return bytes;
+}
+
+
+uint16_t LanguageModel::get_kv_cache_len() const {
+    if (_active_cache_slot != nullptr) {
+        return _active_cache_slot->metadata.kv_cache_len;
+    }
+    std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+    const auto legacy = _kv_cache_assignments.find(std::nullopt);
+    return legacy == _kv_cache_assignments.end()
+        ? 0
+        : _kv_cache_slots.at(legacy->second)->metadata.kv_cache_len;
+}
+
+
+void LanguageModel::set_kv_cache_len(uint16_t len) {
+    if (_active_cache_slot != nullptr) {
+        _active_cache_slot->metadata.kv_cache_len = len;
+        return;
+    }
+    auto lease = _acquire_kv_cache(std::nullopt);
+    ScopedActiveCache active(*this, lease.slot());
+    _active_cache().metadata.kv_cache_len = len;
 }
 
 
@@ -296,6 +638,43 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids
 ) {
+    return run_model(
+        input_token_ids,
+        std::move(timer_ttft),
+        override_max_num_tokens,
+        std::move(override_stop_token_ids),
+        std::nullopt
+    );
+}
+
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model(
+    std::span<const uint32_t> input_token_ids,
+    std::optional<ChronoTimer> timer_ttft,
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<std::set<uint32_t>> override_stop_token_ids,
+    std::optional<std::string> cache_id
+) {
+    auto lease = _acquire_kv_cache(cache_id);
+    ScopedActiveCache active(*this, lease.slot());
+    _text_streamer.push(
+        DecodeCallbackType::CACHE_CREATED, 0, lease.cache_created() ? 1.0 : 0.0
+    );
+    return _run_model_active(
+        input_token_ids,
+        std::move(timer_ttft),
+        override_max_num_tokens,
+        std::move(override_stop_token_ids)
+    );
+}
+
+
+std::optional<std::vector<uint32_t>> LanguageModel::_run_model_active(
+    std::span<const uint32_t> input_token_ids,
+    std::optional<ChronoTimer> timer_ttft,
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<std::set<uint32_t>> override_stop_token_ids
+) {
     // Update the state.
     _is_running = true;
 
@@ -303,34 +682,41 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     auto original_stop_token_ids = set_stop_token_ids(override_stop_token_ids);
 
     std::optional<std::vector<uint32_t>> output_token_ids{};
-
-    // If the input is already greater than the cache size, no need to run the model.
-    if (input_token_ids.size() > _max_num_tokens) {
-        _notify_cache_full();
-        output_token_ids = std::vector<uint32_t>();
-    } else {
-        // Create input embeds from input token ids and image embeds.
-        auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
-
-        // Prefill.
-        auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
-        auto output_token_id_begin = _cached_token_ids.size() - 1;
-        if (_stop_token_ids.contains(token_id)) {
-            _notify_stop();
-            output_token_ids = std::vector<uint32_t>{token_id};
-        } else if (!_is_running.load(std::memory_order_relaxed)) {
-            // Do nothing.
+    try {
+        // If the input is already greater than the cache size, no need to run the model.
+        if (input_token_ids.size() > _max_num_tokens) {
+            _notify_cache_full();
+            output_token_ids = std::vector<uint32_t>();
         } else {
-            // Decode.
-            run_model_decode(input_token_ids.size(), token_id);
-            output_token_ids = std::vector<uint32_t>(
-                _cached_token_ids.begin() + output_token_id_begin, _cached_token_ids.end()
-            );
-        }
-    }
+            // Create input embeds from input token ids and image embeds.
+            auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
 
-    // Wait until all the streaming finishes.
-    _text_streamer.wait_streaming();
+            // Prefill.
+            auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
+            auto output_token_id_begin = _active_cache().metadata.token_ids.size() - 1;
+            if (_stop_token_ids.contains(token_id)) {
+                _notify_stop();
+                output_token_ids = std::vector<uint32_t>{token_id};
+            } else if (!_is_running.load(std::memory_order_relaxed)) {
+                // Do nothing.
+            } else {
+                // Decode.
+                run_model_decode(input_token_ids.size(), token_id);
+                output_token_ids = std::vector<uint32_t>(
+                    _active_cache().metadata.token_ids.begin() + output_token_id_begin, _active_cache().metadata.token_ids.end()
+                );
+            }
+        }
+
+        // Wait until all the streaming finishes.
+        _text_streamer.wait_streaming();
+    } catch (...) {
+        set_max_num_tokens(original_max_num_tokens);
+        set_stop_token_ids(original_stop_token_ids);
+        _invalidate_active_kv_cache();
+        _is_running = false;
+        throw;
+    }
 
     // Restore the original values.
     set_max_num_tokens(original_max_num_tokens);
@@ -339,9 +725,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     if (_is_running) {
         _is_running = false;
         return output_token_ids;
-    } else {
-        return std::nullopt;
     }
+    _invalidate_active_kv_cache();
+    return std::nullopt;
 }
 
 
@@ -350,6 +736,13 @@ uint32_t LanguageModel::run_model_prefill(
     uint16_t num_cached_tokens,
     std::optional<ChronoTimer> timer_ttft
 ) {
+    if (_active_cache_slot == nullptr) {
+        auto lease = _acquire_kv_cache(std::nullopt);
+        ScopedActiveCache active(*this, lease.slot());
+        return run_model_prefill(
+            input_token_ids, num_cached_tokens, std::move(timer_ttft)
+        );
+    }
     if (_uses_per_layer_inputs())
         _prompt_per_layer_token_ids = _get_per_layer_token_ids(input_token_ids);
     if (!timer_ttft.has_value())
@@ -359,16 +752,16 @@ uint32_t LanguageModel::run_model_prefill(
     uint16_t token_idx{};
     uint32_t next_token_id{};
     uint16_t last_group_valid_tokens = 0;
-    if (!_cached_states.empty()) {
+    if (!_cache_state_layouts.empty()) {
         num_cached_tokens = _prepare_state_checkpoints_for_prefill(num_cached_tokens);
     }
 
     if (num_input_tokens == num_cached_tokens) {
         // All input tokens are already cached.
-        if (num_cached_tokens < _cached_token_ids.size())
-            next_token_id = _cached_token_ids[num_cached_tokens];
+        if (num_cached_tokens < _active_cache().metadata.token_ids.size())
+            next_token_id = _active_cache().metadata.token_ids[num_cached_tokens];
         else
-            next_token_id = _cached_first_generated_token;
+            next_token_id = _active_cache().metadata.first_generated_token;
     } else if (_use_group_token_models) {
         const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
@@ -410,14 +803,14 @@ uint32_t LanguageModel::run_model_prefill(
             }
             if (!_is_running.load(std::memory_order_relaxed)) {
                 _notify_interrupt();
-                _cached_token_ids.assign(
+                _active_cache().metadata.token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx
                 );
                 return next_token_id;
             }
         }
         if (
-            !_cached_states.empty() 
+            !_cache_state_layouts.empty()
             && last_group_valid_tokens > 0
             && last_group_valid_tokens < group_size
         ) {
@@ -431,17 +824,17 @@ uint32_t LanguageModel::run_model_prefill(
             next_token_id = run_model_once(1, token_idx, num_input_tokens, 0);
             if (!_is_running.load(std::memory_order_relaxed)) {
                 _notify_interrupt();
-                _cached_token_ids.assign(
+                _active_cache().metadata.token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx + 1
                 );
                 return next_token_id;
             }
         }
     }
-    _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
+    _active_cache().metadata.token_ids.assign(input_token_ids.begin(), input_token_ids.end());
     auto duration = timer_ttft.value().stop();
     _notify_first_token(next_token_id, duration);
-    _cached_first_generated_token = next_token_id;
+    _active_cache().metadata.first_generated_token = next_token_id;
     return next_token_id;
 }
 
@@ -449,11 +842,17 @@ uint32_t LanguageModel::run_model_prefill(
 void LanguageModel::run_model_decode(
     uint16_t num_input_tokens, uint32_t token_id
 ) {
+    if (_active_cache_slot == nullptr) {
+        auto lease = _acquire_kv_cache(std::nullopt);
+        ScopedActiveCache active(*this, lease.slot());
+        run_model_decode(num_input_tokens, token_id);
+        return;
+    }
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
-        _cached_token_ids.emplace_back(token_id);
+        _active_cache().metadata.token_ids.emplace_back(token_id);
         token_id = next_token_id;
 
         auto duration = timer_tps.stop(true);
@@ -481,6 +880,16 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     std::span<const uint32_t> continuation_token_ids,
     bool use_group_prefill
 ) {
+    if (_active_cache_slot == nullptr) {
+        auto lease = _acquire_kv_cache(std::nullopt);
+        ScopedActiveCache active(*this, lease.slot());
+        return run_model_for_loglikelihood(
+            input_token_ids,
+            continuation_start,
+            continuation_token_ids,
+            use_group_prefill
+        );
+    }
     if (!_cfg.pipeline_cfg.return_logits) {
         throw std::runtime_error(
             "model not compiled with --return_logits; "
@@ -549,7 +958,7 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
         if (!should_group_prefill) {
             // Single-token scoring rewrites the model cache from token zero without going
             // through run_model_prefill(), so the cached-token metadata is no longer valid.
-            _cached_token_ids.clear();
+            _active_cache().metadata.token_ids.clear();
         }
         if (should_group_prefill) {
             create_input_buffers(input_token_ids);
@@ -701,7 +1110,36 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
                     1, normal_scale_buf, {normal_input_row, 0}
                 );
             }
-            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+            const uint16_t tail_size = std::max<uint16_t>(1, _cfg.lm_cfg.conv_L_cache - 1);
+            const uint16_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
+            auto& conv_cache = _cache_buffer(
+                fmt::format("conv_cache_history_l{}", layer_idx)
+            );
+            const uint8_t cache_ifm_idx = layer_idx
+                ? 1
+                : 1 + static_cast<uint8_t>(_cfg.pipeline_cfg.quantize_embeddings);
+            ifm_map.emplace(
+                cache_ifm_idx,
+                MLABufferSlice{
+                    &conv_cache,
+                    {tail_begin, 0},
+                    {tail_size, _cfg.lm_cfg.hidden_size}
+                }
+            );
+            std::map<uint8_t, MLABufferSlice> ofm_map{
+                {
+                    1,
+                    MLABufferSlice{
+                        &conv_cache,
+                        {num_tokens > 1 ? 0U : static_cast<uint32_t>(tail_begin), 0},
+                        {
+                            static_cast<uint32_t>(num_tokens + tail_size - 1),
+                            _cfg.lm_cfg.hidden_size
+                        }
+                    }
+                }
+            };
+            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map, &ofm_map);
 
             if (layer_idx != (_cfg.lm_cfg.num_hidden_layers - 1)) {
                 continue;
@@ -718,7 +1156,7 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
 
     MLAModelWithBuffer::run_queue();
 
-    if (!_cached_states.empty()) {
+    if (!_cache_state_layouts.empty()) {
         for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
             if (_checkpoint_boundaries[i] == next_token_idx) {
                 _save_state_checkpoint(i, num_tokens, 1);
@@ -819,6 +1257,13 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
+    if (_active_cache_slot == nullptr) {
+        auto lease = _acquire_kv_cache(std::nullopt);
+        ScopedActiveCache active(*this, lease.slot());
+        return run_model_once(
+            num_tokens, token_idx, num_input_tokens, token_id, logits_ptr
+        );
+    }
     uint16_t next_token_idx;
     if (num_tokens > 1) {
         next_token_idx = std::min(num_input_tokens, uint16_t(token_idx + num_tokens));
@@ -1105,7 +1550,36 @@ uint32_t LanguageModel::run_model_once(
                     1, normal_scale_buf, {normal_input_row, 0}
                 );
             }
-            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+            const uint16_t tail_size = std::max<uint16_t>(1, _cfg.lm_cfg.conv_L_cache - 1);
+            const uint16_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
+            auto& conv_cache = _cache_buffer(
+                fmt::format("conv_cache_history_l{}", layer_idx)
+            );
+            const uint8_t cache_ifm_idx = layer_idx
+                ? 1
+                : 1 + static_cast<uint8_t>(_cfg.pipeline_cfg.quantize_embeddings);
+            ifm_map.emplace(
+                cache_ifm_idx,
+                MLABufferSlice{
+                    &conv_cache,
+                    {tail_begin, 0},
+                    {tail_size, _cfg.lm_cfg.hidden_size}
+                }
+            );
+            std::map<uint8_t, MLABufferSlice> ofm_map{
+                {
+                    1,
+                    MLABufferSlice{
+                        &conv_cache,
+                        {num_tokens > 1 ? 0U : static_cast<uint32_t>(tail_begin), 0},
+                        {
+                            static_cast<uint32_t>(num_tokens + tail_size - 1),
+                            _cfg.lm_cfg.hidden_size
+                        }
+                    }
+                }
+            };
+            _conv_model_map.at(conv_model_key).add_to_queue(&ifm_map, &ofm_map);
 
             if (
                 num_input_tokens > next_token_idx
@@ -1140,7 +1614,7 @@ uint32_t LanguageModel::run_model_once(
     MLAModelWithBuffer::run_queue();
 
     // If this run landed exactly on a checkpoint boundary, save the tail.
-    if (!_cached_states.empty()) {
+    if (!_cache_state_layouts.empty()) {
         for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
             if (_checkpoint_boundaries[i] == next_token_idx) {
                 // A partial prefill group can land exactly on a checkpoint boundary.
@@ -1243,6 +1717,12 @@ void LanguageModel::_initialize() {
     _logger->info("Language model initialize starting ...");
     BaseModel::_initialize();
 
+    // Allocate one physical slot before constructing model wrappers. The
+    // remaining slots are allocated lazily and published only after every
+    // buffer in the canonical layout succeeds.
+    _kv_cache_slots.reserve(_max_kv_cache_slots);
+    _kv_cache_slots.emplace_back(_allocate_cache_slot(0));
+
     // Define and load the models in parallel.
     _define_models();
     MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
@@ -1335,13 +1815,13 @@ void LanguageModel::_initialize() {
     // Clear the KV caches and caches states.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-            get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
+            _cache_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
         } else if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
-            get_buffer(fmt::format("cache_key_l{}", layer_idx)).clear();
-            get_buffer(fmt::format("cache_val_l{}", layer_idx)).clear();
+            _cache_buffer(fmt::format("cache_key_l{}", layer_idx)).clear();
+            _cache_buffer(fmt::format("cache_val_l{}", layer_idx)).clear();
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)).clear();
-                get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)).clear();
+                _cache_buffer(fmt::format("cache_key_scale_l{}", layer_idx)).clear();
+                _cache_buffer(fmt::format("cache_val_scale_l{}", layer_idx)).clear();
             }
         }
     }
@@ -1365,9 +1845,9 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
         _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), num_cached_tokens
     );
     if (it == _checkpoint_boundaries.begin()) {
-        for (const auto& state: _cached_states) {
-            for (const auto& layer_idx: state.layer_indices) {
-                get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx)).clear();
+        for (const auto& layout: _cache_state_layouts) {
+            for (const auto& layer_idx: layout.layer_indices) {
+                _cache_buffer(fmt::format("{}{}", layout.buffer_name_prefix, layer_idx)).clear();
             }
         }
         return 0;
@@ -1376,18 +1856,22 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
     uint16_t restored_token_count = *it;
     auto requested_boundary = std::distance(_checkpoint_boundaries.begin(), it);
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
-    for (auto& state: _cached_states) {
+    for (size_t state_idx = 0; state_idx < _cache_state_layouts.size(); ++state_idx) {
+        const auto& layout = _cache_state_layouts[state_idx];
         const size_t dst_offset = static_cast<size_t>(
-            tail_begin * state.num_elems * state.elem_size
+            tail_begin * layout.num_elems * layout.elem_size
         );
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& checkpoints = state.checkpoints[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
+        for (size_t layer_slot = 0; layer_slot < layout.layer_indices.size(); ++layer_slot) {
+            const auto layer_idx = layout.layer_indices[layer_slot];
+            auto& checkpoints =
+                _active_cache().metadata.checkpoints[state_idx].checkpoints[layer_slot];
+            auto& buf = _cache_buffer(
+                fmt::format("{}{}", layout.buffer_name_prefix, layer_idx)
+            );
             buf.upload_raw(
                 checkpoints[requested_boundary].data(),
                 dst_offset,
-                state.tail_bytes,
+                layout.tail_bytes,
                 true
             );
         }
@@ -1405,17 +1889,22 @@ void LanguageModel::_save_state_checkpoint(
         ? static_cast<uint32_t>(valid_tokens - 1)
         : static_cast<uint32_t>(_cfg.pipeline_cfg.input_token_group_size - 1);
 
-    for (auto& state: _cached_states) {
-        const size_t src_offset_bytes = tail_row_offset * state.num_elems * state.elem_size;
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
+    for (size_t state_idx = 0; state_idx < _cache_state_layouts.size(); ++state_idx) {
+        const auto& layout = _cache_state_layouts[state_idx];
+        const size_t src_offset_bytes =
+            tail_row_offset * layout.num_elems * layout.elem_size;
+        for (size_t layer_slot = 0; layer_slot < layout.layer_indices.size(); ++layer_slot) {
+            const auto layer_idx = layout.layer_indices[layer_slot];
+            auto& buf = _cache_buffer(
+                fmt::format("{}{}", layout.buffer_name_prefix, layer_idx)
+            );
             buf.invalidate_cache();
             auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
             std::memcpy(
-                state.checkpoints[layer_slot][boundary_idx].data(),
+                _active_cache().metadata.checkpoints[state_idx]
+                    .checkpoints[layer_slot][boundary_idx].data(),
                 ptr + src_offset_bytes,
-                state.tail_bytes
+                layout.tail_bytes
             );
         }
     }
@@ -1426,15 +1915,17 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
     // After a partial last group, move the valid tail to the end of the conv buffer,
     //  where the decode MLAModel expects it.
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
-    for (auto& state: _cached_states) {
-        const size_t src_offset_bytes = (valid_tokens - 1) * state.num_elems * state.elem_size;
-        const size_t dst_offset_bytes = tail_begin * state.num_elems * state.elem_size;
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
+    for (const auto& layout: _cache_state_layouts) {
+        const size_t src_offset_bytes =
+            (valid_tokens - 1) * layout.num_elems * layout.elem_size;
+        const size_t dst_offset_bytes = tail_begin * layout.num_elems * layout.elem_size;
+        for (const auto layer_idx: layout.layer_indices) {
+            auto& buf = _cache_buffer(
+                fmt::format("{}{}", layout.buffer_name_prefix, layer_idx)
+            );
             buf.invalidate_cache();
             auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
-            std::memmove(ptr + dst_offset_bytes, ptr + src_offset_bytes, state.tail_bytes);
+            std::memmove(ptr + dst_offset_bytes, ptr + src_offset_bytes, layout.tail_bytes);
             buf.flush_cache();
         }
     }
@@ -1444,6 +1935,12 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
 void LanguageModel::_finalize() {
     _logger->info("Language model finalize starting ...");
     MLAModelWithBuffer::free_all_models(_elf_dir / _cfg.language_model_name);
+    {
+        std::lock_guard<std::mutex> lock(_kv_cache_mutex);
+        _active_cache_slot = nullptr;
+        _kv_cache_assignments.clear();
+        _kv_cache_slots.clear();
+    }
     BaseModel::_finalize();
     _logger->info("Language model finalize completed");
 }
@@ -1518,7 +2015,7 @@ void LanguageModel::_define_buffers() {
     std::vector<size_t> conv_cache_shape{conv_working_len, _cfg.lm_cfg.hidden_size};
     for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
         if (_cfg.lm_cfg.layer_types[i] == "conv") {
-            define_buffer(fmt::format("conv_cache_history_l{}", i), conv_cache_shape);
+            _define_cache_buffer(fmt::format("conv_cache_history_l{}", i), conv_cache_shape);
         } else {
             if (_cfg.pipeline_cfg.use_strided_kv_cache) {
                 cache_shape = {
@@ -1534,8 +2031,8 @@ void LanguageModel::_define_buffers() {
             }
             if (!_cfg.lm_cfg.is_kv_shared_layer(i)) {
                 std::string kv_dtype = _cfg.pipeline_cfg.quantize_kv_cache ? "int8" : "bfloat16";
-                define_buffer(fmt::format("cache_key_l{}", i), cache_shape, kv_dtype);
-                define_buffer(fmt::format("cache_val_l{}", i), cache_shape, kv_dtype);
+                _define_cache_buffer(fmt::format("cache_key_l{}", i), cache_shape, kv_dtype);
+                _define_cache_buffer(fmt::format("cache_val_l{}", i), cache_shape, kv_dtype);
                 if (_cfg.pipeline_cfg.quantize_kv_cache) {
                     // Keep the logical C=1 scale shape. MLABuffer aligns each BF16 row to
                     // the 16-byte MLA row required by the physical HWC16 layout.
@@ -1544,8 +2041,8 @@ void LanguageModel::_define_buffers() {
                         _cfg.pipeline_cfg.max_num_tokens,
                         1
                     };
-                    define_buffer(fmt::format("cache_key_scale_l{}", i), scale_shape);
-                    define_buffer(fmt::format("cache_val_scale_l{}", i), scale_shape);
+                    _define_cache_buffer(fmt::format("cache_key_scale_l{}", i), scale_shape);
+                    _define_cache_buffer(fmt::format("cache_val_scale_l{}", i), scale_shape);
                 }
             }
         }
@@ -1882,25 +2379,25 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
 
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         uint8_t ofm_idx = 1;
-        auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", layer_idx));
-        auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", layer_idx));
+        auto& key_buffer = _cache_buffer(fmt::format("cache_key_l{}", layer_idx));
+        auto& val_buffer = _cache_buffer(fmt::format("cache_val_l{}", layer_idx));
         if (_cfg.pipeline_cfg.use_strided_kv_cache) {
             pre_model._bind_ofm(ofm_idx++, &key_buffer, {0, token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
+                auto& scale = _cache_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
                 pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
             }
             pre_model._bind_ofm(ofm_idx++, &val_buffer, {0, token_idx, 0});
         } else {
             pre_model._bind_ofm(ofm_idx++, &key_buffer, {token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
+                auto& scale = _cache_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
                 pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
             }
             pre_model._bind_ofm(ofm_idx++, &val_buffer, {token_idx, 0});
         }
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
+            auto& scale = _cache_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
             pre_model._bind_ofm(ofm_idx, &scale, {0, token_idx, 0});
         }
     }
@@ -1919,8 +2416,8 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     // IFM 0 is the query buffer. Its pointer, begin, and shape are invariant
     // for a compact cache key, so only the layer-owned cache inputs are rebound.
     uint8_t cache_ifm_idx = 1;
-    auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", kv_source_layer));
-    auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", kv_source_layer));
+    auto& key_buffer = _cache_buffer(fmt::format("cache_key_l{}", kv_source_layer));
+    auto& val_buffer = _cache_buffer(fmt::format("cache_val_l{}", kv_source_layer));
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
             cache_ifm_idx++, &key_buffer, {0, cache_token_idx_begin, 0}
@@ -1929,7 +2426,7 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         cache_model._bind_ifm(cache_ifm_idx++, &key_buffer, {cache_token_idx_begin, 0});
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer));
+        auto& scale = _cache_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer));
         cache_model._bind_ifm(cache_ifm_idx++, &scale, {0, cache_token_idx_begin, 0});
     }
     if (use_group_future_token_mask) {
@@ -1954,7 +2451,7 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         cache_model._bind_ifm(cache_ifm_idx++, &val_buffer, {cache_token_idx_begin, 0});
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer));
+        auto& scale = _cache_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer));
         cache_model._bind_ifm(cache_ifm_idx, &scale, {0, cache_token_idx_begin, 0});
     }
 
@@ -2004,7 +2501,7 @@ void LanguageModel::compact_kv_after_accept(
     }
 
     if (n == 0) {
-        _kv_cache_len = prev_input_len;
+        _active_cache().metadata.kv_cache_len = prev_input_len;
         return;
     }
 
@@ -2016,7 +2513,7 @@ void LanguageModel::compact_kv_after_accept(
 
     std::vector<uint8_t> tmp;
     auto compact_buffer = [&](const std::string& name) {
-        auto& buf = get_buffer(name);
+        auto& buf = _cache_buffer(name);
         const auto& shape = buf.get_shape();
         if (
             shape.size() != 3 || shape[0] != num_kv_heads
@@ -2082,7 +2579,7 @@ void LanguageModel::compact_kv_after_accept(
         }
     }
 
-    _kv_cache_len = static_cast<uint16_t>(prev_input_len + n);
+    _active_cache().metadata.kv_cache_len = static_cast<uint16_t>(prev_input_len + n);
 }
 
 
@@ -2184,7 +2681,7 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         model_ptr->update_reloc(reloc_addr_map);
     }
 
-    _cached_token_ids.clear();
+    _invalidate_all_kv_caches();
     _reloc_name = reloc_name;
     _logger->info("Relocation completed");
 }
@@ -2202,7 +2699,7 @@ void LanguageModel::unset_reloc() {
         buffer.clear();
     }
 
-    _cached_token_ids.clear();
+    _invalidate_all_kv_caches();
     _reloc_name = std::nullopt;
     _logger->info("Undo relocation completed");
 }
@@ -2331,7 +2828,7 @@ void LanguageModel::_stage_embedding_rows(
 
 uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_token_ids) {
     // Log.
-    _logger->info("Cached token ids: [{}]", fmt::join(_cached_token_ids, ", "));
+    _logger->info("Cached token ids: [{}]", fmt::join(_active_cache().metadata.token_ids, ", "));
 
     const uint16_t num_input_tokens = input_token_ids.size();
     const auto& embeddings_buf = get_buffer("embeddings");
@@ -2385,8 +2882,8 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
             if (
                 num_images == 0
                 && token_idx == num_cached_tokens
-                && token_idx < _cached_token_ids.size()
-                && token_id == _cached_token_ids[token_idx]
+                && token_idx < _active_cache().metadata.token_ids.size()
+                && token_id == _active_cache().metadata.token_ids[token_idx]
             )
                 ++num_cached_tokens;
             token_idx = next_token_idx;
@@ -2397,21 +2894,22 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
         scales_buf->flush_cache();
     }
 
-    // Update rope table if needed.
-    if (
-        _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type == "mrope"
-        && (_has_image_token || num_images > 0)
-    ) {
-        // Previous or current input has image.
+    // mRoPE tables are reconstructed from the current request so cache
+    // selection never depends on which session ran previously.
+    if (_cfg.lm_cfg.rope_cfg.rope_scaling.rope_type == "mrope") {
         _logger->info("Update rope table");
-        auto rope_table = calc_mrope_with_image(
-            _cfg, _master_rope_table, _image_token_id.value(), input_token_ids
-        );
+        const auto rope_table = num_images > 0
+            ? calc_mrope_with_image(
+                _cfg, _master_rope_table, _image_token_id.value(), input_token_ids
+            )
+            : _master_rope_table;
         get_buffer("global_freq_real").upload(rope_table.re.data());
         get_buffer("global_freq_imag").upload(rope_table.im.data());
     }
-    _has_image_token = num_images > 0;
 
+    _text_streamer.push(
+        DecodeCallbackType::CACHED_PROMPT_TOKENS, num_cached_tokens, 0.0
+    );
     _logger->info("Number of tokens cached: {:d}", num_cached_tokens);
     return num_cached_tokens;
 }

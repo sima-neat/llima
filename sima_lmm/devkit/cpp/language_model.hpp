@@ -8,9 +8,11 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -37,6 +39,11 @@ struct GenerationPerformanceResult {
     std::optional<uint32_t> accepted_draft_tokens;
 };
 
+class KVCacheCapacityError : public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+};
+
 // Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
 // (num_tokens, cache_kind, aligned_cache_token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
@@ -51,6 +58,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer
         );
+        LanguageModel(
+            std::filesystem::path model_path,
+            std::set<uint32_t> stop_token_ids,
+            std::optional<uint32_t> image_token_id,
+            std::optional<uint32_t> pad_token_id,
+            TextStreamer& text_streamer,
+            size_t max_kv_cache_slots
+        );
         virtual ~LanguageModel() override { _finalize(); }
 
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
@@ -61,6 +76,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
+        );
+        std::optional<std::vector<uint32_t>> run_model(
+            std::span<const uint32_t> input_token_ids,
+            std::optional<ChronoTimer> timer_ttft,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<std::set<uint32_t>> override_stop_token_ids,
+            std::optional<std::string> cache_id
         );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
@@ -92,6 +114,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr
         );
+        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            std::optional<std::string> cache_id
+        );
         void stop_model() { _is_running = false; }
 
         void set_reloc(const std::string& reloc_name);
@@ -102,7 +132,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
         auto get_max_num_tokens() const { return _max_num_tokens; }
         std::set<uint32_t> set_stop_token_ids(std::optional<std::set<uint32_t>> stop_token_ids);
         const auto& get_stop_token_ids() const { return _stop_token_ids; }
-        void clear_cached_token_ids() { _cached_token_ids.clear(); }
+        void clear_cached_token_ids();
+        size_t kv_cache_count() const;
+        bool remove_kv_cache(const std::string& cache_id);
+        void clear_kv_caches();
+        size_t kv_cache_bytes_per_slot() const;
 
         // Captured hidden states from layers 2, N/2, N-3 during prefill (spec decoding).
         // Populated by run_model_once when queue is disabled and spec mode is active.
@@ -228,8 +262,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
 
         // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
-        uint16_t get_kv_cache_len() const { return _kv_cache_len; }
-        void set_kv_cache_len(uint16_t len) { _kv_cache_len = len; }
+        uint16_t get_kv_cache_len() const;
+        void set_kv_cache_len(uint16_t len);
 
         // Current spec round's tree mask, shared between target and draft via
         // shared_ptr. nullptr = "no tree active". Cleared on both at round start.
@@ -241,13 +275,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         // zeros(topk); used in depth loop as position_ids = len_posi + offsets.
         std::vector<int32_t> _eagle3_position_ids;
 
-        // Cumulative draft KV position. Reset per round; advanced by hidden_rows
-        // after each first draft_forward in topk_generate.
-        size_t _eagle3_stable_kv = 0;
-
     private:
         void _define_draft_fc_models();
-        struct CachedState {
+        struct CacheStateLayout {
             // Hidden-layer indices belonging to this stateful family.
             std::vector<uint8_t> layer_indices;
             // MLA buffer name prefix; full name is `{prefix}{layer_idx}`.
@@ -260,13 +290,105 @@ class LanguageModel : public BaseModel<VlmConfig> {
             size_t elem_size;
             // Bytes per tail snapshot = tail_len * num_elems * elem_size.
             size_t tail_bytes;
+        };
+
+        struct CacheCheckpointSet {
             // Tail snapshots indexed as [layer_slot][boundary_idx][byte_offset].
             std::vector<std::vector<std::vector<uint8_t>>> checkpoints;
+        };
+
+        struct KVCacheMetadata {
+            std::vector<uint32_t> token_ids;
+            uint32_t first_generated_token = 0;
+            std::vector<uint32_t> draft_tokens;
+            std::vector<std::vector<int32_t>> retrieve_indices;
+            eagle_helpers::EagleTreeMask tree_mask;
+            std::vector<int32_t> tree_position_ids;
+            uint16_t eagle3_prompt_len = 0;
+            size_t eagle3_stable_kv = 0;
+            size_t cached_eagle3_stable_kv = 0;
+            uint16_t kv_cache_len = 0;
+            std::vector<CacheCheckpointSet> checkpoints;
+        };
+
+        struct CacheBufferSpec {
+            std::string name;
+            std::vector<size_t> shape;
+            std::string dtype;
+            bool align_last_dim = true;
+        };
+
+        struct KVCacheSlot {
+            std::map<std::string, std::unique_ptr<MLABuffer>> buffers;
+            KVCacheMetadata metadata;
+            size_t pin_count = 0;
+        };
+
+        class KVCacheLease {
+            public:
+                KVCacheLease() = default;
+                KVCacheLease(LanguageModel& owner, size_t slot_index, bool cache_created);
+                ~KVCacheLease();
+                KVCacheLease(KVCacheLease&& other) noexcept;
+                KVCacheLease& operator=(KVCacheLease&& other) noexcept;
+                KVCacheLease(const KVCacheLease&) = delete;
+                KVCacheLease& operator=(const KVCacheLease&) = delete;
+
+                KVCacheSlot& slot() const;
+                bool cache_created() const { return _cache_created; }
+                void reset() noexcept;
+
+            private:
+                LanguageModel* _owner = nullptr;
+                size_t _slot_index = 0;
+                bool _cache_created = false;
+        };
+
+        class ScopedActiveCache {
+            public:
+                ScopedActiveCache(LanguageModel& owner, KVCacheSlot& slot);
+                ~ScopedActiveCache();
+                ScopedActiveCache(const ScopedActiveCache&) = delete;
+                ScopedActiveCache& operator=(const ScopedActiveCache&) = delete;
+
+            private:
+                LanguageModel& _owner;
+                KVCacheSlot* _previous;
         };
 
         virtual void _initialize() override;
         virtual void _finalize() override;
         void _define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count);
+        void _define_cache_buffer(
+            std::string name,
+            std::vector<size_t> shape,
+            std::string dtype = "bfloat16",
+            bool align_last_dim = true
+        );
+        std::unique_ptr<KVCacheSlot> _allocate_cache_slot(size_t slot_index) const;
+        KVCacheMetadata _make_cache_metadata() const;
+        KVCacheLease _acquire_kv_cache(const std::optional<std::string>& cache_id);
+        void _release_kv_cache(size_t slot_index) noexcept;
+        bool _remove_kv_cache(const std::optional<std::string>& cache_id);
+        void _invalidate_all_kv_caches();
+        void _invalidate_active_kv_cache();
+        KVCacheSlot& _active_cache();
+        const KVCacheSlot& _active_cache() const;
+        MLABuffer& _cache_buffer(const std::string& name);
+        const MLABuffer& _cache_buffer(const std::string& name) const;
+        std::optional<std::vector<uint32_t>> _run_model_active(
+            std::span<const uint32_t> input_token_ids,
+            std::optional<ChronoTimer> timer_ttft,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<std::set<uint32_t>> override_stop_token_ids
+        );
+        std::optional<std::vector<uint32_t>> _run_model_speculative_decoding_active(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result
+        );
         virtual void _define_buffers() override;
         void _define_model(
             const std::string& model_type,
@@ -384,26 +506,19 @@ class LanguageModel : public BaseModel<VlmConfig> {
         RopeTable _global_freq_host;  // pristine CPU copy; source for tree-RoPE rows
         RopeTable _local_freq_host;   // empty if SWA not enabled
 
-        bool _has_image_token;
-
         Eigen::bfloat16* _embeddings_tensor_ptr;
         size_t _per_layer_embedding_rows_per_shard = 0;
         std::vector<MLABuffer*> _per_layer_embedding_shards;
         std::vector<uint32_t> _prompt_per_layer_token_ids;
-        std::vector<uint32_t> _cached_token_ids;
-        uint32_t _cached_first_generated_token;
-        // Full-match cache: prior turn's tree state. Restored only when the
-        // matching token prefix also has the same prompt length.
-        std::vector<uint32_t> _cached_draft_tokens;
-        std::vector<std::vector<int32_t>> _cached_retrieve_indices;
-        eagle_helpers::EagleTreeMask _cached_tree_mask;
-        std::vector<int32_t> _cached_tree_position_ids;
-        uint16_t _cached_eagle3_prompt_len = 0;
-        size_t _cached_eagle3_stable_kv = 0;
-        uint16_t _kv_cache_len = 0;  // tokens in KV cache; set by prefill, advanced by decode
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
         std::vector<uint16_t> _checkpoint_boundaries;
-        std::vector<CachedState> _cached_states;
+        std::vector<CacheStateLayout> _cache_state_layouts;
+        std::vector<CacheBufferSpec> _cache_buffer_specs;
+        std::vector<std::unique_ptr<KVCacheSlot>> _kv_cache_slots;
+        std::map<std::optional<std::string>, size_t> _kv_cache_assignments;
+        size_t _max_kv_cache_slots;
+        mutable std::mutex _kv_cache_mutex;
+        KVCacheSlot* _active_cache_slot = nullptr;
 
         std::vector<std::vector<Eigen::bfloat16>> _eagle3_intermediate_hidden_states;
 

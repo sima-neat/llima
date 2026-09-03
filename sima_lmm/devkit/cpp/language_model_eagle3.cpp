@@ -297,7 +297,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     if (!_is_running.load(std::memory_order_relaxed))
         return {};
 
-    const int num_cached_tokens = static_cast<int>(_eagle3_stable_kv);
+    const int num_cached_tokens = static_cast<int>(_active_cache().metadata.eagle3_stable_kv);
 
     // num_tokens = 16 for target verify; seq_length is the valid candidate count.
     const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
@@ -643,21 +643,21 @@ LanguageModel::UpdateInferenceInputsResult LanguageModel::update_inference_input
     input_ids_with_bonus.push_back(bonus_token);
 
     // Build next round's tree from the accepted hidden states. Caller must sync
-    // target's _eagle3_stable_kv with draft's after this returns.
+    // target's _active_cache().metadata.eagle3_stable_kv with draft's after this returns.
     auto tg = draft_lm.topk_generate(
         *this,
         std::move(input_ids_with_bonus),
         std::move(accept_hidden_state_new),
-        /*num_cached_tokens=*/static_cast<int>(draft_lm._eagle3_stable_kv),
+        /*num_cached_tokens=*/static_cast<int>(draft_lm._active_cache().metadata.eagle3_stable_kv),
         /*is_prefill=*/false
     );
 
     new_token += accept_length + 1;
 
     // Cache for next-turn prefix matching. input_ids excludes the bonus, so
-    // it matches target's _kv_cache_len after compact_kv_after_accept.
-    _cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    draft_lm._cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    // it matches target's _active_cache().metadata.kv_cache_len after compact_kv_after_accept.
+    _active_cache().metadata.token_ids.assign(input_ids.begin(), input_ids.end());
+    draft_lm._active_cache().metadata.token_ids.assign(input_ids.begin(), input_ids.end());
 
     UpdateInferenceInputsResult result;
     result.input_ids         = std::move(input_ids);
@@ -721,8 +721,8 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     // stable_kv advance and last_hidden indexing.
     const uint32_t embed_size_for_kv = _cfg.lm_cfg.hidden_size;
     const size_t hidden_rows = hidden_states.size() / (3 * embed_size_for_kv);
-    const size_t stable_kv_before = _eagle3_stable_kv;
-    input_ids.erase(input_ids.begin(), input_ids.begin() + _eagle3_stable_kv);
+    const size_t stable_kv_before = _active_cache().metadata.eagle3_stable_kv;
+    input_ids.erase(input_ids.begin(), input_ids.begin() + _active_cache().metadata.eagle3_stable_kv);
 
     DraftForwardResult draft_out;
     size_t last_row;
@@ -778,7 +778,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         // Last valid row of the last chunk = where lm_head logits for the
         // final input position live.
         last_row = static_cast<size_t>(last_valid_in_chunk) - 1;
-        _eagle3_stable_kv += hidden_rows;
+        _active_cache().metadata.eagle3_stable_kv += hidden_rows;
     } else {
         // Cross-round single dispatch (n=5). Absolute position_ids are required
         // so the per-token freq slice matches stable_kv+1..+K, not 0..K-1.
@@ -794,7 +794,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             input_ids,
             /*attention_mask=*/std::nullopt,
             /*position_ids=*/first_call_position_ids,
-            /*num_cached_tokens=*/static_cast<int>(_eagle3_stable_kv),
+            /*num_cached_tokens=*/static_cast<int>(_active_cache().metadata.eagle3_stable_kv),
             /*is_prefill=*/false
         );
         if (!target_lm._is_running.load(std::memory_order_relaxed))
@@ -803,7 +803,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         // Trim trailing bonus_token row (zero-FC slot, uninformative).
         hidden_states.resize(hidden_rows * embed_size_for_kv);
         last_row = hidden_rows - 1;
-        _eagle3_stable_kv += hidden_rows;
+        _active_cache().metadata.eagle3_stable_kv += hidden_rows;
     }
 
     // lm_head logits row for the final input position.
@@ -870,7 +870,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
 
     // Reuse the function parameter slot; the depth loop advances it by topk
     // each iter.
-    num_cached_tokens = static_cast<int>(_eagle3_stable_kv);
+    num_cached_tokens = static_cast<int>(_active_cache().metadata.eagle3_stable_kv);
 
     for (int i = 0; i < depth - 1; ++i) {
         // Share the current tree mask with the target via shared_ptr.
@@ -1183,21 +1183,21 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     get_buffer("global_freq_imag").upload(_global_freq_host.im.data());
 
     // Uploads token embeds and returns the prefix-match length against
-    // _cached_token_ids.
+    // _active_cache().metadata.token_ids.
     uint16_t prefix_cached = _set_input_text_embeds(input_ids);
 
     // Full-match early-out: every input token and the prompt length match the
     // tree state saved last turn.
     if (prefix_cached == num_input_tokens
-        && _cached_eagle3_prompt_len == num_input_tokens
-        && !_cached_draft_tokens.empty()) {
-        result.token              = _cached_first_generated_token;
-        result.draft_tokens       = _cached_draft_tokens;
-        result.retrieve_indices   = _cached_retrieve_indices;
-        result.tree_mask          = _cached_tree_mask;
-        result.tree_position_ids  = _cached_tree_position_ids;
-        _eagle3_stable_kv          = _cached_eagle3_stable_kv;
-        draft_lm._eagle3_stable_kv = draft_lm._cached_eagle3_stable_kv;
+        && _active_cache().metadata.eagle3_prompt_len == num_input_tokens
+        && !_active_cache().metadata.draft_tokens.empty()) {
+        result.token              = _active_cache().metadata.first_generated_token;
+        result.draft_tokens       = _active_cache().metadata.draft_tokens;
+        result.retrieve_indices   = _active_cache().metadata.retrieve_indices;
+        result.tree_mask          = _active_cache().metadata.tree_mask;
+        result.tree_position_ids  = _active_cache().metadata.tree_position_ids;
+        _active_cache().metadata.eagle3_stable_kv          = _active_cache().metadata.cached_eagle3_stable_kv;
+        draft_lm._active_cache().metadata.eagle3_stable_kv = draft_lm._active_cache().metadata.cached_eagle3_stable_kv;
         result.root_ready_time = std::chrono::steady_clock::now();
         result.time_to_first_token = timer_ttft.stop();
         _notify_first_token(result.token, result.time_to_first_token);
@@ -1257,9 +1257,9 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 
     // Cache for next-turn prefix matching. Must run BEFORE push_back so
     // input_ids still matches the pre-root-token prefill length.
-    _cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    draft_lm._cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    _cached_first_generated_token = result.token;
+    _active_cache().metadata.token_ids.assign(input_ids.begin(), input_ids.end());
+    draft_lm._active_cache().metadata.token_ids.assign(input_ids.begin(), input_ids.end());
+    _active_cache().metadata.first_generated_token = result.token;
 
     input_ids.push_back(result.token);
 
@@ -1292,14 +1292,14 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     result.tree_position_ids  = std::move(topk_result.tree_position_ids);
 
     // Cache tree state for the next turn's full-match early-out.
-    // _cached_first_generated_token was set above (before the push_back).
-    _cached_draft_tokens       = result.draft_tokens;
-    _cached_retrieve_indices   = result.retrieve_indices;
-    _cached_tree_mask          = result.tree_mask;
-    _cached_tree_position_ids  = result.tree_position_ids;
-    _cached_eagle3_prompt_len  = num_input_tokens;
-    _cached_eagle3_stable_kv          = _eagle3_stable_kv;
-    draft_lm._cached_eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+    // _active_cache().metadata.first_generated_token was set above (before the push_back).
+    _active_cache().metadata.draft_tokens       = result.draft_tokens;
+    _active_cache().metadata.retrieve_indices   = result.retrieve_indices;
+    _active_cache().metadata.tree_mask          = result.tree_mask;
+    _active_cache().metadata.tree_position_ids  = result.tree_position_ids;
+    _active_cache().metadata.eagle3_prompt_len  = num_input_tokens;
+    _active_cache().metadata.cached_eagle3_stable_kv          = _active_cache().metadata.eagle3_stable_kv;
+    draft_lm._active_cache().metadata.cached_eagle3_stable_kv = draft_lm._active_cache().metadata.eagle3_stable_kv;
 
     return result;
 }
@@ -1309,6 +1309,77 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 // update_inference_inputs while streaming accepted tokens. Caller serializes
 // invocations (VLM wrapper holds the run mutex).
 std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm,
+    std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result
+) {
+    return run_model_speculative_decoding(
+        draft_lm,
+        input_token_ids,
+        override_max_num_tokens,
+        std::move(timer_ttft),
+        performance_result,
+        std::nullopt
+    );
+}
+
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm,
+    std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result,
+    std::optional<std::string> cache_id
+) {
+    auto target_lease = _acquire_kv_cache(cache_id);
+    std::optional<KVCacheLease> draft_lease;
+    try {
+        draft_lease.emplace(draft_lm._acquire_kv_cache(cache_id));
+    } catch (...) {
+        const bool remove_target = target_lease.cache_created();
+        target_lease.reset();
+        if (remove_target) {
+            _remove_kv_cache(cache_id);
+        }
+        throw;
+    }
+
+    if (target_lease.cache_created() != draft_lease->cache_created()) {
+        target_lease.reset();
+        draft_lease->reset();
+        _remove_kv_cache(cache_id);
+        draft_lm._remove_kv_cache(cache_id);
+        throw std::runtime_error("EAGLE3 target and draft KV cache pools diverged");
+    }
+
+    ScopedActiveCache target_active(*this, target_lease.slot());
+    ScopedActiveCache draft_active(draft_lm, draft_lease->slot());
+    _text_streamer.push(
+        DecodeCallbackType::CACHE_CREATED,
+        0,
+        target_lease.cache_created() || draft_lease->cache_created() ? 1.0 : 0.0
+    );
+    try {
+        return _run_model_speculative_decoding_active(
+            draft_lm,
+            input_token_ids,
+            override_max_num_tokens,
+            std::move(timer_ttft),
+            performance_result
+        );
+    } catch (...) {
+        _invalidate_active_kv_cache();
+        draft_lm._invalidate_active_kv_cache();
+        throw;
+    }
+}
+
+
+std::optional<std::vector<uint32_t>>
+LanguageModel::_run_model_speculative_decoding_active(
     LanguageModel& draft_lm,
     std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
@@ -1343,17 +1414,15 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
             "stop (pre-init): input_len {} + spec_budget {} > max_length {}",
             input_len, spec_budget, max_length
         );
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
+        _invalidate_active_kv_cache();
+        draft_lm._invalidate_active_kv_cache();
         _text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
         _text_streamer.wait_streaming();
         _is_running = false;
         return std::nullopt;
     }
 
-    draft_lm._eagle3_stable_kv = 0;
+    draft_lm._active_cache().metadata.eagle3_stable_kv = 0;
 
     // Paired-clear keeps target and draft shared_ptr both null so neither
     // sees a stale mask from a previous run.
@@ -1366,10 +1435,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
     );
     if (!_is_running.load(std::memory_order_relaxed)) {
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
+        _invalidate_active_kv_cache();
+        draft_lm._invalidate_active_kv_cache();
         _notify_interrupt();
         _text_streamer.wait_streaming();
         return std::nullopt;
@@ -1380,9 +1447,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         performance_result->generated_tokens = 1;
     }
 
-    // Sync target's _eagle3_stable_kv with draft's — the draft incremented it
+    // Sync target's _active_cache().metadata.eagle3_stable_kv with draft's — the draft incremented it
     // inside initialize_tree's first topk_generate, and tree_decoding reads it.
-    _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+    _active_cache().metadata.eagle3_stable_kv = draft_lm._active_cache().metadata.eagle3_stable_kv;
 
     // Loop-carried state: seeded from initialize_tree, rebound each iter by
     // update_inference_inputs.
@@ -1481,7 +1548,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
 
             // Sync target's stable_kv with draft's — same pattern as after
             // initialize_tree.
-            _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+            _active_cache().metadata.eagle3_stable_kv = draft_lm._active_cache().metadata.eagle3_stable_kv;
 
             input_ids          = std::move(upd.input_ids);
             draft_tokens       = std::move(upd.draft_tokens);
@@ -1537,10 +1604,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     }
 
     if (!_is_running.load(std::memory_order_relaxed)) {
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
+        _invalidate_active_kv_cache();
+        draft_lm._invalidate_active_kv_cache();
         _notify_interrupt();
         _text_streamer.wait_streaming();
         return std::nullopt;
@@ -1572,10 +1637,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     // Use CACHE_FULL when generation stopped because the K-cache was exhausted,
     // mirroring non-spec; the streamer prints the "Cache full" notice.
     if (cache_full) {
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
+        _invalidate_active_kv_cache();
+        draft_lm._invalidate_active_kv_cache();
     }
     _text_streamer.push(
         cache_full ? DecodeCallbackType::CACHE_FULL : DecodeCallbackType::STOP, 0, 0

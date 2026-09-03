@@ -13,6 +13,19 @@ VisionLanguageModel::VisionLanguageModel(
     std::filesystem::path model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template
+) : VisionLanguageModel(
+    std::move(model_path),
+    std::move(system_prompt),
+    std::move(chat_template),
+    1
+) {}
+
+
+VisionLanguageModel::VisionLanguageModel(
+    std::filesystem::path model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    size_t max_kv_cache_slots
 ) : BaseModel(model_path),
     _vlm_helper(_cfg, _devkit_dir, system_prompt, chat_template),
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
@@ -26,7 +39,8 @@ VisionLanguageModel::VisionLanguageModel(
         _vlm_helper.get_stop_token_ids(),
         _vlm_helper.get_image_token_id(),
         _vlm_helper.get_pad_token_id(),
-        _text_streamer
+        _text_streamer,
+        max_kv_cache_slots
     );
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
@@ -41,6 +55,7 @@ VisionLanguageModel::VisionLanguageModel(
         }
         _text_streamer.disable();
         run_model(chat, 2);
+        _language_model_ptr->clear_kv_caches();
         _text_streamer.enable();
     }
 
@@ -51,6 +66,15 @@ VisionLanguageModel::VisionLanguageModel(
 
 std::optional<std::string> VisionLanguageModel::run_model(
     const Chat& chat, std::optional<uint16_t> max_new_tokens
+) {
+    return run_model(chat, max_new_tokens, std::nullopt);
+}
+
+
+std::optional<std::string> VisionLanguageModel::run_model(
+    const Chat& chat,
+    std::optional<uint16_t> max_new_tokens,
+    std::optional<std::string> cache_id
 ) {
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
@@ -120,11 +144,17 @@ std::optional<std::string> VisionLanguageModel::run_model(
             *_draft_vlm_ptr->_language_model_ptr,
             preprocessed_data.input_token_ids,
             max_num_tokens,
-            timer_ttft
+            timer_ttft,
+            nullptr,
+            cache_id
         );
     } else {
         output_token_ids = _language_model_ptr->run_model(
-            preprocessed_data.input_token_ids, timer_ttft, max_num_tokens
+            preprocessed_data.input_token_ids,
+            timer_ttft,
+            max_num_tokens,
+            std::nullopt,
+            cache_id
         );
     }
 
@@ -139,6 +169,21 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids
 ) {
+    return run_model(
+        input_token_ids,
+        override_max_num_tokens,
+        std::move(override_stop_token_ids),
+        std::nullopt
+    );
+}
+
+
+std::vector<uint32_t> VisionLanguageModel::run_model(
+    std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<std::set<uint32_t>> override_stop_token_ids,
+    std::optional<std::string> cache_id
+) {
     // Given a list of input token ids, return a list of generated token ids. The text streamer is
     // disabled for this mode.
     _text_streamer.set_tool_call_enabled(false);
@@ -146,7 +191,11 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
 
     _language_model_ptr->create_input_buffers(input_token_ids);
     auto output_token_ids = _language_model_ptr->run_model(
-        input_token_ids, std::nullopt, override_max_num_tokens, override_stop_token_ids
+        input_token_ids,
+        std::nullopt,
+        override_max_num_tokens,
+        std::move(override_stop_token_ids),
+        std::move(cache_id)
     );
     _text_streamer.enable();
     return output_token_ids.value_or(std::vector<uint32_t>());
@@ -288,6 +337,45 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
 
 void VisionLanguageModel::stop_model() {
     _language_model_ptr->stop_model();
+}
+
+
+size_t VisionLanguageModel::kv_cache_count() const {
+    return _language_model_ptr->kv_cache_count();
+}
+
+
+bool VisionLanguageModel::remove_kv_cache(const std::string& cache_id) {
+    std::lock_guard<std::mutex> lock(_run_mutex);
+    const bool removed = _language_model_ptr->remove_kv_cache(cache_id);
+    if (_draft_vlm_ptr != nullptr) {
+        const bool draft_removed =
+            _draft_vlm_ptr->_language_model_ptr->remove_kv_cache(cache_id);
+        if (removed != draft_removed) {
+            _language_model_ptr->clear_kv_caches();
+            _draft_vlm_ptr->_language_model_ptr->clear_kv_caches();
+            throw std::runtime_error("EAGLE3 target and draft KV cache pools diverged");
+        }
+    }
+    return removed;
+}
+
+
+void VisionLanguageModel::clear_kv_caches() {
+    std::lock_guard<std::mutex> lock(_run_mutex);
+    _language_model_ptr->clear_kv_caches();
+    if (_draft_vlm_ptr != nullptr) {
+        _draft_vlm_ptr->_language_model_ptr->clear_kv_caches();
+    }
+}
+
+
+size_t VisionLanguageModel::kv_cache_bytes_per_slot() const {
+    size_t bytes = _language_model_ptr->kv_cache_bytes_per_slot();
+    if (_draft_vlm_ptr != nullptr) {
+        bytes += _draft_vlm_ptr->_language_model_ptr->kv_cache_bytes_per_slot();
+    }
+    return bytes;
 }
 
 

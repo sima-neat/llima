@@ -91,3 +91,10 @@ After validating your model with `llima run`, see
 [GenAI Model](/develop-apps/development-workflow/genai-model/) to serve it
 through common API endpoints or use it directly from a C++ or Python
 application.
+
+Neat applications can configure a bounded number of reusable prompt contexts
+per model instance and provide a stable cache ID with each inference request.
+The default remains one context. Applications must explicitly remove completed
+contexts; the runtime reports capacity exhaustion instead of evicting another
+context automatically. Prefix-hit and cache-creation metrics let applications
+verify that large system and tool prompts are actually being reused.
