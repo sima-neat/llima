@@ -32,16 +32,33 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::optional<std::string> system_prompt = std::nullopt,
             std::optional<std::string> chat_template = std::nullopt
         );
+        VisionLanguageModel(
+            std::filesystem::path model_path,
+            std::optional<std::string> system_prompt,
+            std::optional<std::string> chat_template,
+            size_t max_kv_cache_slots
+        );
         ~VisionLanguageModel() {}
 
         std::optional<std::string> run_model(
             const Chat& chat,
             std::optional<uint16_t> max_new_tokens = std::nullopt
         );
+        std::optional<std::string> run_model(
+            const Chat& chat,
+            std::optional<uint16_t> max_new_tokens,
+            std::optional<std::string> cache_id
+        );
         std::vector<uint32_t> run_model(
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
+        );
+        std::vector<uint32_t> run_model(
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<std::set<uint32_t>> override_stop_token_ids,
+            std::optional<std::string> cache_id
         );
         std::vector<Eigen::bfloat16> run_model_for_logits(
             std::span<const uint32_t> input_token_ids
@@ -58,6 +75,10 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
         );
         void stop_model();
+        size_t kv_cache_count() const;
+        bool remove_kv_cache(const std::string& cache_id);
+        void clear_kv_caches();
+        size_t kv_cache_bytes_per_slot() const;
 
         // Configure a non-owning draft VLM for speculative decoding. When set,
         // run_model dispatches through the spec path automatically.

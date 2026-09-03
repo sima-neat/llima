@@ -54,7 +54,11 @@ void TextStreamer::push(DecodeCallbackData data) {
     if (!_is_enabled)
         return;
 
-    if (data.type != DecodeCallbackType::TPS) {
+    if (
+        data.type != DecodeCallbackType::TPS
+        && data.type != DecodeCallbackType::CACHED_PROMPT_TOKENS
+        && data.type != DecodeCallbackType::CACHE_CREATED
+    ) {
         _is_streaming.store(true);
     }
 
@@ -98,6 +102,12 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
                 _callback_info("END", 0.0);
                 _is_streaming.store(false);
                 _is_streaming.notify_one();
+                break;
+            case DecodeCallbackType::CACHED_PROMPT_TOKENS:
+                _callback_info("cached_prompt_tokens", data.token_id);
+                break;
+            case DecodeCallbackType::CACHE_CREATED:
+                _callback_info("cache_created", data.duration);
                 break;
             default:
                 throw std::runtime_error(

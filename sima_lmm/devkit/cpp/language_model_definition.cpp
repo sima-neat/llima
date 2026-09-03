@@ -129,7 +129,7 @@ void LanguageModel::_define_attn_models_iter(
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         pre_ofms.emplace_back(
             MLABufferSlice(
-                &get_buffer(fmt::format("cache_key_l{}", layer_idx)),
+                &_cache_buffer(fmt::format("cache_key_l{}", layer_idx)),
                 pre_kv_cache_offset,
                 pre_kv_cache_shape
             )
@@ -137,7 +137,7 @@ void LanguageModel::_define_attn_models_iter(
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
             pre_ofms.emplace_back(
                 MLABufferSlice(
-                    &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
+                    &_cache_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
@@ -145,7 +145,7 @@ void LanguageModel::_define_attn_models_iter(
         }
         pre_ofms.emplace_back(
             MLABufferSlice(
-                &get_buffer(fmt::format("cache_val_l{}", layer_idx)),
+                &_cache_buffer(fmt::format("cache_val_l{}", layer_idx)),
                 pre_kv_cache_offset,
                 pre_kv_cache_shape
             )
@@ -153,7 +153,7 @@ void LanguageModel::_define_attn_models_iter(
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
             pre_ofms.emplace_back(
                 MLABufferSlice(
-                    &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
+                    &_cache_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
@@ -226,7 +226,7 @@ void LanguageModel::_define_attn_models_iter(
             }
         },
         MLABufferSlice{
-            &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
+            &_cache_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
             cache_kv_cache_offset,
             cache_kv_cache_shape
         },
@@ -234,7 +234,7 @@ void LanguageModel::_define_attn_models_iter(
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
         cache_ifms.emplace_back(
             MLABufferSlice{
-                &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
+                &_cache_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
                 {0, cache_token_idx_begin, 0},
                 {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             }
@@ -280,7 +280,7 @@ void LanguageModel::_define_attn_models_iter(
     }
     cache_ifms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
+            &_cache_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
             cache_kv_cache_offset,
             cache_kv_cache_shape
         }
@@ -288,7 +288,7 @@ void LanguageModel::_define_attn_models_iter(
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
         cache_ifms.emplace_back(
             MLABufferSlice{
-                &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
+                &_cache_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
                 {0, cache_token_idx_begin, 0},
                 {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             }
@@ -469,7 +469,7 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
     }
     conv_ifms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
+            &_cache_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
             {tail_begin, 0},
             {tail_size, _cfg.lm_cfg.hidden_size}
         }
@@ -477,7 +477,7 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
     conv_ofms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))});
     conv_ofms.emplace_back(
         MLABufferSlice(
-            &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
+            &_cache_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
             {num_tokens > 1 ? 0 : tail_begin, 0},
             {
                 static_cast<uint32_t>(num_tokens + tail_size - 1),
@@ -543,7 +543,7 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     }
     linear_ifms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
+            &_cache_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
             {tail_begin, 0},
             {conv_tail_size, linear_cfg.get_conv_dim()}
         }
@@ -553,7 +553,7 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     }
     linear_ifms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)),
+            &_cache_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)),
             {0, 0},
             {1, linear_cfg.get_recurrent_state_size()}
         }
@@ -564,7 +564,7 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     );
     linear_ofms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
+            &_cache_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
             {num_tokens > 1 ? uint32_t{0} : static_cast<uint32_t>(tail_begin), 0},
             {
                 static_cast<uint32_t>(num_tokens + conv_tail_size - 1),
@@ -574,7 +574,7 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     );
     linear_ofms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)),
+            &_cache_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)),
             {0, 0},
             {1, linear_cfg.get_recurrent_state_size()}
         }
