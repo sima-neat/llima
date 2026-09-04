@@ -83,7 +83,7 @@ sync_sysroot_from_internals_manifest {shlex.quote(str(artifact_dir))}
 
 
 def run_targeted_sysroot_payload_install() -> tuple[
-    subprocess.CompletedProcess[str], int, int
+    subprocess.CompletedProcess[str], int, int, int, list[str]
 ]:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -92,6 +92,10 @@ def run_targeted_sysroot_payload_install() -> tuple[
         untouched.parent.mkdir(parents=True)
         untouched.write_text("existing\n", encoding="utf-8")
         untouched.chmod(0o600)
+        existing_libdir = sysroot / "usr" / "lib"
+        existing_libdir.mkdir(parents=True)
+        existing_libdir.chmod(0o710)
+        root_log = root / "root.log"
 
         script = f"""
 set -euo pipefail
@@ -113,8 +117,10 @@ dpkg-deb() {{
   printf 'payload\n' > "${{payload_root}}/usr/lib/aarch64-linux-gnu/${{name}}.so"
   chmod 600 "${{payload_root}}/usr/lib/aarch64-linux-gnu/${{name}}.so"
 }}
-id() {{ echo 0; }}
-{shell_function("run_as_root")}
+run_as_root() {{
+  printf '%s\n' "$1" >> {shlex.quote(str(root_log))}
+  "$@"
+}}
 {shell_function("install_sdk_sysroot_package_payloads")}
 install_sdk_sysroot_package_payloads {shlex.quote(str(sysroot))} libexample:arm64
 """
@@ -123,8 +129,16 @@ install_sdk_sysroot_package_payloads {shlex.quote(str(sysroot))} libexample:arm6
         )
         installed = sysroot / "usr/lib/aarch64-linux-gnu/libexample_1.0_arm64.so"
         untouched_mode = untouched.stat().st_mode & 0o777
+        existing_libdir_mode = existing_libdir.stat().st_mode & 0o777
         installed_mode = installed.stat().st_mode & 0o777 if installed.exists() else 0
-        return result, untouched_mode, installed_mode
+        root_calls = root_log.read_text(encoding="utf-8").splitlines()
+        return (
+            result,
+            untouched_mode,
+            existing_libdir_mode,
+            installed_mode,
+            root_calls,
+        )
 
 
 class InternalsSysrootSyncTest(unittest.TestCase):
@@ -216,10 +230,14 @@ class InternalsSysrootSyncTest(unittest.TestCase):
 
 class SdkSysrootPackageInstallTest(unittest.TestCase):
     def test_normalizes_only_the_new_package_payload(self) -> None:
-        result, untouched_mode, installed_mode = run_targeted_sysroot_payload_install()
+        result, untouched_mode, libdir_mode, installed_mode, root_calls = (
+            run_targeted_sysroot_payload_install()
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(untouched_mode, 0o600)
+        self.assertEqual(libdir_mode, 0o710)
         self.assertEqual(installed_mode, 0o644)
+        self.assertEqual(root_calls, ["cp"])
 
 
 def test_internals_is_located_without_a_derived_version() -> None:
@@ -313,6 +331,8 @@ def test_llima_package_fallback_does_not_run_the_sdk_overlay() -> None:
     assert 'install_sdk_sysroot_package_payloads "${sysroot}"' in package_function
     assert 'chmod -R a+rX "${payload_root}"' in text
     assert 'chmod -R a+rX "${sysroot}"' not in text
+    assert 'run_as_root cp -R "${payload_root}/." "${sysroot}/"' in text
+    assert 'cp -a "${payload_root}/."' not in text
 
 
 def test_llima_has_no_recovery_or_libcamera_branch() -> None:

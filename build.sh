@@ -563,14 +563,14 @@ install_sdk_sysroot_package_payloads() {
   done
 
   # Normalize only the payload being added. Do not traverse or chmod the
-  # existing SDK sysroot.
+  # existing SDK sysroot. Copy without archive/preserve semantics so a
+  # non-root staging user's ownership and directory attributes are not
+  # applied to shared sysroot paths.
   chmod -R a+rX "${payload_root}"
-  if ! cp -a "${payload_root}/." "${sysroot}/" 2>/dev/null; then
-    if ! run_as_root cp -a "${payload_root}/." "${sysroot}/"; then
-      echo "ERROR: Failed to install package payloads into SYSROOT=${sysroot}." >&2
-      rm -rf "${tmp_dir}"
-      exit 1
-    fi
+  if ! run_as_root cp -R "${payload_root}/." "${sysroot}/"; then
+    echo "ERROR: Failed to install package payloads into SYSROOT=${sysroot}." >&2
+    rm -rf "${tmp_dir}"
+    exit 1
   fi
 
   rm -rf "${tmp_dir}"
