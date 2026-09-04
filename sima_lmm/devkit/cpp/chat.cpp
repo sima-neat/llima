@@ -151,6 +151,11 @@ void Chat::add_image(std::filesystem::path image_path) {
 
 
 void Chat::clear_images() {
+    _images.clear();
+}
+
+
+void Chat::clear_queued_images() {
     // Images already submitted with a query are part of chat history. Only discard images queued
     // since the last query; clear_history() removes both submitted and queued images.
     auto num_submitted_images = count_images_in_messages(_messages);

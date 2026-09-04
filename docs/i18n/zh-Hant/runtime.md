@@ -32,7 +32,7 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 
 使用 `llima run` 作為一個簡單的執行階段，用於在 Modalix 上進行初始模型驗證。
 
-在 CLI 模式下，聊天記錄預設會啟用。每個提示和回應都會被保留，作為下一次對話的上下文，直到您使用 `clear history` 清除它。
+在 CLI 模式下，聊天記錄預設會啟用。每個提示和回應都會被保留，作為下一次對話的上下文，直到您使用 `clear history` 清除它。與提示一起提交的圖片也會保留為該記錄的一部分。`clear image` 只會捨棄為下一個提示排入佇列的圖片，而 `clear history` 會移除已提交的提示、回應和所有圖片。已設定的系統提示會維持有效，直到您使用 `clear system` 將其清除，或使用 `set system` 將其取代。
 
 ``` console
 modalix:~$ llima run <model> [options]
@@ -58,10 +58,10 @@ modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
 | 指令 | 描述 |
 |----|----|
 | `add image <file>` | 將圖片新增到目前的提示詞內容中。 |
-| `clear image` | 清除所有圖片。 |
+| `clear image` | 捨棄自上次提交提示後排入佇列的圖片；先前對話中的圖片會保留在記錄中。 |
 | `set system <prompt>` | 設定系統提示。 |
 | `clear system` | 清除系統提示、聊天記錄和圖片。 |
-| `clear history` | 清除聊天記錄和圖片。 |
+| `clear history` | 清除已提交的提示、回應和所有圖片，同時保留系統提示。 |
 | `print history` | 列印聊天記錄。 |
 | `set audio <file>` | 將音訊檔案設定為要進行轉錄的查詢內容。 |
 | `set language <lang>` | 設定用於轉錄的語言字串。 |

@@ -32,7 +32,7 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 
 Modalix에서 초기 모델 검증을 위해 간단한 런타임으로 `llima run`을 사용합니다.
 
-CLI 모드에서는 기본적으로 채팅 기록이 활성화됩니다. 각 프롬프트와 응답은 사용자가 `clear history`를 사용하여 기록을 지울 때까지 다음 대화의 맥락으로 유지됩니다.
+CLI 모드에서는 기본적으로 채팅 기록이 활성화됩니다. 각 프롬프트와 응답은 사용자가 `clear history`를 사용하여 기록을 지울 때까지 다음 대화의 맥락으로 유지됩니다. 프롬프트와 함께 제출한 이미지도 기록의 일부로 유지됩니다. `clear image`는 다음 프롬프트를 위해 대기 중인 이미지만 삭제하고, `clear history`는 제출된 프롬프트, 응답 및 모든 이미지를 삭제합니다. 설정된 시스템 프롬프트는 `clear system`으로 삭제하거나 `set system`으로 교체할 때까지 활성 상태로 유지됩니다.
 
 ``` console
 modalix:~$ llima run <model> [options]
@@ -58,10 +58,10 @@ CLI 모드에서 `llima run`을 실행하면 프롬프트에서 다음 명령어
 | 명령 | 설명 |
 |----|----|
 | `add image <file>` | 현재 프롬프트 컨텍스트에 이미지를 추가합니다. |
-| `clear image` | 모든 이미지를 삭제합니다. |
+| `clear image` | 마지막으로 제출한 프롬프트 이후 대기 중인 이미지를 삭제합니다. 이전 대화의 이미지는 기록에 남습니다. |
 | `set system <prompt>` | 시스템 프롬프트를 설정합니다. |
 | `clear system` | 시스템 프롬프트, 채팅 기록, 이미지를 모두 삭제합니다. |
-| `clear history` | 채팅 기록과 이미지를 모두 삭제합니다. |
+| `clear history` | 시스템 프롬프트는 유지하면서 제출된 프롬프트, 응답 및 모든 이미지를 삭제합니다. |
 | `print history` | 채팅 기록을 인쇄합니다. |
 | `set audio <file>` | 음성 파일을 텍스트로 변환할 파일로 설정합니다. |
 | `set language <lang>` | 음성 인식에 사용되는 언어 설정을 지정합니다. |

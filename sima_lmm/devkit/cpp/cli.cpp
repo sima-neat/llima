@@ -149,7 +149,7 @@ void CLI::run() {
             }
             continue;
         } else if (command == "clear image") {
-            chat.clear_images();
+            chat.clear_queued_images();
             std::cout << "Cleared images queued for the next prompt." << std::endl;
             continue;
         } else if (command.starts_with("set system ")) {
