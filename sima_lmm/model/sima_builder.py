@@ -16,7 +16,9 @@ from afe.ir.build_node import NodeHandle, NodeOrHandle
 from afe.ir.sima_builder import SimaBuilder
 from ml_kernels.types import is_integer_type
 
-from sima_lmm.model.onnx_builder import find_alternate_weight
+from ml_dtypes import finfo as ml_finfo
+
+from sima_lmm.model.onnx_builder import find_alternate_weight, find_expert_weight
 from sima_lmm.utils import (
     ceil_div_row, mla_max_num_rows, mla_row_size, round_up_to_row
 )
@@ -70,17 +72,30 @@ def build_conv(
     bias_process_func = kwargs.pop("bias_process_func", lambda x: x)
     q_size = kwargs.pop("q_size", None)
     kv_size = kwargs.pop("kv_size", None)
+    expert_idx = kwargs.pop("expert_idx", -1)
+    de_interleave = kwargs.pop("de_interleave", False)
     activation = kwargs.pop("activation", None)
 
     # Some models have bundled weights with a different name for a layer.
     if not check_param_func(src_weight_name):
-        src_weight_name, weight_process_func = find_alternate_weight(
-            get_param_func, src_weight_name, q_size, kv_size
-        )
-        src_bias_name = src_weight_name.replace("weight", "bias")
-        scale_process_func = weight_process_func
-        has_scale_process_func = True
-        bias_process_func = weight_process_func
+        if expert_idx >= 0:
+            # MoE: resolve this expert's weight+bias; func yields (out, in, 1, 1),
+            # so the "oi->oihw" reshape must not be applied on top of it.
+            (
+                src_weight_name, weight_process_func,
+                src_bias_name, bias_process_func,
+            ) = find_expert_weight(src_weight_name, expert_idx, de_interleave)
+            reshape_str = None
+            scale_process_func = weight_process_func
+            has_scale_process_func = True
+        else:
+            src_weight_name, weight_process_func = find_alternate_weight(
+                get_param_func, src_weight_name, q_size, kv_size
+            )
+            src_bias_name = src_weight_name.replace("weight", "bias")
+            scale_process_func = weight_process_func
+            has_scale_process_func = True
+            bias_process_func = weight_process_func
 
     params = get_param_func(src_weight_name)
     scales, weight_tensor = params if isinstance(params, tuple) else (None, params)
@@ -386,6 +401,64 @@ def build_space_to_depth(
         input_type=ifm_type.scalar,
     )
     return builder.create_conv_node(data, weights, None, conv_attrs)
+
+
+def swiglu_clip(
+    ifm_type: TensorType, out_channels: int, swiglu_limit: float
+) -> tuple[attributes.ClipAttrs, attributes.ClipAttrs]:
+    """Clamp attributes for the gpt_oss gate and up projections.
+
+    ClipAttrs is always merged into a composite operator, so passing these as a conv's
+    activation folds the clamp into the conv, which is what the ONNX path produces.
+
+    Args:
+        ifm_type: Type of the projection's input.
+        out_channels: Output channel count of the projections.
+        swiglu_limit: Clamp bound from the model configuration.
+
+    Returns:
+        (gate clamp, up clamp).
+    """
+    shape = (*ifm_type.shape[:-1], out_channels)
+    # gate has no lower clamp; use bf16 finite min (-inf is rejected by the clip).
+    gate = attributes.ClipAttrs(
+        a_min=float(ml_finfo(bfloat16).min), a_max=swiglu_limit,
+        shape=shape, scalar_type=ifm_type.scalar,
+    )
+    up = attributes.ClipAttrs(
+        a_min=-swiglu_limit, a_max=swiglu_limit,
+        shape=shape, scalar_type=ifm_type.scalar,
+    )
+    return gate, up
+
+
+def build_swiglu(
+    builder: SimaBuilder, gate: NodeOrHandle, up: NodeOrHandle
+) -> NodeOrHandle:
+    """Gated SwiGLU tail (gpt_oss): (up + 1) * quick_gelu(gate).
+
+    The clamps this needs are folded into the gate/up convs via swiglu_clip,
+    so they are not applied here.
+
+    Args:
+        builder: Builder where the created nodes will be recorded.
+        gate: Output of the clamped gate projection.
+        up: Output of the clamped up projection.
+
+    Returns:
+        Output node of the created SwiGLU.
+    """
+    glu = builder.create_quick_gelu_node(gate)
+    # The constant must share up's scalar type: activations are float32 while the
+    # graph is quantizable and bfloat16 afterwards.
+    up_type = get_expected_tensor_value(
+        up.type if isinstance(up, NodeHandle) else up.get_type().output
+    )
+    one = builder.create_constant_node(
+        np.ones((1, 1, 1, 1), dtype=ScalarType.numpy_type(up_type.scalar))
+    )
+    up = builder.create_add_node(up, one)
+    return builder.create_mul_node(up, glu)
 
 
 def build_activation(
