@@ -539,6 +539,17 @@ class LanguagePreModel(LanguagePartBaseModel):
             kv_size=self._kv_size
          )
 
+        q_norm_name = None
+        for suffix in ("q_layernorm", "q_norm"):
+            if self.check_hf_param(f"{base_name}.{suffix}.weight"):
+                q_norm_name = f"{base_name}.{suffix}"
+                break
+
+        # OLMoE norms the full q projection before the head reshape; Qwen3 norms per-head after.
+        is_olmoe = self.cfg.lm_cfg.arch == LlmArchType.OLMOE
+        if q_norm_name and is_olmoe:
+            q_proj = self._build_sima_rms_norm(builder, q_norm_name, q_proj)
+
         if self.cfg.lm_cfg.attn_cfg.num_attention_heads > 1:
             reshape1 = builder.create_slice_concat_node(
                 q_proj, axis=1, split_axis=3,
@@ -547,13 +558,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         else:
             reshape1 = q_proj
 
-        q_norm_name = None
-        for suffix in ("q_layernorm", "q_norm"):
-            if self.check_hf_param(f"{base_name}.{suffix}.weight"):
-                q_norm_name = f"{base_name}.{suffix}"
-                break
-
-        if q_norm_name:
+        if q_norm_name and not is_olmoe:
             reshape1 = self._build_sima_rms_norm(builder, q_norm_name, reshape1)
 
         rotary_emb = self._build_sima_rotary_emb(
@@ -585,18 +590,23 @@ class LanguagePreModel(LanguagePartBaseModel):
             kv_size=self._kv_size
         )
 
-        reshape1 = builder.create_slice_concat_node(
-            k_proj, axis=1, split_axis=3,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads, split_repeat=1
-        )
-
         k_norm_name = None
         for suffix in ("k_layernorm", "k_norm"):
             if self.check_hf_param(f"{base_name}.{suffix}.weight"):
                 k_norm_name = f"{base_name}.{suffix}"
                 break
 
-        if k_norm_name:
+        # OLMoE norms the full k projection before the head reshape; Qwen3 norms per-head after.
+        is_olmoe = self.cfg.lm_cfg.arch == LlmArchType.OLMOE
+        if k_norm_name and is_olmoe:
+            k_proj = self._build_sima_rms_norm(builder, k_norm_name, k_proj)
+
+        reshape1 = builder.create_slice_concat_node(
+            k_proj, axis=1, split_axis=3,
+            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads, split_repeat=1
+        )
+
+        if k_norm_name and not is_olmoe:
             reshape1 = self._build_sima_rms_norm(builder, k_norm_name, reshape1)
 
         rotary_emb = self._build_sima_rotary_emb(
