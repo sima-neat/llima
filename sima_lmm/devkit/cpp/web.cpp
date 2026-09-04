@@ -1,3 +1,4 @@
+#include <exception>
 #include <fstream>
 #include <variant>
 #include <vector>
@@ -27,8 +28,29 @@ WEB::WEB(
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
     bool enable_thinking
+) : WEB(
+        std::move(vlm_model_path),
+        std::move(whisper_model_path),
+        std::move(draft_model_path),
+        std::move(system_prompt),
+        std::move(chat_template),
+        enable_thinking,
+        1
+    ) {}
+
+
+WEB::WEB(
+    std::filesystem::path vlm_model_path,
+    std::optional<std::filesystem::path> whisper_model_path,
+    std::optional<std::filesystem::path> draft_model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    bool enable_thinking,
+    size_t max_kv_cache_slots
 ) : _vision_language_model_ptr(
-        std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
+        std::make_unique<VisionLanguageModel>(
+            vlm_model_path, system_prompt, chat_template, max_kv_cache_slots
+        )
     ),
     _enable_thinking(enable_thinking)
 {
@@ -42,7 +64,7 @@ WEB::WEB(
 
     if (draft_model_path.has_value()) {
         _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
-            draft_model_path.value(), system_prompt, chat_template
+            draft_model_path.value(), system_prompt, chat_template, max_kv_cache_slots
         );
         _vision_language_model_ptr->set_draft_vlm(_vision_language_draft_model_ptr.get());
     }
@@ -94,6 +116,20 @@ void WEB::run() {
         }
     );
 
+    _http_server.Post(
+        "/remove_cache",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            this->_handle_remove_cache(req, res);
+        }
+    );
+
+    _http_server.Post(
+        "/clear_caches",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            this->_handle_clear_caches(req, res);
+        }
+    );
+
     // OpenAI protocol
     auto openai_handler = [this](const httplib::Request& req, httplib::Response& res) {
         this->_handle_chat_completions(req, res, ChatProtocol::OpenAI);
@@ -131,6 +167,7 @@ void WEB::run() {
     };
 
     _http_server.Options("/v1/chat/completions", cors_handler);
+    _http_server.Options("/v1/completions", cors_handler);
     _http_server.Options("/api/chat", cors_handler);
     _http_server.Options("/api/generate", cors_handler);
     _http_server.Options("/v1/chat", cors_handler);
@@ -139,6 +176,10 @@ void WEB::run() {
     _http_server.Options("/v1/audio/translations", cors_handler);
     _http_server.Options("/audio/translations", cors_handler);
     _http_server.Options("/stop", cors_handler);
+    _http_server.Options("/set_lora", cors_handler);
+    _http_server.Options("/unset_lora", cors_handler);
+    _http_server.Options("/remove_cache", cors_handler);
+    _http_server.Options("/clear_caches", cors_handler);
 
     auto msg = fmt::format("Starting the HTTP server and listening on port {}", _SERVER_PORT);
     _logger->info(msg);
@@ -299,7 +340,9 @@ std::string WEB::_format_openai_sse_chunk(
     std::optional<double> ttft,
     std::optional<double> tps,
     bool from_draft,
-    bool reasoning
+    bool reasoning,
+    std::optional<uint32_t> cached_prompt_tokens,
+    std::optional<bool> cache_created
 ) {
     nlohmann::json chunk;
     chunk["id"] = completion_id;
@@ -314,6 +357,12 @@ std::string WEB::_format_openai_sse_chunk(
     }
     if (tps.has_value()) {
         chunk["tps"] = tps.value();  // tokens per second
+    }
+    if (cached_prompt_tokens.has_value()) {
+        chunk["usage"] = {{"cached_prompt_tokens", *cached_prompt_tokens}};
+    }
+    if (cache_created.has_value()) {
+        chunk["cache_created"] = *cache_created;
     }
 
     nlohmann::json choice;
@@ -346,7 +395,9 @@ std::string WEB::_format_ollama_ndjson_chunk(
     std::optional<double> ttft,
     std::optional<double> tps,
     bool from_draft,
-    bool reasoning
+    bool reasoning,
+    std::optional<uint32_t> cached_prompt_tokens,
+    std::optional<bool> cache_created
 ) {
     nlohmann::json chunk;
     chunk["model"] = model;
@@ -359,6 +410,12 @@ std::string WEB::_format_ollama_ndjson_chunk(
     }
     if (tps.has_value()) {
         chunk["tps"] = tps.value();
+    }
+    if (cached_prompt_tokens.has_value()) {
+        chunk["cached_prompt_tokens"] = *cached_prompt_tokens;
+    }
+    if (cache_created.has_value()) {
+        chunk["cache_created"] = *cache_created;
     }
 
     if (finished && finish_reason.has_value()) {
@@ -441,10 +498,11 @@ void WEB::_handle_chat_completions(
     try {
         std::string model;
         bool stream = false;
+        std::optional<std::string> cache_id;
 
         // 1. Prepare
         std::optional<Chat> chat_opt = _prepare_chat_context(
-            req, res, model, stream, protocol
+            req, res, model, stream, cache_id, protocol
         );
         if (!chat_opt.has_value()) {
             return;
@@ -456,10 +514,22 @@ void WEB::_handle_chat_completions(
 
         // 3. Execution
         if (stream) {
-            _execute_streaming_chat(res, chat, model, protocol);
+            _execute_streaming_chat(res, chat, model, cache_id, protocol);
         } else {
-            _execute_normal_chat(res, chat, model, protocol);
+            _execute_normal_chat(res, chat, model, cache_id, protocol);
         }
+    } catch (const KVCacheCapacityError& e) {
+        _logger->warn("KV-cache capacity reached: {}", e.what());
+        res.status = 429;
+        nlohmann::json error_body = {
+            {"error", e.what()}, {"error_type", "cache_capacity_error"}
+        };
+        if (is_openai) {
+            error_body = {
+                {"error", {{"message", e.what()}, {"type", "cache_capacity_error"}}}
+            };
+        }
+        res.set_content(error_body.dump(), "application/json");
     } catch (const std::exception& e) {
         _logger->error("Error in chat handler: {}", e.what());
         res.status = 500;
@@ -661,11 +731,32 @@ std::optional<Chat> WEB::_prepare_chat_context(
     httplib::Response& res,
     std::string& model,
     bool& stream,
+    std::optional<std::string>& cache_id,
     ChatProtocol protocol
 ) {
     auto json_data = nlohmann::json::parse(req.body);
     model = json_data.value("model", "default-model");
     stream = json_data.value("stream", false);
+    cache_id.reset();
+    if (json_data.contains("cache_id") && !json_data.at("cache_id").is_null()) {
+        const auto& value = json_data.at("cache_id");
+        if (!value.is_string() || value.get_ref<const std::string&>().empty()) {
+            res.status = 400;
+            nlohmann::json error_body = {
+                {"error", "cache_id must be a non-empty string or null"}
+            };
+            if (protocol == ChatProtocol::OpenAI) {
+                error_body = {{"error", {
+                    {"message", "cache_id must be a non-empty string or null"},
+                    {"type", "invalid_request_error"},
+                    {"param", "cache_id"}
+                }}};
+            }
+            res.set_content(error_body.dump(), "application/json");
+            return std::nullopt;
+        }
+        cache_id = value.get<std::string>();
+    }
 
     Chat chat = _vision_language_model_ptr->create_chat();
     const bool enable_thinking = request_enable_thinking(json_data, _enable_thinking, protocol);
@@ -755,6 +846,7 @@ void WEB::_execute_streaming_chat(
     httplib::Response& res,
     Chat& chat,
     const std::string& model,
+    std::optional<std::string> cache_id,
     ChatProtocol protocol
 ) {
     const bool is_openai = protocol == ChatProtocol::OpenAI;
@@ -764,7 +856,7 @@ void WEB::_execute_streaming_chat(
 
     res.set_chunked_content_provider(
         is_openai ? "text/event-stream" : "application/x-ndjson",
-        [this, chat, model, protocol](size_t offset, httplib::DataSink &sink) {
+        [this, chat, model, cache_id, protocol](size_t offset, httplib::DataSink &sink) {
             (void)offset;
             const bool is_openai = protocol == ChatProtocol::OpenAI;
             const auto created = std::time(nullptr);
@@ -774,6 +866,8 @@ void WEB::_execute_streaming_chat(
             bool ttft_sent = false;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
+            std::optional<uint32_t> cached_prompt_tokens;
+            std::optional<bool> cache_created;
             ToolCallStreamParser tool_parser(
                 _vision_language_model_ptr->tool_call_format(),
                 tool_names_from_definitions(chat.get_tools()));
@@ -893,6 +987,15 @@ void WEB::_execute_streaming_chat(
                     return;
                 }
 
+                if (metric_type == "cached_prompt_tokens") {
+                    cached_prompt_tokens = static_cast<uint32_t>(metric_value);
+                    return;
+                }
+                if (metric_type == "cache_created") {
+                    cache_created = metric_value != 0.0;
+                    return;
+                }
+
                 // Handle END and FULL signals (metric_value is 0.0 for these)
                 if (metric_type == "END" || metric_type == "FULL") {
                     const std::string default_finish_reason =
@@ -904,7 +1007,9 @@ void WEB::_execute_streaming_chat(
                     if (is_openai) {
                         send_openai_initial();
                         auto formatted_chunk = _format_openai_sse_chunk(
-                            "", model, completion_id, created, true, finish_reason
+                            "", model, completion_id, created, true, finish_reason,
+                            ttft_value, tps_value, false, false,
+                            cached_prompt_tokens, cache_created
                         ) + "data: [DONE]\n\n";
                         sink.write(formatted_chunk.data(), formatted_chunk.size());
                     } else {
@@ -916,6 +1021,12 @@ void WEB::_execute_streaming_chat(
                         };
                         if (ttft_value.has_value()) final_obj["ttft"] = *ttft_value;
                         if (tps_value.has_value()) final_obj["tps"] = *tps_value;
+                        if (cached_prompt_tokens.has_value()) {
+                            final_obj["cached_prompt_tokens"] = *cached_prompt_tokens;
+                        }
+                        if (cache_created.has_value()) {
+                            final_obj["cache_created"] = *cache_created;
+                        }
                         if (protocol == ChatProtocol::OllamaChat) {
                             nlohmann::json message = {
                                 {"role", "assistant"}, {"content", ""}
@@ -956,16 +1067,55 @@ void WEB::_execute_streaming_chat(
             _vision_language_model_ptr->set_info_callback(info_callback);
             _vision_language_model_ptr->set_text_callback(text_callback);
 
-            // Create thread and track it for /stop endpoint
-            _vlm_thread = std::jthread([this, chat]() {
-                _vision_language_model_ptr->run_model(chat);
+            // Create thread and track it for /stop endpoint. Exceptions must not
+            // escape the worker thread because that would terminate the process.
+            auto run_error = std::make_shared<std::exception_ptr>();
+            _vlm_thread = std::jthread([this, chat, cache_id, run_error]() {
+                try {
+                    _vision_language_model_ptr->run_model(
+                        chat, std::nullopt, cache_id
+                    );
+                } catch (...) {
+                    *run_error = std::current_exception();
+                }
             });
 
             // Wait for completion
             _vlm_thread.join();
 
-            // No need to reset callbacks - they'll be overwritten on next request
+            if (*run_error) {
+                std::string message;
+                std::string error_type = "internal_error";
+                try {
+                    std::rethrow_exception(*run_error);
+                } catch (const KVCacheCapacityError& ex) {
+                    message = ex.what();
+                    error_type = "cache_capacity_error";
+                } catch (const std::exception& ex) {
+                    message = ex.what();
+                } catch (...) {
+                    message = "Unknown inference error";
+                }
 
+                nlohmann::json error;
+                if (is_openai) {
+                    error = {{"error", {
+                        {"message", message}, {"type", error_type}
+                    }}};
+                    auto output = "data: " + error.dump() + "\n\ndata: [DONE]\n\n";
+                    sink.write(output.data(), output.size());
+                } else {
+                    error = {
+                        {"error", message},
+                        {"error_type", error_type},
+                        {"done", true}
+                    };
+                    auto output = error.dump() + "\n";
+                    sink.write(output.data(), output.size());
+                }
+            }
+
+            // No need to reset callbacks - they will be overwritten on the next request.
             sink.done();
             return true;
         }
@@ -1009,6 +1159,7 @@ void WEB::_execute_normal_chat(
     httplib::Response& res,
     Chat& chat,
     const std::string& model,
+    std::optional<std::string> cache_id,
     ChatProtocol protocol
 ) {
     std::string reasoning_response;
@@ -1024,7 +1175,15 @@ void WEB::_execute_normal_chat(
         reasoning_format, chat.get_enable_thinking(), prompt_opens_reasoning
     );
 
-    auto info_callback = [](const std::string&, double) {};
+    std::optional<uint32_t> cached_prompt_tokens;
+    std::optional<bool> cache_created;
+    auto info_callback = [&](const std::string& metric, double value) {
+        if (metric == "cached_prompt_tokens") {
+            cached_prompt_tokens = static_cast<uint32_t>(value);
+        } else if (metric == "cache_created") {
+            cache_created = value != 0.0;
+        }
+    };
 
     auto text_callback = [&](const std::string& text, bool stream_end, bool from_draft) {
         for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
@@ -1039,13 +1198,20 @@ void WEB::_execute_normal_chat(
     _vision_language_model_ptr->set_info_callback(info_callback);
     _vision_language_model_ptr->set_text_callback(text_callback);
 
-    // Run in thread for consistency with barge-in logic
-    _vlm_thread = std::jthread([this, chat]() {
-        _vision_language_model_ptr->run_model(chat);
+    // Run in thread for consistency with barge-in logic. Capture and rethrow
+    // failures on the request thread so they can be mapped to an HTTP response.
+    auto run_error = std::make_shared<std::exception_ptr>();
+    _vlm_thread = std::jthread([this, chat, cache_id, run_error]() {
+        try {
+            _vision_language_model_ptr->run_model(chat, std::nullopt, cache_id);
+        } catch (...) {
+            *run_error = std::current_exception();
+        }
     });
     _vlm_thread.join();
+    if (*run_error) std::rethrow_exception(*run_error);
 
-    // No need to reset callbacks - they'll be overwritten on next request
+    // No need to reset callbacks - they will be overwritten on the next request.
 
     nlohmann::json tool_calls = nullptr;
     if (chat.has_tools()) {
@@ -1107,7 +1273,87 @@ void WEB::_execute_normal_chat(
         };
         if (!reasoning_response.empty()) response["thinking"] = reasoning_response;
     }
+    if (cached_prompt_tokens.has_value()) {
+        if (protocol == ChatProtocol::OpenAI) {
+            response["usage"] = {{"cached_prompt_tokens", *cached_prompt_tokens}};
+        } else {
+            response["cached_prompt_tokens"] = *cached_prompt_tokens;
+        }
+    }
+    if (cache_created.has_value()) response["cache_created"] = *cache_created;
     res.set_content(response.dump(), "application/json");
+}
+
+
+void WEB::_handle_remove_cache(const httplib::Request& req, httplib::Response& res) {
+    _set_cors_headers(res);
+    try {
+        const auto json_data = nlohmann::json::parse(req.body);
+        if (!json_data.is_object()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":"Cache request body must be a JSON object"})",
+                "application/json"
+            );
+            return;
+        }
+        const auto model = json_data.value("model", "default-model");
+        if (!json_data.contains("cache_id") || !json_data.at("cache_id").is_string() ||
+            json_data.at("cache_id").get_ref<const std::string&>().empty()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":"cache_id must be a non-empty string"})",
+                "application/json"
+            );
+            return;
+        }
+        const auto cache_id = json_data.at("cache_id").get<std::string>();
+        const bool removed = _vision_language_model_ptr->remove_kv_cache(cache_id);
+        res.set_content(nlohmann::json({
+            {"status", "ok"},
+            {"model", model},
+            {"cache_id", cache_id},
+            {"removed", removed},
+            {"cache_count", _vision_language_model_ptr->kv_cache_count()}
+        }).dump(), "application/json");
+    } catch (const nlohmann::json::exception& ex) {
+        res.status = 400;
+        res.set_content(nlohmann::json({{"error", ex.what()}}).dump(), "application/json");
+    } catch (const std::exception& ex) {
+        _logger->error("Failed to remove KV cache: {}", ex.what());
+        res.status = 500;
+        res.set_content(nlohmann::json({{"error", ex.what()}}).dump(), "application/json");
+    }
+}
+
+
+void WEB::_handle_clear_caches(const httplib::Request& req, httplib::Response& res) {
+    _set_cors_headers(res);
+    try {
+        const auto json_data = nlohmann::json::parse(req.body);
+        if (!json_data.is_object()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":"Cache request body must be a JSON object"})",
+                "application/json"
+            );
+            return;
+        }
+        const auto model = json_data.value("model", "default-model");
+        _vision_language_model_ptr->clear_kv_caches();
+        res.set_content(nlohmann::json({
+            {"status", "ok"},
+            {"model", model},
+            {"cache_count", _vision_language_model_ptr->kv_cache_count()}
+        }).dump(), "application/json");
+    } catch (const nlohmann::json::exception& ex) {
+        res.status = 400;
+        res.set_content(nlohmann::json({{"error", ex.what()}}).dump(), "application/json");
+    } catch (const std::exception& ex) {
+        _logger->error("Failed to clear KV caches: {}", ex.what());
+        res.status = 500;
+        res.set_content(nlohmann::json({{"error", ex.what()}}).dump(), "application/json");
+    }
 }
 
 

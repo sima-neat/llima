@@ -80,13 +80,15 @@ NB_MODULE(cpp_ext, m) {
                 std::optional<std::filesystem::path>,
                 std::optional<std::filesystem::path>,
                 std::optional<std::string>,
-                std::optional<std::string>
+                std::optional<std::string>,
+                size_t
             >(),
             nb::arg("model_path"),
             nb::arg("whisper_model_path") = nb::none(),
             nb::arg("draft_model_path") = nb::none(),
             nb::arg("system_prompt") = nb::none(),
-            nb::arg("chat_template") = nb::none()
+            nb::arg("chat_template") = nb::none(),
+            nb::arg("max_kv_cache_slots") = 1
         )
         .def("run", &CLI::run)
     ;
@@ -99,14 +101,16 @@ NB_MODULE(cpp_ext, m) {
                 std::optional<std::filesystem::path>,
                 std::optional<std::string>,
                 std::optional<std::string>,
-                bool
+                bool,
+                size_t
             >(),
             nb::arg("model_path"),
             nb::arg("whisper_model_path") = nb::none(),
             nb::arg("draft_model_path") = nb::none(),
             nb::arg("system_prompt") = nb::none(),
             nb::arg("chat_template") = nb::none(),
-            nb::arg("enable_thinking") = false
+            nb::arg("enable_thinking") = false,
+            nb::arg("max_kv_cache_slots") = 1
         )
         .def("run", &WEB::run)
     ;

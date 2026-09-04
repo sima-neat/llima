@@ -28,6 +28,13 @@ class DemoMode(str, Enum):
     WEB = "web"
 
 
+def _positive_int(value: str, label: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"{label} must be at least 1")
+    return parsed
+
+
 def _init_logging(mode: DemoMode, log_level: str | None) -> None:
     config_file_path = os.path.join(os.path.dirname(__file__), "logging_config.yaml")
     os.environ["SIMA_LOGGING_CONFIG_YAML_FILE"] = os.getenv(
@@ -141,6 +148,7 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
+                args.max_kv_cache_slots,
             )
         else:
             demo = WEB(
@@ -149,6 +157,8 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
+                False,
+                args.max_kv_cache_slots,
             )
     except Exception:
         msg = "Failed to create VLM or STT model"
@@ -265,6 +275,13 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help="Path to the elf files for speech-to-text model.",
+    )
+    run_parser.add_argument(
+        "--max-kv-cache-slots",
+        "--max_kv_cache_slots",
+        type=lambda value: _positive_int(value, "max KV-cache slots"),
+        default=1,
+        help="Maximum number of reusable KV-cache sessions (default: 1).",
     )
 
     group = run_parser.add_mutually_exclusive_group()

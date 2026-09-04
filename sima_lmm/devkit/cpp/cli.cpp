@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 
 #include "cli.hpp"
 #include "reasoning_parser.hpp"
@@ -11,19 +12,24 @@ namespace llima {
 
 
 const std::string CLI::_COMMANDS = R"(
-add image <fn>     : add an image.
-set system <prompt>: set system prompt.
-clear system       : clear system prompt, chat history and images.
-clear history      : clear prompts, responses and images; keep system prompt.
-print history      : print chat history.
-set audio <fn>     : set the audio file to be transcribed as query.
-set language <lang>: set transcription language; omit <lang> or use auto to detect it.
-set lora           : set the model to use LoRA weights from a npy_files folder.
-unset lora         : revert LoRA model to baseline model.
-enable-thinking    : enable thinking mode and clear chat history.
-disable-thinking   : disable thinking mode and clear chat history.
-quit               : quit.
-help               : print this page.
+add image <fn>       : add an image.
+set system <prompt>  : set system prompt for the active cache session.
+clear system         : clear system prompt, chat history and images for the active session.
+clear history        : clear prompts, responses and images for the active session; keep system prompt.
+print history        : print chat history for the active session.
+use cache <id>       : select or create a named cache session.
+use default cache    : select the legacy default cache session.
+remove cache <id>    : remove a named cache session.
+clear caches         : remove every KV cache and reset all session histories.
+print caches         : print active and allocated cache information.
+set audio <fn>       : set the audio file to be transcribed as query.
+set language <lang>  : set transcription language; omit <lang> or use auto to detect it.
+set lora             : set the model to use LoRA weights from a npy_files folder.
+unset lora           : revert LoRA model to baseline model.
+enable-thinking      : enable thinking mode and clear active chat history.
+disable-thinking     : disable thinking mode and clear active chat history.
+quit                 : quit.
+help                 : print this page.
 )";
 
 
@@ -33,9 +39,29 @@ CLI::CLI(
     std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template
+) : CLI(
+        std::move(vlm_model_path),
+        std::move(whisper_model_path),
+        std::move(draft_model_path),
+        std::move(system_prompt),
+        std::move(chat_template),
+        1
+    ) {}
+
+
+CLI::CLI(
+    std::filesystem::path vlm_model_path,
+    std::optional<std::filesystem::path> whisper_model_path,
+    std::optional<std::filesystem::path> draft_model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    size_t max_kv_cache_slots
 ) : _vision_language_model_ptr(
-        std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
-    )
+        std::make_unique<VisionLanguageModel>(
+            vlm_model_path, system_prompt, chat_template, max_kv_cache_slots
+        )
+    ),
+    _max_kv_cache_slots(max_kv_cache_slots)
 {
     if (_singleton_ptr)
         throw std::runtime_error("Only one CLI instance can be created");
@@ -47,7 +73,7 @@ CLI::CLI(
 
     if (draft_model_path.has_value()) {
         _vision_language_draft_model_ptr = std::make_unique<VisionLanguageModel>(
-            draft_model_path.value(), system_prompt, chat_template
+            draft_model_path.value(), system_prompt, chat_template, max_kv_cache_slots
         );
         // Hand the draft to the target so VLM::run_model dispatches to
         // speculative decoding automatically.
@@ -78,41 +104,114 @@ CLI::~CLI() {
 
 void CLI::run() {
     std::string language = "en";
-    auto chat = _vision_language_model_ptr->create_chat();
+    const Chat initial_chat = _vision_language_model_ptr->create_chat();
+    std::map<std::optional<std::string>, std::unique_ptr<Chat>> chats;
+    std::optional<std::string> active_cache_id;
+    chats.emplace(std::nullopt, std::make_unique<Chat>(initial_chat));
+
+    auto active_chat = [&]() -> Chat& {
+        return *chats.at(active_cache_id);
+    };
+    auto clear_all_histories = [&]() {
+        for (auto& [cache_id, chat_ptr] : chats) {
+            (void)cache_id;
+            chat_ptr->clear_history();
+        }
+    };
+    auto reset_sessions = [&]() {
+        chats.clear();
+        chats.emplace(std::nullopt, std::make_unique<Chat>(initial_chat));
+        active_cache_id.reset();
+    };
+    auto cache_label = [](const std::optional<std::string>& cache_id) {
+        return cache_id.value_or("default");
+    };
+
     const bool highlight_draft = []() {
         const char* value = std::getenv("SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT");
         return value != nullptr && (
             std::strcmp(value, "true") == 0 || std::strcmp(value, "1") == 0
         );
     }();
-    std::string command;
     ReadlineSupport readline_support;
     while (true) {
         auto maybe_command = ReadlineSupport::read_line(">>> ");
         if (!maybe_command) break;
         std::string command = std::move(*maybe_command);
         readline_support.add_to_history(command);
-        
+
+        Chat& chat = active_chat();
         if (command == "quit") {
             break;
         } else if (command == "help") {
             std::cout << _COMMANDS << std::endl;
+            continue;
+        } else if (command == "use default cache") {
+            active_cache_id.reset();
+            std::cout << "Using default cache session." << std::endl;
+            continue;
+        } else if (command.starts_with("use cache ")) {
+            constexpr auto pos = std::string("use cache ").length();
+            auto cache_id = trim(command.substr(pos));
+            if (cache_id.empty()) {
+                std::cout << "Cache ID must not be empty." << std::endl;
+                continue;
+            }
+            chats.try_emplace(cache_id, std::make_unique<Chat>(initial_chat));
+            active_cache_id = std::move(cache_id);
+            std::cout << "Using cache session '" << *active_cache_id << "'." << std::endl;
+            continue;
+        } else if (command.starts_with("remove cache ")) {
+            constexpr auto pos = std::string("remove cache ").length();
+            auto cache_id = trim(command.substr(pos));
+            if (cache_id.empty()) {
+                std::cout << "Cache ID must not be empty." << std::endl;
+                continue;
+            }
+            const bool removed_cache = _vision_language_model_ptr->remove_kv_cache(cache_id);
+            const bool removed_chat = chats.erase(cache_id) != 0;
+            if (active_cache_id == cache_id) active_cache_id.reset();
+            if (removed_cache || removed_chat) {
+                std::cout << "Removed cache session '" << cache_id << "'." << std::endl;
+            } else {
+                std::cout << "Cache session not found: '" << cache_id << "'." << std::endl;
+            }
+            continue;
+        } else if (command == "clear caches") {
+            _vision_language_model_ptr->clear_kv_caches();
+            reset_sessions();
+            std::cout << "Cleared all KV caches and reset session histories." << std::endl;
+            continue;
+        } else if (command == "print caches") {
+            std::cout << "Active cache: " << cache_label(active_cache_id) << std::endl
+                      << "Allocated caches: "
+                      << _vision_language_model_ptr->kv_cache_count() << "/"
+                      << _max_kv_cache_slots << std::endl
+                      << "Device bytes per cache slot: "
+                      << _vision_language_model_ptr->kv_cache_bytes_per_slot() << std::endl
+                      << "Known sessions:";
+            for (const auto& [cache_id, chat_ptr] : chats) {
+                (void)chat_ptr;
+                std::cout << " " << cache_label(cache_id);
+                if (cache_id == active_cache_id) std::cout << "*";
+            }
+            std::cout << std::endl;
             continue;
         } else if (command.starts_with("set lora ")) {
             constexpr auto pos = std::string("set lora ").length();
             std::string lora_name = command.substr(pos);
             try {
                 _vision_language_model_ptr->set_reloc(lora_name);
-                chat.clear_history();
-                std::cout << "Set LoRA and cleared chat history" << std::endl;
+                clear_all_histories();
+                std::cout << "Set LoRA and cleared all session histories" << std::endl;
             } catch (const std::exception& ex) {
                 std::cout << "Failed to set LoRA: " << ex.what() << std::endl;
             }
             continue;
         } else if (command == "unset lora") {
             _vision_language_model_ptr->unset_reloc();
-            chat.clear_history();
-            std::cout << "Un-set LoRA and cleared chat history" << std::endl;
+            clear_all_histories();
+            std::cout << "Un-set LoRA and cleared all session histories" << std::endl;
             continue;
         } else if (command == "enable-thinking") {
             if (reasoning_format_for_model(_vision_language_model_ptr->model_type())
@@ -122,12 +221,12 @@ void CLI::run() {
             }
             chat.set_enable_thinking(true);
             chat.clear_history();
-            std::cout << "Enabled thinking and cleared chat history." << std::endl;
+            std::cout << "Enabled thinking and cleared active chat history." << std::endl;
             continue;
         } else if (command == "disable-thinking") {
             chat.set_enable_thinking(false);
             chat.clear_history();
-            std::cout << "Disabled thinking and cleared chat history." << std::endl;
+            std::cout << "Disabled thinking and cleared active chat history." << std::endl;
             continue;
         } else if (command == "set language") {
             language.clear();
@@ -154,20 +253,23 @@ void CLI::run() {
         } else if (command.starts_with("set system ")) {
             constexpr auto pos = std::string("set system ").length();
             chat.set_system_prompt(command.substr(pos));
-            std::cout << "Set system message and cleared chat history." << std::endl;
+            std::cout << "Set system message and cleared active chat history." << std::endl;
             continue;
         } else if (command == "clear system") {
             chat.clear_system_prompt();
-            std::cout << "Cleared system message and chat history." << std::endl;
+            std::cout << "Cleared system message and active chat history." << std::endl;
             continue;
         } else if (command == "clear history") {
             chat.clear_history();
-            std::cout << "Cleared chat history." << std::endl;
+            std::cout << "Cleared active chat history." << std::endl;
             continue;
         } else if (command == "print history") {
             chat.print_history();
             continue;
-        } else if (command.starts_with("set audio ")) {
+        }
+
+        auto chat_before_query = std::make_unique<Chat>(chat);
+        if (command.starts_with("set audio ")) {
             constexpr auto pos = std::string("set audio ").length();
             std::filesystem::path audio_file_name = command.substr(pos);
             if (!_whisper_model_ptr) {
@@ -194,7 +296,8 @@ void CLI::run() {
             auto result = _whisper_model_ptr->run_model(audio_file_name, language);
             chat.add_query(result.text);
         } else {
-            std::cout << "Query: " << command << std::endl;
+            std::cout << "Query: " << command << " [cache="
+                      << cache_label(active_cache_id) << "]" << std::endl;
             chat.add_query(command);
         }
         ReasoningStreamParser reasoning_parser(
@@ -204,6 +307,8 @@ void CLI::run() {
         std::string final_response;
         bool saw_reasoning = false;
         bool saw_content = false;
+        std::optional<uint32_t> cached_prompt_tokens;
+        std::optional<bool> cache_created;
 
         const auto print_text = [&](const std::string& text, bool from_draft) {
             if (from_draft && highlight_draft && !text.empty()) {
@@ -214,6 +319,15 @@ void CLI::run() {
             std::cout << std::flush;
         };
 
+        _vision_language_model_ptr->set_info_callback(
+            [&](const std::string& metric, double value) {
+                if (metric == "cached_prompt_tokens") {
+                    cached_prompt_tokens = static_cast<uint32_t>(value);
+                } else if (metric == "cache_created") {
+                    cache_created = value != 0.0;
+                }
+            }
+        );
         _vision_language_model_ptr->set_text_callback(
             [&](const std::string& text, bool stream_end, bool from_draft) {
                 for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
@@ -239,33 +353,53 @@ void CLI::run() {
                 }
             }
         );
-        struct TextCallbackGuard {
+        struct CallbackGuard {
             VisionLanguageModel* model;
-            ~TextCallbackGuard() {
+            ~CallbackGuard() {
+                model->set_info_callback([](const std::string&, double) {});
                 model->set_text_callback([](const std::string&, bool, bool) {});
             }
         } callback_guard{_vision_language_model_ptr.get()};
 
-        // run_model dispatches to speculative decoding internally when a
-        // draft VLM was registered at construction time.
-        auto response = _vision_language_model_ptr->run_model(chat);
+        std::optional<std::string> response;
+        try {
+            // run_model dispatches to speculative decoding internally when a
+            // draft VLM was registered at construction time.
+            response = _vision_language_model_ptr->run_model(
+                chat, std::nullopt, active_cache_id
+            );
+        } catch (const KVCacheCapacityError& ex) {
+            chats[active_cache_id] = std::move(chat_before_query);
+            std::cout << "KV-cache capacity reached: " << ex.what() << std::endl
+                      << "Remove a cache session or restart with a larger "
+                         "--max-kv-cache-slots value."
+                      << std::endl;
+            continue;
+        }
+
+        if (cached_prompt_tokens.has_value() && cache_created.has_value()) {
+            std::cout << "Cache [" << cache_label(active_cache_id) << "]: reused "
+                      << *cached_prompt_tokens << " prompt token(s), "
+                      << (*cache_created ? "allocated a new slot" : "reused its slot")
+                      << "." << std::endl;
+        }
         if (response.has_value()) {
             auto answer = trim(std::move(final_response));
             if (answer.empty()) {
                 chat.clear_history();
-                std::cout << "No final answer generated. Cleared chat history." << std::endl;
+                std::cout << "No final answer generated. Cleared active chat history."
+                          << std::endl;
             } else {
                 chat.add_response(std::move(answer));
             }
         } else {
             chat.clear_history();
             std::cout << std::endl
-                << "User interrupt received. Cleared chat history." << std::endl
+                << "User interrupt received. Cleared active chat history." << std::endl
                 << "Type quit to quit." << std::endl;
         }
     }
 }
-
 
 void CLI::stop() {
     _vision_language_model_ptr->stop_model();
