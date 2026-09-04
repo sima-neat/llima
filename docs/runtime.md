@@ -43,10 +43,9 @@ Use `llima run` as a simple runtime for initial model validation on Modalix.
 
 In CLI mode, chat history is enabled by default. Each prompt and response is
 kept as context for the next turn until you clear it with `clear history`. Images
-submitted with a prompt are also retained as part of that history. Use `clear image`
-to discard only images queued for the next prompt, or `clear history` to remove the
-submitted prompts, responses, and all images. The configured system prompt remains
-active until you use `clear system` or replace it with `set system`.
+submitted with a prompt are also retained as part of that history. `clear history`
+removes the submitted prompts, responses, and all images. The configured system
+prompt remains active until you use `clear system` or replace it with `set system`.
 
 ``` console
 modalix:~$ llima run <model> [options]
@@ -72,7 +71,6 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | Command | Description |
 |----|----|
 | `add image <file>` | Add an image to the current prompt context. |
-| `clear image` | Discard images queued since the last submitted prompt; images from previous turns remain in history. |
 | `set system <prompt>` | Set the system prompt. |
 | `clear system` | Clear the system prompt, chat history, and images. |
 | `clear history` | Clear submitted prompts, responses, and all images while preserving the system prompt. |

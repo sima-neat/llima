@@ -42,7 +42,6 @@ class Chat {
 
         void add_image(std::filesystem::path image_path);
         void clear_images();
-        void clear_queued_images();
         const std::vector<std::filesystem::path>& get_images() const { return _images; }
 
         void clear_history() { clear_messages(); clear_images(); }

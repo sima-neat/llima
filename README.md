@@ -139,8 +139,6 @@ llima rm <model>
 Inside `llima run --mode cli`:
 
 - `add image <file>`: add an image.
-- `clear image`: discard images queued since the last submitted prompt. Images from previous turns
-  remain in chat history.
 - `set system <prompt>`: set the system prompt.
 - `clear system`: clear system prompt, chat history, and images.
 - `clear history`: clear submitted prompts, responses, and all images while preserving the system

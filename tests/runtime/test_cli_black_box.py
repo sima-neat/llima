@@ -111,9 +111,7 @@ def _run_cli(
         env=env,
     )
     try:
-        output, _ = process.communicate(
-            input=f"clear image\n{QUERY}\nquit\n", timeout=180
-        )
+        output, _ = process.communicate(input=f"{QUERY}\nquit\n", timeout=180)
     except subprocess.TimeoutExpired:
         process.send_signal(signal.SIGINT)
         try:
@@ -161,8 +159,6 @@ def test_installed_cli_start_query_quit(tmp_path):
 
     for output in (first_output, second_output):
         assert "Setting up environments and loading models" in output
-        assert "Cleared images queued for the next prompt." in output
-        assert "Query: clear image" not in output
         assert f"Query: {QUERY}" in output
         assert "Assistant:" in output
         assert "capital of Germany is Berlin" in output
