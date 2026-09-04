@@ -121,14 +121,6 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
-        # Mixture-of-Experts models are recognized and their configuration is
-        # parsed, but file generation and devkit execution are not yet ported.
-        if vlm_cfg.lm_cfg.moe_cfg is not None:
-            raise NotImplementedError(
-                "Mixture-of-Experts models are not yet supported: only "
-                "configuration parsing is implemented."
-            )
-
         if target_model is not None:
             # Some draft models use target model's tokenization scheme.
             tokenizer_files = ("tokenizer_config.json", "tokenizer.json", "tokenizer.model")
@@ -159,6 +151,12 @@ class VisionLanguageModel(BaseModel):
         return model
 
     def set_lora_adapter(self, lora_path: Path):
+        if self.cfg.lm_cfg.moe_cfg is not None:
+            raise NotImplementedError(
+                "LoRA adapters are not supported for Mixture-of-Experts models: "
+                "the MoE router ignores adapter targets and would silently produce "
+                "base-model results."
+            )
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
         self.cfg.lm_cfg.set_lora_adapter(lora_config)
 

@@ -5,7 +5,7 @@ import onnx.numpy_helper
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from ml_dtypes import bfloat16
+from ml_dtypes import bfloat16, finfo as ml_finfo
 from onnx.shape_inference import infer_shapes_path
 from onnxsim.onnxsim_cpp2py_export import simplify_path
 from pathlib import Path
@@ -272,14 +272,24 @@ class OnnxBuilder:
         bias_process_func = kwargs.pop("bias_process_func", lambda x: x)
         q_size = kwargs.pop("q_size", None)
         kv_size = kwargs.pop("kv_size", None)
+        expert_idx = kwargs.pop("expert_idx", -1)
+        de_interleave = kwargs.pop("de_interleave", False)
 
         # Some models have bundled weights with a different name for a layer.
         if not self.check_param_func(src_weight_name):
-            src_weight_name, weight_process_func = find_alternate_weight(
-                self.get_param_func, src_weight_name, q_size, kv_size
-            )
-            src_bias_name = src_weight_name.replace("weight", "bias")
-            bias_process_func = weight_process_func
+            if expert_idx >= 0:
+                # MoE: resolve this expert's weight+bias; func yields (out, in, 1, 1).
+                (
+                    src_weight_name, weight_process_func,
+                    src_bias_name, bias_process_func,
+                ) = find_expert_weight(src_weight_name, expert_idx, de_interleave)
+                reshape_str = None
+            else:
+                src_weight_name, weight_process_func = find_alternate_weight(
+                    self.get_param_func, src_weight_name, q_size, kv_size
+                )
+                src_bias_name = src_weight_name.replace("weight", "bias")
+                bias_process_func = weight_process_func
 
         weight_tensor = self.reshape_data(self.get_param_func(src_weight_name), reshape_str)
         weight_tensor = weight_process_func(weight_tensor)
@@ -575,6 +585,18 @@ class OnnxBuilder:
         last = self.build_op(f"{base_name}.sub", [mul2, -scalar], "Add")
         return last
 
+    def build_swiglu(
+        self, base_name: str, gate: OnnxNode, up: OnnxNode, swiglu_limit: float
+    ) -> OnnxNode:
+        """Clamped gated SwiGLU (gpt_oss): (clamp(up)+1) * quick_gelu(clamp(gate,max))."""
+        # gate has no lower clamp; use bf16 finite min (-inf is rejected by the clip).
+        gate_lo = float(ml_finfo(bfloat16).min)
+        gate = self.build_op(f"{base_name}.gate_clip", [gate, gate_lo, swiglu_limit], "Clip")
+        up = self.build_op(f"{base_name}.up_clip", [up, -swiglu_limit, swiglu_limit], "Clip")
+        glu = self.build_activation(f"{base_name}.glu", gate, "quick_gelu")
+        up = self.build_op(f"{base_name}.up_p1", [up, 1.0], "Add")
+        return self.build_op(f"{base_name}.gated", [up, glu], "Mul")
+
     def build_activation(self, base_name: str, input_node: OnnxNode, act_type: str) -> OnnxNode:
         """Build nodes for activation.
 
@@ -830,6 +852,63 @@ def _get_array_partition(
         return slice_array(a)
 
     return get
+
+
+def _get_expert_weight(
+    expert_idx: int, interleave_offset: int | None = None
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Batched expert weight (num_experts, in, out) -> conv (out, in, 1, 1) for one
+    expert. interleave_offset de-interleaves fused gate_up rows: 0=gate, 1=up."""
+    def get(a: np.ndarray) -> np.ndarray:
+        w = a[expert_idx].T[:, :, None, None]
+        if interleave_offset is not None:
+            w = w[interleave_offset::2]
+        return w
+    return get
+
+
+def _get_expert_bias(
+    expert_idx: int, interleave_offset: int | None = None
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Batched expert bias (num_experts, out) for one expert; interleave_offset like
+    _get_expert_weight."""
+    def get(a: np.ndarray) -> np.ndarray:
+        b = a[expert_idx].astype(np.float32)
+        if interleave_offset is not None:
+            b = b[interleave_offset::2]
+        return b
+    return get
+
+
+def find_expert_weight(
+    weight_name: str, expert_idx: int, de_interleave: bool
+) -> tuple[str, Callable, str, Callable]:
+    """Resolve a MoE expert projection to the batched expert tensors, returning
+    (weight_name, weight_func, bias_name, bias_func). Separate from
+    find_alternate_weight to leave the dense contract unchanged. de_interleave (set by
+    the caller; gpt_oss only) splits the fused interleaved gate_up_proj (even=gate,
+    odd=up) into gate/up.
+    """
+    proj_name = weight_name.replace(".weight", "").split(".")[-1]
+    prefix = weight_name.replace(".weight", "").rsplit(".", 1)[0]
+    interleave_offset = None
+    if proj_name in ("gate_proj", "up_proj"):
+        if not de_interleave:
+            raise NotImplementedError(
+                f"MoE {proj_name} without de-interleaving is not supported; today "
+                "only gpt_oss's interleaved fused gate_up is handled (de_interleave)."
+            )
+        new_weight_name = f"{prefix}.experts.gate_up_proj"
+        interleave_offset = 0 if proj_name == "gate_proj" else 1
+    elif proj_name == "down_proj":
+        new_weight_name = f"{prefix}.experts.down_proj"
+    else:
+        raise NotImplementedError(f"{proj_name} is not a MoE expert weight.")
+    new_bias_name = f"{new_weight_name}_bias"
+    return (
+        new_weight_name, _get_expert_weight(expert_idx, interleave_offset),
+        new_bias_name, _get_expert_bias(expert_idx, interleave_offset),
+    )
 
 
 def find_alternate_weight(

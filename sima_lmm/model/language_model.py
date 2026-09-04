@@ -16,6 +16,8 @@ from sima_lmm.model.base import (
 )
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.language_post_model import LanguagePostModel
+from sima_lmm.model.language_moe_router_model import LanguageMoeRouterModel
+from sima_lmm.model.language_moe_weightedsum_model import LanguageMoeWeightedSumModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
@@ -156,6 +158,32 @@ class LanguageModel(BaseModel):
                     part_model = self._get_part_model("per_layer", num_tokens)
                 case "single_per_layer":
                     part_model = self._get_part_model("per_layer", 1)
+                case "group_router":
+                    part_model = self._get_part_model(
+                        "router", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_router":
+                    part_model = self._get_part_model(
+                        "router", single_model_num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "group_expert":
+                    part_model = self._get_part_model(
+                        "post", num_tokens, layer_idx=layer_id.part_idx,
+                        expert_idx=layer_id.expert_idx,
+                    )
+                case "single_expert":
+                    part_model = self._get_part_model(
+                        "post", single_model_num_tokens, layer_idx=layer_id.part_idx,
+                        expert_idx=layer_id.expert_idx,
+                    )
+                case "group_weightedsum":
+                    part_model = self._get_part_model(
+                        "moe_weightedsum", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_weightedsum":
+                    part_model = self._get_part_model(
+                        "moe_weightedsum", single_model_num_tokens, layer_idx=layer_id.part_idx
+                    )
                 case _:
                     # Not a part of this model
                     continue
@@ -369,6 +397,19 @@ class LanguageModel(BaseModel):
                     )
                     mask[..., :token_idx + 1 - token_idx_begin] = 0
                     cache_ifms.append(mask)
+                if self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS:
+                    # Per-head attention sink logit, slotted right before cached_values.
+                    base_name = self.hf_model.language_model_param_base_name
+                    sinks = self.get_hf_param(
+                        f"{base_name}.layers.{layer_idx}.self_attn.sinks"
+                    ).astype(np.float32)
+                    num_attn_heads = self.cfg.lm_cfg.attn_cfg.num_attention_heads
+                    cache_ifms.append(
+                        np.broadcast_to(
+                            sinks.reshape(1, 1, 1, num_attn_heads),
+                            (1, 1, num_tokens, num_attn_heads),
+                        ).copy()
+                    )
                 cache_ifms.append(
                     cache_val[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
                 )
@@ -382,12 +423,17 @@ class LanguageModel(BaseModel):
                 )
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 
-                post_ifms = [pre_ifms[0]]
-                if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
-                    post_ifms.append(pre_ifms[1])
-                post_ifms.append(cache_ofms[0])
-                post_model = self._get_part_model("post", num_tokens, layer_idx=layer_idx)
-                post_ofms = post_model.run_model(eval_mode, post_ifms)
+                if self.cfg.lm_cfg.moe_cfg is not None:
+                    post_ofms = self._run_moe_post_onnx(
+                        eval_mode, num_tokens, layer_idx, pre_ifms[0], cache_ofms[0]
+                    )
+                else:
+                    post_ifms = [pre_ifms[0]]
+                    if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
+                        post_ifms.append(pre_ifms[1])
+                    post_ifms.append(cache_ofms[0])
+                    post_model = self._get_part_model("post", num_tokens, layer_idx=layer_idx)
+                    post_ofms = post_model.run_model(eval_mode, post_ifms)
 
             # Download the argmax output.
             if num_input_tokens <= next_token_idx:
@@ -413,10 +459,57 @@ class LanguageModel(BaseModel):
         # Return the generated tokens.
         return np.array([new_tokens])
 
+    def _run_moe_post_onnx(self, eval_mode, num_tokens, layer_idx, hidden, self_attn):
+        """MoE post block: router (TopK+softmax on-graph) -> experts -> weighted-sum."""
+        moe = self.cfg.lm_cfg.moe_cfg
+        num_experts = moe.num_experts
+
+        router_model = self._get_part_model("router", num_tokens, layer_idx=layer_idx)
+        values, indices, residual, norm_hidden = router_model.run_model(
+            eval_mode, [hidden, self_attn]
+        )
+        vals = values[0, 0]                    # (num_tokens, top_k)
+        idxs = indices[0, 0].astype(np.int64)  # (num_tokens, top_k)
+
+        # Scatter the k routing weights into a dense (num_tokens, num_experts) tensor.
+        router_weights = np.zeros((num_tokens, num_experts), dtype=np.float32)
+        for t in range(num_tokens):
+            router_weights[t, idxs[t]] = vals[t]
+        rw = router_weights[None, None]  # -> NCHW (1, num_experts, 1, num_tokens)
+
+        # Only run experts at least one token selected; the rest have weight 0.
+        activated = set(int(e) for e in idxs.flatten())
+
+        def run_expert(e):
+            ex_model = self._get_part_model(
+                "post", num_tokens, layer_idx=layer_idx, expert_idx=e
+            )
+            return ex_model.run_model(eval_mode, [norm_hidden, rw])[0]
+
+        expert_outs = []
+        if num_tokens > 1:
+            # Group combine consumes all num_experts slots; skipped ones are zeros.
+            zero = np.zeros(
+                (1, 1, num_tokens, self.cfg.lm_cfg.hidden_size), dtype=np.float32
+            )
+            for e in range(num_experts):
+                expert_outs.append(run_expert(e) if e in activated else zero)
+        else:
+            for e in sorted(activated):
+                expert_outs.append(run_expert(e))
+
+        ws_model = self._get_part_model("moe_weightedsum", num_tokens, layer_idx=layer_idx)
+        return ws_model.run_model(eval_mode, expert_outs + [residual])
+
     def calc_freq_real_imag(self, use_swa: bool) -> tuple[np.ndarray, np.ndarray]:
         if use_swa:
             theta = self.cfg.lm_cfg.rope_cfg.rope_local_base_freq
-            rope_type = "default"
+            # A distinct local base freq (Gemma3) means an unscaled local rope; when it
+            # matches rope_theta the sliding layers share the global scaling (gpt-oss YaRN).
+            rope_type = (
+                "default" if theta != self.cfg.lm_cfg.rope_cfg.rope_theta
+                else self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
+            )
         else:
             theta = self.cfg.lm_cfg.rope_cfg.rope_theta
             rope_type = self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
@@ -483,7 +576,7 @@ class LanguageModel(BaseModel):
 
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,
-        token_idx: int | None = None,
+        token_idx: int | None = None, expert_idx: int = -1,
     ) -> BaseModel:
         match part:
             case "pre":
@@ -494,9 +587,28 @@ class LanguageModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                 )
             case "post":
-                model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
+                if expert_idx >= 0:
+                    model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}_expert{expert_idx}"
+                else:
+                    model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguagePostModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                    final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
+                    expert_idx=expert_idx,
+                )
+            case "router":
+                model_name = f"{self.model_name}_n{num_tokens}_router_layer{layer_idx}"
+                assert layer_idx is not None
+                return LanguageMoeRouterModel(
+                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                )
+            case "moe_weightedsum":
+                model_name = f"{self.model_name}_n{num_tokens}_moe_weightedsum_layer{layer_idx}"
+                assert layer_idx is not None
+                return LanguageMoeWeightedSumModel(
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,

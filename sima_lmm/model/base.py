@@ -38,7 +38,7 @@ from afe.ir.tensor_type import ScalarType
 import afe.ir.serializer
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
-    BaseConfig, VlmConfig, VlmArchType, vision_model_names
+    BaseConfig, VlmConfig, VlmArchType, LlmArchType, vision_model_names
 )
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.gguf.gguf_conversion import GgufModel
@@ -509,6 +509,20 @@ class BaseModel(ABC):
             del embeddings
             del embeddings_scale
 
+        # gpt_oss attention sinks, stacked (num_layers, num_attention_heads) for the devkit.
+        if self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS:
+            sinks_file_name = self.sima_devkit_path / f"{self.language_model_name}_sinks.bin"
+            if not (resume and sinks_file_name.is_file()):
+                base_name = self.hf_model.language_model_param_base_name
+                sinks = np.stack([
+                    np.asarray(
+                        self.get_hf_param(f"{base_name}.layers.{i}.self_attn.sinks"),
+                        dtype=np.float32,
+                    )
+                    for i in range(self.cfg.lm_cfg.num_hidden_layers)
+                ])
+                sinks.astype(bfloat16).tofile(sinks_file_name)
+
         if write_cfg:
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name
@@ -585,7 +599,12 @@ class BaseModel(ABC):
                 precision_list = list()
                 for layer_id, layer_p in precision.items():
                     precision_list.append(
-                        {"part": layer_id.part, "idx": layer_id.part_idx, "precision": layer_p}
+                        {
+                            "part": layer_id.part,
+                            "idx": layer_id.part_idx,
+                            "expert_idx": layer_id.expert_idx,
+                            "precision": layer_p,
+                        }
                     )
                 with open(precision_file_name, "w") as f:
                     json.dump(precision_list, f, indent=4)

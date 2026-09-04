@@ -12,7 +12,7 @@ from sima_lmm.model.language_part_base import LanguagePostBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
     SimaBuilder, build_conv_from_dense_with_lora,
-    build_activation, activation_type, activation_dtype
+    build_activation, activation_type, activation_dtype, create_channel_slice
 )
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 from sima_lmm.utils import ceil_div
@@ -39,6 +39,10 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.pipeline_cfg.split_mlp
 
     @property
+    def _is_moe_expert(self) -> bool:
+        return self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0
+
+    @property
     def uses_quantized_input_embeddings(self) -> bool:
         # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
         return super().uses_quantized_input_embeddings and not self.is_draft
@@ -51,26 +55,36 @@ class LanguagePostModel(LanguagePostBaseModel):
     def gen_onnx_files(self):
         base_name = self._layer_base_name
         self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-        )
-        self._onnx_builder.create_input_node(
-            "self_attn", (1, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type), 1, self.num_tokens)
-        )
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self._is_moe_expert:
+            # Expert consumes norm(h) from the router + this layer's routing weights.
             self._onnx_builder.create_input_node(
-                "per_layer_input",
-                (1, self.cfg.lm_cfg.hidden_size_per_layer_input, 1, self.num_tokens),
+                "norm_hidden", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
             )
+            self._onnx_builder.create_input_node(
+                "router", (1, self.cfg.lm_cfg.moe_cfg.num_experts, 1, self.num_tokens)
+            )
+        else:
+            self._onnx_builder.create_input_node(
+                "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+            )
+            self._onnx_builder.create_input_node(
+                "self_attn", (1, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type), 1, self.num_tokens)
+            )
+            if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+                self._onnx_builder.create_input_node(
+                    "per_layer_input",
+                    (1, self.cfg.lm_cfg.hidden_size_per_layer_input, 1, self.num_tokens),
+                )
 
-        llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
-        if self.cfg.vm_cfg and self.layer_idx in llm_injection_layers and self.num_tokens > 1:
-            self._onnx_builder.create_input_node(
-                "deepstack_features", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-            )
+            llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
+            if self.cfg.vm_cfg and self.layer_idx in llm_injection_layers and self.num_tokens > 1:
+                self._onnx_builder.create_input_node(
+                    "deepstack_features", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+                )
         output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
         output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
-        if self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1:
+        # An expert only outputs its hidden-sized contribution (combined at runtime).
+        if self._is_moe_expert or self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1:
             self._onnx_builder.create_output_node(
                 output_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
             )
@@ -84,6 +98,28 @@ class LanguagePostModel(LanguagePostBaseModel):
 
 
     def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
+        if self._is_moe_expert:
+            # Expert runs MLP(norm(h)) and scales by router[:, expert_idx]; the router
+            # already did o_proj+residual+norm. OLMoE uses per-expert mlp.experts.{e};
+            # gpt_oss keeps mlp (fused gate_up split inside build_conv).
+            mlp_base = f"{base_name}.mlp"
+            if self.check_hf_param(
+                f"{base_name}.mlp.experts.{self.expert_idx}.gate_proj.weight"
+            ):
+                mlp_base = f"{base_name}.mlp.experts.{self.expert_idx}"
+            mlp_out = self._build_onnx_mlp(mlp_base, [input_nodes[0]])
+            e = self.expert_idx
+            # router[:, e] via a 1x1 one-hot selection conv.
+            num_experts = self.cfg.lm_cfg.moe_cfg.num_experts
+            sel_w = np.zeros((1, num_experts, 1, 1), dtype=np.float32)
+            sel_w[0, e, 0, 0] = 1.0
+            weight_e = self._onnx_builder.build_op(
+                f"{base_name}.router_weight", [input_nodes[-1], sel_w], "Conv"
+            )
+            return [self._onnx_builder.build_op(
+                f"{base_name}.weighted", [mlp_out, weight_e], "Mul"
+            )]
+
         # LFM2 uses self_attn.out_proj instead of o_proj.
         attn_out_name = ("out_proj" if self.check_hf_param(f"{base_name}.self_attn.out_proj.weight") else "o_proj")
         lora_rank = None
@@ -224,12 +260,73 @@ class LanguagePostModel(LanguagePostBaseModel):
         g = self._build_sima_nodes(base_name, quantizable, merged_lora)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
 
+    def _build_sima_expert_nodes(
+        self, base_name: str, quantizable: bool, merged_lora: bool = False
+    ):
+        """Build one MoE expert: MLP(norm(h)) scaled by this expert's routing weight.
+
+        The router already did o_proj, the residual and the norm, so the expert only
+        runs its MLP and emits a hidden-sized contribution for the weighted sum to
+        combine. Tensors are (1, 1, num_tokens, C), unlike the ONNX path's
+        (1, C, 1, num_tokens).
+        """
+        hidden_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        router_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.moe_cfg.num_experts)
+        dtype = activation_type(quantizable)
+
+        builder = SimaBuilder(
+            Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target
+        )
+        model_input_norm_hidden = builder.create_placeholder_node(
+            "norm_hidden", TensorType(dtype, hidden_shape)
+        )
+        model_input_router = builder.create_placeholder_node(
+            "router", TensorType(dtype, router_shape)
+        )
+        # MLA subgraph inputs are the same as the model inputs, with different names.
+        builder.begin_subnet([model_input_norm_hidden, model_input_router])
+
+        mla_input_norm_hidden = builder.create_placeholder_node(
+            "MLA_0/norm_hidden", TensorType(dtype, hidden_shape)
+        )
+        mla_input_router = builder.create_placeholder_node(
+            "MLA_0/router", TensorType(dtype, router_shape)
+        )
+
+        # OLMoE uses per-expert mlp.experts.{e}; gpt_oss keeps mlp (its fused,
+        # interleaved gate_up is split inside build_conv via de_interleave).
+        mlp_base = f"{base_name}.mlp"
+        if self.check_hf_param(
+            f"{base_name}.mlp.experts.{self.expert_idx}.gate_proj.weight"
+        ):
+            mlp_base = f"{base_name}.mlp.experts.{self.expert_idx}"
+        mlp_out = self._build_sima_mlp(
+            builder, mlp_base, [mla_input_norm_hidden], quantizable, merged_lora
+        )
+
+        # router[:, e]: a 1-wide channel selection, which create_channel_slice turns
+        # into the same 1x1 selector conv the ONNX path uses (a 1-wide window can
+        # never be 16-aligned at both ends).
+        weight_e = create_channel_slice(
+            builder, mla_input_router, self.expert_idx, self.expert_idx + 1
+        )
+        _ = builder.create_mul_node(mlp_out, weight_e)
+
+        mla_node = builder.finish_subnet("MLA_0")
+
+        self._cast_bf16_outputs_to_fp32(builder, mla_node)
+
+        return builder.finish(self.model_name)
+
     def has_ffn_layernorms(self, base_name):
         pre_ln = f"{base_name}.pre_feedforward_layernorm.weight"
         post_ln = f"{base_name}.post_feedforward_layernorm.weight"
         return self.check_hf_param(pre_ln) and self.check_hf_param(post_ln)
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
+        if self._is_moe_expert:
+            return self._build_sima_expert_nodes(base_name, quantizable, merged_lora)
+
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
         self_attn_shape = (
