@@ -693,7 +693,11 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
             );
             _pre_model_map.at(model_key).add_to_queue(&ifm_map);
             _cache_model_map.at(cache_key).add_to_queue();
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            if (_cfg.lm_cfg.is_moe()) {
+                _run_moe_post(model_key, &ifm_map, num_tokens, layer_idx);
+            } else {
+                _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            }
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
             if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
@@ -1070,7 +1074,11 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            if (_cfg.lm_cfg.is_moe()) {
+                _run_moe_post(model_key, &ifm_map, num_tokens, layer_idx);
+            } else {
+                _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            }
 
             // Spec-decoding capture: download n128_buffer1 (this layer's hidden
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
@@ -1247,6 +1255,11 @@ void LanguageModel::_initialize() {
     _define_models();
     MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
 
+    // Resolve the MoE host round-trip handles once (buffers allocated above).
+    if (_cfg.lm_cfg.is_moe()) {
+        _init_moe_host_cache();
+    }
+
     // Upload language embeddings (drafts use the target's embeddings, so skip).
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
@@ -1279,6 +1292,50 @@ void LanguageModel::_initialize() {
         _logger->info("Loaded d2t mapping with {} entries", _d2t.size());
     }
 
+    // Upload attention sinks (gpt_oss): broadcast each layer's per-head vector across its
+    // buffer rows. Raw bf16, shape (num_layers, num_heads).
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        const auto sinks_file_name = _devkit_dir / (_cfg.language_model_name + "_sinks.bin");
+        std::ifstream sinks_file(sinks_file_name, std::ios::binary);
+        if (!sinks_file) {
+            throw std::runtime_error(
+                fmt::format("Missing attention sinks file: {}", sinks_file_name.string())
+            );
+        }
+        const uint16_t num_heads = _cfg.lm_cfg.attn_cfg.num_attention_heads;
+        std::vector<uint16_t> sinks(  // raw bf16, 2 bytes/elem
+            static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers) * num_heads
+        );
+        // A stale or truncated file would leave entries zeroed, and a zero sink is not neutral:
+        // it is a logit in the softmax, so it silently reweights attention. Require an exact match.
+        const auto expected_bytes = static_cast<std::uintmax_t>(sinks.size() * sizeof(uint16_t));
+        const auto actual_bytes = std::filesystem::file_size(sinks_file_name);
+        if (actual_bytes != expected_bytes) {
+            throw std::runtime_error(fmt::format(
+                "Attention sinks file {} has {} bytes, expected {} for {} layers x {} heads. "
+                "The file is stale or truncated; recompile the model.",
+                sinks_file_name.string(), actual_bytes, expected_bytes,
+                static_cast<unsigned>(_cfg.lm_cfg.num_hidden_layers), num_heads
+            ));
+        }
+        sinks_file.read(
+            reinterpret_cast<char*>(sinks.data()),
+            static_cast<std::streamsize>(expected_bytes)
+        );
+        for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
+            auto& buf = get_buffer(fmt::format("sinks_l{}", layer));
+            const size_t rows = buf.get_shape()[0];
+            std::vector<uint16_t> host(rows * num_heads);
+            for (size_t r = 0; r < rows; ++r) {
+                std::copy_n(
+                    sinks.data() + static_cast<size_t>(layer) * num_heads, num_heads,
+                    host.begin() + r * num_heads
+                );
+            }
+            buf.upload(host.data());
+        }
+    }
+
     // Upload freq real and imag.
     auto rope_table = calc_freq_real_imag(
         _cfg.pipeline_cfg.max_num_tokens,
@@ -1294,9 +1351,14 @@ void LanguageModel::_initialize() {
     // the (mutated) device buffer.
     _global_freq_host = rope_table;
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        // A distinct local base freq (Gemma3) means an unscaled local rope; when it
+        // matches rope_theta the sliding layers share the global scaling (gpt-oss YaRN).
+        const std::string local_rope_type =
+            _cfg.lm_cfg.rope_cfg.rope_local_base_freq != _cfg.lm_cfg.rope_cfg.rope_theta
+            ? "default" : _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type;
         rope_table = calc_freq_real_imag(
             _cfg.pipeline_cfg.max_num_tokens,
-            "default",
+            local_rope_type,
             _cfg.lm_cfg.rope_cfg.rope_local_base_freq,
             _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention"),
             _cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention"),
@@ -1551,6 +1613,21 @@ void LanguageModel::_define_buffers() {
         }
     }
 
+    // gpt_oss attention sinks: per-head logit for the (shared) cache model, one buffer per
+    // layer broadcast across tokens; the cache model slices num_tokens rows.
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        uint16_t max_sink_tokens = _cfg.lm_cfg.get_single_num_tokens();
+        if (_use_group_token_models) {
+            max_sink_tokens = std::max(max_sink_tokens, _cfg.pipeline_cfg.input_token_group_size);
+        }
+        for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
+            define_buffer(
+                fmt::format("sinks_l{}", i),
+                {max_sink_tokens, _cfg.lm_cfg.attn_cfg.num_attention_heads}
+            );
+        }
+    }
+
     // Deepstack features for qwen3.
     if (_cfg.vm_cfg.has_value()) {
         for (size_t i = 0; i < _cfg.vm_cfg.value().deepstack_visual_indexes.size(); ++i) {
@@ -1639,6 +1716,33 @@ void LanguageModel::_define_buffers() {
                 fmt::format("n{}_per_layer_input", num_tokens),
                 {_cfg.lm_cfg.num_hidden_layers * num_tokens, _cfg.lm_cfg.hidden_size_per_layer_input}
             );
+        }
+
+        // Mixture-of-Experts working buffers (router outputs + per-expert outputs).
+        if (_cfg.lm_cfg.is_moe()) {
+            const uint16_t num_experts = _cfg.lm_cfg.moe_cfg.value().num_experts;
+            const uint16_t top_k = _cfg.lm_cfg.moe_cfg.value().num_experts_per_tok;
+            // Router outputs: top-k weights + selected indices (int32 from the MLA), residual
+            // h, and norm(h) (computed once by the router; every expert consumes it).
+            define_buffer(fmt::format("n{}_router_values", num_tokens), {num_tokens, top_k});
+            define_buffer(
+                fmt::format("n{}_router_indices", num_tokens), {num_tokens, top_k}, "int32"
+            );
+            define_buffer(
+                fmt::format("n{}_residual", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+            define_buffer(
+                fmt::format("n{}_norm_hidden", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+            // Dense per-expert routing weights (host scatters the k values here).
+            define_buffer(fmt::format("n{}_router_weights", num_tokens), {num_tokens, num_experts});
+            // Per-expert outputs, summed by the combine (decode fills only the first top_k).
+            for (uint16_t e = 0; e < num_experts; ++e) {
+                define_buffer(
+                    fmt::format("n{}_expert{}", num_tokens, e),
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                );
+            }
         }
 
         // Draft-only buffers: second pre input, draft hidden states output, FC fusion buffers.
@@ -1843,7 +1947,10 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     );
     auto& pre_model = _pre_model_map.at(pre_post_key);
     auto& cache_model = _cache_model_map.at(cache_key);
-    auto& post_model = _post_model_map.at(pre_post_key);
+    // MoE has no post model; bind these inputs to the router (it consumes the raw hidden).
+    auto& post_model = _cfg.lm_cfg.is_moe()
+        ? _router_model_map.at(pre_post_key)
+        : _post_model_map.at(pre_post_key);
 
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
@@ -1946,6 +2053,11 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
             );
         }
     }
+    // gpt_oss sinks: cache model is layer-shared, so bind this layer's sinks before cached_values.
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        auto& sinks_buf = get_buffer(fmt::format("sinks_l{}", layer_idx));
+        cache_model._bind_ifm(cache_ifm_idx++, &sinks_buf, {0, 0});
+    }
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
             cache_ifm_idx++, &val_buffer, {0, cache_token_idx_begin, 0}
@@ -1983,6 +2095,154 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
 
 
 
+
+
+void LanguageModel::_init_moe_host_cache() {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+
+    // Same num_tokens set the MoE buffers were defined for, and the set of moe_nt values
+    // _run_moe_post can ask for.
+    std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
+    if (_use_group_token_models) {
+        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+    }
+
+    _moe_host.clear();
+    _moe_host.reserve(num_tokens_vec.size());
+    for (const auto& nt: num_tokens_vec) {
+        MoeHostCache mh;
+        mh.num_tokens = nt;
+        mh.values = &get_buffer(fmt::format("n{}_router_values", nt));
+        mh.indices = &get_buffer(fmt::format("n{}_router_indices", nt));
+        mh.weights = &get_buffer(fmt::format("n{}_router_weights", nt));
+        mh.expert_out.reserve(num_experts);
+        for (uint16_t e = 0; e < num_experts; ++e) {
+            mh.expert_out.emplace_back(&get_buffer(fmt::format("n{}_expert{}", nt, e)));
+        }
+        // Only the single-token variant takes the slot-routing path in _run_moe_post.
+        if (nt == 1) {
+            mh.slot_ofm.resize(top_k);
+            for (uint16_t slot = 0; slot < top_k; ++slot) {
+                mh.slot_ofm[slot].emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(0),
+                    std::forward_as_tuple(
+                        mh.expert_out[slot],
+                        std::vector<uint32_t>{0, 0},
+                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+                    )
+                );
+            }
+        }
+        mh.values_scratch.resize(static_cast<size_t>(nt) * top_k);
+        mh.indices_scratch.resize(static_cast<size_t>(nt) * top_k);
+        mh.weights_scratch.resize(static_cast<size_t>(nt) * num_experts);
+        mh.activated_scratch.resize(num_experts);
+        _moe_host.emplace_back(std::move(mh));
+    }
+}
+
+
+LanguageModel::MoeHostCache& LanguageModel::_get_moe_host(uint16_t moe_nt) {
+    // At most two entries (single-token and group), so a scan beats any container.
+    for (auto& mh: _moe_host) {
+        if (mh.num_tokens == moe_nt) return mh;
+    }
+    throw std::runtime_error(
+        fmt::format("No MoE host cache defined for num_tokens = {}", moe_nt)
+    );
+}
+
+
+void LanguageModel::_run_moe_post(
+    const LanguageModelMapKey& model_key,
+    std::map<uint8_t, MLABufferSlice>* ifm_map,
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    (void)model_key;  // router/ws use their own {num_tokens, layer_idx, 0} keys below.
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+    const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
+    // The last layer processes only the last token (n1), like the non-MoE last post.
+    const uint16_t moe_nt = (is_last && !_cfg.lm_cfg.is_spec_decode()) ? 1 : num_tokens;
+
+    const LanguageModelMapKey router_key{num_tokens, layer_idx, 0};
+    const LanguageModelMapKey ws_key{num_tokens, layer_idx, 0};
+
+    // Router -> values + indices + residual + norm(h) (TopK+softmax on MLA).
+    _router_model_map.at(router_key).add_to_queue(ifm_map);
+
+    // Flush this layer's pre+cache+router (+ prev layer's experts+ws) so indices are ready.
+    MLAModelWithBuffer::run_queue();
+
+    // Host: scatter the k weights into dense router_weights (indices are int32 from the MLA).
+    MoeHostCache& mh = _get_moe_host(moe_nt);
+    auto& values = mh.values_scratch;
+    auto& indices = mh.indices_scratch;
+    auto& weights = mh.weights_scratch;
+    const size_t n_sel = static_cast<size_t>(moe_nt) * top_k;
+    mh.values->download(values.data());
+    mh.indices->download(indices.data());
+
+    // Validate device-emitted indices before indexing host arrays / keying the expert map.
+    for (size_t i = 0; i < n_sel; ++i) {
+        if (indices[i] < 0 || indices[i] >= num_experts) {
+            throw std::runtime_error(fmt::format(
+                "MoE router emitted out-of-range expert index {} at selection {} "
+                "(layer {}, num_experts {})",
+                indices[i], i, layer_idx, num_experts
+            ));
+        }
+    }
+
+    std::fill(weights.begin(), weights.end(), Eigen::bfloat16(0.0f));
+    if (moe_nt > 1) {
+        // Prefill: independent rows.
+        #pragma omp parallel for schedule(static)
+        for (uint16_t r = 0; r < moe_nt; ++r) {
+            for (uint16_t j = 0; j < top_k; ++j) {
+                const size_t sel = static_cast<size_t>(r) * top_k + j;
+                weights[static_cast<size_t>(r) * num_experts + indices[sel]] = values[sel];
+            }
+        }
+    } else {
+        // Decode: single row, top_k scalar stores.
+        for (uint16_t j = 0; j < top_k; ++j) {
+            weights[indices[j]] = values[j];
+        }
+    }
+    mh.weights->upload(weights.data());
+
+    // Experts. Prefill runs the selected experts (rest zeroed); decode runs the top-k,
+    // routing each into the first combine slots.
+    if (moe_nt > 1) {
+        auto& activated = mh.activated_scratch;
+        std::fill(activated.begin(), activated.end(), uint8_t{0});
+        for (size_t i = 0; i < n_sel; ++i) {
+            activated[indices[i]] = 1;
+        }
+        for (uint16_t e = 0; e < num_experts; ++e) {
+            if (activated[e]) {
+                _expert_model_map.at({num_tokens, layer_idx, e}).add_to_queue();
+            } else {
+                mh.expert_out[e]->clear();
+            }
+        }
+    } else {
+        for (uint16_t slot = 0; slot < top_k; ++slot) {
+            const uint16_t e = static_cast<uint16_t>(indices[slot]);  // moe_nt==1 row 0
+            // Route this expert's output into combine slot `slot` (prebuilt override).
+            _expert_model_map.at({num_tokens, layer_idx, e})
+                .add_to_queue(nullptr, &mh.slot_ofm[slot]);
+        }
+    }
+
+    // Weighted sum -> layer output. No flush: experts+ws ride to the next router flush.
+    _weightedsum_model_map.at(ws_key).add_to_queue();
+}
 
 
 void LanguageModel::compact_kv_after_accept(

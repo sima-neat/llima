@@ -273,6 +273,16 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
     }
+    // gpt_oss attention sinks slot, right before cached_values (rebound per layer at runtime).
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        cache_ifms.emplace_back(
+            MLABufferSlice{
+                &get_buffer(fmt::format("sinks_l{}", layer_idx)),
+                {0, 0},
+                {num_tokens, _cfg.lm_cfg.attn_cfg.num_attention_heads}
+            }
+        );
+    }
     cache_ifms.emplace_back(
         MLABufferSlice{
             &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
@@ -304,6 +314,14 @@ void LanguageModel::_define_attn_models_iter(
             cache_ifms,
             cache_ofms
         );
+    }
+
+    // Mixture-of-Experts: the post block splits into router -> experts -> weighted-sum.
+    if (_cfg.lm_cfg.is_moe()) {
+        if (!_router_model_map.contains(pre_post_key)) {
+            _define_moe_post_models(num_tokens, layer_idx, is_draft, pre_ifms, cache_ofms);
+        }
+        return;
     }
 
     // Draft post consumes the BF16 FC-fused hidden state. Target post consumes the same
@@ -425,6 +443,98 @@ void LanguageModel::_define_attn_models_iter(
     if (define_post) {
         _define_model("post", pre_post_key, post_elf_path, post_ifms, post_ofms);
     }
+}
+
+
+void LanguageModel::_define_moe_post_models(
+    uint16_t num_tokens, uint8_t layer_idx, bool is_draft,
+    const std::vector<MLABufferSlice>& pre_ifms,
+    const std::vector<MLABufferSlice>& cache_ofms
+) {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+    const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
+
+    // Last layer runs single-token (n1 ELFs/buffers), like the dense post.
+    const uint16_t moe_nt = (is_last && !_cfg.lm_cfg.is_spec_decode()) ? 1 : num_tokens;
+
+    // Shared attention-block inputs: the residual-stream hidden state and self_attn.
+    const MLABufferSlice hidden = is_draft ? pre_ifms[1] : pre_ifms[0];
+    const MLABufferSlice self_attn = cache_ofms[0];
+
+    // Layer zero consumes embedding rows, which carry a per-row scale when the
+    // embedding table is quantized. The router replaces the dense post block, so it
+    // takes the scale on the same terms; the slice is a placeholder that
+    // _bind_attn_models binds at index 1.
+    const bool router_uses_embedding_scale = (
+        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 && !is_draft
+    );
+
+    // Router -> top-k weights + indices (TopK+softmax on MLA) + residual h + norm(h).
+    std::vector<MLABufferSlice> router_ifms{hidden};
+    if (router_uses_embedding_scale) {
+        router_ifms.emplace_back(MLABufferSlice{nullptr, {0, 0}, {moe_nt, 1}});
+    }
+    router_ifms.emplace_back(self_attn);
+    std::vector<MLABufferSlice> router_ofms{
+        MLABufferSlice{&get_buffer(fmt::format("n{}_router_values", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_router_indices", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_residual", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_norm_hidden", moe_nt))},
+    };
+    LanguageModelMapKey router_key{num_tokens, layer_idx, 0};
+    _define_model(
+        "router", router_key, _get_elf_path_router(moe_nt, layer_idx), router_ifms, router_ofms
+    );
+
+    // Experts consume norm(h), scaled by their routing-weight column (runtime runs the top-k).
+    for (uint16_t e = 0; e < num_experts; ++e) {
+        std::vector<MLABufferSlice> expert_ifms{
+            MLABufferSlice{&get_buffer(fmt::format("n{}_norm_hidden", moe_nt))},
+            MLABufferSlice{&get_buffer(fmt::format("n{}_router_weights", moe_nt))},
+        };
+        std::vector<MLABufferSlice> expert_ofms{
+            MLABufferSlice{&get_buffer(fmt::format("n{}_expert{}", moe_nt, e))},
+        };
+        LanguageModelMapKey expert_key{num_tokens, layer_idx, e};
+        _define_model(
+            "expert", expert_key, _get_elf_path_expert(moe_nt, layer_idx, e),
+            expert_ifms, expert_ofms
+        );
+    }
+
+    // Weighted sum of the routing-weighted expert outputs + residual (decode sums the top-k).
+    const uint16_t n_combine = (moe_nt == 1) ? top_k : num_experts;
+    std::vector<MLABufferSlice> ws_ifms;
+    for (uint16_t e = 0; e < n_combine; ++e) {
+        ws_ifms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_expert{}", moe_nt, e))});
+    }
+    ws_ifms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_residual", moe_nt))});
+
+    std::vector<MLABufferSlice> ws_ofms;
+    if (!is_last) {
+        // Hidden-state output feeds the next layer's pre model.
+        ws_ofms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))});
+    } else if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+        // Last layer folds in final norm + lm_head -> logits, laid out like the dense post.
+        ws_ofms.emplace_back(MLABufferSlice{&get_buffer("n1_buffer4")});
+    } else {
+        const auto lm_head_output_size = _cfg.lm_cfg.get_lm_head_output_size();
+        const auto& split_dim = _cfg.lm_cfg.lm_head_split_dim;
+        for (uint32_t split_begin = 0; split_begin < lm_head_output_size;
+             split_begin += split_dim) {
+            auto split_size =
+                std::min(lm_head_output_size, split_begin + split_dim) - split_begin;
+            ws_ofms.emplace_back(
+                MLABufferSlice{&get_buffer("n1_buffer4"), {split_begin}, {split_size}}
+            );
+        }
+    }
+    LanguageModelMapKey ws_key{num_tokens, layer_idx, 0};
+    _define_model(
+        "weightedsum", ws_key, _get_elf_path_weightedsum(moe_nt, layer_idx), ws_ifms, ws_ofms
+    );
 }
 
 
@@ -629,6 +739,12 @@ LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) {
         return _conv_final_model_map;
     } else if (model_type == "per_layer") {
         return _per_layer_model_map;
+    } else if (model_type == "router") {
+        return _router_model_map;
+    } else if (model_type == "expert") {
+        return _expert_model_map;
+    } else if (model_type == "weightedsum") {
+        return _weightedsum_model_map;
     } else {
         throw std::runtime_error(std::string("Invalid model type: ") + model_type);
     }
@@ -663,6 +779,37 @@ std::filesystem::path LanguageModel::_get_elf_path_cache(
 std::filesystem::path LanguageModel::_get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx) {
     auto elf_file_name = fmt::format(
         "{}_n{}_post_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
+    );
+    return _elf_dir / elf_file_name;
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_router(uint16_t num_tokens, uint8_t layer_idx) {
+    auto elf_file_name = fmt::format(
+        "{}_n{}_router_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
+    );
+    return _elf_dir / elf_file_name;
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_expert(
+    uint16_t num_tokens, uint8_t layer_idx, uint16_t expert_idx
+) {
+    // Experts keep the factory post_layer..expert.. naming.
+    auto elf_file_name = fmt::format(
+        "{}_n{}_post_layer{}_expert{}_stage1_mla.elf",
+        _cfg.language_model_name, num_tokens, layer_idx, expert_idx
+    );
+    return _elf_dir / elf_file_name;
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_weightedsum(
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    auto elf_file_name = fmt::format(
+        "{}_n{}_moe_weightedsum_layer{}_stage1_mla.elf",
+        _cfg.language_model_name, num_tokens, layer_idx
     );
     return _elf_dir / elf_file_name;
 }

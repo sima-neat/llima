@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from afe.backends.backends import Backend
-from afe.ir.build_node import NodeOrHandle
+from afe.ir.build_node import NodeHandle, NodeOrHandle
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.model.base import BaseModel
@@ -51,6 +51,30 @@ class LanguagePartBaseModel(BaseModel):
        """
         # Make sure that there is residual add input if needed.
         assert len(input_nodes) == (2 if with_residual_add else 1)
+
+        expert_idx = getattr(self, "expert_idx", -1)
+        swiglu_limit = self.cfg.lm_cfg.mlp_cfg.swiglu_limit
+        if swiglu_limit is not None:
+            # Clamped gated SwiGLU. de_interleave (gpt_oss only) splits the fused
+            # interleaved gate_up into two projection convs at load time.
+            de_interleave = self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
+            gate = self._onnx_builder.build_conv_from_dense_with_lora(
+                f"{base_name}.gate_proj", input_nodes[0], None,
+                expert_idx=expert_idx, de_interleave=de_interleave,
+            )
+            up = self._onnx_builder.build_conv_from_dense_with_lora(
+                f"{base_name}.up_proj", input_nodes[0], None,
+                expert_idx=expert_idx, de_interleave=de_interleave,
+            )
+            act = self._onnx_builder.build_swiglu(f"{base_name}.act", gate, up, swiglu_limit)
+            down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
+                f"{base_name}.down_proj", act, None, expert_idx=expert_idx
+            )
+            if with_residual_add:
+                down_proj = self._onnx_builder.build_op(
+                    f"{base_name}.add2", [input_nodes[1], down_proj], "Add"
+                )
+            return down_proj
 
         # Determine weight naming convention based on what exists in the model.
         if self.check_hf_param(f"{base_name}.w2.weight"):
@@ -137,6 +161,12 @@ class LanguagePartBaseModel(BaseModel):
         # Make sure that there is residual add input if needed.
         assert len(input_nodes) == (2 if with_residual_add else 1)
 
+        swiglu_limit = self.cfg.lm_cfg.mlp_cfg.swiglu_limit
+        if swiglu_limit is not None:
+            return self._build_sima_swiglu_mlp(
+                builder, base_name, input_nodes, swiglu_limit, merged_lora, with_residual_add
+            )
+
         # Determine weight naming convention based on what exists in the model.
         if self.check_hf_param(f"{base_name}.w2.weight"):
             gate_name, up_name, down_name = "w1", "w3", "w2"
@@ -201,6 +231,56 @@ class LanguagePartBaseModel(BaseModel):
 
         return down_proj
 
+    def _build_sima_swiglu_mlp(
+        self, builder, base_name: str, input_nodes: list[NodeOrHandle], swiglu_limit: float,
+        merged_lora: bool = False, with_residual_add: bool = False
+    ) -> NodeOrHandle:
+        """Build SiMa nodes for a clamped gated SwiGLU MLP block (gpt_oss).
+
+        Mirrors the swiglu branch of _build_onnx_mlp, including its lack of part
+        splitting.
+        """
+        from afe.ir.defines import get_expected_tensor_value
+        from sima_lmm.model.sima_builder import (
+            build_conv_from_dense_with_lora, build_swiglu, swiglu_clip
+        )
+
+        expert_idx = getattr(self, "expert_idx", -1)
+        # de_interleave (gpt_oss only) splits the fused interleaved gate_up into two
+        # projection convs at load time.
+        de_interleave = self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
+
+        # Fold the SwiGLU clamps into the projections, as the ONNX path does, rather
+        # than emitting standalone Clip nodes.
+        ifm = input_nodes[0]
+        ifm_type = get_expected_tensor_value(
+            ifm.type if isinstance(ifm, NodeHandle) else ifm.get_type().output
+        )
+        gate_clip, up_clip = swiglu_clip(
+            ifm_type,
+            self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx),
+            swiglu_limit,
+        )
+        gate = build_conv_from_dense_with_lora(
+            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.gate_proj",
+            ifm, None, merged_lora=merged_lora,
+            expert_idx=expert_idx, de_interleave=de_interleave, activation=gate_clip,
+        )
+        up = build_conv_from_dense_with_lora(
+            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.up_proj",
+            ifm, None, merged_lora=merged_lora,
+            expert_idx=expert_idx, de_interleave=de_interleave, activation=up_clip,
+        )
+        act = build_swiglu(builder, gate, up)
+        down_proj = build_conv_from_dense_with_lora(
+            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.down_proj",
+            act, None, merged_lora=merged_lora, expert_idx=expert_idx,
+        )
+        if with_residual_add:
+            # Sums the MLP output with the residual stream.
+            down_proj = builder.create_add_node(input_nodes[1], down_proj)
+        return down_proj
+
     def _cast_bf16_outputs_to_fp32(self, builder: SimaBuilder, mla_node: NodeOrHandle):
         """Cast bfloat16 outputs to float32. Do not cast int outputs."""
         from afe.ir.defines import TensorValue, TupleValue, get_expected_tensor_value
@@ -244,10 +324,12 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             in one model.
         layer_idx: Transformer layer index.
         final_softcapping: Final logit soft capping for gemma 2.
+        expert_idx: MoE expert this post model builds; -1 for a non-expert post model.
     """
     num_tokens: int
     layer_idx: int
     final_softcapping: float | None
+    expert_idx: int = -1
 
     def _create_final_layer_output_nodes(self, output_nodes: list[OnnxNode]):
         """Create output nodes for the final transformer layer."""

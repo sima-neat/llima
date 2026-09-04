@@ -276,6 +276,19 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<MLABufferSlice>& ofms
         );
         void _define_attn_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
+        // Mixture-of-Experts post block: router + experts + weighted-sum (replaces post).
+        void _define_moe_post_models(
+            uint16_t num_tokens, uint8_t layer_idx, bool is_draft,
+            const std::vector<MLABufferSlice>& pre_ifms,
+            const std::vector<MLABufferSlice>& cache_ofms
+        );
+        // Runtime for one MoE post block: router -> host top-k/softmax scatter -> experts ->
+        // weighted-sum. Gated on _cfg.lm_cfg.is_moe().
+        void _run_moe_post(
+            const LanguageModelMapKey& model_key,
+            std::map<uint8_t, MLABufferSlice>* ifm_map,
+            uint16_t num_tokens, uint8_t layer_idx
+        );
         LanguageModelMapKey _get_cache_model_key(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
         ) const;
@@ -297,6 +310,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
             bool use_sliding_cache
         );
         std::filesystem::path _get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx);
+        std::filesystem::path _get_elf_path_router(uint16_t num_tokens, uint8_t layer_idx);
+        std::filesystem::path _get_elf_path_expert(
+            uint16_t num_tokens, uint8_t layer_idx, uint16_t expert_idx
+        );
+        std::filesystem::path _get_elf_path_weightedsum(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
@@ -377,6 +395,30 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_model_map;
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
+        // Mixture-of-Experts maps. router/weightedsum are keyed like post
+        // ({num_tokens, layer_idx, 0}); the expert map repurposes the third key slot
+        // as the expert index ({num_tokens, layer_idx, expert_idx}).
+        LanguageModelMap _router_model_map;
+        LanguageModelMap _expert_model_map;
+        LanguageModelMap _weightedsum_model_map;
+        // Preresolved handles + staging for the MoE host round-trip, one per MoE variant.
+        struct MoeHostCache {
+            uint16_t num_tokens = 0;             // the moe_nt this entry serves
+            MLABuffer* values = nullptr;         // n{nt}_router_values
+            MLABuffer* indices = nullptr;        // n{nt}_router_indices
+            MLABuffer* weights = nullptr;        // n{nt}_router_weights
+            std::vector<MLABuffer*> expert_out;  // n{nt}_expert{e}, e < num_experts
+            // Decode only: top_k OFM overrides routing each expert into its combine slot.
+            std::vector<std::map<uint8_t, MLABufferSlice>> slot_ofm;
+            // Host staging, sized once; never reallocated on the critical path.
+            std::vector<Eigen::bfloat16> values_scratch;   // nt * top_k
+            std::vector<int32_t> indices_scratch;          // nt * top_k
+            std::vector<Eigen::bfloat16> weights_scratch;  // nt * num_experts
+            std::vector<uint8_t> activated_scratch;        // num_experts (prefill only)
+        };
+        std::vector<MoeHostCache> _moe_host;
+        void _init_moe_host_cache();
+        MoeHostCache& _get_moe_host(uint16_t moe_nt);
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
 
