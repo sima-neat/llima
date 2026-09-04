@@ -397,6 +397,18 @@ class LanguageCacheModel(LanguagePartBaseModel):
             )
         else:
             model_input_attn_mask = None
+        if self._use_attention_sinks:
+            # Per-head sink logit. The runtime defines this buffer as
+            # {num_tokens, num_attention_heads}, i.e. heads on the channel axis, so
+            # declare it that way and reshape to per-head rows below.
+            sinks_shape = (
+                1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.num_attention_heads
+            )
+            model_input_sinks = builder.create_placeholder_node(
+                "sinks", TensorType(activation_type(quantizable), sinks_shape)
+            )
+        else:
+            model_input_sinks = None
         model_input_cached_values = builder.create_placeholder_node(
             "cached_values", TensorType(kv_dtype, kv_tensor_shape)
         )
@@ -412,6 +424,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             model_input_cached_keys,
             model_input_cached_keys_scale,
             model_input_attn_mask,
+            model_input_sinks,
             model_input_cached_values,
             model_input_cached_values_scale
         ]))
@@ -435,6 +448,12 @@ class LanguageCacheModel(LanguagePartBaseModel):
             )
         else:
             mla_input_attn_mask = None
+        if model_input_sinks is not None:
+            mla_input_sinks = builder.create_placeholder_node(
+                "MLA_0/sinks", TensorType(activation_type(quantizable), sinks_shape)
+            )
+        else:
+            mla_input_sinks = None
         mla_input_cached_values = builder.create_placeholder_node(
             "MLA_0/cached_values", TensorType(kv_dtype, kv_tensor_shape)
         )
@@ -500,7 +519,21 @@ class LanguageCacheModel(LanguagePartBaseModel):
             assert mla_input_attn_mask is not None
             bmm1 = builder.create_add_node(bmm1, mla_input_attn_mask)
 
-        softmax = builder.create_softmax_node(bmm1, 3)
+        if mla_input_sinks is not None:
+            # Heads arrive on the channel axis; move them to rows so the sink lines up
+            # with bmm1's (1, num_heads, num_tokens, context) layout.
+            sinks = builder.create_slice_concat_node(
+                mla_input_sinks, axis=1, split_axis=3,
+                split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
+            )
+            # Sink as an extra key position: concat, softmax over context+1, drop it.
+            combined = builder.create_concat_node([bmm1, sinks], axis=3)
+            softmax = builder.create_softmax_node(combined, 3)
+            softmax = builder.create_slice_node(
+                softmax, [0], [self.context_length], [1], [3]
+            )
+        else:
+            softmax = builder.create_softmax_node(bmm1, 3)
 
         # Second multiply ((input * key) * value)
         reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
