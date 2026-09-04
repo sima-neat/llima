@@ -55,6 +55,7 @@ modalix:~$ llima run <model> [options]
 |----|----|
 | `model` | Model ID or path (e.g., `Qwen3-VL-8B-Instruct-a16w4`). |
 | `--stt_model_path` | Path to the elf files for a Speech-to-Text model (optional). |
+| `--max-kv-cache-slots` | Maximum reusable KV-cache sessions for this model instance (default: `1`). The alias `--max_kv_cache_slots` is also accepted. |
 
 For all available options, run `llima run -h`.
 
@@ -62,6 +63,7 @@ For all available options, run `llima run -h`.
 
 ``` console
 modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
+modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4 --max-kv-cache-slots 4
 ```
 
 ## Interactive Commands
@@ -71,10 +73,15 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | Command | Description |
 |----|----|
 | `add image <file>` | Add an image to the current prompt context. |
-| `set system <prompt>` | Set the system prompt. |
-| `clear system` | Clear the system prompt, chat history, and images. |
-| `clear history` | Clear submitted prompts, responses, and all images while preserving the system prompt. |
-| `print history` | Print chat history. |
+| `set system <prompt>` | Set the system prompt for the active cache session. |
+| `clear system` | Clear the system prompt, chat history, and images for the active session. |
+| `clear history` | Clear submitted prompts, responses, and all images for the active session while preserving the system prompt. |
+| `print history` | Print chat history for the active session. |
+| `use cache <id>` | Select or create a named cache session with independent chat history. |
+| `use default cache` | Select the legacy unnamed cache session. |
+| `remove cache <id>` | Remove a named cache session and make its slot available. |
+| `clear caches` | Remove all KV caches and reset all session histories. |
+| `print caches` | Print the active session, allocated-slot count, and bytes per allocated slot. |
 | `set audio <file>` | Set the audio file to transcribe as the query. |
 | `set language <lang>` | Set the language string used for transcription. |
 | `set lora <name>` | Use LoRA weights from a `npy_files` folder. |
@@ -83,6 +90,72 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `disable-thinking` | Disable thinking mode and clear chat history. |
 | `quit` | Quit. |
 | `help` | Print available commands. |
+
+
+
+## Reusable KV Caches in Web Mode
+
+Start the web server with the number of simultaneous prompt contexts the
+application needs:
+
+``` console
+modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4 \
+  --mode web \
+  --max-kv-cache-slots 4
+```
+
+Pass a stable, non-empty `cache_id` at the top level of every inference request.
+This extension is accepted by `/v1/chat/completions`, `/v1/completions`,
+`/api/chat`, and `/api/generate`:
+
+``` console
+modalix:~$ curl http://localhost:9998/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "ivi-assistant",
+    "cache_id": "driver-profile",
+    "messages": [
+      {"role": "system", "content": "<large system and tool prompt>"},
+      {"role": "user", "content": "Navigate home"}
+    ]
+  }'
+```
+
+The HTTP API remains stateless with respect to messages: the application must
+send the complete conversation required for each request. `cache_id` selects
+reusable device-side prompt state; it does not replace `messages` or `prompt`.
+Omitting `cache_id`, or setting it to `null`, selects the legacy default cache.
+That default cache consumes one slot when first used.
+
+Slots are assigned lazily and there is no automatic eviction. A request for a
+new ID after the configured limit is reached returns HTTP `429` with error type
+`cache_capacity_error` for a non-streaming request. A streaming response that
+has already started reports the same typed error in its final SSE or NDJSON
+event.
+
+Remove a completed named session or clear the complete pool:
+
+``` console
+modalix:~$ curl http://localhost:9998/remove_cache \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "ivi-assistant", "cache_id": "driver-profile"}'
+
+modalix:~$ curl http://localhost:9998/clear_caches \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "ivi-assistant"}'
+```
+
+Removing a session releases its logical slot. Its physical device allocation is
+retained for reuse until the model instance is destroyed. Responses expose
+`cache_created` and `cached_prompt_tokens`; OpenAI-compatible non-streaming and
+final streaming responses place the token count at
+`usage.cached_prompt_tokens`, while Ollama-compatible responses use a top-level
+`cached_prompt_tokens` field.
+
+Choose the slot limit from the number of live sessions and available device
+DRAM. The upper-bound cache allocation is approximately the per-slot cache
+footprint multiplied by `--max-kv-cache-slots`; model weights, activations, and
+other runtime buffers also consume device memory.
 
 
 ## Build an Application with Neat

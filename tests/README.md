@@ -337,10 +337,10 @@ Pytest validates the installed package and external interfaces:
 | Test | Coverage |
 |------|----------|
 | Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
-| CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
+| CLI black box | Validates `llima run` cache-slot argument parsing; the temporarily disabled model-backed case starts `llima`, submits a real Qwen query, sends `quit`, and verifies teardown |
 | MLA memory cleanup | Runs Qwen four times through `llima run -> quit`, checks `/dev/simaai-mem` after every exit, and verifies that the daemon PID and allocation baseline remain stable |
 | Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
-| OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
+| OpenAI/Ollama HTTP | Recovery and cancellation, bounded reusable KV-cache sessions and lifecycle endpoints, plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
 
 `tests/runtime/pytest.ini` is packaged with these tests and prevents compiler
