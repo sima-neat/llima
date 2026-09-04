@@ -520,9 +520,13 @@ class MixtureOfExpertsConfig(BaseConfig):
     Attributes:
         num_experts: Total number of experts in each MoE layer.
         num_experts_per_tok: Number of experts the router activates per token (top-k).
+        norm_topk_prob: Whether the selected routing weights are divided by their sum.
+            Only meaningful when the softmax runs over all experts before the top-k
+            (OLMoE); HF defaults it to False.
     """
     num_experts: int = 0
     num_experts_per_tok: int = 0
+    norm_topk_prob: bool = False
 
     def set_config(self, text_cfg: dict):
         # gpt_oss/Mixtral use "num_local_experts"; OLMoE uses "num_experts".
@@ -532,6 +536,7 @@ class MixtureOfExpertsConfig(BaseConfig):
         self.num_experts_per_tok = text_cfg.get(
             "num_experts_per_tok", text_cfg.get("experts_per_token", 0)
         )
+        self.norm_topk_prob = text_cfg.get("norm_topk_prob", False)
 
 
 @dataclass

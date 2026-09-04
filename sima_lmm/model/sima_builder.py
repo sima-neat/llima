@@ -455,7 +455,7 @@ def build_swiglu(
         up.type if isinstance(up, NodeHandle) else up.get_type().output
     )
     one = builder.create_constant_node(
-        np.ones((1, 1, 1, 1), dtype=ScalarType.numpy_type(up_type.scalar))
+        np.array([1.0], dtype=ScalarType.numpy_type(up_type.scalar))
     )
     up = builder.create_add_node(up, one)
     return builder.create_mul_node(up, glu)
