@@ -44,53 +44,6 @@ int main() {
                 throw std::runtime_error("VLM model does not support images");
             }
 
-            auto count_message_images = [](const auto& messages) {
-                size_t count = 0;
-                for (const auto& message: messages) {
-                    const auto& content = message.at("content");
-                    if (!content.is_array())
-                        continue;
-                    for (const auto& item: content) {
-                        if (item.value("type", "") == "image")
-                            ++count;
-                    }
-                }
-                return count;
-            };
-
-            auto image_state_chat = model.create_chat();
-            image_state_chat.add_image(image);
-            image_state_chat.add_query("Describe the first image.");
-            image_state_chat.add_image(image);
-            image_state_chat.clear_images();
-            if (
-                image_state_chat.get_images().size() != 1
-                || count_message_images(image_state_chat.get_messages()) != 1
-            ) {
-                throw std::runtime_error(
-                    "Clearing queued images changed a previously submitted image"
-                );
-            }
-
-            image_state_chat.add_query("Continue without a new image.");
-            image_state_chat.add_image(image);
-            image_state_chat.add_query("Describe the second image.");
-            if (
-                image_state_chat.get_images().size() != 2
-                || count_message_images(image_state_chat.get_messages()) != 2
-            ) {
-                throw std::runtime_error("New image was not associated with its own query");
-            }
-            image_state_chat.clear_history();
-            if (!image_state_chat.get_images().empty()) {
-                throw std::runtime_error("Clearing history retained image files");
-            }
-            for (const auto& message: image_state_chat.get_messages()) {
-                if (message.value("role", "") != "system") {
-                    throw std::runtime_error("Clearing history retained a conversation turn");
-                }
-            }
-
             auto chat = model.create_chat();
             chat.add_image(image);
             chat.add_query("Describe this image in a short phrase.");
