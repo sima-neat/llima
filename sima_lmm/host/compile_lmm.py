@@ -119,6 +119,14 @@ def gen_files(
                         FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
                         FileGenMode.MODEL_SDK_COMPILE
                     ]
+                elif model.cfg.lm_cfg.moe_cfg is not None:
+                    # The MoE router needs TopK, which the SiMa Builder has no
+                    # primitive for, so MoE models go through ONNX instead of
+                    # direct graph generation.
+                    modes = [
+                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX,
+                        FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
+                    ]
                 else:
                     # Use direct SiMa Builder graph generation for ordinary HF models.
                     modes = [
