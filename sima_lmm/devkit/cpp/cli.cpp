@@ -147,6 +147,10 @@ void CLI::run() {
                 chat.add_image(image_file_name);
             }
             continue;
+        } else if (command == "clear image") {
+            std::cout << "The clear image command is not supported; use clear history instead."
+                      << std::endl;
+            continue;
         } else if (command.starts_with("set system ")) {
             constexpr auto pos = std::string("set system ").length();
             chat.set_system_prompt(command.substr(pos));
