@@ -12,6 +12,44 @@ from sima_utils.logging.sima_logger import sima_log_warning
 
 LONG_CONTEXT_MIN_TOKENS = 2048
 LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE = 1024
+_VISION_MODEL_TYPE_ALIASES = {
+    "qwen2_5_vl_vision": "qwen2_5_vl",
+    "qwen3_vl_vision": "qwen3_vl",
+}
+
+
+def _normalize_attention_config(text_cfg: dict) -> dict:
+    """Translate Gemma 4 per-layer overrides into our full/sliding contract."""
+    if text_cfg.get("model_type") != "gemma4_text" or not text_cfg.get("per_layer_config"):
+        return text_cfg
+
+    layer_types = text_cfg["layer_types"]
+    # Transformers serializes indices with zero padding (e.g. "04").
+    overrides = {int(index): values for index, values in text_cfg["per_layer_config"].items()}
+    for index, values in overrides.items():
+        if not 0 <= index < len(layer_types):
+            raise ValueError(f"Invalid Gemma 4 layer override index: {index}")
+        for key, value in values.items():
+            if key != "head_dim" and value != text_cfg.get(key):
+                raise ValueError(f"Unsupported Gemma 4 layer {index} override: {key}={value!r}")
+
+    dimensions = {}
+    for index, layer_type in enumerate(layer_types):
+        default = text_cfg["head_dim"]
+        if layer_type == "full_attention":
+            default = text_cfg.get("global_head_dim") or default
+        dimension = overrides.get(index, {}).get("head_dim", default)
+        if layer_type not in ("full_attention", "sliding_attention"):
+            raise ValueError(f"Unsupported Gemma 4 layer type: {layer_type}")
+        if layer_type in dimensions and dimensions[layer_type] != dimension:
+            raise ValueError(f"Inconsistent Gemma 4 head dimensions for {layer_type}")
+        dimensions[layer_type] = dimension
+
+    normalized = dict(text_cfg)
+    normalized["head_dim"] = dimensions.get("sliding_attention", text_cfg["head_dim"])
+    if "full_attention" in dimensions:
+        normalized["global_head_dim"] = dimensions["full_attention"]
+    return normalized
 
 
 class ExtensibleEnum:
@@ -225,6 +263,7 @@ class VisionModelConfig(BaseConfig):
         if "num_hidden_layers" not in vision_cfg and "depth" in vision_cfg:
             vision_cfg["num_hidden_layers"] = vision_cfg["depth"]
         super().set_config(vision_cfg)
+        self.model_type = _VISION_MODEL_TYPE_ALIASES.get(self.model_type, self.model_type)
 
         self.arch = arch
         self.image_size = vision_cfg.get("image_size") or model_cfg.get("tile_size", 0)
@@ -662,6 +701,7 @@ class LanguageModelConfig(BaseConfig):
         return lmc
 
     def set_config(self, text_cfg: dict, dtype: "LlmDataType", lm_arch: "LlmArchType", model_format: "ModelFormat"):
+        text_cfg = _normalize_attention_config(text_cfg)
         self.model_type = text_cfg["model_type"]
         self.data_type = dtype
         self.arch = lm_arch
@@ -1401,6 +1441,7 @@ def get_model_arch_gen(
         raise NotImplementedError(f"Unsupported LLM architecture: {text_type}")
 
     if is_vlm:
+        vision_type = _VISION_MODEL_TYPE_ALIASES.get(vision_type, vision_type)
         vm_arch = VisionArchType(vision_type.split("_vision_model")[0])
     else:
         vm_arch = None
