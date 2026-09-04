@@ -161,7 +161,7 @@ def test_installed_cli_start_query_quit(tmp_path):
 
     for output in (first_output, second_output):
         assert "Setting up environments and loading models" in output
-        assert "Cleared images." in output
+        assert "Cleared images queued for the next prompt." in output
         assert "Query: clear image" not in output
         assert f"Query: {QUERY}" in output
         assert "Assistant:" in output

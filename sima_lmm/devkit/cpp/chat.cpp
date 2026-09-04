@@ -5,6 +5,26 @@
 namespace simaai {
 namespace llima {
 
+namespace {
+
+uint32_t count_images_in_messages(const nlohmann::ordered_json& messages) {
+    uint32_t num_images = 0;
+    for (const auto& message: messages) {
+        if (!message.contains("content"))
+            continue;
+        const auto& content = message["content"];
+        if (!content.is_array())
+            continue;
+        for (const auto& item: content) {
+            if (item.is_object() && item.value("type", "") == "image")
+                ++num_images;
+        }
+    }
+    return num_images;
+}
+
+}
+
 
 Chat::Chat(VlmHelper& vlm_helper) : _vlm_helper(vlm_helper),
     _enable_thinking(vlm_helper.get_enable_thinking()) {
@@ -43,16 +63,7 @@ void Chat::add_query(std::string query) {
     }
 
     // Check how many images need to be added to this message in addition to the query.
-    uint32_t num_images_in_messages = 0;
-    for (const auto& message: _messages) {
-        const auto& content = message["content"];
-        if (!content.is_array())
-            continue;
-        for (const auto& item: content) {
-            if (item.at("type") == "image")
-                ++num_images_in_messages;
-        }
-    }
+    auto num_images_in_messages = count_images_in_messages(_messages);
 
     nlohmann::ordered_json content;
     if (!_images.empty()) {
@@ -140,7 +151,11 @@ void Chat::add_image(std::filesystem::path image_path) {
 
 
 void Chat::clear_images() {
-    _images.clear();
+    // Images already submitted with a query are part of chat history. Only discard images queued
+    // since the last query; clear_history() removes both submitted and queued images.
+    auto num_submitted_images = count_images_in_messages(_messages);
+    if (_images.size() > num_submitted_images)
+        _images.resize(num_submitted_images);
 }
 
 
