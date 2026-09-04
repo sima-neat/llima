@@ -448,12 +448,24 @@ def build_swiglu(
     Returns:
         Output node of the created SwiGLU.
     """
-    glu = builder.create_quick_gelu_node(gate)
-    # The constant must share up's scalar type: activations are float32 while the
-    # graph is quantizable and bfloat16 afterwards.
+    # Constants must share their operand's scalar type: activations are float32 while
+    # the graph is quantizable and bfloat16 afterwards.
+    gate_type = get_expected_tensor_value(
+        gate.type if isinstance(gate, NodeHandle) else gate.get_type().output
+    )
     up_type = get_expected_tensor_value(
         up.type if isinstance(up, NodeHandle) else up.get_type().output
     )
+
+    # quick_gelu(x) = x * sigmoid(1.702 * x), built the same way the ONNX path builds
+    # it rather than as a single QuickGelu node, so the two paths round identically.
+    scale = builder.create_constant_node(
+        np.array([1.702], dtype=ScalarType.numpy_type(gate_type.scalar))
+    )
+    glu = builder.create_mul_node(
+        gate, builder.create_sigmoid_node(builder.create_mul_node(gate, scale))
+    )
+
     one = builder.create_constant_node(
         np.array([1.0], dtype=ScalarType.numpy_type(up_type.scalar))
     )
