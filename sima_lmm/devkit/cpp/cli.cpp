@@ -148,6 +148,10 @@ void CLI::run() {
                 chat.add_image(image_file_name);
             }
             continue;
+        } else if (command == "clear image") {
+            chat.clear_images();
+            std::cout << "Cleared images." << std::endl;
+            continue;
         } else if (command.starts_with("set system ")) {
             constexpr auto pos = std::string("set system ").length();
             chat.set_system_prompt(command.substr(pos));
