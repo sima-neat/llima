@@ -34,7 +34,6 @@ def build_conv(
         is_fc: bool = True,
         stride: tuple[int, ...] = (1, 1),
         relocatable: bool = False,
-        weight_slice: tuple[int, int, int, int] | None = None,
         is_depthwise: bool = False,
         **kwargs
 ) -> AwesomeNode:
@@ -116,29 +115,6 @@ def build_conv(
         weight_tensor = weight_process_func(weight_tensor)
         # Convert to SiMa IR layout
         weight_tensor = layout_array(weight_tensor, "oihw", "hwigo")
-
-    # Take part of weight tensor if slice is defined.
-    if weight_slice is not None:
-        num_in_channels = weight_tensor.shape[2]
-        start, size, axis, idx = weight_slice
-        # Normalize axis (e.g., -1 means last axis)
-        axis = np.core.numeric.normalize_axis_index(axis, weight_tensor.ndim)
-        weight_tensor = np.take(weight_tensor, np.arange(start, start + size), axis=axis)
-
-        # Split scale if exists.
-        if scales is not None:
-            if axis == 2 and scales.shape[1] > 1:
-                # Split scale by input channels axis (number of blocks).
-                num_blocks = scales.shape[0]
-                block_size = num_in_channels // num_blocks
-
-                # Adjust start/size into block indices.
-                start = start // block_size
-                size = size // block_size
-                scales = np.take(scales, np.arange(start, start + size), axis=0)
-            else:
-                # Split scale by output channels axis.
-                scales = np.take(scales, np.arange(start, start + size), axis=1)
 
     if weight_tensor.dtype in [bfloat16, np.float16]:
         weight_tensor = weight_tensor.astype(np.float32)  # Model SDK requires float32
@@ -278,7 +254,6 @@ def build_conv_from_dense_with_lora(
     ifm: NodeOrHandle,
     lora_rank: int | None = None,
     merged_lora: bool = False,
-    weight_slice: tuple[int, int, int, int] | None = None,
     **kwargs
 ) -> NodeOrHandle:
     """Builds a conv from dense op with LoRA branch.
@@ -291,14 +266,9 @@ def build_conv_from_dense_with_lora(
         ifm: The input node.
         lora_rank: The rank of LoRA adapter.
         merged_lora: Whether or not lora adapter is merged to the base model.
-        weight_slice: Optional specification of a sub-region of the weight tensor. Includes
-            size, offset, axis and index of weight slice. If None, use the entire weight.
     Returns:
         Created conv node or merged node of the conv and LoRA branch.
     """
-    if weight_slice is not None and lora_rank is not None:
-        raise NotImplementedError("Conv slicing is not supported for LoRA.")
-
     if lora_rank and merged_lora:
         proj = build_conv(
             builder, get_param_func, check_param_func, base_name, ifm, relocatable=True, **kwargs
@@ -306,8 +276,7 @@ def build_conv_from_dense_with_lora(
         return proj
 
     proj = build_conv(
-        builder, get_param_func, check_param_func, base_name, ifm, weight_slice=weight_slice,
-        **kwargs
+        builder, get_param_func, check_param_func, base_name, ifm, **kwargs
     )
 
     if lora_rank:
