@@ -83,7 +83,7 @@ sync_sysroot_from_internals_manifest {shlex.quote(str(artifact_dir))}
 
 
 def run_targeted_sysroot_payload_install() -> tuple[
-    subprocess.CompletedProcess[str], int, int, int, list[str]
+    subprocess.CompletedProcess[str], int, int, int, int, list[str]
 ]:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -122,6 +122,7 @@ run_as_root() {{
   "$@"
 }}
 {shell_function("install_sdk_sysroot_package_payloads")}
+umask 027
 install_sdk_sysroot_package_payloads {shlex.quote(str(sysroot))} libexample:arm64
 """
         result = subprocess.run(
@@ -131,12 +132,14 @@ install_sdk_sysroot_package_payloads {shlex.quote(str(sysroot))} libexample:arm6
         untouched_mode = untouched.stat().st_mode & 0o777
         existing_libdir_mode = existing_libdir.stat().st_mode & 0o777
         installed_mode = installed.stat().st_mode & 0o777 if installed.exists() else 0
+        installed_libdir_mode = installed.parent.stat().st_mode & 0o777
         root_calls = root_log.read_text(encoding="utf-8").splitlines()
         return (
             result,
             untouched_mode,
             existing_libdir_mode,
             installed_mode,
+            installed_libdir_mode,
             root_calls,
         )
 
@@ -229,15 +232,21 @@ class InternalsSysrootSyncTest(unittest.TestCase):
 
 
 class SdkSysrootPackageInstallTest(unittest.TestCase):
-    def test_normalizes_only_the_new_package_payload(self) -> None:
-        result, untouched_mode, libdir_mode, installed_mode, root_calls = (
-            run_targeted_sysroot_payload_install()
-        )
+    def test_normalizes_only_the_new_payload_under_restrictive_umask(self) -> None:
+        (
+            result,
+            untouched_mode,
+            libdir_mode,
+            installed_mode,
+            new_dir_mode,
+            root_calls,
+        ) = run_targeted_sysroot_payload_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(untouched_mode, 0o600)
         self.assertEqual(libdir_mode, 0o710)
         self.assertEqual(installed_mode, 0o644)
-        self.assertEqual(root_calls, ["cp"])
+        self.assertEqual(new_dir_mode, 0o755)
+        self.assertEqual(root_calls, ["bash"])
 
 
 def test_internals_is_located_without_a_derived_version() -> None:
@@ -331,7 +340,7 @@ def test_llima_package_fallback_does_not_run_the_sdk_overlay() -> None:
     assert 'install_sdk_sysroot_package_payloads "${sysroot}"' in package_function
     assert 'chmod -R a+rX "${payload_root}"' in text
     assert 'chmod -R a+rX "${sysroot}"' not in text
-    assert 'run_as_root cp -R "${payload_root}/." "${sysroot}/"' in text
+    assert "umask 022; cp -R" in text
     assert 'cp -a "${payload_root}/."' not in text
 
 
