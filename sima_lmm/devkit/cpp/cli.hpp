@@ -26,6 +26,14 @@ class EXPORT CLI {
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template
         );
+        CLI(
+            std::filesystem::path vlm_model_path,
+            std::optional<std::filesystem::path> whisper_model_path,
+            std::optional<std::filesystem::path> draft_model_path,
+            std::optional<std::string> system_prompt,
+            std::optional<std::string> chat_template,
+            size_t max_kv_cache_slots
+        );
         ~CLI();
 
         void run();
@@ -35,6 +43,7 @@ class EXPORT CLI {
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
+        size_t _max_kv_cache_slots;
 
         // Logging.
         std::shared_ptr<spdlog::logger> _logger;

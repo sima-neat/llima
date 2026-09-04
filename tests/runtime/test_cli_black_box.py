@@ -126,6 +126,31 @@ def _run_cli(
     return output, process.pid
 
 
+def test_run_help_and_kv_cache_slot_validation():
+    llima = shutil.which("llima")
+    if llima is None:
+        pytest.skip("installed llima executable was not found")
+
+    help_result = subprocess.run(
+        [llima, "run", "--help"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert "--max-kv-cache-slots" in help_result.stdout
+    assert "--max_kv_cache_slots" in help_result.stdout
+
+    invalid_result = subprocess.run(
+        [llima, "run", "unused-model", "--max-kv-cache-slots", "0"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert invalid_result.returncode == 2
+    assert "max KV-cache slots must be at least 1" in invalid_result.stderr
+
+
 @pytest.mark.skip(
     reason="Temporarily disabled while mlashmcomplex thread cleanup is investigated"
 )

@@ -73,7 +73,12 @@ def _wait_for_server(process: subprocess.Popen[str], timeout: float = 30) -> Non
 
 
 @contextmanager
-def _running_web_server(tmp_path, model_name: str | None = None):
+def _running_web_server(
+    tmp_path,
+    model_name: str | None = None,
+    *,
+    max_kv_cache_slots: int = 1,
+):
     models_path = Path(os.environ.get("LLIMA_MODELS_PATH", DEFAULT_MODELS_PATH))
     model_name = model_name or _text_model_name()
     assert (models_path / model_name / "devkit" / "vlm_config.json").is_file()
@@ -85,7 +90,15 @@ def _running_web_server(tmp_path, model_name: str | None = None):
     env = os.environ.copy()
     env["LLIMA_MODELS_PATH"] = str(models_path)
     process = subprocess.Popen(
-        [llima, "run", model_name, "--mode", "web"],
+        [
+            llima,
+            "run",
+            model_name,
+            "--mode",
+            "web",
+            "--max-kv-cache-slots",
+            str(max_kv_cache_slots),
+        ],
         cwd=tmp_path,
         env=env,
         text=True,
@@ -125,14 +138,20 @@ def _post(path: str, body: bytes, timeout: float = 180):
         connection.close()
 
 
-def _chat_body(*, stream: bool, query: str = QUERY) -> bytes:
-    return json.dumps(
-        {
-            "model": "runtime-test",
-            "stream": stream,
-            "messages": [{"role": "user", "content": query}],
-        }
-    ).encode()
+def _chat_body(
+    *,
+    stream: bool,
+    query: str = QUERY,
+    cache_id: str | None = None,
+) -> bytes:
+    payload = {
+        "model": "runtime-test",
+        "stream": stream,
+        "messages": [{"role": "user", "content": query}],
+    }
+    if cache_id is not None:
+        payload["cache_id"] = cache_id
+    return json.dumps(payload).encode()
 
 
 def _reconstruct_openai_stream(body: bytes) -> tuple[str, bool]:
@@ -150,6 +169,23 @@ def _reconstruct_openai_stream(body: bytes) -> tuple[str, bool]:
         if delta.get("content"):
             content.append(delta["content"])
     return "".join(content), saw_done
+
+
+def _openai_stream_cache_metrics(body: bytes) -> tuple[int | None, bool | None]:
+    cached_prompt_tokens = None
+    cache_created = None
+    for line in body.decode().splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line.removeprefix("data: ")
+        if payload == "[DONE]":
+            continue
+        chunk = json.loads(payload)
+        if "usage" in chunk:
+            cached_prompt_tokens = chunk["usage"].get("cached_prompt_tokens")
+        if "cache_created" in chunk:
+            cache_created = chunk["cache_created"]
+    return cached_prompt_tokens, cache_created
 
 
 def _reasoning_chat_body(
@@ -247,6 +283,89 @@ def test_openai_http_protocol_and_recovery(tmp_path):
         assert headers["Content-Type"].startswith("text/event-stream")
         assert saw_done
         assert "capital of Germany is Berlin" in reconstructed
+
+
+def test_openai_kv_cache_sessions_capacity_and_reuse(tmp_path):
+    assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
+
+    with _running_web_server(tmp_path, max_kv_cache_slots=2):
+        invalid_status, _, invalid_body = _post(
+            "/v1/chat/completions",
+            json.dumps({
+                "model": "runtime-test",
+                "stream": False,
+                "cache_id": "",
+                "messages": [{"role": "user", "content": QUERY}],
+            }).encode(),
+        )
+        assert invalid_status == 400, invalid_body.decode()
+        assert json.loads(invalid_body)["error"]["type"] == "invalid_request_error"
+
+        for cache_id in ("driver", "passenger"):
+            status, _, body = _post(
+                "/v1/chat/completions",
+                _chat_body(stream=False, cache_id=cache_id),
+            )
+            response = json.loads(body)
+            assert status == 200, response
+            assert response["cache_created"] is True
+            assert response["usage"]["cached_prompt_tokens"] == 0
+
+        status, _, body = _post(
+            "/v1/chat/completions",
+            _chat_body(stream=True, cache_id="driver"),
+        )
+        assert status == 200, body.decode()
+        cached_prompt_tokens, cache_created = _openai_stream_cache_metrics(body)
+        assert cached_prompt_tokens is not None and cached_prompt_tokens > 0
+        assert cache_created is False
+
+        status, _, body = _post(
+            "/v1/chat/completions",
+            _chat_body(stream=False, cache_id="guest"),
+        )
+        response = json.loads(body)
+        assert status == 429, response
+        assert response["error"]["type"] == "cache_capacity_error"
+
+        status, _, body = _post(
+            "/remove_cache",
+            json.dumps({"model": "runtime-test", "cache_id": "passenger"}).encode(),
+        )
+        response = json.loads(body)
+        assert status == 200, response
+        assert response == {
+            "status": "ok",
+            "model": "runtime-test",
+            "cache_id": "passenger",
+            "removed": True,
+            "cache_count": 1,
+        }
+
+        status, _, body = _post(
+            "/api/generate",
+            json.dumps({
+                "model": "runtime-test",
+                "prompt": QUERY,
+                "stream": False,
+                "cache_id": "guest",
+            }).encode(),
+        )
+        response = json.loads(body)
+        assert status == 200, response
+        assert response["cache_created"] is True
+        assert response["cached_prompt_tokens"] == 0
+
+        status, _, body = _post(
+            "/clear_caches", json.dumps({"model": "runtime-test"}).encode()
+        )
+        response = json.loads(body)
+        assert status == 200, response
+        assert response == {
+            "status": "ok",
+            "model": "runtime-test",
+            "cache_count": 0,
+        }
 
 
 def test_stop_interrupts_active_http_inference(tmp_path):
