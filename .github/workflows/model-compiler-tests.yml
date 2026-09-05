@@ -348,6 +348,7 @@ jobs:
           expected_test_count=32
           base_wheel_dir="${RUNNER_TEMP}/llima-base-wheel"
           base_package_root="${RUNNER_TEMP}/llima-base-package"
+          base_resolution="${RUNNER_TEMP}/llima-base-resolution.json"
           candidate_package_root="${RUNNER_TEMP}/llima-candidate-package"
           base_onnx_root="${RUNNER_TEMP}/llima-base-onnx"
           base_onnx_manifest="${RUNNER_TEMP}/llima-base-onnx-manifest.json"
@@ -361,7 +362,8 @@ jobs:
               "${candidate_package_root}" \
               "${base_onnx_root}" \
               "${candidate_onnx_root}"
-            rm -f "${base_onnx_manifest}" "${candidate_onnx_manifest}"
+            rm -f "${base_onnx_manifest}" "${candidate_onnx_manifest}" \
+              "${base_resolution}" "${base_resolution}.txt"
           }
           trap cleanup_onnx EXIT
           cleanup_onnx
@@ -430,6 +432,24 @@ jobs:
               --no-deps \
               --target "${base_package_root}" \
               "${base_wheels[0]}"
+            # Resolve against the SDK environment without modifying it. Overlay
+            # baseline dependencies that differ from the candidate's versions.
+            python -m pip install \
+              --disable-pip-version-check \
+              --dry-run --report "${base_resolution}" \
+              "${base_wheels[0]}[sdk_ext]"
+            python - "${base_resolution}" <<'PY' > "${base_resolution}.txt"
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as report:
+              for package in json.load(report)["install"]:
+                  print(package["download_info"]["url"])
+          PY
+            python -m pip install \
+              --disable-pip-version-check --no-deps --upgrade \
+              --target "${base_package_root}" \
+              -r "${base_resolution}.txt"
             base_package_version="$(
               PYTHONPATH="${base_package_root}" python -P -c \
                 'import importlib.metadata; print(importlib.metadata.version("sima-lmm"))'
