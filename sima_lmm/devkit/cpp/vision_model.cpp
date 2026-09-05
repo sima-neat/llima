@@ -23,12 +23,46 @@ void VisionModel::run_model(
     // Upload the ifm.
     get_buffer("vision_ifm").upload(ifm_tensor.data());
 
+    if (_model_ptrs.size() == 1) {
+        _model_ptrs.front()->run(nullptr, ofm_map_ptr);
+        return;
+    }
+
     // Each layer is a separate dispatcher job so other MLA workloads can run
     // between dependent vision layers.
-    for (size_t i = 0; i + 1 < _model_ptrs.size(); ++i) {
-        _model_ptrs[i]->run();
+    const uint8_t final_ofm_count = _cfg.pipeline_cfg.quantize_embeddings ? 2 : 1;
+    for (size_t layer_idx = 0; layer_idx < _model_ptrs.size(); ++layer_idx) {
+        const bool is_last = layer_idx + 1 == _model_ptrs.size();
+        std::map<uint8_t, MLABufferSlice> layer_ofm_map;
+
+        if (ofm_map_ptr != nullptr) {
+            if (is_last) {
+                for (uint8_t ofm_idx = 0; ofm_idx < final_ofm_count; ++ofm_idx) {
+                    if (const auto it = ofm_map_ptr->find(ofm_idx); it != ofm_map_ptr->end()) {
+                        layer_ofm_map.emplace(ofm_idx, it->second);
+                    }
+                }
+            }
+
+            for (size_t deepstack_idx = 0;
+                 deepstack_idx < _vm_cfg.deepstack_visual_indexes.size();
+                 ++deepstack_idx) {
+                if (_vm_cfg.deepstack_visual_indexes[deepstack_idx] == layer_idx) {
+                    const uint8_t layer_ofm_idx = is_last ? final_ofm_count : 1;
+                    const uint8_t request_ofm_idx = final_ofm_count + deepstack_idx;
+                    if (const auto it = ofm_map_ptr->find(request_ofm_idx);
+                        it != ofm_map_ptr->end()) {
+                        layer_ofm_map.emplace(layer_ofm_idx, it->second);
+                    }
+                    break;
+                }
+            }
+        }
+
+        _model_ptrs[layer_idx]->run(
+            nullptr, layer_ofm_map.empty() ? nullptr : &layer_ofm_map
+        );
     }
-    _model_ptrs.back()->run(nullptr, ofm_map_ptr);
 }
 
 
