@@ -26,24 +26,21 @@ def _normalize_attention_config(text_cfg: dict) -> dict:
     layer_types = text_cfg["layer_types"]
     # Transformers serializes indices with zero padding (e.g. "04").
     overrides = {int(index): values for index, values in text_cfg["per_layer_config"].items()}
-    for index, values in overrides.items():
-        if not 0 <= index < len(layer_types):
-            raise ValueError(f"Invalid Gemma 4 layer override index: {index}")
-        for key, value in values.items():
-            if key != "head_dim" and value != text_cfg.get(key):
-                raise ValueError(f"Unsupported Gemma 4 layer {index} override: {key}={value!r}")
+    if any(not 0 <= index < len(layer_types) for index in overrides):
+        raise ValueError("Gemma 4 layer override index is out of range")
 
     dimensions = {}
     for index, layer_type in enumerate(layer_types):
-        default = text_cfg["head_dim"]
-        if layer_type == "full_attention":
-            default = text_cfg.get("global_head_dim") or default
-        dimension = overrides.get(index, {}).get("head_dim", default)
         if layer_type not in ("full_attention", "sliding_attention"):
             raise ValueError(f"Unsupported Gemma 4 layer type: {layer_type}")
-        if layer_type in dimensions and dimensions[layer_type] != dimension:
+        values = overrides.get(index, {})
+        for key, value in values.items():
+            if key != "head_dim" and value != text_cfg.get(key):
+                raise ValueError(f"Unsupported Gemma 4 layer {index} override: {key}={value!r}")
+        default = text_cfg.get("global_head_dim") if layer_type == "full_attention" else None
+        dimension = values.get("head_dim", default or text_cfg["head_dim"])
+        if dimensions.setdefault(layer_type, dimension) != dimension:
             raise ValueError(f"Inconsistent Gemma 4 head dimensions for {layer_type}")
-        dimensions[layer_type] = dimension
 
     normalized = dict(text_cfg)
     normalized["head_dim"] = dimensions.get("sliding_attention", text_cfg["head_dim"])

@@ -362,7 +362,8 @@ jobs:
               "${candidate_package_root}" \
               "${base_onnx_root}" \
               "${candidate_onnx_root}"
-            rm -f "${base_onnx_manifest}" "${candidate_onnx_manifest}" "${base_resolution}"
+            rm -f "${base_onnx_manifest}" "${candidate_onnx_manifest}" \
+              "${base_resolution}" "${base_resolution}.txt"
           }
           trap cleanup_onnx EXIT
           cleanup_onnx
@@ -437,22 +438,18 @@ jobs:
               --disable-pip-version-check \
               --dry-run --report "${base_resolution}" \
               "${base_wheels[0]}[sdk_ext]"
-            python - "${base_resolution}" "${base_package_root}" <<'PY'
+            python - "${base_resolution}" <<'PY' > "${base_resolution}.txt"
           import json
-          import subprocess
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as report:
-              packages = json.load(report)["install"]
-          if packages:
-              subprocess.run(
-                  [sys.executable, "-m", "pip", "install",
-                   "--disable-pip-version-check", "--no-deps", "--upgrade",
-                   "--target", sys.argv[2],
-                   *[package["download_info"]["url"] for package in packages]],
-                  check=True,
-              )
+              for package in json.load(report)["install"]:
+                  print(package["download_info"]["url"])
           PY
+            python -m pip install \
+              --disable-pip-version-check --no-deps --upgrade \
+              --target "${base_package_root}" \
+              -r "${base_resolution}.txt"
             base_package_version="$(
               PYTHONPATH="${base_package_root}" python -P -c \
                 'import importlib.metadata; print(importlib.metadata.version("sima-lmm"))'
