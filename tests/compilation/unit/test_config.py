@@ -8,10 +8,10 @@ import pytest
 from sima_lmm.config.vlm_config import (
     ModelFormat,
     PipelineConfig,
+    VlmArchType,
     VlmConfig,
     group_cache_model_indices,
     single_cache_model_indices,
-    vision_model_names,
 )
 from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.model import VisionLanguageModel
@@ -124,18 +124,34 @@ def test_default_max_num_tokens():
     assert PipelineConfig().max_num_tokens == 4096
 
 
-def test_vision_model_names_describe_single_and_per_layer_artifacts():
+@pytest.mark.parametrize("image_size", ([224, 224], [960, 672]))
+def test_vision_model_names_are_always_per_layer(image_size: list[int]):
     config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
     model_name = "gemma4_vision"
 
-    config.vm_cfg.image_size = [224, 224]
-    assert vision_model_names(config.vm_cfg, model_name) == [model_name]
-
-    config.vm_cfg.image_size = [960, 672]
-    assert vision_model_names(config.vm_cfg, model_name) == [
+    config.vm_cfg.image_size = image_size
+    config.config_pipeline(None, None, 2048, 128, 128)
+    assert config.get_vision_model_names(model_name) == [
         f"{model_name}_layer{layer_idx}"
         for layer_idx in range(config.vm_cfg.num_hidden_layers)
     ]
+    assert _layer_indices(config, "vision") == list(
+        range(config.vm_cfg.num_hidden_layers)
+    )
+
+
+def test_vision_model_names_omit_unused_llava_layer():
+    config = _load_reference_config("gemma3_siglip448_vlm_config.json")
+    config.model_type = VlmArchType.VLM_LLAVA
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    assert config.get_vision_model_names("llava_vision") == [
+        f"llava_vision_layer{layer_idx}"
+        for layer_idx in range(config.vm_cfg.num_hidden_layers - 1)
+    ]
+    assert _layer_indices(config, "vision") == list(
+        range(config.vm_cfg.num_hidden_layers - 1)
+    )
 
 
 @pytest.mark.parametrize(

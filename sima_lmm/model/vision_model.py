@@ -1,6 +1,6 @@
 import logging
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.ndimage import zoom
@@ -12,7 +12,8 @@ from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import (
-    BaseModel, FileGenMode, TensorTessellateParameters, GenConfiguration, LayerConfiguration
+    BaseModel, EvalMode, FileGenMode, TensorTessellateParameters, GenConfiguration,
+    LayerConfiguration
 )
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
@@ -30,14 +31,27 @@ from sima_lmm.config.vlm_config import VisionArchType, VlmArchType
 class VisionModel(BaseModel):
     """Vision model implementation."""
 
-    is_single_vision_model: bool = field(default=True, kw_only=True)
-    actual_num_hidden_layers: int = field(init=False)
+    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+        layer_ifms = ifms
+        deepstack_outputs: dict[int, np.ndarray] = {}
+        deepstack_indexes = self.cfg.vm_cfg.deepstack_visual_indexes
 
-    def __post_init__(self):
-        num_hidden_layers = self.cfg.vm_cfg.num_hidden_layers
-        if self.cfg.model_type == VlmArchType.VLM_LLAVA:
-            num_hidden_layers -= 1
-        self.actual_num_hidden_layers = num_hidden_layers
+        for layer_idx in range(self.cfg.num_vision_layers):
+            layer_outputs = list(
+                self._get_part_model(layer_idx).run_model(eval_mode, layer_ifms)
+            )
+            if (
+                self.cfg.model_type == VlmArchType.VLM_QWEN3_VL
+                and layer_idx in deepstack_indexes
+            ):
+                deepstack_idx = deepstack_indexes.index(layer_idx)
+                deepstack_outputs[deepstack_idx] = layer_outputs.pop()
+            layer_ifms = [layer_outputs[0]]
+
+        return [
+            *layer_outputs,
+            *(deepstack_outputs[idx] for idx in range(len(deepstack_indexes))),
+        ]
 
     def gen_files(
         self,
@@ -83,16 +97,14 @@ class VisionModel(BaseModel):
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
 
     def _get_part_model(self, layer_idx: int) -> BaseModel:
-        if self.is_single_vision_model:
-            include_embeddings = True
-            include_mm_proj = True
-            num_layers = self.actual_num_hidden_layers
-            model_name = self.model_name
-        else:
-            include_embeddings = layer_idx == 0
-            include_mm_proj = layer_idx == self.actual_num_hidden_layers - 1
-            num_layers = 1
-            model_name = f"{self.model_name}_layer{layer_idx}"
+        if not 0 <= layer_idx < self.cfg.num_vision_layers:
+            raise ValueError(
+                f"Vision layer index {layer_idx} is outside the valid range "
+                f"[0, {self.cfg.num_vision_layers})"
+            )
+        include_embeddings = layer_idx == 0
+        include_mm_proj = layer_idx == self.cfg.num_vision_layers - 1
+        model_name = f"{self.model_name}_layer{layer_idx}"
             
         kwargs = {
             "cfg": self.cfg,
@@ -101,7 +113,6 @@ class VisionModel(BaseModel):
             "sima_path": self.sima_path,
             "hf_model": self.hf_model,
             "layer_idx": layer_idx,
-            "num_layers": num_layers,
             "include_embeddings": include_embeddings,
             "include_mm_proj": include_mm_proj,
         }
@@ -123,7 +134,6 @@ class StandardVisionLayerModel(BaseModel):
     """
 
     layer_idx: int
-    num_layers: int
     include_embeddings: bool
     include_mm_proj: bool
 
@@ -229,16 +239,9 @@ class StandardVisionLayerModel(BaseModel):
         else:
             encoder_input = input_nodes[0]
 
-        if self.num_layers > 1:
-            for layer_idx in range(self.num_layers):
-                encoder_input = self._build_encoder(
-                    f"{base_name}.encoder.layers.{layer_idx}", [encoder_input]
-                )
-            encoder_output = encoder_input
-        else:
-            encoder_output = self._build_encoder(
-                f"{base_name}.encoder.layers.{self.layer_idx}", [encoder_input]
-            )
+        encoder_output = self._build_encoder(
+            f"{base_name}.encoder.layers.{self.layer_idx}", [encoder_input]
+        )
 
         if not self.include_mm_proj:
             return encoder_output
@@ -559,16 +562,12 @@ class StandardVisionLayerModel(BaseModel):
         else:
             encoder_input = input_node
 
-        if self.num_layers > 1:
-            for layer_idx in range(self.num_layers):
-                encoder_input = self._build_sima_encoder(
-                    builder, f"{base_name}.encoder.layers.{layer_idx}", encoder_input, quantizable
-                )
-            encoder_output = encoder_input
-        else:
-            encoder_output = self._build_sima_encoder(
-                builder, f"{base_name}.encoder.layers.{self.layer_idx}", encoder_input, quantizable
-            )
+        encoder_output = self._build_sima_encoder(
+            builder,
+            f"{base_name}.encoder.layers.{self.layer_idx}",
+            encoder_input,
+            quantizable,
+        )
 
         if not self.include_mm_proj:
             return encoder_output

@@ -102,6 +102,26 @@ output_directory/
     └── ...
 ```
 
+### Layered vision encoders
+
+Supported VLMs compile every executed vision-transformer layer as a separate
+compiler unit and ELF artifact. The first artifact includes patch embedding,
+the final artifact includes the multimodal projector, and intermediate
+artifacts consume and produce the vision hidden state. Qwen3-VL deepstack
+features are emitted by the layer that owns each configured deepstack index.
+
+The generated `devkit/vlm_config.json` records the artifacts in execution
+order as `<vision-model-name>_layer0`, `<vision-model-name>_layer1`, and so on.
+Do not remove, rename, or reorder these artifacts: the runtime validates the
+list before allocating MLA buffers. Existing deployed repositories with one
+monolithic vision artifact remain loadable, but newly compiled VLMs always use
+the layered layout.
+
+Layered compilation reduces peak host memory per compiler job and allows
+multiple vision layers to compile in parallel with `--jobs`. At runtime, each
+vision layer is submitted as its own dispatcher job, allowing other MLA work
+to be scheduled between the dependent layers.
+
 ## Command-Line Arguments
 
 The `llima-compile` tool accepts various arguments to customize the compilation process. The following tables describe the available options:

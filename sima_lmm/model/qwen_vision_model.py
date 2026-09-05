@@ -33,7 +33,6 @@ class QwenVisionLayerModel(BaseModel):
     """
 
     layer_idx: int
-    num_layers: int
     include_embeddings: bool
     include_mm_proj: bool
 
@@ -41,20 +40,31 @@ class QwenVisionLayerModel(BaseModel):
         base_name = "vision_model"
         self.create_onnx_builder()
         
-        # Create input nodes
-        # Qwen2/2.5-VL and Qwen3-VL use the same input shape logic
-        patch_feature_size = 3 * self.cfg.vm_cfg.temporal_patch_size * (self.cfg.vm_cfg.patch_size ** 2)
+        patch_feature_size = (
+            3
+            * self.cfg.vm_cfg.temporal_patch_size
+            * (self.cfg.vm_cfg.patch_size ** 2)
+        )
+        input_size = (
+            patch_feature_size if self.include_embeddings else self.cfg.vm_cfg.hidden_size
+        )
         self._onnx_builder.create_input_node(
-            "input", (1, patch_feature_size, 1, self.cfg.vm_cfg.seq_len)
+            "input", (1, input_size, 1, self.cfg.vm_cfg.seq_len)
         )
 
         output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
-        
-        # Create output nodes (handles both single output for Qwen2.5-VL and multiple for Qwen3-VL)
-        for node in output_nodes:
+        primary_shape = (
+            (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image)
+            if self.include_mm_proj
+            else (1, self.cfg.vm_cfg.hidden_size, 1, self.cfg.vm_cfg.seq_len)
+        )
+        deepstack_shape = (
+            1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image
+        )
+        for output_idx, node in enumerate(output_nodes):
             self._onnx_builder.create_output_node(
                 self._onnx_builder.get_node_output_name(node),
-                (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image)
+                primary_shape if output_idx == 0 else deepstack_shape,
             )
 
         self._onnx_builder.create_and_save_model()
@@ -77,47 +87,45 @@ class QwenVisionLayerModel(BaseModel):
     # ------------------------------------------------------------------------
 
     def _build_qwen3_vision_model(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        """
-        Builds the complete, static Qwen3-VL vision model (encoder + merger).
-        Returns a list of output nodes: [final_merger_output, deepstack_output_1, ...]
-        """
+        """Build one Qwen3-VL encoder layer and its boundary operations."""
         cos_table_node, sin_table_node = self._prepare_qwen3_rotary_tables(base_name)
-        pos_embed_node = self._prepare_qwen3_position_embedding(base_name)
-
-        encoder_input = self._onnx_builder.build_conv(
-            f"{base_name}.patch_embed.proj",
-            input_nodes[0],
-            is_fc=False,
-            src_bias_name=f"{base_name}.patch_embed.proj.bias",
-            weight_process_func=self._reshape_qwen_patch_embed_kernel
-        )
-
-        encoder_input = self._onnx_builder.build_op(
-            f"{base_name}.add_position_embedding",
-            [encoder_input, pos_embed_node],
-            "Add"
-        )
-
-        deepstack_outputs: list[OnnxNode] = []
-        hidden_states = encoder_input
-        for layer_idx in range(self.num_layers):
-            layer_base = f"{base_name}.blocks.{layer_idx}"
-            hidden_states = self._build_qwen3_vision_block(
-                layer_base,
+        hidden_states = input_nodes[0]
+        if self.include_embeddings:
+            pos_embed_node = self._prepare_qwen3_position_embedding(base_name)
+            hidden_states = self._onnx_builder.build_conv(
+                f"{base_name}.patch_embed.proj",
                 hidden_states,
-                cos_table_node,
-                sin_table_node
+                is_fc=False,
+                src_bias_name=f"{base_name}.patch_embed.proj.bias",
+                weight_process_func=self._reshape_qwen_patch_embed_kernel
             )
-            if layer_idx in getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", []):
-                ds_index = self.cfg.vm_cfg.deepstack_visual_indexes.index(layer_idx)
-                ds_base = f"{base_name}.deepstack_merger_list.{ds_index}"
-                deepstack_outputs.append(
-                    self._build_qwen3_deepstack_merger(ds_base, hidden_states)
-                )
+            hidden_states = self._onnx_builder.build_op(
+                f"{base_name}.add_position_embedding",
+                [hidden_states, pos_embed_node],
+                "Add"
+            )
 
-        final_output = self._build_qwen3_merger(f"{base_name}.merger", hidden_states)
+        layer_base = f"{base_name}.blocks.{self.layer_idx}"
+        hidden_states = self._build_qwen3_vision_block(
+            layer_base,
+            hidden_states,
+            cos_table_node,
+            sin_table_node
+        )
+        deepstack_outputs: list[OnnxNode] = []
+        if self.layer_idx in self.cfg.vm_cfg.deepstack_visual_indexes:
+            ds_index = self.cfg.vm_cfg.deepstack_visual_indexes.index(self.layer_idx)
+            ds_base = f"{base_name}.deepstack_merger_list.{ds_index}"
+            deepstack_outputs.append(
+                self._build_qwen3_deepstack_merger(ds_base, hidden_states)
+            )
 
-        return [final_output, *deepstack_outputs]
+        primary_output = (
+            self._build_qwen3_merger(f"{base_name}.merger", hidden_states)
+            if self.include_mm_proj
+            else hidden_states
+        )
+        return [primary_output, *deepstack_outputs]
 
     def _build_qwen3_vision_block(
         self,
@@ -459,33 +467,31 @@ class QwenVisionLayerModel(BaseModel):
     # ------------------------------------------------------------------------
 
     def _build_qwen2_vision_model(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
-        """
-        Builds the complete, static Qwen 2.5-VL vision model (encoder + merger).
-        """
-        encoder_input = self._onnx_builder.build_conv(
-            f"{base_name}.patch_embed.proj",
-            input_nodes[0],
-            is_fc=False,
-            weight_process_func=self._reshape_qwen_patch_embed_kernel
-        )
+        """Build one Qwen2.5-VL encoder layer and its boundary operations."""
+        encoder_input = input_nodes[0]
+        if self.include_embeddings:
+            encoder_input = self._onnx_builder.build_conv(
+                f"{base_name}.patch_embed.proj",
+                encoder_input,
+                is_fc=False,
+                weight_process_func=self._reshape_qwen_patch_embed_kernel
+            )
         (cos_table_node, sin_table_node, 
         global_mask_node, windowed_mask_node) = self._prepare_qwen2_static_inputs()
 
-        for layer_idx in range(self.num_layers):
-            layer_base_name = f"{base_name}.blocks.{layer_idx}"
-            
-            mask_to_use = (
-                global_mask_node 
-                if layer_idx in self.cfg.vm_cfg.fullatt_block_indexes 
-                else windowed_mask_node
-            )
-            encoder_input = self._build_qwen2_vision_block(
-                layer_base_name,
-                encoder_input,
-                mask_to_use,
-                cos_table_node,
-                sin_table_node
-            )
+        layer_base_name = f"{base_name}.blocks.{self.layer_idx}"
+        mask_to_use = (
+            global_mask_node
+            if self.layer_idx in self.cfg.vm_cfg.fullatt_block_indexes
+            else windowed_mask_node
+        )
+        encoder_input = self._build_qwen2_vision_block(
+            layer_base_name,
+            encoder_input,
+            mask_to_use,
+            cos_table_node,
+            sin_table_node
+        )
 
         if self.include_mm_proj:
             final_output = self._build_qwen2_merger(base_name, encoder_input)
@@ -721,7 +727,10 @@ class QwenVisionLayerModel(BaseModel):
         patch_feature_size = (
             3 * self.cfg.vm_cfg.temporal_patch_size * (self.cfg.vm_cfg.patch_size ** 2)
         )
-        input_shape = (1, 1, self.cfg.vm_cfg.seq_len, patch_feature_size)
+        input_size = (
+            patch_feature_size if self.include_embeddings else self.cfg.vm_cfg.hidden_size
+        )
+        input_shape = (1, 1, self.cfg.vm_cfg.seq_len, input_size)
 
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
         model_input = builder.create_placeholder_node(
@@ -777,55 +786,66 @@ class QwenVisionLayerModel(BaseModel):
     def _build_sima_qwen3_vision_model(
         self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> list[NodeOrHandle]:
-        cos_table, sin_table = self._prepare_sima_qwen3_rotary_tables(builder, base_name, quantizable)
-        pos_embed = self._prepare_sima_qwen3_position_embedding(builder, base_name, quantizable)
-
-        hidden_states = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.patch_embed.proj", input_node,
-            is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
-            src_bias_name=f"{base_name}.patch_embed.proj.bias",
+        cos_table, sin_table = self._prepare_sima_qwen3_rotary_tables(
+            builder, base_name, quantizable
         )
-        hidden_states = builder.create_add_node(hidden_states, pos_embed)
-
-        deepstack_outputs: list[NodeOrHandle] = []
-        for layer_idx in range(self.num_layers):
-            layer_base = f"{base_name}.blocks.{layer_idx}"
-            hidden_states = self._build_sima_qwen3_vision_block(
-                builder, layer_base, hidden_states, cos_table, sin_table, quantizable
+        hidden_states = input_node
+        if self.include_embeddings:
+            pos_embed = self._prepare_sima_qwen3_position_embedding(
+                builder, base_name, quantizable
             )
-            if layer_idx in getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", []):
-                ds_idx = self.cfg.vm_cfg.deepstack_visual_indexes.index(layer_idx)
-                ds_base = f"{base_name}.deepstack_merger_list.{ds_idx}"
-                deepstack_outputs.append(
-                    self._build_sima_qwen3_deepstack_merger(builder, ds_base, hidden_states, quantizable)
-                )
+            hidden_states = build_conv(
+                builder, self.get_hf_param, self.check_hf_param,
+                f"{base_name}.patch_embed.proj", hidden_states,
+                is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
+                src_bias_name=f"{base_name}.patch_embed.proj.bias",
+            )
+            hidden_states = builder.create_add_node(hidden_states, pos_embed)
 
-        final_output = self._build_sima_qwen3_merger(
-            builder, f"{base_name}.merger", hidden_states, quantizable
+        layer_base = f"{base_name}.blocks.{self.layer_idx}"
+        hidden_states = self._build_sima_qwen3_vision_block(
+            builder, layer_base, hidden_states, cos_table, sin_table, quantizable
         )
-        return [final_output, *deepstack_outputs]
+        deepstack_outputs: list[NodeOrHandle] = []
+        if self.layer_idx in self.cfg.vm_cfg.deepstack_visual_indexes:
+            ds_idx = self.cfg.vm_cfg.deepstack_visual_indexes.index(self.layer_idx)
+            ds_base = f"{base_name}.deepstack_merger_list.{ds_idx}"
+            deepstack_outputs.append(
+                self._build_sima_qwen3_deepstack_merger(
+                    builder, ds_base, hidden_states, quantizable
+                )
+            )
+
+        primary_output = (
+            self._build_sima_qwen3_merger(
+                builder, f"{base_name}.merger", hidden_states, quantizable
+            )
+            if self.include_mm_proj
+            else hidden_states
+        )
+        return [primary_output, *deepstack_outputs]
 
     def _build_sima_qwen2_vision_model(
         self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
-        hidden_states = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.patch_embed.proj", input_node,
-            is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
-        )
+        hidden_states = input_node
+        if self.include_embeddings:
+            hidden_states = build_conv(
+                builder, self.get_hf_param, self.check_hf_param,
+                f"{base_name}.patch_embed.proj", hidden_states,
+                is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
+            )
         cos_table, sin_table, global_mask, windowed_mask = self._prepare_sima_qwen2_static_inputs(builder, quantizable)
 
-        for layer_idx in range(self.num_layers):
-            layer_base = f"{base_name}.blocks.{layer_idx}"
-            mask = (
-                global_mask
-                if layer_idx in self.cfg.vm_cfg.fullatt_block_indexes
-                else windowed_mask
-            )
-            hidden_states = self._build_sima_qwen2_vision_block(
-                builder, layer_base, hidden_states, mask, cos_table, sin_table, quantizable
-            )
+        layer_base = f"{base_name}.blocks.{self.layer_idx}"
+        mask = (
+            global_mask
+            if self.layer_idx in self.cfg.vm_cfg.fullatt_block_indexes
+            else windowed_mask
+        )
+        hidden_states = self._build_sima_qwen2_vision_block(
+            builder, layer_base, hidden_states, mask, cos_table, sin_table, quantizable
+        )
 
         if self.include_mm_proj:
             return self._build_sima_qwen2_merger(builder, base_name, hidden_states, quantizable)
