@@ -15,6 +15,7 @@ LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE = 1024
 _VISION_MODEL_TYPE_ALIASES = {
     "qwen2_5_vl_vision": "qwen2_5_vl",
     "qwen3_vl_vision": "qwen3_vl",
+    "qwen3_5_vision": "qwen3_5",
 }
 
 

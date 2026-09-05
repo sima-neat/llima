@@ -23,6 +23,7 @@ from sima_lmm.model.sima_builder import (
     build_activation,
     build_conv,
     build_conv_from_dense_with_lora,
+    create_channel_slice,
 )
 
 
@@ -156,6 +157,96 @@ class LanguageLinearModel(LanguagePartBaseModel):
     ) -> NodeOrHandle:
         dtype = activation_dtype(quantizable)
         return builder.create_constant_node(np.asarray(value, dtype=dtype))
+
+    def _get_ab_projection_params(
+        self, linear_base: str
+    ) -> dict[str, np.ndarray | tuple[np.ndarray, np.ndarray]] | None:
+        """Join output channels without changing weight precision or scale groups.
+
+        Mixed weight formats retain separate projections because one convolution
+        cannot represent both formats without requantizing one of them.
+        """
+        params = [self.get_hf_param(f"{linear_base}.in_proj_{key}.weight") for key in ("a", "b")]
+        quantized = [isinstance(param, tuple) for param in params]
+        if quantized[0] != quantized[1]:
+            return None
+        weights = [param[1] if isinstance(param, tuple) else param for param in params]
+        expected = (self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, self.cfg.lm_cfg.hidden_size)
+        if any(weight.shape != expected for weight in weights):
+            raise ValueError(f"{linear_base}: A/B projection weights must have shape {expected}")
+        if weights[0].dtype != weights[1].dtype:
+            return None
+        joined_weights = np.concatenate(weights, axis=0)
+        if quantized[0]:
+            # HF/GGUF scales are output-channel first, including grouped INT4.
+            scales = [param[0].reshape(expected[0], -1) for param in params]
+            if scales[0].shape != scales[1].shape or scales[0].dtype != scales[1].dtype:
+                return None
+            joined_weights = (np.concatenate(scales, axis=0), joined_weights)
+        fused_base = f"{linear_base}.in_proj_ab"
+        result = {f"{fused_base}.weight": joined_weights}
+        bias_names = [f"{linear_base}.in_proj_{key}.bias" for key in ("a", "b")]
+        if any(self.check_hf_param(name) for name in bias_names):
+            biases = [
+                self.get_hf_param(name) if self.check_hf_param(name)
+                else np.zeros(expected[0], dtype=np.float32)
+                for name in bias_names
+            ]
+            result[f"{fused_base}.bias"] = np.concatenate(biases)
+        return result
+
+    def _build_sima_ab_projections(
+        self, builder: SimaBuilder, linear_base: str, norm_input: NodeOrHandle
+    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+        params = self._get_ab_projection_params(linear_base)
+        if params is None:
+            return tuple(
+                build_conv_from_dense_with_lora(
+                    builder, self.get_hf_param, self.check_hf_param,
+                    f"{linear_base}.in_proj_{key}", norm_input,
+                )
+                for key in ("a", "b")
+            )
+        ab = build_conv(
+            builder, params.__getitem__, params.__contains__,
+            f"{linear_base}.in_proj_ab", norm_input,
+        )
+        heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
+        return (
+            create_channel_slice(builder, ab, 0, heads),
+            create_channel_slice(builder, ab, heads, 2 * heads),
+        )
+
+    def _build_onnx_ab_projections(
+        self, linear_base: str, norm_input: OnnxNode
+    ) -> tuple[OnnxNode, OnnxNode]:
+        params = self._get_ab_projection_params(linear_base)
+        builder = self._onnx_builder
+        if params is None:
+            return tuple(
+                builder.build_conv_from_dense_with_lora(f"{linear_base}.in_proj_{key}", norm_input)
+                for key in ("a", "b")
+            )
+        fused_base = f"{linear_base}.in_proj_ab"
+        weights = params[f"{fused_base}.weight"]
+        if isinstance(weights, tuple):
+            raise ValueError("ONNX A/B projection generation requires unquantized weights")
+        inputs = [norm_input, builder.create_initializer(
+            f"{fused_base}.weight", weights, reshape_str="nc->nchw"
+        )]
+        if f"{fused_base}.bias" in params:
+            inputs.append(builder.create_initializer(f"{fused_base}.bias", params[f"{fused_base}.bias"]))
+        ab = builder.build_op(fused_base, inputs, "Conv")
+        heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
+        return tuple(
+            builder.build_op(
+                f"{linear_base}.in_proj_{key}",
+                [ab, np.array([start], dtype=np.int64),
+                 np.array([start + heads], dtype=np.int64), np.array([1], dtype=np.int64)],
+                "Slice",
+            )
+            for key, start in (("a", 0), ("b", heads))
+        )
 
     def _build_sima_static_triangular_sums(
         self, builder: SimaBuilder, g: NodeOrHandle, upper: bool, quantizable: bool
@@ -684,12 +775,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         z = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{linear_base}.in_proj_z", norm_input
         )
-        b = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{linear_base}.in_proj_b", norm_input
-        )
-        a = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{linear_base}.in_proj_a", norm_input
-        )
+        a, b = self._build_sima_ab_projections(builder, linear_base, norm_input)
 
         conv_tail = builder.create_concat_node([mla_conv_state, mixed_qkv], 2)
         linear_conv_state_out = builder.create_slice_node(
@@ -1511,12 +1597,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         z = self._onnx_builder.build_conv_from_dense_with_lora(
             f"{linear_base}.in_proj_z", norm_input
         )
-        b = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{linear_base}.in_proj_b", norm_input
-        )
-        a = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{linear_base}.in_proj_a", norm_input
-        )
+        a, b = self._build_onnx_ab_projections(linear_base, norm_input)
 
         conv_tail = self._onnx_builder.build_op(
             f"{linear_base}.conv_tail.concat", [input_nodes[1], mixed_qkv], "Concat", axis=3
