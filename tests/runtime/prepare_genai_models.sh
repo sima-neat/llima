@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep the shared text/VLM/ASR defaults aligned with Core's GenAI runtime tests.
-# The Qwen3 and Gemma4 fixtures provide LLiMa-specific reasoning coverage.
+# Keep the shared text/VLM defaults aligned with Core's GenAI runtime tests.
+# The layered Whisper encoder and reasoning fixtures provide LLiMa-specific coverage.
 DEFAULT_LLIMA_MODELS_PATH="/media/nvme/llima/models"
 DEFAULT_TEXT_MODEL="Qwen2.5-0.5B-Instruct-Autoround-a16w4"
 DEFAULT_TEXT_REVISION="0b47c65d41d5f457458746796966ca031fd7d608"
 DEFAULT_VLM_MODEL="LFM2.5-VL-450M-Autoround-a16w4"
 DEFAULT_VLM_REVISION="228bfc6d0a4b3f354367a012f6fe7bec00c4625e"
-DEFAULT_ASR_MODEL="whisper-small-a16w8"
-DEFAULT_ASR_REPO="simaai/whisper-small-a16w8"
-DEFAULT_ASR_REVISION="9957d9d561023f0ad7c466ac57dd1b40fe76e6fd"
+DEFAULT_ASR_MODEL="whisper-small-a16w8-layered-encoder"
+DEFAULT_ASR_REPO="florianvoss/whisper-small-a16w8-layered-encoder"
+DEFAULT_ASR_REVISION="c0a34f15eaeee13fc7d80cd545c3fb828dc5010f"
 DEFAULT_REASONING_QWEN_MODEL="Qwen3-0.6B-Autoround-a16w4"
 DEFAULT_REASONING_QWEN_REPO="simaai/Qwen3-0.6B-Autoround-a16w4"
 DEFAULT_REASONING_QWEN_REVISION="bfe4a547a56d94fb4474cbc7e8fcbc1e4ee276ac"
