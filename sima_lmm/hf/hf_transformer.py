@@ -14,7 +14,7 @@ from PIL import Image
 from ml_dtypes import bfloat16, int4
 from transformers import AutoConfig, MistralConfig
 from transformers.image_utils import load_images
-from sima_utils.logging.sima_logger import sima_log_info
+from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
 
 
 HF_SINGLE_MODEL_FILENAME = 'model.safetensors'
@@ -271,12 +271,26 @@ class LocalHuggingFaceModel:
         # Load model config
         config_file = find_file(directory=directory, filename="config.json", resolve=False)
         assert config_file
-        hf_config = AutoConfig.from_pretrained(config_file.parent)
-        config = hf_config.to_dict()
+        try:
+            hf_config = AutoConfig.from_pretrained(config_file.parent)
+            config = hf_config.to_dict()
+        except Exception as exc:
+            with config_file.open("r") as fp:
+                config = json.load(fp=fp)
+            hf_config = None
+            sima_log_warning(
+                "Falling back to raw config.json parsing because Transformers "
+                "could not load %s: %s",
+                config_file.parent, exc
+            )
 
         # HF has head_dim to be None for Mistral model
-        if isinstance(hf_config, MistralConfig) and config["head_dim"] is None:
-            config["head_dim"] =  config["hidden_size"] // config["num_attention_heads"]
+        if (
+            hf_config is not None
+            and isinstance(hf_config, MistralConfig)
+            and config["head_dim"] is None
+        ):
+            config["head_dim"] = config["hidden_size"] // config["num_attention_heads"]
 
         # Load and verify HF Index File
         # Some small models do not have an index file, so we need to build one here.

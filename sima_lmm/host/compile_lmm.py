@@ -8,13 +8,15 @@ except ImportError:
     )
     sys.exit(-1)
 import argparse
+import json
 import logging
 from pathlib import Path
 import psutil
 
 from sima_lmm.config.layer_id import LayerID
+from sima_lmm.config.vlm_config import SpeculativeDecodingMethod
 from sima_lmm.gguf.gguf_conversion import GgufModel
-from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
+from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel, find_file
 from sima_lmm.host.configuration_helper import (
     _abort, default_configuration, read_configuration_file
 )
@@ -45,6 +47,19 @@ def _print_precisions(precision: dict[LayerID, FileGenPrecision], for_quantize: 
     print(message, flush=True)
 
 
+def _detect_speculative_method(draft_model_path: Path) -> str:
+    """Detect the speculative decoding implementation for a draft model."""
+    config_file = find_file(draft_model_path, "config.json", resolve=False)
+    if config_file is None:
+        return SpeculativeDecodingMethod.EAGLE3
+
+    with config_file.open("r") as fp:
+        draft_cfg = json.load(fp)
+    if draft_cfg.get("model_type") == "gemma4_assistant":
+        return SpeculativeDecodingMethod.GEMMA4_MTP
+    return SpeculativeDecodingMethod.EAGLE3
+
+
 def gen_files(
     num_processes: int, resume: bool, model_path: Path, lora_path: Path | None,
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
@@ -52,7 +67,7 @@ def gen_files(
     language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None
+    draft_output_path: Path | None, speculative_method: str
 ):
     enable_verbose_error_messages()
     models = list()
@@ -81,7 +96,11 @@ def gen_files(
 
     # Check if draft model is provided
     if draft_model_path is not None:
-        base_model.configure_speculative_decoding(is_draft=False)
+        if speculative_method == "auto":
+            speculative_method = _detect_speculative_method(draft_model_path)
+        base_model.configure_speculative_decoding(
+            is_draft=False, method=speculative_method
+        )
         draft_model = VisionLanguageModel.from_hf_cache(
             hf_cache_path=draft_model_path,
             model_name=draft_model_path.name,
@@ -97,7 +116,8 @@ def gen_files(
             quantize_embeddings=quantize_embeddings,
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
-            target_model=base_model
+            target_model=base_model,
+            speculative_method=speculative_method
         )
         models.append(draft_model)
 
@@ -309,7 +329,16 @@ def main():
     )
     group.add_argument(
         "--draft_model_path", type=Path,
-        help="Path of the EAGLE3 draft model for the base (target) model."
+        help="Path of the speculative draft/assistant model for the base (target) model."
+    )
+    group.add_argument(
+        "--speculative_method",
+        choices=[
+            "auto", SpeculativeDecodingMethod.EAGLE3,
+            SpeculativeDecodingMethod.GEMMA4_MTP
+        ],
+        default="auto",
+        help="Speculative decoding implementation to use with --draft_model_path."
     )
 
     group = parser.add_argument_group("Options to compile LoRA")
@@ -422,7 +451,7 @@ def main():
         args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
         args.quantize_kv_cache, return_logits, log_level, image_resolution,
-        args.draft_model_path, draft_output_path
+        args.draft_model_path, draft_output_path, args.speculative_method
     )
 
     # Compile LoRA weights if requested.

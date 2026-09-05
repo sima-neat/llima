@@ -13,8 +13,8 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype,
-    create_channel_slice
+    SimaBuilder, build_conv, build_conv_from_dense_with_lora, activation_type,
+    activation_dtype, create_channel_slice
 )
 from sima_lmm.config.vlm_config import VlmArchType
 
@@ -44,7 +44,34 @@ class LanguagePreModel(LanguagePartBaseModel):
     @property
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
-        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+        return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
+
+    @property
+    def uses_quantized_input_embeddings(self) -> bool:
+        return super().uses_quantized_input_embeddings and not self.is_gemma4_mtp_draft
+
+    @property
+    def _input_hidden_size(self) -> int:
+        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
+            return 2 * self.cfg.lm_cfg.assistant_backbone_hidden_size
+        return self.cfg.lm_cfg.hidden_size
+
+    def _build_onnx_pre_projection_if_needed(self, input_node: OnnxNode) -> OnnxNode:
+        if not (self.is_gemma4_mtp_draft and self.layer_idx == 0):
+            return input_node
+        return self._onnx_builder.build_conv(
+            "pre_projection", input_node, src_weight_name="pre_projection.weight"
+        )
+
+    def _build_sima_pre_projection_if_needed(
+        self, builder: SimaBuilder, input_node: NodeOrHandle
+    ) -> NodeOrHandle:
+        if not (self.is_gemma4_mtp_draft and self.layer_idx == 0):
+            return input_node
+        return build_conv(
+            builder, self.get_hf_param, self.check_hf_param, "pre_projection", input_node,
+            src_weight_name="pre_projection.weight"
+        )
 
     @property
     def layer_type(self) -> str:
@@ -73,9 +100,9 @@ class LanguagePreModel(LanguagePartBaseModel):
         base_name = self._layer_base_name
         self.create_onnx_builder()
         self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+            "input", (1, self._input_hidden_size, 1, self.num_tokens)
         )
-        if self.is_draft:
+        if self.is_eagle3_draft:
             self._onnx_builder.create_input_node(
                 "hidden_states", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
             )
@@ -125,8 +152,9 @@ class LanguagePreModel(LanguagePartBaseModel):
             if self.check_hf_param(f"{base_name}.operator_norm.weight")
             else f"{base_name}.input_layernorm"
         )
-        rms_norm = self._build_rms_norm(norm_name, input_nodes[0])
-        if self.is_draft:
+        rms_norm_input = self._build_onnx_pre_projection_if_needed(input_nodes[0])
+        rms_norm = self._build_rms_norm(norm_name, rms_norm_input)
+        if self.is_eagle3_draft:
             # EAGLE3 draft model also normalizes the target hidden_states.
             hidden_states_norm = self._build_rms_norm(
                 f"{base_name}.hidden_norm", input_nodes[1]
@@ -344,7 +372,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
-        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
         freq_shape = (
             1,
@@ -365,10 +393,11 @@ class LanguagePreModel(LanguagePartBaseModel):
             model_input_scale = builder.create_placeholder_node(
                 "input_scale", TensorType(activation_type(quantizable), scale_shape)
             )
-        # EAGLE3 draft model has an extra hidden_states input
-        if self.is_draft:
+        hidden_states_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        # EAGLE3 draft model has an extra hidden_states input.
+        if self.is_eagle3_draft:
             model_input_hidden_states = builder.create_placeholder_node(
-                "hidden_states", TensorType(activation_type(quantizable), input_shape)
+                "hidden_states", TensorType(activation_type(quantizable), hidden_states_shape)
             )
         model_input_freq_real = builder.create_placeholder_node(
             "freq_real", TensorType(activation_type(quantizable), freq_shape)
@@ -381,7 +410,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         subnet_inputs = [model_input_input]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             subnet_inputs.append(model_input_scale)
-        if self.is_draft:
+        if self.is_eagle3_draft:
             subnet_inputs.append(model_input_hidden_states)
         subnet_inputs.extend([model_input_freq_real, model_input_freq_imag])
         builder.begin_subnet(subnet_inputs)
@@ -392,10 +421,10 @@ class LanguagePreModel(LanguagePartBaseModel):
             mla_input_scale = builder.create_placeholder_node(
                 "MLA_0/input_scale", TensorType(activation_type(quantizable), scale_shape)
             )
-        # EAGLE3 draft model has an extra hidden_states input
-        if self.is_draft:
+        # EAGLE3 draft model has an extra hidden_states input.
+        if self.is_eagle3_draft:
             mla_input_hidden_states = builder.create_placeholder_node(
-                "MLA_0/hidden_states", TensorType(activation_type(quantizable), input_shape)
+                "MLA_0/hidden_states", TensorType(activation_type(quantizable), hidden_states_shape)
             )
         mla_input_freq_real = builder.create_placeholder_node(
             "MLA_0/freq_real", TensorType(activation_type(quantizable), freq_shape)
@@ -412,6 +441,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         else:
             rms_norm_in = mla_input_input
 
+        rms_norm_in = self._build_sima_pre_projection_if_needed(builder, rms_norm_in)
+
         norm_name = (
             f"{base_name}.operator_norm"
             if self.check_hf_param(f"{base_name}.operator_norm.weight")
@@ -421,7 +452,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder, norm_name, rms_norm_in
         )
         # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
-        if self.is_draft:
+        if self.is_eagle3_draft:
             hidden_states_norm = self._build_sima_rms_norm(
                 builder, f"{base_name}.hidden_norm", mla_input_hidden_states
             )

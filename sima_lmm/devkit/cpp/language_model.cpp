@@ -109,7 +109,11 @@ LanguageModel::LanguageModel(
             "max_num_tokens must be a positive multiple of 1024"
         );
     }
-    if (_cfg.lm_cfg.is_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+    if (
+        _cfg.lm_cfg.is_spec_decode()
+        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_eagle3()
+        && _cfg.lm_cfg.attn_cfg.swa_enable
+    ) {
         throw std::runtime_error(
             "EAGLE3 speculative decoding does not support sliding-window attention"
         );
@@ -188,8 +192,7 @@ LanguageModel::LanguageModel(
 
     // EAGLE3: build the constant tree_mask_init (eye(topk)) once. Only the
     // draft uses it (consumed in topk_generate's depth loop seed and concat).
-    if (_cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft) {
+    if (_cfg.lm_cfg.is_eagle3_draft()) {
         const int topk = _cfg.lm_cfg.speculative_decoding_cfg.value().speculative_budget;
         _eagle3_tree_mask_init.data = std::vector<std::vector<std::vector<std::vector<float>>>>(
             1, std::vector<std::vector<std::vector<float>>>(
@@ -1521,7 +1524,7 @@ uint32_t LanguageModel::run_model_once(
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
             // into FC fusion.
             if (
-                _cfg.lm_cfg.is_spec_decode()
+                _cfg.lm_cfg.is_eagle3_spec_decode()
                 && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
             ) {
                 const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
@@ -1728,8 +1731,8 @@ void LanguageModel::_initialize() {
     MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
     if (!is_draft) {
         auto embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
         if (std::filesystem::exists(embeddings_file_name)) {
@@ -1746,8 +1749,8 @@ void LanguageModel::_initialize() {
             );
             get_buffer("embedding_scales").load_file(scale_file_name);
         }
-    } else {
-        // Load d2t mapping (int64 in npy, narrows to int32 — values fit easily).
+    } else if (is_eagle3_draft) {
+        // Load d2t mapping (int64 in npy, narrows to int32; values fit easily).
         auto d2t_file_name = _devkit_dir / "d2t.npy";
         auto d2t_tensor = cnpy::npy_load(d2t_file_name);
         const int64_t* src = d2t_tensor.data<int64_t>();
@@ -1960,8 +1963,9 @@ void LanguageModel::_define_buffer_freq_table(const std::string& name, uint32_t 
 
 void LanguageModel::_define_buffers() {
     // Embedding table. Drafts use the target's embeddings, so skip.
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
     if (!is_draft) {
         define_buffer(
             "embeddings",
@@ -2138,8 +2142,15 @@ void LanguageModel::_define_buffers() {
             );
         }
 
-        // Draft-only buffers: second pre input, draft hidden states output, FC fusion buffers.
-        if (is_draft) {
+        if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+            define_buffer(
+                fmt::format("n{}_target_hidden_states", num_tokens),
+                {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+        }
+
+        // EAGLE3 draft-only buffers: second pre input, hidden-state output, FC fusion.
+        if (is_eagle3_draft) {
             define_buffer(
                 fmt::format("n{}_buffer1a", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
@@ -2155,6 +2166,15 @@ void LanguageModel::_define_buffers() {
             define_buffer(
                 fmt::format("fc_n{}_output", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+        } else if (is_gemma4_mtp_draft) {
+            define_buffer(
+                fmt::format("gemma4_mtp_input_n{}", num_tokens),
+                {num_tokens, 2 * _cfg.lm_cfg.assistant_backbone_hidden_size}
+            );
+            define_buffer(
+                fmt::format("n{}_buffer5", num_tokens),
+                {num_tokens, _cfg.lm_cfg.assistant_backbone_hidden_size}
             );
         }
     }
@@ -2357,10 +2377,11 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         );
     }
 
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
     const bool pre_uses_embedding_scale = (
-        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
+        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 && !is_gemma4_mtp_draft
     );
     const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_draft;
     if (pre_uses_embedding_scale) {
@@ -2370,12 +2391,19 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         pre_model._bind_ifm(1, embedding_scale_buf, {embedding_scale_row, 0});
     }
     const uint8_t freq_ifm_idx = (
-        1 + static_cast<uint8_t>(pre_uses_embedding_scale) + static_cast<uint8_t>(is_draft)
+        1 + static_cast<uint8_t>(pre_uses_embedding_scale)
+        + static_cast<uint8_t>(is_eagle3_draft)
     );
     auto& freq_real = get_buffer(fmt::format("{}_freq_real", freq_prefix));
     auto& freq_imag = get_buffer(fmt::format("{}_freq_imag", freq_prefix));
     pre_model._bind_ifm(freq_ifm_idx, &freq_real, {token_idx, 0});
     pre_model._bind_ifm(freq_ifm_idx + 1, &freq_imag, {token_idx, 0});
+
+    if (is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
+        throw std::runtime_error(
+            "Gemma4 MTP shared-KV binding must use run_model_gemma4_mtp"
+        );
+    }
 
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         uint8_t ofm_idx = 1;

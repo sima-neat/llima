@@ -130,7 +130,8 @@ class LanguageModel(BaseModel):
                     )
                 case "single_sliding_cache":
                     part_model = self._get_part_model(
-                        "sliding_cache", 1, token_idx=layer_id.part_idx
+                        "sliding_cache", single_model_num_tokens,
+                        token_idx=layer_id.part_idx
                     )
                 case "group_conv":
                     part_model = self._get_part_model(

@@ -483,10 +483,9 @@ class BaseModel(ABC):
             not (resume and embeddings_file_name.is_file())
             or write_embedding_scales
         )
-        write_cfg = (
-            not (resume and cfg_json_file_name.is_file())
-            or (write_embeddings and self.cfg.pipeline_cfg.quantize_embeddings)
-        )
+        # Keep runtime metadata in sync with the current compile flags even when
+        # large binary artifacts are reused by --resume.
+        write_cfg = True
         if write_embeddings or write_embedding_scales:
             embeddings, embeddings_scale = self.get_language_embeddings_tensor()
 
@@ -531,13 +530,17 @@ class BaseModel(ABC):
             self.sima_devkit_path
             / f"{self.language_model_name}_per_layer_embedding_scales.bin"
         )
-        write_per_layer_embedding_scales = (
+        uses_per_layer_inputs = (
             self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.cfg.lm_cfg.hidden_size_per_layer_input > 0
+        )
+        write_per_layer_embedding_scales = (
+            uses_per_layer_inputs
             and self.cfg.pipeline_cfg.quantize_embeddings
             and not (resume and per_layer_embeddings_scale_file_name.is_file())
         )
         write_per_layer_embeddings = (
-            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            uses_per_layer_inputs
             and (
                 not (resume and per_layer_embeddings_file_name.is_file())
                 or write_per_layer_embedding_scales

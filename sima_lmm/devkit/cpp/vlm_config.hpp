@@ -161,11 +161,15 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 struct SpeculativeDecodingConfig {
+    std::string method = "eagle3";
     bool is_draft = false;
     uint16_t speculative_budget = 16;
+
+    bool is_eagle3() const { return method == "eagle3"; }
+    bool is_gemma4_mtp() const { return method == "gemma4_mtp"; }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    SpeculativeDecodingConfig, is_draft, speculative_budget
+    SpeculativeDecodingConfig, method, is_draft, speculative_budget
 )
 
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
@@ -185,6 +189,11 @@ struct LanguageModelConfig {
     double rms_norm_eps = 1e-05;
     bool rms_norm_unit_offset = false;
     uint32_t draft_vocab_size = 0;
+    std::string assistant_model_type = "";
+    uint32_t assistant_backbone_hidden_size = 0;
+    bool assistant_use_ordered_embeddings = false;
+    uint32_t assistant_num_centroids = 0;
+    uint32_t assistant_centroid_intermediate_top_k = 0;
     std::optional<SpeculativeDecodingConfig> speculative_decoding_cfg = std::nullopt;
     bool is_kv_shared_layer(uint8_t layer_idx) const {
         uint8_t first_shared_layer = num_hidden_layers - num_kv_shared_layers;
@@ -214,9 +223,36 @@ struct LanguageModelConfig {
         return speculative_decoding_cfg.has_value();
     }
 
+    bool is_speculative_draft() const {
+        return is_spec_decode() && speculative_decoding_cfg.value().is_draft;
+    }
+
+    bool is_eagle3_spec_decode() const {
+        return is_spec_decode() && speculative_decoding_cfg.value().is_eagle3();
+    }
+
+    bool is_gemma4_mtp_spec_decode() const {
+        return is_spec_decode() && speculative_decoding_cfg.value().is_gemma4_mtp();
+    }
+
+    bool is_eagle3_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_eagle3();
+    }
+
+    bool is_gemma4_mtp_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_gemma4_mtp();
+    }
+
+    bool is_gemma4_mtp_target() const {
+        return is_gemma4_mtp_spec_decode() && !speculative_decoding_cfg.value().is_draft;
+    }
+
+    bool is_gemma4_assistant() const {
+        return assistant_model_type == "gemma4_assistant";
+    }
+
     uint32_t get_lm_head_output_size() const {
-        if (speculative_decoding_cfg.has_value()
-            && speculative_decoding_cfg.value().is_draft){
+        if (is_speculative_draft() && draft_vocab_size > 0) {
             return draft_vocab_size;
         }
         return token_cfg.vocab_size;
@@ -227,7 +263,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache,
     hidden_size_per_layer_input, num_kv_shared_layers,
     rms_norm_eps, rms_norm_unit_offset,
-    draft_vocab_size, speculative_decoding_cfg
+    draft_vocab_size, assistant_model_type, assistant_backbone_hidden_size,
+    assistant_use_ordered_embeddings, assistant_num_centroids,
+    assistant_centroid_intermediate_top_k, speculative_decoding_cfg
 )
 
 
