@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 63
+- Expected cases: 74
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -291,12 +291,13 @@ the installed runtime and use the image and audio assets installed by
 
 ### GenAI model preparation
 
-The dedicated `Prepare GenAI models` step keeps the shared runtime fixtures
-aligned with Core and adds two LLiMa-specific reasoning fixtures:
+The dedicated `Prepare GenAI models` step keeps the shared text and VLM runtime
+fixtures aligned with Core. It adds a layered-encoder Whisper fixture and two
+LLiMa-specific reasoning fixtures:
 
 - `Qwen2.5-0.5B-Instruct-Autoround-a16w4`
 - `LFM2.5-VL-450M-Autoround-a16w4`
-- `whisper-small-a16w8`
+- `florianvoss/whisper-small-a16w8-layered-encoder`
 - `Qwen3-0.6B-Autoround-a16w4`
 - `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`
 
@@ -306,6 +307,7 @@ The shared environment contract is:
 - `SIMA_TEST_LLIMA_TEXT_MODEL`
 - `SIMA_TEST_LLIMA_VLM_MODEL`
 - `SIMA_TEST_LLIMA_ASR_MODEL`
+- `SIMA_TEST_LLIMA_ASR_REPO`
 - `SIMA_TEST_LLIMA_REASONING_QWEN_MODEL`
 - `SIMA_TEST_LLIMA_REASONING_GEMMA_MODEL`
 
