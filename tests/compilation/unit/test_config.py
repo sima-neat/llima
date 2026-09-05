@@ -54,6 +54,37 @@ def test_whisper_finds_generation_config_in_cache_root(tmp_path):
     assert config.num_languages == 2
 
 
+@pytest.mark.parametrize(
+    ("model_suppress_tokens", "generation_config", "expected_suppress_tokens"),
+    [
+        ([1], {"suppress_tokens": [2, 3]}, [2, 3]),
+        ([1], {}, [1]),
+        (None, {"suppress_tokens": [2, 3]}, [2, 3]),
+        (None, {}, []),
+        ([1], {"suppress_tokens": None}, []),
+    ],
+)
+def test_whisper_resolves_suppress_tokens_from_generation_config(
+    tmp_path,
+    model_suppress_tokens,
+    generation_config,
+    expected_suppress_tokens,
+):
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps(generation_config), encoding="utf-8"
+    )
+
+    config = WhisperConfig.from_hf_config(
+        tmp_path,
+        {
+            "architectures": ["WhisperForConditionalGeneration"],
+            "suppress_tokens": model_suppress_tokens,
+        },
+    )
+
+    assert config.suppress_tokens == expected_suppress_tokens
+
+
 def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp_path):
     config = _load_reference_config("qwen3_vl_vlm_config.json")
     hf_model = SimpleNamespace(config={})
