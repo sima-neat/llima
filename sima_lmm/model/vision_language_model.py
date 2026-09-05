@@ -71,7 +71,6 @@ class VisionLanguageModel(BaseModel):
         enable_filter_sharing: bool = False,
         quantize_embeddings: bool = False,
         quantize_kv_cache: bool = False,
-        split_mlp: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
     ) -> "VisionLanguageModel":
@@ -90,7 +89,6 @@ class VisionLanguageModel(BaseModel):
                 enabled.
             quantize_embeddings: True if embedding table is quantized.
             quantize_kv_cache: True if KV cache is quantized.
-            split_mlp: True if mlp is being split into multiple parts.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
         Returns:
@@ -115,11 +113,18 @@ class VisionLanguageModel(BaseModel):
         )
 
         vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)
-        vlm_cfg.pipeline_cfg.set_split_mlp(split_mlp)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)
 
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
+
+        # Mixture-of-Experts models are recognized and their configuration is
+        # parsed, but file generation and devkit execution are not yet ported.
+        if vlm_cfg.lm_cfg.moe_cfg is not None:
+            raise NotImplementedError(
+                "Mixture-of-Experts models are not yet supported: only "
+                "configuration parsing is implemented."
+            )
 
         if target_model is not None:
             # Some draft models use target model's tokenization scheme.

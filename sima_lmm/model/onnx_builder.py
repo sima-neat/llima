@@ -245,8 +245,7 @@ class OnnxBuilder:
         return op
 
     def build_conv(
-        self, base_name: str, input_node: OnnxNode, is_fc: bool = True,
-        weight_slice: tuple[int, int, int, int] | None = None, **kwargs
+        self, base_name: str, input_node: OnnxNode, is_fc: bool = True, **kwargs
     ) -> OnnxNode:
         """Builds a convolution node.
 
@@ -257,8 +256,6 @@ class OnnxBuilder:
             is_fc: Set True to indicate that the original operator is a fully-connected layer or a
                 matrix multiplication where the weight needs to be reshaped to build the
                 convolution.
-            weight_slice: Optional specification of a sub-region of the weight tensor. Includes
-                size, offset, axis and index of weight slice. If None, use the entire weight.
             **kwargs: Convolution attributes.
         Returns:
             Created convolution node.
@@ -284,17 +281,8 @@ class OnnxBuilder:
         weight_tensor = self.reshape_data(self.get_param_func(src_weight_name), reshape_str)
         weight_tensor = weight_process_func(weight_tensor)
 
-        # Take part of weight tensor if slice is defined.
-        slice_idx = ""
-        if weight_slice is not None:
-            start, size, axis, idx = weight_slice
-            slice_idx = f".{idx}"
-            # Normalize axis (e.g., -1 means last axis)
-            axis = np.core.numeric.normalize_axis_index(axis, weight_tensor.ndim)
-            weight_tensor = np.take(weight_tensor, np.arange(start, start + size), axis=axis)
-
         assert isinstance(weight_tensor, np.ndarray)  # Only unquantized weights are handled here
-        weight = self.create_initializer(f"{base_name}.weight{slice_idx}", weight_tensor)
+        weight = self.create_initializer(f"{base_name}.weight", weight_tensor)
         conv_inputs = [self.get_node_output_name(input_node), self.get_node_output_name(weight)]
 
         if self.check_param_func(src_bias_name):
@@ -304,10 +292,10 @@ class OnnxBuilder:
             conv_inputs.append(self.get_node_output_name(bias))
 
         conv = self._create_node(
-            name=f"{base_name}{slice_idx}",
+            name=base_name,
             op_type="Conv",
             inputs=conv_inputs,
-            outputs=[f"{base_name}{slice_idx}_output"],
+            outputs=[f"{base_name}_output"],
             **kwargs
         )
         return conv
@@ -349,8 +337,7 @@ class OnnxBuilder:
         return conv
 
     def build_conv_from_dense_with_lora(
-        self, base_name: str, input_node: OnnxNode, lora_rank: int | None = None,
-        weight_slice: tuple[int, int, int, int] | None = None, **kwargs
+        self, base_name: str, input_node: OnnxNode, lora_rank: int | None = None, **kwargs
     ) -> OnnxNode:
         """Builds a conv from dense op with LoRA branch.
 
@@ -358,16 +345,11 @@ class OnnxBuilder:
             base_name: The name of the layer in the base model.
             input_node: The input node.
             lora_rank: The rank of LoRA adapter.
-            weight_slice: Optional specification of a sub-region of the weight tensor. Includes
-                size, offset, axis and index of weight slice. If None, use the entire weight.
         Returns:
             Created conv node or merged node of a conv and LoRA branch.
         """
-        if weight_slice is not None and lora_rank is not None:
-            raise NotImplementedError("Conv slicing is not supported for LoRA.")
-
         # The dense node in the base model.
-        proj = self.build_conv(base_name, input_node, weight_slice=weight_slice, **kwargs)
+        proj = self.build_conv(base_name, input_node, **kwargs)
 
         # The LoRA branch.
         if lora_rank is not None:

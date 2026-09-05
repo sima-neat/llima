@@ -12,7 +12,7 @@ import zmq
 
 
 DEFAULT_MODELS_PATH = Path("/media/nvme/llima/models")
-DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-GPTQ-a16w4"
+DEFAULT_TEXT_MODEL = "Qwen2.5-0.5B-Instruct-Autoround-a16w4"
 SERVER_PUBLIC_KEY = b"xA?#1AE663fk][M)Dd9}x?#nV2Iy!p3^&>kerN.>"
 
 
