@@ -82,6 +82,68 @@ sync_sysroot_from_internals_manifest {shlex.quote(str(artifact_dir))}
         return result, calls
 
 
+def run_targeted_sysroot_payload_install() -> tuple[
+    subprocess.CompletedProcess[str], int, int, int, int, list[str]
+]:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        sysroot = root / "sysroot"
+        untouched = sysroot / "existing" / "private.dat"
+        untouched.parent.mkdir(parents=True)
+        untouched.write_text("existing\n", encoding="utf-8")
+        untouched.chmod(0o600)
+        existing_libdir = sysroot / "usr" / "lib"
+        existing_libdir.mkdir(parents=True)
+        existing_libdir.chmod(0o710)
+        root_log = root / "root.log"
+
+        script = f"""
+set -euo pipefail
+apt-get() {{
+  [[ "$1" == "download" ]]
+  shift
+  local package
+  for package in "$@"; do
+    touch "${{package%%:*}}_1.0_arm64.deb"
+  done
+}}
+dpkg-deb() {{
+  [[ "$1" == "-x" ]]
+  local deb="$2"
+  local payload_root="$3"
+  local name
+  name="$(basename "${{deb}}" .deb)"
+  mkdir -p "${{payload_root}}/usr/lib/aarch64-linux-gnu"
+  printf 'payload\n' > "${{payload_root}}/usr/lib/aarch64-linux-gnu/${{name}}.so"
+  chmod 600 "${{payload_root}}/usr/lib/aarch64-linux-gnu/${{name}}.so"
+}}
+run_as_root() {{
+  printf '%s\n' "$1" >> {shlex.quote(str(root_log))}
+  "$@"
+}}
+{shell_function("install_sdk_sysroot_package_payloads")}
+umask 027
+install_sdk_sysroot_package_payloads {shlex.quote(str(sysroot))} libexample:arm64
+"""
+        result = subprocess.run(
+            ["bash", "-c", script], check=False, text=True, capture_output=True
+        )
+        installed = sysroot / "usr/lib/aarch64-linux-gnu/libexample_1.0_arm64.so"
+        untouched_mode = untouched.stat().st_mode & 0o777
+        existing_libdir_mode = existing_libdir.stat().st_mode & 0o777
+        installed_mode = installed.stat().st_mode & 0o777 if installed.exists() else 0
+        installed_libdir_mode = installed.parent.stat().st_mode & 0o777
+        root_calls = root_log.read_text(encoding="utf-8").splitlines()
+        return (
+            result,
+            untouched_mode,
+            existing_libdir_mode,
+            installed_mode,
+            installed_libdir_mode,
+            root_calls,
+        )
+
+
 class InternalsSysrootSyncTest(unittest.TestCase):
     def test_syncs_the_exact_receipt(self) -> None:
         base = "2.1.3"
@@ -169,6 +231,24 @@ class InternalsSysrootSyncTest(unittest.TestCase):
         self.assertEqual(calls, [f"update {base}~pre9999"])
 
 
+class SdkSysrootPackageInstallTest(unittest.TestCase):
+    def test_normalizes_only_the_new_payload_under_restrictive_umask(self) -> None:
+        (
+            result,
+            untouched_mode,
+            libdir_mode,
+            installed_mode,
+            new_dir_mode,
+            root_calls,
+        ) = run_targeted_sysroot_payload_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(untouched_mode, 0o600)
+        self.assertEqual(libdir_mode, 0o710)
+        self.assertEqual(installed_mode, 0o644)
+        self.assertEqual(new_dir_mode, 0o755)
+        self.assertEqual(root_calls, ["bash"])
+
+
 def test_internals_is_located_without_a_derived_version() -> None:
     assert "find_package(NeatInternals CONFIG REQUIRED)" in cmake()
 
@@ -247,6 +327,21 @@ def test_vulcan_build_uses_the_internals_sysroot_receipt() -> None:
     assert not re.search(r"\b[0-9]+(?:\.[0-9]+){2}~pre[0-9]+\b", text)
     assert not re.search(r"\b[0-9]+(?:\.[0-9]+){2}~pre[0-9]+\b", workflow)
     assert sync < extract
+
+
+def test_llima_package_fallback_does_not_run_the_sdk_overlay() -> None:
+    text = build_script()
+    package_start = text.index("ensure_sdk_sysroot_packages() {")
+    package_end = text.index("\n}\n", package_start)
+    package_function = text[package_start:package_end]
+
+    assert "https://github.com/sima-neat/sdk/issues/164" in package_function
+    assert "install-sysroot-overlay.sh" not in package_function
+    assert 'install_sdk_sysroot_package_payloads "${sysroot}"' in package_function
+    assert 'chmod -R a+rX "${payload_root}"' in text
+    assert 'chmod -R a+rX "${sysroot}"' not in text
+    assert "umask 022; cp -R" in text
+    assert 'cp -a "${payload_root}/."' not in text
 
 
 def test_llima_has_no_recovery_or_libcamera_branch() -> None:
