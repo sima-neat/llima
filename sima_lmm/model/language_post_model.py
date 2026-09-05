@@ -15,7 +15,6 @@ from sima_lmm.model.sima_builder import (
     build_activation, activation_type, activation_dtype
 )
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
-from sima_lmm.utils import ceil_div
 
 
 @dataclass
@@ -35,6 +34,13 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.pipeline_cfg.enable_filter_sharing
 
     @property
+    def uses_per_layer_inputs(self) -> bool:
+        return (
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.cfg.lm_cfg.hidden_size_per_layer_input > 0
+        )
+
+    @property
     def uses_quantized_input_embeddings(self) -> bool:
         # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
         return super().uses_quantized_input_embeddings and not self.is_draft
@@ -42,18 +48,41 @@ class LanguagePostModel(LanguagePostBaseModel):
     @property
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
-        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+        return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
+
+    @property
+    def _input_hidden_size(self) -> int:
+        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
+            return 2 * self.cfg.lm_cfg.assistant_backbone_hidden_size
+        return self.cfg.lm_cfg.hidden_size
+
+    def _build_onnx_pre_projection_if_needed(self, input_node: OnnxNode) -> OnnxNode:
+        if not (self.is_gemma4_mtp_draft and self.layer_idx == 0):
+            return input_node
+        return self._onnx_builder.build_conv(
+            "pre_projection", input_node, src_weight_name="pre_projection.weight"
+        )
+
+    def _build_sima_pre_projection_if_needed(
+        self, builder: SimaBuilder, input_node: NodeOrHandle
+    ) -> NodeOrHandle:
+        if not (self.is_gemma4_mtp_draft and self.layer_idx == 0):
+            return input_node
+        return build_conv_from_dense_with_lora(
+            builder, self.get_hf_param, self.check_hf_param, "pre_projection",
+            input_node, None, src_weight_name="pre_projection.weight"
+        )
 
     def gen_onnx_files(self):
         base_name = self._layer_base_name
         self.create_onnx_builder()
         self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+            "input", (1, self._input_hidden_size, 1, self.num_tokens)
         )
         self._onnx_builder.create_input_node(
             "self_attn", (1, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type), 1, self.num_tokens)
         )
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             self._onnx_builder.create_input_node(
                 "per_layer_input",
                 (1, self.cfg.lm_cfg.hidden_size_per_layer_input, 1, self.num_tokens),
@@ -86,6 +115,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, attn_out_name)
 
+        residual_input = self._build_onnx_pre_projection_if_needed(input_nodes[0])
         o_proj = self._onnx_builder.build_conv_from_dense_with_lora(
             f"{base_name}.self_attn.{attn_out_name}", input_nodes[1], lora_rank
         )
@@ -94,13 +124,13 @@ class LanguagePostModel(LanguagePostBaseModel):
         if has_ffn_norms:
             rms_norm1 = self._build_rms_norm(f"{base_name}.post_attention_layernorm", o_proj)
             add1 = self._onnx_builder.build_op(
-                f"{base_name}.add1", [input_nodes[0], rms_norm1], "Add"
+                f"{base_name}.add1", [residual_input, rms_norm1], "Add"
             )
             rms_norm2 = self._build_rms_norm(f"{base_name}.pre_feedforward_layernorm", add1)
         else:
             norm_name = "ffn_norm" if self.check_hf_param(f"{base_name}.ffn_norm.weight") else "post_attention_layernorm"
             add1 = self._onnx_builder.build_op(
-                f"{base_name}.add1", [input_nodes[0], o_proj], "Add"
+                f"{base_name}.add1", [residual_input, o_proj], "Add"
             )
             rms_norm2 = self._build_rms_norm(f"{base_name}.{norm_name}", add1)
 
@@ -124,7 +154,7 @@ class LanguagePostModel(LanguagePostBaseModel):
             )
 
         final_output = add2
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             final_output = self._build_onnx_per_layer_input_branch(
                 base_name, final_output, input_nodes[2]
             )
@@ -226,7 +256,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.check_hf_param(pre_ln) and self.check_hf_param(post_ln)
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
-        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
         self_attn_shape = (
             1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type),
@@ -258,7 +288,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             subnet_inputs.append(model_input_scale)
         subnet_inputs.append(model_input_self_attn)
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             model_input_per_layer = builder.create_placeholder_node(
                 "per_layer_input", TensorType(activation_type(quantizable), per_layer_shape)
             )
@@ -280,7 +310,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         mla_input_self_attn = builder.create_placeholder_node(
             "MLA_0/self_attn", TensorType(activation_type(quantizable), self_attn_shape)
         )
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             mla_input_per_layer = builder.create_placeholder_node(
                 "MLA_0/per_layer_input",
                 TensorType(activation_type(quantizable), per_layer_shape),
@@ -308,6 +338,7 @@ class LanguagePostModel(LanguagePostBaseModel):
             )
         else:
             rms_norm_in = mla_input_input
+        rms_norm_in = self._build_sima_pre_projection_if_needed(builder, rms_norm_in)
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
         if has_ffn_norms:
@@ -347,7 +378,7 @@ class LanguagePostModel(LanguagePostBaseModel):
 
         # Add deepstack features if needed
         final_output = add2
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             final_output = self._build_sima_per_layer_input_branch(
                 builder,
                 base_name,

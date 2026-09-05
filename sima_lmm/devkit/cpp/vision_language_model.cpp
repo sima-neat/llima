@@ -140,14 +140,31 @@ std::optional<std::string> VisionLanguageModel::run_model(
 
     std::optional<std::vector<uint32_t>> output_token_ids;
     if (_draft_vlm_ptr != nullptr) {
-        output_token_ids = _language_model_ptr->run_model_speculative_decoding(
-            *_draft_vlm_ptr->_language_model_ptr,
-            preprocessed_data.input_token_ids,
-            max_num_tokens,
-            timer_ttft,
-            nullptr,
-            cache_id
-        );
+        if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
+            throw std::runtime_error(
+                "Draft VLM is configured but target model lacks speculative decoding config"
+            );
+        }
+        const auto& spec_cfg = _cfg.lm_cfg.speculative_decoding_cfg.value();
+        if (spec_cfg.is_gemma4_mtp()) {
+            output_token_ids = _language_model_ptr->run_model_gemma4_mtp(
+                *_draft_vlm_ptr->_language_model_ptr,
+                preprocessed_data.input_token_ids,
+                max_num_tokens,
+                timer_ttft,
+                nullptr,
+                cache_id
+            );
+        } else {
+            output_token_ids = _language_model_ptr->run_model_speculative_decoding(
+                *_draft_vlm_ptr->_language_model_ptr,
+                preprocessed_data.input_token_ids,
+                max_num_tokens,
+                timer_ttft,
+                nullptr,
+                cache_id
+            );
+        }
     } else {
         output_token_ids = _language_model_ptr->run_model(
             preprocessed_data.input_token_ids,
@@ -260,13 +277,27 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
             override_stop_token_ids
         );
         try {
-            auto output_token_ids = _language_model_ptr->run_model_speculative_decoding(
-                *_draft_vlm_ptr->_language_model_ptr,
-                input_token_ids,
-                override_max_num_tokens,
-                std::nullopt,
-                &result
-            );
+            if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
+                throw std::runtime_error(
+                    "Draft VLM is configured but target model lacks speculative decoding config"
+                );
+            }
+            const auto& spec_cfg = _cfg.lm_cfg.speculative_decoding_cfg.value();
+            auto output_token_ids = spec_cfg.is_gemma4_mtp()
+                ? _language_model_ptr->run_model_gemma4_mtp(
+                    *_draft_vlm_ptr->_language_model_ptr,
+                    input_token_ids,
+                    override_max_num_tokens,
+                    std::nullopt,
+                    &result
+                )
+                : _language_model_ptr->run_model_speculative_decoding(
+                    *_draft_vlm_ptr->_language_model_ptr,
+                    input_token_ids,
+                    override_max_num_tokens,
+                    std::nullopt,
+                    &result
+                );
             if (!output_token_ids.has_value()) {
                 throw std::runtime_error(
                     "Speculative performance request leaves insufficient token capacity "

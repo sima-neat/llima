@@ -8,7 +8,7 @@ from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.model.base import BaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import SimaBuilder, build_conv, build_logit_softcapping
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
+from sima_lmm.config.vlm_config import LlmArchType, SpeculativeDecodingMethod, VlmArchType
 
 
 @dataclass
@@ -175,6 +175,33 @@ class LanguagePartBaseModel(BaseModel):
         return cfg is not None and cfg.is_draft
 
     @property
+    def is_eagle3_draft(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return (
+            cfg is not None
+            and cfg.is_draft
+            and cfg.method == SpeculativeDecodingMethod.EAGLE3
+        )
+
+    @property
+    def is_gemma4_mtp_draft(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return (
+            cfg is not None
+            and cfg.is_draft
+            and cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+        )
+
+    @property
+    def is_gemma4_mtp_target(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return (
+            cfg is not None
+            and not cfg.is_draft
+            and cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+        )
+
+    @property
     def uses_quantized_input_embeddings(self) -> bool:
         return self.cfg.pipeline_cfg.quantize_embeddings
 
@@ -219,11 +246,16 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 self._onnx_builder.create_output_node(
                     output_name, (1, split_size, 1, self.num_tokens)
                 )
-            if self.is_draft:
-                # EAGLE3 draft model also returns hidden_states as the last output
+            if self.is_draft or self.is_gemma4_mtp_target:
+                # Drafts return next-step state; MTP targets expose final target activations.
+                hidden_state_size = (
+                    self.cfg.lm_cfg.assistant_backbone_hidden_size
+                    if self.is_gemma4_mtp_draft
+                    else self.cfg.lm_cfg.hidden_size
+                )
                 hidden_states_name = self._onnx_builder.get_node_output_name(output_nodes[-1])
                 self._onnx_builder.create_output_node(
-                    hidden_states_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+                    hidden_states_name, (1, hidden_state_size, 1, self.num_tokens)
                 )
 
     def _build_onnx_post_transformer(self, base_name: str, input_node: OnnxNode) -> list[OnnxNode]:
@@ -236,7 +268,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
         )
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_draft:
+        if self.is_eagle3_draft:
             final_norm_full_name = final_norm_name
         rms_norm2 = self._build_rms_norm(final_norm_full_name, input_node)
 
@@ -271,8 +303,17 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 )
             lm_heads.append(lm_head)
 
-        if self.is_draft:
+        if self.is_eagle3_draft:
             lm_heads.append(input_node)
+            return lm_heads
+        if self.is_gemma4_mtp_draft:
+            projected_state = self._onnx_builder.build_conv(
+                "post_projection", rms_norm2, src_weight_name="post_projection.weight"
+            )
+            lm_heads.append(projected_state)
+            return lm_heads
+        if self.is_gemma4_mtp_target:
+            lm_heads.append(rms_norm2)
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             argmax = self._onnx_builder.build_op(
@@ -290,7 +331,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         base_prefix = self.hf_model.language_model_param_base_name
         final_norm_name = "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_draft:
+        if self.is_eagle3_draft:
             final_norm_full_name = final_norm_name
         rms_norm = self._build_sima_rms_norm(builder,
             final_norm_full_name, input_node
@@ -335,8 +376,18 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 )
             lm_heads.append(lm_head)
 
-        if self.is_draft:
+        if self.is_eagle3_draft:
             lm_heads.append(input_node)
+            return lm_heads
+        if self.is_gemma4_mtp_draft:
+            projected_state = build_conv(
+                builder, self.get_hf_param, self.check_hf_param, "post_projection", rms_norm,
+                src_weight_name="post_projection.weight"
+            )
+            lm_heads.append(projected_state)
+            return lm_heads
+        if self.is_gemma4_mtp_target:
+            lm_heads.append(rms_norm)
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             argmax = builder.create_argmax_node(lm_heads[0], ScalarType.int32)
