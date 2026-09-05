@@ -12,7 +12,8 @@ from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import (
-    BaseModel, FileGenMode, TensorTessellateParameters, GenConfiguration, LayerConfiguration
+    BaseModel, EvalMode, FileGenMode, TensorTessellateParameters, GenConfiguration,
+    LayerConfiguration
 )
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
@@ -29,6 +30,28 @@ from sima_lmm.config.vlm_config import VisionArchType, VlmArchType
 @dataclass
 class VisionModel(BaseModel):
     """Vision model implementation."""
+
+    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+        layer_ifms = ifms
+        deepstack_outputs: dict[int, np.ndarray] = {}
+        deepstack_indexes = self.cfg.vm_cfg.deepstack_visual_indexes
+
+        for layer_idx in range(self.cfg.num_vision_layers):
+            layer_outputs = list(
+                self._get_part_model(layer_idx).run_model(eval_mode, layer_ifms)
+            )
+            if (
+                self.cfg.model_type == VlmArchType.VLM_QWEN3_VL
+                and layer_idx in deepstack_indexes
+            ):
+                deepstack_idx = deepstack_indexes.index(layer_idx)
+                deepstack_outputs[deepstack_idx] = layer_outputs.pop()
+            layer_ifms = [layer_outputs[0]]
+
+        return [
+            *layer_outputs,
+            *(deepstack_outputs[idx] for idx in range(len(deepstack_indexes))),
+        ]
 
     def gen_files(
         self,

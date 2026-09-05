@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 77
+- Expected cases: 78
 
 Fast, hermetic tests that run before model inputs are downloaded:
 

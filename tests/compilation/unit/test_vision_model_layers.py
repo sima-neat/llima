@@ -5,6 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from sima_lmm.config.vlm_config import VlmConfig
+from sima_lmm.model import EvalMode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
 from sima_lmm.model.vision_model import StandardVisionLayerModel, VisionModel
@@ -67,6 +68,34 @@ def test_vision_part_rejects_out_of_range_layer():
 
     with pytest.raises(ValueError, match="outside the valid range"):
         vision_model._get_part_model(config.vm_cfg.num_hidden_layers)
+
+
+def test_vision_evaluation_chains_layers_and_preserves_deepstack_order():
+    config = _load_reference_config("qwen3_vl_vlm_config.json")
+    config.vm_cfg.num_hidden_layers = 3
+    config.vm_cfg.deepstack_visual_indexes = [1]
+    vision_model = VisionModel(config, "test_vision")
+
+    image = object()
+    hidden_0 = object()
+    hidden_1 = object()
+    projection = object()
+    scale = object()
+    deepstack = object()
+    layers = [Mock(), Mock(), Mock()]
+    layers[0].run_model.return_value = [hidden_0]
+    layers[1].run_model.return_value = [hidden_1, deepstack]
+    layers[2].run_model.return_value = [projection, scale]
+    vision_model._get_part_model = Mock(side_effect=layers)
+
+    assert vision_model.run_model(EvalMode.SDK, [image]) == [
+        projection,
+        scale,
+        deepstack,
+    ]
+    layers[0].run_model.assert_called_once_with(EvalMode.SDK, [image])
+    layers[1].run_model.assert_called_once_with(EvalMode.SDK, [hidden_0])
+    layers[2].run_model.assert_called_once_with(EvalMode.SDK, [hidden_1])
 
 
 def test_qwen2_layer_uses_its_source_block_and_attention_mode():
