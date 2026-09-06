@@ -15,12 +15,16 @@ from sima_lmm.model import (
 _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "group_pre": (True, "PRE"),
     "single_pre": (False, "PRE"),
+    "point_pre": (False, "PRE"),
     "group_cache": (True, "CACHE"),
     "single_cache": (False, "CACHE"),
+    "point_cache": (False, "CACHE"),
     "group_sliding_cache": (True, "CACHE"),
     "single_sliding_cache": (False, "CACHE"),
+    "point_sliding_cache": (False, "CACHE"),
     "group_post": (True, "POST"),
     "single_post": (False, "POST"),
+    "point_post": (False, "POST"),
     "group_conv": (True, "POST"),
     "single_conv": (False, "POST"),
     "conv_post_final": (False, "POST"),
@@ -29,6 +33,7 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_draft_fc": (False, "DRAFT_FC"),
     "group_per_layer": (True, "PER_LAYER"),
     "single_per_layer": (False, "PER_LAYER"),
+    "speculative_per_layer": (False, "PER_LAYER"),
 }
 
 
