@@ -330,11 +330,52 @@ LanguageModel::Gemma4MtpTargetStepResult LanguageModel::_run_gemma4_mtp_target_s
     );
 
     if (_uses_per_layer_inputs()) {
-        std::vector<uint32_t> per_layer_token_ids(num_tokens, 0);
-        per_layer_token_ids[0] = (
+        const uint32_t per_layer_token_id = (
             _image_token_id.has_value() && token_id == _image_token_id.value()
         ) ? _pad_token_id.value() : token_id;
-        _upload_per_layer_embedding_rows(per_layer_token_ids, num_tokens);
+        const std::vector<uint32_t> per_layer_token_ids{per_layer_token_id};
+        _upload_per_layer_embedding_rows(per_layer_token_ids, 1);
+
+        std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
+        const uint8_t input_ifm_idx = _cfg.pipeline_cfg.quantize_embeddings ? 2 : 1;
+        per_layer_ifm_map.emplace(
+            input_ifm_idx,
+            MLABufferSlice{
+                &input_embeds_buf,
+                {0, 0},
+                {1, hidden_size}
+            }
+        );
+        if (_cfg.pipeline_cfg.quantize_embeddings) {
+            per_layer_ifm_map.emplace(
+                3,
+                MLABufferSlice{
+                    input_embedding_scales_buf,
+                    {0, 0},
+                    {1, 1}
+                }
+            );
+        }
+        const LanguageModelMapKey per_layer_key{1, 0, 0};
+        _per_layer_model_map.at(per_layer_key).run(&per_layer_ifm_map);
+
+        auto& single_input = get_buffer("n1_per_layer_input");
+        auto& target_input = get_buffer(fmt::format("n{}_per_layer_input", num_tokens));
+        single_input.invalidate_cache();
+        target_input.clear(false);
+        const size_t row_size = single_input.get_buf_len(std::vector<uint32_t>{
+            1, _cfg.lm_cfg.hidden_size_per_layer_input
+        });
+        const auto* source = reinterpret_cast<const uint8_t*>(single_input.get_virtual_addr());
+        auto* destination = reinterpret_cast<uint8_t*>(target_input.get_virtual_addr());
+        for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+            std::memcpy(
+                destination + static_cast<size_t>(layer_idx) * num_tokens * row_size,
+                source + static_cast<size_t>(layer_idx) * row_size,
+                row_size
+            );
+        }
+        target_input.flush_cache();
     }
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {

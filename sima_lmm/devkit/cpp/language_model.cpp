@@ -122,6 +122,10 @@ LanguageModel::LanguageModel(
     _use_group_token_models = (
         _cfg.pipeline_cfg.input_token_group_offsets.has_value()
         && _cfg.pipeline_cfg.input_token_group_offsets.value().size() > 0
+        // Gemma4 MTP assistants only execute their speculative-width path. Their
+        // serialized pipeline config retains target group offsets, but the compiler
+        // intentionally does not emit grouped assistant pre/cache/post models.
+        && !_cfg.lm_cfg.is_gemma4_mtp_draft()
     );
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
@@ -2212,26 +2216,30 @@ void LanguageModel::_define_buffers() {
             );
             _per_layer_embedding_shards.emplace_back(&get_buffer(name));
         }
-        // Input staging for the standalone per-layer model, filled from token-id gathers.
-        define_buffer("per_layer_emb_staging_n1", {1, out_dim}, dtype);
-        if (_cfg.pipeline_cfg.quantize_embeddings) {
-            define_buffer("per_layer_emb_staging_scale_n1", {1, 1});
-        }
+        // The compiler emits pointwise single-token and grouped per-layer models. Speculative
+        // targets run the n1 model and scatter its output into their wider verification buffer.
+        std::vector<uint16_t> per_layer_num_tokens_vec{1};
         if (_use_group_token_models) {
+            per_layer_num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+        }
+        for (const auto num_tokens: per_layer_num_tokens_vec) {
             define_buffer(
-                fmt::format("per_layer_emb_staging_n{}", _cfg.pipeline_cfg.input_token_group_size),
-                {_cfg.pipeline_cfg.input_token_group_size, out_dim},
+                fmt::format("per_layer_emb_staging_n{}", num_tokens),
+                {num_tokens, out_dim},
                 dtype
             );
             if (_cfg.pipeline_cfg.quantize_embeddings) {
                 define_buffer(
-                    fmt::format(
-                        "per_layer_emb_staging_scale_n{}",
-                        _cfg.pipeline_cfg.input_token_group_size
-                    ),
-                    {_cfg.pipeline_cfg.input_token_group_size, 1}
+                    fmt::format("per_layer_emb_staging_scale_n{}", num_tokens),
+                    {num_tokens, 1}
                 );
             }
+        }
+        if (_cfg.lm_cfg.get_single_num_tokens() != 1) {
+            define_buffer(
+                "n1_per_layer_input",
+                {_cfg.lm_cfg.num_hidden_layers, _cfg.lm_cfg.hidden_size_per_layer_input}
+            );
         }
     }
 
