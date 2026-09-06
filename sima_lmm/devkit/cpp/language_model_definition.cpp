@@ -601,7 +601,7 @@ void LanguageModel::_define_per_layer_models() {
     if (!_uses_per_layer_inputs())
         return;
 
-    std::vector<uint16_t> num_tokens_vec = {_cfg.lm_cfg.get_single_num_tokens()};
+    std::vector<uint16_t> num_tokens_vec = {1};
     if (_use_group_token_models)
         num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
 
