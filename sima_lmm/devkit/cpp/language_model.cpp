@@ -64,6 +64,8 @@ LogLikelihoodResult score_logits(
 
 namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
+static_assert(sizeof(std::unique_ptr<EmbeddingOffload>) == sizeof(Eigen::bfloat16*));
+static_assert(alignof(std::unique_ptr<EmbeddingOffload>) == alignof(Eigen::bfloat16*));
 }
 
 LanguageModel::LanguageModel(
@@ -191,6 +193,8 @@ LanguageModel::LanguageModel(
 
     _initialize();
 }
+
+LanguageModel::~LanguageModel() { _finalize(); }
 
 
 std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffers(
@@ -1264,7 +1268,7 @@ void LanguageModel::_initialize() {
         const bool nvme = embedding_file_on_nvme(normal)
             && (!_uses_per_layer_inputs() || embedding_file_on_nvme(per_layer));
         if (nvme) {
-            auto offload = std::make_shared<EmbeddingOffload>();
+            auto offload = std::make_unique<EmbeddingOffload>();
             const size_t elem = _cfg.pipeline_cfg.quantize_embeddings ? 1 : 2;
             const size_t vocab = _cfg.lm_cfg.token_cfg.vocab_size;
             offload->normal = std::make_unique<DiskEmbeddingTable>(normal, vocab, _cfg.lm_cfg.hidden_size * elem);

@@ -53,7 +53,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer
         );
-        virtual ~LanguageModel() override { _finalize(); }
+        virtual ~LanguageModel() override;
 
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
@@ -248,7 +248,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
-        std::shared_ptr<EmbeddingOffload> _embedding_offload;
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,
             MLABuffer* scales, size_t row_begin = 0
@@ -394,7 +393,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         bool _has_image_token;
 
-        Eigen::bfloat16* _embeddings_tensor_ptr;
+        // Reuse the former, unused embedding pointer slot to preserve the class layout.
+        std::unique_ptr<EmbeddingOffload> _embedding_offload;
         size_t _per_layer_embedding_rows_per_shard = 0;
         std::vector<MLABuffer*> _per_layer_embedding_shards;
         std::vector<uint32_t> _prompt_per_layer_token_ids;
