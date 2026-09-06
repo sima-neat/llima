@@ -58,6 +58,9 @@ modalix:~$ llima run <model> [options]
 
 For all available options, run `llima run -h`.
 
+To disable automatic embedding offloading and keep the tables in DRAM, run
+`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
+
 **Examples**
 
 ``` console
