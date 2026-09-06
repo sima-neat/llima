@@ -39,9 +39,6 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 
 ## Running LLiMa
 
-To disable automatic embedding offloading and keep the tables in DRAM, run
-`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
-
 Use `llima run` as a simple runtime for initial model validation on Modalix.
 
 In CLI mode, chat history is enabled by default. Each prompt and response is
@@ -60,6 +57,9 @@ modalix:~$ llima run <model> [options]
 | `--stt_model_path` | Path to the elf files for a Speech-to-Text model (optional). |
 
 For all available options, run `llima run -h`.
+
+To disable automatic embedding offloading and keep the tables in DRAM, run
+`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
 
 **Examples**
 
