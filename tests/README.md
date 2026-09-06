@@ -325,6 +325,20 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.asr_transcription` | Whisper transcription using the installed sample audio |
 | `runtime.tool_call_parser` | Tool-call parsing safety and streaming provenance without model inference |
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
+| `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |
+| `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
+
+The embedding generation test requires raw embedding tables on local NVMe
+and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
+`SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
+and `auto`, verifies that automatic offloading saves DRAM, and checks allocation
+cleanup after teardown. The executable also accepts an explicit model directory
+and optionally a speculative draft model directory:
+
+```bash
+./lib/sima-lmm/tests/sima_lmm_embedding_offload_generation_test \
+  /media/nvme/llima/models/Gemma-4-E4B-it-GPTQ-a16w4
+```
 
 The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on

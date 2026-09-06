@@ -26,6 +26,8 @@
 namespace simaai {
 namespace llima {
 
+struct EmbeddingOffload;
+
 struct LogLikelihoodResult {
     double logprob;
     bool is_greedy;
@@ -246,6 +248,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
+        std::shared_ptr<EmbeddingOffload> _embedding_offload;
+        void _gather_embedding_rows(
+            std::span<const uint32_t> ids, MLABuffer& destination,
+            MLABuffer* scales, size_t row_begin = 0
+        );
+        void _prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx);
         void _define_draft_fc_models();
         struct CachedState {
             // Hidden-layer indices belonging to this stateful family.

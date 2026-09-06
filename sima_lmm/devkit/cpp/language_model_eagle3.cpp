@@ -129,8 +129,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     }
 
     // Drafts share the target's embedding table — read rows from target's buffer.
-    const auto& target_embeddings_buf = target_lm.get_buffer("embeddings");
-    const uint32_t embed_size = target_embeddings_buf.get_shape().back();  // = hidden_size
+    const uint32_t embed_size = target_lm._cfg.lm_cfg.hidden_size;
 
     // FC fusion: folds (seq_length, 3*hidden_size) stacked target captures down
     // to (seq_length, hidden_size). Skipped when input is already hidden_size wide.
