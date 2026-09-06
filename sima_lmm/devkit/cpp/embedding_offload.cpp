@@ -73,6 +73,31 @@ void DiskEmbeddingTable::gather(std::span<const uint32_t> ids, void* destination
     if (stride < _row_bytes || (!destination && !ids.empty()))
         throw std::runtime_error("Invalid embedding destination");
     for (auto id : ids) if (id >= _rows) throw std::out_of_range("Embedding token ID exceeds vocabulary");
+    auto* dst = static_cast<uint8_t*>(destination);
+    auto read_row = [this](uint32_t id, uint8_t* row) {
+        const size_t offset = static_cast<size_t>(id) * _row_bytes;
+        size_t done = 0;
+        while (done < _row_bytes) {
+            const auto n = pread(_fd, row + done, _row_bytes - done, offset + done);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) throw std::system_error(errno, std::generic_category(), "Read embedding " + _path.string());
+            if (n == 0) throw std::runtime_error("Short embedding read: " + _path.string());
+            done += static_cast<size_t>(n);
+        }
+    };
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto evict_row = [this, page](uint32_t id) {
+        const size_t offset = static_cast<size_t>(id) * _row_bytes;
+        const size_t aligned = offset / page * page;
+        const size_t count = (offset - aligned + _row_bytes + page - 1) / page * page;
+        posix_fadvise(_fd, aligned, count, POSIX_FADV_DONTNEED);
+    };
+    // Decode has no duplicates: read directly without allocating gather metadata.
+    if (ids.size() == 1) {
+        read_row(ids.front(), dst);
+        evict_row(ids.front());
+        return;
+    }
     std::unordered_map<uint32_t, size_t> seen;
     seen.reserve(ids.size());
     std::vector<size_t> unique_rows;
@@ -80,7 +105,6 @@ void DiskEmbeddingTable::gather(std::span<const uint32_t> ids, void* destination
     for (size_t i = 0; i < ids.size(); ++i) {
         if (seen.emplace(ids[i], i).second) unique_rows.push_back(i);
     }
-    auto* dst = static_cast<uint8_t*>(destination);
     std::exception_ptr error;
     // Reuse the runtime's OpenMP pool. Reads target disjoint staging rows;
     // duplicate copies wait for the implicit barrier. All workers finish before
@@ -89,15 +113,7 @@ void DiskEmbeddingTable::gather(std::span<const uint32_t> ids, void* destination
     for (size_t task = 0; task < unique_rows.size(); ++task) {
         try {
             const size_t i = unique_rows[task];
-            const size_t offset = static_cast<size_t>(ids[i]) * _row_bytes;
-            size_t done = 0;
-            while (done < _row_bytes) {
-                const auto n = pread(_fd, dst + i * stride + done, _row_bytes - done, offset + done);
-                if (n < 0 && errno == EINTR) continue;
-                if (n < 0) throw std::system_error(errno, std::generic_category(), "Read embedding " + _path.string());
-                if (n == 0) throw std::runtime_error("Short embedding read: " + _path.string());
-                done += static_cast<size_t>(n);
-            }
+            read_row(ids[i], dst + i * stride);
         } catch (...) {
             #pragma omp critical(llima_embedding_read_error)
             { if (!error) error = std::current_exception(); }
@@ -110,13 +126,7 @@ void DiskEmbeddingTable::gather(std::span<const uint32_t> ids, void* destination
     }
     // Avoid retaining a second table in Linux's page cache. Advisories are best
     // effort (e.g. another process may hold these pages); no global cache drop.
-    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    for (const auto& [id, row] : seen) {
-        const size_t offset = static_cast<size_t>(id) * _row_bytes;
-        const size_t aligned = offset / page * page;
-        const size_t count = (offset - aligned + _row_bytes + page - 1) / page * page;
-        posix_fadvise(_fd, aligned, count, POSIX_FADV_DONTNEED);
-    }
+    for (const auto& [id, row] : seen) evict_row(id);
 }
 
 } // namespace simaai::llima

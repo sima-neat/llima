@@ -37,10 +37,12 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < ids.size(); ++i) ids[i] = i * 17 % rows;
             ids[1] = ids[0]; ids[2] = rows - 1;
             std::vector<uint8_t> output(ids.size() * stride, 0xFE);
-            table.gather(ids, output.data(), stride);
-            for (size_t i = 0; i < ids.size(); ++i) {
-                for (size_t j = 0; j < bytes; ++j) require(output[i * stride + j] == input[ids[i] * bytes + j], "Incorrect gathered row");
-                for (size_t j = bytes; j < stride; ++j) require(output[i * stride + j] == 0xFE, "Row padding overwritten");
+            for (const size_t count : {size_t{1}, ids.size()}) {
+                table.gather(std::span<const uint32_t>(ids).first(count), output.data(), stride);
+                for (size_t i = 0; i < count; ++i) {
+                    for (size_t j = 0; j < bytes; ++j) require(output[i * stride + j] == input[ids[i] * bytes + j], "Incorrect gathered row");
+                    for (size_t j = bytes; j < stride; ++j) require(output[i * stride + j] == 0xFE, "Row padding overwritten");
+                }
             }
             table.gather({}, nullptr, stride);
             const uint32_t invalid = rows;
@@ -48,6 +50,7 @@ int main(int argc, char** argv) {
             rejects([&] { table.gather(ids, output.data(), bytes - 1); });
             rejects([&] { DiskEmbeddingTable wrong(file, rows + 1, bytes); });
             std::filesystem::resize_file(file, 0);
+            rejects([&] { table.gather(std::span<const uint32_t>(ids).first(1), output.data(), stride); });
             rejects([&] { table.gather(ids, output.data(), stride); });
         }
         unsetenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD");
