@@ -14,8 +14,10 @@ class LayerID:
             'group_cache', 'group_sliding_cache', 'group_post', 'single_pre',
             'single_cache', 'single_sliding_cache', 'single_post', 'group_conv',
             'single_conv', 'conv_post_final', 'vision', 'group_per_layer',
-            'single_per_layer', and for Mixture-of-Experts models 'group_router',
-            'single_router', 'group_expert', 'single_expert',
+            'single_per_layer', the Gemma4 MTP variants 'point_pre',
+            'point_cache', 'point_sliding_cache', 'point_post',
+            'speculative_per_layer', and for Mixture-of-Experts models
+            'group_router', 'single_router', 'group_expert', 'single_expert',
             'group_weightedsum', 'single_weightedsum'.
         part_idx: Index of the layer.
         expert_idx: Index of the expert within the layer, for the MoE

@@ -611,8 +611,8 @@ class SpeculativeDecodingConfig(BaseConfig):
         method: Speculative decoding implementation.
         is_draft: True if the model is a draft model in a speculative decoding setup.
         speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
-            EAGLE3 uses 16 for target and 5 for draft by default. Gemma4 MTP uses a
-            small fixed assistant-token budget in the initial MVP.
+            EAGLE3 uses 16 for target and 5 for draft by default. Gemma4 MTP uses
+            5 target verification rows and a recurrent 4-token assistant budget.
     """
     method: str = SpeculativeDecodingMethod.EAGLE3
     is_draft: bool = False
@@ -1414,6 +1414,34 @@ class VlmConfig(BaseConfig):
         ):
             layers.append(LayerID("group_per_layer", 0))
             layers.append(LayerID("single_per_layer", 0))
+            if (
+                lm_cfg.speculative_decoding_cfg is not None
+                and not lm_cfg.speculative_decoding_cfg.is_draft
+                and lm_cfg.speculative_decoding_cfg.method
+                == SpeculativeDecodingMethod.GEMMA4_MTP
+            ):
+                layers.append(LayerID("speculative_per_layer", 0))
+
+        if (
+            self.model_type == VlmArchType.VLM_GEMMA4
+            and lm_cfg.speculative_decoding_cfg is not None
+            and not lm_cfg.speculative_decoding_cfg.is_draft
+            and lm_cfg.speculative_decoding_cfg.method
+            == SpeculativeDecodingMethod.GEMMA4_MTP
+        ):
+            layers.extend(LayerID("point_pre", n) for n in range(lm_cfg.num_hidden_layers))
+            layers.extend(LayerID("point_post", n) for n in range(lm_cfg.num_hidden_layers))
+            layers.extend(
+                LayerID("point_cache", n)
+                for n in single_cache_model_indices(pipeline_cfg)
+            )
+            if "sliding_attention" in layer_types:
+                layers.extend(
+                    LayerID("point_sliding_cache", n)
+                    for n in single_sliding_cache_model_indices(
+                        pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                    )
+                )
 
         return layers
 

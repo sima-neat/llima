@@ -1994,6 +1994,14 @@ void LanguageModel::_define_buffers() {
             fmt::format("eagle3_input_embedding_scales_n{}", single_num_tokens),
             {single_num_tokens, 1}
         );
+        if (_cfg.lm_cfg.is_gemma4_mtp_target() && single_num_tokens != 1) {
+            define_buffer(
+                "eagle3_input_embeds_n1",
+                {1, _cfg.lm_cfg.hidden_size},
+                "int8"
+            );
+            define_buffer("eagle3_input_embedding_scales_n1", {1, 1});
+        }
         const uint16_t group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         if (is_draft && _use_group_token_models && group_num_tokens != single_num_tokens) {
             define_buffer(
@@ -2068,9 +2076,18 @@ void LanguageModel::_define_buffers() {
 
     // Other buffers.
     std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
+    if (
+        _cfg.lm_cfg.is_gemma4_mtp_target()
+        && _cfg.lm_cfg.get_single_num_tokens() != 1
+    ) {
+        num_tokens_vec.emplace_back(1);
+    }
     if (_use_group_token_models) {
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
-        num_tokens_vec.emplace_back(num_tokens);
+        if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), num_tokens)
+            == num_tokens_vec.end()) {
+            num_tokens_vec.emplace_back(num_tokens);
+        }
     }
     const uint16_t max_future_token_mask_size = _get_max_future_token_mask_size();
     if (max_future_token_mask_size > 1) {
@@ -2216,11 +2233,26 @@ void LanguageModel::_define_buffers() {
             );
             _per_layer_embedding_shards.emplace_back(&get_buffer(name));
         }
-        // The compiler emits pointwise single-token and grouped per-layer models. Speculative
-        // targets run the n1 model and scatter its output into their wider verification buffer.
+        // MTP target verification consumes a native speculative-width projection.
         std::vector<uint16_t> per_layer_num_tokens_vec{1};
+        const auto speculative_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+        if (
+            _cfg.lm_cfg.is_gemma4_mtp_target()
+            && speculative_num_tokens != 1
+        ) {
+            per_layer_num_tokens_vec.emplace_back(speculative_num_tokens);
+        }
         if (_use_group_token_models) {
-            per_layer_num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+            const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
+            if (
+                std::find(
+                    per_layer_num_tokens_vec.begin(),
+                    per_layer_num_tokens_vec.end(),
+                    group_num_tokens
+                ) == per_layer_num_tokens_vec.end()
+            ) {
+                per_layer_num_tokens_vec.emplace_back(group_num_tokens);
+            }
         }
         for (const auto num_tokens: per_layer_num_tokens_vec) {
             define_buffer(
@@ -2235,7 +2267,10 @@ void LanguageModel::_define_buffers() {
                 );
             }
         }
-        if (_cfg.lm_cfg.get_single_num_tokens() != 1) {
+        if (
+            _cfg.lm_cfg.get_single_num_tokens() != 1
+            && !has_buffer("n1_per_layer_input")
+        ) {
             define_buffer(
                 "n1_per_layer_input",
                 {_cfg.lm_cfg.num_hidden_layers, _cfg.lm_cfg.hidden_size_per_layer_input}
@@ -2255,7 +2290,11 @@ void LanguageModel::_define_buffers() {
         for (const auto& num_tokens: num_tokens_vec) {
             // Target prefill reuses the single-token-group final post model
             // (n16 for EAGLE3). Only drafts need group-width final-post outputs.
-            if (!is_draft && num_tokens != _cfg.lm_cfg.get_single_num_tokens()) {
+            if (
+                !is_draft
+                && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
+                && !(_cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1)
+            ) {
                 continue;
             }
             if (_cfg.lm_cfg.lm_head_num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
@@ -2298,7 +2337,10 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     const uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    const bool is_single_model = num_tokens == single_num_tokens;
+    const bool is_single_model = (
+        num_tokens == single_num_tokens
+        || (_cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1)
+    );
     const uint16_t sliding_window = _cfg.lm_cfg.attn_cfg.sliding_window.value_or(0);
     const bool separate_sliding_cache = (
         layer_type == "sliding_attention"
@@ -2373,7 +2415,10 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    const bool is_single_model = num_tokens == single_num_tokens;
+    const bool is_single_model = (
+        num_tokens == single_num_tokens
+        || (_cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1)
+    );
 
     uint16_t cache_token_idx_begin = 0;
     const char* freq_prefix = "global";

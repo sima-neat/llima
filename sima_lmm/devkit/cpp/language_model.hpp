@@ -193,6 +193,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::vector<Eigen::bfloat16> hidden_state;  // (backbone_hidden_size)
         };
 
+        struct Gemma4MtpTargetBatchResult {
+            std::vector<uint32_t> next_token_ids;
+            std::vector<Eigen::bfloat16> hidden_states;
+        };
+
         struct Gemma4MtpDraftStepResult {
             uint32_t token_id;
             std::vector<Eigen::bfloat16> projected_hidden_state;  // (backbone_hidden_size)
@@ -497,12 +502,21 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
         uint32_t _argmax_lm_head_row(uint16_t num_tokens, uint16_t row);
-        std::vector<Eigen::bfloat16> _read_embedding_row_bf16(uint32_t token_id);
-        std::vector<Eigen::bfloat16> _read_gemma4_mtp_target_hidden_row(
-            uint16_t num_tokens, uint16_t row
+        std::vector<uint32_t> _argmax_lm_head_rows(
+            uint16_t num_tokens, uint16_t valid_tokens
         );
-        void _upload_gemma4_mtp_freq_rows(uint16_t num_tokens, uint16_t position_id);
-        void _upload_gemma4_mtp_visible_mask(uint16_t num_tokens, uint16_t visible_tokens);
+        std::vector<Eigen::bfloat16> _read_embedding_row_bf16(uint32_t token_id);
+        std::vector<Eigen::bfloat16> _read_gemma4_mtp_target_hidden_rows(
+            uint16_t num_tokens, uint16_t valid_tokens
+        );
+        void _upload_gemma4_mtp_freq_rows(
+            uint16_t num_tokens, uint16_t position_id, uint16_t valid_tokens
+        );
+        void _upload_gemma4_mtp_causal_mask(
+            uint16_t num_tokens,
+            uint16_t first_visible_token_count,
+            uint16_t valid_tokens
+        );
         uint8_t _find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const;
         void _bind_gemma4_mtp_shared_kv_cache(
             LanguageModel& target_lm,
@@ -516,11 +530,15 @@ class LanguageModel : public BaseModel<VlmConfig> {
         Gemma4MtpTargetStepResult _run_gemma4_mtp_target_step(
             uint16_t token_idx, uint32_t token_id
         );
+        Gemma4MtpTargetBatchResult _run_gemma4_mtp_target_batch(
+            uint16_t token_idx, std::span<const uint32_t> token_ids
+        );
         Gemma4MtpDraftStepResult _run_gemma4_mtp_draft_step(
             LanguageModel& target_lm,
             uint32_t token_id,
             const std::vector<Eigen::bfloat16>& hidden_state,
-            uint16_t shared_kv_len
+            uint16_t shared_kv_len,
+            uint16_t draft_depth
         );
 
         void _notify_first_token(uint32_t token_id, double duration);

@@ -114,10 +114,15 @@ Model files load in parallel by default. When starting LLiMa alongside an
 active MLA workload, set `SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD=1` to load models
 one at a time so other inference requests can run between model loads.
 
-For EAGLE3 speculative decoding, pass the parent compiled-model directory that
-contains both the target and draft model subdirectories. `llima run` reads each
-subdirectory's `sima_files/devkit/vlm_config.json` and automatically selects the
-target and draft.
+For EAGLE3 or Gemma4 MTP speculative decoding, pass the parent
+compiled-model directory that contains both the target and draft model
+subdirectories. `llima run` reads each subdirectory's
+`sima_files/devkit/vlm_config.json` and automatically selects the target and
+draft. Gemma4 MTP artifacts must be compiled with matching pointwise n1
+target/draft models and the batched n5 target verification models; recompile
+older Gemma4 MTP artifacts after upgrading LLiMa. At runtime, sustained
+acceptance below 25% switches generation to pointwise target decoding so draft
+overhead does not dominate TPS.
 
 Model resolution order:
 
@@ -153,7 +158,7 @@ Inside `llima run --mode cli`:
 - `help`: print available commands.
 
 Set `SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT=1` to highlight tokens accepted from the
-draft model when running EAGLE3 speculative decoding in CLI mode.
+draft model when running speculative decoding in CLI mode.
 
 ## Model Compiler Python Package
 

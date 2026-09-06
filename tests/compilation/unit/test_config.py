@@ -8,14 +8,16 @@ import pytest
 from sima_lmm.config.vlm_config import (
     ModelFormat,
     PipelineConfig,
+    SpeculativeDecodingMethod,
     VlmConfig,
     group_cache_model_indices,
     single_cache_model_indices,
     vision_model_names,
 )
 from sima_lmm.config.whisper_config import WhisperConfig
-from sima_lmm.model import VisionLanguageModel
-from sima_lmm.model import vision_language_model
+from sima_lmm.host.configuration_helper import _encode_layer_id
+from sima_lmm.model import VisionLanguageModel, vision_language_model
+from sima_lmm.model.language_model import LanguageModel
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -178,6 +180,46 @@ def test_speculative_decoding_rejects_sliding_attention():
         match="EAGLE3 speculative decoding does not support sliding-window attention",
     ):
         config.lm_cfg.set_speculative_decoding_config({})
+
+
+def test_gemma4_mtp_target_compiles_point_and_batched_decode_models():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": SpeculativeDecodingMethod.GEMMA4_MTP,
+            "is_draft": False,
+            "speculative_budget": 5,
+        }
+    )
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    expected_layers = list(range(config.lm_cfg.num_hidden_layers))
+    assert _layer_indices(config, "point_pre") == expected_layers
+    assert _layer_indices(config, "point_post") == expected_layers
+    assert _layer_indices(config, "point_cache") == _layer_indices(
+        config, "single_cache"
+    )
+    assert _layer_indices(config, "point_sliding_cache") == _layer_indices(
+        config, "single_sliding_cache"
+    )
+    assert _layer_indices(config, "speculative_per_layer") == [0]
+    for layer_id in config.get_layer_ids():
+        _encode_layer_id(layer_id)
+
+
+def test_gemma4_mtp_draft_uses_pointwise_execution_width():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": SpeculativeDecodingMethod.GEMMA4_MTP,
+            "is_draft": True,
+            "speculative_budget": 4,
+        }
+    )
+    model = object.__new__(LanguageModel)
+    model.cfg = config
+
+    assert model._single_model_num_tokens == 1
 
 
 def test_legacy_pipeline_config_uses_stored_mask_for_all_attention_types():
