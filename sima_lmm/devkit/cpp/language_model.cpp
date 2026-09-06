@@ -1813,11 +1813,16 @@ void LanguageModel::_initialize() {
         );
         MLABuffer& future_token_mask_buf = get_buffer("future_token_mask");
         future_token_mask_buf.clear();
-        future_token_mask_buf.upload_raw(
-            future_token_mask.data(),
-            _cfg.pipeline_cfg.max_num_tokens * 2,
-            future_token_mask.size() * 2
-        );
+        // The pointwise Gemma4 MTP draft has exactly one max_num_tokens-wide
+        // mask row, with no legacy tail space. Its runtime mask is populated
+        // immediately before every draft execution.
+        if (!_cfg.lm_cfg.is_gemma4_mtp_draft()) {
+            future_token_mask_buf.upload_raw(
+                future_token_mask.data(),
+                _cfg.pipeline_cfg.max_num_tokens * 2,
+                future_token_mask.size() * 2
+            );
+        }
     }
     // Clear the KV caches and caches states.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
