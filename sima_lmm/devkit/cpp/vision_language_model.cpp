@@ -242,14 +242,18 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     ChronoTimer timer(true);
 
     // Generate the first token.
-    auto next_token_ids = _language_model_ptr->run_model(
+    auto prefill_result = _language_model_ptr->run_model(
         input_token_ids, std::nullopt, input_token_ids.size(), override_stop_token_ids
     );
     ttnt.emplace_back(timer.stop(true));
-    assert(next_token_ids.has_value() && next_token_ids.value().size() == 1);
-    auto next_token_id = next_token_ids.value()[0];
+    if (!prefill_result.has_value()) {
+        _language_model_ptr->clear_cached_token_ids();
+        _text_streamer.enable();
+        throw std::runtime_error("Performance request was interrupted during prefill");
+    }
+    auto next_token_id = _language_model_ptr->get_cached_first_generated_token();
 
-    if (!_language_model_ptr->get_stop_token_ids().contains(next_token_id)) {
+    if (prefill_result->empty()) {
         // Override the max_num_tokens and stop_token_ids.
         auto original_max_num_tokens = _language_model_ptr->set_max_num_tokens(
             override_max_num_tokens

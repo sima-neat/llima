@@ -379,7 +379,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
 
         // Prefill.
         auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
-        auto output_token_id_begin = _cached_token_ids.size() - 1;
+        const auto output_token_id_begin = input_token_ids.size();
         if (_stop_token_ids.contains(token_id)) {
             _notify_stop();
             output_token_ids = std::vector<uint32_t>{token_id};

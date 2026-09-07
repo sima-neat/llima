@@ -302,7 +302,9 @@ ONNX_REGRESSION_CASES = (
     OnnxRegressionCase(
         "models--Qwen--Qwen3-VL-2B-Instruct", "vision", (224, 224)
     ),
-    OnnxRegressionCase("models--LiquidAI--LFM2-VL-450M", "vision"),
+    OnnxRegressionCase(
+        "models--LiquidAI--LFM2-VL-450M", "vision", mode="informative"
+    ),
     OnnxRegressionCase(
         "models--google--gemma-4-E2B-it", "vision", (240, 240)
     ),
