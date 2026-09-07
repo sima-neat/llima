@@ -424,8 +424,16 @@ class LanguageModel(BaseModel):
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 
                 if self.cfg.lm_cfg.moe_cfg is not None:
-                    post_ofms = self._run_moe_post_onnx(
-                        eval_mode, num_tokens, layer_idx, pre_ifms[0], cache_ofms[0]
+                    router_ifms = [pre_ifms[0]]
+                    if (
+                        eval_mode == EvalMode.SDK
+                        and self.cfg.pipeline_cfg.quantize_embeddings
+                        and layer_idx == 0
+                    ):
+                        router_ifms.append(pre_ifms[1])
+                    router_ifms.append(cache_ofms[0])
+                    post_ofms = self._run_moe_post(
+                        eval_mode, num_tokens, layer_idx, router_ifms
                     )
                 else:
                     post_ifms = [pre_ifms[0]]
@@ -459,14 +467,18 @@ class LanguageModel(BaseModel):
         # Return the generated tokens.
         return np.array([new_tokens])
 
-    def _run_moe_post_onnx(self, eval_mode, num_tokens, layer_idx, hidden, self_attn):
-        """MoE post block: router (TopK+softmax on-graph) -> experts -> weighted-sum."""
+    def _run_moe_post(self, eval_mode, num_tokens, layer_idx, router_ifms):
+        """MoE post block: router (TopK+softmax on-graph) -> experts -> weighted-sum.
+
+        router_ifms is [hidden, self_attn], or [hidden, input_scale, self_attn] when
+        Model SDK evaluation feeds layer zero quantized embedding rows.
+        """
         moe = self.cfg.lm_cfg.moe_cfg
         num_experts = moe.num_experts
 
         router_model = self._get_part_model("router", num_tokens, layer_idx=layer_idx)
         values, indices, residual, norm_hidden = router_model.run_model(
-            eval_mode, [hidden, self_attn]
+            eval_mode, router_ifms
         )
         vals = values[0, 0]                    # (num_tokens, top_k)
         idxs = indices[0, 0].astype(np.int64)  # (num_tokens, top_k)

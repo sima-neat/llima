@@ -463,8 +463,20 @@ void LanguageModel::_define_moe_post_models(
     const MLABufferSlice hidden = is_draft ? pre_ifms[1] : pre_ifms[0];
     const MLABufferSlice self_attn = cache_ofms[0];
 
+    // Layer zero consumes embedding rows, which carry a per-row scale when the
+    // embedding table is quantized. The router replaces the dense post block, so it
+    // takes the scale on the same terms; the slice is a placeholder that
+    // _bind_attn_models binds at index 1.
+    const bool router_uses_embedding_scale = (
+        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 && !is_draft
+    );
+
     // Router -> top-k weights + indices (TopK+softmax on MLA) + residual h + norm(h).
-    std::vector<MLABufferSlice> router_ifms{hidden, self_attn};
+    std::vector<MLABufferSlice> router_ifms{hidden};
+    if (router_uses_embedding_scale) {
+        router_ifms.emplace_back(MLABufferSlice{nullptr, {0, 0}, {moe_nt, 1}});
+    }
+    router_ifms.emplace_back(self_attn);
     std::vector<MLABufferSlice> router_ofms{
         MLABufferSlice{&get_buffer(fmt::format("n{}_router_values", moe_nt))},
         MLABufferSlice{&get_buffer(fmt::format("n{}_router_indices", moe_nt))},
