@@ -1679,7 +1679,7 @@ void LanguageModel::_define_buffers() {
             "linear_valid_mask",
             {_cfg.pipeline_cfg.input_token_group_size, 1},
             "bfloat16",
-            false
+            true
         );
     }
 
