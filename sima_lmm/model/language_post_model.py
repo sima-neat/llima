@@ -35,14 +35,6 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.pipeline_cfg.enable_filter_sharing
 
     @property
-    def split_mlp(self) -> bool:
-        return self.cfg.pipeline_cfg.split_mlp
-
-    @property
-    def _is_moe_expert(self) -> bool:
-        return self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0
-
-    @property
     def uses_quantized_input_embeddings(self) -> bool:
         # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
         return super().uses_quantized_input_embeddings and not self.is_draft
@@ -51,6 +43,10 @@ class LanguagePostModel(LanguagePostBaseModel):
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
         return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+
+    @property
+    def _is_moe_expert(self) -> bool:
+        return self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0
 
     def gen_onnx_files(self):
         base_name = self._layer_base_name

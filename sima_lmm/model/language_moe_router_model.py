@@ -133,9 +133,12 @@ class LanguageMoeRouterModel(LanguagePartBaseModel):
             topk = _build_topk(probs)
             if self.cfg.lm_cfg.moe_cfg.norm_topk_prob:
                 # routing_weights /= routing_weights.sum(dim=-1, keepdim=True).
+                # ReduceSum takes axes as its second input from opset 13 on, not as
+                # an attribute the way ReduceMean still does.
                 total = self._onnx_builder.build_op(
-                    f"{base_name}.mlp.router_sum", [[topk, 0]], "ReduceSum",
-                    axes=[1], keepdims=1
+                    f"{base_name}.mlp.router_sum",
+                    [[topk, 0], np.array([1], dtype=np.int64)],
+                    "ReduceSum", keepdims=1
                 )
                 router_values = self._onnx_builder.build_op(
                     f"{base_name}.mlp.router_norm", [[topk, 0], total], "Div"
