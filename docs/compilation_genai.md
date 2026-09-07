@@ -139,6 +139,15 @@ Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 819
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
 | `--compile_lora`, `--no-compile_lora` | Enable or disable adapter-weight compilation when LoRA paths are supplied. Enabled by default. |
 
+Gemma4 MTP assistants with `use_ordered_embeddings=true` must contain
+`masked_embedding.centroids.weight` and
+`masked_embedding.token_ordering`. The compiler validates both tensors,
+adds centroid logits to the draft post model, and writes
+`gemma4_token_ordering.npy` into the draft DevKit directory. Recompile
+packages produced before this metadata was emitted; older packages remain
+loadable through the full-vocabulary compatibility path but do not reproduce
+the assistant's centroid-filtered proposal selection.
+
 ## System Prompts
 
 Use `--system_prompt` or `--system_prompt_file` to store a system prompt in the

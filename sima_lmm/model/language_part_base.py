@@ -246,6 +246,20 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 self._onnx_builder.create_output_node(
                     output_name, (1, split_size, 1, self.num_tokens)
                 )
+            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                centroid_output = output_nodes[self.cfg.lm_cfg.lm_head_num_splits]
+                centroid_output_name = self._onnx_builder.get_node_output_name(
+                    centroid_output
+                )
+                self._onnx_builder.create_output_node(
+                    centroid_output_name,
+                    (
+                        1,
+                        self.cfg.lm_cfg.assistant_num_centroids,
+                        1,
+                        self.num_tokens,
+                    ),
+                )
             if self.is_draft or self.is_gemma4_mtp_target:
                 # Drafts return next-step state; MTP targets expose final target activations.
                 hidden_state_size = (
@@ -307,6 +321,13 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             lm_heads.append(input_node)
             return lm_heads
         if self.is_gemma4_mtp_draft:
+            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                centroid_logits = self._onnx_builder.build_conv(
+                    "masked_embedding.centroids",
+                    rms_norm2,
+                    src_weight_name="masked_embedding.centroids.weight",
+                )
+                lm_heads.append(centroid_logits)
             projected_state = self._onnx_builder.build_conv(
                 "post_projection", rms_norm2, src_weight_name="post_projection.weight"
             )
@@ -380,6 +401,16 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             lm_heads.append(input_node)
             return lm_heads
         if self.is_gemma4_mtp_draft:
+            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                centroid_logits = build_conv(
+                    builder,
+                    self.get_hf_param,
+                    self.check_hf_param,
+                    "masked_embedding.centroids",
+                    rms_norm,
+                    src_weight_name="masked_embedding.centroids.weight",
+                )
+                lm_heads.append(centroid_logits)
             projected_state = build_conv(
                 builder, self.get_hf_param, self.check_hf_param, "post_projection", rms_norm,
                 src_weight_name="post_projection.weight"

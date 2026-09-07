@@ -72,3 +72,14 @@ set_tests_properties(
         LABELS "devkit;runtime;unit"
         TIMEOUT 30
 )
+
+add_test(
+    runtime.gemma4_mtp_helpers
+    "./sima_lmm_gemma4_mtp_helpers_test"
+)
+set_tests_properties(
+    runtime.gemma4_mtp_helpers
+    PROPERTIES
+        LABELS "devkit;runtime;unit;gemma4;speculative"
+        TIMEOUT 30
+)

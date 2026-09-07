@@ -1814,6 +1814,58 @@ void LanguageModel::_initialize() {
             _d2t[i] = static_cast<int32_t>(src[i]);
         }
         _logger->info("Loaded d2t mapping with {} entries", _d2t.size());
+    } else if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+        const auto ordering_file_name = _devkit_dir / "gemma4_token_ordering.npy";
+        const auto ordering_tensor = cnpy::npy_load(ordering_file_name);
+        const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
+        if (
+            ordering_tensor.word_size != sizeof(int64_t)
+            || ordering_tensor.num_vals != vocab_size
+        ) {
+            throw std::runtime_error(fmt::format(
+                "Invalid Gemma4 MTP token ordering in {}: expected {} int64 entries",
+                ordering_file_name.string(),
+                vocab_size
+            ));
+        }
+        if (
+            _cfg.lm_cfg.assistant_num_centroids == 0
+            || vocab_size % _cfg.lm_cfg.assistant_num_centroids != 0
+            || _cfg.lm_cfg.assistant_centroid_intermediate_top_k == 0
+            || _cfg.lm_cfg.assistant_centroid_intermediate_top_k
+                > _cfg.lm_cfg.assistant_num_centroids
+        ) {
+            throw std::runtime_error("Invalid Gemma4 MTP ordered-embedding configuration");
+        }
+
+        const int64_t* source = ordering_tensor.data<int64_t>();
+        std::vector<uint8_t> seen(vocab_size, 0);
+        _gemma4_token_ordering.resize(vocab_size);
+        for (size_t index = 0; index < vocab_size; ++index) {
+            const int64_t token_id = source[index];
+            if (
+                token_id < 0 || static_cast<size_t>(token_id) >= vocab_size
+                || seen[static_cast<size_t>(token_id)] != 0
+            ) {
+                throw std::runtime_error(fmt::format(
+                    "Invalid Gemma4 MTP token ordering entry at index {}", index
+                ));
+            }
+            seen[static_cast<size_t>(token_id)] = 1;
+            _gemma4_token_ordering[index] = static_cast<uint32_t>(token_id);
+        }
+        _logger->info(
+            "Loaded Gemma4 MTP token ordering with {} entries",
+            _gemma4_token_ordering.size()
+        );
+    } else if (
+        _cfg.lm_cfg.is_gemma4_mtp_draft()
+        && _cfg.lm_cfg.assistant_use_ordered_embeddings
+    ) {
+        _logger->warn(
+            "Gemma4 MTP ordered embeddings are disabled for this legacy artifact; "
+            "recompile the model to enable masked LM-head selection"
+        );
     }
 
     // Upload freq real and imag.
@@ -2258,6 +2310,12 @@ void LanguageModel::_define_buffers() {
                 fmt::format("n{}_buffer5", num_tokens),
                 {num_tokens, _cfg.lm_cfg.assistant_backbone_hidden_size}
             );
+            if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+                define_buffer(
+                    fmt::format("n{}_gemma4_mtp_centroid_logits", num_tokens),
+                    {num_tokens, _cfg.lm_cfg.assistant_num_centroids}
+                );
+            }
         }
     }
 

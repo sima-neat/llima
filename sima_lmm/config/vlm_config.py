@@ -657,6 +657,9 @@ class LanguageModelConfig(BaseConfig):
             Gemma4 MTP assistant projections.
         assistant_use_ordered_embeddings: Whether the assistant uses the centroid-based
             ordered/masked embedding head.
+        assistant_masked_lm_head_enabled: Whether compiler outputs include the centroid
+            logits and token-ordering artifact required to reproduce the masked head.
+            Kept separate from source metadata so older compiled artifacts remain loadable.
         assistant_num_centroids: Number of ordered-embedding centroids for Gemma4 MTP.
         assistant_centroid_intermediate_top_k: Active centroids for Gemma4 MTP.
         speculative_decoding_cfg: Speculative-decoding settings; None unless this
@@ -687,6 +690,7 @@ class LanguageModelConfig(BaseConfig):
     assistant_model_type: str = ""
     assistant_backbone_hidden_size: int = 0
     assistant_use_ordered_embeddings: bool = False
+    assistant_masked_lm_head_enabled: bool = False
     assistant_num_centroids: int = 0
     assistant_centroid_intermediate_top_k: int = 0
     conv_L_cache: int = 3
@@ -725,8 +729,26 @@ class LanguageModelConfig(BaseConfig):
         self.assistant_model_type = cfg.get("model_type", "")
         self.assistant_backbone_hidden_size = cfg.get("backbone_hidden_size", 0)
         self.assistant_use_ordered_embeddings = cfg.get("use_ordered_embeddings", False)
-        self.assistant_num_centroids = cfg.get("num_centroids", 0)
-        self.assistant_centroid_intermediate_top_k = cfg.get("centroid_intermediate_top_k", 0)
+        self.assistant_masked_lm_head_enabled = self.assistant_use_ordered_embeddings
+        self.assistant_num_centroids = cfg.get("num_centroids", 2048)
+        self.assistant_centroid_intermediate_top_k = cfg.get("centroid_intermediate_top_k", 32)
+        if self.assistant_use_ordered_embeddings:
+            if self.assistant_num_centroids <= 0:
+                raise ValueError("Gemma4 ordered embeddings require num_centroids > 0")
+            if self.token_cfg.vocab_size % self.assistant_num_centroids != 0:
+                raise ValueError(
+                    "Gemma4 ordered-embedding vocabulary size must be divisible by "
+                    f"num_centroids: vocab_size={self.token_cfg.vocab_size}, "
+                    f"num_centroids={self.assistant_num_centroids}"
+                )
+            if not (
+                0 < self.assistant_centroid_intermediate_top_k <= self.assistant_num_centroids
+            ):
+                raise ValueError(
+                    "Gemma4 ordered embeddings require centroid_intermediate_top_k in "
+                    f"[1, {self.assistant_num_centroids}], got "
+                    f"{self.assistant_centroid_intermediate_top_k}"
+                )
 
     @property
     def is_gemma4_assistant(self) -> bool:

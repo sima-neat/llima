@@ -511,6 +511,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
         uint32_t _argmax_lm_head_row(uint16_t num_tokens, uint16_t row);
+        uint32_t _argmax_gemma4_mtp_masked_row(uint16_t num_tokens, uint16_t row);
         std::vector<uint32_t> _argmax_lm_head_rows(
             uint16_t num_tokens, uint16_t valid_tokens
         );
@@ -546,8 +547,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             LanguageModel& target_lm,
             uint32_t token_id,
             const std::vector<Eigen::bfloat16>& hidden_state,
-            uint16_t shared_kv_len,
-            uint16_t draft_depth
+            uint16_t shared_kv_len
         );
 
         void _notify_first_token(uint32_t token_id, double duration);
@@ -582,6 +582,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<MLABuffer*> _per_layer_embedding_shards;
         std::vector<uint32_t> _prompt_per_layer_token_ids;
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
+        std::vector<uint32_t> _gemma4_token_ordering;
         std::vector<uint16_t> _checkpoint_boundaries;
         std::vector<CacheStateLayout> _cache_state_layouts;
         std::vector<CacheBufferSpec> _cache_buffer_specs;

@@ -11,6 +11,7 @@
 
 #include <fmt/format.h>
 
+#include "gemma4_mtp_helpers.hpp"
 #include "language_model.hpp"
 
 namespace simaai {
@@ -32,6 +33,9 @@ uint32_t LanguageModel::_argmax_lm_head_row(uint16_t num_tokens, uint16_t row) {
         throw std::runtime_error(fmt::format(
             "lm_head row {} is outside n{} output", row, num_tokens
         ));
+    }
+    if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+        return _argmax_gemma4_mtp_masked_row(num_tokens, row);
     }
 
     const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
@@ -70,6 +74,72 @@ uint32_t LanguageModel::_argmax_lm_head_row(uint16_t num_tokens, uint16_t row) {
         }
     }
     return best_idx;
+}
+
+uint32_t LanguageModel::_argmax_gemma4_mtp_masked_row(
+    uint16_t num_tokens, uint16_t row
+) {
+    const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
+    if (_gemma4_token_ordering.size() != output_size) {
+        throw std::runtime_error("Gemma4 token_ordering is not loaded");
+    }
+
+    const uint32_t num_centroids = _cfg.lm_cfg.assistant_num_centroids;
+    auto& centroid_buf = get_buffer(
+        fmt::format("n{}_gemma4_mtp_centroid_logits", num_tokens)
+    );
+    std::vector<Eigen::bfloat16> centroid_logits(
+        static_cast<size_t>(num_tokens) * num_centroids
+    );
+    centroid_buf.download(centroid_logits.data());
+    const auto candidate_tokens = gemma4_mtp_helpers::select_candidate_tokens(
+        std::span<const Eigen::bfloat16>(
+            centroid_logits.data() + static_cast<size_t>(row) * num_centroids,
+            num_centroids
+        ),
+        _gemma4_token_ordering,
+        _cfg.lm_cfg.assistant_centroid_intermediate_top_k
+    );
+
+    uint32_t best_token = std::numeric_limits<uint32_t>::max();
+    float best_value = -std::numeric_limits<float>::infinity();
+    const uint16_t num_splits = _cfg.lm_cfg.lm_head_num_splits;
+    const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
+    for (uint16_t split_idx = 0; split_idx < num_splits; ++split_idx) {
+        const uint32_t split_begin = static_cast<uint32_t>(split_idx) * split_dim;
+        const uint32_t split_size = (num_splits == 1)
+            ? output_size
+            : std::min<uint32_t>(split_dim, output_size - split_begin);
+        const std::string buf_name = (num_splits == 1)
+            ? fmt::format("n{}_buffer4", num_tokens)
+            : fmt::format("n{}_lm_split{}", num_tokens, split_idx);
+        auto& buf = get_buffer(buf_name);
+        std::vector<Eigen::bfloat16> split_logits(
+            static_cast<size_t>(num_tokens) * split_size
+        );
+        buf.download(split_logits.data());
+        const auto* row_ptr = (
+            split_logits.data() + static_cast<size_t>(row) * split_size
+        );
+        const uint32_t split_end = split_begin + split_size;
+        for (const uint32_t token : candidate_tokens) {
+            if (token < split_begin || token >= split_end) {
+                continue;
+            }
+            const float value = static_cast<float>(row_ptr[token - split_begin]);
+            if (
+                value > best_value
+                || (value == best_value && token < best_token)
+            ) {
+                best_value = value;
+                best_token = token;
+            }
+        }
+    }
+    if (best_token == std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("Gemma4 masked lm_head selected no token");
+    }
+    return best_token;
 }
 
 std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
@@ -640,12 +710,8 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     LanguageModel& target_lm,
     uint32_t token_id,
     const std::vector<Eigen::bfloat16>& hidden_state,
-    uint16_t shared_kv_len,
-    uint16_t draft_depth
+    uint16_t shared_kv_len
 ) {
-    if (shared_kv_len == 0) {
-        throw std::runtime_error("Gemma4 MTP draft requires at least one target KV row");
-    }
     const uint32_t backbone_hidden_size = _cfg.lm_cfg.assistant_backbone_hidden_size;
     if (hidden_state.size() != backbone_hidden_size) {
         throw std::runtime_error(fmt::format(
@@ -655,13 +721,11 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     }
 
     const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    const uint16_t query_position_id = checked_u16(
-        static_cast<size_t>(shared_kv_len - 1) + draft_depth,
-        "Gemma4 MTP draft position"
+    // The assistant never extends the target-owned KV cache. Every proposal in
+    // one drafting round therefore queries the last target position.
+    const uint16_t query_position_id = gemma4_mtp_helpers::draft_query_position(
+        shared_kv_len, _cfg.pipeline_cfg.max_num_tokens
     );
-    if (query_position_id >= _cfg.pipeline_cfg.max_num_tokens) {
-        throw std::runtime_error("Gemma4 MTP draft position exceeds cache capacity");
-    }
     const uint16_t cache_model_token_idx = shared_kv_len > num_tokens
         ? static_cast<uint16_t>(shared_kv_len - num_tokens)
         : 0;
@@ -980,13 +1044,12 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 target_step.hidden_state
             );
             const uint16_t shared_kv_len = static_cast<uint16_t>(current_pos + 1);
-            for (uint16_t depth = 0; depth < draft_budget; ++depth) {
+            while (draft_steps.size() < draft_budget) {
                 auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
                     *this,
                     draft_input_token,
                     draft_hidden,
-                    shared_kv_len,
-                    depth
+                    shared_kv_len
                 );
                 draft_input_token = draft_step.token_id;
                 draft_hidden = draft_step.projected_hidden_state;

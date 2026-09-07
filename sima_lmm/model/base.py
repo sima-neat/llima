@@ -47,6 +47,33 @@ from sima_utils.logging.sima_logger import (
     ScopedLogLevel, sima_log_exception, sima_log_dbg, sima_log_info
 )
 
+GEMMA4_TOKEN_ORDERING_FILE = "gemma4_token_ordering.npy"
+
+
+def validate_gemma4_token_ordering(
+    token_ordering: np.ndarray, vocab_size: int
+) -> np.ndarray:
+    """Validate and canonicalize the assistant's centroid-to-token permutation."""
+    if not isinstance(token_ordering, np.ndarray) or not np.issubdtype(
+        token_ordering.dtype, np.integer
+    ):
+        raise ValueError("Gemma4 token_ordering must be an integer tensor")
+    ordering = token_ordering.reshape(-1)
+    if ordering.size != vocab_size:
+        raise ValueError(
+            "Gemma4 token_ordering size does not match vocabulary size: "
+            f"ordering={ordering.size}, vocab_size={vocab_size}"
+        )
+    if (
+        np.any(ordering < 0)
+        or np.any(ordering >= vocab_size)
+        or np.unique(ordering).size != vocab_size
+    ):
+        raise ValueError(
+            "Gemma4 token_ordering must be a permutation of canonical token IDs"
+        )
+    return ordering.astype(np.int64, copy=False)
+
 
 class FileGenMode(Enum):
     """
@@ -596,6 +623,20 @@ class BaseModel(ABC):
                 if tensor_name in self.hf_model.weight_map:
                     tensor = self.hf_model.load_np_param(tensor_name)
                     np.save(out_path, tensor)
+
+            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                ordering_path = self.sima_devkit_path / GEMMA4_TOKEN_ORDERING_FILE
+                if not (resume and ordering_path.is_file()):
+                    tensor_name = "masked_embedding.token_ordering"
+                    if not self.hf_model.param_exists(tensor_name):
+                        raise ValueError(
+                            f"Gemma4 ordered embeddings require {tensor_name}"
+                        )
+                    ordering = validate_gemma4_token_ordering(
+                        self.hf_model.load_np_param(tensor_name),
+                        self.cfg.lm_cfg.token_cfg.vocab_size,
+                    )
+                    np.save(ordering_path, ordering)
         else:
             assert isinstance(self.hf_model, GgufModel)
             # Copy the GGUF file to construct the VlmHelper.

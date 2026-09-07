@@ -192,6 +192,7 @@ struct LanguageModelConfig {
     std::string assistant_model_type = "";
     uint32_t assistant_backbone_hidden_size = 0;
     bool assistant_use_ordered_embeddings = false;
+    bool assistant_masked_lm_head_enabled = false;
     uint32_t assistant_num_centroids = 0;
     uint32_t assistant_centroid_intermediate_top_k = 0;
     std::optional<SpeculativeDecodingConfig> speculative_decoding_cfg = std::nullopt;
@@ -254,6 +255,10 @@ struct LanguageModelConfig {
         return assistant_model_type == "gemma4_assistant";
     }
 
+    bool uses_gemma4_masked_lm_head() const {
+        return is_gemma4_mtp_draft() && assistant_masked_lm_head_enabled;
+    }
+
     uint32_t get_lm_head_output_size() const {
         if (is_speculative_draft() && draft_vocab_size > 0) {
             return draft_vocab_size;
@@ -267,7 +272,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     hidden_size_per_layer_input, num_kv_shared_layers,
     rms_norm_eps, rms_norm_unit_offset,
     draft_vocab_size, assistant_model_type, assistant_backbone_hidden_size,
-    assistant_use_ordered_embeddings, assistant_num_centroids,
+    assistant_use_ordered_embeddings, assistant_masked_lm_head_enabled,
+    assistant_num_centroids,
     assistant_centroid_intermediate_top_k, speculative_decoding_cfg
 )
 

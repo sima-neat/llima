@@ -269,6 +269,8 @@ jobs:
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/sima_lmm_reasoning_parser_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_gemma4_mtp_helpers_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./share/sima-lmm/tests/runtime/pytest.ini" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./share/sima-lmm/tests/runtime/test_mla_memory_cleanup.py" >/dev/null

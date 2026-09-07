@@ -432,6 +432,16 @@ void LanguageModel::_define_attn_models_iter(
             }
         }
 
+        if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+            post_ofms.emplace_back(
+                MLABufferSlice{
+                    &get_buffer(fmt::format(
+                        "n{}_gemma4_mtp_centroid_logits", post_num_tokens
+                    ))
+                }
+            );
+        }
+
         if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
             post_ofms.emplace_back(
                 MLABufferSlice{

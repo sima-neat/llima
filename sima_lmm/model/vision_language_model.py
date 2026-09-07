@@ -17,6 +17,7 @@ from sima_lmm.model.base import (
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
+from sima_lmm.utils import ceil_div_row, mla_max_num_rows
 from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
 
 
@@ -140,11 +141,19 @@ class VisionLanguageModel(BaseModel):
                         f"assistant={vlm_cfg.lm_cfg.assistant_backbone_hidden_size}, "
                         f"target={target_model.cfg.lm_cfg.hidden_size}"
                     )
-                if vlm_cfg.lm_cfg.assistant_use_ordered_embeddings:
-                    sima_log_warning(
-                        "Gemma4 MTP MVP compiles the assistant full lm_head; "
-                        "ordered/masked embedding lowering is not implemented yet."
+                if vlm_cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                    required_tensors = (
+                        "masked_embedding.centroids.weight",
+                        "masked_embedding.token_ordering",
                     )
+                    missing_tensors = [
+                        name for name in required_tensors if not hf_model.param_exists(name)
+                    ]
+                    if missing_tensors:
+                        raise ValueError(
+                            "Gemma4 ordered embeddings require checkpoint tensors: "
+                            + ", ".join(missing_tensors)
+                        )
 
             # Some draft models use target model's tokenization scheme.
             tokenizer_files = ("tokenizer_config.json", "tokenizer.json", "tokenizer.model")
