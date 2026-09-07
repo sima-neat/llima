@@ -46,7 +46,7 @@ class LanguagePostModel(LanguagePostBaseModel):
 
     @property
     def _is_moe_expert(self) -> bool:
-        return self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0g
+        return self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0
 
     def gen_onnx_files(self):
         base_name = self._layer_base_name
