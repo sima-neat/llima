@@ -58,7 +58,6 @@ DiskEmbeddingTable::DiskEmbeddingTable(
         if (!S_ISREG(st.st_mode) || st.st_size < 0 || static_cast<uint64_t>(st.st_size) != rows * row_bytes)
             throw std::runtime_error("Invalid embedding file size: " + path.string());
         posix_fadvise(_fd, 0, 0, POSIX_FADV_RANDOM);
-        posix_fadvise(_fd, 0, 0, POSIX_FADV_DONTNEED);
     } catch (...) {
         close(_fd);
         throw;
@@ -85,17 +84,9 @@ void DiskEmbeddingTable::gather(std::span<const uint32_t> ids, void* destination
             done += static_cast<size_t>(n);
         }
     };
-    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    auto evict_row = [this, page](uint32_t id) {
-        const size_t offset = static_cast<size_t>(id) * _row_bytes;
-        const size_t aligned = offset / page * page;
-        const size_t count = (offset - aligned + _row_bytes + page - 1) / page * page;
-        posix_fadvise(_fd, aligned, count, POSIX_FADV_DONTNEED);
-    };
     // Decode has no duplicates: read directly without allocating gather metadata.
     if (ids.size() == 1) {
         read_row(ids.front(), dst);
-        evict_row(ids.front());
         return;
     }
     std::unordered_map<uint32_t, size_t> seen;
@@ -124,9 +115,6 @@ void DiskEmbeddingTable::gather(std::span<const uint32_t> ids, void* destination
         const size_t source = seen.at(ids[i]);
         if (source != i) std::memcpy(dst + i * stride, dst + source * stride, _row_bytes);
     }
-    // Avoid retaining a second table in Linux's page cache. Advisories are best
-    // effort (e.g. another process may hold these pages); no global cache drop.
-    for (const auto& [id, row] : seen) evict_row(id);
 }
 
 } // namespace simaai::llima
