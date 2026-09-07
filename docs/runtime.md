@@ -42,7 +42,10 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 Use `llima run` as a simple runtime for initial model validation on Modalix.
 
 In CLI mode, chat history is enabled by default. Each prompt and response is
-kept as context for the next turn until you clear it with `clear history`.
+kept as context for the next turn until you clear it with `clear history`. Images
+submitted with a prompt are also retained as part of that history. `clear history`
+removes the submitted prompts, responses, and all images. The configured system
+prompt remains active until you use `clear system` or replace it with `set system`.
 
 ``` console
 modalix:~$ llima run <model> [options]
@@ -68,10 +71,9 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | Command | Description |
 |----|----|
 | `add image <file>` | Add an image to the current prompt context. |
-| `clear image` | Clear all images. |
 | `set system <prompt>` | Set the system prompt. |
 | `clear system` | Clear the system prompt, chat history, and images. |
-| `clear history` | Clear chat history and images. |
+| `clear history` | Clear submitted prompts, responses, and all images while preserving the system prompt. |
 | `print history` | Print chat history. |
 | `set audio <file>` | Set the audio file to transcribe as the query. |
 | `set language <lang>` | Set the language string used for transcription. |
