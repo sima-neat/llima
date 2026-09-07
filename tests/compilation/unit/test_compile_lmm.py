@@ -11,14 +11,14 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 @pytest.mark.parametrize(
     ("options", "expected"),
     [
-        ([], (False, True, True, True, False)),
+        ([], (False, True, True, False)),
         (
             ["--onnx", "--no-quantize_embeddings", "--no-quantize_kv_cache"],
-            (False, False, False, True, False),
+            (False, False, False, False),
         ),
         (
             ["--draft_model_path", "draft"],
-            (False, True, True, True, True),
+            (False, True, True, True),
         ),
         (
             [
@@ -26,7 +26,7 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
                 "--no-quantize_embeddings",
                 "--no-quantize_kv_cache",
             ],
-            (True, False, False, True, False),
+            (True, False, False, False),
         ),
     ],
 )
@@ -34,7 +34,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
     options: list[str],
-    expected: tuple[bool, bool, bool, bool, bool],
+    expected: tuple[bool, bool, bool, bool],
 ):
     calls = []
     monkeypatch.setattr(
@@ -55,7 +55,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     compile_lmm.main()
 
     args = calls[0]
-    assert (args[12], args[13], args[14], args[15], args[16]) == expected
+    assert (args[12], args[13], args[14], args[15]) == expected
 
 
 @pytest.mark.parametrize(

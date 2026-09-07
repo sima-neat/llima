@@ -41,16 +41,18 @@ class WhisperConfig(BaseConfig):
             name: value
             for name, value in model_cfg.items() if name in field_names
         }
-        if filtered_model_cfg.get("suppress_tokens") is None:
-            filtered_model_cfg["suppress_tokens"] = []
         generation_cfg_file = find_file(
             directory=Path(model_path), filename="generation_config.json", resolve=False
         )
         if generation_cfg_file is not None:
             with open(generation_cfg_file, "r") as f:
                 generation_cfg = json.load(f)
+            if "suppress_tokens" in generation_cfg:
+                filtered_model_cfg["suppress_tokens"] = generation_cfg["suppress_tokens"]
             if "lang_to_id" in generation_cfg:
                 filtered_model_cfg["num_languages"] = len(generation_cfg["lang_to_id"])
+        if filtered_model_cfg.get("suppress_tokens") is None:
+            filtered_model_cfg["suppress_tokens"] = []
         return WhisperConfig(**filtered_model_cfg)
 
     @staticmethod

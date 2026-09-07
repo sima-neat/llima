@@ -139,10 +139,10 @@ llima rm <model>
 Inside `llima run --mode cli`:
 
 - `add image <file>`: add an image.
-- `clear image`: clear all images.
 - `set system <prompt>`: set the system prompt.
 - `clear system`: clear system prompt, chat history, and images.
-- `clear history`: clear chat history and images.
+- `clear history`: clear submitted prompts, responses, and all images while preserving the system
+  prompt.
 - `print history`: print chat history.
 - `set audio <file>`: set an audio file for transcription.
 - `set language <lang>`: set transcription language.

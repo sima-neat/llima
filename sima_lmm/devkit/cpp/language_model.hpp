@@ -103,6 +103,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::set<uint32_t> set_stop_token_ids(std::optional<std::set<uint32_t>> stop_token_ids);
         const auto& get_stop_token_ids() const { return _stop_token_ids; }
         void clear_cached_token_ids() { _cached_token_ids.clear(); }
+        uint32_t get_cached_first_generated_token() const {
+            return _cached_first_generated_token;
+        }
 
         // Captured hidden states from layers 2, N/2, N-3 during prefill (spec decoding).
         // Populated by run_model_once when queue is disabled and spec mode is active.
