@@ -101,6 +101,65 @@ void test_rejects_invalid_qwen35_xml_tool_calls() {
     );
 }
 
+void test_preserves_argument_order() {
+    struct TestCase {
+        ToolCallFormat format;
+        std::string text;
+        std::string label;
+    };
+    const std::vector<TestCase> test_cases = {
+        {
+            ToolCallFormat::Lfm,
+            R"(<|tool_call_start|>[plan_route(origin='Berlin', destination='Paris')]<|tool_call_end|>)",
+            "LFM"
+        },
+        {
+            ToolCallFormat::Gemma,
+            R"(<|tool_call>call:plan_route{origin:<|"|>Berlin<|"|>,destination:<|"|>Paris<|"|>}<tool_call|>)",
+            "Gemma"
+        },
+        {
+            ToolCallFormat::Mistral,
+            R"([TOOL_CALLS][{"name":"plan_route","arguments":{"origin":"Berlin","destination":"Paris"}}])",
+            "Mistral"
+        },
+        {
+            ToolCallFormat::Qwen,
+            R"(<tool_call>{"name":"plan_route","arguments":{"origin":"Berlin","destination":"Paris"}}</tool_call>)",
+            "Qwen"
+        },
+        {
+            ToolCallFormat::Qwen35,
+            R"(<tool_call><function=plan_route><parameter=origin>Berlin</parameter><parameter=destination>Paris</parameter></function></tool_call>)",
+            "Qwen3.5"
+        },
+        {
+            ToolCallFormat::Llama,
+            R"({"name":"plan_route","arguments":{"origin":"Berlin","destination":"Paris"}})",
+            "Llama"
+        },
+        {
+            ToolCallFormat::GenericJson,
+            R"({"name":"plan_route","arguments":{"origin":"Berlin","destination":"Paris"}})",
+            "generic JSON"
+        }
+    };
+
+    for (const auto& test_case : test_cases) {
+        const auto calls = try_parse_tool_calls(
+            test_case.format, test_case.text, {"plan_route"}
+        );
+        expect(!calls.is_null(), test_case.label + " call with multiple arguments must parse");
+        if (calls.is_null()) continue;
+
+        expect(
+            calls.at(0).at("function").at("arguments") ==
+                R"({"origin":"Berlin","destination":"Paris"})",
+            test_case.label + " argument serialization must preserve generated order"
+        );
+    }
+}
+
 void test_streams_qwen35_xml_tool_calls() {
     ToolCallStreamParser parser(ToolCallFormat::Qwen35, {"set_ac"});
     expect(
@@ -378,6 +437,7 @@ void test_preserves_stream_content_provenance() {
 int main() {
     test_parses_qwen35_xml_tool_calls();
     test_rejects_invalid_qwen35_xml_tool_calls();
+    test_preserves_argument_order();
     test_streams_qwen35_xml_tool_calls();
     test_rejects_premature_lfm_string_close();
     test_quotes_complete_gemma_keys();

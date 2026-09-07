@@ -65,7 +65,7 @@ constexpr std::string_view qwen35_parameter_open = "<parameter=";
 constexpr std::string_view qwen35_parameter_close = "</parameter>";
 
 nlohmann::json build_tool_call_entry(
-    const nlohmann::json& parsed,
+    const nlohmann::ordered_json& parsed,
     int& id_counter,
     const std::vector<std::string>* allowed_tool_names
 ) {
@@ -80,7 +80,7 @@ nlohmann::json build_tool_call_entry(
         return nullptr;
     }
 
-    const nlohmann::json* raw_args = nullptr;
+    const nlohmann::ordered_json* raw_args = nullptr;
     if (parsed.contains("arguments")) {
         raw_args = &parsed["arguments"];
     } else if (parsed.contains("parameters")) {
@@ -88,11 +88,11 @@ nlohmann::json build_tool_call_entry(
     }
     if (raw_args == nullptr) return nullptr;
 
-    nlohmann::json args;
+    nlohmann::ordered_json args;
     if (raw_args->is_object()) {
         args = *raw_args;
     } else if (raw_args->is_string()) {
-        args = nlohmann::json::parse(raw_args->get<std::string>());
+        args = nlohmann::ordered_json::parse(raw_args->get<std::string>());
         if (!args.is_object()) return nullptr;
     } else {
         return nullptr;
@@ -201,7 +201,7 @@ std::string gemma4_bare_to_json(const std::string& text) {
 }
 
 nlohmann::json parse_json_array_tool_calls(
-    const nlohmann::json& parsed,
+    const nlohmann::ordered_json& parsed,
     int& id_counter,
     const std::vector<std::string>* allowed_tool_names
 ) {
@@ -221,7 +221,7 @@ nlohmann::json parse_json_tool_call_envelope(
     int& id_counter,
     const std::vector<std::string>* allowed_tool_names
 ) {
-    const auto parsed = nlohmann::json::parse(std::string(text));
+    const auto parsed = nlohmann::ordered_json::parse(std::string(text));
     if (!parsed.is_object() || !parsed.contains("tool_calls") ||
         !parsed["tool_calls"].is_array()) {
         return nullptr;
@@ -270,7 +270,9 @@ nlohmann::json parse_plain_json_tool_calls(
         if (text[pos] != '{') return nullptr;
         auto close = find_matching_brace(text, pos);
         if (close == std::string_view::npos) return nullptr;
-        auto parsed = nlohmann::json::parse(std::string(text.substr(pos, close - pos + 1)));
+        auto parsed = nlohmann::ordered_json::parse(
+            std::string(text.substr(pos, close - pos + 1))
+        );
         if (allow_function_wrapper && parsed.is_object() && parsed.size() == 1 &&
             parsed.contains("function") && parsed["function"].is_object()) {
             parsed = parsed["function"];
@@ -332,7 +334,7 @@ std::vector<std::string_view> split_top_level(std::string_view text, char separa
     return parts;
 }
 
-std::optional<nlohmann::json> parse_python_value(std::string_view value) {
+std::optional<nlohmann::ordered_json> parse_python_value(std::string_view value) {
     value = trim_view(value);
     if (value.size() >= 2 && ((value.front() == '\'' && value.back() == '\'') ||
                               (value.front() == '"' && value.back() == '"'))) {
@@ -353,7 +355,7 @@ std::optional<nlohmann::json> parse_python_value(std::string_view value) {
                             std::all_of(value.begin() + idx + 1, value.begin() + idx + 5,
                                         [](char c) { return std::isxdigit(
                                             static_cast<unsigned char>(c)) != 0; })) {
-                            const auto decoded = nlohmann::json::parse(
+                            const auto decoded = nlohmann::ordered_json::parse(
                                 "\"\\u" + std::string(value.substr(idx + 1, 4)) + "\"",
                                 nullptr, false);
                             if (decoded.is_string()) {
@@ -377,9 +379,9 @@ std::optional<nlohmann::json> parse_python_value(std::string_view value) {
     }
     if (value == "True") return true;
     if (value == "False") return false;
-    if (value == "None") return nlohmann::json(nullptr);
+    if (value == "None") return nlohmann::ordered_json(nullptr);
     try {
-        return nlohmann::json::parse(std::string(value));
+        return nlohmann::ordered_json::parse(std::string(value));
     } catch (const nlohmann::json::exception&) {
         return std::nullopt;
     }
@@ -408,7 +410,7 @@ nlohmann::json parse_lfm_tool_calls(
         const auto name = trim_view(call.substr(0, open));
         if (name.empty()) return nullptr;
 
-        nlohmann::json arguments = nlohmann::json::object();
+        nlohmann::ordered_json arguments = nlohmann::ordered_json::object();
         const auto raw_args = call.substr(open + 1, call.size() - open - 2);
         if (!trim_view(raw_args).empty()) {
             const auto entries = split_top_level(raw_args, ',');
@@ -498,7 +500,8 @@ nlohmann::json parse_mistral_tool_calls(
     text = trim_left_view(text.substr(mistral_prefix.size()));
     if (text.empty()) return nullptr;
     return parse_json_array_tool_calls(
-        nlohmann::json::parse(std::string(text)), id_counter, allowed_tool_names);
+        nlohmann::ordered_json::parse(std::string(text)), id_counter,
+        allowed_tool_names);
 }
 
 nlohmann::json parse_qwen_tool_calls(
@@ -521,7 +524,9 @@ nlohmann::json parse_qwen_tool_calls(
         const auto tag_end = text.find(qwen_close, content_start);
         if (tag_end == std::string_view::npos) return nullptr;
         auto entry = build_tool_call_entry(
-            nlohmann::json::parse(std::string(text.substr(content_start, tag_end - content_start))),
+            nlohmann::ordered_json::parse(
+                std::string(text.substr(content_start, tag_end - content_start))
+            ),
             id_counter, allowed_tool_names);
         if (entry.is_null()) return nullptr;
         result.push_back(std::move(entry));
@@ -563,7 +568,7 @@ nlohmann::json parse_qwen35_tool_calls(
             return nullptr;
         }
 
-        nlohmann::json arguments = nlohmann::json::object();
+        nlohmann::ordered_json arguments = nlohmann::ordered_json::object();
         auto parameters = body.substr(
             function_name_end + 1, function_end - function_name_end - 1
         );
@@ -588,15 +593,15 @@ nlohmann::json parse_qwen35_tool_calls(
             ));
             const auto parsed_value = parse_python_value(value);
             arguments[std::string(parameter_name)] = parsed_value.value_or(
-                nlohmann::json(std::string(value))
+                nlohmann::ordered_json(std::string(value))
             );
             parameters.remove_prefix(parameter_end + qwen35_parameter_close.size());
         }
 
-        auto entry = build_tool_call_entry(
-            {{"name", std::string(function_name)}, {"arguments", arguments}},
-            id_counter, allowed_tool_names
-        );
+        nlohmann::ordered_json parsed_call;
+        parsed_call["name"] = std::string(function_name);
+        parsed_call["arguments"] = std::move(arguments);
+        auto entry = build_tool_call_entry(parsed_call, id_counter, allowed_tool_names);
         if (entry.is_null()) return nullptr;
         result.push_back(std::move(entry));
 
@@ -638,7 +643,8 @@ nlohmann::json try_parse_tool_calls_impl(
             case ToolCallFormat::GenericJson:
                 if (text.starts_with('[')) {
                     return parse_json_array_tool_calls(
-                        nlohmann::json::parse(std::string(text)), id_counter, allowed_tool_names);
+                        nlohmann::ordered_json::parse(std::string(text)), id_counter,
+                        allowed_tool_names);
                 }
                 return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names, false);
         }
