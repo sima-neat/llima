@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -13,6 +14,11 @@ namespace llima {
 namespace gemma4_mtp_helpers {
 
 uint16_t draft_query_position(uint16_t shared_kv_len, size_t max_num_tokens);
+
+std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
+    std::span<const uint32_t> draft_token_ids,
+    std::span<const uint32_t> target_next_token_ids
+);
 
 std::vector<uint32_t> select_candidate_tokens(
     std::span<const Eigen::bfloat16> centroid_logits,

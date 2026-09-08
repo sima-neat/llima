@@ -8,6 +8,7 @@
 namespace {
 
 using simaai::llima::gemma4_mtp_helpers::draft_query_position;
+using simaai::llima::gemma4_mtp_helpers::resolve_draft_tokens;
 using simaai::llima::gemma4_mtp_helpers::select_masked_token;
 
 int failures = 0;
@@ -102,18 +103,61 @@ void test_rejects_invalid_metadata() {
     );
 }
 
-void test_draft_query_position_stays_on_the_last_target_row() {
+void test_draft_query_position_follows_the_shared_target_cache() {
     expect(
-        draft_query_position(123, 2048) == 122,
-        "the draft query position must be derived only from the shared target KV length"
+        draft_query_position(123, 2048) == 123,
+        "the draft query must occupy the first position after the shared target KV"
     );
     expect_runtime_error(
         [] { draft_query_position(0, 2048); },
         "an empty shared target KV cache must be rejected"
     );
     expect_runtime_error(
-        [] { draft_query_position(2049, 2048); },
+        [] { draft_query_position(2048, 2048); },
         "a draft query outside cache capacity must be rejected"
+    );
+}
+
+void test_verification_emits_the_first_target_mismatch() {
+    const std::vector<uint32_t> drafts = {10, 11, 12, 13};
+    const std::vector<uint32_t> target = {10, 21, 22, 23, 24};
+    const auto emitted = resolve_draft_tokens(drafts, target);
+
+    expect(emitted.size() == 2, "verification must stop at the first mismatch");
+    expect(
+        emitted[0] == std::pair<uint32_t, bool>{10, true},
+        "the matching prefix is accepted"
+    );
+    expect(
+        emitted[1] == std::pair<uint32_t, bool>{21, false},
+        "the mismatch uses the target token"
+    );
+}
+
+void test_verification_emits_bonus_after_a_full_match() {
+    const std::vector<uint32_t> drafts = {10, 11, 12, 13};
+    const std::vector<uint32_t> target = {10, 11, 12, 13, 14};
+    const auto emitted = resolve_draft_tokens(drafts, target);
+
+    expect(emitted.size() == 5, "a full match must also emit the target bonus token");
+    for (size_t index = 0; index < drafts.size(); ++index) {
+        expect(
+            emitted[index] == std::pair<uint32_t, bool>{drafts[index], true},
+            "every matching draft token must be marked accepted"
+        );
+    }
+    expect(
+        emitted.back() == std::pair<uint32_t, bool>{14, false},
+        "the bonus token comes from target"
+    );
+}
+
+void test_verification_rejects_an_incomplete_target_result() {
+    const std::vector<uint32_t> drafts = {10, 11};
+    const std::vector<uint32_t> target = {10, 11};
+    expect_runtime_error(
+        [&] { resolve_draft_tokens(drafts, target); },
+        "verification requires one more target result than draft tokens"
     );
 }
 
@@ -123,6 +167,9 @@ int main() {
     test_selects_only_from_active_centroids();
     test_uses_canonical_token_ids_and_deterministic_ties();
     test_rejects_invalid_metadata();
-    test_draft_query_position_stays_on_the_last_target_row();
+    test_draft_query_position_follows_the_shared_target_cache();
+    test_verification_emits_the_first_target_mismatch();
+    test_verification_emits_bonus_after_a_full_match();
+    test_verification_rejects_an_incomplete_target_result();
     return failures == 0 ? 0 : 1;
 }

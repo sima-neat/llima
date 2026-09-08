@@ -916,6 +916,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     const uint16_t max_length = _max_num_tokens;
     std::vector<uint32_t> input_ids(input_token_ids.begin(), input_token_ids.end());
     std::vector<uint32_t> output_token_ids;
+    std::optional<std::vector<Eigen::bfloat16>> predecessor_hidden_state;
     bool cache_full = false;
     bool stopped = false;
 
@@ -952,6 +953,20 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 if (_stop_token_ids.contains(first_token)) {
                     stopped = true;
                 }
+
+                if (!stopped && input_ids.size() < max_length) {
+                    // Prefill leaves the first generated token as an unprocessed
+                    // target bonus. Re-run only the prompt tail to obtain the
+                    // hidden state paired with that bonus without advancing KV.
+                    const auto prompt_tail = _run_gemma4_mtp_target_step(
+                        checked_u16(
+                            input_token_ids.size() - 1,
+                            "Gemma4 MTP prompt-tail position"
+                        ),
+                        input_token_ids.back()
+                    );
+                    predecessor_hidden_state = prompt_tail.hidden_state;
+                }
             }
         }
 
@@ -983,7 +998,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             draft_lm._active_cache().metadata.kv_cache_len = 0;
         };
 
-        std::optional<Gemma4MtpTargetStepResult> carried_target_step;
         size_t speculative_rounds = 0;
         size_t proposed_tokens = 0;
         size_t accepted_tokens = 0;
@@ -1002,23 +1016,17 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             );
             const uint32_t current_token = input_ids.back();
 
-            auto take_target_step = [&]() {
-                if (carried_target_step.has_value()) {
-                    auto result = std::move(carried_target_step.value());
-                    carried_target_step.reset();
-                    return result;
-                }
-                return _run_gemma4_mtp_target_step(current_pos, current_token);
-            };
-
             const bool verification_fits = (
                 input_ids.size() + draft_budget <= max_length
                 && static_cast<size_t>(current_pos) + verification_width
                     <= _cfg.pipeline_cfg.max_num_tokens
             );
             if (use_target_only || !verification_fits) {
-                auto target_step = take_target_step();
+                auto target_step = _run_gemma4_mtp_target_step(
+                    current_pos, current_token
+                );
                 const uint32_t emitted = target_step.next_token_id;
+                predecessor_hidden_state = std::move(target_step.hidden_state);
                 output_token_ids.emplace_back(emitted);
                 input_ids.emplace_back(emitted);
                 commit_processed_prefix(static_cast<size_t>(current_pos) + 1);
@@ -1036,14 +1044,21 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 continue;
             }
 
-            auto target_step = take_target_step();
+            if (!predecessor_hidden_state.has_value()) {
+                throw std::runtime_error(
+                    "Gemma4 MTP is missing the preceding target hidden state"
+                );
+            }
             std::vector<Gemma4MtpDraftStepResult> draft_steps;
             draft_steps.reserve(draft_budget);
             uint32_t draft_input_token = current_token;
             std::vector<Eigen::bfloat16> draft_hidden = std::move(
-                target_step.hidden_state
+                predecessor_hidden_state.value()
             );
-            const uint16_t shared_kv_len = static_cast<uint16_t>(current_pos + 1);
+            predecessor_hidden_state.reset();
+            // current_token is the unprocessed bonus at current_pos. The
+            // target-owned shared KV ends immediately before it.
+            const uint16_t shared_kv_len = current_pos;
             while (draft_steps.size() < draft_budget) {
                 auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
                     *this,
@@ -1075,21 +1090,28 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 );
             }
 
+            std::vector<uint32_t> draft_token_ids;
+            draft_token_ids.reserve(draft_steps.size());
+            for (const auto& draft_step : draft_steps) {
+                draft_token_ids.emplace_back(draft_step.token_id);
+            }
+            const auto resolved_tokens = gemma4_mtp_helpers::resolve_draft_tokens(
+                draft_token_ids, verification.next_token_ids
+            );
+
             std::vector<std::pair<uint32_t, bool>> emitted_tokens;
-            emitted_tokens.reserve(draft_budget);
+            emitted_tokens.reserve(resolved_tokens.size());
             uint16_t accepted_this_round = 0;
-            uint32_t expected_token = verification.next_token_ids.front();
-            for (uint16_t depth = 0; depth < draft_budget; ++depth) {
-                const bool accepted = draft_steps[depth].token_id == expected_token;
-                const uint32_t emitted = accepted
-                    ? draft_steps[depth].token_id
-                    : expected_token;
+            for (const auto& [emitted, accepted] : resolved_tokens) {
+                if (input_ids.size() >= max_length) {
+                    cache_full = true;
+                    break;
+                }
                 emitted_tokens.emplace_back(emitted, accepted);
                 output_token_ids.emplace_back(emitted);
                 input_ids.emplace_back(emitted);
                 if (accepted) {
                     ++accepted_this_round;
-                    expected_token = verification.next_token_ids[depth + 1];
                 }
 
                 if (_stop_token_ids.contains(emitted)) {
@@ -1100,34 +1122,22 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                     cache_full = true;
                     break;
                 }
-                if (!accepted) {
-                    break;
-                }
             }
 
             const size_t processed_tokens = static_cast<size_t>(current_pos) + 1
                 + accepted_this_round;
             commit_processed_prefix(processed_tokens);
-
-            const bool accepted_full_batch = (
-                accepted_this_round == draft_budget
-                && emitted_tokens.size() == draft_budget
+            const size_t predecessor_hidden_begin = static_cast<size_t>(
+                accepted_this_round
+            ) * _cfg.lm_cfg.hidden_size;
+            predecessor_hidden_state = std::vector<Eigen::bfloat16>(
+                verification.hidden_states.begin() + predecessor_hidden_begin,
+                verification.hidden_states.begin()
+                    + predecessor_hidden_begin + _cfg.lm_cfg.hidden_size
             );
-            if (accepted_full_batch && !stopped && !cache_full) {
-                const size_t last_hidden_begin = static_cast<size_t>(
-                    verification_width - 1
-                ) * _cfg.lm_cfg.hidden_size;
-                carried_target_step = Gemma4MtpTargetStepResult{
-                    verification.next_token_ids.back(),
-                    std::vector<Eigen::bfloat16>(
-                        verification.hidden_states.begin() + last_hidden_begin,
-                        verification.hidden_states.end()
-                    )
-                };
-            }
 
             ++speculative_rounds;
-            proposed_tokens += emitted_tokens.size();
+            proposed_tokens += draft_steps.size();
             accepted_tokens += accepted_this_round;
             if (
                 !use_target_only
@@ -1135,7 +1145,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 && accepted_tokens * MIN_ACCEPTANCE_DENOMINATOR < proposed_tokens
             ) {
                 use_target_only = true;
-                carried_target_step.reset();
                 _logger->info(
                     "Gemma4 MTP acceptance {}/{} is below 25%; "
                     "switching to pointwise target decode",

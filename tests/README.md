@@ -328,7 +328,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
 | `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
-| `runtime.gemma4_mtp_helpers` | Ordered-embedding centroid filtering and canonical token selection without model inference |
+| `runtime.gemma4_mtp_helpers` | Ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
 
 The embedding generation test requires raw embedding tables on local NVMe
 and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with

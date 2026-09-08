@@ -16,11 +16,43 @@ uint16_t draft_query_position(uint16_t shared_kv_len, size_t max_num_tokens) {
             "Gemma4 MTP draft requires at least one target KV row"
         );
     }
-    const uint16_t position_id = static_cast<uint16_t>(shared_kv_len - 1);
+    // The current bonus token has not been processed by the target. Its
+    // position is therefore the first position after the shared target KV.
+    // The same value is reused for every autoregressive draft step.
+    const uint16_t position_id = shared_kv_len;
     if (position_id >= max_num_tokens) {
         throw std::runtime_error("Gemma4 MTP draft position exceeds cache capacity");
     }
     return position_id;
+}
+
+std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
+    std::span<const uint32_t> draft_token_ids,
+    std::span<const uint32_t> target_next_token_ids
+) {
+    if (
+        draft_token_ids.empty()
+        || target_next_token_ids.size() != draft_token_ids.size() + 1
+    ) {
+        throw std::runtime_error(
+            "Gemma4 MTP verification requires one target result beyond the draft"
+        );
+    }
+
+    std::vector<std::pair<uint32_t, bool>> emitted_tokens;
+    emitted_tokens.reserve(draft_token_ids.size() + 1);
+    for (size_t depth = 0; depth < draft_token_ids.size(); ++depth) {
+        if (draft_token_ids[depth] != target_next_token_ids[depth]) {
+            emitted_tokens.emplace_back(target_next_token_ids[depth], false);
+            return emitted_tokens;
+        }
+        emitted_tokens.emplace_back(draft_token_ids[depth], true);
+    }
+
+    // When every proposal matches, the last verification row supplies the
+    // target's bonus token. It remains unprocessed until the next round.
+    emitted_tokens.emplace_back(target_next_token_ids.back(), false);
+    return emitted_tokens;
 }
 
 std::vector<uint32_t> select_candidate_tokens(
