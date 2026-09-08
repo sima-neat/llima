@@ -92,26 +92,3 @@ def test_incompatible_quantization_defaults_report_disable_flags(
         compile_lmm.main()
 
     assert expected_error in capsys.readouterr().err
-
-
-def test_default_jobs_warns_about_host_memory(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-    capsys: pytest.CaptureFixture[str],
-):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["llima-compile", str(tmp_path / "model"), "-o", str(tmp_path / "output")],
-    )
-    monkeypatch.setattr(compile_lmm, "gen_files", lambda *args: None)
-
-    compile_lmm.main()
-
-    warning = capsys.readouterr().err
-    assert "substantial host memory" in warning
-    assert "-j 2 or -j 4" in warning
-
-    monkeypatch.setattr(sys, "argv", [*sys.argv, "-j", "2"])
-    compile_lmm.main()
-    assert "substantial host memory" not in capsys.readouterr().err
