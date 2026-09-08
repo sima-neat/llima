@@ -196,8 +196,8 @@ MLA_CONSTRAINTS: dict = {
 SPECULATIVE_BUDGET: dict = {
     "draft": 5,
     "target": 16,
-    "gemma4_mtp_draft": 4,
-    "gemma4_mtp_target": 5,
+    "gemma4_mtp_draft": 6,
+    "gemma4_mtp_target": 7,
 }
 
 
@@ -612,7 +612,7 @@ class SpeculativeDecodingConfig(BaseConfig):
         is_draft: True if the model is a draft model in a speculative decoding setup.
         speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
             EAGLE3 uses 16 for target and 5 for draft by default. Gemma4 MTP uses
-            5 target verification rows and a recurrent 4-token assistant budget.
+            7 target verification rows and a recurrent 6-token assistant budget.
     """
     method: str = SpeculativeDecodingMethod.EAGLE3
     is_draft: bool = False

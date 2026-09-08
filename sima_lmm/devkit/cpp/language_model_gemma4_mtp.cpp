@@ -710,6 +710,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     LanguageModel& target_lm,
     uint32_t token_id,
     const std::vector<Eigen::bfloat16>& hidden_state,
+    uint16_t query_position_id,
     uint16_t shared_kv_len
 ) {
     const uint32_t backbone_hidden_size = _cfg.lm_cfg.assistant_backbone_hidden_size;
@@ -721,11 +722,6 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     }
 
     const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    // The assistant never extends the target-owned KV cache. Every proposal in
-    // one drafting round therefore queries the last target position.
-    const uint16_t query_position_id = gemma4_mtp_helpers::draft_query_position(
-        shared_kv_len, _cfg.pipeline_cfg.max_num_tokens
-    );
     const uint16_t cache_model_token_idx = shared_kv_len > num_tokens
         ? static_cast<uint16_t>(shared_kv_len - num_tokens)
         : 0;
@@ -998,12 +994,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             draft_lm._active_cache().metadata.kv_cache_len = 0;
         };
 
-        size_t speculative_rounds = 0;
-        size_t proposed_tokens = 0;
-        size_t accepted_tokens = 0;
-        bool use_target_only = false;
-        constexpr size_t ADAPTATION_WINDOW = 4;
-        constexpr size_t MIN_ACCEPTANCE_DENOMINATOR = 4;
+        uint16_t target_shared_kv_available_len = _active_cache().metadata.kv_cache_len;
 
         while (
             !cache_full && !stopped
@@ -1021,10 +1012,11 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 && static_cast<size_t>(current_pos) + verification_width
                     <= _cfg.pipeline_cfg.max_num_tokens
             );
-            if (use_target_only || !verification_fits) {
+            if (!verification_fits) {
                 auto target_step = _run_gemma4_mtp_target_step(
                     current_pos, current_token
                 );
+                target_shared_kv_available_len = _active_cache().metadata.kv_cache_len;
                 const uint32_t emitted = target_step.next_token_id;
                 predecessor_hidden_state = std::move(target_step.hidden_state);
                 output_token_ids.emplace_back(emitted);
@@ -1056,14 +1048,22 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 predecessor_hidden_state.value()
             );
             predecessor_hidden_state.reset();
-            // current_token is the unprocessed bonus at current_pos. The
-            // target-owned shared KV ends immediately before it.
-            const uint16_t shared_kv_len = current_pos;
+            const uint16_t query_position_id =
+                gemma4_mtp_helpers::draft_query_position(
+                    input_ids.size(), _cfg.pipeline_cfg.max_num_tokens
+                );
+            const uint16_t shared_kv_len =
+                gemma4_mtp_helpers::draft_visible_shared_kv_len(
+                    input_ids.size(),
+                    target_shared_kv_available_len,
+                    _cfg.pipeline_cfg.max_num_tokens
+                );
             while (draft_steps.size() < draft_budget) {
                 auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
                     *this,
                     draft_input_token,
                     draft_hidden,
+                    query_position_id,
                     shared_kv_len
                 );
                 draft_input_token = draft_step.token_id;
@@ -1080,6 +1080,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             auto verification = _run_gemma4_mtp_target_batch(
                 current_pos, verification_tokens
             );
+            target_shared_kv_available_len = _active_cache().metadata.kv_cache_len;
             if (
                 verification.next_token_ids.size() != verification_width
                 || verification.hidden_states.size()
@@ -1135,23 +1136,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 verification.hidden_states.begin()
                     + predecessor_hidden_begin + _cfg.lm_cfg.hidden_size
             );
-
-            ++speculative_rounds;
-            proposed_tokens += draft_steps.size();
-            accepted_tokens += accepted_this_round;
-            if (
-                !use_target_only
-                && speculative_rounds >= ADAPTATION_WINDOW
-                && accepted_tokens * MIN_ACCEPTANCE_DENOMINATOR < proposed_tokens
-            ) {
-                use_target_only = true;
-                _logger->info(
-                    "Gemma4 MTP acceptance {}/{} is below 25%; "
-                    "switching to pointwise target decode",
-                    accepted_tokens,
-                    proposed_tokens
-                );
-            }
 
             const double round_duration = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - round_begin

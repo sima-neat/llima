@@ -8,6 +8,7 @@
 namespace {
 
 using simaai::llima::gemma4_mtp_helpers::draft_query_position;
+using simaai::llima::gemma4_mtp_helpers::draft_visible_shared_kv_len;
 using simaai::llima::gemma4_mtp_helpers::resolve_draft_tokens;
 using simaai::llima::gemma4_mtp_helpers::select_masked_token;
 
@@ -103,24 +104,55 @@ void test_rejects_invalid_metadata() {
     );
 }
 
-void test_draft_query_position_follows_the_shared_target_cache() {
+void test_draft_query_position_follows_the_input_length() {
     expect(
-        draft_query_position(123, 2048) == 123,
-        "the draft query must occupy the first position after the shared target KV"
+        draft_query_position(124, 2048) == 123,
+        "the draft query must use input_length minus one"
     );
     expect_runtime_error(
         [] { draft_query_position(0, 2048); },
-        "an empty shared target KV cache must be rejected"
+        "an empty input must be rejected"
     );
     expect_runtime_error(
-        [] { draft_query_position(2048, 2048); },
+        [] { draft_query_position(2049, 2048); },
         "a draft query outside cache capacity must be rejected"
     );
 }
 
+void test_partial_rejection_exposes_one_more_shared_kv_row_than_query_position() {
+    const uint16_t query_position = draft_query_position(124, 2048);
+    const uint16_t visible_shared_kv_len = draft_visible_shared_kv_len(
+        124, 130, 2048
+    );
+    expect(query_position == 123, "partial rejection keeps the query on the last input");
+    expect(
+        visible_shared_kv_len == 124,
+        "partial rejection exposes target KV through the current input length"
+    );
+    expect(
+        visible_shared_kv_len == query_position + 1,
+        "query position and visible shared KV length must remain independent"
+    );
+}
+
+void test_shared_kv_visibility_never_exceeds_computed_target_rows() {
+    expect(
+        draft_visible_shared_kv_len(124, 123, 2048) == 123,
+        "the initial or full-match round must not expose an uncomputed bonus row"
+    );
+    expect_runtime_error(
+        [] { draft_visible_shared_kv_len(124, 0, 2048); },
+        "an empty target KV cache must be rejected"
+    );
+    expect_runtime_error(
+        [] { draft_visible_shared_kv_len(124, 2049, 2048); },
+        "target KV availability outside cache capacity must be rejected"
+    );
+}
+
 void test_verification_emits_the_first_target_mismatch() {
-    const std::vector<uint32_t> drafts = {10, 11, 12, 13};
-    const std::vector<uint32_t> target = {10, 21, 22, 23, 24};
+    const std::vector<uint32_t> drafts = {10, 11, 12, 13, 14, 15};
+    const std::vector<uint32_t> target = {10, 21, 22, 23, 24, 25, 26};
     const auto emitted = resolve_draft_tokens(drafts, target);
 
     expect(emitted.size() == 2, "verification must stop at the first mismatch");
@@ -135,11 +167,11 @@ void test_verification_emits_the_first_target_mismatch() {
 }
 
 void test_verification_emits_bonus_after_a_full_match() {
-    const std::vector<uint32_t> drafts = {10, 11, 12, 13};
-    const std::vector<uint32_t> target = {10, 11, 12, 13, 14};
+    const std::vector<uint32_t> drafts = {10, 11, 12, 13, 14, 15};
+    const std::vector<uint32_t> target = {10, 11, 12, 13, 14, 15, 16};
     const auto emitted = resolve_draft_tokens(drafts, target);
 
-    expect(emitted.size() == 5, "a full match must also emit the target bonus token");
+    expect(emitted.size() == 7, "a full match must also emit the target bonus token");
     for (size_t index = 0; index < drafts.size(); ++index) {
         expect(
             emitted[index] == std::pair<uint32_t, bool>{drafts[index], true},
@@ -147,7 +179,7 @@ void test_verification_emits_bonus_after_a_full_match() {
         );
     }
     expect(
-        emitted.back() == std::pair<uint32_t, bool>{14, false},
+        emitted.back() == std::pair<uint32_t, bool>{16, false},
         "the bonus token comes from target"
     );
 }
@@ -167,7 +199,9 @@ int main() {
     test_selects_only_from_active_centroids();
     test_uses_canonical_token_ids_and_deterministic_ties();
     test_rejects_invalid_metadata();
-    test_draft_query_position_follows_the_shared_target_cache();
+    test_draft_query_position_follows_the_input_length();
+    test_partial_rejection_exposes_one_more_shared_kv_row_than_query_position();
+    test_shared_kv_visibility_never_exceeds_computed_target_rows();
     test_verification_emits_the_first_target_mismatch();
     test_verification_emits_bonus_after_a_full_match();
     test_verification_rejects_an_incomplete_target_result();

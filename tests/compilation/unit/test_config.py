@@ -9,6 +9,7 @@ import pytest
 from sima_lmm.config.vlm_config import (
     ModelFormat,
     PipelineConfig,
+    SPECULATIVE_BUDGET,
     SpeculativeDecodingMethod,
     VlmArchType,
     VlmConfig,
@@ -206,12 +207,13 @@ def test_gemma4_mtp_target_compiles_point_and_batched_decode_models():
         {
             "method": SpeculativeDecodingMethod.GEMMA4_MTP,
             "is_draft": False,
-            "speculative_budget": 5,
+            "speculative_budget": SPECULATIVE_BUDGET["gemma4_mtp_target"],
         }
     )
     config.config_pipeline(None, None, 2048, 128, 128)
 
     expected_layers = list(range(config.lm_cfg.num_hidden_layers))
+    assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 7
     assert _layer_indices(config, "point_pre") == expected_layers
     assert _layer_indices(config, "point_post") == expected_layers
     assert _layer_indices(config, "point_cache") == _layer_indices(
@@ -231,12 +233,13 @@ def test_gemma4_mtp_draft_uses_pointwise_execution_width():
         {
             "method": SpeculativeDecodingMethod.GEMMA4_MTP,
             "is_draft": True,
-            "speculative_budget": 4,
+            "speculative_budget": SPECULATIVE_BUDGET["gemma4_mtp_draft"],
         }
     )
     model = object.__new__(LanguageModel)
     model.cfg = config
 
+    assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 6
     assert model._single_model_num_tokens == 1
 
 

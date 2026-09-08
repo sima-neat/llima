@@ -10,20 +10,43 @@ namespace simaai {
 namespace llima {
 namespace gemma4_mtp_helpers {
 
-uint16_t draft_query_position(uint16_t shared_kv_len, size_t max_num_tokens) {
-    if (shared_kv_len == 0) {
+uint16_t draft_query_position(size_t input_length, size_t max_num_tokens) {
+    if (input_length == 0) {
+        throw std::runtime_error("Gemma4 MTP draft requires at least one input token");
+    }
+    const size_t position_id = input_length - 1;
+    if (
+        position_id >= max_num_tokens
+        || position_id > std::numeric_limits<uint16_t>::max()
+    ) {
+        throw std::runtime_error("Gemma4 MTP draft position exceeds cache capacity");
+    }
+    return static_cast<uint16_t>(position_id);
+}
+
+uint16_t draft_visible_shared_kv_len(
+    size_t input_length,
+    size_t available_shared_kv_len,
+    size_t max_num_tokens
+) {
+    if (input_length == 0 || available_shared_kv_len == 0) {
         throw std::runtime_error(
             "Gemma4 MTP draft requires at least one target KV row"
         );
     }
-    // The current bonus token has not been processed by the target. Its
-    // position is therefore the first position after the shared target KV.
-    // The same value is reused for every autoregressive draft step.
-    const uint16_t position_id = shared_kv_len;
-    if (position_id >= max_num_tokens) {
-        throw std::runtime_error("Gemma4 MTP draft position exceeds cache capacity");
+    if (
+        input_length > max_num_tokens
+        || available_shared_kv_len > max_num_tokens
+        || max_num_tokens > std::numeric_limits<uint16_t>::max()
+    ) {
+        throw std::runtime_error("Gemma4 MTP shared KV length exceeds cache capacity");
     }
-    return position_id;
+    // The target may have computed speculative rows beyond the accepted prefix.
+    // Transformers exposes those rows only through the current input length. A
+    // partial rejection therefore makes the visible KV length one greater than
+    // the assistant query position, while initial/full-acceptance rounds remain
+    // bounded by the number of rows the target actually produced.
+    return static_cast<uint16_t>(std::min(input_length, available_shared_kv_len));
 }
 
 std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(

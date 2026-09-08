@@ -547,6 +547,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             LanguageModel& target_lm,
             uint32_t token_id,
             const std::vector<Eigen::bfloat16>& hidden_state,
+            uint16_t query_position_id,
             uint16_t shared_kv_len
         );
 

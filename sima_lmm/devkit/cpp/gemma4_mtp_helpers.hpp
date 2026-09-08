@@ -13,7 +13,13 @@ namespace simaai {
 namespace llima {
 namespace gemma4_mtp_helpers {
 
-uint16_t draft_query_position(uint16_t shared_kv_len, size_t max_num_tokens);
+uint16_t draft_query_position(size_t input_length, size_t max_num_tokens);
+
+uint16_t draft_visible_shared_kv_len(
+    size_t input_length,
+    size_t available_shared_kv_len,
+    size_t max_num_tokens
+);
 
 std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
     std::span<const uint32_t> draft_token_ids,

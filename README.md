@@ -119,11 +119,11 @@ compiled-model directory that contains both the target and draft model
 subdirectories. `llima run` reads each subdirectory's
 `sima_files/devkit/vlm_config.json` and automatically selects the target and
 draft. Gemma4 MTP artifacts must be compiled with matching pointwise n1
-target/draft models, the batched n5 target verification models, and the
+target/draft models, the batched n7 target verification models, and the
 assistant's ordered-embedding metadata; recompile older Gemma4 MTP artifacts
-after upgrading LLiMa. At runtime, sustained
-acceptance below 25% switches generation to pointwise target decoding so draft
-overhead does not dominate TPS.
+after upgrading LLiMa. Gemma4 MTP uses the assistant's fixed six-candidate
+schedule for every full speculative round; near the context limit, generation
+uses pointwise target decoding when an n7 verification batch no longer fits.
 
 Model resolution order:
 

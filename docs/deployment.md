@@ -76,7 +76,7 @@ modalix:~$ llima run <model_name>
 When `llima-compile` is given `--draft_model_path`, its output contains target and
 draft compiler outputs under one parent. This layout supports EAGLE3 and Gemma4
 MTP. Gemma4 MTP packages require pointwise n1 target/draft executables plus the
-batched n5 target verification executables. Ordered-embedding assistants also
+batched n7 target verification executables. Ordered-embedding assistants also
 require the draft's `gemma4_token_ordering.npy` artifact, so packages built
 with an older LLiMa compiler must be recompiled. Deploy the parent in one command:
 
