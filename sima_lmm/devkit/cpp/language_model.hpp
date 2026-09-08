@@ -26,6 +26,8 @@
 namespace simaai {
 namespace llima {
 
+struct EmbeddingOffload;
+
 struct LogLikelihoodResult {
     double logprob;
     bool is_greedy;
@@ -103,6 +105,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::set<uint32_t> set_stop_token_ids(std::optional<std::set<uint32_t>> stop_token_ids);
         const auto& get_stop_token_ids() const { return _stop_token_ids; }
         void clear_cached_token_ids() { _cached_token_ids.clear(); }
+        uint32_t get_cached_first_generated_token() const {
+            return _cached_first_generated_token;
+        }
 
         // Captured hidden states from layers 2, N/2, N-3 during prefill (spec decoding).
         // Populated by run_model_once when queue is disabled and spec mode is active.
@@ -246,6 +251,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
+        std::shared_ptr<EmbeddingOffload> _embedding_offload;
+        void _gather_embedding_rows(
+            std::span<const uint32_t> ids, MLABuffer& destination,
+            MLABuffer* scales, size_t row_begin = 0
+        );
+        void _prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx);
         void _define_draft_fc_models();
         struct CachedState {
             // Hidden-layer indices belonging to this stateful family.
