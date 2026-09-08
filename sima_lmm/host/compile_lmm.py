@@ -340,6 +340,12 @@ def main():
 
     args = parser.parse_args()
 
+    if args.jobs is None:
+        print(
+            "Warning: using all physical CPU cores may require substantial host memory. "
+            "Use -j 2 or -j 4 on lower-memory systems; compilation will take longer.",
+            file=sys.stderr,
+        )
     num_processes = args.jobs
     if num_processes is None:
         num_processes = psutil.cpu_count(logical=False)
