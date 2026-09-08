@@ -267,13 +267,7 @@ void CLI::run() {
                     final_response += event.text;
                     print_text(event.text, event.from_draft);
                 }
-                // Only before the first visible token: redrawing the spinner
-                // after that would land on the answer's last line and the
-                // erase would take part of the answer with it.
-                if (
-                    animate_thinking && !saw_reasoning && !saw_content &&
-                    reasoning_parser.in_hidden_reasoning()
-                ) {
+                if (animate_thinking && reasoning_parser.in_hidden_reasoning()) {
                     draw_spinner();
                 }
                 if (stream_end) {

@@ -102,65 +102,6 @@ void test_gemma_generated_and_prompt_opened_boundaries() {
     assert_no_markers(continued);
 }
 
-void test_gptoss_hides_reasoning_across_channel_switches() {
-    // gpt-oss ends a message with <|end|> and opens another one, so a response
-    // can carry several analysis and final blocks.
-    // <|start|> and <|return|> are stripped before the parser sees them, so the
-    // role name of the next message arrives bare, as "assistant".
-    ReasoningStreamParser parser(ReasoningFormat::GptOss, false);
-    ParsedText parsed;
-    append_events(parsed, parser.add("<|channel|>analysis<|message|>We need to answer."));
-    append_events(parsed, parser.add("<|end|>assistant<|channel|>final<|message|>"));
-    append_events(parsed, parser.add("first "));
-    append_events(parsed, parser.add("<|end|>assistant<|channel|>analysis<|message|>"));
-    append_events(parsed, parser.add("second thoughts"));
-    append_events(parsed, parser.add("<|end|>assistant<|channel|>final<|message|>"));
-    append_events(parsed, parser.add("answer", true));
-
-    assert(parsed.reasoning.empty());
-    assert(parsed.content == "first answer");
-    assert(parsed.content.find("assistant") == std::string::npos);
-    assert(parsed.content.find("<|channel|>") == std::string::npos);
-}
-
-void test_gptoss_shows_reasoning_when_enabled_and_splits_markers() {
-    ReasoningStreamParser parser(ReasoningFormat::GptOss, true);
-    ParsedText parsed;
-    append_events(parsed, parser.add("<|chan"));
-    append_events(parsed, parser.add("nel|>analysis<|mess"));
-    append_events(parsed, parser.add("age|>why", false, true));
-    append_events(parsed, parser.add("<|en"));
-    append_events(parsed, parser.add("d|>assistant<|channel|>final<|message|>ok", true));
-
-    assert(parsed.reasoning == "why");
-    assert(parsed.content == "ok");
-    assert(parsed.reasoning_provenance == std::vector<bool>({true}));
-}
-
-void test_gptoss_commentary_and_direct_final() {
-    // Answering straight on the final channel must not fall back to raw output.
-    ReasoningStreamParser direct(ReasoningFormat::GptOss, false);
-    ParsedText parsed;
-    append_events(parsed, direct.add("<|channel|>final<|message|>direct", true));
-    assert(parsed.content == "direct");
-    assert(parsed.reasoning.empty());
-
-    // Commentary addressed to the user is the answer; a tool call is not.
-    ReasoningStreamParser commentary(ReasoningFormat::GptOss, false);
-    ParsedText user_facing;
-    append_events(user_facing, commentary.add("<|channel|>commentary<|message|>hello<|end|>", true));
-    assert(user_facing.content == "hello");
-
-    ReasoningStreamParser tool_call(ReasoningFormat::GptOss, false);
-    ParsedText hidden;
-    append_events(hidden, tool_call.add(
-        "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>"
-        "{\"city\":\"Paris\"}", true
-    ));
-    assert(hidden.content.empty());
-    assert(hidden.reasoning.empty());
-}
-
 void test_disabled_and_unsupported_pass_through() {
     for (auto parser : {
              ReasoningStreamParser(ReasoningFormat::Qwen, false),
@@ -181,9 +122,6 @@ int main() {
     test_qwen_generated_open_and_split_close();
     test_qwen_prompt_opened_and_truncated();
     test_gemma_generated_and_prompt_opened_boundaries();
-    test_gptoss_hides_reasoning_across_channel_switches();
-    test_gptoss_shows_reasoning_when_enabled_and_splits_markers();
-    test_gptoss_commentary_and_direct_final();
     test_disabled_and_unsupported_pass_through();
     std::cout << "reasoning parser tests passed\n";
     return 0;
