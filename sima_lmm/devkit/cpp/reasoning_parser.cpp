@@ -11,8 +11,29 @@ constexpr std::string_view think_open = "<think>";
 constexpr std::string_view think_close = "</think>";
 constexpr std::string_view gemma_reasoning_open = "<|channel>thought\n";
 constexpr std::string_view gemma_reasoning_close = "<channel|>";
-constexpr std::string_view gptoss_reasoning_open = "<|channel|>analysis<|message|>";
-constexpr std::string_view gptoss_reasoning_close = "<|channel|>final<|message|>";
+constexpr std::string_view harmony_channel = "<|channel|>";
+constexpr std::string_view harmony_message = "<|message|>";
+constexpr std::string_view harmony_end = "<|end|>";
+
+// A message body ends at <|end|>; <|channel|> also ends it so a dropped <|end|>
+// cannot merge the next message into the current one.
+constexpr std::array<std::string_view, 2> harmony_body_enders = {
+    harmony_end, harmony_channel
+};
+
+struct MarkerMatch {
+    size_t pos = std::string::npos;
+    std::string_view marker;
+};
+
+MarkerMatch find_first_marker(const std::string& text) {
+    MarkerMatch match;
+    for (const auto marker : harmony_body_enders) {
+        const auto pos = text.find(marker);
+        if (pos < match.pos) match = {pos, marker};
+    }
+    return match;
+}
 
 } // namespace
 
@@ -32,7 +53,7 @@ ReasoningFormat reasoning_format_for_model(std::string_view model_type) {
     return ReasoningFormat::None;
 }
 
-std::array<std::string_view, 2> reasoning_special_tokens(ReasoningFormat format) {
+std::vector<std::string_view> reasoning_special_tokens(ReasoningFormat format) {
     switch (format) {
         case ReasoningFormat::Qwen:
         case ReasoningFormat::Lfm2:
@@ -40,11 +61,13 @@ std::array<std::string_view, 2> reasoning_special_tokens(ReasoningFormat format)
         case ReasoningFormat::Gemma4:
             return {"<|channel>", gemma_reasoning_close};
         case ReasoningFormat::GptOss:
-            return {"<|channel|>", "<|message|>"};
+            // <|end|> is preserved too: without it a channel body would run
+            // into the role name of the next message.
+            return {harmony_channel, harmony_message, harmony_end};
         case ReasoningFormat::None:
-            return {"", ""};
+            return {};
     }
-    return {"", ""};
+    return {};
 }
 
 ReasoningStreamParser::ReasoningStreamParser(
@@ -58,11 +81,12 @@ ReasoningStreamParser::ReasoningStreamParser(
         _end_marker = think_close;
         _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
     } else if (format == ReasoningFormat::GptOss) {
-        // Harmony always emits channels; analysis = reasoning, final = answer.
-        // Parse even when thinking is off so only the final channel shows.
-        _start_marker = gptoss_reasoning_open;
-        _end_marker = gptoss_reasoning_close;
-        _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
+        // Harmony wraps every message in a channel header, and the model may
+        // switch channels several times in one response, so follow the headers
+        // instead of matching a single open/close pair. Text outside a known
+        // channel body is dropped rather than shown.
+        _show_reasoning = enabled;
+        _mode = Mode::ChannelScan;
     } else if (!enabled || format == ReasoningFormat::None) {
         _mode = Mode::Content;
     } else if (format == ReasoningFormat::Qwen) {
@@ -82,6 +106,13 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
     bool done,
     bool from_draft
 ) {
+    if (
+        _mode == Mode::ChannelScan || _mode == Mode::ChannelHeader ||
+        _mode == Mode::ChannelBody
+    ) {
+        return add_channels(text, done, from_draft);
+    }
+
     std::vector<Event> events;
     if (_mode == Mode::Done) return events;
 
@@ -168,6 +199,94 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
         break;
     }
 
+    return events;
+}
+
+void ReasoningStreamParser::route_channel(std::string_view header) {
+    // The header is the text between <|channel|> and <|message|>, e.g. "final",
+    // "analysis", or "commentary to=functions.get_weather <|constrain|>json".
+    const bool has_recipient = header.find(" to=") != std::string_view::npos;
+    if (header.starts_with("final")) {
+        _body_reasoning = false;
+        _body_visible = true;
+    } else if (header.starts_with("commentary") && !has_recipient) {
+        // Commentary without a recipient is addressed to the user; models
+        // answer there outright when the developer message nudges them to.
+        _body_reasoning = false;
+        _body_visible = true;
+    } else {
+        // Analysis, tool calls and anything unrecognised are reasoning.
+        _body_reasoning = true;
+        _body_visible = _show_reasoning && !has_recipient;
+    }
+}
+
+std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add_channels(
+    std::string_view text,
+    bool done,
+    bool from_draft
+) {
+    std::vector<Event> events;
+    if (_pending.empty()) _pending_from_draft = from_draft;
+    _pending.append(text);
+
+    while (true) {
+        if (_mode == Mode::ChannelScan) {
+            // Role names and message delimiters live between channels; none of
+            // it is meant for the user, so discard up to the next header.
+            const auto pos = _pending.find(harmony_channel);
+            if (pos == std::string::npos) {
+                _pending.erase(0, _pending.size() - partial_marker_size(harmony_channel));
+                break;
+            }
+            _pending.erase(0, pos + harmony_channel.size());
+            _mode = Mode::ChannelHeader;
+            continue;
+        }
+
+        if (_mode == Mode::ChannelHeader) {
+            const auto pos = _pending.find(harmony_message);
+            if (pos == std::string::npos) break;
+            route_channel(std::string_view(_pending).substr(0, pos));
+            _pending.erase(0, pos + harmony_message.size());
+            _pending_from_draft = from_draft;
+            _mode = Mode::ChannelBody;
+            continue;
+        }
+
+        const auto ender = find_first_marker(_pending);
+        if (ender.pos != std::string::npos) {
+            if (_body_visible) {
+                emit(events, _pending.substr(0, ender.pos), _body_reasoning, _pending_from_draft);
+            }
+            _pending.erase(0, ender.pos + ender.marker.size());
+            _pending_from_draft = from_draft;
+            _mode = ender.marker == harmony_channel ? Mode::ChannelHeader : Mode::ChannelScan;
+            continue;
+        }
+
+        // Hold back any suffix that could be the head of a terminator.
+        size_t retained = 0;
+        for (const auto marker : harmony_body_enders) {
+            retained = std::max(retained, partial_marker_size(marker));
+        }
+        if (_body_visible) {
+            emit(
+                events,
+                _pending.substr(0, _pending.size() - retained),
+                _body_reasoning,
+                _pending_from_draft
+            );
+        }
+        _pending.erase(0, _pending.size() - retained);
+        if (!_pending.empty()) _pending_from_draft = from_draft;
+        break;
+    }
+
+    if (done) {
+        _pending.clear();
+        _mode = Mode::Done;
+    }
     return events;
 }
 
