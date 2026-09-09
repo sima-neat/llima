@@ -218,8 +218,7 @@ void TextStreamer::end() {
         messages.emplace_back(fmt::format("TTFT: {:.2f}s", _time_to_first_token));
     }
 
-    const bool performance_summary_enabled =
-        _performance_summary_enabled.load(std::memory_order_relaxed);
+    const bool performance_summary_enabled = _performance_summary_enabled;
     for (const auto& message: messages) {
         _logger->info(message);
         if (performance_summary_enabled) {

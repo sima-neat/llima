@@ -87,8 +87,9 @@ class TextStreamer {
             std::vector<std::pair<uint32_t, std::string>> tokens
         );
         void set_tool_call_enabled(bool enabled);
+        // Configure before the first run; do not change while inference is active.
         void set_performance_summary_enabled(bool enabled) {
-            _performance_summary_enabled.store(enabled, std::memory_order_relaxed);
+            _performance_summary_enabled = enabled;
         }
 
         void put(uint32_t token_id, bool from_draft = false);
@@ -133,7 +134,7 @@ class TextStreamer {
         TextCallback _callback_finalize_text;
         std::vector<std::pair<uint32_t, std::string>> _preserved_tokens;
         bool _tool_call_enabled = false;
-        std::atomic<bool> _performance_summary_enabled{true};
+        bool _performance_summary_enabled = true;
         std::jthread _pop_thread;
         std::atomic<bool> _is_streaming;
 
