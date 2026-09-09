@@ -158,6 +158,7 @@ class LanguagePostModel(LanguagePostBaseModel):
             final_output = self._build_onnx_per_layer_input_branch(
                 base_name, final_output, input_nodes[2]
             )
+        final_output = self._build_onnx_layer_scalar_if_needed(base_name, final_output)
         llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
         if self.layer_idx in llm_injection_layers and self.num_tokens > 1:
             deepstack_features_input = input_nodes[2]
@@ -192,13 +193,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         add = self._onnx_builder.build_op(
             f"{base_name}.per_layer_input_add", [residual, norm], "Add"
         )
-        layer_scalar = self._onnx_builder.create_initializer(
-            f"{base_name}.layer_scalar",
-            self.get_hf_param(f"{base_name}.layer_scalar").astype(np.float32).reshape(1, 1, 1, 1),
-        )
-        return self._onnx_builder.build_op(
-            f"{base_name}.layer_scalar_mul", [add, layer_scalar], "Mul"
-        )
+        return add
 
     def _build_sima_per_layer_input_branch(
         self,
@@ -232,12 +227,35 @@ class LanguagePostModel(LanguagePostBaseModel):
         )
         norm = self._build_sima_rms_norm(builder, f"{base_name}.post_per_layer_input_norm", proj)
         add = builder.create_add_node(residual, norm)
+        return add
+
+    def _build_onnx_layer_scalar_if_needed(
+        self, base_name: str, hidden_states: OnnxNode
+    ) -> OnnxNode:
+        if self.cfg.model_type != VlmArchType.VLM_GEMMA4 or not self.check_hf_param(f"{base_name}.layer_scalar"):
+            return hidden_states
+        layer_scalar = self._onnx_builder.create_initializer(
+            f"{base_name}.layer_scalar",
+            self.get_hf_param(f"{base_name}.layer_scalar")
+            .astype(np.float32)
+            .reshape(1, 1, 1, 1),
+        )
+        return self._onnx_builder.build_op(
+            f"{base_name}.layer_scalar_mul", [hidden_states, layer_scalar], "Mul"
+        )
+
+    def _build_sima_layer_scalar_if_needed(
+        self, builder: SimaBuilder, base_name: str, hidden_states: NodeOrHandle,
+        quantizable: bool,
+    ) -> NodeOrHandle:
+        if self.cfg.model_type != VlmArchType.VLM_GEMMA4 or not self.check_hf_param(f"{base_name}.layer_scalar"):
+            return hidden_states
         layer_scalar = builder.create_constant_node(
             self.get_hf_param(f"{base_name}.layer_scalar")
             .astype(activation_dtype(quantizable))
             .reshape(1)
         )
-        return builder.create_mul_node(add, layer_scalar)
+        return builder.create_mul_node(hidden_states, layer_scalar)
 
     def gen_model_sdk_files_directly(
         self,
@@ -387,6 +405,9 @@ class LanguagePostModel(LanguagePostBaseModel):
                 quantizable,
                 merged_lora,
             )
+        final_output = self._build_sima_layer_scalar_if_needed(
+            builder, base_name, final_output, quantizable
+        )
         if needs_deepstack and mla_input_deepstack is not None:
             final_output = builder.create_add_node(final_output, mla_input_deepstack)
 
