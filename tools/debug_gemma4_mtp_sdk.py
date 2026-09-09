@@ -43,6 +43,30 @@ def _accepted_prefix(drafts: np.ndarray, target_predictions: np.ndarray) -> int:
     return accepted
 
 
+def _captured_target_acceptance(
+    sdk_drafts: np.ndarray,
+    hf_drafts: np.ndarray,
+    target_predictions: np.ndarray,
+) -> tuple[int, bool]:
+    """Return the verified SDK prefix and whether it is the exact acceptance."""
+    if len(sdk_drafts) > len(hf_drafts) or len(sdk_drafts) > len(target_predictions):
+        raise ValueError("Capture does not cover every SDK draft token")
+
+    proposal_match = _accepted_prefix(sdk_drafts, hf_drafts)
+    if proposal_match == len(sdk_drafts):
+        valid_target_rows = len(sdk_drafts)
+    else:
+        # The prediction for the first divergent proposal still has the same
+        # preceding context. Later captured predictions do not.
+        valid_target_rows = proposal_match + 1
+
+    accepted = _accepted_prefix(
+        sdk_drafts[:valid_target_rows], target_predictions[:valid_target_rows]
+    )
+    exact = accepted < valid_target_rows or valid_target_rows == len(sdk_drafts)
+    return accepted, exact
+
+
 def _format_tokens(tokens: np.ndarray | list[int]) -> str:
     return "[" + ", ".join(str(int(token)) for token in tokens) + "]"
 
@@ -534,10 +558,18 @@ def _select_masked_token(
     num_centroids: int,
     top_k: int,
 ) -> int:
+    if num_centroids <= 0 or token_ordering.size % num_centroids != 0:
+        raise ValueError("Token ordering must divide evenly across centroids")
+    if top_k <= 0 or top_k > num_centroids:
+        raise ValueError("Invalid centroid top-k")
+
     ordering = token_ordering.reshape(num_centroids, -1)
-    top_centroids = np.argpartition(centroid_logits, -top_k)[-top_k:]
+    centroid_ids = np.arange(num_centroids)
+    top_centroids = np.lexsort((centroid_ids, -centroid_logits))[:top_k]
     candidates = ordering[top_centroids].reshape(-1)
-    return int(candidates[np.argmax(full_logits[candidates])])
+    candidate_logits = full_logits[candidates]
+    best_candidates = candidates[candidate_logits == candidate_logits.max()]
+    return int(best_candidates.min())
 
 
 def _run_assistant_round(
@@ -769,15 +801,21 @@ def replay_sdk(args: argparse.Namespace) -> None:
             hidden = result.projected
 
         recurrent_array = np.asarray(recurrent_tokens, dtype=np.int64)
-        accepted = _accepted_prefix(recurrent_array, target_predictions)
+        accepted, acceptance_is_exact = _captured_target_acceptance(
+            recurrent_array, hf_drafts[:recurrent_rounds], target_predictions
+        )
         hf_accepted = _accepted_prefix(hf_drafts, target_predictions)
         print(f"HF drafts:        {_format_tokens(hf_drafts)}")
         print(f"SDK drafts:       {_format_tokens(recurrent_array)}")
-        print(f"Target predicts:  {_format_tokens(target_predictions)}")
-        print(
-            f"Accepted prefix: SDK={accepted}/{recurrent_rounds}, "
-            f"HF={hf_accepted}/{len(hf_drafts)}"
-        )
+        print(f"Target on HF proposals: {_format_tokens(target_predictions)}")
+        print(f"HF accepted prefix: {hf_accepted}/{len(hf_drafts)}")
+        if acceptance_is_exact:
+            print(f"SDK accepted prefix: {accepted}/{recurrent_rounds}")
+        else:
+            print(
+                f"SDK accepted prefix: at least {accepted}/{recurrent_rounds}; "
+                "later target predictions require re-evaluation on SDK proposals"
+            )
         if np.array_equal(recurrent_array, hf_drafts[:recurrent_rounds]):
             print("Result: quantized assistant recurrence matches Hugging Face tokens")
         else:
