@@ -218,11 +218,17 @@ void TextStreamer::end() {
         messages.emplace_back(fmt::format("TTFT: {:.2f}s", _time_to_first_token));
     }
 
+    const bool performance_summary_enabled =
+        _performance_summary_enabled.load(std::memory_order_relaxed);
     for (const auto& message: messages) {
         _logger->info(message);
-        std::cout << message << std::endl;
+        if (performance_summary_enabled) {
+            std::cout << message << std::endl;
+        }
     }
-    std::cout << std::flush;
+    if (performance_summary_enabled) {
+        std::cout << std::flush;
+    }
 
     // Reset the stats.
     _time_to_first_token = -1;
