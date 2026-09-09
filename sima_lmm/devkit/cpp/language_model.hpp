@@ -523,9 +523,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t num_tokens, uint16_t position_id, uint16_t valid_tokens
         );
         void _upload_gemma4_mtp_causal_mask(
+            MLABuffer& buffer,
             uint16_t num_tokens,
             uint16_t first_visible_token_count,
-            uint16_t valid_tokens
+            uint16_t valid_tokens,
+            uint16_t cache_token_idx_begin,
+            uint16_t context_length
         );
         uint8_t _find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const;
         void _bind_gemma4_mtp_shared_kv_cache(

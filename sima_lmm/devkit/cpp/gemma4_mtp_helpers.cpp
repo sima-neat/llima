@@ -49,6 +49,34 @@ uint16_t draft_visible_shared_kv_len(
     return static_cast<uint16_t>(std::min(input_length, available_shared_kv_len));
 }
 
+std::vector<Eigen::bfloat16> build_causal_mask(
+    uint16_t num_tokens,
+    uint16_t first_visible_token_count,
+    uint16_t valid_tokens,
+    uint16_t cache_token_idx_begin,
+    uint16_t context_length
+) {
+    if (valid_tokens == 0 || valid_tokens > num_tokens
+        || first_visible_token_count <= cache_token_idx_begin
+        || static_cast<size_t>(first_visible_token_count) + valid_tokens - 1
+            > static_cast<size_t>(cache_token_idx_begin) + context_length) {
+        throw std::runtime_error("Invalid Gemma4 MTP causal-mask range");
+    }
+    const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
+    std::vector<Eigen::bfloat16> mask(
+        static_cast<size_t>(num_tokens) * context_length, neg_inf
+    );
+    const size_t first_visible_columns = first_visible_token_count - cache_token_idx_begin;
+    for (uint16_t row = 0; row < valid_tokens; ++row) {
+        std::fill_n(
+            mask.begin() + static_cast<size_t>(row) * context_length,
+            first_visible_columns + row,
+            Eigen::bfloat16{0.0f}
+        );
+    }
+    return mask;
+}
+
 std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
     std::span<const uint32_t> draft_token_ids,
     std::span<const uint32_t> target_next_token_ids

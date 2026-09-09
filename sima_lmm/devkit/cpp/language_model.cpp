@@ -2219,6 +2219,14 @@ void LanguageModel::_define_buffers() {
             );
         }
     }
+    if (_cfg.lm_cfg.is_gemma4_mtp_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+        // Full and sliding attention can use different compiled mask strides.
+        // They need separate storage because the entire transformer is queued.
+        define_buffer(
+            "gemma4_mtp_sliding_future_token_mask",
+            {_cfg.lm_cfg.get_single_num_tokens(), _cfg.pipeline_cfg.max_num_tokens}
+        );
+    }
     const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
     if (
         _use_group_token_models

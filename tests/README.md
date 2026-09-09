@@ -328,14 +328,15 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
 | `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
-| `runtime.gemma4_mtp_helpers` | Ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
+| `runtime.gemma4_mtp_helpers` | Packed causal masks at compiled context widths, sliding-window offsets, ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
 
 The embedding generation test requires raw embedding tables on local NVMe
 and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
 `SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
 and `auto`, verifies that automatic offloading saves DRAM, and checks allocation
 cleanup after teardown. The executable also accepts an explicit model directory
-and optionally a speculative draft model directory:
+and optionally a speculative draft model directory. With a draft, it also checks
+that repeating a prompt after speculative decoding returns the same response:
 
 ```bash
 ./lib/sima-lmm/tests/sima_lmm_embedding_offload_generation_test \

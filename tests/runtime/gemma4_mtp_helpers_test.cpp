@@ -1,3 +1,4 @@
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -7,6 +8,7 @@
 
 namespace {
 
+using simaai::llima::gemma4_mtp_helpers::build_causal_mask;
 using simaai::llima::gemma4_mtp_helpers::draft_query_position;
 using simaai::llima::gemma4_mtp_helpers::draft_visible_shared_kv_len;
 using simaai::llima::gemma4_mtp_helpers::resolve_draft_tokens;
@@ -27,6 +29,59 @@ void expect_runtime_error(Callable&& callable, const std::string& message) {
         expect(false, message);
     } catch (const std::runtime_error&) {
     }
+}
+
+void expect_mask_row(
+    const std::vector<Eigen::bfloat16>& mask, size_t columns,
+    size_t row, size_t visible_columns
+) {
+    for (size_t column = 0; column < columns; ++column) {
+        const float value = static_cast<float>(mask[row * columns + column]);
+        expect(
+            column < visible_columns ? value == 0.0f : std::isinf(value) && value < 0.0f,
+            "mask visibility must match the causal prefix at the compiled row stride"
+        );
+    }
+}
+
+void test_causal_mask_uses_compiled_context_stride() {
+    // The allocation may cover 4096 positions, but this cache ELF consumes
+    // seven compact 128-column rows. Full-context packing misreads rows 1..6.
+    const auto mask = build_causal_mask(7, 40, 7, 0, 128);
+    expect(mask.size() == 7 * 128, "short-context mask must use the compiled width");
+    const size_t visible[] = {40, 41, 42, 43, 44, 45, 46};
+    for (size_t row = 0; row < 7; ++row) {
+        expect_mask_row(mask, 128, row, visible[row]);
+    }
+}
+
+void test_causal_mask_spans_a_context_bucket_boundary() {
+    const auto mask = build_causal_mask(7, 127, 7, 0, 256);
+    expect(mask.size() == 7 * 256, "verification crossing 128 must use the next bucket");
+    expect_mask_row(mask, 256, 0, 127);
+    expect_mask_row(mask, 256, 6, 133);
+}
+
+void test_causal_mask_uses_relative_sliding_columns() {
+    const auto mask = build_causal_mask(7, 1201, 7, 183, 1024);
+    expect_mask_row(mask, 1024, 0, 1018);
+    expect_mask_row(mask, 1024, 6, 1024);
+
+    // The pointwise assistant can expose a complete shared-KV window.
+    const auto draft_mask = build_causal_mask(1, 1201, 1, 177, 1024);
+    expect_mask_row(draft_mask, 1024, 0, 1024);
+}
+
+void test_causal_mask_keeps_padding_masked_and_rejects_invalid_ranges() {
+    const auto mask = build_causal_mask(7, 40, 1, 0, 128);
+    expect_mask_row(mask, 128, 0, 40);
+    for (size_t row = 1; row < 7; ++row) {
+        expect_mask_row(mask, 128, row, 0);
+    }
+    expect_runtime_error([] { build_causal_mask(7, 40, 0, 0, 128); }, "empty batch");
+    expect_runtime_error([] { build_causal_mask(7, 40, 8, 0, 128); }, "too many rows");
+    expect_runtime_error([] { build_causal_mask(7, 40, 7, 40, 128); }, "empty visible prefix");
+    expect_runtime_error([] { build_causal_mask(7, 127, 7, 0, 128); }, "insufficient compiled width");
 }
 
 void test_selects_only_from_active_centroids() {
@@ -196,6 +251,10 @@ void test_verification_rejects_an_incomplete_target_result() {
 } // namespace
 
 int main() {
+    test_causal_mask_uses_compiled_context_stride();
+    test_causal_mask_spans_a_context_bucket_boundary();
+    test_causal_mask_uses_relative_sliding_columns();
+    test_causal_mask_keeps_padding_masked_and_rejects_invalid_ranges();
     test_selects_only_from_active_centroids();
     test_uses_canonical_token_ids_and_deterministic_ties();
     test_rejects_invalid_metadata();

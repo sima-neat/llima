@@ -320,43 +320,17 @@ void LanguageModel::_upload_gemma4_mtp_freq_rows(
 }
 
 void LanguageModel::_upload_gemma4_mtp_causal_mask(
-    uint16_t num_tokens, uint16_t first_visible_token_count, uint16_t valid_tokens
+    MLABuffer& buffer,
+    uint16_t num_tokens, uint16_t first_visible_token_count, uint16_t valid_tokens,
+    uint16_t cache_token_idx_begin, uint16_t context_length
 ) {
-    if (!has_buffer("future_token_mask")) {
-        return;
-    }
-    if (
-        valid_tokens == 0 || valid_tokens > num_tokens
-        || first_visible_token_count == 0
-        || static_cast<size_t>(first_visible_token_count) + valid_tokens - 1
-            > _cfg.pipeline_cfg.max_num_tokens
-    ) {
-        throw std::runtime_error("Invalid Gemma4 MTP causal-mask range");
-    }
-
-    auto& mask_buf = get_buffer("future_token_mask");
-    const auto& shape = mask_buf.get_shape();
-    if (shape.size() != 2 || shape.front() < num_tokens) {
-        throw std::runtime_error(fmt::format(
-            "Unexpected Gemma4 MTP future_token_mask shape for n{}", num_tokens
-        ));
-    }
-
-    const size_t cols = shape.back();
-    const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
-    std::vector<Eigen::bfloat16> mask(static_cast<size_t>(num_tokens) * cols, neg_inf);
-    for (uint16_t row = 0; row < valid_tokens; ++row) {
-        const size_t visible_tokens = static_cast<size_t>(first_visible_token_count) + row;
-        if (visible_tokens > cols) {
-            throw std::runtime_error("Gemma4 MTP visible KV length exceeds mask capacity");
-        }
-        std::fill_n(
-            mask.begin() + static_cast<size_t>(row) * cols,
-            visible_tokens,
-            Eigen::bfloat16{0.0f}
-        );
-    }
-    mask_buf.upload_raw(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
+    const auto mask = gemma4_mtp_helpers::build_causal_mask(
+        num_tokens, first_visible_token_count, valid_tokens,
+        cache_token_idx_begin, context_length
+    );
+    // MLA reads packed rows at the cache ELF's compiled context width.
+    // upload() would insert padding for the allocation's full-context shape.
+    buffer.upload_raw(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
 }
 
 uint8_t LanguageModel::_find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const {
@@ -489,10 +463,8 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
         throw std::runtime_error("Gemma4 MTP target batch exceeds cache capacity");
     }
 
-    _upload_gemma4_mtp_causal_mask(
-        num_tokens, static_cast<uint16_t>(token_idx + 1), valid_tokens
-    );
     _upload_gemma4_mtp_freq_rows(num_tokens, token_idx, valid_tokens);
+    std::array<bool, 2> mask_uploaded{};
 
     std::vector<uint32_t> staged_token_ids(token_ids.begin(), token_ids.end());
     const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
@@ -656,7 +628,21 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             );
         }
         if (use_group_future_token_mask || use_single_future_token_mask) {
-            ++cache_ifm_idx;
+            auto& mask_buffer = get_buffer(is_sliding
+                ? "gemma4_mtp_sliding_future_token_mask" : "future_token_mask");
+            if (!mask_uploaded[is_sliding]) {
+                _upload_gemma4_mtp_causal_mask(
+                    mask_buffer, num_tokens, static_cast<uint16_t>(token_idx + 1),
+                    valid_tokens, cache_token_idx_begin, aligned_eff_num_cached_tokens
+                );
+                mask_uploaded[is_sliding] = true;
+            }
+            cache_ifm_map.emplace(
+                cache_ifm_idx++,
+                MLABufferSlice{
+                    &mask_buffer, {0, 0}, {num_tokens, aligned_eff_num_cached_tokens}
+                }
+            );
         }
         cache_ifm_map.emplace(
             std::piecewise_construct,
@@ -761,8 +747,8 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     );
     mtp_input_buf.upload(mtp_input.data());
 
-    _upload_gemma4_mtp_causal_mask(num_tokens, shared_kv_len, 1);
     _upload_gemma4_mtp_freq_rows(num_tokens, query_position_id, 1);
+    std::array<bool, 2> mask_uploaded{};
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
@@ -821,6 +807,26 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
             use_group_future_token_mask || use_single_future_token_mask,
             layer_type
         );
+        if (use_group_future_token_mask || use_single_future_token_mask) {
+            auto& mask_buffer = get_buffer(is_sliding
+                ? "gemma4_mtp_sliding_future_token_mask" : "future_token_mask");
+            if (!mask_uploaded[is_sliding]) {
+                _upload_gemma4_mtp_causal_mask(
+                    mask_buffer, num_tokens, shared_kv_len, 1,
+                    cache_token_idx_begin, aligned_eff_num_cached_tokens
+                );
+                mask_uploaded[is_sliding] = true;
+            }
+            const uint8_t mask_ifm_idx = 2 + static_cast<uint8_t>(
+                _cfg.pipeline_cfg.quantize_kv_cache
+            );
+            cache_ifm_map.emplace(
+                mask_ifm_idx,
+                MLABufferSlice{
+                    &mask_buffer, {0, 0}, {num_tokens, aligned_eff_num_cached_tokens}
+                }
+            );
+        }
 
         std::map<uint8_t, MLABufferSlice> layer0_ifm_map;
         std::map<uint8_t, MLABufferSlice>* ifm_map_ptr = nullptr;
@@ -938,6 +944,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         if (input_ids.size() >= max_length) {
             cache_full = true;
         } else {
+            // Decode stages arbitrary positions over the start of the RoPE
+            // tables. Restore those rows before prefilling another request.
+            const auto verification_width = _cfg.lm_cfg.get_single_num_tokens();
+            _upload_gemma4_mtp_freq_rows(verification_width, 0, verification_width);
             _set_input_text_embeds(input_token_ids);
             const auto first_begin = std::chrono::steady_clock::now();
             auto first_token = run_model_prefill(

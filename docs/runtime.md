@@ -69,6 +69,11 @@ modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
 modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4 --max-kv-cache-slots 4
 ```
 
+The Gemma4 MTP verification-mask and repeated-prompt fixes require updated
+runtime packages only; existing compiled MTP models can be reused. After
+updating, check a short prompt and a repeated prompt before comparing generation
+speed.
+
 ## Interactive Commands
 
 Once `llima run` starts in CLI mode, use these commands at the prompt:
