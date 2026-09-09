@@ -194,12 +194,24 @@ std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
 }
 
 std::vector<Eigen::bfloat16> LanguageModel::_read_embedding_row_bf16(uint32_t token_id) {
-    auto& embeddings = get_buffer("embeddings");
+    auto& embeddings = get_buffer(
+        _embedding_offload ? "offload_decode_embeds" : "embeddings"
+    );
+    const uint32_t row_index = _embedding_offload ? 0 : token_id;
     const auto& shape = embeddings.get_shape();
-    if (shape.size() != 2 || token_id >= shape.front()) {
+    if (shape.size() != 2 || row_index >= shape.front()
+        || token_id >= _cfg.lm_cfg.token_cfg.vocab_size) {
         throw std::runtime_error(fmt::format(
             "Embedding token id {} is outside embedding table", token_id
         ));
+    }
+
+    if (_embedding_offload) {
+        // Drafts read the target's embeddings; offloaded tables have only a
+        // single staging row in DRAM, populated through the shared gather path.
+        auto* scales = _cfg.pipeline_cfg.quantize_embeddings
+            ? &get_buffer("offload_decode_scales") : nullptr;
+        _gather_embedding_rows({&token_id, 1}, embeddings, scales);
     }
 
     const uint32_t hidden_size = static_cast<uint32_t>(shape.back());
@@ -208,7 +220,7 @@ std::vector<Eigen::bfloat16> LanguageModel::_read_embedding_row_bf16(uint32_t to
     );
     const auto* row_base = reinterpret_cast<const uint8_t*>(
         embeddings.get_virtual_addr()
-    ) + static_cast<size_t>(token_id) * row_bytes;
+    ) + static_cast<size_t>(row_index) * row_bytes;
 
     std::vector<Eigen::bfloat16> row(hidden_size);
     if (embeddings.get_dtype() == "bfloat16") {
@@ -222,11 +234,13 @@ std::vector<Eigen::bfloat16> LanguageModel::_read_embedding_row_bf16(uint32_t to
         ));
     }
 
-    auto& scales = get_buffer("embedding_scales");
+    auto& scales = get_buffer(
+        _embedding_offload ? "offload_decode_scales" : "embedding_scales"
+    );
     const size_t scale_row_bytes = scales.get_buf_len(std::vector<uint32_t>{1, 1});
     const auto* scale_base = reinterpret_cast<const uint8_t*>(
         scales.get_virtual_addr()
-    ) + static_cast<size_t>(token_id) * scale_row_bytes;
+    ) + static_cast<size_t>(row_index) * scale_row_bytes;
     const auto scale = *reinterpret_cast<const Eigen::bfloat16*>(scale_base);
     const float scale_f = static_cast<float>(scale) / 127.0f;
     const auto* quantized = reinterpret_cast<const int8_t*>(row_base);
