@@ -135,12 +135,12 @@ def _manifest_case(
     return manifest_case
 
 
-def _case_path(
+def _case_paths(
     root: Path,
     manifest: dict,
     case: OnnxRegressionCase,
     source: str,
-) -> Path:
+) -> list[Path]:
     manifest_case = _manifest_case(manifest, case, source)
     status = manifest_case.get("status", "available")
     if status != "available":
@@ -148,10 +148,49 @@ def _case_path(
             f"{source} ONNX for {case.id} has unexpected status {status}: "
             f"{manifest_case.get('reason', 'no reason recorded')}"
         )
-    return require_readable_path(
-        root / manifest_case["onnx_path"],
-        f"{source} generated ONNX for {case.id}",
-    )
+    relative_paths = manifest_case.get("onnx_paths")
+    if not isinstance(relative_paths, list) or not relative_paths:
+        raise RuntimeError(
+            f"{source} ONNX manifest has no artifact paths for {case.id}"
+        )
+    return [
+        require_readable_path(
+            root / relative_path,
+            f"{source} generated ONNX artifact {index} for {case.id}",
+        )
+        for index, relative_path in enumerate(relative_paths)
+    ]
+
+
+def _run_onnx_chain(
+    case: OnnxRegressionCase,
+    paths: list[Path],
+    signatures: list[tuple],
+    feeds: dict[str, np.ndarray],
+) -> list[np.ndarray]:
+    side_outputs: list[np.ndarray] = []
+    current_feeds = feeds
+    primary_output: np.ndarray | None = None
+
+    for index, (path, signature) in enumerate(
+        zip(paths, signatures, strict=True)
+    ):
+        outputs = _run_onnx(path, current_feeds)
+        _validate_runtime_outputs(case, signature, outputs)
+        primary_output = outputs[0]
+        side_outputs.extend(outputs[1:])
+
+        if index + 1 < len(paths):
+            next_inputs = signatures[index + 1][0]
+            if len(next_inputs) != 1:
+                raise RuntimeError(
+                    f"ONNX artifact {index + 1} for {case.id} must have one "
+                    f"chained input, got {len(next_inputs)}"
+                )
+            current_feeds = {next_inputs[0][0]: primary_output}
+
+    assert primary_output is not None
+    return [primary_output, *side_outputs]
 
 
 def _report_regression(case: OnnxRegressionCase, message: str) -> None:
@@ -169,13 +208,16 @@ def test_branch_relative_onnx_regression(
     base_onnx_root: Path | None,
     base_onnx_manifest: dict | None,
 ):
-    candidate_path = _case_path(
+    candidate_paths = _case_paths(
         candidate_onnx_root, candidate_onnx_manifest, case, "candidate"
     )
-    candidate_signature = _validate_graph(candidate_path)
-    feeds = _make_inputs(case, candidate_signature)
-    candidate_outputs = _run_onnx(candidate_path, feeds)
-    _validate_runtime_outputs(case, candidate_signature, candidate_outputs)
+    candidate_signatures = [
+        _validate_graph(path) for path in candidate_paths
+    ]
+    feeds = _make_inputs(case, candidate_signatures[0])
+    candidate_outputs = _run_onnx_chain(
+        case, candidate_paths, candidate_signatures, feeds
+    )
 
     if onnx_validation_mode == "candidate-only":
         return
@@ -190,20 +232,20 @@ def test_branch_relative_onnx_regression(
             f"{base_manifest_case.get('reason', 'no reason recorded')}",
         )
         return
-    base_path = _case_path(
+    base_paths = _case_paths(
         base_onnx_root, base_onnx_manifest, case, "baseline"
     )
-    base_signature = _validate_graph(base_path)
-    if candidate_signature != base_signature:
+    base_signatures = [_validate_graph(path) for path in base_paths]
+    if candidate_signatures[0][0] != base_signatures[0][0]:
         _report_regression(
             case,
-            "ONNX input/output interface differs between candidate and base: "
-            f"candidate={candidate_signature}, base={base_signature}",
+            "ONNX input interface differs between candidate and base: "
+            f"candidate={candidate_signatures[0][0]}, "
+            f"base={base_signatures[0][0]}",
         )
         return
 
-    base_outputs = _run_onnx(base_path, feeds)
-    _validate_runtime_outputs(case, base_signature, base_outputs)
+    base_outputs = _run_onnx_chain(case, base_paths, base_signatures, feeds)
     if len(candidate_outputs) != len(base_outputs):
         _report_regression(
             case,

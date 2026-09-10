@@ -1,3 +1,8 @@
+add_test(runtime.embedding_offload "./sima_lmm_embedding_offload_test")
+set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
+add_test(runtime.embedding_offload_generation "./sima_lmm_embedding_offload_generation_test")
+set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK dispatcher TIMEOUT 900)
+
 add_test(
     runtime.dispatcher_lifecycle
     "./sima_lmm_dispatcher_lifecycle_test"

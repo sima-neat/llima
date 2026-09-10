@@ -16,7 +16,6 @@ from sima_lmm.model.base import (
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
-from sima_lmm.utils import ceil_div_row, mla_max_num_rows
 from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
 
 
@@ -206,15 +205,9 @@ class VisionLanguageModel(BaseModel):
         with gen_context:
             if self.cfg.vm_cfg is not None and self.cfg.is_supported_multimodal:
                 # This model includes a vision model
-                elem_size = 2
-                seq_len = self.cfg.vm_cfg.seq_len
-                num_mla_rows_per_head = seq_len * ceil_div_row(seq_len) * elem_size
-                is_single_vision_model = num_mla_rows_per_head <= mla_max_num_rows
-
                 vision_model = VisionModel(
                     self.cfg, self.vision_model_name, onnx_path=self.onnx_path,
-                    sima_path=self.sima_path, hf_model=self.hf_model,
-                    is_single_vision_model=is_single_vision_model
+                    sima_path=self.sima_path, hf_model=self.hf_model
                 )
                 vision_model.gen_files(
                     gen_mode, gen_config=gen_config, log_level=log_level,
