@@ -58,6 +58,9 @@ class CompressedTensorsConfig:
                 symmetric = False
             group_size = weights_config.get("group_size")
             if group_size is not None:
+                # A power of two has no shared set bits with the value immediately below it.
+                if group_size & (group_size - 1):
+                    raise ValueError("Only power-of-two group sizes are supported.")
                 group_sizes.append(group_size)
             targets.extend(group_cfg.get("targets", []))
 
@@ -361,7 +364,7 @@ class LocalHuggingFaceModel:
                 return True
         return False
 
-    def load_np_param(self, param_name: str) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    def load_np_param(self, param_name: str) -> np.ndarray | tuple:
         """
         Load a parameter into a numpy array.
 
@@ -369,7 +372,7 @@ class LocalHuggingFaceModel:
             param_name: Parameter name, as it appears in the HF Cache
 
         Returns:
-            The parameter as an numpy array, or a tuple of (scales, weights) if quantized.
+            The parameter as an numpy array, or (scales, weights, group size) if quantized.
         """
         if self.params and param_name in self.params:
             return self.params[param_name]
@@ -404,8 +407,12 @@ class LocalHuggingFaceModel:
                     f"from shape {original_shape}."
                 )
             scale = scale.astype(np.float32)
+            num_scale_groups = scale.size // original_shape[0]
+            minimum_group_size = math.ceil(original_shape[1] / num_scale_groups)
+            # Recover the configured block size by rounding up to the next power of two.
+            group_size = 2 ** math.ceil(math.log2(minimum_group_size))
 
-            return (scale, unpacked)
+            return scale, unpacked, group_size
 
         # shard -> the safetensors symlink file, usually called 'model-00001-of-00002.safetensors'
         model_shard = self.weight_map.get(param_name)

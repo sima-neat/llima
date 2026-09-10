@@ -82,7 +82,8 @@ def build_conv(
         bias_process_func = weight_process_func
 
     params = get_param_func(src_weight_name)
-    scales, weight_tensor = params if isinstance(params, tuple) else (None, params)
+    scales, weight_tensor, *metadata = params if isinstance(params, tuple) else (None, params)
+    c_block_size = metadata[0] if metadata else None
 
     # SiMaIR expects weights in the scales shape (num_c_blocks, out_channels)
     if scales is not None:
@@ -139,7 +140,10 @@ def build_conv(
         batch_size=1,
         input_type=ifm_type.scalar
     )
-    conv = builder.create_conv_node(ifm, weight_tensor, bias_tensor, conv_attrs, activation, scales=scales)
+    conv = builder.create_conv_node(
+        ifm, weight_tensor, bias_tensor, conv_attrs, activation,
+        scales=scales, c_block_size=c_block_size
+    )
     return conv
 
 
