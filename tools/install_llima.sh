@@ -3,13 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 INSTALL_MANIFEST="${LLIMA_INSTALL_MANIFEST:-llima-install-manifest.txt}"
-LLIMA_PACKAGE_MANIFEST="${LLIMA_PACKAGE_MANIFEST:-resolved-deps-manifest.json}"
+LLIMA_PACKAGE_MANIFEST="${LLIMA_PACKAGE_MANIFEST:-llima-package-manifest.json}"
 LLIMA_BUILDINFO_FILE="${LLIMA_BUILDINFO_FILE:-/etc/buildinfo}"
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 LLIMA_INSTALLER_SKIP_PLATFORM_CHECK="${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK:-OFF}"
 SUDO_PASSWORD="${SUDO_PASSWORD:-${DEVKIT_PASSWORD:-}}"
 DEFAULT_SUDO_PASSWORD="${DEFAULT_SUDO_PASSWORD:-edgeai}"
-FIRMWARE_INSTALLER="${NEAT_EV74_FIRMWARE_INSTALLER:-/usr/libexec/sima-neat-firmware/install.sh}"
 
 log() {
   printf '[install_llima] %s\n' "$*"
@@ -151,7 +150,6 @@ fi
 declare -A seen_files=()
 declare -A llima_debs=()
 declare -A llima_versions=()
-declare -A bundled_packages=()
 debs=()
 
 while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -183,11 +181,6 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
     echo "Unable to read package identity from ${line}." >&2
     exit 1
   fi
-  if [[ -n "${bundled_packages["${package}"]+x}" ]]; then
-    echo "Install bundle contains more than one ${package} package." >&2
-    exit 1
-  fi
-  bundled_packages["${package}"]="${deb_path}"
   case "${package}" in
     sima-lmm-core|sima-lmm-cli|sima-lmm-dev)
       if [[ -n "${llima_debs["${package}"]+x}" ]]; then
@@ -196,6 +189,10 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
       fi
       llima_debs["${package}"]="${deb_path}"
       llima_versions["${package}"]="${version}"
+      ;;
+    *)
+      echo "Install bundle contains unexpected package ${package}." >&2
+      exit 1
       ;;
   esac
 done < "${manifest_path}"
@@ -224,13 +221,6 @@ for package in sima-lmm-core sima-lmm-cli sima-lmm-dev; do
   fi
 done
 
-for package in neat-ev74-firmware neat-runtime neat-gst-plugins neat-internals-dev; do
-  if [[ -z "${bundled_packages["${package}"]:-}" ]]; then
-    echo "Install bundle is missing required Internals package ${package}." >&2
-    exit 1
-  fi
-done
-
 log "Validated ${#debs[@]} Debian package(s); LLiMa version ${expected_version}."
 
 log "Refreshing APT package indexes."
@@ -246,22 +236,14 @@ fi
 mapfile -t removed_packages < <(awk '$1 == "Remv" {print $2}' "${simulate_output}")
 if [[ "${#removed_packages[@]}" -gt 0 ]]; then
   for package in "${removed_packages[@]}"; do
-    case "${package%%:*}" in
-      sima-neat|sima-neat-dev|swsoc-video-codec-modalix) ;;
-      *)
-        cat "${simulate_output}" >&2
-        echo "Refusing to install because APT would remove ${package}." >&2
-        exit 1
-        ;;
-    esac
+    cat "${simulate_output}" >&2
+    echo "Refusing to install because APT would remove ${package}." >&2
+    exit 1
   done
-  log "Replacing platform/legacy packages owned by bundled Internals: ${removed_packages[*]}"
 fi
 
-log "Installing bundled Internals and LLiMa packages."
-run_sudo apt-get install -y --reinstall --allow-downgrades \
-  -o Dpkg::Options::=--force-overwrite \
-  "${debs[@]}"
+log "Installing LLiMa packages."
+run_sudo apt-get install -y --reinstall --allow-downgrades "${debs[@]}"
 
 for deb_path in "${debs[@]}"; do
   package="$(dpkg-deb -f "${deb_path}" Package)"
@@ -273,19 +255,9 @@ for deb_path in "${debs[@]}"; do
   fi
 done
 
-if [[ ! -x "${FIRMWARE_INSTALLER}" ]]; then
-  echo "Internals installation completed, but the NEAT EV74 firmware installer is unavailable." >&2
-  exit 1
-fi
-log "Activating and checking the bundled NEAT EV74 firmware."
-run_sudo env NEAT_EV74_MAINTENANCE=1 "${FIRMWARE_INSTALLER}" --activate
-
 if ! command -v llima >/dev/null 2>&1; then
   echo "LLiMa installation completed, but the llima command is unavailable." >&2
   exit 1
 fi
 llima --help >/dev/null
 log "LLiMa ${expected_version} installed successfully."
-if [[ "${#removed_packages[@]}" -gt 0 ]]; then
-  log "Replaced packages: ${removed_packages[*]}"
-fi

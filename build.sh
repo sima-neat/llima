@@ -4,17 +4,10 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR="${LLIMA_DEB_BUILD_DIR:-$ROOT_DIR/build-deb}"
 BUILD_JOBS="${LLIMA_DEB_BUILD_JOBS:-${CMAKE_BUILD_PARALLEL_LEVEL:-}}"
-NEAT_INTERNALS_VULCAN_REPOSITORY="${NEAT_INTERNALS_VULCAN_REPOSITORY:-internals}"
-NEAT_INTERNALS_SNAP_POLICY="${NEAT_INTERNALS_SNAP_POLICY:-ON}"
-NEAT_INTERNALS_MANIFEST="${NEAT_INTERNALS_MANIFEST:-${ROOT_DIR}/deps/manifest.json}"
-NEAT_INTERNALS_PACKAGE_DIR="${NEAT_INTERNALS_PACKAGE_DIR:-}"
-NEAT_INTERNALS_RESOLVED_REF="${NEAT_INTERNALS_RESOLVED_REF:-}"
-NEAT_INTERNALS_DEB_DIR="${NEAT_INTERNALS_DEB_DIR:-}"
-NEAT_INTERNALS_RESOLVED_MANIFEST="${NEAT_INTERNALS_RESOLVED_MANIFEST:-}"
-NEAT_VULCAN_ENV="${NEAT_VULCAN_ENV:-prod}"
-NEAT_VULCAN_BASE_URL="${NEAT_VULCAN_BASE_URL:-}"
+LLIMA_PACKAGE_MANIFEST="${ROOT_DIR}/deps/manifest.json"
 LLIMA_INSTALL_SCRIPT="install_llima.sh"
 LLIMA_INSTALL_MANIFEST="llima-install-manifest.txt"
+LLIMA_DIST_PACKAGE_MANIFEST="llima-package-manifest.json"
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 ARCH=arm64
 ELXR_SDK=OFF
@@ -177,224 +170,6 @@ install_deps() {
     dpkg-dev
 }
 
-extract_json_string() {
-  local key="$1"
-  local file="$2"
-  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "${file}" | head -n1
-}
-
-manifest_has_json_key() {
-  local key="$1"
-  local file="$2"
-  python3 - "${key}" "${file}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-key = sys.argv[1]
-manifest_path = Path(sys.argv[2])
-data = json.loads(manifest_path.read_text(encoding="utf-8"))
-raise SystemExit(0 if key in data else 1)
-PY
-}
-
-manifest_dependency_spec() {
-  local key="$1"
-  local file="$2"
-  python3 - "${key}" "${file}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-key = sys.argv[1]
-manifest_path = Path(sys.argv[2])
-data = json.loads(manifest_path.read_text(encoding="utf-8"))
-if key not in data:
-    raise SystemExit(f"ERROR: {manifest_path} must define '{key}'.")
-
-value = data[key]
-if isinstance(value, str):
-    print("__SNAP__" if not value.strip() else value.strip())
-    raise SystemExit(0)
-
-if isinstance(value, dict):
-    policy = str(value.get("policy", "")).strip().lower()
-    if policy == "snap":
-        print("__SNAP__")
-        raise SystemExit(0)
-    if policy:
-        raise SystemExit(f"ERROR: unsupported {key}.policy in {manifest_path}: {policy!r}")
-
-    spec = str(value.get("spec", "")).strip()
-    branch = str(value.get("branch", value.get("ref", ""))).strip()
-    if branch:
-        print(f"{branch}:{spec or 'latest'}")
-        raise SystemExit(0)
-
-raise SystemExit(
-    f"ERROR: {manifest_path} field '{key}' must be a string, "
-    "or an object with {'policy':'snap'} or {'branch':'...', 'spec':'...'}."
-)
-PY
-}
-
-current_branch_name() {
-  if [[ -n "${GITHUB_HEAD_REF:-}" ]]; then
-    printf '%s\n' "${GITHUB_HEAD_REF}"
-    return 0
-  fi
-  if [[ -n "${GITHUB_REF_NAME:-}" ]]; then
-    printf '%s\n' "${GITHUB_REF_NAME}"
-    return 0
-  fi
-  if command -v git >/dev/null 2>&1 &&
-     git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git -C "${ROOT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null
-    return 0
-  fi
-  printf '\n'
-}
-
-current_exact_tag() {
-  if [[ "${GITHUB_REF_TYPE:-}" == "tag" && -n "${GITHUB_REF_NAME:-}" ]]; then
-    printf '%s\n' "${GITHUB_REF_NAME}"
-    return 0
-  fi
-  if command -v git >/dev/null 2>&1 &&
-     git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git -C "${ROOT_DIR}" describe --tags --exact-match HEAD 2>/dev/null || true
-    return 0
-  fi
-  printf '\n'
-}
-
-resolve_neat_internals_ref() {
-  if [[ ! -f "${NEAT_INTERNALS_MANIFEST}" ]]; then
-    echo "ERROR: Missing manifest: ${NEAT_INTERNALS_MANIFEST}" >&2
-    return 1
-  fi
-
-  if ! manifest_has_json_key "internals" "${NEAT_INTERNALS_MANIFEST}"; then
-    echo "ERROR: ${NEAT_INTERNALS_MANIFEST} must define an internals dependency." >&2
-    return 1
-  fi
-
-  local manifest_ref
-  if ! manifest_ref="$(manifest_dependency_spec "internals" "${NEAT_INTERNALS_MANIFEST}")"; then
-    return 1
-  fi
-  if [[ "${manifest_ref}" != "__SNAP__" ]]; then
-    case "${manifest_ref}" in
-      *:*)
-        printf '%s\n' "${manifest_ref}"
-        ;;
-      *-latest)
-        printf '%s:latest\n' "${manifest_ref%-latest}"
-        ;;
-      *)
-        printf '%s\n' "${manifest_ref}"
-        ;;
-    esac
-    return 0
-  fi
-
-  local branch tag
-  tag="$(current_exact_tag)"
-  if [[ -n "${tag}" ]]; then
-    printf '%s\n' "${tag}:latest"
-    return 0
-  fi
-
-  branch="$(current_branch_name)"
-  if [[ -n "${branch}" && "${branch}" != "HEAD" ]]; then
-    printf '%s\n' "${branch}:latest"
-    return 0
-  fi
-
-  echo "Could not determine current branch for internals snap; using develop:latest." >&2
-  printf '%s\n' "develop:latest"
-}
-
-require_sima_cli_neat_install() {
-  if ! command -v sima-cli >/dev/null 2>&1; then
-    echo "ERROR: sima-cli is required for Vulcan internals artifact access." >&2
-    exit 1
-  fi
-  if ! SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli neat install --help >/dev/null 2>&1; then
-    echo "ERROR: sima-cli with Neat artifact install support is required." >&2
-    exit 1
-  fi
-}
-
-fetch_neat_internals_vulcan_artifacts() {
-  local internals_ref="$1"
-  local output_dir="$2"
-
-  require_sima_cli_neat_install
-
-  local -a base_args=(
-    neat
-    install
-    --env "${NEAT_VULCAN_ENV}"
-  )
-  if [[ -n "${NEAT_VULCAN_BASE_URL}" ]]; then
-    base_args+=(--base-url "${NEAT_VULCAN_BASE_URL}")
-  fi
-
-  local exact_tag resolve_output resolved_ref
-  if ! resolve_output="$(SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli "${base_args[@]}" "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" --json)"; then
-    exact_tag="$(current_exact_tag)"
-    if [[ -n "${exact_tag}" && "${internals_ref}" == "${exact_tag}:latest" ]]; then
-      echo "ERROR: Failed to resolve exact tag-snap internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
-      exit 1
-    fi
-    if [[ "${NEAT_INTERNALS_SNAP_POLICY}" != "ON" || "${internals_ref}" == "develop:latest" ]]; then
-      echo "ERROR: Failed to resolve internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
-      exit 1
-    fi
-
-    echo "No internals Vulcan artifact found for '${internals_ref}'; retrying develop:latest." >&2
-    internals_ref="develop:latest"
-    if ! resolve_output="$(SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli "${base_args[@]}" "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" --json)"; then
-      echo "ERROR: Failed to resolve fallback internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${internals_ref}" >&2
-      exit 1
-    fi
-  fi
-
-  resolved_ref="$(python3 - <<'PY' "${resolve_output}"
-import json
-import sys
-
-text = sys.argv[1]
-start = text.find("{")
-if start < 0:
-    raise SystemExit("missing JSON object in sima-cli neat install --json output")
-payload = json.loads(text[start:])
-ref = str(payload.get("ref", "")).strip()
-spec = str(payload.get("resolved_spec", "")).strip()
-if not ref or not spec:
-    raise SystemExit("sima-cli neat install --json did not return ref and resolved_spec")
-print(f"{ref}:{spec}")
-PY
-)"
-  NEAT_INTERNALS_RESOLVED_REF="${resolved_ref}"
-
-  local -a install_args=(
-    "${base_args[@]}"
-    -d "${output_dir}"
-    "${NEAT_INTERNALS_VULCAN_REPOSITORY}@${resolved_ref}"
-  )
-
-  echo "[build] Fetching NEAT internals packages from Vulcan:"
-  echo "[build]   ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${resolved_ref}"
-  rm -rf "${output_dir}"
-  mkdir -p "${output_dir}"
-  if ! SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli "${install_args[@]}"; then
-    echo "ERROR: Failed to fetch internals Vulcan artifact: ${NEAT_INTERNALS_VULCAN_REPOSITORY}@${resolved_ref}" >&2
-    exit 1
-  fi
-}
-
 ensure_git_submodules() {
   local path
   local missing=0
@@ -474,6 +249,9 @@ ensure_sdk_sysroot_packages() {
   ensure_sdk_sysroot_header_package "${sysroot}" "simaai-heap-dev:arm64" "SiMa DMA heap" \
     "${sysroot}/usr/include/simaai/simaai_heap.h" \
     "${sysroot}/usr/lib/aarch64-linux-gnu/libsimaai_heap.so"
+  ensure_sdk_sysroot_header_package "${sysroot}" "simaai-mlart-modalix-dev:arm64" "MLA-RT" \
+    "${sysroot}/usr/include/simaai/gst-api.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/libMLArt.so"
 
   local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
   local packages=()
@@ -616,181 +394,13 @@ path_exists_any() {
   return 1
 }
 
-validate_neat_internals_payload() {
-  local root="${1%/}"
-  local source_name="$2"
-  local path
-  local -a missing=()
-  local -a required=(
-    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsConfig.cmake"
-    "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsTargets.cmake"
-    "/usr/share/sima-neat-internals/runtime-profile.json"
-    "/usr/libexec/sima-neat-firmware/install.sh"
-  )
-
-  for path in "${required[@]}"; do
-    [[ -e "${root}${path}" ]] || missing+=("${path}")
-  done
-
-  if [[ "${#missing[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  echo "ERROR: ${source_name} is incomplete." >&2
-  echo "Missing:" >&2
-  printf '  %s\n' "${missing[@]}" >&2
-  return 1
-}
-
-sync_sysroot_from_internals_manifest() {
-  local artifact_dir="$1"
-  [[ "${NEAT_SYNC_SYSROOT:-OFF}" == "ON" ]] || return 0
-
-  if [[ "${ELXR_SDK}" != "ON" ]]; then
-    echo "ERROR: NEAT_SYNC_SYSROOT requires an eLxr SDK." >&2
-    exit 1
-  fi
-
-  local artifact_manifest="${artifact_dir}/internals-manifest.json"
-  if [[ ! -f "${artifact_manifest}" ]]; then
-    echo "ERROR: Internals artifact is missing internals-manifest.json." >&2
-    exit 1
-  fi
-
-  local receipt
-  if ! receipt="$(python3 -c '
-import json, re, sys
-artifact = json.load(open(sys.argv[1], encoding="utf-8"))
-consumer = json.load(open(sys.argv[2], encoding="utf-8"))
-receipt = artifact["sysroot-version"]
-consumer_base = consumer["platform-version"]
-if not isinstance(receipt, str) or (
-    receipt
-    and not re.fullmatch(r"[0-9]+(?:[.][0-9]+){2}(?:~pre[0-9]+)?", receipt)
-):
-    raise ValueError("invalid sysroot-version")
-if receipt and consumer_base != receipt.split("~pre", 1)[0]:
-    raise ValueError("platform-version does not match the Internals receipt")
-print(receipt)
-' "${artifact_manifest}" "${NEAT_INTERNALS_MANIFEST}")"; then
-    echo "ERROR: Cannot read Internals build receipt." >&2
-    exit 1
-  fi
-  if [[ -z "${receipt}" ]]; then
-    echo "LLiMa is using the existing SDK sysroot."
-    return 0
-  fi
-
-  if [[ "${receipt}" == *"~pre"* ]]; then
-    echo "[build] Updating SDK sysroot to Internals receipt ${receipt}"
-    run_as_root sysroot update "${receipt}"
-    sysroot status
-    return 0
-  fi
-
-  local sdk_platform_version
-  sdk_platform_version="$(sed -nE \
-    's/^Platform Version[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\1/p' \
-    "${ELXR_SDK_RELEASE_FILE}" 2>/dev/null | head -n1 || true)"
-  if [[ "${sdk_platform_version}" != "${receipt}" ]]; then
-    echo "ERROR: SDK platform ${sdk_platform_version:-unknown} does not match required stable platform ${receipt}." >&2
-    exit 1
-  fi
-  echo "[build] Using stable SDK sysroot ${sdk_platform_version} without updating it."
-}
-
-ensure_neat_internals() {
-  local sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
-  local tmp_dir
-  tmp_dir=""
-  local extract_dir
-  local payload_root
-  local archive_name="Vulcan internals artifact"
-  local -a all_debs=()
-
-  if [[ -n "${NEAT_INTERNALS_PACKAGE_DIR}" ]]; then
-    if [[ ! -d "${NEAT_INTERNALS_PACKAGE_DIR}" ]]; then
-      echo "ERROR: NEAT_INTERNALS_PACKAGE_DIR does not exist: ${NEAT_INTERNALS_PACKAGE_DIR}" >&2
-      exit 1
-    fi
-    extract_dir="${NEAT_INTERNALS_PACKAGE_DIR}"
-    archive_name="local internals package directory"
-    echo "[build] Using local NEAT internals packages: ${extract_dir}"
-  else
-    tmp_dir="$(mktemp -d /tmp/llima-neat-internals.XXXXXX)"
-    extract_dir="${tmp_dir}/package"
-    local internals_ref
-    if ! internals_ref="$(resolve_neat_internals_ref)"; then
-      exit 1
-    fi
-    fetch_neat_internals_vulcan_artifacts "${internals_ref}" "${extract_dir}"
-  fi
-
-  mapfile -t all_debs < <(find "${extract_dir}" -type f -name '*.deb' | sort)
-  if [[ "${#all_debs[@]}" -eq 0 ]]; then
-    echo "ERROR: ${archive_name} did not contain any Debian packages." >&2
-    [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
-    exit 1
-  fi
-
-  sync_sysroot_from_internals_manifest "${extract_dir}"
-
-  mkdir -p "${NEAT_INTERNALS_DEB_DIR}"
-  rm -f "${NEAT_INTERNALS_DEB_DIR}"/*.deb
-  local source_deb cached_deb
-  for source_deb in "${all_debs[@]}"; do
-    cached_deb="${NEAT_INTERNALS_DEB_DIR}/$(basename "${source_deb}")"
-    if [[ -e "${cached_deb}" ]]; then
-      echo "ERROR: Duplicate Internals package basename: $(basename "${source_deb}")" >&2
-      [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
-      exit 1
-    fi
-    cp -f "${source_deb}" "${cached_deb}"
-  done
-  echo "[build] Cached ${#all_debs[@]} NEAT internals Debian package(s):"
-  find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' -printf '[build]   %f\n' | sort
-
-  local debs=()
-  local deb
-  mapfile -t debs < <(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' | sort)
-
-  if [[ "${ELXR_SDK}" == "ON" ]]; then
-    if [[ ! -d "${sysroot}" ]]; then
-      echo "ERROR: SYSROOT does not exist: ${sysroot}" >&2
-      exit 1
-    fi
-
-    payload_root="$(mktemp -d /tmp/llima-neat-internals-payload.XXXXXX)"
-    for deb in "${debs[@]}"; do
-      dpkg-deb -x "${deb}" "${payload_root}"
-    done
-    if ! validate_neat_internals_payload "${payload_root}" "${archive_name}"; then
-      rm -rf "${payload_root}"
-      [[ -z "${tmp_dir}" ]] || rm -rf "${tmp_dir}"
-      exit 1
-    fi
-    rm -rf "${payload_root}"
-
-    echo "[build] Installing NEAT internals deb payloads into SDK sysroot:"
-    echo "[build]   ${sysroot}"
-    for deb in "${debs[@]}"; do
-      echo "[build]   $(basename "${deb}")"
-      run_as_root dpkg-deb -x "${deb}" "${sysroot}"
-    done
-  else
-    if ! command -v apt >/dev/null 2>&1; then
-      echo "ERROR: apt is required to install NEAT internals deb packages outside SDK mode." >&2
-      exit 1
-    fi
-    echo "[build] Installing NEAT internals deb packages into host system"
-    run_as_root apt install -y --allow-downgrades "${debs[@]}"
-    validate_neat_internals_payload "" "installed NEAT internals packages"
-  fi
-
+validate_platform_development_files() {
+  local sysroot=""
   local mlart_header mlart_library heap_header heap_library
   local missing=()
 
   if [[ "${ELXR_SDK}" == "ON" ]]; then
+    sysroot="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
     mlart_header="${sysroot}/usr/include/simaai/gst-api.h"
     mlart_library="${sysroot}/usr/lib/aarch64-linux-gnu/libMLArt.so"
     heap_header="${sysroot}/usr/include/simaai/simaai_heap.h"
@@ -808,15 +418,12 @@ ensure_neat_internals() {
   [[ -e "${heap_library}" ]] || missing+=("${heap_library}")
 
   if [[ "${#missing[@]}" -gt 0 ]]; then
-    echo "ERROR: The MLA-RT platform development files are incomplete." >&2
+    echo "ERROR: The MLA-RT and SiMa DMA heap development files are incomplete." >&2
     echo "Missing:" >&2
     printf '  %s\n' "${missing[@]}" >&2
     exit 1
   fi
 
-  if [[ -n "${tmp_dir}" ]]; then
-    rm -rf "${tmp_dir}"
-  fi
   echo "[build] MLA-RT and SiMa DMA heap development files are ready."
 }
 
@@ -860,28 +467,6 @@ ensure_writable_cargo_home() {
   echo "[build] Using Cargo home: ${CARGO_HOME}"
 }
 
-write_resolved_deps_manifest() {
-  mkdir -p "$(dirname "${NEAT_INTERNALS_RESOLVED_MANIFEST}")"
-  python3 - \
-    "${NEAT_INTERNALS_MANIFEST}" \
-    "${NEAT_INTERNALS_RESOLVED_REF}" \
-    "${NEAT_INTERNALS_RESOLVED_MANIFEST}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-source_path = Path(sys.argv[1])
-resolved_ref = sys.argv[2].strip()
-output_path = Path(sys.argv[3])
-
-manifest = json.loads(source_path.read_text(encoding="utf-8"))
-if resolved_ref:
-    manifest["internals"] = resolved_ref
-output_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-PY
-  echo "[build] Resolved dependency manifest: ${NEAT_INTERNALS_RESOLVED_MANIFEST}"
-}
-
 required_llima_debs() {
   local version="$1"
   printf '%s\n' \
@@ -923,35 +508,19 @@ stage_package_artifacts() {
     return
   fi
 
-  if [[ -n "${NEAT_INTERNALS_PACKAGE_DIR}" &&
-        ! "${NEAT_INTERNALS_RESOLVED_REF}" =~ ^[^:[:space:]]+:[^:[:space:]]+$ ]]; then
-    echo "ERROR: NEAT_INTERNALS_RESOLVED_REF must be an exact branch:spec reference when NEAT_INTERNALS_PACKAGE_DIR is used for a publishable artifact." >&2
-    return 1
-  fi
-
   local version="$1"
-  local deb
-  local -a internals_debs=()
 
   verify_required_llima_debs "${version}" "${ROOT_DIR}/dist"
-  mapfile -t internals_debs < <(find "${NEAT_INTERNALS_DEB_DIR}" -maxdepth 1 -type f -name '*.deb' | sort)
-  if [[ "${#internals_debs[@]}" -eq 0 ]]; then
-    echo "ERROR: No cached Internals Debian packages found in ${NEAT_INTERNALS_DEB_DIR}." >&2
-    return 1
-  fi
   find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name '*.deb' ! -name 'sima-lmm-*.deb' -delete
   rm -f \
     "${ROOT_DIR}/dist/${LLIMA_INSTALL_SCRIPT}" \
     "${ROOT_DIR}/dist/${LLIMA_INSTALL_MANIFEST}" \
-    "${ROOT_DIR}/dist/resolved-deps-manifest.json" \
+    "${ROOT_DIR}/dist/${LLIMA_DIST_PACKAGE_MANIFEST}" \
     "${ROOT_DIR}/dist/metadata.json"
   rm -rf "${ROOT_DIR}/dist/debs"
 
-  for deb in "${internals_debs[@]}"; do
-    cp -f "${deb}" "${ROOT_DIR}/dist/$(basename "${deb}")"
-  done
   install -m 0755 "${ROOT_DIR}/tools/${LLIMA_INSTALL_SCRIPT}" "${ROOT_DIR}/dist/${LLIMA_INSTALL_SCRIPT}"
-  install -m 0644 "${NEAT_INTERNALS_RESOLVED_MANIFEST}" "${ROOT_DIR}/dist/resolved-deps-manifest.json"
+  install -m 0644 "${LLIMA_PACKAGE_MANIFEST}" "${ROOT_DIR}/dist/${LLIMA_DIST_PACKAGE_MANIFEST}"
   write_install_manifest
 
   mkdir -p "${ROOT_DIR}/dist/debs"
@@ -959,7 +528,7 @@ stage_package_artifacts() {
     cp -f "${ROOT_DIR}/dist/${deb}" "${ROOT_DIR}/dist/debs/${deb}"
   done < <(required_llima_debs "${version}")
 
-  echo "[build] Staged installable root bundle with ${#internals_debs[@]} Internals package(s)."
+  echo "[build] Staged installable root bundle with three LLiMa packages."
   echo "[build] Staged download-only Debian profile: dist/debs/"
 }
 
@@ -1045,7 +614,7 @@ build_extras_archive() {
 read_package_compatibility_args() {
   local -n out_ref="$1"
   local compatibility_args
-  if ! compatibility_args="$(python3 - "${NEAT_INTERNALS_MANIFEST}" <<'PY'
+  if ! compatibility_args="$(python3 - "${LLIMA_PACKAGE_MANIFEST}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1060,7 +629,7 @@ for argument in ("--board-platform", f"modalix@{platform_version}"):
     print(argument)
 PY
   )"; then
-    echo "ERROR: Failed to read package compatibility from ${NEAT_INTERNALS_MANIFEST}." >&2
+    echo "ERROR: Failed to read package compatibility from ${LLIMA_PACKAGE_MANIFEST}." >&2
     return 1
   fi
   mapfile -t out_ref <<< "${compatibility_args}"
@@ -1080,15 +649,14 @@ add_package_source_metadata() {
   source_sha="${GITHUB_SHA:-$(git -C "${ROOT_DIR}" rev-parse HEAD)}"
 
   python3 - "${metadata_path}" "${package_path}" "${profile}" \
-    "${source_repository}" "${source_ref}" "${source_sha}" \
-    "${NEAT_INTERNALS_RESOLVED_REF}" <<'PY'
+    "${source_repository}" "${source_ref}" "${source_sha}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 metadata_path = Path(sys.argv[1])
-package_path, profile, repository, ref, commit, internals_ref = sys.argv[2:]
+package_path, profile, repository, ref, commit = sys.argv[2:]
 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 metadata.update(
     {
@@ -1097,7 +665,6 @@ metadata.update(
             "repository": "llima",
             "package_path": package_path,
             "profile": profile,
-            "internals_ref": internals_ref,
         },
         "repository": repository,
         "branch": ref,
@@ -1140,7 +707,7 @@ generate_package_metadata() {
   SIMA_CLI_CHECK_FOR_UPDATE=0 sima-cli packages build "${root_package_dir}" \
     --name "gh:sima-neat/llima" \
     --version "${version}" \
-    --description "Installable SiMa.ai LLiMa runtime and exact Internals dependencies" \
+    --description "Installable SiMa.ai LLiMa runtime" \
     --install-script "bash ./${LLIMA_INSTALL_SCRIPT}" \
     "${package_compatibility_args[@]}"
 
@@ -1228,8 +795,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-NEAT_INTERNALS_DEB_DIR="${NEAT_INTERNALS_DEB_DIR:-${BUILD_DIR}/internals-debs}"
-NEAT_INTERNALS_RESOLVED_MANIFEST="${NEAT_INTERNALS_RESOLVED_MANIFEST:-${BUILD_DIR}/resolved-deps-manifest.json}"
 BUILD_VENV="$BUILD_DIR/.deb-build-venv"
 
 if [ "$INSTALL_DEPS_ONLY" -eq 1 ]; then
@@ -1258,10 +823,9 @@ fi
 check_local_build_tools
 ensure_git_submodules
 detect_elxr_sdk
-ensure_neat_internals
-write_resolved_deps_manifest
 apply_default_sdk_toolchain
 ensure_sdk_sysroot_packages
+validate_platform_development_files
 
 LLIMA_VERSION="$(compute_package_version)"
 LLIMA_PROJECT_VERSION="${LLIMA_VERSION%%+*}"

@@ -1,13 +1,8 @@
 {
-  "internals": {
-    "branch": "codex/b1157-mlart-dmabuf",
-    "spec": "latest"
-  },
   "sdk": {
     "channel": "develop"
   },
   "package-version": "0.4.0",
   "platform-version": "3.0.0",
-  "runtime-profile": "modalix-3.0.0-b1297",
-  "expected-internals-sysroot": "3.0.0~git202609110138.6a3d895-1297"
+  "sysroot-version": "3.0.0~git202609110138.6a3d895-1297"
 }
