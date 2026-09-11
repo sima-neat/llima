@@ -43,8 +43,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m unittest -v tests.ci.test_resolve_test_scope
-          python3 -m pytest -q tests/test_platform_package_boundary.py
+          python3 -m unittest -v \
+            tests.ci.test_resolve_test_scope \
+            tests.test_platform_package_boundary
 
       - name: Resolve test scope
         id: scope

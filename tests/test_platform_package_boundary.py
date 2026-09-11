@@ -3,57 +3,53 @@
 from __future__ import annotations
 
 import json
+import unittest
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
-pytestmark = pytest.mark.premerge
 
 
 def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def test_runtime_uses_platform_libraries_without_neat_internals() -> None:
-    cmake = read("CMakeLists.txt")
-    build = read("build.sh")
-    installer = read("tools/install_llima.sh")
-    manifest = json.loads(read("deps/manifest.json"))
+class PlatformPackageBoundaryTest(unittest.TestCase):
+    def test_runtime_uses_platform_libraries_without_neat_internals(self) -> None:
+        cmake = read("CMakeLists.txt")
+        build = read("build.sh")
+        installer = read("tools/install_llima.sh")
+        manifest = json.loads(read("deps/manifest.json"))
 
-    assert "find_package(NeatInternals" not in cmake
-    assert "NeatInternals::" not in cmake
-    assert "simaai-mlart-modalix, " in cmake
-    assert "simaai-heap (>= 3.0~), " in cmake
+        self.assertNotIn("find_package(NeatInternals", cmake)
+        self.assertNotIn("NeatInternals::", cmake)
+        self.assertIn("simaai-mlart-modalix, ", cmake)
+        self.assertIn("simaai-heap (>= 3.0~), ", cmake)
+        self.assertNotIn("NEAT_INTERNALS", build)
+        self.assertNotIn("neat-runtime", installer)
+        self.assertNotIn("neat-gst-plugins", installer)
+        self.assertNotIn("neat-ev74-firmware", installer)
+        self.assertNotIn("internals", manifest)
 
-    assert "NEAT_INTERNALS" not in build
-    assert "neat-runtime" not in installer
-    assert "neat-gst-plugins" not in installer
-    assert "neat-ev74-firmware" not in installer
-    assert "internals" not in manifest
+    def test_build_checks_direct_platform_development_files(self) -> None:
+        build = read("build.sh")
 
+        self.assertIn("simaai-mlart-modalix-dev:arm64", build)
+        self.assertIn("simaai-heap-dev:arm64", build)
+        self.assertIn("/usr/include/simaai/gst-api.h", build)
+        self.assertIn("/usr/include/simaai/simaai_heap.h", build)
+        self.assertIn("/usr/lib/aarch64-linux-gnu/libMLArt.so", build)
+        self.assertIn("/usr/lib/aarch64-linux-gnu/libsimaai_heap.so", build)
 
-def test_build_checks_direct_platform_development_files() -> None:
-    build = read("build.sh")
+    def test_installer_keeps_modalix_3_platform_check(self) -> None:
+        installer = read("tools/install_llima.sh")
+        manifest = json.loads(read("deps/manifest.json"))
+        workflow = read(".github/workflows/vulcan-ci.yml")
 
-    assert "simaai-mlart-modalix-dev:arm64" in build
-    assert "simaai-heap-dev:arm64" in build
-    assert "/usr/include/simaai/gst-api.h" in build
-    assert "/usr/include/simaai/simaai_heap.h" in build
-    assert "/usr/lib/aarch64-linux-gnu/libMLArt.so" in build
-    assert "/usr/lib/aarch64-linux-gnu/libsimaai_heap.so" in build
-
-
-def test_installer_keeps_modalix_3_platform_check() -> None:
-    installer = read("tools/install_llima.sh")
-    manifest = json.loads(read("deps/manifest.json"))
-    workflow = read(".github/workflows/vulcan-ci.yml")
-
-    assert manifest["platform-version"] == "3.0.0"
-    assert manifest["sysroot-version"].endswith("-1297")
-    assert '["sysroot-version"]' in workflow
-    assert 'sysroot update "${sysroot_version}"' in workflow
-    assert "MACHINE=modalix" in installer
-    assert 'actual="$(read_devkit_platform_version' in installer
-    assert 'if [[ "${actual}" != "${expected}" ]]' in installer
-    assert "Refusing to install before modifying apt packages" in installer
+        self.assertEqual(manifest["platform-version"], "3.0.0")
+        self.assertTrue(manifest["sysroot-version"].endswith("-1297"))
+        self.assertIn('["sysroot-version"]', workflow)
+        self.assertIn('sysroot update "${sysroot_version}"', workflow)
+        self.assertIn("MACHINE=modalix", installer)
+        self.assertIn('actual="$(read_devkit_platform_version', installer)
+        self.assertIn('if [[ "${actual}" != "${expected}" ]]', installer)
+        self.assertIn("Refusing to install before modifying apt packages", installer)
