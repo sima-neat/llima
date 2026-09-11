@@ -259,7 +259,7 @@ jobs:
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/CTestTestfile.cmake" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
-          "./lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" >/dev/null
+          "./lib/sima-lmm/tests/sima_lmm_mla_rt_lifecycle_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/sima_lmm_text_generation_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
@@ -590,7 +590,7 @@ jobs:
 
           test_dir="_work/runtime-tests/lib/sima-lmm/tests"
           test -f "${test_dir}/CTestTestfile.cmake"
-          test -x "${test_dir}/sima_lmm_dispatcher_lifecycle_test"
+          test -x "${test_dir}/sima_lmm_mla_rt_lifecycle_test"
           test -x "${test_dir}/sima_lmm_text_generation_test"
           test -x "${test_dir}/sima_lmm_vision_generation_test"
           test -x "${test_dir}/sima_lmm_asr_transcription_test"
@@ -601,7 +601,7 @@ jobs:
 
           test_dir = Path("_work/runtime-tests/lib/sima-lmm/tests")
           test_binaries = (
-              "sima_lmm_dispatcher_lifecycle_test",
+              "sima_lmm_mla_rt_lifecycle_test",
               "sima_lmm_text_generation_test",
               "sima_lmm_vision_generation_test",
               "sima_lmm_asr_transcription_test",
