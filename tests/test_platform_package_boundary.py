@@ -40,6 +40,29 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
         self.assertIn("/usr/lib/aarch64-linux-gnu/libMLArt.so", build)
         self.assertIn("/usr/lib/aarch64-linux-gnu/libsimaai_heap.so", build)
 
+    def test_build_bootstrap_uses_b1297_library_abis(self) -> None:
+        build = read("build.sh")
+
+        for package in (
+            "libopencv-flann410:arm64",
+            "libopencv-dnn410:arm64",
+            "libopencv-features2d410:arm64",
+            "libopencv-objdetect410:arm64",
+            "libopencv-video410:arm64",
+            "libfmt10:arm64",
+            "libspdlog1.15:arm64",
+            "libcpp-httplib0.18:arm64",
+        ):
+            self.assertIn(package, build)
+
+        for stale_abi in (
+            "406:arm64",
+            "libfmt9:arm64",
+            "libspdlog1.10:arm64",
+            "libcpp-httplib0.11:arm64",
+        ):
+            self.assertNotIn(stale_abi, build)
+
     def test_installer_keeps_modalix_3_platform_check(self) -> None:
         installer = read("tools/install_llima.sh")
         manifest = json.loads(read("deps/manifest.json"))

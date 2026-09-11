@@ -257,25 +257,25 @@ ensure_sdk_sysroot_packages() {
   local packages=()
 
   path_exists_any "${libdir}/libopencv_flann.so" "${libdir}/libopencv_flann.so.*" ||
-    packages+=(libopencv-flann406:arm64)
+    packages+=(libopencv-flann410:arm64)
   path_exists_any "${libdir}/libopencv_dnn.so" "${libdir}/libopencv_dnn.so.*" ||
-    packages+=(libopencv-dnn406:arm64)
+    packages+=(libopencv-dnn410:arm64)
   path_exists_any "${libdir}/libopencv_features2d.so" "${libdir}/libopencv_features2d.so.*" ||
-    packages+=(libopencv-features2d406:arm64)
+    packages+=(libopencv-features2d410:arm64)
   path_exists_any "${libdir}/libopencv_objdetect.so" "${libdir}/libopencv_objdetect.so.*" ||
-    packages+=(libopencv-objdetect406:arm64)
+    packages+=(libopencv-objdetect410:arm64)
   path_exists_any "${libdir}/libopencv_video.so" "${libdir}/libopencv_video.so.*" ||
-    packages+=(libopencv-video406:arm64)
+    packages+=(libopencv-video410:arm64)
   if [[ ! -f "${sysroot}/usr/include/openssl/ssl.h" ||
         ! -e "${libdir}/libcrypto.so" ]]; then
     packages+=(libssl-dev:arm64)
   fi
   path_exists_any "${libdir}/libfmt.so" "${libdir}/libfmt.so.*" ||
-    packages+=(libfmt9:arm64)
+    packages+=(libfmt10:arm64)
   path_exists_any "${libdir}/libspdlog.so" "${libdir}/libspdlog.so.*" ||
-    packages+=(libspdlog1.10:arm64)
+    packages+=(libspdlog1.15:arm64)
   path_exists_any "${libdir}/libcpp-httplib.so" "${libdir}/libcpp-httplib.so.*" ||
-    packages+=(libcpp-httplib0.11:arm64)
+    packages+=(libcpp-httplib0.18:arm64)
   path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" ||
     packages+=(libpgm-5.3-0:arm64 libpgm-dev:arm64)
 
@@ -291,16 +291,16 @@ ensure_sdk_sysroot_packages() {
   echo "[build] Installing missing LLiMa SDK sysroot package payloads"
   install_sdk_sysroot_package_payloads "${sysroot}" "${packages[@]}"
 
-  if ! path_exists_any "${libdir}/libopencv_flann.so.406*" ||
-     ! path_exists_any "${libdir}/libopencv_dnn.so.406*" ||
-     ! path_exists_any "${libdir}/libopencv_features2d.so.406*" ||
-     ! path_exists_any "${libdir}/libopencv_objdetect.so.406*" ||
-     ! path_exists_any "${libdir}/libopencv_video.so.406*" ||
+  if ! path_exists_any "${libdir}/libopencv_flann.so.410*" ||
+     ! path_exists_any "${libdir}/libopencv_dnn.so.410*" ||
+     ! path_exists_any "${libdir}/libopencv_features2d.so.410*" ||
+     ! path_exists_any "${libdir}/libopencv_objdetect.so.410*" ||
+     ! path_exists_any "${libdir}/libopencv_video.so.410*" ||
      [[ ! -f "${sysroot}/usr/include/openssl/ssl.h" ]] ||
      [[ ! -e "${libdir}/libcrypto.so" ]] ||
-     ! path_exists_any "${libdir}/libfmt.so.9.1.0" ||
-     ! path_exists_any "${libdir}/libspdlog.so.1.10.0" ||
-     ! path_exists_any "${libdir}/libcpp-httplib.so.0.11*" ||
+     ! path_exists_any "${libdir}/libfmt.so.10*" ||
+     ! path_exists_any "${libdir}/libspdlog.so.1.15*" ||
+     ! path_exists_any "${libdir}/libcpp-httplib.so.0.18*" ||
      ! path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*"; then
     echo "ERROR: LLiMa SDK sysroot package payloads are incomplete after install." >&2
     exit 1
