@@ -11,7 +11,7 @@ from onnxsim.onnxsim_cpp2py_export import simplify_path
 from pathlib import Path
 from typing import ClassVar
 
-from sima_utils.logging.sima_logger import sima_log_dbg
+from sima_lmm.logging import sima_log_dbg
 from sima_lmm.utils import (
     ceil_div_row, mla_max_num_rows, mla_row_size, round_up_to_row
 )

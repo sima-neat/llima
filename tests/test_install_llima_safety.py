@@ -62,24 +62,22 @@ def write_command(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def run_installer(
-    tmp_path: Path, replacement_version: str
-) -> subprocess.CompletedProcess:
+def run_installer(tmp_path: Path, removed_package: str) -> subprocess.CompletedProcess:
     bundle = tmp_path / "bundle"
     commands = tmp_path / "commands"
     bundle.mkdir()
     commands.mkdir()
 
     debs = [
-        build_deb(
-            bundle,
-            "neat-common",
-            "0.4.0",
-            provides=f"simaai-common (= {replacement_version})",
-            replaces="simaai-common",
-            conflicts="simaai-common",
-        )
+        build_deb(bundle, "neat-common", "0.4.0")
     ]
+    for package in (
+        "neat-ev74-firmware",
+        "neat-runtime",
+        "neat-gst-plugins",
+        "neat-internals-dev",
+    ):
+        debs.append(build_deb(bundle, package, "0.4.0"))
     for package in ("sima-lmm-core", "sima-lmm-cli", "sima-lmm-dev"):
         debs.append(build_deb(bundle, package, "0.4.0"))
     (bundle / "llima-install-manifest.txt").write_text(
@@ -88,9 +86,9 @@ def run_installer(
 
     write_command(
         commands / "apt-get",
-        """
+        f"""
 if [[ " $* " == *" --simulate "* ]]; then
-  echo "Remv simaai-common [2.1.3~pre4678]"
+  echo "Remv {removed_package} [3.0.0]"
 fi
 exit 0
 """,
@@ -100,8 +98,7 @@ exit 0
         """
 package="${!#}"
 case "${package}" in
-  simaai-common) echo "2.1.3~pre4678" ;;
-  neat-common|sima-lmm-core|sima-lmm-cli|sima-lmm-dev) echo "0.4.0" ;;
+  neat-common|neat-ev74-firmware|neat-runtime|neat-gst-plugins|neat-internals-dev|sima-lmm-core|sima-lmm-cli|sima-lmm-dev) echo "0.4.0" ;;
   *) exit 1 ;;
 esac
 """,
@@ -116,6 +113,8 @@ exec "$@"
 """,
     )
     write_command(commands / "llima", "exit 0\n")
+    firmware_installer = commands / "install-neat-firmware"
+    write_command(firmware_installer, "exit 0\n")
 
     installer = bundle / "install_llima.sh"
     installer.write_bytes((ROOT / "tools/install_llima.sh").read_bytes())
@@ -123,6 +122,7 @@ exec "$@"
     env = os.environ.copy()
     env["PATH"] = f"{commands}:{env['PATH']}"
     env["LLIMA_INSTALLER_SKIP_PLATFORM_CHECK"] = "ON"
+    env["NEAT_EV74_FIRMWARE_INSTALLER"] = str(firmware_installer)
     return subprocess.run(
         [str(installer)],
         cwd=bundle,
@@ -134,19 +134,17 @@ exec "$@"
 
 
 @requires_associative_arrays
-def test_installer_allows_exact_identity_preserving_replacement(tmp_path: Path) -> None:
-    result = run_installer(tmp_path, "2.1.3~pre4678")
+def test_installer_allows_replacing_legacy_neat_package(tmp_path: Path) -> None:
+    result = run_installer(tmp_path, "sima-neat")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Verified platform package replacements" in result.stdout
-    assert "simaai-common=2.1.3~pre4678" in result.stdout
+    assert "Replacing platform/legacy packages" in result.stdout
+    assert "sima-neat" in result.stdout
 
 
 @requires_associative_arrays
-def test_installer_rejects_non_exact_replacement(tmp_path: Path) -> None:
-    result = run_installer(tmp_path, "2.1.3")
+def test_installer_rejects_removing_unrelated_platform_package(tmp_path: Path) -> None:
+    result = run_installer(tmp_path, "simaai-common")
 
     assert result.returncode != 0
-    assert "without a bundled package that Provides its exact installed version" in (
-        result.stderr
-    )
+    assert "Refusing to install because APT would remove simaai-common" in result.stderr

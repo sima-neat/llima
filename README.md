@@ -114,6 +114,12 @@ Model files load in parallel by default. When starting LLiMa alongside an
 active MLA workload, set `SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD=1` to load models
 one at a time so other inference requests can run between model loads.
 
+LLiMa connects through MLA-RT's `/dev/mla` backend and requests scheduler group
+priority 10, leaving the platform default priority 0 available to
+latency-sensitive vision processes. Set `MLA_CTX_PRIORITY` before startup to
+override this value; lower numbers have higher priority, and negative values
+require `CAP_SYS_NICE`.
+
 For EAGLE3 speculative decoding, pass the parent compiled-model directory that
 contains both the target and draft model subdirectories. `llima run` reads each
 subdirectory's `sima_files/devkit/vlm_config.json` and automatically selects the

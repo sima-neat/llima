@@ -460,29 +460,43 @@ ensure_sdk_sysroot_packages() {
     "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/libbrotlienc.pc"
   ensure_sdk_sysroot_header_package "${sysroot}" "libcpp-httplib-dev:arm64" "cpp-httplib" \
     "${sysroot}/usr/include/httplib.h"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libfftw3-dev:arm64" "FFTW3" \
+    "${sysroot}/usr/include/fftw3.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/fftw3.pc" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/libfftw3.so"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libreadline-dev:arm64" "readline" \
+    "${sysroot}/usr/include/readline/readline.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/readline.pc" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/libreadline.so"
+  ensure_sdk_sysroot_header_package "${sysroot}" "libncurses-dev:arm64" "tinfo" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/pkgconfig/tinfo.pc" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/libtinfo.so"
+  ensure_sdk_sysroot_header_package "${sysroot}" "simaai-heap-dev:arm64" "SiMa DMA heap" \
+    "${sysroot}/usr/include/simaai/simaai_heap.h" \
+    "${sysroot}/usr/lib/aarch64-linux-gnu/libsimaai_heap.so"
 
   local libdir="${sysroot}/usr/lib/aarch64-linux-gnu"
   local packages=()
 
-  path_exists_any "${libdir}/libopencv_flann.so.406*" ||
+  path_exists_any "${libdir}/libopencv_flann.so" "${libdir}/libopencv_flann.so.*" ||
     packages+=(libopencv-flann406:arm64)
-  path_exists_any "${libdir}/libopencv_dnn.so.406*" ||
+  path_exists_any "${libdir}/libopencv_dnn.so" "${libdir}/libopencv_dnn.so.*" ||
     packages+=(libopencv-dnn406:arm64)
-  path_exists_any "${libdir}/libopencv_features2d.so.406*" ||
+  path_exists_any "${libdir}/libopencv_features2d.so" "${libdir}/libopencv_features2d.so.*" ||
     packages+=(libopencv-features2d406:arm64)
-  path_exists_any "${libdir}/libopencv_objdetect.so.406*" ||
+  path_exists_any "${libdir}/libopencv_objdetect.so" "${libdir}/libopencv_objdetect.so.*" ||
     packages+=(libopencv-objdetect406:arm64)
-  path_exists_any "${libdir}/libopencv_video.so.406*" ||
+  path_exists_any "${libdir}/libopencv_video.so" "${libdir}/libopencv_video.so.*" ||
     packages+=(libopencv-video406:arm64)
   if [[ ! -f "${sysroot}/usr/include/openssl/ssl.h" ||
         ! -e "${libdir}/libcrypto.so" ]]; then
     packages+=(libssl-dev:arm64)
   fi
-  path_exists_any "${libdir}/libfmt.so.9.1.0" ||
+  path_exists_any "${libdir}/libfmt.so" "${libdir}/libfmt.so.*" ||
     packages+=(libfmt9:arm64)
-  path_exists_any "${libdir}/libspdlog.so.1.10.0" ||
+  path_exists_any "${libdir}/libspdlog.so" "${libdir}/libspdlog.so.*" ||
     packages+=(libspdlog1.10:arm64)
-  path_exists_any "${libdir}/libcpp-httplib.so.0.11*" ||
+  path_exists_any "${libdir}/libcpp-httplib.so" "${libdir}/libcpp-httplib.so.*" ||
     packages+=(libcpp-httplib0.11:arm64)
   path_exists_any "${libdir}/libpgm*.so" "${libdir}/libpgm*.so.*" ||
     packages+=(libpgm-5.3-0:arm64 libpgm-dev:arm64)
@@ -610,9 +624,8 @@ validate_neat_internals_payload() {
   local -a required=(
     "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsConfig.cmake"
     "/usr/lib/aarch64-linux-gnu/cmake/NeatInternals/NeatInternalsTargets.cmake"
-    "/usr/include/dispatcherfactory.hh"
-    "/usr/include/dispatcherbase.hh"
-    "/usr/lib/aarch64-linux-gnu/neat/runtime/libneatdispatchercore.so"
+    "/usr/share/sima-neat-internals/runtime-profile.json"
+    "/usr/libexec/sima-neat-firmware/install.sh"
   )
 
   for path in "${required[@]}"; do
@@ -774,10 +787,37 @@ ensure_neat_internals() {
     validate_neat_internals_payload "" "installed NEAT internals packages"
   fi
 
+  local mlart_header mlart_library heap_header heap_library
+  local missing=()
+
+  if [[ "${ELXR_SDK}" == "ON" ]]; then
+    mlart_header="${sysroot}/usr/include/simaai/gst-api.h"
+    mlart_library="${sysroot}/usr/lib/aarch64-linux-gnu/libMLArt.so"
+    heap_header="${sysroot}/usr/include/simaai/simaai_heap.h"
+    heap_library="${sysroot}/usr/lib/aarch64-linux-gnu/libsimaai_heap.so"
+  else
+    mlart_header="/usr/include/simaai/gst-api.h"
+    mlart_library="/usr/lib/aarch64-linux-gnu/libMLArt.so"
+    heap_header="/usr/include/simaai/simaai_heap.h"
+    heap_library="/usr/lib/aarch64-linux-gnu/libsimaai_heap.so"
+  fi
+
+  [[ -f "${mlart_header}" ]] || missing+=("${mlart_header}")
+  [[ -e "${mlart_library}" ]] || missing+=("${mlart_library}")
+  [[ -f "${heap_header}" ]] || missing+=("${heap_header}")
+  [[ -e "${heap_library}" ]] || missing+=("${heap_library}")
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo "ERROR: The MLA-RT platform development files are incomplete." >&2
+    echo "Missing:" >&2
+    printf '  %s\n' "${missing[@]}" >&2
+    exit 1
+  fi
+
   if [[ -n "${tmp_dir}" ]]; then
     rm -rf "${tmp_dir}"
   fi
-  echo "[build] NEAT internals are ready."
+  echo "[build] MLA-RT and SiMa DMA heap development files are ready."
 }
 
 detect_build_jobs() {
@@ -899,7 +939,6 @@ stage_package_artifacts() {
     echo "ERROR: No cached Internals Debian packages found in ${NEAT_INTERNALS_DEB_DIR}." >&2
     return 1
   fi
-
   find "${ROOT_DIR}/dist" -maxdepth 1 -type f -name '*.deb' ! -name 'sima-lmm-*.deb' -delete
   rm -f \
     "${ROOT_DIR}/dist/${LLIMA_INSTALL_SCRIPT}" \
@@ -970,8 +1009,8 @@ build_extras_archive() {
     mkdir -p "${install_prefix}"
     cmake --install "${BUILD_DIR}" --component extras --prefix "${install_prefix}"
 
-    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" ]]; then
-      echo "ERROR: Runtime test extras are missing the dispatcher lifecycle executable." >&2
+    if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_mla_rt_lifecycle_test" ]]; then
+      echo "ERROR: Runtime test extras are missing the MLA-RT lifecycle executable." >&2
       exit 1
     fi
     if [[ ! -x "${install_prefix}/lib/sima-lmm/tests/sima_lmm_text_generation_test" ]]; then
@@ -1238,15 +1277,18 @@ ensure_python_build_env
 CMAKE_SOABI_ARGS=()
 CMAKE_PYTHON_ARGS=("-DPython_EXECUTABLE=$BUILD_VENV/bin/python")
 if [[ "${ELXR_SDK}" == "ON" ]]; then
-  CMAKE_SOABI_ARGS+=("-DSKBUILD_SOABI=cpython-311-${MULTIARCH}")
   SDK_SYSROOT="${SYSROOT:-/opt/toolchain/aarch64/modalix}"
-  SDK_PYTHON_EXECUTABLE="${SDK_SYSROOT}/usr/bin/python3"
-  SDK_PYTHON_INCLUDE_DIR="${SDK_SYSROOT}/usr/include/python3.11"
-  SDK_PYTHON_LIBRARY="${SDK_SYSROOT}/usr/lib/${MULTIARCH}/libpython3.11.so"
-  if [[ ! -x "${SDK_PYTHON_EXECUTABLE}" ]]; then
-    echo "ERROR: SDK Python executable not found: ${SDK_PYTHON_EXECUTABLE}" >&2
+  SDK_PYTHON_INCLUDE_DIR="$(find "${SDK_SYSROOT}/usr/include" -maxdepth 1 \
+    -type d -name 'python3.*' -print | sort -V | tail -n 1)"
+  if [[ -z "${SDK_PYTHON_INCLUDE_DIR}" ]]; then
+    echo "ERROR: SDK Python include directory was not found." >&2
     exit 1
   fi
+  SDK_PYTHON_VERSION="${SDK_PYTHON_INCLUDE_DIR##*python}"
+  SDK_PYTHON_LIBRARY="${SDK_SYSROOT}/usr/lib/${MULTIARCH}/libpython${SDK_PYTHON_VERSION}.so"
+  PYTHON_ABI_TAG="cpython-${SDK_PYTHON_VERSION//./}"
+  PYTHON_TARGET_SOABI="${PYTHON_ABI_TAG}-${MULTIARCH}"
+  CMAKE_SOABI_ARGS+=("-DSKBUILD_SOABI=${PYTHON_TARGET_SOABI}")
   if [[ ! -f "${SDK_PYTHON_INCLUDE_DIR}/Python.h" ]]; then
     echo "ERROR: SDK Python headers not found: ${SDK_PYTHON_INCLUDE_DIR}/Python.h" >&2
     exit 1

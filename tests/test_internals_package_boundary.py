@@ -249,8 +249,10 @@ class SdkSysrootPackageInstallTest(unittest.TestCase):
         self.assertEqual(root_calls, ["bash"])
 
 
-def test_internals_is_located_without_a_derived_version() -> None:
-    assert "find_package(NeatInternals CONFIG REQUIRED)" in cmake()
+def test_runtime_does_not_link_the_internals_dispatcher() -> None:
+    text = cmake()
+    assert "find_package(NeatInternals" not in text
+    assert "NeatInternals::" not in text
 
 
 def test_no_manually_constructed_internals_version_ranges() -> None:
@@ -263,9 +265,11 @@ def test_no_manually_constructed_internals_version_ranges() -> None:
     ):
         assert removed not in text, removed
 
-    assert "neat-runtime, " in text
-    assert "neat-internals-dev, " in text
-    assert "simaai-memory-lib, " in text
+    assert "neat-runtime, " not in text
+    assert "neat-internals-dev, " not in text
+    assert "simaai-memory-lib, " not in text
+    assert "simaai-mlart-modalix, " in text
+    assert "simaai-heap (>= 3.0~), " in text
     assert "simaai-memory-lib (= " not in text
     assert "neat-runtime (>=" not in text
     assert "neat-runtime (<<" not in text
