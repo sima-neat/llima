@@ -69,6 +69,7 @@ class MLABuffer {
         size_t get_num_elems() const { return _size / _elem_size; }
         size_t get_allocation_size() const { return _size_padded; }
         void* get_virtual_addr() const { return _virtual_addr; }
+        uint64_t get_allocation_generation() const { return _allocation_generation; }
         int get_dmabuf_fd() const;
 
         void print(
@@ -96,6 +97,7 @@ class MLABuffer {
         // unsigned because a negative tensor stride is never valid here.
         std::vector<uint64_t> _stride;
         simaai_dmabuf_t* _simaai_dmabuf_ptr;
+        uint64_t _allocation_generation = 0;
         uint64_t _physical_addr = 0;
         void* _virtual_addr;
 };

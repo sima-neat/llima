@@ -1,7 +1,9 @@
+#include <atomic>
 #include <fstream>
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <utility>
 
 #include <fmt/ranges.h>
 #include <simaai/simaai_heap.h>
@@ -12,6 +14,42 @@ namespace simaai {
 namespace llima {
 
 namespace {
+std::atomic<uint64_t> next_allocation_generation{1};
+
+// B1297's MLA-RT performs partial cache maintenance the same way: the
+// cacheable DMS mapping gives userspace a VA and arm64 permits dc cvac/civac
+// at EL0 when Linux enables SCTLR_EL1.UCI. Keep these operations local to
+// MLABuffer: every buffer allocated by this class comes from the SiMa DMS
+// dma-heap and LLiMa serializes CPU access with MLA completion.
+#if defined(__aarch64__)
+constexpr size_t kA65CacheLineSize = 64;
+
+void clean_cache_range(const void* virtual_address, size_t size) {
+    if (!virtual_address || size == 0) return;
+    uintptr_t address = reinterpret_cast<uintptr_t>(virtual_address);
+    const uintptr_t end = address + size;
+    address &= ~static_cast<uintptr_t>(kA65CacheLineSize - 1);
+    for (; address < end; address += kA65CacheLineSize) {
+        __asm__ __volatile__("dc cvac, %0" : : "r"(address) : "memory");
+    }
+    __asm__ __volatile__("dsb sy" : : : "memory");
+}
+
+void invalidate_cache_range(const void* virtual_address, size_t size) {
+    if (!virtual_address || size == 0) return;
+    uintptr_t address = reinterpret_cast<uintptr_t>(virtual_address);
+    const uintptr_t end = address + size;
+    address &= ~static_cast<uintptr_t>(kA65CacheLineSize - 1);
+    // civac is available at EL0 and protects unrelated dirty bytes sharing an
+    // edge cache line. Ownership discipline guarantees that device-written
+    // ranges do not contain intentional dirty CPU data when this is called.
+    for (; address < end; address += kA65CacheLineSize) {
+        __asm__ __volatile__("dc civac, %0" : : "r"(address) : "memory");
+    }
+    __asm__ __volatile__("dsb sy" : : : "memory");
+}
+#endif
+
 size_t checked_mul_size(size_t lhs, size_t rhs, const char* what) {
     if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs) {
         throw std::overflow_error(what);
@@ -166,12 +204,16 @@ void MLABuffer::allocate() {
             "Failed to resolve physical address for buffer (" + _name + ")"
         );
     }
+    _allocation_generation = next_allocation_generation.fetch_add(
+        1, std::memory_order_relaxed
+    );
 }
 
 void MLABuffer::free() {
     if (_simaai_dmabuf_ptr == nullptr) return;
     simaai_dmabuf_free(_simaai_dmabuf_ptr);
     _simaai_dmabuf_ptr = nullptr;
+    _allocation_generation = 0;
     _virtual_addr = nullptr;
     _physical_addr = 0;
 }
@@ -191,18 +233,12 @@ int MLABuffer::get_dmabuf_fd() const {
 }
 
 void MLABuffer::flush_cache() const {
-    if (!_simaai_dmabuf_ptr) {
-        throw std::logic_error("cannot flush an unallocated MLA buffer");
-    }
-    const int rc = simaai_dmabuf_flush(_simaai_dmabuf_ptr);
-    if (rc < 0) {
-        throw std::runtime_error(fmt::format(
-            "Failed to flush MLA buffer {}: {}", _name, std::strerror(-rc)
-        ));
-    }
+    flush_cache(0, _size_padded);
 }
 
 void MLABuffer::flush_cache(size_t offset, size_t size) const {
+    if (!_simaai_dmabuf_ptr)
+        throw std::logic_error("cannot flush an unallocated MLA buffer");
     if (offset > _size_padded || size > _size_padded - offset) {
         throw std::out_of_range(fmt::format(
             "Cache flush range [{}, {}) exceeds buffer {} size {}",
@@ -210,25 +246,26 @@ void MLABuffer::flush_cache(size_t offset, size_t size) const {
         ));
     }
     if (size == 0) return;
-    // DMA_BUF_IOCTL_SYNC has whole-buffer granularity. Keep the range overload
-    // for callers that update slices, while using the supported dma-buf cache
-    // ownership operation for the allocation that contains the slice.
-    flush_cache();
+#if defined(__aarch64__)
+    const auto* address = static_cast<const uint8_t*>(_virtual_addr) + offset;
+    clean_cache_range(address, size);
+#else
+    const int rc = simaai_dmabuf_flush(_simaai_dmabuf_ptr);
+    if (rc < 0) {
+        throw std::runtime_error(fmt::format(
+            "Failed to flush MLA buffer {}: {}", _name, std::strerror(-rc)
+        ));
+    }
+#endif
 }
 
 void MLABuffer::invalidate_cache() const {
-    if (!_simaai_dmabuf_ptr) {
-        throw std::logic_error("cannot invalidate an unallocated MLA buffer");
-    }
-    const int rc = simaai_dmabuf_invalidate(_simaai_dmabuf_ptr);
-    if (rc < 0) {
-        throw std::runtime_error(fmt::format(
-            "Failed to invalidate MLA buffer {}: {}", _name, std::strerror(-rc)
-        ));
-    }
+    invalidate_cache(0, _size_padded);
 }
 
 void MLABuffer::invalidate_cache(size_t offset, size_t size) const {
+    if (!_simaai_dmabuf_ptr)
+        throw std::logic_error("cannot invalidate an unallocated MLA buffer");
     if (offset > _size_padded || size > _size_padded - offset) {
         throw std::out_of_range(fmt::format(
             "Cache invalidate range [{}, {}) exceeds buffer {} size {}",
@@ -236,7 +273,17 @@ void MLABuffer::invalidate_cache(size_t offset, size_t size) const {
         ));
     }
     if (size == 0) return;
-    invalidate_cache();
+#if defined(__aarch64__)
+    const auto* address = static_cast<const uint8_t*>(_virtual_addr) + offset;
+    invalidate_cache_range(address, size);
+#else
+    const int rc = simaai_dmabuf_invalidate(_simaai_dmabuf_ptr);
+    if (rc < 0) {
+        throw std::runtime_error(fmt::format(
+            "Failed to invalidate MLA buffer {}: {}", _name, std::strerror(-rc)
+        ));
+    }
+#endif
 }
 
 void MLABuffer::clear(bool flush) {
@@ -307,9 +354,7 @@ void MLABuffer::upload(const void* data, size_t data_begin, size_t data_size, bo
     }
     // Upload a full logical tensor, inserting physical MLA row padding when needed.
     if (data_begin != 0 || data_size != _size) {
-        upload_raw(data, data_begin, data_size, false);
-        if (flush)
-            flush_cache();
+        upload_raw(data, data_begin, data_size, flush);
         return;
     }
 
@@ -656,10 +701,9 @@ void MLABufferSlice::to_file(const std::filesystem::path& file_name) const {
         static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
         throw std::overflow_error("MLA buffer slice is too large for stream I/O");
     }
-    const char* ptr = (
-        reinterpret_cast<const char*>(_buf_ptr->get_virtual_addr())
-        + byte_offset
-    );
+    _buf_ptr->invalidate_cache(byte_offset, num_bytes);
+    const char* ptr = reinterpret_cast<const char*>(_buf_ptr->get_virtual_addr())
+        + byte_offset;
 
     out_file.write(ptr, static_cast<std::streamsize>(num_bytes));
     out_file.close();

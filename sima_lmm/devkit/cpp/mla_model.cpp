@@ -1,11 +1,15 @@
 #include <dlfcn.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 #include <fmt/format.h>
@@ -22,9 +26,13 @@ namespace {
 
 struct QueuedRun {
     std::size_t model_index = 0;
-    std::filesystem::path model_path;
-    std::vector<mla_fd_tensor> ifms;
-    std::vector<mla_fd_tensor> ofms;
+    std::vector<mla_tensor> ifms;
+    std::vector<mla_tensor> ofms;
+};
+
+struct ImportedBuffer {
+    uint64_t generation = 0;
+    uint32_t id = 0;
 };
 
 struct MlaRuntimeState {
@@ -34,6 +42,7 @@ struct MlaRuntimeState {
     std::map<std::filesystem::path, std::size_t> path_to_index;
     std::vector<std::filesystem::path> paths;
     std::vector<mla_model_p> models;
+    std::unordered_map<const MLABuffer*, ImportedBuffer> imported_buffers;
 };
 
 MlaRuntimeState& runtime_state() {
@@ -42,6 +51,7 @@ MlaRuntimeState& runtime_state() {
 }
 
 thread_local std::vector<QueuedRun> queued_runs;
+thread_local std::size_t queued_run_count = 0;
 
 mla_handle_p require_handle() {
     auto& state = runtime_state();
@@ -51,18 +61,72 @@ mla_handle_p require_handle() {
     return state.handle;
 }
 
-bool path_is_under(
-    const std::filesystem::path& model_path,
-    const std::optional<std::filesystem::path>& directory
-) {
-    if (!directory) return true;
-    const auto model = std::filesystem::absolute(model_path).lexically_normal();
-    const auto root = std::filesystem::absolute(*directory).lexically_normal();
-    auto model_it = model.begin();
-    for (auto root_it = root.begin(); root_it != root.end(); ++root_it, ++model_it) {
-        if (model_it == model.end() || *model_it != *root_it) return false;
+uint32_t imported_buffer_id(MLABuffer* buffer) {
+    auto& state = runtime_state();
+    const uint64_t generation = buffer->get_allocation_generation();
+    if (generation == 0) {
+        throw std::logic_error("cannot import an unallocated MLA buffer");
     }
-    return true;
+
+    auto found = state.imported_buffers.find(buffer);
+    if (found != state.imported_buffers.end() &&
+        found->second.generation == generation) {
+        return found->second.id;
+    }
+    if (found != state.imported_buffers.end()) {
+        const int rc = mla_release_dmabuf(require_handle(), found->second.id);
+        if (rc != 0) {
+            throw std::runtime_error(fmt::format(
+                "MLA-RT failed to release stale DMA-BUF registration: rc={} ({})",
+                rc, std::strerror(rc < 0 ? -rc : rc)
+            ));
+        }
+        state.imported_buffers.erase(found);
+    }
+
+    uint32_t id = 0;
+    const int rc = mla_import_dmabuf(
+        require_handle(), buffer->get_dmabuf_fd(), MLA_BUF_IFM, &id, nullptr
+    );
+    if (rc != 0) {
+        throw std::runtime_error(fmt::format(
+            "MLA-RT failed to import DMA-BUF: rc={} ({})",
+            rc, std::strerror(rc < 0 ? -rc : rc)
+        ));
+    }
+    state.imported_buffers.emplace(buffer, ImportedBuffer{generation, id});
+    return id;
+}
+
+bool path_matches_family(
+    const std::filesystem::path& model_path,
+    const std::optional<std::filesystem::path>& selector
+) {
+    if (!selector) return true;
+    const auto model = std::filesystem::absolute(model_path).lexically_normal();
+    const auto family = std::filesystem::absolute(*selector).lexically_normal();
+
+    // Callers use either a directory (Whisper) or a filename stem (language
+    // and vision models). Match real path components first, then accept a
+    // sibling whose filename begins with the complete stem at a separator.
+    const auto mismatch = std::mismatch(
+        family.begin(), family.end(), model.begin(), model.end()
+    );
+    if (mismatch.first == family.end()) {
+        return true;
+    }
+    if (family.parent_path() != model.parent_path()) {
+        return false;
+    }
+
+    const std::string stem = family.filename().string();
+    const std::string candidate = model.filename().string();
+    if (candidate.size() <= stem.size() ||
+        candidate.compare(0, stem.size(), stem) != 0) {
+        return false;
+    }
+    const char boundary = candidate[stem.size()];
+    return boundary == '_' || boundary == '.';
 }
 
 void validate_override_indices(
@@ -108,16 +172,17 @@ MLABuffer* effective_buffer(
     return buffer;
 }
 
-std::vector<mla_fd_tensor> make_fd_bindings(
+void make_bindings(
     const std::vector<MLABufferSlice>& defaults,
     const std::map<uint8_t, MLABufferSlice>* overrides,
-    const char* kind
+    const char* kind,
+    std::vector<mla_tensor>& bindings
 ) {
     validate_override_indices(overrides, defaults.size(), kind);
     if (defaults.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::overflow_error(fmt::format("{} binding count exceeds MLA-RT", kind));
     }
-    std::vector<mla_fd_tensor> bindings;
+    bindings.clear();
     bindings.reserve(defaults.size());
     for (std::size_t i = 0; i < defaults.size(); ++i) {
         const auto& slice = effective_slice(defaults, overrides, i);
@@ -134,9 +199,8 @@ std::vector<mla_fd_tensor> make_fd_bindings(
         // touched; this matters for strided KV-cache slices whose ELF section
         // size is larger than their per-token access span.
         const uint64_t length = buffer->get_allocation_size() - offset;
-        bindings.push_back({buffer->get_dmabuf_fd(), offset, length});
+        bindings.push_back({imported_buffer_id(buffer), 0, offset, length});
     }
-    return bindings;
 }
 
 mla_model_p model_for(std::size_t index) {
@@ -236,6 +300,18 @@ void disconnect_mla_rt() {
         }
     }
     queued_runs.clear();
+    queued_run_count = 0;
+    for (const auto& [buffer, imported] : state.imported_buffers) {
+        (void)buffer;
+        const int rc = mla_release_dmabuf(state.handle, imported.id);
+        if (rc != 0) {
+            spdlog::error(
+                "MLA-RT failed to release DMA-BUF registration {}: rc={} ({})",
+                imported.id, rc, std::strerror(rc < 0 ? -rc : rc)
+            );
+        }
+    }
+    state.imported_buffers.clear();
     if (state.handle) {
         mla_free_handle(state.handle);
         state.handle = nullptr;
@@ -294,10 +370,12 @@ void MLAModelWithBuffer::run(
     load();
     _debug_inouts("ifm", ifm_map_ptr);
 
-    auto ifms = make_fd_bindings(_ifms, ifm_map_ptr, "IFM");
-    auto ofms = make_fd_bindings(_ofms, ofm_map_ptr, "OFM");
+    std::vector<mla_tensor> ifms;
+    std::vector<mla_tensor> ofms;
+    make_bindings(_ifms, ifm_map_ptr, "IFM", ifms);
+    make_bindings(_ofms, ofm_map_ptr, "OFM", ofms);
     mla_job_h job = nullptr;
-    int rc = mla_submit_async_fd(
+    int rc = mla_submit_async(
         model_for(_model_idx),
         static_cast<int>(ifms.size()), ifms.data(),
         static_cast<int>(ofms.size()), ofms.data(),
@@ -338,62 +416,84 @@ void MLAModelWithBuffer::add_to_queue(
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
     load();
-    auto ifms = make_fd_bindings(_ifms, ifm_map_ptr, "IFM");
-    auto ofms = make_fd_bindings(_ofms, ofm_map_ptr, "OFM");
-    QueuedRun queued;
+    const std::size_t slot = queued_run_count;
+    if (slot == queued_runs.size()) queued_runs.emplace_back();
+    auto& queued = queued_runs[slot];
     queued.model_index = _model_idx;
-    queued.model_path = path_for(_model_idx);
-    queued.ifms = std::move(ifms);
-    queued.ofms = std::move(ofms);
-    queued_runs.push_back(std::move(queued));
+    make_bindings(_ifms, ifm_map_ptr, "IFM", queued.ifms);
+    make_bindings(_ofms, ofm_map_ptr, "OFM", queued.ofms);
+    ++queued_run_count;
 }
 
 void MLAModelWithBuffer::run_queue() {
-    if (!_enable_queue || queued_runs.empty()) return;
+    if (!_enable_queue || queued_run_count == 0) return;
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
-    auto runs = std::move(queued_runs);
-    queued_runs.clear();
+    const std::size_t run_count = queued_run_count;
+    queued_run_count = 0;
+    const auto queue_start = std::chrono::steady_clock::now();
     uint64_t total_tile_us = 0;
-    // LLiMa stages form an ordered dependency chain and reuse the same
-    // dma-bufs. Consume each job before submitting the next one so implicit
-    // dma-buf fences cannot make an earlier stage wait on a later writer.
-    // The completion boundary also gives the kernel a scheduling point for
-    // latency-sensitive MLA contexts owned by other processes.
-    for (const auto& queued : runs) {
-        mla_model_p model = model_for(queued.model_index);
-        if (!model) {
-            throw std::runtime_error(fmt::format(
-                "MLA model was released before queued execution: {}",
-                queued.model_path
-            ));
+    constexpr std::size_t queue_ahead_depth = 256;
+    std::deque<std::pair<mla_job_h, std::size_t>> inflight;
+    std::size_t next = 0;
+    std::string first_error;
+
+    // Submit the complete model sequence before reaping, matching MLA-RT's
+    // legacy pipelined multi-model behavior while retaining one kernel
+    // scheduling boundary per model. The public async pool is capped at 256;
+    // longer queues advance as completed slots become available.
+    while (next < run_count || !inflight.empty()) {
+        while (first_error.empty() && next < run_count &&
+               inflight.size() < queue_ahead_depth) {
+            const auto& queued = queued_runs[next];
+            mla_model_p model = model_for(queued.model_index);
+            if (!model) {
+                first_error = fmt::format(
+                    "MLA model was released before queued execution: {}",
+                    path_for(queued.model_index)
+                );
+                break;
+            }
+            mla_job_h job = nullptr;
+            int rc = mla_submit_async(
+                model,
+                static_cast<int>(queued.ifms.size()), queued.ifms.data(),
+                static_cast<int>(queued.ofms.size()), queued.ofms.data(),
+                &job
+            );
+            if (rc != 0) {
+                first_error = fmt::format(
+                    "MLA-RT queued submit failed for {}: rc={} ({})",
+                    path_for(queued.model_index), rc,
+                    std::strerror(rc < 0 ? -rc : rc)
+                );
+                break;
+            }
+            inflight.emplace_back(job, queued.model_index);
+            ++next;
         }
-        mla_job_h job = nullptr;
-        int rc = mla_submit_async_fd(
-            model,
-            static_cast<int>(queued.ifms.size()), queued.ifms.data(),
-            static_cast<int>(queued.ofms.size()), queued.ofms.data(),
-            &job
-        );
-        if (rc != 0) {
-            throw std::runtime_error(fmt::format(
-                "MLA-RT queued submit failed for {}: rc={} ({})",
-                queued.model_path, rc, std::strerror(rc < 0 ? -rc : rc)
-            ));
-        }
+
+        if (inflight.empty()) break;
+        const auto [job, model_index] = inflight.front();
+        inflight.pop_front();
         uint64_t tile_us = 0;
-        rc = mla_wait(job, &tile_us, nullptr);
-        if (rc != 0) {
-            throw std::runtime_error(fmt::format(
+        const int rc = mla_wait(job, &tile_us, nullptr);
+        if (rc != 0 && first_error.empty()) {
+            first_error = fmt::format(
                 "MLA-RT queued wait failed for {}: rc={} ({})",
-                queued.model_path, rc, std::strerror(rc < 0 ? -rc : rc)
-            ));
+                path_for(model_index), rc, std::strerror(rc < 0 ? -rc : rc)
+            );
         }
         total_tile_us += tile_us;
     }
+    if (!first_error.empty()) throw std::runtime_error(first_error);
     if (_profile) {
+        const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - queue_start
+        ).count();
         spdlog::info(
-            "MLA-RT queue: {} jobs, total tile={} us", runs.size(), total_tile_us
+            "MLA-RT queue: {} jobs, total tile={} us, wall={} us",
+            run_count, total_tile_us, wall_us
         );
     }
 }
@@ -440,23 +540,26 @@ void MLAModelWithBuffer::load_all_models(
     require_handle();
 
     if (!_disable_parallel_load) {
-        std::map<std::filesystem::path, uint16_t> selected;
+        std::map<std::filesystem::path, uint16_t> batch_paths;
         for (const auto& [path, index] : state.path_to_index) {
-            if (index > std::numeric_limits<uint16_t>::max()) {
-                throw std::overflow_error("MLA model registry exceeds MLA-RT index range");
-            }
-            if (!state.models[index] && path_is_under(path, relative_dir)) {
-                selected.emplace(path, static_cast<uint16_t>(index));
+            if (!state.models[index] && path_matches_family(path, relative_dir)) {
+                if (batch_paths.size() > std::numeric_limits<uint16_t>::max()) {
+                    throw std::overflow_error("MLA model batch exceeds MLA-RT index range");
+                }
+                batch_paths.emplace(path, static_cast<uint16_t>(batch_paths.size()));
             }
         }
-        if (!selected.empty()) {
-            mla_load_model_multi(state.handle, selected, state.models, std::nullopt);
-            for (const auto& [path, index] : selected) {
-                if (!state.models[index]) {
+        if (!batch_paths.empty()) {
+            std::vector<mla_model_p> batch_models(batch_paths.size(), nullptr);
+            mla_load_model_multi(state.handle, batch_paths, batch_models, std::nullopt);
+            for (const auto& [path, batch_index] : batch_paths) {
+                auto model = batch_models[batch_index];
+                if (!model) {
                     throw std::runtime_error(fmt::format(
                         "MLA-RT bulk load failed for model: {}", path
                     ));
                 }
+                state.models[state.path_to_index.at(path)] = model;
                 spdlog::info("Loaded model: {}", path);
             }
         }
@@ -464,7 +567,7 @@ void MLAModelWithBuffer::load_all_models(
     }
 
     for (const auto& [path, index] : state.path_to_index) {
-        if (state.models[index] || !path_is_under(path, relative_dir)) continue;
+        if (state.models[index] || !path_matches_family(path, relative_dir)) continue;
         state.models[index] = mla_load_model(state.handle, path.c_str());
         if (!state.models[index]) {
             throw std::runtime_error(fmt::format("MLA-RT failed to load model: {}", path));
@@ -480,7 +583,7 @@ void MLAModelWithBuffer::free_all_models(
     std::lock_guard execution_lock(state.execution_mutex);
     std::lock_guard registry_lock(state.registry_mutex);
     for (std::size_t i = 0; i < state.models.size(); ++i) {
-        if (!state.models[i] || !path_is_under(state.paths[i], relative_dir)) continue;
+        if (!state.models[i] || !path_matches_family(state.paths[i], relative_dir)) continue;
         mla_free_model(state.models[i]);
         state.models[i] = nullptr;
     }
