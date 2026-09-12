@@ -138,7 +138,7 @@ jobs:
       fetch_depth: 0
       checkout_submodules: recursive
       ensure_sdk_container: true
-      sdk_setup_args: "-y -n --minimal --workspace /mnt/vulcan/workspace --no-model-sdk --no-insight"
+      sdk_setup_args: "-y -n --minimal --workspace /mnt/vulcan/workspace --no-model-sdk --no-insight --image latest"
       artifact_name: sima-llima-dist
       artifact_path: dist/*
       artifact_retention_days: 3
