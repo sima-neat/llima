@@ -40,7 +40,7 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
         self.assertIn("/usr/lib/aarch64-linux-gnu/libMLArt.so", build)
         self.assertIn("/usr/lib/aarch64-linux-gnu/libsimaai_heap.so", build)
 
-    def test_build_bootstrap_uses_b1297_library_abis(self) -> None:
+    def test_build_bootstrap_uses_modalix_3_library_abis(self) -> None:
         build = read("build.sh")
 
         for package in (
@@ -69,7 +69,10 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
         workflow = read(".github/workflows/vulcan-ci.yml")
 
         self.assertEqual(manifest["platform-version"], "3.0.0")
-        self.assertTrue(manifest["sysroot-version"].endswith("-1297"))
+        self.assertRegex(
+            manifest["sysroot-version"],
+            r"^3[.]0[.]0~git[0-9]{12}[.][0-9a-f]{7,40}-[0-9]+$",
+        )
         self.assertIn('["sysroot-version"]', workflow)
         self.assertIn(
             'if [[ "${sdk_platform_version}" != "${sysroot_version}" ]]', workflow

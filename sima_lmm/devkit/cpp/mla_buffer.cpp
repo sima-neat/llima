@@ -16,7 +16,7 @@ namespace llima {
 namespace {
 std::atomic<uint64_t> next_allocation_generation{1};
 
-// B1297's MLA-RT performs partial cache maintenance the same way: the
+// MLA-RT performs partial cache maintenance the same way: the
 // cacheable DMS mapping gives userspace a VA and arm64 permits dc cvac/civac
 // at EL0 when Linux enables SCTLR_EL1.UCI. Keep these operations local to
 // MLABuffer: every buffer allocated by this class comes from the SiMa DMS
