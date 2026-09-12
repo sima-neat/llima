@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 
-def test_installed_python_binding_dispatcher_lifecycle(tmp_path, monkeypatch):
+def test_installed_python_binding_mla_rt_lifecycle(tmp_path, monkeypatch):
     assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
     subprocess.run(
         ["systemctl", "is-active", "--quiet", "simaai-appcomplex.service"],

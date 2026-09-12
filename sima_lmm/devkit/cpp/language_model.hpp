@@ -274,6 +274,17 @@ class LanguageModel : public BaseModel<VlmConfig> {
             // Tail snapshots indexed as [layer_slot][boundary_idx][byte_offset].
             std::vector<std::vector<std::vector<uint8_t>>> checkpoints;
         };
+        struct AttentionBindingBuffers {
+            MLABuffer* key = nullptr;
+            MLABuffer* value = nullptr;
+            MLABuffer* key_scale = nullptr;
+            MLABuffer* value_scale = nullptr;
+        };
+        struct BoundAttentionModels {
+            MLAModelWithBuffer* pre;
+            MLAModelWithBuffer* cache;
+            MLAModelWithBuffer* post;
+        };
 
         virtual void _initialize() override;
         virtual void _finalize() override;
@@ -290,7 +301,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMapKey _get_cache_model_key(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
         ) const;
-        LanguageModelMapKey _bind_attn_models(
+        BoundAttentionModels _bind_attn_models(
             uint16_t num_tokens,
             uint16_t token_idx,
             uint8_t layer_idx,
@@ -390,6 +401,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _per_layer_model_map;
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
+
+        std::vector<AttentionBindingBuffers> _attention_binding_buffers;
+        MLABuffer* _global_freq_real = nullptr;
+        MLABuffer* _global_freq_imag = nullptr;
+        MLABuffer* _local_freq_real = nullptr;
+        MLABuffer* _local_freq_imag = nullptr;
 
         RopeTable _master_rope_table;
         RopeTable _global_freq_host;  // pristine CPU copy; source for tree-RoPE rows

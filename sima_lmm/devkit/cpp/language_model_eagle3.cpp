@@ -196,7 +196,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     const uint8_t  layer_idx = 0;
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
     const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-    const auto cache_key = _bind_attn_models(
+    const auto attn_models = _bind_attn_models(
         num_tokens, token_idx, layer_idx, token_embedding_scales_buf
     );
     auto& fc_output_buf = get_buffer(fmt::format("fc_n{}_output", num_tokens));
@@ -250,16 +250,16 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
             )
         );
     }
-    _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
+    attn_models.pre->add_to_queue(&pre_ifm_map);
 
     // cache_model dispatch. IFMs/OFMs are all statically wired, no overrides.
-    _cache_model_map.at(cache_key).add_to_queue();
+    attn_models.cache->add_to_queue();
 
     // post_model dispatch (lm_head fused in). Override IFM[0] to fc_n{N}_output
     // (same buffer pre_model used as IFM[1]); IFM[1] is statically wired.
     std::map<uint8_t, MLABufferSlice> post_ifm_map;
     post_ifm_map.emplace(0, MLABufferSlice{&fc_output_buf});
-    _post_model_map.at(model_key).add_to_queue(&post_ifm_map);
+    attn_models.post->add_to_queue(&post_ifm_map);
 
     // Download both outputs: hidden_states (n{N}_buffer5) and logits
     // (n{N}_buffer4, lm_head fused into post_model; single split for draft).
@@ -407,7 +407,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         }
 
         const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-        const auto cache_key = _bind_attn_models(
+        const auto attn_models = _bind_attn_models(
             num_tokens, token_idx, layer_idx, input_embedding_scales_buf
         );
 
@@ -460,9 +460,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             )
         );
 
-        _pre_model_map.at(model_key).add_to_queue(&pre_ifm_map);
-        _cache_model_map.at(cache_key).add_to_queue();
-        _post_model_map.at(model_key).add_to_queue(&ifm_map);
+        attn_models.pre->add_to_queue(&pre_ifm_map);
+        attn_models.cache->add_to_queue();
+        attn_models.post->add_to_queue(&ifm_map);
 
         // post_model.ofms[0] writes n{N}_buffer1 (next layer's IFM[0]), so
         // reading it here yields this layer's output.

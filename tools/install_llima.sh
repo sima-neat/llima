@@ -3,68 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 INSTALL_MANIFEST="${LLIMA_INSTALL_MANIFEST:-llima-install-manifest.txt}"
-LLIMA_PACKAGE_MANIFEST="${LLIMA_PACKAGE_MANIFEST:-resolved-deps-manifest.json}"
+LLIMA_PACKAGE_MANIFEST="${LLIMA_PACKAGE_MANIFEST:-llima-package-manifest.json}"
 LLIMA_BUILDINFO_FILE="${LLIMA_BUILDINFO_FILE:-/etc/buildinfo}"
 ELXR_SDK_RELEASE_FILE="${ELXR_SDK_RELEASE_FILE:-/etc/sdk-release}"
 LLIMA_INSTALLER_SKIP_PLATFORM_CHECK="${LLIMA_INSTALLER_SKIP_PLATFORM_CHECK:-OFF}"
 SUDO_PASSWORD="${SUDO_PASSWORD:-${DEVKIT_PASSWORD:-}}"
 DEFAULT_SUDO_PASSWORD="${DEFAULT_SUDO_PASSWORD:-edgeai}"
-LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD="${LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD:-ON}"
 
 log() {
   printf '[install_llima] %s\n' "$*"
-}
-
-relation_field_has_package() {
-  local field="$1"
-  local expected_package="$2"
-  local relation package
-
-  while IFS= read -r relation; do
-    relation="${relation#"${relation%%[![:space:]]*}"}"
-    relation="${relation%"${relation##*[![:space:]]}"}"
-    package="${relation%%[[:space:](]*}"
-    package="${package%%:*}"
-    if [[ "${package}" == "${expected_package}" ]]; then
-      return 0
-    fi
-  done < <(printf '%s\n' "${field}" | tr ',' '\n')
-  return 1
-}
-
-relation_field_provides_exact_version() {
-  local field="$1"
-  local expected_package="$2"
-  local expected_version="$3"
-  local relation
-
-  while IFS= read -r relation; do
-    relation="$(printf '%s' "${relation}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')"
-    if [[ "${relation}" == "${expected_package} (= ${expected_version})" ]]; then
-      return 0
-    fi
-  done < <(printf '%s\n' "${field}" | tr ',' '\n')
-  return 1
-}
-
-find_verified_replacement() {
-  local removed_package="$1"
-  local installed_version="$2"
-  local deb_path provides replaces conflicts
-
-  for deb_path in "${debs[@]}"; do
-    provides="$(dpkg-deb -f "${deb_path}" Provides 2>/dev/null || true)"
-    replaces="$(dpkg-deb -f "${deb_path}" Replaces 2>/dev/null || true)"
-    conflicts="$(dpkg-deb -f "${deb_path}" Conflicts 2>/dev/null || true)"
-    if relation_field_provides_exact_version \
-         "${provides}" "${removed_package}" "${installed_version}" &&
-       relation_field_has_package "${replaces}" "${removed_package}" &&
-       relation_field_has_package "${conflicts}" "${removed_package}"; then
-      basename "${deb_path}"
-      return 0
-    fi
-  done
-  return 1
 }
 
 resolve_package_manifest_path() {
@@ -185,160 +132,6 @@ run_sudo() {
   exit 1
 }
 
-remove_stale_global_sima_lmm_pip_install() {
-  if ! command -v pip3 >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if run_sudo pip3 show sima_lmm >/dev/null 2>&1; then
-    log "Removing stale global sima_lmm pip package before installing LLiMa DEBs."
-    run_sudo pip3 uninstall -y sima_lmm --break-system-packages
-  fi
-}
-
-stop_board_runtime_before_install() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 0
-  fi
-
-  log "Stopping NEAT runtime services before package replacement."
-  local svc
-  for svc in \
-      simaai-pipeline-manager.service \
-      simaai-appcomplex.service \
-      rctd.service \
-      encoder.service \
-      decoder.service \
-      simaai-log.service; do
-    if systemctl cat "${svc}" >/dev/null 2>&1; then
-      run_sudo systemctl stop "${svc}" >/dev/null 2>&1 || true
-      run_sudo systemctl reset-failed "${svc}" >/dev/null 2>&1 || true
-    fi
-  done
-
-  if [[ -x /usr/libexec/simaai-appcomplex/clean-stale-mlashmcomplex ]]; then
-    run_sudo /usr/libexec/simaai-appcomplex/clean-stale-mlashmcomplex || true
-  else
-    run_sudo pkill -TERM -x mlashmcomplex >/dev/null 2>&1 || true
-    sleep 0.5
-    run_sudo pkill -KILL -x mlashmcomplex >/dev/null 2>&1 || true
-  fi
-
-  run_sudo rm -f /tmp/mlactrl /dev/shm/mlashmdata
-}
-
-activate_board_runtime_after_install() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 0
-  fi
-
-  # These files are recreated by simaai-appcomplex.service. Remove stale IPC
-  # before the post-install MLA init/reset path so clients cannot observe an
-  # old dispatcher lifetime after package replacement.
-  run_sudo rm -f /tmp/mlactrl /dev/shm/mlashmdata
-  # Package configuration intentionally does not restart services. Reload
-  # systemd here so the owned maintenance window starts services from the unit
-  # files that were just unpacked.
-  run_sudo systemctl daemon-reload || true
-
-  if [[ "${LLIMA_INSTALLER_ACTIVATE_FIRMWARE_ON_BOARD}" == "ON" &&
-        -x /usr/libexec/sima-neat-firmware/install.sh ]]; then
-    log "Activating staged EV74 firmware and resetting runtime state."
-    run_sudo /usr/libexec/sima-neat-firmware/install.sh --activate
-  else
-    log "EV74 firmware activation skipped; starting simaai-appcomplex.service directly."
-    if systemctl cat simaai-appcomplex.service >/dev/null 2>&1; then
-      run_sudo systemctl restart simaai-appcomplex.service || true
-    fi
-  fi
-}
-
-verify_board_runtime_services() {
-  local service="simaai-appcomplex.service"
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if ! systemctl list-unit-files "${service}" --no-legend 2>/dev/null | grep -q "^${service}[[:space:]]"; then
-    return 0
-  fi
-
-  # Debian service start failures can be non-fatal during package installation,
-  # but LLiMa cannot run without the MLA shared-memory dispatcher.
-  if ! systemctl is-active --quiet "${service}"; then
-    log "${service} is not active after package install; attempting to start it once."
-    run_sudo systemctl start "${service}" || true
-    sleep 1
-  fi
-
-  if ! systemctl is-active --quiet "${service}"; then
-    echo "${service} is not active after LLiMa package installation." >&2
-    run_sudo systemctl --no-pager --full status "${service}" >&2 || true
-    run_sudo journalctl -u "${service}" --no-pager -n 80 >&2 || true
-    run_sudo bash -c 'for f in /sys/class/remoteproc/remoteproc*/name /sys/class/remoteproc/remoteproc*/state; do [ -e "$f" ] && printf "%s: " "$f" && cat "$f"; done' >&2 || true
-    exit 1
-  fi
-
-  log "Verified ${service} is active."
-}
-
-restart_board_codec_services() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 0
-  fi
-
-  local -a services=()
-  local service
-  for service in encoder.service decoder.service; do
-    if systemctl list-unit-files "${service}" --no-legend 2>/dev/null | grep -q "^${service}[[:space:]]"; then
-      services+=("${service}")
-    fi
-  done
-
-  if [[ "${#services[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  log "Restarting codec services after package replacement."
-  run_sudo systemctl daemon-reload || true
-  run_sudo systemctl enable "${services[@]}" || true
-  if ! run_sudo systemctl restart "${services[@]}"; then
-    echo "Failed to restart codec services after LLiMa package installation." >&2
-    run_sudo systemctl --no-pager --full status "${services[@]}" >&2 || true
-    run_sudo journalctl -u encoder.service -u decoder.service --no-pager -n 80 >&2 || true
-    exit 1
-  fi
-}
-
-verify_board_codec_services() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    return 0
-  fi
-
-  local service
-  for service in encoder.service decoder.service; do
-    if ! systemctl list-unit-files "${service}" --no-legend 2>/dev/null | grep -q "^${service}[[:space:]]"; then
-      continue
-    fi
-
-    if ! systemctl is-active --quiet "${service}"; then
-      log "${service} is not active after package install; attempting to start it once."
-      run_sudo systemctl start "${service}" || true
-      sleep 1
-    fi
-
-    if ! systemctl is-active --quiet "${service}"; then
-      echo "${service} is not active after LLiMa package installation." >&2
-      run_sudo systemctl --no-pager --full status "${service}" >&2 || true
-      run_sudo journalctl -u "${service}" --no-pager -n 80 >&2 || true
-      exit 1
-    fi
-
-    log "Verified ${service} is active."
-  done
-}
-
 for command_name in apt-get dpkg dpkg-deb dpkg-query; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "${command_name} is required to install LLiMa." >&2
@@ -384,6 +177,10 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
 
   package="$(dpkg-deb -f "${deb_path}" Package 2>/dev/null || true)"
   version="$(dpkg-deb -f "${deb_path}" Version 2>/dev/null || true)"
+  if [[ -z "${package}" || -z "${version}" ]]; then
+    echo "Unable to read package identity from ${line}." >&2
+    exit 1
+  fi
   case "${package}" in
     sima-lmm-core|sima-lmm-cli|sima-lmm-dev)
       if [[ -n "${llima_debs["${package}"]+x}" ]]; then
@@ -392,6 +189,10 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
       fi
       llima_debs["${package}"]="${deb_path}"
       llima_versions["${package}"]="${version}"
+      ;;
+    *)
+      echo "Install bundle contains unexpected package ${package}." >&2
+      exit 1
       ;;
   esac
 done < "${manifest_path}"
@@ -422,6 +223,9 @@ done
 
 log "Validated ${#debs[@]} Debian package(s); LLiMa version ${expected_version}."
 
+log "Refreshing APT package indexes."
+run_sudo apt-get update
+
 simulate_output="$(mktemp /tmp/install-llima-apt-simulate.XXXXXX)"
 trap 'rm -f "${simulate_output}"' EXIT
 if ! apt-get install --simulate --reinstall --allow-downgrades "${debs[@]}" >"${simulate_output}" 2>&1; then
@@ -430,51 +234,16 @@ if ! apt-get install --simulate --reinstall --allow-downgrades "${debs[@]}" >"${
   exit 1
 fi
 mapfile -t removed_packages < <(awk '$1 == "Remv" {print $2}' "${simulate_output}")
-verified_replacements=()
-removed_neat_packages=()
 if [[ "${#removed_packages[@]}" -gt 0 ]]; then
   for package in "${removed_packages[@]}"; do
-    package_name="${package%%:*}"
-    if [[ "${package_name}" == "sima-neat" || "${package_name}" == "sima-neat-dev" ]]; then
-      removed_neat_packages+=("${package}")
-      continue
-    fi
-
-    installed_version="$(dpkg-query -W -f='${Version}' "${package_name}" 2>/dev/null || true)"
-    replacement_deb=""
-    if [[ -n "${installed_version}" ]]; then
-      replacement_deb="$(find_verified_replacement \
-        "${package_name}" "${installed_version}" || true)"
-    fi
-    if [[ -n "${replacement_deb}" ]]; then
-      verified_replacements+=("${package_name}=${installed_version} -> ${replacement_deb}")
-      continue
-    fi
-
     cat "${simulate_output}" >&2
-    echo "Refusing to install because APT would remove ${package} without a bundled package that Provides its exact installed version and explicitly Replaces and Conflicts with it." >&2
+    echo "Refusing to install because APT would remove ${package}." >&2
     exit 1
   done
-  if [[ "${#verified_replacements[@]}" -gt 0 ]]; then
-    log "Verified platform package replacements:"
-    printf '  %s\n' "${verified_replacements[@]}"
-  fi
-  if [[ "${#removed_neat_packages[@]}" -gt 0 ]]; then
-    log "Removing incompatible Neat packages: ${removed_neat_packages[*]}"
-  fi
 fi
 
-log "Installing bundled Internals and LLiMa packages."
-remove_stale_global_sima_lmm_pip_install
-stop_board_runtime_before_install
-run_sudo apt-get install -y --reinstall --allow-downgrades \
-  -o Dpkg::Options::=--force-overwrite \
-  "${debs[@]}"
-run_sudo apt-get check
-activate_board_runtime_after_install
-restart_board_codec_services
-verify_board_codec_services
-verify_board_runtime_services
+log "Installing LLiMa packages."
+run_sudo apt-get install -y --reinstall --allow-downgrades "${debs[@]}"
 
 for deb_path in "${debs[@]}"; do
   package="$(dpkg-deb -f "${deb_path}" Package)"
@@ -492,6 +261,3 @@ if ! command -v llima >/dev/null 2>&1; then
 fi
 llima --help >/dev/null
 log "LLiMa ${expected_version} installed successfully."
-if [[ "${#removed_neat_packages[@]}" -gt 0 ]]; then
-  echo "WARNING: Removed incompatible Neat packages: ${removed_neat_packages[*]}. Reinstall a Core package compatible with the bundled Internals before using Neat." >&2
-fi

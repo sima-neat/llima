@@ -7,11 +7,11 @@ target_link_libraries(sima_lmm_embedding_offload_test PRIVATE OpenMP::OpenMP_CXX
 add_test(NAME runtime.embedding_offload COMMAND sima_lmm_embedding_offload_test)
 set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
 add_test(NAME runtime.embedding_offload_generation COMMAND sima_lmm_embedding_offload_generation_test)
-set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK dispatcher TIMEOUT 900)
+set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
 
 add_executable(
-    sima_lmm_dispatcher_lifecycle_test
-    dispatcher_lifecycle_test.cpp
+    sima_lmm_mla_rt_lifecycle_test
+    mla_rt_lifecycle_test.cpp
 )
 add_executable(
     sima_lmm_text_generation_test
@@ -34,7 +34,7 @@ add_executable(
     reasoning_parser_test.cpp
 )
 target_link_libraries(
-    sima_lmm_dispatcher_lifecycle_test
+    sima_lmm_mla_rt_lifecycle_test
     PRIVATE
         sima_lmm_runtime
 )
@@ -66,7 +66,7 @@ target_link_libraries(
 set_target_properties(
     sima_lmm_embedding_offload_generation_test
     sima_lmm_embedding_offload_test
-    sima_lmm_dispatcher_lifecycle_test
+    sima_lmm_mla_rt_lifecycle_test
     sima_lmm_text_generation_test
     sima_lmm_vision_generation_test
     sima_lmm_asr_transcription_test
@@ -74,12 +74,12 @@ set_target_properties(
     sima_lmm_reasoning_parser_test
     PROPERTIES
         INSTALL_RPATH
-            "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
+            "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}"
 )
 
 add_test(
-    NAME runtime.dispatcher_lifecycle
-    COMMAND "$<TARGET_FILE:sima_lmm_dispatcher_lifecycle_test>"
+    NAME runtime.mla_rt_lifecycle
+    COMMAND "$<TARGET_FILE:sima_lmm_mla_rt_lifecycle_test>"
 )
 add_test(
     NAME runtime.text_generation
@@ -104,31 +104,31 @@ add_test(
         "$<TARGET_FILE:sima_lmm_reasoning_parser_test>"
 )
 set_tests_properties(
-    runtime.dispatcher_lifecycle
+    runtime.mla_rt_lifecycle
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;smoke"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;smoke"
+        RESOURCE_LOCK mla
         TIMEOUT 30
 )
 set_tests_properties(
     runtime.text_generation
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;genai;llm;long"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;genai;llm;long"
+        RESOURCE_LOCK mla
         TIMEOUT 900
 )
 set_tests_properties(
     runtime.vision_generation
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;genai;vlm;long"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;genai;vlm;long"
+        RESOURCE_LOCK mla
         TIMEOUT 900
 )
 set_tests_properties(
     runtime.asr_transcription
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;genai;asr;long"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;genai;asr;long"
+        RESOURCE_LOCK mla
         TIMEOUT 900
 )
 set_tests_properties(
@@ -148,7 +148,7 @@ install(
     TARGETS
         sima_lmm_embedding_offload_generation_test
         sima_lmm_embedding_offload_test
-        sima_lmm_dispatcher_lifecycle_test
+        sima_lmm_mla_rt_lifecycle_test
         sima_lmm_text_generation_test
         sima_lmm_vision_generation_test
         sima_lmm_asr_transcription_test
@@ -172,7 +172,7 @@ install(
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.hpp"
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp"
         asr_transcription_test.cpp
-        dispatcher_lifecycle_test.cpp
+        mla_rt_lifecycle_test.cpp
         pytest.ini
         runtime_test_utils.hpp
         test_cli_black_box.py

@@ -43,7 +43,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m unittest -v tests.ci.test_resolve_test_scope tests.test_internals_package_boundary
+          python3 -m unittest -v \
+            tests.ci.test_resolve_test_scope \
+            tests.test_platform_package_boundary
 
       - name: Resolve test scope
         id: scope
@@ -135,11 +137,26 @@ jobs:
       capacity: ${{ needs.resolve-vulcan-config.outputs.capacity }}
       fetch_depth: 0
       checkout_submodules: recursive
-      ensure_sdk_container: true
-      sdk_setup_args: "-y -n --minimal --workspace /mnt/vulcan/workspace --no-model-sdk --no-insight"
+      ensure_sdk_container: false
       artifact_name: sima-llima-dist
       artifact_path: dist/*
       artifact_retention_days: 3
+      pre_build_command: |
+        set -euo pipefail
+
+        mapfile -t sdk_images < <(
+          docker images --format '{{.Repository}}:{{.Tag}}' |
+            awk '/^ghcr[.]io\/sima-neat\/sdk/ && $0 !~ /:<none>$/ { print }'
+        )
+        if [[ "${#sdk_images[@]}" -ne 1 ]]; then
+          printf 'Expected exactly one tagged SDK image; found %d:\n' "${#sdk_images[@]}" >&2
+          printf '  %s\n' "${sdk_images[@]}" >&2
+          exit 1
+        fi
+        /mnt/vulcan/bin/sima-cli sdk setup -y -n --minimal \
+          --workspace /mnt/vulcan/workspace --no-model-sdk --no-insight \
+          --image "${sdk_images[0]}"
+
       build_command: |
         set -euo pipefail
 
@@ -168,9 +185,6 @@ jobs:
           -e GITHUB_RUN_ID="${{ github.run_id }}" \
           -e GITHUB_SHA="${{ github.sha }}" \
           -e NEAT_VULCAN_ENV="${{ needs.resolve-vulcan-config.outputs.vulcan_env }}" \
-          -e NEAT_INTERNALS_SOURCE="vulcan" \
-          -e NEAT_INTERNALS_VULCAN_REPOSITORY="internals" \
-          -e NEAT_SYNC_SYSROOT="ON" \
           "${sdk_container}" \
           bash -lc '
             set -euo pipefail
@@ -179,11 +193,41 @@ jobs:
             /workspace/scripts/ci/install_sima_cli_main.sh
             export PATH="${HOME}/.sima-cli/.venv/bin:${PATH}"
             sima-cli --version
-            sima-cli neat install --help >/dev/null
             sima-cli packages build --help >/dev/null
             python3.12 --version
 
             cd /workspace
+
+            sysroot_version="$(python3 -c '\''import json,re; value=json.load(open("deps/manifest.json", encoding="utf-8"))["sysroot-version"]; pattern=r"[0-9]+(?:[.][0-9]+){2}~(?:pre[0-9]+|git[0-9]{12}[.][0-9a-f]{7,40}-[0-9]+)"; print(value) if isinstance(value, str) and re.fullmatch(pattern, value) else exit("sysroot-version must be an exact platform receipt")'\'')"
+            sdk_platform_version="$(sed -nE "s/^Platform Version[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\1/p" /etc/sdk-release)"
+            if [[ "${sdk_platform_version}" != "${sysroot_version}" ]]; then
+              echo "Refreshing daily SDK sysroot from ${sdk_platform_version:-unknown} to ${sysroot_version}."
+              printf "%s\n" \
+                "Package: simaai-palette-modalix" \
+                "Pin: version ${sysroot_version}" \
+                "Pin-Priority: 1001" \
+                "" \
+                "Package: simaai-palette-modalix" \
+                "Pin: version *" \
+                "Pin-Priority: -1" \
+                > /etc/apt/preferences.d/simaai-sdk-version.pref
+              SDK_APT_CHANNEL=daily \
+                setup-sdk-sysroot.sh "${sysroot_version}" "${SDK_PKG_LIST:-}"
+              overlay_dir="${SYSROOT:-/opt/toolchain/aarch64/modalix}/var/lib/sima-sdk"
+              mkdir -p "${overlay_dir}"
+              printf "%s\n" \
+                "Overlay State = active" \
+                "Platform Base = ${sysroot_version%%~*}" \
+                "Platform Revision = ${sysroot_version}" \
+                "Platform Channel = daily" \
+                "Platform Repository = https://debian.neat.sima.ai/daily" \
+                "Updated At = $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                "Package Inventory = ${overlay_dir}/sysroot-packages.tsv" \
+                > "${overlay_dir}/sysroot-overlay"
+            else
+              echo "Using SDK sysroot ${sdk_platform_version} without updating it."
+            fi
+            sysroot status
 
             if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
               version="${GITHUB_REF_NAME}"
@@ -257,7 +301,7 @@ jobs:
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/CTestTestfile.cmake" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
-          "./lib/sima-lmm/tests/sima_lmm_dispatcher_lifecycle_test" >/dev/null
+          "./lib/sima-lmm/tests/sima_lmm_mla_rt_lifecycle_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/sima_lmm_text_generation_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
@@ -278,7 +322,7 @@ jobs:
         test -f dist/debs/metadata.json
         test -x dist/install_llima.sh
         test -f dist/llima-install-manifest.txt
-        test -f dist/resolved-deps-manifest.json
+        test -f dist/llima-package-manifest.json
         python3 -m json.tool dist/metadata.json >/dev/null
         python3 -m json.tool dist/debs/metadata.json >/dev/null
 
@@ -290,21 +334,21 @@ jobs:
 
         dist = Path("dist")
         llima_debs = sorted(path.name for path in dist.glob("sima-lmm-*.deb"))
-        internals_debs = sorted(
+        unexpected_debs = sorted(
             path.name for path in dist.glob("*.deb")
             if not path.name.startswith("sima-lmm-")
         )
         if len(llima_debs) != 3:
             raise SystemExit(f"expected three root LLiMa DEBs, got {llima_debs!r}")
-        if not internals_debs:
-            raise SystemExit("root bundle does not contain Internals DEBs")
+        if unexpected_debs:
+            raise SystemExit(f"root bundle contains unexpected DEBs: {unexpected_debs!r}")
 
         manifest_entries = [
             line.strip()
             for line in (dist / "llima-install-manifest.txt").read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-        expected_debs = sorted(llima_debs + internals_debs)
+        expected_debs = llima_debs
         if sorted(manifest_entries) != expected_debs:
             raise SystemExit(
                 "install manifest does not match root DEBs:\n"
@@ -312,14 +356,13 @@ jobs:
                 f"  expected={expected_debs!r}"
             )
 
-        resolved = json.loads(
-            (dist / "resolved-deps-manifest.json").read_text(encoding="utf-8")
+        package_manifest = json.loads(
+            (dist / "llima-package-manifest.json").read_text(encoding="utf-8")
         )
-        internals_ref = resolved.get("internals")
-        if not isinstance(internals_ref, str) or ":" not in internals_ref:
-            raise SystemExit(f"Internals ref is not exact: {internals_ref!r}")
         source_manifest = json.loads(Path("deps/manifest.json").read_text(encoding="utf-8"))
-        platform_version = source_manifest.get("platform-version")
+        if package_manifest != source_manifest:
+            raise SystemExit("bundled LLiMa package manifest differs from its source")
+        platform_version = package_manifest.get("platform-version")
 
         root_metadata = json.loads((dist / "metadata.json").read_text(encoding="utf-8"))
         root_resources = set(root_metadata.get("resources", []))
@@ -345,8 +388,6 @@ jobs:
                 raise SystemExit(f"{label} metadata commit mismatch")
             if metadata.get("branch") != expected_ref:
                 raise SystemExit(f"{label} metadata ref mismatch")
-            if metadata.get("artifact", {}).get("internals_ref") != internals_ref:
-                raise SystemExit(f"{label} metadata Internals ref mismatch")
             expected_platforms = (
                 {
                     ("board", platform_version, ("modalix",)),
@@ -370,7 +411,7 @@ jobs:
                 if actual != checksum:
                     raise SystemExit(f"checksum mismatch: {label}/{resource}")
 
-        print(f"Verified {len(internals_debs)} exact Internals DEBs in root bundle")
+        print("Verified standalone three-package LLiMa root bundle")
         PY
 
         python3 - <<'PY'
@@ -564,8 +605,8 @@ jobs:
       - name: Verify installed LLiMa runtime
         run: |
           set -euo pipefail
-          test -f _work/llima-install/resolved-deps-manifest.json
-          python3 -m json.tool _work/llima-install/resolved-deps-manifest.json >/dev/null
+          test -f _work/llima-install/llima-package-manifest.json
+          python3 -m json.tool _work/llima-install/llima-package-manifest.json >/dev/null
           dpkg-query -W sima-lmm-core sima-lmm-cli sima-lmm-dev
           llima --help >/dev/null
           python3 -c 'import sima_lmm'
@@ -591,7 +632,7 @@ jobs:
 
           test_dir="_work/runtime-tests/lib/sima-lmm/tests"
           test -f "${test_dir}/CTestTestfile.cmake"
-          test -x "${test_dir}/sima_lmm_dispatcher_lifecycle_test"
+          test -x "${test_dir}/sima_lmm_mla_rt_lifecycle_test"
           test -x "${test_dir}/sima_lmm_text_generation_test"
           test -x "${test_dir}/sima_lmm_vision_generation_test"
           test -x "${test_dir}/sima_lmm_asr_transcription_test"
@@ -602,7 +643,7 @@ jobs:
 
           test_dir = Path("_work/runtime-tests/lib/sima-lmm/tests")
           test_binaries = (
-              "sima_lmm_dispatcher_lifecycle_test",
+              "sima_lmm_mla_rt_lifecycle_test",
               "sima_lmm_text_generation_test",
               "sima_lmm_vision_generation_test",
               "sima_lmm_asr_transcription_test",

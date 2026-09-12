@@ -14,7 +14,7 @@
 
 #include "utils.hpp"
 
-typedef struct simaai_memory_t simaai_memory_t;
+typedef struct simaai_dmabuf simaai_dmabuf_t;
 
 namespace simaai {
 namespace llima {
@@ -28,8 +28,12 @@ class MLABuffer {
             bool align_last_dim
         );
         ~MLABuffer();
+        MLABuffer(const MLABuffer&) = delete;
+        MLABuffer& operator=(const MLABuffer&) = delete;
+        MLABuffer(MLABuffer&&) = delete;
+        MLABuffer& operator=(MLABuffer&&) = delete;
         void allocate();
-        void try_allocate() { if (!_simaai_mem_ptr) allocate(); }
+        void try_allocate() { if (!_simaai_dmabuf_ptr) allocate(); }
         void free();
         void clear(bool flush = true);
         // Load exactly one raw, unpadded tensor payload from a file.
@@ -44,7 +48,7 @@ class MLABuffer {
             const void* data, size_t destination_offset, size_t size, bool flush = true
         );
         void download(void* data) const;
-        uint32_t get_buf_addr_offset(
+        uint64_t get_buf_addr_offset(
             const std::optional<std::vector<uint32_t>>& begin = std::nullopt
         ) const;
         uint64_t get_buf_addr(
@@ -60,11 +64,13 @@ class MLABuffer {
 
         const std::string& get_name() const { return _name; }
         const std::string& get_dtype() const { return _dtype; }
-        const uint8_t get_elem_size() const { return _elem_size; }
+        uint8_t get_elem_size() const { return _elem_size; }
         const std::vector<size_t>& get_shape() const { return _shape; }
         size_t get_num_elems() const { return _size / _elem_size; }
+        size_t get_allocation_size() const { return _size_padded; }
         void* get_virtual_addr() const { return _virtual_addr; }
-        simaai_memory_t* get_simaai_memory() const { return _simaai_mem_ptr; }
+        uint64_t get_allocation_generation() const { return _allocation_generation; }
+        int get_dmabuf_fd() const;
 
         void print(
             std::ostream& s,
@@ -87,9 +93,12 @@ class MLABuffer {
 
         size_t _size;
         size_t _size_padded;
-        std::vector<int64_t> _stride;
-        simaai_memory_t* _simaai_mem_ptr;
-        uint64_t _physical_addr;
+        // Physical element strides.  These include MLA row padding and are
+        // unsigned because a negative tensor stride is never valid here.
+        std::vector<uint64_t> _stride;
+        simaai_dmabuf_t* _simaai_dmabuf_ptr;
+        uint64_t _allocation_generation = 0;
+        uint64_t _physical_addr = 0;
         void* _virtual_addr;
 };
 
@@ -116,6 +125,7 @@ class MLABufferSlice {
         uint64_t get_buf_addr(const std::optional<std::vector<uint32_t>>& begins) const;
         const auto& get_buf_begins() const { return _begins; }
         const auto& get_buf_shapes() const { return _shapes; }
+        uint64_t get_byte_offset() const;
 
         void to_file(const std::filesystem::path& file_name) const;
 
