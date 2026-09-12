@@ -1,8 +1,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <regex>
 #include <thread>
+#include <unordered_set>
 #include <nlohmann/json.hpp>
 
 #include "embedding_offload.hpp"
@@ -12,13 +12,24 @@
 
 namespace {
 uint64_t allocated_bytes() {
-    std::ifstream memory("/dev/simaai-mem");
-    std::string line;
-    std::getline(memory, line);
-    std::smatch match;
-    if (!std::regex_search(line, match, std::regex("Total allocated size: (0x[0-9a-fA-F]+)")))
-        throw std::runtime_error("Cannot inspect SiMa memory allocation summary");
-    return std::stoull(match[1], nullptr, 16);
+    uint64_t total = 0;
+    std::unordered_set<uint64_t> seen;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fdinfo")) {
+        std::ifstream info(entry.path());
+        std::string line;
+        uint64_t inode = 0;
+        uint64_t size = 0;
+        bool dms = false;
+        while (std::getline(info, line)) {
+            if (line.starts_with("ino:\t")) inode = std::stoull(line.substr(5));
+            else if (line.starts_with("size:\t")) size = std::stoull(line.substr(6));
+            else if (line == "exp_name:\tsimaai,dms") dms = true;
+        }
+        // MLA-RT may duplicate an imported fd. Count the underlying DMA-BUF
+        // inode once so this reflects allocated DMS storage rather than handles.
+        if (dms && inode && seen.insert(inode).second) total += size;
+    }
+    return total;
 }
 }
 
