@@ -29,6 +29,12 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_draft_fc": (False, "DRAFT_FC"),
     "group_per_layer": (True, "PER_LAYER"),
     "single_per_layer": (False, "PER_LAYER"),
+    "group_router": (True, "ROUTER"),
+    "single_router": (False, "ROUTER"),
+    "group_expert": (True, "EXPERT"),
+    "single_expert": (False, "EXPERT"),
+    "group_weightedsum": (True, "WEIGHTEDSUM"),
+    "single_weightedsum": (False, "WEIGHTEDSUM"),
 }
 
 
@@ -56,7 +62,7 @@ def _encode_layer_id(l: LayerID) -> dict[str, Any]:
     """
     is_group, part = _ENCODE_LAYER_PART[l.part]
     index = l.part_idx
-    return {"is_group": is_group, "part": part, "index": index}
+    return {"is_group": is_group, "part": part, "index": index, "expert_idx": l.expert_idx}
 
 
 def _decode_layer_configuration(c: dict) -> LayerConfiguration | None:
