@@ -14,6 +14,7 @@ enum class ReasoningFormat {
     Qwen,
     Gemma4,
     Lfm2,
+    GptOss,
 };
 
 ReasoningFormat reasoning_format_for_model(std::string_view model_type);
