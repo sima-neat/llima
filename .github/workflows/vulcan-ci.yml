@@ -202,14 +202,14 @@ jobs:
             sdk_platform_version="$(sed -nE "s/^Platform Version[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\1/p" /etc/sdk-release)"
             if [[ "${sdk_platform_version}" != "${sysroot_version}" ]]; then
               echo "Refreshing daily SDK sysroot from ${sdk_platform_version:-unknown} to ${sysroot_version}."
-              printf '%s\n' \
-                'Package: simaai-palette-modalix' \
+              printf "%s\n" \
+                "Package: simaai-palette-modalix" \
                 "Pin: version ${sysroot_version}" \
-                'Pin-Priority: 1001' \
-                '' \
-                'Package: simaai-palette-modalix' \
-                'Pin: version *' \
-                'Pin-Priority: -1' \
+                "Pin-Priority: 1001" \
+                "" \
+                "Package: simaai-palette-modalix" \
+                "Pin: version *" \
+                "Pin-Priority: -1" \
                 > /etc/apt/preferences.d/simaai-sdk-version.pref
               SDK_APT_CHANNEL=daily \
                 setup-sdk-sysroot.sh "${sysroot_version}" "${SDK_PKG_LIST:-}"
