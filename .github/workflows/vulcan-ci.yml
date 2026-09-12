@@ -213,6 +213,17 @@ jobs:
                 > /etc/apt/preferences.d/simaai-sdk-version.pref
               SDK_APT_CHANNEL=daily \
                 setup-sdk-sysroot.sh "${sysroot_version}" "${SDK_PKG_LIST:-}"
+              overlay_dir="${SYSROOT:-/opt/toolchain/aarch64/modalix}/var/lib/sima-sdk"
+              mkdir -p "${overlay_dir}"
+              printf "%s\n" \
+                "Overlay State = active" \
+                "Platform Base = ${sysroot_version%%~*}" \
+                "Platform Revision = ${sysroot_version}" \
+                "Platform Channel = daily" \
+                "Platform Repository = https://debian.neat.sima.ai/daily" \
+                "Updated At = $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                "Package Inventory = ${overlay_dir}/sysroot-packages.tsv" \
+                > "${overlay_dir}/sysroot-overlay"
             else
               echo "Using SDK sysroot ${sdk_platform_version} without updating it."
             fi

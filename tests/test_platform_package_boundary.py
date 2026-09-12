@@ -78,6 +78,7 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
             'setup-sdk-sysroot.sh "${sysroot_version}" "${SDK_PKG_LIST:-}"',
             workflow,
         )
+        self.assertIn('"Platform Revision = ${sysroot_version}"', workflow)
         self.assertNotIn('sysroot update "${sysroot_version}"', workflow)
         self.assertIn("MACHINE=modalix", installer)
         self.assertIn('actual="$(read_devkit_platform_version', installer)
