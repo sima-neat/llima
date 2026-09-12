@@ -220,9 +220,10 @@ void TextStreamer::end() {
 
     for (const auto& message: messages) {
         _logger->info(message);
-        std::cout << message << std::endl;
+        if (_performance_summary_enabled) {
+            std::cout << message << std::endl;
+        }
     }
-    std::cout << std::flush;
 
     // Reset the stats.
     _time_to_first_token = -1;
