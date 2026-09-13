@@ -4,7 +4,7 @@ from typing import Sequence
 
 import numpy as np
 from ml_dtypes import bfloat16, int4, uint4
-import sima_utils.logging.sima_logger as sima_logger
+import sima_lmm.logging as sima_logger
 
 class QuantizationMode(IntEnum):
     """GGUF quantization Mode.

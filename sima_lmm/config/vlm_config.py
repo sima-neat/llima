@@ -8,7 +8,7 @@ from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.utils import ceil_div, round_up_to
-from sima_utils.logging.sima_logger import sima_log_warning
+from sima_lmm.logging import sima_log_warning
 
 LONG_CONTEXT_MIN_TOKENS = 2048
 LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE = 1024

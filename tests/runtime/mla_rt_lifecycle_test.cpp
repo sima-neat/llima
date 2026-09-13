@@ -16,7 +16,7 @@ int main() {
         connect_mla_rt({});
         disconnect_mla_rt();
     } catch (const std::exception& error) {
-        std::cerr << "Dispatcher lifecycle test failed: " << error.what() << '\n';
+        std::cerr << "MLA-RT lifecycle test failed: " << error.what() << '\n';
         try {
             disconnect_mla_rt();
         } catch (...) {
@@ -24,6 +24,6 @@ int main() {
         return 1;
     }
 
-    std::cout << "Dispatcher lifecycle test passed\n";
+    std::cout << "MLA-RT lifecycle test passed\n";
     return 0;
 }

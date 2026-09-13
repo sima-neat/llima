@@ -34,8 +34,7 @@ The Model Compiler tooling is delivered as a Python wheel:
 
 ## Install Runtime Packages
 
-Install the latest LLiMa runtime and its exact Internals dependencies on a
-Modalix DevKit with `sima-cli`:
+Install the latest LLiMa runtime on a Modalix 3.0.0 DevKit with `sima-cli`:
 
 ```bash
 sima-cli neat install llima
@@ -48,9 +47,9 @@ target:
 sima-cli neat install llima@<version-or-ref>
 ```
 
-The root artifact contains `install_llima.sh`, an explicit install manifest, the
-three LLiMa Debian packages, and every Debian package from the exact resolved
-Internals artifact used for the build.
+The root artifact contains `install_llima.sh`, an explicit install manifest,
+and the three LLiMa Debian packages. The installer verifies the Modalix 3.0.0
+platform before APT resolves the MLA-RT and SiMa DMA-heap runtime dependencies.
 
 Build consumers that only need to download the three LLiMa Debian packages can
 use the download-only subpackage:
@@ -85,6 +84,10 @@ Build output is generated under `build-deb/`. The installable bundle is written
 to `dist/`; its download-only three-package profile and archive are written to
 `dist/debs/`.
 
+The runtime links directly to the platform `simaai-mlart-modalix` and
+`simaai-heap` libraries. Building LLiMa does not fetch or install NEAT Internals
+packages.
+
 Install and validate those packages on Modalix; do not use the DevKit as the
 source-build environment.
 
@@ -113,6 +116,12 @@ llima run <model_dir> --mode web
 Model files load in parallel by default. When starting LLiMa alongside an
 active MLA workload, set `SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD=1` to load models
 one at a time so other inference requests can run between model loads.
+
+LLiMa connects through MLA-RT's `/dev/mla` backend and requests scheduler group
+priority 10, leaving the platform default priority 0 available to
+latency-sensitive vision processes. Set `MLA_CTX_PRIORITY` before startup to
+override this value; lower numbers have higher priority, and negative values
+require `CAP_SYS_NICE`.
 
 For EAGLE3 speculative decoding, pass the parent compiled-model directory that
 contains both the target and draft model subdirectories. `llima run` reads each
@@ -221,10 +230,9 @@ sima-cli neat install --type wheel --install-dir <wheel-dir> llima/compiler@deve
 ```text
 dist/
 ├── sima-lmm-<version>-Linux-{core,dev,cli}.deb
-├── <resolved Internals packages>.deb
 ├── install_llima.sh
 ├── llima-install-manifest.txt
-├── resolved-deps-manifest.json
+├── llima-package-manifest.json
 ├── metadata.json
 ├── debs/
 │   ├── sima-lmm-<version>-Linux-{core,dev,cli}.deb
