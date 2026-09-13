@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <fstream>
 #include <string_view>
 
@@ -171,9 +172,48 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // Encode the formatted prompt to token ids.
     auto add_special_tokens = !formatted_prompt.starts_with(_bos_token);
     auto input_token_ids = _tokenizer_ptr->encode(formatted_prompt, add_special_tokens);
+
+    uint16_t stable_prefix_token_count = 0;
+    const auto& messages = chat.get_messages();
+    const auto& layer_types = _vlm_cfg.lm_cfg.layer_types;
+    const auto& group_offsets = _vlm_cfg.pipeline_cfg.input_token_group_offsets;
+    const bool uses_state_checkpoints = group_offsets.has_value() && !group_offsets->empty()
+        && std::any_of(
+            layer_types.begin(), layer_types.end(),
+            [](const auto& type) { return type == "conv" || type == "linear_attention"; }
+        );
+    if (
+        uses_state_checkpoints
+        && !messages.empty()
+        && messages.front().value("role", "") == "system"
+    ) {
+        const auto first_user = std::find_if(
+            messages.begin(), messages.end(),
+            [](const auto& message) { return message.value("role", "") == "user"; }
+        );
+        if (first_user != messages.end()) {
+            auto stable_inputs = inputs;
+            stable_inputs.messages = nlohmann::ordered_json::array(
+                {messages.front(), *first_user}
+            );
+            stable_inputs.messages.back()["content"] = "__llima_stable_prefix_end__";
+            auto stable_prompt = _chat_template_ptr->apply(stable_inputs);
+            auto stable_token_ids = _tokenizer_ptr->encode(
+                stable_prompt, !stable_prompt.starts_with(_bos_token)
+            );
+            const auto mismatch = std::mismatch(
+                stable_token_ids.begin(), stable_token_ids.end(),
+                input_token_ids.begin(), input_token_ids.end()
+            );
+            stable_prefix_token_count = static_cast<uint16_t>(
+                std::distance(stable_token_ids.begin(), mismatch.first)
+            );
+        }
+    }
     return {
         std::move(formatted_prompt),
         std::move(input_token_ids),
+        stable_prefix_token_count,
         std::move(image_tensors)
     };
 }

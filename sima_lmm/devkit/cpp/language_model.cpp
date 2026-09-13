@@ -163,10 +163,12 @@ LanguageModel::LanguageModel(
             );
             conv_state.layer_indices = std::move(conv_layer_indices);
 
-            const auto num_boundaries = _checkpoint_boundaries.size();
             conv_state.checkpoints.resize(conv_state.layer_indices.size());
             for (auto& checkpoints: conv_state.checkpoints) {
-                checkpoints.resize(num_boundaries, std::vector<uint8_t>(conv_state.tail_bytes));
+                checkpoints.resize(
+                    _state_checkpoint_positions.size(),
+                    std::vector<uint8_t>(conv_state.tail_bytes)
+                );
             }
             _cached_states.emplace_back(std::move(conv_state));
         }
@@ -184,11 +186,11 @@ LanguageModel::LanguageModel(
             );
             linear_conv_state.layer_indices = linear_layer_indices;
 
-            const auto num_boundaries = _checkpoint_boundaries.size();
             linear_conv_state.checkpoints.resize(linear_conv_state.layer_indices.size());
             for (auto& checkpoints: linear_conv_state.checkpoints) {
                 checkpoints.resize(
-                    num_boundaries, std::vector<uint8_t>(linear_conv_state.tail_bytes)
+                    _state_checkpoint_positions.size(),
+                    std::vector<uint8_t>(linear_conv_state.tail_bytes)
                 );
             }
             _cached_states.emplace_back(std::move(linear_conv_state));
@@ -209,7 +211,8 @@ LanguageModel::LanguageModel(
             linear_delta_state.checkpoints.resize(linear_delta_state.layer_indices.size());
             for (auto& checkpoints: linear_delta_state.checkpoints) {
                 checkpoints.resize(
-                    num_boundaries, std::vector<uint8_t>(linear_delta_state.tail_bytes)
+                    _state_checkpoint_positions.size(),
+                    std::vector<uint8_t>(linear_delta_state.tail_bytes)
                 );
             }
             _cached_states.emplace_back(std::move(linear_delta_state));
@@ -369,7 +372,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::span<const uint32_t> input_token_ids,
     std::optional<ChronoTimer> timer_ttft,
     std::optional<uint16_t> override_max_num_tokens,
-    std::optional<std::set<uint32_t>> override_stop_token_ids
+    std::optional<std::set<uint32_t>> override_stop_token_ids,
+    uint16_t stable_prefix_token_count
 ) {
     // Update the state.
     _is_running = true;
@@ -384,6 +388,20 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         _notify_cache_full();
         output_token_ids = std::vector<uint32_t>();
     } else {
+        if (!_cached_states.empty()) {
+            _capture_state_checkpoints = true;
+            _rolling_checkpoint_slot = 0;
+            auto system_boundary = std::upper_bound(
+                _checkpoint_boundaries.begin(),
+                _checkpoint_boundaries.end(),
+                std::min<size_t>(stable_prefix_token_count, input_token_ids.size())
+            );
+            _system_checkpoint_position = system_boundary == _checkpoint_boundaries.begin()
+                ? 0 : *std::prev(system_boundary);
+            if (_state_checkpoint_positions[0] != _system_checkpoint_position)
+                _state_checkpoint_positions[0] = 0;
+        }
+
         // Create input embeds from input token ids and image embeds.
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
 
@@ -403,6 +421,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
             );
         }
     }
+
+    _rolling_checkpoint_slot = 0;
+    _capture_state_checkpoints = false;
 
     // Wait until all the streaming finishes.
     _text_streamer.wait_streaming();
@@ -810,14 +831,6 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
         }
     }
 
-    if (!_cached_states.empty()) {
-        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
-            if (_checkpoint_boundaries[i] == next_token_idx) {
-                _save_state_checkpoint(i, num_tokens, 1);
-                break;
-            }
-        }
-    }
 }
 
 
@@ -1303,15 +1316,14 @@ uint32_t LanguageModel::run_model_once(
     }
 
     // If this run landed exactly on a checkpoint boundary, save the tail.
-    if (!_cached_states.empty()) {
-        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
-            if (_checkpoint_boundaries[i] == next_token_idx) {
-                // A partial prefill group can land exactly on a checkpoint boundary.
-                const uint16_t valid_tokens = next_token_idx - token_idx;
-                _save_state_checkpoint(i, num_tokens, valid_tokens);
-                break;
-            }
-        }
+    if (
+        _capture_state_checkpoints
+        && std::binary_search(
+            _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), next_token_idx
+        )
+    ) {
+        // A partial prefill group can land exactly on a checkpoint boundary.
+        _save_state_checkpoint(next_token_idx, num_tokens, next_token_idx - token_idx);
     }
 
     if (logits_ptr) {
@@ -1552,11 +1564,15 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
         num_cached_tokens = clamp_token_count;
     }
 
-    // Restore latest checkpoint boundary <= requested cache length.
-    auto it = std::upper_bound(
-        _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), num_cached_tokens
-    );
-    if (it == _checkpoint_boundaries.begin()) {
+    // Invalidate checkpoints from the old conversation branch and select the newest match.
+    size_t checkpoint_slot = 0;
+    for (size_t i = 0; i < _state_checkpoint_positions.size(); ++i) {
+        if (_state_checkpoint_positions[i] > num_cached_tokens)
+            _state_checkpoint_positions[i] = 0;
+        if (_state_checkpoint_positions[i] > _state_checkpoint_positions[checkpoint_slot])
+            checkpoint_slot = i;
+    }
+    if (!_state_checkpoint_positions[checkpoint_slot]) {
         for (const auto& state: _cached_states) {
             for (const auto& layer_idx: state.layer_indices) {
                 get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx)).clear();
@@ -1564,9 +1580,7 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
         }
         return 0;
     }
-    --it;
-    uint16_t restored_token_count = *it;
-    auto requested_boundary = std::distance(_checkpoint_boundaries.begin(), it);
+    const auto restored_token_count = _state_checkpoint_positions[checkpoint_slot];
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
     for (auto& state: _cached_states) {
         const uint32_t restore_row_offset = state.prefill_single_output ? 0 : tail_begin;
@@ -1578,7 +1592,7 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
             auto& checkpoints = state.checkpoints[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
             buf.upload_raw(
-                checkpoints[requested_boundary].data(),
+                checkpoints[checkpoint_slot].data(),
                 dst_offset,
                 state.tail_bytes,
                 true
@@ -1590,8 +1604,24 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
 
 
 void LanguageModel::_save_state_checkpoint(
-    size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
+    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens
 ) {
+    if (token_count < _system_checkpoint_position)
+        return;
+
+    size_t checkpoint_slot = 0;
+    if (token_count != _system_checkpoint_position) {
+        if (!_rolling_checkpoint_slot) {
+            auto oldest = std::min_element(
+                _state_checkpoint_positions.begin() + 1, _state_checkpoint_positions.end()
+            );
+            _rolling_checkpoint_slot = static_cast<size_t>(
+                std::distance(_state_checkpoint_positions.begin(), oldest)
+            );
+        }
+        checkpoint_slot = _rolling_checkpoint_slot;
+    }
+
     // Save the L-1 tail of each stateful layer's MLA buffer
     // so a future prefill can resume from this boundary without replay.
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
@@ -1611,12 +1641,13 @@ void LanguageModel::_save_state_checkpoint(
             buf.invalidate_cache();
             auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
             std::memcpy(
-                state.checkpoints[layer_slot][boundary_idx].data(),
+                state.checkpoints[layer_slot][checkpoint_slot].data(),
                 ptr + src_offset_bytes,
                 state.tail_bytes
             );
         }
     }
+    _state_checkpoint_positions[checkpoint_slot] = token_count;
 }
 
 

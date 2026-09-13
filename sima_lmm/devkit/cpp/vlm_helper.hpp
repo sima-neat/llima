@@ -24,6 +24,7 @@ namespace llima {
 struct PreprocessedChat {
     std::string formatted_prompt;
     std::vector<uint32_t> input_token_ids;
+    uint16_t stable_prefix_token_count;
     std::vector<std::vector<Eigen::bfloat16>> image_tensors;
 };
 

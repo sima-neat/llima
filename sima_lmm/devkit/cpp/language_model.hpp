@@ -2,6 +2,7 @@
 #define _SIMA_LLIMA_LANGUAGE_MODEL_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -62,7 +63,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
+            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt,
+            uint16_t stable_prefix_token_count = 0
         );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
@@ -273,7 +275,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             size_t tail_bytes;
             // Group prefill models output only one final state row, not per-token state history.
             bool prefill_single_output = false;
-            // Tail snapshots indexed as [layer_slot][boundary_idx][byte_offset].
+            // Tail snapshots indexed as [layer_slot][checkpoint_slot][byte_offset].
             std::vector<std::vector<std::vector<uint8_t>>> checkpoints;
         };
 
@@ -345,7 +347,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
         void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
-            size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
+            uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens
         );
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
@@ -422,6 +424,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
         std::vector<uint16_t> _checkpoint_boundaries;
         std::vector<CachedState> _cached_states;
+        // Slot 0 is the system prefix; slots 1-3 are completed turns. Zero means unused.
+        std::array<uint16_t, 4> _state_checkpoint_positions{};
+        bool _capture_state_checkpoints = false;
+        uint16_t _system_checkpoint_position = 0;
+        size_t _rolling_checkpoint_slot = 0;
 
         std::vector<std::vector<Eigen::bfloat16>> _eagle3_intermediate_hidden_states;
 
