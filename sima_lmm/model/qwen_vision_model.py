@@ -1018,7 +1018,6 @@ class QwenVisionLayerModel(BaseModel):
             f"{base_name}.linear_fc1", norm,
             is_fc=False, stride=(1, factor),
             weight_process_func=self._reshape_merger_kernel,
-            scale_process_func=lambda x: x,
             src_bias_name=f"{base_name}.linear_fc1.bias",
         )
         act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)
@@ -1040,7 +1039,6 @@ class QwenVisionLayerModel(BaseModel):
             f"{base_name}.merger.mlp.0", norm,
             is_fc=False, stride=(1, factor),
             weight_process_func=self._reshape_merger_kernel,
-            scale_process_func=lambda x: x,
             src_bias_name=f"{base_name}.merger.mlp.0.bias",
         )
         act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)
