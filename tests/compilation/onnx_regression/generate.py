@@ -16,7 +16,6 @@ from sima_lmm.model import FileGenMode, FileGenPrecision, VisionLanguageModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
-from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_pre_model import LanguagePreModel
@@ -70,6 +69,8 @@ def _standard_models(
             final_softcapping=None,
         )
     elif case.component == "linear":
+        from sima_lmm.model.language_linear_model import LanguageLinearModel
+
         model = LanguageLinearModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_layer{case.layer_index}_linear",
