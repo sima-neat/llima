@@ -648,6 +648,8 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
             // Single-token scoring rewrites the model cache from token zero without going
             // through run_model_prefill(), so the cached-token metadata is no longer valid.
             _cached_token_ids.clear();
+            if (!_cached_states.empty())
+                _prepare_state_checkpoints_for_prefill(0);
         }
         if (should_group_prefill) {
             create_input_buffers(input_token_ids);
@@ -926,6 +928,9 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
+    if (token_idx == 0 && logits_ptr && !_cached_states.empty())
+        _prepare_state_checkpoints_for_prefill(0);
+
     uint16_t next_token_idx;
     if (num_tokens > 1) {
         next_token_idx = std::min(num_input_tokens, uint16_t(token_idx + num_tokens));
