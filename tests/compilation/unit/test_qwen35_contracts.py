@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from sima_lmm.config.vlm_config import LanguageModelConfig, LoraConfig
 from sima_lmm.model import language_linear_model
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
@@ -110,3 +111,50 @@ def test_qwen_patch_embedding_preserves_grouped_scales():
     assert result is scales
     with pytest.raises(ValueError, match="Qwen patch-embedding scales"):
         model._reshape_qwen_patch_embed_scales(np.ones((7, 3), dtype=np.float32))
+
+
+def test_linear_attention_lora_targets_disable_ab_projection_fusion(monkeypatch):
+    model = _linear_model(quantize_embeddings=False)
+    lm_cfg = LanguageModelConfig(
+        hidden_size=model.cfg.lm_cfg.hidden_size,
+        linear_attn_cfg=model.cfg.lm_cfg.linear_attn_cfg,
+        lora_cfg=LoraConfig(r=8, target_modules=["all-linear"]),
+    )
+    model.cfg.lm_cfg = lm_cfg
+    model.get_hf_param = lambda _name: None
+    model.check_hf_param = lambda _name: False
+    calls = []
+
+    def build_projection(
+        _builder, _get_param, _check_param, base_name, _input, **kwargs
+    ):
+        calls.append((base_name, kwargs))
+        return _FakeNode(base_name)
+
+    monkeypatch.setattr(
+        language_linear_model, "build_conv_from_dense_with_lora", build_projection
+    )
+    monkeypatch.setattr(
+        LanguageLinearModel,
+        "_get_ab_projection_params",
+        lambda *_args: pytest.fail("targeted A/B projections must not be fused"),
+    )
+
+    a, b = model._build_sima_ab_projections(
+        object(), "model.layers.0.linear_attn", object(), merged_lora=True
+    )
+
+    assert (a.name, b.name) == (
+        "model.layers.0.linear_attn.in_proj_a",
+        "model.layers.0.linear_attn.in_proj_b",
+    )
+    assert calls == [
+        (
+            "model.layers.0.linear_attn.in_proj_a",
+            {"lora_rank": 8, "merged_lora": True},
+        ),
+        (
+            "model.layers.0.linear_attn.in_proj_b",
+            {"lora_rank": 8, "merged_lora": True},
+        ),
+    ]

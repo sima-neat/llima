@@ -196,8 +196,32 @@ class LanguageLinearModel(LanguagePartBaseModel):
         return result
 
     def _build_sima_ab_projections(
-        self, builder: SimaBuilder, linear_base: str, norm_input: NodeOrHandle
+        self,
+        builder: SimaBuilder,
+        linear_base: str,
+        norm_input: NodeOrHandle,
+        merged_lora: bool,
     ) -> tuple[NodeOrHandle, NodeOrHandle]:
+        lora_ranks = {"a": None, "b": None}
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_ranks = {
+                key: self.cfg.lm_cfg.get_lora_rank(linear_base, f"in_proj_{key}")
+                for key in lora_ranks
+            }
+        if any(rank is not None for rank in lora_ranks.values()):
+            return tuple(
+                build_conv_from_dense_with_lora(
+                    builder,
+                    self.get_hf_param,
+                    self.check_hf_param,
+                    f"{linear_base}.in_proj_{key}",
+                    norm_input,
+                    lora_rank=lora_ranks[key],
+                    merged_lora=merged_lora,
+                )
+                for key in ("a", "b")
+            )
+
         params = self._get_ab_projection_params(linear_base)
         if params is None:
             return tuple(
@@ -220,6 +244,22 @@ class LanguageLinearModel(LanguagePartBaseModel):
     def _build_onnx_ab_projections(
         self, linear_base: str, norm_input: OnnxNode
     ) -> tuple[OnnxNode, OnnxNode]:
+        lora_ranks = {"a": None, "b": None}
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_ranks = {
+                key: self.cfg.lm_cfg.get_lora_rank(linear_base, f"in_proj_{key}")
+                for key in lora_ranks
+            }
+        if any(rank is not None for rank in lora_ranks.values()):
+            return tuple(
+                self._onnx_builder.build_conv_from_dense_with_lora(
+                    f"{linear_base}.in_proj_{key}",
+                    norm_input,
+                    lora_rank=lora_ranks[key],
+                )
+                for key in ("a", "b")
+            )
+
         params = self._get_ab_projection_params(linear_base)
         builder = self._onnx_builder
         if params is None:
@@ -772,10 +812,21 @@ class LanguageLinearModel(LanguagePartBaseModel):
             lora_rank=lora_rank,
             merged_lora=merged_lora,
         )
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_z")
         z = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{linear_base}.in_proj_z", norm_input
+            builder,
+            self.get_hf_param,
+            self.check_hf_param,
+            f"{linear_base}.in_proj_z",
+            norm_input,
+            lora_rank=lora_rank,
+            merged_lora=merged_lora,
         )
-        a, b = self._build_sima_ab_projections(builder, linear_base, norm_input)
+        a, b = self._build_sima_ab_projections(
+            builder, linear_base, norm_input, merged_lora
+        )
 
         conv_tail = builder.create_concat_node([mla_conv_state, mixed_qkv], 2)
         linear_conv_state_out = builder.create_slice_node(
@@ -1594,8 +1645,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
         mixed_qkv = self._onnx_builder.build_conv_from_dense_with_lora(
             f"{linear_base}.in_proj_qkv", norm_input, lora_rank=lora_rank
         )
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_z")
         z = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{linear_base}.in_proj_z", norm_input
+            f"{linear_base}.in_proj_z", norm_input, lora_rank=lora_rank
         )
         a, b = self._build_onnx_ab_projections(linear_base, norm_input)
 
