@@ -16,6 +16,7 @@ from sima_lmm.model import FileGenMode, FileGenPrecision, VisionLanguageModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
+from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_pre_model import LanguagePreModel
@@ -39,12 +40,12 @@ def _standard_models(
     if case.component == "pre":
         model = LanguagePreModel(
             cfg,
-            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_pre_layer{LAYER_IDX}",
+            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_pre_layer{case.layer_index}",
             onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
-            layer_idx=LAYER_IDX,
+            layer_idx=case.layer_index,
         )
     elif case.component == "cache":
         model = LanguageCacheModel(
@@ -60,13 +61,23 @@ def _standard_models(
     elif case.component == "post":
         model = LanguagePostModel(
             cfg,
-            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_post_layer{LAYER_IDX}",
+            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_post_layer{case.layer_index}",
             onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
-            layer_idx=LAYER_IDX,
+            layer_idx=case.layer_index,
             final_softcapping=None,
+        )
+    elif case.component == "linear":
+        model = LanguageLinearModel(
+            cfg,
+            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_layer{case.layer_index}_linear",
+            onnx_path=vlm_model.onnx_path,
+            sima_path=vlm_model.sima_path,
+            hf_model=vlm_model.hf_model,
+            num_tokens=NUM_TOKENS,
+            layer_idx=case.layer_index,
         )
     elif case.component == "per_layer":
         model = LanguagePerLayerModel(
@@ -97,7 +108,7 @@ def _standard_models(
             hf_model=vlm_model.hf_model,
         )
         if getattr(vision_model, "is_single_vision_model", False):
-            models = [vision_model._get_part_model(LAYER_IDX)]
+            models = [vision_model._get_part_model(case.layer_index)]
         else:
             models = [
                 vision_model._get_part_model(layer_idx)

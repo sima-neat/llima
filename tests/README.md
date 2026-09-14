@@ -85,7 +85,7 @@ offline mode, and reject network connections.
 
 - Location: `tests/compilation/configuration/`
 - Marker: `compiler_config`
-- Expected cases: 25
+- Expected cases: 26
 
 Generates `VlmConfig` objects from cached Hugging Face and GGUF sources and
 compares them with the checked-in JSON contracts under
@@ -120,7 +120,7 @@ shared across quantization variants where possible.
 
 - Location: `tests/compilation/onnx_regression/`
 - Marker: `compiler_onnx_regression`
-- Expected cases: 32
+- Expected cases: 37
 
 Every case:
 
