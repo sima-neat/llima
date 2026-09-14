@@ -457,9 +457,7 @@ uint32_t LanguageModel::run_model_prefill(
     uint16_t token_idx{};
     uint32_t next_token_id{};
     uint16_t last_group_valid_tokens = 0;
-    if (!_cached_states.empty()) {
-        num_cached_tokens = _prepare_state_checkpoints_for_prefill(num_cached_tokens);
-    }
+    num_cached_tokens = _prepare_state_checkpoints_for_prefill(num_cached_tokens);
 
     if (num_input_tokens == num_cached_tokens) {
         // All input tokens are already cached.
@@ -648,8 +646,7 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
             // Single-token scoring rewrites the model cache from token zero without going
             // through run_model_prefill(), so the cached-token metadata is no longer valid.
             _cached_token_ids.clear();
-            if (!_cached_states.empty())
-                _prepare_state_checkpoints_for_prefill(0);
+            _prepare_state_checkpoints_for_prefill(0);
         }
         if (should_group_prefill) {
             create_input_buffers(input_token_ids);
@@ -928,7 +925,7 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
-    if (token_idx == 0 && logits_ptr && !_cached_states.empty())
+    if (token_idx == 0 && logits_ptr)
         _prepare_state_checkpoints_for_prefill(0);
 
     uint16_t next_token_idx;
@@ -1562,8 +1559,24 @@ void LanguageModel::_initialize() {
     _logger->info("Language model initialize completed");
 }
 
-// Restore the latest checkpoint <= num_cached_tokens so grouped prefill can resume from a saved position.
+// Restore the latest checkpoint, or clear state when checkpoints are unavailable.
 uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens) {
+    if (_cached_states.empty()) {
+        bool cleared_state = false;
+        for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+            if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
+                get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
+                cleared_state = true;
+            } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+                get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)).clear();
+                get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).clear();
+                get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)).clear();
+                cleared_state = true;
+            }
+        }
+        return cleared_state ? 0 : num_cached_tokens;
+    }
+
     // Manual clamp semantics: if cache reuse asks past the last grouped block,
     // clamp to last_offset + group_size before selecting a checkpoint boundary.
     const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
