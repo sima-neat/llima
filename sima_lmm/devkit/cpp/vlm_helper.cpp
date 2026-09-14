@@ -185,7 +185,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     if (
         uses_state_checkpoints
         && !messages.empty()
-        && messages.front().value("role", "") == "system"
+        && (messages.front().value("role", "") == "system" || !inputs.tools.empty())
     ) {
         const auto first_user = std::find_if(
             messages.begin(), messages.end(),
@@ -193,9 +193,10 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         );
         if (first_user != messages.end()) {
             auto stable_inputs = inputs;
-            stable_inputs.messages = nlohmann::ordered_json::array(
-                {messages.front(), *first_user}
-            );
+            stable_inputs.messages = nlohmann::ordered_json::array();
+            if (messages.front().value("role", "") == "system")
+                stable_inputs.messages.push_back(messages.front());
+            stable_inputs.messages.push_back(*first_user);
             stable_inputs.messages.back()["content"] = "__llima_stable_prefix_end__";
             auto stable_prompt = _chat_template_ptr->apply(stable_inputs);
             auto stable_token_ids = _tokenizer_ptr->encode(

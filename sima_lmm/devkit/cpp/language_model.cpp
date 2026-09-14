@@ -391,6 +391,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         if (!_cached_states.empty()) {
             _capture_state_checkpoints = true;
             _rolling_checkpoint_slot = 0;
+            _writable_checkpoint_slots = 0;
             auto system_boundary = std::upper_bound(
                 _checkpoint_boundaries.begin(),
                 _checkpoint_boundaries.end(),
@@ -398,7 +399,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
             );
             _system_checkpoint_position = system_boundary == _checkpoint_boundaries.begin()
                 ? 0 : *std::prev(system_boundary);
-            if (_state_checkpoint_positions[0] != _system_checkpoint_position)
+            if (_system_checkpoint_position && _state_checkpoint_positions[0] != _system_checkpoint_position)
                 _state_checkpoint_positions[0] = 0;
         }
 
@@ -423,6 +424,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     }
 
     _rolling_checkpoint_slot = 0;
+    _writable_checkpoint_slots = 0;
     _capture_state_checkpoints = false;
 
     // Wait until all the streaming finishes.
@@ -1323,7 +1325,9 @@ uint32_t LanguageModel::run_model_once(
         )
     ) {
         // A partial prefill group can land exactly on a checkpoint boundary.
-        _save_state_checkpoint(next_token_idx, num_tokens, next_token_idx - token_idx);
+        _save_state_checkpoint(
+            next_token_idx, num_tokens, next_token_idx - token_idx, token_idx < num_input_tokens
+        );
     }
 
     if (logits_ptr) {
@@ -1604,20 +1608,31 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
 
 
 void LanguageModel::_save_state_checkpoint(
-    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens
+    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
 ) {
     if (token_count < _system_checkpoint_position)
         return;
 
     size_t checkpoint_slot = 0;
     if (token_count != _system_checkpoint_position) {
-        if (!_rolling_checkpoint_slot) {
-            auto oldest = std::min_element(
-                _state_checkpoint_positions.begin() + 1, _state_checkpoint_positions.end()
-            );
-            _rolling_checkpoint_slot = static_cast<size_t>(
-                std::distance(_state_checkpoint_positions.begin(), oldest)
-            );
+        if (!_writable_checkpoint_slots) {
+            const size_t first_slot = _system_checkpoint_position ? 1 : 0;
+            _rolling_checkpoint_slot = first_slot;
+            for (size_t i = first_slot; i < _state_checkpoint_positions.size(); ++i) {
+                if (!_state_checkpoint_positions[i])
+                    _writable_checkpoint_slots |= 1u << i;
+                if (_state_checkpoint_positions[i] < _state_checkpoint_positions[_rolling_checkpoint_slot])
+                    _rolling_checkpoint_slot = i;
+            }
+            _writable_checkpoint_slots |= 1u << _rolling_checkpoint_slot;
+        }
+        // Prefill keeps the latest boundaries in spare slots; decode advances only the newest one.
+        if (is_prefill) {
+            for (size_t i = 0; i < _state_checkpoint_positions.size(); ++i) {
+                if ((_writable_checkpoint_slots & (1u << i))
+                    && _state_checkpoint_positions[i] < _state_checkpoint_positions[_rolling_checkpoint_slot])
+                    _rolling_checkpoint_slot = i;
+            }
         }
         checkpoint_slot = _rolling_checkpoint_slot;
     }

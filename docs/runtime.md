@@ -90,6 +90,12 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 
 ## Build an Application with Neat
 
+Qwen3.5 can retain a protected prefix checkpoint for stable native tool
+definitions even when requests omit an explicit system message.
+Spare checkpoint slots retain recent aligned prompt boundaries; generation
+advances only the latest checkpoint. Slot 0 is available for reuse when there
+is no aligned system/tool prefix to protect.
+
 After validating your model with `llima run`, see
 [GenAI Model](/develop-apps/development-workflow/genai-model/) to serve it
 through common API endpoints or use it directly from a C++ or Python

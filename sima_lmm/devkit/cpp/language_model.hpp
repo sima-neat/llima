@@ -347,7 +347,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
         void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
-            uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens
+            uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
         );
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
@@ -424,9 +424,10 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
         std::vector<uint16_t> _checkpoint_boundaries;
         std::vector<CachedState> _cached_states;
-        // Slot 0 is the system prefix; slots 1-3 are completed turns. Zero means unused.
+        // Positions are zero for unused slots. Slot 0 is reserved only for a system/tool prefix.
         std::array<uint16_t, 4> _state_checkpoint_positions{};
         bool _capture_state_checkpoints = false;
+        uint8_t _writable_checkpoint_slots = 0;
         uint16_t _system_checkpoint_position = 0;
         size_t _rolling_checkpoint_slot = 0;
 
