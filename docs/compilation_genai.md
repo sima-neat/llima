@@ -115,8 +115,8 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--resume` | Resume interrupted builds by skipping existing files. |
 | `-j, --jobs` | Number of parallel compilation jobs. Default: Number of physical CPU cores. |
 | `--log_level` | Logging level (DEBUG, INFO, WARNING, ERROR). Default: WARNING. |
-| `--input_height` | Input image height in pixels. Must be provided with `--input_width`. Required for Qwen 2 VL, Qwen 3 VL, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
-| `--input_width` | Input image width in pixels. Must be provided with `--input_height`. Required for Qwen 2 VL, Qwen 3 VL, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
+| `--input_height` | Input image height in pixels. Must be provided with `--input_width`. Required for Qwen 2 VL, Qwen 3 VL, Qwen3.5, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
+| `--input_width` | Input image width in pixels. Must be provided with `--input_height`. Required for Qwen 2 VL, Qwen 3 VL, Qwen3.5, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
 | `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
 | `--system_prompt_file` | Path to a text file containing the system prompt. |
 | `--chat_template` | Chat template string to store in the compiled model. Mutually exclusive with the system-prompt and chat-template file options. |
@@ -235,7 +235,19 @@ This will:
 - Set context length to 4096 tokens
 - Output to `Llama-3.2-3B-Instruct_out` directory
 
-**Example 3: Compiling Gemma 3 VLM with Mixed Precision**
+**Example 3: Compiling a Qwen3.5 VLM**
+
+Qwen3.5 uses a hybrid language stack with standard-attention and Gated DeltaNet
+layers. Provide both image dimensions when compiling it. Each dimension must be
+divisible by `patch_size * spatial_merge_size`, which is 32 for the current
+Qwen3.5 checkpoints.
+
+``` console
+sima-user@docker-image-id:/home/docker$ hf download Qwen/Qwen3.5-0.8B --local-dir Qwen3.5-0.8B
+sima-user@docker-image-id:/home/docker$ llima-compile Qwen3.5-0.8B --input_height 448 --input_width 448 -o Qwen3.5-0.8B_out
+```
+
+**Example 4: Compiling Gemma 3 VLM with Mixed Precision**
 
 For complex models like Gemma 3 VLM, you may need to specify different precisions for different layers (e.g., keeping the vision encoder in BF16).
 
@@ -267,7 +279,7 @@ For complex models like Gemma 3 VLM, you may need to specify different precision
     sima-user@docker-image-id:/home/docker$ llima-compile -c config.py --max_num_tokens 2048 gemma-3-model -o gemma-3-model_out
     ```
 
-**Example 4: Advanced Configuration**
+**Example 5: Advanced Configuration**
 
 Mixed precision with transformer-layer-specific control:
 
@@ -285,7 +297,7 @@ Do not interpret `"CACHE"` indices as transformer-layer indices. Omitting
 cache variants can make the compiled output incomplete and unusable at
 runtime.
 
-**Example 5: Compiling an LLM with LoRA**
+**Example 6: Compiling an LLM with LoRA**
 
 LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter to be dynamically applied or removed at runtime without recompiling the base model. The base model is compiled with parallel LoRA branches (initialized to zero), and the adapter weights are compiled separately into `.npy` files that are loaded on demand.
 
