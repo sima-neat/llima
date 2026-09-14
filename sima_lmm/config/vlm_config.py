@@ -831,6 +831,10 @@ class LanguageModelConfig(BaseConfig):
         if cfg is None:
             self.speculative_decoding_cfg = None
         else:
+            if self.linear_attn_cfg is not None:
+                raise ValueError(
+                    "EAGLE3 speculative decoding does not support linear-attention layers"
+                )
             if self.attn_cfg.swa_enable:
                 raise ValueError(
                     "EAGLE3 speculative decoding does not support sliding-window attention"
