@@ -743,25 +743,47 @@ class LanguageLinearModel(LanguagePartBaseModel):
         if emit_prefix_states:
             # Share the grouped solve with the logits. Keep the existing final
             # state as SB, including its suffix-sum BF16 evaluation order.
-            states = []
-            for prefix_idx in range(self.num_tokens - 1):
-                prefix_mask = builder.create_slice_node(
-                    decay_mask, [prefix_idx], [prefix_idx + 1], [1], [2]
-                )
-                prefix_mask = builder.create_transpose_node(
-                    prefix_mask, [0, 1, 3, 2]
-                )
-                weighted = builder.create_mul_node(v_new, prefix_mask)
-                updates = builder.create_einsum_node(
-                    key, weighted, equation="nhcw,nhcq->nhwq", layout="NHWC"
-                )
-                prefix_decay = builder.create_slice_node(
-                    g_exp, [prefix_idx], [prefix_idx + 1], [1], [2]
-                )
-                base = builder.create_mul_node(state, prefix_decay)
-                states.append(builder.create_add_node(base, updates))
+            prefix_count = self.num_tokens - 1
+            num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
+            folded_heads = prefix_count * num_heads
+
+            prefix_mask = builder.create_slice_node(
+                decay_mask, [0], [prefix_count], [1], [2]
+            )
+            prefix_mask = builder.create_transpose_node(prefix_mask, [0, 2, 1, 3])
+            prefix_mask = builder.create_reshape_node(
+                prefix_mask, [1, folded_heads, self.num_tokens, 1]
+            )
+            folded_value = builder.create_slice_concat_node(
+                v_new, axis=1, split_axis=1, split_block=1,
+                split_repeat=prefix_count,
+            )
+            folded_value = builder.create_mul_node(folded_value, prefix_mask)
+            folded_key = builder.create_slice_concat_node(
+                key, axis=1, split_axis=1, split_block=1,
+                split_repeat=prefix_count,
+            )
+            updates = builder.create_einsum_node(
+                folded_key, folded_value,
+                equation="nhcw,nhcq->nhwq", layout="NHWC",
+            )
+
+            prefix_decay = builder.create_slice_node(
+                g_exp, [0], [prefix_count], [1], [2]
+            )
+            prefix_decay = builder.create_transpose_node(prefix_decay, [0, 2, 1, 3])
+            prefix_decay = builder.create_reshape_node(
+                prefix_decay, [1, folded_heads, 1, 1]
+            )
+            folded_state = builder.create_slice_concat_node(
+                state, axis=1, split_axis=1, split_block=1,
+                split_repeat=prefix_count,
+            )
+            states = builder.create_add_node(
+                builder.create_mul_node(folded_state, prefix_decay), updates
+            )
             linear_delta_state_out = builder.create_concat_node(
-                [*states, linear_delta_state_out], 1
+                [states, linear_delta_state_out], 1
             )
 
         return core_attn_out, linear_delta_state_out
@@ -1697,46 +1719,77 @@ class LanguageLinearModel(LanguagePartBaseModel):
         if emit_prefix_states:
             # NCHW stores heads on axis 2; pack prefixes there without adding
             # a fifth dimension. The common output transpose handles both paths.
-            states = []
-            for prefix_idx in range(self.num_tokens - 1):
-                prefix_name = f"{base_name}.prefix.{prefix_idx + 1}"
-                prefix_mask = self._onnx_builder.build_op(
-                    f"{prefix_name}.mask",
-                    [decay_mask, np.array([prefix_idx], dtype=np.int64),
-                     np.array([prefix_idx + 1], dtype=np.int64),
-                     np.array([3], dtype=np.int64)],
-                    "Slice",
-                )
-                prefix_mask = self._onnx_builder.build_op(
-                    f"{prefix_name}.mask.token_major", [prefix_mask],
-                    "Transpose", perm=[0, 3, 2, 1],
-                )
-                weighted = self._onnx_builder.build_op(
-                    f"{prefix_name}.weighted", [v_new, prefix_mask], "Mul"
-                )
-                weighted = self._onnx_builder.build_op(
-                    f"{prefix_name}.weighted.token_major", [weighted],
-                    "Transpose", perm=[0, 3, 2, 1],
-                )
-                updates = self._onnx_builder.build_op(
-                    f"{prefix_name}.updates", [weighted, key],
-                    "Einsum", equation="nchw,nqhc->nqhw",
-                )
-                prefix_decay = self._onnx_builder.build_op(
-                    f"{prefix_name}.decay",
-                    [g_exp, np.array([prefix_idx], dtype=np.int64),
-                     np.array([prefix_idx + 1], dtype=np.int64),
-                     np.array([3], dtype=np.int64)],
-                    "Slice",
-                )
-                base = self._onnx_builder.build_op(
-                    f"{prefix_name}.base", [state, prefix_decay], "Mul"
-                )
-                states.append(self._onnx_builder.build_op(
-                    f"{prefix_name}.state", [base, updates], "Add"
-                ))
+            prefix_name = f"{base_name}.prefix"
+            prefix_count = self.num_tokens - 1
+            num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
+            folded_heads = prefix_count * num_heads
+
+            prefix_mask = self._onnx_builder.build_op(
+                f"{prefix_name}.mask",
+                [decay_mask, np.array([0], dtype=np.int64),
+                 np.array([prefix_count], dtype=np.int64),
+                 np.array([3], dtype=np.int64)],
+                "Slice",
+            )
+            prefix_mask = self._onnx_builder.build_op(
+                f"{prefix_name}.mask.prefix_major", [prefix_mask],
+                "Transpose", perm=[0, 3, 2, 1],
+            )
+            prefix_mask = self._onnx_builder.build_op(
+                f"{prefix_name}.mask.fold",
+                [prefix_mask, np.array(
+                    [1, 1, folded_heads, self.num_tokens], dtype=np.int64
+                )],
+                "Reshape",
+            )
+            folded_value = self._onnx_builder.build_op(
+                f"{prefix_name}.value.fold", [v_new] * prefix_count,
+                "Concat", axis=2,
+            )
+            folded_value = self._onnx_builder.build_op(
+                f"{prefix_name}.weighted", [folded_value, prefix_mask], "Mul"
+            )
+            folded_value = self._onnx_builder.build_op(
+                f"{prefix_name}.weighted.token_major", [folded_value],
+                "Transpose", perm=[0, 3, 2, 1],
+            )
+            folded_key = self._onnx_builder.build_op(
+                f"{prefix_name}.key.fold", [key] * prefix_count,
+                "Concat", axis=2,
+            )
+            updates = self._onnx_builder.build_op(
+                f"{prefix_name}.updates", [folded_value, folded_key],
+                "Einsum", equation="nchw,nqhc->nqhw",
+            )
+
+            prefix_decay = self._onnx_builder.build_op(
+                f"{prefix_name}.decay",
+                [g_exp, np.array([0], dtype=np.int64),
+                 np.array([prefix_count], dtype=np.int64),
+                 np.array([3], dtype=np.int64)],
+                "Slice",
+            )
+            prefix_decay = self._onnx_builder.build_op(
+                f"{prefix_name}.decay.prefix_major", [prefix_decay],
+                "Transpose", perm=[0, 3, 2, 1],
+            )
+            prefix_decay = self._onnx_builder.build_op(
+                f"{prefix_name}.decay.fold",
+                [prefix_decay, np.array([1, 1, folded_heads, 1], dtype=np.int64)],
+                "Reshape",
+            )
+            folded_state = self._onnx_builder.build_op(
+                f"{prefix_name}.initial_state.fold", [state] * prefix_count,
+                "Concat", axis=2,
+            )
+            base = self._onnx_builder.build_op(
+                f"{prefix_name}.base", [folded_state, prefix_decay], "Mul"
+            )
+            states = self._onnx_builder.build_op(
+                f"{prefix_name}.states", [base, updates], "Add"
+            )
             linear_delta_state_out = self._onnx_builder.build_op(
-                f"{base_name}.prefix_states", [*states, linear_delta_state_out],
+                f"{base_name}.prefix_states", [states, linear_delta_state_out],
                 "Concat", axis=2,
             )
 
