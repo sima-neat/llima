@@ -237,11 +237,29 @@ class VisionLanguageModel(BaseModel):
                 "than the checkpoint block_size"
             )
         if (
-            target_model.cfg.pipeline_cfg.input_token_group_size < block_size
-            or draft_cfg.pipeline_cfg.input_token_group_size < block_size
+            target_model.cfg.pipeline_cfg.input_token_group_size
+            != draft_cfg.pipeline_cfg.input_token_group_size
         ):
             raise ValueError(
+                "DFlash target and draft language group sizes must match"
+            )
+        if target_model.cfg.pipeline_cfg.input_token_group_size < block_size:
+            raise ValueError(
                 "DFlash language group size must be at least the speculative block size"
+            )
+        if (
+            draft_cfg.pipeline_cfg.max_num_tokens
+            < target_model.cfg.pipeline_cfg.max_num_tokens
+        ):
+            raise ValueError(
+                "DFlash draft cache must be at least as large as the target cache"
+            )
+        if (
+            draft_cfg.pipeline_cfg.quantize_embeddings
+            != target_model.cfg.pipeline_cfg.quantize_embeddings
+        ):
+            raise ValueError(
+                "DFlash target and draft embedding quantization modes must match"
             )
         if draft_cfg.lm_cfg.layer_types != ["sliding_attention"] * 5 + ["full_attention"]:
             raise ValueError(

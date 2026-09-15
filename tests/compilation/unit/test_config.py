@@ -440,6 +440,47 @@ def test_dflash_pair_validation_accepts_generic_target_taps():
     )
 
 
+@pytest.mark.parametrize(
+    ("draft_update", "message"),
+    [
+        ({"group_size": 64}, "language group sizes must match"),
+        ({"max_num_tokens": 1024}, "draft cache must be at least as large"),
+        ({"quantize_embeddings": True}, "embedding quantization modes must match"),
+    ],
+)
+def test_dflash_pair_validation_rejects_incompatible_runtime_contract(
+    draft_update, message
+):
+    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
+    target_cfg.lm_cfg.num_hidden_layers = 32
+    target_cfg.config_pipeline(None, None, 2048, 128, 128)
+    draft_cfg = _dflash_draft_config()
+    if "group_size" in draft_update:
+        draft_cfg.config_pipeline(
+            None, None, 2048, draft_update["group_size"], 128
+        )
+    if "max_num_tokens" in draft_update:
+        draft_cfg.pipeline_cfg.max_num_tokens = draft_update["max_num_tokens"]
+    if "quantize_embeddings" in draft_update:
+        draft_cfg.pipeline_cfg.quantize_embeddings = draft_update[
+            "quantize_embeddings"
+        ]
+
+    with pytest.raises(ValueError, match=message):
+        VisionLanguageModel._validate_dflash_pair(
+            SimpleNamespace(cfg=target_cfg),
+            draft_cfg,
+            {
+                "model_type": "qwen3",
+                "num_target_layers": 32,
+                "dflash_config": {"block_size": 16},
+            },
+            8,
+            [1, 5, 9, 13, 17, 21, 25, 29],
+            248077,
+        )
+
+
 def test_linear_attention_validates_group_size():
     for group_size in (1, 4, 8, 16, 32, 128):
         config = _load_reference_config("qwen3.5_vlm_config.json")

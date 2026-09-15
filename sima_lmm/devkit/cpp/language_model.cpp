@@ -1033,7 +1033,9 @@ uint32_t LanguageModel::run_model_once(
         const uint16_t valid_tokens = next_token_idx - token_idx;
         std::vector<Eigen::bfloat16> valid_mask(num_tokens, Eigen::bfloat16(0.0f));
         std::fill_n(valid_mask.begin(), valid_tokens, Eigen::bfloat16(1.0f));
-        get_buffer("linear_valid_mask").upload(valid_mask.data());
+        get_buffer("linear_valid_mask").upload_raw(
+            valid_mask.data(), 0, valid_mask.size() * sizeof(Eigen::bfloat16)
+        );
     }
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
@@ -1058,6 +1060,13 @@ uint32_t LanguageModel::run_model_once(
             const auto cache_key = _bind_attn_models(
                 num_tokens, token_idx, layer_idx, normal_scale_buf, normal_input_row
             );
+            if (
+                _cfg.lm_cfg.is_dflash()
+                && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+                && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
+            ) {
+                _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx, false);
+            }
             _pre_model_map.at(model_key).add_to_queue(&ifm_map);
 
             if (
@@ -2308,7 +2317,10 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         ++cache_ifm_idx;
     } else if (use_single_future_token_mask) {
         auto& mask = get_buffer("future_token_mask");
-        if (_cfg.lm_cfg.is_spec_decode()) {
+        if (_cfg.lm_cfg.is_dflash()) {
+            // DFlash uploads the compact [B, aligned_context] mask layout.
+            cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, 0});
+        } else if (_cfg.lm_cfg.is_spec_decode()) {
             cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, cache_token_idx_begin});
         } else {
             cache_model._bind_ifm(

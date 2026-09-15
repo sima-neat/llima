@@ -605,7 +605,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
         beta: NodeOrHandle,
         g: NodeOrHandle,
         initial_state: NodeOrHandle,
-        final_state: NodeOrHandle,
     ) -> NodeOrHandle:
         """Return the recurrent state after every token, packed on the head axis."""
         state = initial_state
@@ -635,8 +634,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
             state = builder.create_add_node(state, state_add)
             states.append(state)
 
-        # Preserve the existing grouped result exactly when the full block is accepted.
-        states[-1] = final_state
         return builder.create_concat_node(states, 1)
 
     def _build_sima_group_delta(
@@ -1041,7 +1038,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
                     beta,
                     g,
                     mla_delta_state,
-                    linear_delta_state_out,
                 )
 
         z_heads = builder.create_slice_concat_node(
@@ -1545,7 +1541,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
         beta: OnnxNode,
         g: OnnxNode,
         initial_state: OnnxNode,
-        final_state: OnnxNode,
     ) -> OnnxNode:
         """Return the recurrent state after every token, packed on the head axis."""
         state = initial_state
@@ -1601,7 +1596,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
             )
             states.append(state)
 
-        states[-1] = final_state
         packed = self._onnx_builder.build_op(
             f"{base_name}.packed", states, "Concat", axis=2
         )
@@ -2039,7 +2033,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
                     beta,
                     g,
                     state_flat,
-                    linear_delta_state_out,
                 )
 
         z_heads = self._onnx_builder.build_split_expand_concat(

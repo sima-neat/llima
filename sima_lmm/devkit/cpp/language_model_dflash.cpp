@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <cstring>
+#include <exception>
+#include <functional>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -17,6 +20,16 @@ namespace {
 bool is_attention(std::string_view layer_type) {
   return layer_type == "full_attention" || layer_type == "sliding_attention";
 }
+
+class ScopeExit {
+public:
+  explicit ScopeExit(std::function<void()> callback)
+      : _callback(std::move(callback)) {}
+  ~ScopeExit() noexcept { _callback(); }
+
+private:
+  std::function<void()> _callback;
+};
 
 } // namespace
 
@@ -65,12 +78,63 @@ void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
   }
 }
 
+void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
+                                                  uint16_t token_idx,
+                                                  uint8_t layer_idx,
+                                                  bool bidirectional) {
+  const auto &layer_type = _cfg.lm_cfg.layer_types.at(layer_idx);
+  const uint16_t cache_begin =
+      layer_type == "sliding_attention"
+          ? std::max(0, token_idx + num_tokens -
+                            static_cast<int>(
+                                _cfg.lm_cfg.attn_cfg.sliding_window.value()))
+          : 0;
+  const auto cache_key = _get_cache_model_key(num_tokens, token_idx, layer_idx);
+  const uint16_t aligned_context = std::get<2>(cache_key) + 1;
+  const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
+  std::vector<Eigen::bfloat16> mask(
+      static_cast<size_t>(num_tokens) * aligned_context, neg_inf);
+
+  for (uint16_t query = 0; query < num_tokens; ++query) {
+    const uint16_t query_position = token_idx + query;
+    const uint16_t end = bidirectional
+                             ? token_idx + num_tokens
+                             : static_cast<uint16_t>(query_position + 1);
+    const uint16_t begin =
+        layer_type == "sliding_attention"
+            ? std::max<uint16_t>(
+                  cache_begin,
+                  end - std::min<uint16_t>(
+                            end, _cfg.lm_cfg.attn_cfg.sliding_window.value()))
+            : 0;
+    std::fill(mask.begin() + static_cast<size_t>(query) * aligned_context +
+                  begin - cache_begin,
+              mask.begin() + static_cast<size_t>(query) * aligned_context +
+                  end - cache_begin,
+              Eigen::bfloat16{0.0f});
+  }
+  get_buffer("future_token_mask")
+      .upload_raw(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
+}
+
 std::optional<std::vector<uint32_t>>
 LanguageModel::run_model_speculative_decoding(
     LanguageModel &draft_lm, std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult *performance_result) {
+  return run_model_speculative_decoding(draft_lm, input_token_ids,
+                                        override_max_num_tokens, timer_ttft,
+                                        performance_result, 0);
+}
+
+std::optional<std::vector<uint32_t>>
+LanguageModel::run_model_speculative_decoding(
+    LanguageModel &draft_lm, std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens,
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult *performance_result,
+    uint16_t stable_prefix_token_count) {
   if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value() ||
       !draft_lm._cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
     throw std::invalid_argument(
@@ -98,9 +162,41 @@ LanguageModel::run_model_speculative_decoding(
       throw std::invalid_argument(
           "DFlash target and draft block configuration does not match");
     }
+    if (_cfg.pipeline_cfg.input_token_group_size !=
+        draft_lm._cfg.pipeline_cfg.input_token_group_size) {
+      throw std::invalid_argument(
+          "DFlash target and draft language group sizes do not match");
+    }
+    if (_cfg.pipeline_cfg.input_token_group_size <
+        target.speculative_budget) {
+      throw std::invalid_argument(
+          "DFlash language group size is smaller than the block size");
+    }
+    if (draft_lm._cfg.pipeline_cfg.max_num_tokens <
+        _cfg.pipeline_cfg.max_num_tokens) {
+      throw std::invalid_argument(
+          "DFlash draft cache is smaller than the target cache");
+    }
+    if (_cfg.pipeline_cfg.quantize_embeddings !=
+        draft_lm._cfg.pipeline_cfg.quantize_embeddings) {
+      throw std::invalid_argument(
+          "DFlash target and draft embedding quantization modes do not match");
+    }
+    if (_cfg.pipeline_cfg.future_token_mask_size <= 1 ||
+        draft_lm._cfg.pipeline_cfg.future_token_mask_size <= 1) {
+      throw std::invalid_argument(
+          "DFlash models require a multi-token future-mask configuration");
+    }
+    if (target.mask_token_id != draft.mask_token_id ||
+        draft.mask_token_id < 0 ||
+        static_cast<uint32_t>(draft.mask_token_id) >=
+            _cfg.lm_cfg.token_cfg.vocab_size) {
+      throw std::invalid_argument(
+          "DFlash target and draft mask token IDs do not match");
+    }
     return _run_model_dflash_speculative_decoding(
         draft_lm, input_token_ids, override_max_num_tokens, timer_ttft,
-        performance_result);
+        performance_result, stable_prefix_token_count);
   }
   if (target.method == "eagle3") {
     return _run_model_eagle3_speculative_decoding(
@@ -196,45 +292,11 @@ std::vector<uint32_t> LanguageModel::_run_dflash_draft(LanguageModel &target_lm,
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const uint16_t cache_begin =
-        layer_type == "sliding_attention"
-            ? std::max(0, token_idx + num_tokens -
-                              static_cast<int>(
-                                  _cfg.lm_cfg.attn_cfg.sliding_window.value()))
-            : 0;
-    const uint16_t visible_end = token_idx + num_tokens;
-    const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
-    std::vector<Eigen::bfloat16> mask(static_cast<size_t>(num_tokens) *
-                                          _cfg.pipeline_cfg.max_num_tokens,
-                                      neg_inf);
-    for (uint16_t query = 0; query < num_tokens; ++query) {
-      const uint16_t query_position = token_idx + query;
-      const uint16_t end = layer_type == "full_attention"
-                               ? visible_end
-                               : static_cast<uint16_t>(query_position + 1);
-      const uint16_t begin =
-          layer_type == "sliding_attention"
-              ? std::max<uint16_t>(
-                    cache_begin,
-                    static_cast<uint16_t>(
-                        end -
-                        std::min<uint16_t>(
-                            end, _cfg.lm_cfg.attn_cfg.sliding_window.value())))
-              : 0;
-      std::fill(
-          mask.begin() +
-              static_cast<size_t>(query) * _cfg.pipeline_cfg.max_num_tokens +
-              begin,
-          mask.begin() +
-              static_cast<size_t>(query) * _cfg.pipeline_cfg.max_num_tokens +
-              end,
-          Eigen::bfloat16{0.0f});
-    }
-    get_buffer("future_token_mask").upload(mask.data());
-
     const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
     const auto cache_key =
         _bind_attn_models(num_tokens, token_idx, layer_idx, input_scale);
+    _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx,
+                                  layer_type == "full_attention");
     std::map<uint8_t, MLABufferSlice> pre_inputs;
     if (layer_idx == 0) {
       pre_inputs.emplace(
@@ -315,18 +377,9 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
   _stage_embedding_rows(*this, input_ids, input, input_scale);
   if (_has_linear_attention_layers()) {
     std::vector<Eigen::bfloat16> valid(num_tokens, Eigen::bfloat16{1.0f});
-    get_buffer("linear_valid_mask").upload(valid.data());
+    get_buffer("linear_valid_mask")
+        .upload_raw(valid.data(), 0, valid.size() * sizeof(Eigen::bfloat16));
   }
-  const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
-  std::vector<Eigen::bfloat16> causal_mask(static_cast<size_t>(num_tokens) *
-                                               _cfg.pipeline_cfg.max_num_tokens,
-                                           neg_inf);
-  for (uint16_t query = 0; query < num_tokens; ++query) {
-    std::fill_n(causal_mask.begin() + static_cast<size_t>(query) *
-                                          _cfg.pipeline_cfg.max_num_tokens,
-                token_idx + query + 1, Eigen::bfloat16{0.0f});
-  }
-  get_buffer("future_token_mask").upload(causal_mask.data());
 
   const auto &capture_layers =
       _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids;
@@ -344,6 +397,7 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
     if (is_attention(layer_type)) {
       const auto cache_key =
           _bind_attn_models(num_tokens, token_idx, layer_idx, input_scale);
+      _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx, false);
       _pre_model_map.at(model_key).add_to_queue(&inputs);
       _cache_model_map.at(cache_key).add_to_queue();
       _post_model_map.at(model_key).add_to_queue(layer_idx == 0 ? &inputs
@@ -424,9 +478,29 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     LanguageModel &draft_lm, std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult *performance_result) {
+    GenerationPerformanceResult *performance_result,
+    uint16_t stable_prefix_token_count) {
   _is_running = true;
   draft_lm._is_running = true;
+  const int uncaught_exceptions = std::uncaught_exceptions();
+  ScopeExit cleanup([&]() {
+    const bool failed = std::uncaught_exceptions() > uncaught_exceptions;
+    if (failed) {
+      _cached_token_ids.clear();
+      draft_lm._cached_token_ids.clear();
+    }
+    _rolling_checkpoint_slot = 0;
+    _writable_checkpoint_slots = 0;
+    _capture_state_checkpoints = false;
+    _is_running = false;
+    draft_lm._is_running = false;
+    if (failed) {
+      try {
+        _text_streamer.wait_streaming();
+      } catch (...) {
+      }
+    }
+  });
   if (!timer_ttft.has_value()) {
     timer_ttft = ChronoTimer{true};
   }
@@ -434,67 +508,56 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     *performance_result = GenerationPerformanceResult{};
     performance_result->accepted_draft_tokens = 0;
   }
-  const uint16_t max_length = override_max_num_tokens.value_or(_max_num_tokens);
+  const uint16_t max_length =
+      override_max_num_tokens.value_or(_max_num_tokens);
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
   if (input_token_ids.empty() || input_token_ids.size() >= max_length ||
-      input_token_ids.size() + block_size > _cfg.pipeline_cfg.max_num_tokens) {
-    _is_running = false;
-    draft_lm._is_running = false;
+      input_token_ids.size() + block_size >
+          _cfg.pipeline_cfg.max_num_tokens) {
     return std::nullopt;
   }
 
-  auto clear_state = [](LanguageModel &model) {
-    for (uint8_t layer = 0; layer < model._cfg.lm_cfg.num_hidden_layers;
-         ++layer) {
-      const auto &type = model._cfg.lm_cfg.layer_types[layer];
-      if (is_attention(type) && !model._cfg.lm_cfg.is_kv_shared_layer(layer)) {
-        model.get_buffer(fmt::format("cache_key_l{}", layer)).clear();
-        model.get_buffer(fmt::format("cache_val_l{}", layer)).clear();
-        if (model._cfg.pipeline_cfg.quantize_kv_cache) {
-          model.get_buffer(fmt::format("cache_key_scale_l{}", layer)).clear();
-          model.get_buffer(fmt::format("cache_val_scale_l{}", layer)).clear();
-        }
-      } else if (type == "linear_attention") {
-        model.get_buffer(fmt::format("linear_conv_cache_history_l{}", layer))
-            .clear();
-        model.get_buffer(fmt::format("linear_delta_state_history_l{}", layer))
-            .clear();
-        model
-            .get_buffer(
-                fmt::format("linear_delta_state_history_alt_l{}", layer))
-            .clear();
-      }
+  if (!_cached_states.empty()) {
+    _capture_state_checkpoints = true;
+    _rolling_checkpoint_slot = 0;
+    _writable_checkpoint_slots = 0;
+    const auto system_boundary = std::upper_bound(
+        _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(),
+        std::min<size_t>(stable_prefix_token_count, input_token_ids.size()));
+    _system_checkpoint_position =
+        system_boundary == _checkpoint_boundaries.begin()
+            ? 0
+            : *std::prev(system_boundary);
+    if (_system_checkpoint_position &&
+        _state_checkpoint_positions[0] != _system_checkpoint_position) {
+      _state_checkpoint_positions[0] = 0;
     }
-    model._kv_cache_len = 0;
-    model._cached_token_ids.clear();
-  };
-  clear_state(*this);
-  clear_state(draft_lm);
+  }
+  uint16_t cached_tokens = _set_input_text_embeds(input_token_ids);
+  uint16_t draft_cached_tokens = 0;
+  while (draft_cached_tokens < input_token_ids.size() &&
+         draft_cached_tokens < draft_lm._cached_token_ids.size() &&
+         input_token_ids[draft_cached_tokens] ==
+             draft_lm._cached_token_ids[draft_cached_tokens]) {
+    ++draft_cached_tokens;
+  }
+  cached_tokens = _prepare_state_checkpoints_for_prefill(
+      std::min(cached_tokens, draft_cached_tokens));
+  _kv_cache_len = cached_tokens;
+  draft_lm._kv_cache_len = cached_tokens;
 
-  _set_input_text_embeds(input_token_ids);
   const uint16_t prompt_len = input_token_ids.size();
-  const uint16_t prefill_width = _use_group_token_models
-                                     ? _cfg.pipeline_cfg.input_token_group_size
-                                     : block_size;
-  uint32_t anchor = 0;
-  for (uint16_t offset = 0; offset < prompt_len; offset += prefill_width) {
+  const uint16_t prefill_width =
+      _use_group_token_models ? _cfg.pipeline_cfg.input_token_group_size
+                              : block_size;
+  uint32_t anchor =
+      cached_tokens == prompt_len ? _cached_first_generated_token : 0;
+  for (uint16_t offset = cached_tokens; offset < prompt_len;
+       offset += prefill_width) {
     const uint16_t valid =
         std::min<uint16_t>(prefill_width, prompt_len - offset);
-    if (prefill_width == block_size) {
-      const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
-      std::vector<Eigen::bfloat16> mask(static_cast<size_t>(block_size) *
-                                            _cfg.pipeline_cfg.max_num_tokens,
-                                        neg_inf);
-      for (uint16_t query = 0; query < block_size; ++query) {
-        std::fill_n(mask.begin() + static_cast<size_t>(query) *
-                                       _cfg.pipeline_cfg.max_num_tokens,
-                    offset + query + 1, Eigen::bfloat16{0.0f});
-      }
-      get_buffer("future_token_mask").upload(mask.data());
-    }
     anchor = run_model_once(prefill_width, offset, prompt_len, 0);
     if (!_is_running.load(std::memory_order_relaxed)) {
-      draft_lm._is_running = false;
       _notify_interrupt();
       _text_streamer.wait_streaming();
       return std::nullopt;
@@ -510,6 +573,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
   draft_lm._cached_token_ids = _cached_token_ids;
   _cached_first_generated_token = anchor;
+  draft_lm._cached_first_generated_token = anchor;
 
   std::vector<uint32_t> output{anchor};
   const double first_duration = timer_ttft->stop();
@@ -524,6 +588,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   while (!stopped && _is_running.load(std::memory_order_relaxed) &&
          output.size() + prompt_len < max_length) {
     if (_kv_cache_len + block_size > _cfg.pipeline_cfg.max_num_tokens) {
+      // A fixed-width DFlash package cannot safely run a partial final block.
       cache_full = true;
       break;
     }
@@ -532,47 +597,62 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     auto proposals = draft_lm._run_dflash_draft(*this, anchor, verify_start);
     std::vector<uint32_t> verify_input(block_size, anchor);
     std::copy(proposals.begin(), proposals.end(), verify_input.begin() + 1);
-    auto target_tokens = _run_dflash_target_verify(verify_input, verify_start);
+    auto target_tokens =
+        _run_dflash_target_verify(verify_input, verify_start);
 
     size_t accepted = 0;
     while (accepted < proposals.size() &&
            proposals[accepted] == target_tokens[accepted]) {
       ++accepted;
     }
-    const uint16_t committed_rows = static_cast<uint16_t>(accepted + 1);
+    std::vector<uint32_t> emitted(proposals.begin(),
+                                  proposals.begin() + accepted);
+    emitted.push_back(target_tokens[accepted]);
+    size_t produced = std::min<size_t>(
+        emitted.size(), max_length - prompt_len - output.size());
+    for (size_t index = 0; index < produced; ++index) {
+      if (_stop_token_ids.contains(emitted[index])) {
+        produced = index + 1;
+        stopped = true;
+        break;
+      }
+    }
+    const uint16_t committed_rows = static_cast<uint16_t>(produced);
     _commit_dflash_linear_state(committed_rows);
     _kv_cache_len = verify_start + committed_rows;
     draft_lm._kv_cache_len = verify_start;
     draft_lm._append_dflash_context(*this, block_size, verify_start,
                                     committed_rows);
+    if (_capture_state_checkpoints &&
+        std::binary_search(_checkpoint_boundaries.begin(),
+                           _checkpoint_boundaries.end(), _kv_cache_len)) {
+      _save_state_checkpoint(_kv_cache_len, block_size, committed_rows,
+                             false);
+    }
 
-    std::vector<uint32_t> emitted(proposals.begin(),
-                                  proposals.begin() + accepted);
-    emitted.push_back(target_tokens[accepted]);
     const double duration = iteration_timer.stop();
-    for (const auto token : emitted) {
-      if (prompt_len + output.size() >= max_length) {
-        cache_full = true;
-        break;
-      }
+    for (size_t index = 0; index < produced; ++index) {
+      const auto token = emitted[index];
       output.push_back(token);
-      _cached_token_ids.push_back(token);
-      draft_lm._cached_token_ids.push_back(token);
-      _notify_new_token(token, duration / emitted.size());
+      _notify_new_token(token, duration / produced);
       if (performance_result != nullptr) {
-        performance_result->token_durations.push_back(duration /
-                                                      emitted.size());
+        performance_result->token_durations.push_back(duration / produced);
         ++performance_result->generated_tokens;
       }
-      if (_stop_token_ids.contains(token)) {
-        stopped = true;
-        break;
-      }
     }
+    _cached_token_ids.insert(_cached_token_ids.end(), verify_input.begin(),
+                             verify_input.begin() + committed_rows);
+    draft_lm._cached_token_ids = _cached_token_ids;
+    _cached_first_generated_token = emitted[produced - 1];
+    draft_lm._cached_first_generated_token = _cached_first_generated_token;
     if (performance_result != nullptr) {
-      performance_result->accepted_draft_tokens.value() += accepted;
+      performance_result->accepted_draft_tokens.value() +=
+          std::min(accepted, produced);
     }
-    anchor = emitted.back();
+    anchor = emitted[produced - 1];
+    if (produced < emitted.size()) {
+      cache_full = true;
+    }
   }
 
   if (stopped) {
@@ -584,8 +664,6 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   }
   _text_streamer.wait_streaming();
   const bool completed = _is_running.load(std::memory_order_relaxed);
-  _is_running = false;
-  draft_lm._is_running = false;
   return completed ? std::optional<std::vector<uint32_t>>(std::move(output))
                    : std::nullopt;
 }

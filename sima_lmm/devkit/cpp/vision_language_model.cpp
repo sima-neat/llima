@@ -120,7 +120,9 @@ std::optional<std::string> VisionLanguageModel::run_model(
             *_draft_vlm_ptr->_language_model_ptr,
             preprocessed_data.input_token_ids,
             max_num_tokens,
-            timer_ttft
+            timer_ttft,
+            nullptr,
+            preprocessed_data.stable_prefix_token_count
         );
     } else {
         output_token_ids = _language_model_ptr->run_model(

@@ -96,6 +96,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr
         );
+        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            uint16_t stable_prefix_token_count
+        );
         void stop_model() { _is_running = false; }
 
         void set_reloc(const std::string& reloc_name);
@@ -266,6 +274,10 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t token_idx, uint16_t valid_tokens
         );
         void _commit_dflash_linear_state(uint16_t prefix_tokens);
+        void _upload_dflash_attention_mask(
+            uint16_t num_tokens, uint16_t token_idx,
+            uint8_t layer_idx, bool bidirectional
+        );
         std::vector<uint32_t> _run_dflash_target_verify(
             std::span<const uint32_t> input_ids, uint16_t token_idx
         );
@@ -277,7 +289,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens,
             std::optional<ChronoTimer> timer_ttft,
-            GenerationPerformanceResult* performance_result
+            GenerationPerformanceResult* performance_result,
+            uint16_t stable_prefix_token_count
         );
         std::optional<std::vector<uint32_t>> _run_model_eagle3_speculative_decoding(
             LanguageModel& draft_lm,
