@@ -3,6 +3,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from sima_lmm.config.vlm_config import (
@@ -275,6 +276,44 @@ def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_p
     assert model._get_part_model("dflash_context", 128, layer_idx=0).num_tokens == 128
 
 
+def test_dflash_draft_deduplicates_equal_group_and_block_widths():
+    config = _dflash_draft_config()
+    config.config_pipeline(None, None, 2048, 8, 8)
+
+    assert _layer_indices(config, "group_dflash_context") == []
+    assert _layer_indices(config, "single_dflash_context") == list(range(6))
+    assert _layer_indices(config, "group_draft_fc") == []
+    assert _layer_indices(config, "single_draft_fc") == [0]
+
+
+def test_dflash_final_post_uses_paired_target_head(tmp_path):
+    config = _dflash_draft_config()
+    quantized_head = (
+        np.array([[0.5, 0.25]], dtype=np.float32),
+        np.array([[2, 4, 8, 12]], dtype=np.int8),
+        2,
+    )
+    target_weights = SimpleNamespace(
+        param_exists=lambda name: name == "lm_head.weight",
+        load_np_param=lambda _name: quantized_head,
+    )
+    model = LanguageModel(
+        config,
+        "draft",
+        onnx_path=tmp_path / "onnx",
+        sima_path=tmp_path / "sima",
+        hf_model=SimpleNamespace(),
+        dflash_target_hf_model=target_weights,
+    )
+
+    post = model._get_part_model("post", 8, layer_idx=5)
+    assert post._dflash_target_output_embed_name() == "lm_head.weight"
+    np.testing.assert_array_equal(
+        post._get_dflash_target_param("lm_head.weight", dequantize=True),
+        np.array([[1, 2, 2, 3]], dtype=np.float32),
+    )
+
+
 def test_configuration_identifies_speculative_draft_model(tmp_path):
     configuration_file = tmp_path / "precision.py"
     configuration_file.write_text(
@@ -362,6 +401,7 @@ def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(
 def test_dflash_pair_validation_accepts_published_contract():
     target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
     target_cfg.lm_cfg.num_hidden_layers = 32
+    target_cfg.config_pipeline(None, None, 2048, 128, 128)
     target = SimpleNamespace(cfg=target_cfg)
     draft_cfg = _dflash_draft_config()
     draft_hf_cfg = {
@@ -376,6 +416,26 @@ def test_dflash_pair_validation_accepts_published_contract():
         draft_hf_cfg,
         8,
         [1, 5, 9, 13, 17, 21, 25, 29],
+        248077,
+    )
+
+
+def test_dflash_pair_validation_accepts_generic_target_taps():
+    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
+    target_cfg.lm_cfg.num_hidden_layers = 32
+    target_cfg.config_pipeline(None, None, 2048, 128, 128)
+    draft_cfg = _dflash_draft_config()
+
+    VisionLanguageModel._validate_dflash_pair(
+        SimpleNamespace(cfg=target_cfg),
+        draft_cfg,
+        {
+            "model_type": "qwen3",
+            "num_target_layers": 32,
+            "dflash_config": {"block_size": 16},
+        },
+        8,
+        [0, 7, 15, 23],
         248077,
     )
 

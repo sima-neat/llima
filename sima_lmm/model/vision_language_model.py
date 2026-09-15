@@ -165,6 +165,12 @@ class VisionLanguageModel(BaseModel):
                 vlm_cfg.lm_cfg.set_speculative_decoding_config(
                     dict(**spec_cfg, is_draft=True)
                 )
+                for pipeline_cfg in (
+                    target_model.cfg.pipeline_cfg,
+                    vlm_cfg.pipeline_cfg,
+                ):
+                    if pipeline_cfg.future_token_mask_size == 1:
+                        pipeline_cfg.set_future_token_mask_size(budget)
             else:
                 if is_dflash_checkpoint:
                     raise ValueError("DFlashDraftModel cannot be compiled as an EAGLE3 draft")
@@ -186,6 +192,8 @@ class VisionLanguageModel(BaseModel):
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        if target_model is not None and method == "dflash":
+            model.language_model.dflash_target_hf_model = target_model.hf_model
         return model
 
     @staticmethod
@@ -208,11 +216,18 @@ class VisionLanguageModel(BaseModel):
             raise ValueError("DFlash target and draft vocabulary sizes must match")
         if draft_hf_cfg.get("num_target_layers") != target_cfg.num_hidden_layers:
             raise ValueError("DFlash draft num_target_layers does not match the target")
-        if target_layer_ids != [1, 5, 9, 13, 17, 21, 25, 29] or any(
-            not isinstance(layer, int) or not 0 <= layer < target_cfg.num_hidden_layers
-            for layer in target_layer_ids
+        if (
+            not target_layer_ids
+            or not all(isinstance(layer, int) for layer in target_layer_ids)
+            or target_layer_ids != sorted(set(target_layer_ids))
+            or not all(
+                0 <= layer < target_cfg.num_hidden_layers - 1
+                for layer in target_layer_ids
+            )
         ):
-            raise ValueError("Unsupported DFlash target_layer_ids")
+            raise ValueError(
+                "DFlash target_layer_ids must be non-empty, unique, sorted, and in range"
+            )
         if not 0 <= mask_token_id < target_cfg.token_cfg.vocab_size:
             raise ValueError("DFlash mask_token_id is missing or out of range")
         checkpoint_block_size = draft_hf_cfg.get("dflash_config", {}).get("block_size", 0)
@@ -220,6 +235,13 @@ class VisionLanguageModel(BaseModel):
             raise ValueError(
                 "DFlash speculative block size must be 4, 8, or 16 and no larger "
                 "than the checkpoint block_size"
+            )
+        if (
+            target_model.cfg.pipeline_cfg.input_token_group_size < block_size
+            or draft_cfg.pipeline_cfg.input_token_group_size < block_size
+        ):
+            raise ValueError(
+                "DFlash language group size must be at least the speculative block size"
             )
         if draft_cfg.lm_cfg.layer_types != ["sliding_attention"] * 5 + ["full_attention"]:
             raise ValueError(

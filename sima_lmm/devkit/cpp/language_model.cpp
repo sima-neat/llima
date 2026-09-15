@@ -90,7 +90,11 @@ LanguageModel::LanguageModel(
             "max_num_tokens must be a positive multiple of 1024"
         );
     }
-    if (_cfg.lm_cfg.is_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+    if (
+        _cfg.lm_cfg.is_spec_decode()
+        && !_cfg.lm_cfg.is_dflash()
+        && _cfg.lm_cfg.attn_cfg.swa_enable
+    ) {
         throw std::runtime_error(
             "EAGLE3 speculative decoding does not support sliding-window attention"
         );
@@ -222,7 +226,8 @@ LanguageModel::LanguageModel(
     // EAGLE3: build the constant tree_mask_init (eye(topk)) once. Only the
     // draft uses it (consumed in topk_generate's depth loop seed and concat).
     if (_cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft) {
+        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+        && !_cfg.lm_cfg.is_dflash()) {
         const int topk = _cfg.lm_cfg.speculative_decoding_cfg.value().speculative_budget;
         _eagle3_tree_mask_init.data = std::vector<std::vector<std::vector<std::vector<float>>>>(
             1, std::vector<std::vector<std::vector<float>>>(
@@ -1237,32 +1242,6 @@ uint32_t LanguageModel::run_model_once(
             }
             _post_model_map.at(model_key).add_to_queue(&ifm_map);
 
-            // Spec-decoding capture: download n128_buffer1 (this layer's hidden
-            // states) for layers 2, N/2, N-3 so the orchestrator can feed them
-            // into FC fusion.
-            if (
-                _cfg.lm_cfg.is_spec_decode()
-                && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
-            ) {
-                const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
-                const std::vector<uint8_t> capture_layers = {
-                    2,
-                    static_cast<uint8_t>(num_layers / 2),
-                    static_cast<uint8_t>(num_layers - 3),
-                };
-                auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
-                if (it != capture_layers.end()) {
-                    MLAModelWithBuffer::run_queue();
-                    if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
-                        _eagle3_intermediate_hidden_states.resize(capture_layers.size());
-                    }
-                    size_t idx = std::distance(capture_layers.begin(), it);
-                    auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-                    const size_t num_elems = static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size;
-                    _eagle3_intermediate_hidden_states[idx].resize(num_elems);
-                    buf.download(_eagle3_intermediate_hidden_states[idx].data());
-                }
-            }
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
             if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
@@ -1307,16 +1286,56 @@ uint32_t LanguageModel::run_model_once(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
             );
         }
+
+        if (
+            _cfg.lm_cfg.is_spec_decode()
+            && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+            && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
+        ) {
+            const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
+            const auto capture_layers = _cfg.lm_cfg.is_dflash()
+                ? _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids
+                : std::vector<uint8_t>{
+                    2,
+                    static_cast<uint8_t>(num_layers / 2),
+                    static_cast<uint8_t>(num_layers - 3),
+                };
+            const auto it = std::find(
+                capture_layers.begin(), capture_layers.end(), layer_idx
+            );
+            if (it != capture_layers.end()) {
+                MLAModelWithBuffer::run_queue();
+                if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
+                    _eagle3_intermediate_hidden_states.resize(capture_layers.size());
+                }
+                const size_t capture_idx = std::distance(capture_layers.begin(), it);
+                auto& buffer = get_buffer(fmt::format("n{}_buffer1", num_tokens));
+                auto& capture = _eagle3_intermediate_hidden_states[capture_idx];
+                capture.resize(static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size);
+                buffer.download(capture.data());
+            }
+        }
     }
 
     // Run all the queued models.
     MLAModelWithBuffer::run_queue();
+    const bool has_dflash_prefix_states = (
+        _cfg.lm_cfg.is_dflash()
+        && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+        && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
+    );
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+        if (
+            _cfg.lm_cfg.layer_types[layer_idx] == "linear_attention"
+            && !has_dflash_prefix_states
+        ) {
             get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
                 get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
             );
         }
+    }
+    if (has_dflash_prefix_states) {
+        _commit_dflash_linear_state(next_token_idx - token_idx);
     }
 
     // If this run landed exactly on a checkpoint boundary, save the tail.
@@ -1472,7 +1491,7 @@ void LanguageModel::_initialize() {
             );
             get_buffer("embedding_scales").load_file(scale_file_name);
         }
-    } else {
+    } else if (!_cfg.lm_cfg.is_dflash()) {
         // Load d2t mapping (int64 in npy, narrows to int32 — values fit easily).
         auto d2t_file_name = _devkit_dir / "d2t.npy";
         auto d2t_tensor = cnpy::npy_load(d2t_file_name);
@@ -1783,10 +1802,16 @@ void LanguageModel::_define_buffers() {
             "local", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention")
         );
 
-    if (_use_group_token_models && _has_linear_attention_layers()) {
+    if (_has_linear_attention_layers()) {
         define_buffer(
             "linear_valid_mask",
-            {_cfg.pipeline_cfg.input_token_group_size, 1},
+            {
+                std::max(
+                    _cfg.pipeline_cfg.input_token_group_size,
+                    _cfg.lm_cfg.get_single_num_tokens()
+                ),
+                1
+            },
             "bfloat16",
             true
         );
@@ -1820,6 +1845,20 @@ void LanguageModel::_define_buffers() {
                 fmt::format("linear_delta_state_history_alt_l{}", i),
                 {1, linear_cfg.get_recurrent_state_size()}
             );
+            if (
+                _cfg.lm_cfg.is_dflash()
+                && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+            ) {
+                const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
+                define_buffer(
+                    fmt::format("linear_conv_prefix_states_l{}", i),
+                    {block_size + linear_cfg.conv_kernel_dim - 2, linear_cfg.get_conv_dim()}
+                );
+                define_buffer(
+                    fmt::format("linear_delta_prefix_states_l{}", i),
+                    {block_size, linear_cfg.get_recurrent_state_size()}
+                );
+            }
         } else {
             if (_cfg.pipeline_cfg.use_strided_kv_cache) {
                 cache_shape = {
@@ -1950,20 +1989,32 @@ void LanguageModel::_define_buffers() {
             );
         }
 
-        // Draft-only buffers: second pre input, draft hidden states output, FC fusion buffers.
+        // Draft-only buffers: EAGLE fusion input, final hidden states, and FC buffers.
         if (is_draft) {
-            define_buffer(
-                fmt::format("n{}_buffer1a", num_tokens),
-                {num_tokens, _cfg.lm_cfg.hidden_size}
-            );
-            define_buffer(
-                fmt::format("n{}_buffer5", num_tokens),
-                {num_tokens, _cfg.lm_cfg.hidden_size}
-            );
-            define_buffer(
-                fmt::format("fc_n{}_input", num_tokens),
-                {num_tokens, _cfg.lm_cfg.hidden_size * 3}
-            );
+            if (!_cfg.lm_cfg.is_dflash()) {
+                define_buffer(
+                    fmt::format("n{}_buffer1a", num_tokens),
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                );
+                define_buffer(
+                    fmt::format("n{}_buffer5", num_tokens),
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                );
+            }
+            const size_t fc_input_count = _cfg.lm_cfg.is_dflash()
+                ? _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size()
+                : 1;
+            for (size_t index = 0; index < fc_input_count; ++index) {
+                define_buffer(
+                    _cfg.lm_cfg.is_dflash()
+                        ? fmt::format("fc_n{}_input{}", num_tokens, index)
+                        : fmt::format("fc_n{}_input", num_tokens),
+                    {
+                        num_tokens,
+                        _cfg.lm_cfg.hidden_size * (_cfg.lm_cfg.is_dflash() ? 1 : 3)
+                    }
+                );
+            }
             define_buffer(
                 fmt::format("fc_n{}_output", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
@@ -2042,27 +2093,36 @@ void LanguageModel::_define_buffers() {
             if (!is_draft && num_tokens != _cfg.lm_cfg.get_single_num_tokens()) {
                 continue;
             }
-            if (_cfg.lm_cfg.lm_head_num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
+            if (
+                _cfg.lm_cfg.lm_head_num_splits == 1
+                && !_cfg.pipeline_cfg.return_logits
+                && !(is_draft && _cfg.lm_cfg.is_dflash())
+            ) {
                 define_buffer(
                     fmt::format("n{}_buffer4", num_tokens), {num_tokens, 1}, "int32"
                 );
             } else if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+                const uint16_t output_rows = is_draft && _cfg.lm_cfg.is_dflash()
+                    ? num_tokens - 1 : num_tokens;
                 define_buffer(
                     fmt::format("n{}_buffer4", num_tokens),
-                    {num_tokens, lm_head_output_size}
+                    {output_rows, lm_head_output_size}
                 );
             } else {
                 uint32_t i = 0;
                 for(uint32_t split_begin = 0; split_begin < lm_head_output_size; split_begin += split_dim, ++i) {
                     uint32_t split_size = std::min(lm_head_output_size, split_begin + split_dim) - split_begin;
+                    const uint16_t output_rows = is_draft && _cfg.lm_cfg.is_dflash()
+                        ? num_tokens - 1 : num_tokens;
                     define_buffer(
                         fmt::format("n{}_lm_split{}", num_tokens, i),
-                        {num_tokens, split_size}
+                        {output_rows, split_size}
                     );
                 }
             }
         }
     }
+
 }
 
 
@@ -2171,10 +2231,11 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
 
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_eagle3_draft = is_draft && !_cfg.lm_cfg.is_dflash();
     const bool pre_uses_embedding_scale = (
         _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
     );
-    const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_draft;
+    const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_eagle3_draft;
     if (pre_uses_embedding_scale) {
         if (embedding_scale_buf == nullptr) {
             throw std::runtime_error("Quantized embedding input is missing its scale buffer");
@@ -2182,7 +2243,8 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         pre_model._bind_ifm(1, embedding_scale_buf, {embedding_scale_row, 0});
     }
     const uint8_t freq_ifm_idx = (
-        1 + static_cast<uint8_t>(pre_uses_embedding_scale) + static_cast<uint8_t>(is_draft)
+        1 + static_cast<uint8_t>(pre_uses_embedding_scale)
+            + static_cast<uint8_t>(is_eagle3_draft)
     );
     auto& freq_real = get_buffer(fmt::format("{}_freq_real", freq_prefix));
     auto& freq_imag = get_buffer(fmt::format("{}_freq_imag", freq_prefix));

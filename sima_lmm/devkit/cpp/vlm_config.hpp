@@ -247,7 +247,7 @@ struct LanguageModelConfig {
     uint32_t get_lm_head_output_size() const {
         if (speculative_decoding_cfg.has_value()
             && speculative_decoding_cfg.value().is_draft){
-            return is_dflash() ? hidden_size : draft_vocab_size;
+            return is_dflash() ? token_cfg.vocab_size : draft_vocab_size;
         }
         return token_cfg.vocab_size;
     }

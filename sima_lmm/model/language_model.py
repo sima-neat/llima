@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import time
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from afe.ir.tensor_type import ScalarType
 from afe.ir.quantization_conv import block_quantize_weight_tensor
@@ -65,6 +65,10 @@ class LanguageModel(BaseModel):
     3. PostCacheModel: Post cache model implements the transformer layer after the self-attention
         block, including the layers after the last transformer layer.
     """
+    dflash_target_hf_model: LocalHuggingFaceModel | GgufModel | None = field(
+        default=None, kw_only=True
+    )
+
     def __post_init__(self):
         if self.cfg.pipeline_cfg.input_token_group_offsets:
             self.cfg.pipeline_cfg.input_token_group_offsets.sort()
@@ -530,6 +534,7 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
+                    dflash_target_hf_model=self.dflash_target_hf_model,
                 )
             case "cache":
                 model_name = f"{self.model_name}_n{num_tokens}_cache_token{token_idx}"

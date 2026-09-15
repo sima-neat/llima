@@ -260,6 +260,32 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         void _prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx);
         void _define_draft_fc_models();
+        void _define_dflash_models();
+        void _append_dflash_context(
+            LanguageModel& target_lm, uint16_t num_tokens,
+            uint16_t token_idx, uint16_t valid_tokens
+        );
+        void _commit_dflash_linear_state(uint16_t prefix_tokens);
+        std::vector<uint32_t> _run_dflash_target_verify(
+            std::span<const uint32_t> input_ids, uint16_t token_idx
+        );
+        std::vector<uint32_t> _run_dflash_draft(
+            LanguageModel& target_lm, uint32_t anchor_token, uint16_t token_idx
+        );
+        std::optional<std::vector<uint32_t>> _run_model_dflash_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result
+        );
+        std::optional<std::vector<uint32_t>> _run_model_eagle3_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result
+        );
         struct CachedState {
             // Hidden-layer indices belonging to this stateful family.
             std::vector<uint8_t> layer_indices;
@@ -397,8 +423,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
         LanguageModelMap _linear_model_map;
-        // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
+        // Draft-only context-fusion models indexed by their compiled width.
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
+        LanguageModelMap _dflash_context_model_map;
 
         RopeTable _master_rope_table;
         RopeTable _global_freq_host;  // pristine CPU copy; source for tree-RoPE rows
