@@ -48,6 +48,7 @@ def _linear_model(*, quantize_embeddings: bool, layer_idx: int = 0) -> LanguageL
         pipeline_cfg=SimpleNamespace(quantize_embeddings=quantize_embeddings),
         lm_cfg=SimpleNamespace(
             hidden_size=16,
+            num_hidden_layers=2,
             linear_attn_cfg=SimpleNamespace(
                 conv_kernel_dim=4,
                 conv_dim=48,
@@ -59,6 +60,20 @@ def _linear_model(*, quantize_embeddings: bool, layer_idx: int = 0) -> LanguageL
         ),
     )
     return model
+
+
+def test_linear_attention_selects_supported_delta_block_sizes():
+    for num_tokens, block_size in ((1, 1), (4, 4), (8, 8), (16, 16), (32, 32), (128, 32)):
+        model = _linear_model(quantize_embeddings=False)
+        model.num_tokens = num_tokens
+        model.__post_init__()
+        assert model._delta_block_size == block_size
+
+    for num_tokens in (2, 12, 24, 48):
+        model = _linear_model(quantize_embeddings=False)
+        model.num_tokens = num_tokens
+        with pytest.raises(AssertionError, match="requires 1, 4, 8, 16"):
+            model.__post_init__()
 
 
 def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(monkeypatch):

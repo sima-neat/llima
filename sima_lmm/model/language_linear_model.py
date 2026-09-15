@@ -60,8 +60,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
     def __post_init__(self):
         assert self.num_tokens >= 1
-        assert self.num_tokens == 1 or self.num_tokens % 32 == 0, (
-            "Qwen3.5 grouped linear_attention requires num_tokens divisible by 32."
+        assert self.num_tokens in (1, 4, 8, 16) or self.num_tokens % 32 == 0, (
+            "Qwen3.5 linear_attention requires 1, 4, 8, 16, or a multiple of 32 tokens."
         )
         assert 0 <= self.layer_idx < self.cfg.lm_cfg.num_hidden_layers
         assert self.cfg.lm_cfg.linear_attn_cfg is not None
@@ -77,6 +77,10 @@ class LanguageLinearModel(LanguagePartBaseModel):
     @property
     def split_mlp(self) -> bool:
         return self.cfg.pipeline_cfg.split_mlp
+
+    @property
+    def _delta_block_size(self) -> int:
+        return min(self.num_tokens, 32)
 
     def gen_onnx_files(self):
         """Create the ONNX graph for one fused Qwen3.5 linear-attention layer.
@@ -455,7 +459,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
             np.zeros(
                 (
                     1,
-                    (self.num_tokens // 32) * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    (self.num_tokens // self._delta_block_size)
+                    * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
                     half,
                     half,
                 ),
@@ -470,7 +475,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
     def _build_sima_block_chunk_inverse(
         self, builder: SimaBuilder, initial_attn: NodeOrHandle, quantizable: bool, block_size: int = 32
     ) -> NodeOrHandle:
-        """Build the NHWC grouped-prefill lower-triangular inverse from 32-token blocks."""
+        """Build the NHWC grouped lower-triangular inverse from fixed-size blocks."""
         assert self.num_tokens % block_size == 0
         num_blocks = self.num_tokens // block_size
 
@@ -628,7 +633,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
         kk = builder.create_mul_node(raw_kk, beta_scaled)
         init_attn = builder.create_mul_node(kk, decay_mask)
         init_attn = builder.create_mul_node(init_attn, strict_lower)
-        attn = self._build_sima_block_chunk_inverse(builder, init_attn, quantizable)
+        attn = self._build_sima_block_chunk_inverse(
+            builder,
+            init_attn,
+            quantizable,
+            block_size=self._delta_block_size,
+        )
 
         value_i = builder.create_einsum_node(
             attn,
@@ -1273,7 +1283,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 (
                     1,
                     half,
-                    (self.num_tokens // 32) * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    (self.num_tokens // self._delta_block_size)
+                    * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
                     half,
                 ),
                 dtype=np.float32,
@@ -1289,7 +1300,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
     def _build_block_chunk_inverse(
         self, base_name: str, initial_attn: OnnxNode, block_size: int = 32
     ) -> OnnxNode:
-        """Build the full grouped-prefill triangular inverse from 32-token blocks.
+        """Build the full grouped triangular inverse from fixed-size blocks.
 
         Diagonal blocks and off-diagonal spans are folded into the head axis to
         reduce graph fragmentation while preserving triangular dependencies.
@@ -1506,7 +1517,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
         init_attn = self._onnx_builder.build_op(
             f"{base_name}.init_attn_mask", [init_attn, strict_lower], "Mul"
         )
-        attn = self._build_block_chunk_inverse(f"{base_name}.tri_solve", init_attn)
+        attn = self._build_block_chunk_inverse(
+            f"{base_name}.tri_solve",
+            init_attn,
+            block_size=self._delta_block_size,
+        )
 
         value_i = self._onnx_builder.build_op(
             f"{base_name}.value", [attn, v_beta], "Einsum", equation="nchw,nqhc->nqhw"

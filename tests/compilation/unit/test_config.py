@@ -206,6 +206,21 @@ def test_speculative_decoding_rejects_linear_attention():
         config.lm_cfg.set_speculative_decoding_config({})
 
 
+def test_linear_attention_validates_group_size():
+    for group_size in (1, 4, 8, 16, 32, 128):
+        config = _load_reference_config("qwen3.5_vlm_config.json")
+        config.config_pipeline(None, None, 2048, group_size, 128)
+        assert config.pipeline_cfg.input_token_group_size == group_size
+
+    for group_size in (2, 12, 24, 48):
+        config = _load_reference_config("qwen3.5_vlm_config.json")
+        with pytest.raises(
+            ValueError,
+            match="language_group_size must be 1, 4, 8, 16, or a multiple of 32",
+        ):
+            config.config_pipeline(None, None, 2048, group_size, 128)
+
+
 def test_legacy_pipeline_config_uses_stored_mask_for_all_attention_types():
     config = PipelineConfig(max_num_tokens=2048, future_token_mask_size=128)
 

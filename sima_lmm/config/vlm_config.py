@@ -1255,6 +1255,17 @@ class VlmConfig(BaseConfig):
         self.pipeline_cfg.set_group_size(language_group_size)
         self.pipeline_cfg.set_future_token_mask_size(future_token_mask_size)
 
+        group_size = self.pipeline_cfg.input_token_group_size
+        if (
+            self.lm_cfg.linear_attn_cfg is not None
+            and group_size not in (1, 4, 8, 16)
+            and group_size % 32
+        ):
+            raise ValueError(
+                "language_group_size must be 1, 4, 8, 16, or a multiple of 32 "
+                "for linear-attention models"
+            )
+
         if (
             self.lm_cfg.attn_cfg.swa_enable
             and self.pipeline_cfg.input_token_group_offsets
