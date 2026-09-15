@@ -41,6 +41,11 @@ add_executable(
     sima_lmm_gemma4_mtp_helpers_test
     gemma4_mtp_helpers_test.cpp
 )
+add_executable(
+    sima_lmm_gemma4_mtp_cache_test
+    gemma4_mtp_cache_test.cpp
+)
+target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime)
 target_link_libraries(
     sima_lmm_dispatcher_lifecycle_test
     PRIVATE
@@ -91,6 +96,7 @@ set_target_properties(
     sima_lmm_tool_call_parser_test
     sima_lmm_reasoning_parser_test
     sima_lmm_gemma4_mtp_helpers_test
+    sima_lmm_gemma4_mtp_cache_test
     PROPERTIES
         INSTALL_RPATH
             "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
@@ -197,6 +203,7 @@ install(
         sima_lmm_tool_call_parser_test
         sima_lmm_reasoning_parser_test
         sima_lmm_gemma4_mtp_helpers_test
+        sima_lmm_gemma4_mtp_cache_test
     RUNTIME DESTINATION lib/sima-lmm/tests
     COMPONENT extras
 )
@@ -217,6 +224,7 @@ install(
         asr_transcription_test.cpp
         dispatcher_lifecycle_test.cpp
         gemma4_mtp_helpers_test.cpp
+        gemma4_mtp_cache_test.cpp
         pytest.ini
         runtime_test_utils.hpp
         test_cli_black_box.py

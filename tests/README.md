@@ -347,6 +347,25 @@ The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on
 the DevKit.
 
+The manual Gemma4 MTP prefix-cache test takes an individual deployed target and
+assistant directory. It checks exact generated-token parity for cold/warm
+requests, prefill group boundaries, partial prefixes, continuation through the
+committed KV boundary, alternating slots, cancellation recovery, and long-context
+reuse (4,097 tokens for an 8K model). It also
+asserts the actual prefill dispatch positions from runtime logs, rather than
+relying only on reported cache hits, and prints TTFT for comparison:
+
+```bash
+./lib/sima-lmm/tests/sima_lmm_gemma4_mtp_cache_test \
+  /path/to/deployed-mtp/target /path/to/deployed-mtp/assistant
+```
+
+This test needs two cache slots and a target with at least three prefill groups.
+It is built and packaged with `./build.sh --all`, but is not in the automatic
+CTest suite until a compiled MTP pair is available in the CI fixture manifest.
+TTFT is reported without a timing threshold; dispatch counts establish that
+cached prefill work was skipped even when device timing varies.
+
 ### Python and black-box tests
 
 Pytest validates the installed package and external interfaces:

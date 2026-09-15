@@ -937,7 +937,14 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     bool stopped = false;
 
     try {
-        _active_cache().metadata.token_ids.clear();
+        // Only committed target rows can be matched on the next request. The
+        // physical buffers can also contain rejected drafts or prefill padding.
+        auto& target_metadata = _active_cache().metadata;
+        if (target_metadata.token_ids.size() > target_metadata.kv_cache_len) {
+            target_metadata.token_ids.resize(target_metadata.kv_cache_len);
+        }
+        // The assistant consumes the selected target's KV; it has no reusable
+        // private KV or hidden state to restore between requests.
         draft_lm._active_cache().metadata.token_ids.clear();
         draft_lm._active_cache().metadata.kv_cache_len = 0;
 
@@ -948,11 +955,18 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             // tables. Restore those rows before prefilling another request.
             const auto verification_width = _cfg.lm_cfg.get_single_num_tokens();
             _upload_gemma4_mtp_freq_rows(verification_width, 0, verification_width);
-            _set_input_text_embeds(input_token_ids);
+            const auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
+            // Even a complete prefix match needs a fresh next-token result:
+            // first_generated_token may belong to an earlier, shorter prompt.
+            // Recompute the last prefill group, then obtain its tail hidden
+            // state below, just as on a cold request.
+            const auto prefill_cached_tokens = std::min<uint16_t>(
+                num_cached_tokens, static_cast<uint16_t>(input_token_ids.size() - 1)
+            );
             const auto first_begin = std::chrono::steady_clock::now();
             auto first_token = run_model_prefill(
                 input_token_ids,
-                /*num_cached_tokens=*/0,
+                prefill_cached_tokens,
                 timer_ttft
             );
             const double first_duration = std::chrono::duration<double>(
@@ -1189,8 +1203,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     }
 
     if (!_is_running.load(std::memory_order_relaxed)) {
-        _active_cache().metadata.token_ids.clear();
-        draft_lm._active_cache().metadata.token_ids.clear();
+        _invalidate_active_kv_cache();
+        draft_lm._invalidate_active_kv_cache();
         _notify_interrupt();
         _text_streamer.wait_streaming();
         draft_lm._is_running = false;
