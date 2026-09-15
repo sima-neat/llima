@@ -175,6 +175,19 @@ class LanguagePartBaseModel(BaseModel):
         return cfg is not None and cfg.is_draft
 
     @property
+    def is_dflash(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return cfg is not None and cfg.method == "dflash"
+
+    @property
+    def is_eagle3_draft(self) -> bool:
+        return self.is_draft and not self.is_dflash
+
+    @property
+    def is_dflash_draft(self) -> bool:
+        return self.is_draft and self.is_dflash
+
+    @property
     def uses_quantized_input_embeddings(self) -> bool:
         return self.cfg.pipeline_cfg.quantize_embeddings
 
@@ -198,6 +211,12 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
 
     def _create_final_layer_output_nodes(self, output_nodes: list[OnnxNode]):
         """Create output nodes for the final transformer layer."""
+        if self.is_dflash_draft:
+            output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
+            self._onnx_builder.create_output_node(
+                output_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
+            )
+            return
         if not self.is_draft and self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
             self._onnx_builder.create_output_node(output_name, (1, 1, 1, self.num_tokens), np.int64)
@@ -219,7 +238,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 self._onnx_builder.create_output_node(
                     output_name, (1, split_size, 1, self.num_tokens)
                 )
-            if self.is_draft:
+            if self.is_eagle3_draft:
                 # EAGLE3 draft model also returns hidden_states as the last output
                 hidden_states_name = self._onnx_builder.get_node_output_name(output_nodes[-1])
                 self._onnx_builder.create_output_node(
@@ -236,7 +255,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
         )
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_draft:
+        if self.is_eagle3_draft:
             final_norm_full_name = final_norm_name
         rms_norm2 = self._build_rms_norm(final_norm_full_name, input_node)
 
@@ -271,7 +290,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 )
             lm_heads.append(lm_head)
 
-        if self.is_draft:
+        if self.is_eagle3_draft:
             lm_heads.append(input_node)
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
@@ -290,7 +309,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         base_prefix = self.hf_model.language_model_param_base_name
         final_norm_name = "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_draft:
+        if self.is_eagle3_draft:
             final_norm_full_name = final_norm_name
         rms_norm = self._build_sima_rms_norm(builder,
             final_norm_full_name, input_node
@@ -335,7 +354,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 )
             lm_heads.append(lm_head)
 
-        if self.is_draft:
+        if self.is_eagle3_draft:
             lm_heads.append(input_node)
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:

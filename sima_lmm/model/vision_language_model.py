@@ -72,6 +72,8 @@ class VisionLanguageModel(BaseModel):
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
+        speculative_method: str | None = None,
+        speculative_block_size: int | None = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -136,10 +138,42 @@ class VisionLanguageModel(BaseModel):
             else:
                 vlm_helper = target_model.vlm_helper
 
-            # Set speculative decoding configs for the draft model
-            vlm_cfg.lm_cfg.set_speculative_decoding_config(
-                dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
-            )
+            is_dflash_checkpoint = "DFlashDraftModel" in model_config.get("architectures", [])
+            method = speculative_method or ("dflash" if is_dflash_checkpoint else "eagle3")
+            if method not in ("eagle3", "dflash"):
+                raise ValueError(f"Unsupported speculative decoding method: {method}")
+            if method == "dflash":
+                if not is_dflash_checkpoint:
+                    raise ValueError("DFlash requires a DFlashDraftModel checkpoint")
+                dflash_cfg = model_config.get("dflash_config", {})
+                budget = speculative_block_size or 8
+                target_layer_ids = dflash_cfg.get("target_layer_ids", [])
+                mask_token_id = dflash_cfg.get("mask_token_id", -1)
+                VisionLanguageModel._validate_dflash_pair(
+                    target_model, vlm_cfg, model_config, budget,
+                    target_layer_ids, mask_token_id,
+                )
+                spec_cfg = dict(
+                    method=method,
+                    speculative_budget=budget,
+                    target_layer_ids=target_layer_ids,
+                    mask_token_id=mask_token_id,
+                )
+                target_model.cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=False)
+                )
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=True)
+                )
+            else:
+                if is_dflash_checkpoint:
+                    raise ValueError("DFlashDraftModel cannot be compiled as an EAGLE3 draft")
+                if speculative_block_size is not None:
+                    raise ValueError("--speculative_block_size is only valid for DFlash")
+                target_model.configure_speculative_decoding(is_draft=False)
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
+                )
 
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
@@ -153,6 +187,45 @@ class VisionLanguageModel(BaseModel):
             vlm_helper=vlm_helper,
         )
         return model
+
+    @staticmethod
+    def _validate_dflash_pair(
+        target_model: "VisionLanguageModel",
+        draft_cfg: VlmConfig,
+        draft_hf_cfg: dict,
+        block_size: int,
+        target_layer_ids: list[int],
+        mask_token_id: int,
+    ):
+        target_cfg = target_model.cfg.lm_cfg
+        if target_cfg.model_type != "qwen3_5_text":
+            raise ValueError("DFlash currently supports only Qwen3.5 target models")
+        if draft_hf_cfg.get("model_type") != "qwen3":
+            raise ValueError("DFlash draft model_type must be qwen3")
+        if draft_cfg.lm_cfg.hidden_size != target_cfg.hidden_size:
+            raise ValueError("DFlash target and draft hidden sizes must match")
+        if draft_cfg.lm_cfg.token_cfg.vocab_size != target_cfg.token_cfg.vocab_size:
+            raise ValueError("DFlash target and draft vocabulary sizes must match")
+        if draft_hf_cfg.get("num_target_layers") != target_cfg.num_hidden_layers:
+            raise ValueError("DFlash draft num_target_layers does not match the target")
+        if target_layer_ids != [1, 5, 9, 13, 17, 21, 25, 29] or any(
+            not isinstance(layer, int) or not 0 <= layer < target_cfg.num_hidden_layers
+            for layer in target_layer_ids
+        ):
+            raise ValueError("Unsupported DFlash target_layer_ids")
+        if not 0 <= mask_token_id < target_cfg.token_cfg.vocab_size:
+            raise ValueError("DFlash mask_token_id is missing or out of range")
+        checkpoint_block_size = draft_hf_cfg.get("dflash_config", {}).get("block_size", 0)
+        if block_size not in (4, 8, 16) or block_size > checkpoint_block_size:
+            raise ValueError(
+                "DFlash speculative block size must be 4, 8, or 16 and no larger "
+                "than the checkpoint block_size"
+            )
+        if draft_cfg.lm_cfg.layer_types != ["sliding_attention"] * 5 + ["full_attention"]:
+            raise ValueError(
+                "DFlash draft must contain five sliding-attention layers followed by "
+                "one full-attention layer"
+            )
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)

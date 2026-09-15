@@ -37,12 +37,14 @@ class LanguagePostModel(LanguagePostBaseModel):
     @property
     def uses_quantized_input_embeddings(self) -> bool:
         # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
-        return super().uses_quantized_input_embeddings and not self.is_draft
+        return super().uses_quantized_input_embeddings and not self.is_eagle3_draft
 
     @property
     def _layer_base_name(self) -> str:
+        if self.is_dflash_draft:
+            return f"layers.{self.layer_idx}"
         base = self.hf_model.language_model_param_base_name
-        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+        return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
 
     def gen_onnx_files(self):
         base_name = self._layer_base_name
@@ -159,6 +161,9 @@ class LanguagePostModel(LanguagePostBaseModel):
             )
         if self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1:
             return [final_output]
+
+        if self.is_dflash_draft:
+            return [self._build_rms_norm("norm", final_output)]
 
         # Include the operations after the last transformer layer into last post cache model.
         return self._build_onnx_post_transformer(base_name, final_output)
@@ -399,7 +404,11 @@ class LanguagePostModel(LanguagePostBaseModel):
             final_output = builder.create_add_node(final_output, mla_input_deepstack)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
-            outputs = self._build_post_transformer(builder, final_output, quantizable)
+            outputs = (
+                [self._build_sima_rms_norm(builder, "norm", final_output)]
+                if self.is_dflash_draft
+                else self._build_post_transformer(builder, final_output, quantizable)
+            )
             if len(outputs) > 1:
                 _ = builder.create_tuple_node(outputs)
 

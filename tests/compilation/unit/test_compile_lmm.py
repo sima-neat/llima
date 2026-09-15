@@ -92,3 +92,30 @@ def test_incompatible_quantization_defaults_report_disable_flags(
         compile_lmm.main()
 
     assert expected_error in capsys.readouterr().err
+
+
+def test_dflash_cli_forwards_method_and_block_size(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llima-compile",
+            str(tmp_path / "model"),
+            "-o",
+            str(tmp_path / "output"),
+            "-j",
+            "1",
+            "--draft_model_path",
+            str(tmp_path / "draft"),
+            "--speculative_method",
+            "dflash",
+            "--speculative_block_size",
+            "8",
+        ],
+    )
+    monkeypatch.setattr(compile_lmm, "gen_files", lambda *args: calls.append(args))
+
+    compile_lmm.main()
+
+    assert calls[0][-2:] == ("dflash", 8)

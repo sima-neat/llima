@@ -43,8 +43,10 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     @property
     def _layer_base_name(self) -> str:
+        if self.is_dflash_draft:
+            return f"layers.{self.layer_idx}"
         base = self.hf_model.language_model_param_base_name
-        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+        return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
 
     @property
     def layer_type(self) -> str:
@@ -75,7 +77,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         self._onnx_builder.create_input_node(
             "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
         )
-        if self.is_draft:
+        if self.is_eagle3_draft:
             self._onnx_builder.create_input_node(
                 "hidden_states", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
             )
@@ -132,7 +134,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             else f"{base_name}.input_layernorm"
         )
         rms_norm = self._build_rms_norm(norm_name, input_nodes[0])
-        if self.is_draft:
+        if self.is_eagle3_draft:
             # EAGLE3 draft model also normalizes the target hidden_states.
             hidden_states_norm = self._build_rms_norm(
                 f"{base_name}.hidden_norm", input_nodes[1]
@@ -423,7 +425,7 @@ class LanguagePreModel(LanguagePartBaseModel):
                 "input_scale", TensorType(activation_type(quantizable), scale_shape)
             )
         # EAGLE3 draft model has an extra hidden_states input
-        if self.is_draft:
+        if self.is_eagle3_draft:
             model_input_hidden_states = builder.create_placeholder_node(
                 "hidden_states", TensorType(activation_type(quantizable), input_shape)
             )
@@ -438,7 +440,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         subnet_inputs = [model_input_input]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             subnet_inputs.append(model_input_scale)
-        if self.is_draft:
+        if self.is_eagle3_draft:
             subnet_inputs.append(model_input_hidden_states)
         subnet_inputs.extend([model_input_freq_real, model_input_freq_imag])
         builder.begin_subnet(subnet_inputs)
@@ -450,7 +452,7 @@ class LanguagePreModel(LanguagePartBaseModel):
                 "MLA_0/input_scale", TensorType(activation_type(quantizable), scale_shape)
             )
         # EAGLE3 draft model has an extra hidden_states input
-        if self.is_draft:
+        if self.is_eagle3_draft:
             mla_input_hidden_states = builder.create_placeholder_node(
                 "MLA_0/hidden_states", TensorType(activation_type(quantizable), input_shape)
             )
@@ -478,7 +480,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             builder, norm_name, rms_norm_in
         )
         # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
-        if self.is_draft:
+        if self.is_eagle3_draft:
             hidden_states_norm = self._build_sima_rms_norm(
                 builder, f"{base_name}.hidden_norm", mla_input_hidden_states
             )

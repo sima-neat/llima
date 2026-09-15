@@ -630,12 +630,18 @@ class SpeculativeDecodingConfig(BaseConfig):
     """Configuration of a model in a speculative decoding setup.
 
     Attributes:
+        method: Speculative decoding algorithm. Existing archives default to eagle3.
         is_draft: True if the model is a draft model in a speculative decoding setup.
         speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
             16 for target, 5 for draft model.
+        target_layer_ids: Target transformer layers consumed by a DFlash draft.
+        mask_token_id: DFlash mask token used to fill the noisy proposal block.
     """
+    method: str = "eagle3"
     is_draft: bool = False
     speculative_budget: int = 16
+    target_layer_ids: list[int] = field(default_factory=list)
+    mask_token_id: int = -1
 
 
 @dataclass
@@ -831,16 +837,29 @@ class LanguageModelConfig(BaseConfig):
         if cfg is None:
             self.speculative_decoding_cfg = None
         else:
-            if self.linear_attn_cfg is not None:
+            speculative_cfg = SpeculativeDecodingConfig()
+            speculative_cfg.set_config(cfg)
+            if speculative_cfg.method not in ("eagle3", "dflash"):
+                raise ValueError(
+                    f"Unsupported speculative decoding method: {speculative_cfg.method}"
+                )
+            if speculative_cfg.speculative_budget <= 1:
+                raise ValueError("speculative_budget must be greater than one")
+            if speculative_cfg.method == "dflash" and speculative_cfg.speculative_budget not in (
+                4,
+                8,
+                16,
+            ):
+                raise ValueError("DFlash speculative_budget must be 4, 8, or 16")
+            if speculative_cfg.method == "eagle3" and self.linear_attn_cfg is not None:
                 raise ValueError(
                     "EAGLE3 speculative decoding does not support linear-attention layers"
                 )
-            if self.attn_cfg.swa_enable:
+            if speculative_cfg.method == "eagle3" and self.attn_cfg.swa_enable:
                 raise ValueError(
                     "EAGLE3 speculative decoding does not support sliding-window attention"
                 )
-            self.speculative_decoding_cfg = SpeculativeDecodingConfig()
-            self.speculative_decoding_cfg.set_config(cfg)
+            self.speculative_decoding_cfg = speculative_cfg
 
     def is_lora_target_module(self, base_name: str, module_name: str) -> bool:
         """
@@ -1290,6 +1309,10 @@ class VlmConfig(BaseConfig):
             lm_cfg.speculative_decoding_cfg is not None
             and lm_cfg.speculative_decoding_cfg.is_draft
         )
+        is_dflash_draft = (
+            is_speculative_draft
+            and lm_cfg.speculative_decoding_cfg.method == "dflash"
+        )
 
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
@@ -1308,6 +1331,12 @@ class VlmConfig(BaseConfig):
                     layers.append(LayerID("single_conv", i))
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
+                    if is_dflash_draft:
+                        layers.append(LayerID("group_dflash_context", i))
+                        layers.append(LayerID("single_dflash_context", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_post", i))
+                        continue
                     if lm_cfg.moe_cfg is not None:
                         # MoE layers replace the single post (MLP) part with a router
                         # plus one model per expert, for both group and single paths.
@@ -1344,6 +1373,8 @@ class VlmConfig(BaseConfig):
             if has_attn:
                 group_cache_indices = group_cache_model_indices(pipeline_cfg)
                 single_cache_indices = single_cache_model_indices(pipeline_cfg)
+                if is_dflash_draft:
+                    group_cache_indices = []
                 has_sliding_attn = "sliding_attention" in layer_types
                 separate_sliding_cache = (
                     lm_cfg.attn_cfg.sliding_head_dim is not None

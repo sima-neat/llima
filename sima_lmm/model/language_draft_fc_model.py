@@ -14,14 +14,10 @@ from sima_lmm.model.sima_builder import (
 
 @dataclass
 class LanguageDraftFCModel(LanguagePartBaseModel):
-    """FC Fusion layer for the EAGLE3 draft model.
+    """Target-context fusion layer for a speculative draft model.
 
-    Projects concatenated hidden states of shape (1, hidden_size * 3, 1, num_tokens)
-    to (1, hidden_size, 1, num_tokens) using a single linear layer
-
-    EAGLE3 conditions the draft model on hidden states from three specific layers of
-    the target model (low, mid, and high), which are concatenated along the channel
-    dimension to form a tensor of shape (1, hidden_size * 3, 1, num_tokens).
+    EAGLE3 projects one concatenated 3H tensor. DFlash accepts eight target-layer
+    tensors, concatenates them on device, projects 8H to H, and applies hidden_norm.
     """
     num_tokens: int
 
@@ -29,14 +25,27 @@ class LanguageDraftFCModel(LanguagePartBaseModel):
         assert self.num_tokens >= 1
 
     def gen_onnx_files(self):
-        base_name = self.hf_model.language_model_param_base_name
         self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size * 3, 1, self.num_tokens)
-        )
+        input_count = len(self.cfg.lm_cfg.speculative_decoding_cfg.target_layer_ids)
+        if self.is_dflash:
+            for index in range(input_count):
+                self._onnx_builder.create_input_node(
+                    f"input_{index}",
+                    (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens),
+                )
+            fc_input = self._onnx_builder.build_op(
+                "target_hidden.concat", self._onnx_builder.input_nodes, "Concat", axis=1
+            )
+        else:
+            self._onnx_builder.create_input_node(
+                "input", (1, self.cfg.lm_cfg.hidden_size * 3, 1, self.num_tokens)
+            )
+            fc_input = self._onnx_builder.input_nodes[0]
         output_node = self._onnx_builder.build_conv(
-            f"fc", self._onnx_builder.input_nodes[0], is_fc=True
+            "fc", fc_input, is_fc=True
         )
+        if self.is_dflash:
+            output_node = self._build_rms_norm("hidden_norm", output_node)
         output_name = self._onnx_builder.get_node_output_name(output_node)
         self._onnx_builder.create_output_node(
             output_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
@@ -52,26 +61,48 @@ class LanguageDraftFCModel(LanguagePartBaseModel):
         log_level: int,
         quantizable: bool,
     ):
-        base_name = self.hf_model.language_model_param_base_name
-        g = self._build_sima_nodes(base_name, quantizable)
+        g = self._build_sima_nodes(quantizable)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
 
-    def _build_sima_nodes(self, base_name: str, quantizable: bool):
-        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size * 3)
+    def _build_sima_nodes(self, quantizable: bool):
+        input_count = len(self.cfg.lm_cfg.speculative_decoding_cfg.target_layer_ids)
+        input_channels = self.cfg.lm_cfg.hidden_size * (input_count if self.is_dflash else 3)
+        input_shape = (1, 1, self.num_tokens, input_channels)
+        dflash_input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
         output_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
 
         builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
 
-        model_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
-        )
-        builder.begin_subnet([model_input])
-        mla_input = builder.create_placeholder_node(
-            "MLA_0/input", TensorType(activation_type(quantizable), input_shape)
-        )
+        if self.is_dflash:
+            model_inputs = [
+                builder.create_placeholder_node(
+                    f"input_{index}",
+                    TensorType(activation_type(quantizable), dflash_input_shape),
+                )
+                for index in range(input_count)
+            ]
+            builder.begin_subnet(model_inputs)
+            mla_inputs = [
+                builder.create_placeholder_node(
+                    f"MLA_0/input_{index}",
+                    TensorType(activation_type(quantizable), dflash_input_shape),
+                )
+                for index in range(input_count)
+            ]
+            mla_input = builder.create_concat_node(mla_inputs, 3)
+        else:
+            model_input = builder.create_placeholder_node(
+                "input", TensorType(activation_type(quantizable), input_shape)
+            )
+            builder.begin_subnet([model_input])
+            mla_input = builder.create_placeholder_node(
+                "MLA_0/input", TensorType(activation_type(quantizable), input_shape)
+            )
         output = build_conv(
             builder, self.get_hf_param, self.check_hf_param, "fc", mla_input
         )
+        if self.is_dflash:
+            output = self._build_sima_rms_norm(builder, "hidden_norm", output)
         assert get_expected_tensor_value(output.get_type().output).shape == output_shape
 
         mla_node = builder.finish_subnet("MLA_0")
