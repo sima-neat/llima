@@ -15,6 +15,7 @@
   "safetensors": [
     "model.safetensors",
     "model-*.safetensors",
+    "model.safetensors-*.safetensors",
     "model.safetensors.index.json"
   ]
 }
