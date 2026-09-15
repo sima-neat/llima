@@ -31,7 +31,32 @@ private:
   std::function<void()> _callback;
 };
 
+void copy_buffer_slice(MLABuffer &destination,
+                       const std::vector<uint32_t> &dst_begin,
+                       MLABuffer &source,
+                       const std::vector<uint32_t> &src_begin,
+                       const std::vector<uint32_t> &shape,
+                       const char *operation) {
+  if (simaai_memcpy_part(destination.get_simaai_memory(),
+                         destination.get_buf_addr_offset(dst_begin),
+                         source.get_simaai_memory(),
+                         source.get_buf_addr_offset(src_begin),
+                         source.get_buf_len(shape)) == nullptr) {
+    throw std::runtime_error(operation);
+  }
+}
+
 } // namespace
+
+void LanguageModel::_capture_dflash_hidden_state(uint16_t num_tokens,
+                                                  size_t capture_idx) {
+  auto &source = get_buffer(fmt::format("n{}_buffer1", num_tokens));
+  auto &destination = get_buffer(
+      fmt::format("dflash_target_hidden_n{}_{}", num_tokens, capture_idx));
+  copy_buffer_slice(destination, {0, 0}, source, {0, 0},
+                    {num_tokens, _cfg.lm_cfg.hidden_size},
+                    "Failed to retain DFlash target hidden state");
+}
 
 void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
@@ -48,34 +73,68 @@ void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
       continue;
     }
 
-    auto copy_slice =
-        [&](MLABuffer &destination, const std::vector<uint32_t> &dst_begin,
-            MLABuffer &source, const std::vector<uint32_t> &src_begin,
-            const std::vector<uint32_t> &shape) {
-          if (simaai_memcpy_part(destination.get_simaai_memory(),
-                                 destination.get_buf_addr_offset(dst_begin),
-                                 source.get_simaai_memory(),
-                                 source.get_buf_addr_offset(src_begin),
-                                 source.get_buf_len(shape)) == nullptr) {
-            throw std::runtime_error(
-                "Failed to commit DFlash linear-attention state");
-          }
-        };
-
     auto &conv_state =
         get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx));
     auto &conv_prefix =
         get_buffer(fmt::format("linear_conv_prefix_states_l{}", layer_idx));
-    copy_slice(conv_state, {tail_begin, 0}, conv_prefix, {prefix_index, 0},
-               {linear_cfg.conv_kernel_dim - 1, linear_cfg.get_conv_dim()});
+    copy_buffer_slice(
+        conv_state, {tail_begin, 0}, conv_prefix, {prefix_index, 0},
+        {linear_cfg.conv_kernel_dim - 1, linear_cfg.get_conv_dim()},
+        "Failed to commit DFlash convolution state");
 
     auto &delta_state =
         get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx));
     auto &delta_prefix =
         get_buffer(fmt::format("linear_delta_prefix_states_l{}", layer_idx));
-    copy_slice(delta_state, {0, 0}, delta_prefix, {prefix_index, 0},
-               {1, linear_cfg.get_recurrent_state_size()});
+    copy_buffer_slice(delta_state, {0, 0}, delta_prefix, {prefix_index, 0},
+                      {1, linear_cfg.get_recurrent_state_size()},
+                      "Failed to commit DFlash recurrent state");
   }
+}
+
+void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
+                                                   uint16_t prefix_tokens,
+                                                   bool is_prefill) {
+  const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
+  if (prefix_tokens == 0 || prefix_tokens > block_size) {
+    throw std::invalid_argument("Invalid DFlash checkpoint prefix length");
+  }
+  if (_cached_states.empty()) {
+    return;
+  }
+
+  const auto checkpoint_slot =
+      _select_state_checkpoint_slot(token_count, is_prefill);
+  if (!checkpoint_slot.has_value()) {
+    return;
+  }
+  const uint32_t prefix_index = prefix_tokens - 1;
+  for (auto &state : _cached_states) {
+    const char *source_prefix;
+    if (state.buffer_name_prefix == "linear_conv_cache_history_l") {
+      source_prefix = "linear_conv_prefix_states_l";
+    } else if (state.buffer_name_prefix == "linear_delta_state_history_l") {
+      source_prefix = "linear_delta_prefix_states_l";
+    } else {
+      throw std::runtime_error(
+          "Unsupported state family in DFlash checkpoint capture");
+    }
+
+    for (size_t layer_slot = 0; layer_slot < state.layer_indices.size();
+         ++layer_slot) {
+      const auto layer_idx = state.layer_indices[layer_slot];
+      auto &source = get_buffer(fmt::format("{}{}", source_prefix, layer_idx));
+      const size_t source_offset = source.get_buf_addr_offset(
+          std::vector<uint32_t>{prefix_index, 0});
+      source.invalidate_cache(source_offset, state.tail_bytes);
+      auto *source_ptr = reinterpret_cast<const uint8_t *>(
+          source.get_virtual_addr());
+      std::memcpy(
+          state.checkpoints[layer_slot][*checkpoint_slot].data(),
+          source_ptr + source_offset, state.tail_bytes);
+    }
+  }
+  _state_checkpoint_positions[*checkpoint_slot] = token_count;
 }
 
 void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
@@ -211,22 +270,21 @@ void LanguageModel::_append_dflash_context(LanguageModel &target_lm,
                                            uint16_t num_tokens,
                                            uint16_t token_idx,
                                            uint16_t valid_tokens) {
-  const auto &captures = target_lm._eagle3_intermediate_hidden_states;
   const auto expected =
       _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size();
-  if (captures.size() != expected) {
-    throw std::runtime_error(
-        "DFlash target did not produce all configured hidden-state taps");
-  }
   if (token_idx + num_tokens > _cfg.pipeline_cfg.max_num_tokens) {
     throw std::runtime_error("DFlash context write exceeds the draft cache");
   }
 
-  for (size_t index = 0; index < captures.size(); ++index) {
-    auto &input = get_buffer(fmt::format("fc_n{}_input{}", num_tokens, index));
-    input.upload(captures[index].data());
+  auto &fc_model = _fc_model_map.at(num_tokens);
+  for (size_t index = 0; index < expected; ++index) {
+    fc_model._bind_ifm(
+        static_cast<uint8_t>(index),
+        &target_lm.get_buffer(fmt::format(
+            "dflash_target_hidden_n{}_{}", num_tokens, index)),
+        {0, 0});
   }
-  _fc_model_map.at(num_tokens).add_to_queue();
+  fc_model.add_to_queue();
 
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
@@ -383,7 +441,6 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
 
   const auto &capture_layers =
       _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids;
-  _eagle3_intermediate_hidden_states.assign(capture_layers.size(), {});
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
@@ -423,12 +480,8 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
         std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
     if (capture != capture_layers.end()) {
       MLAModelWithBuffer::run_queue();
-      auto &destination = _eagle3_intermediate_hidden_states[std::distance(
-          capture_layers.begin(), capture)];
-      destination.resize(static_cast<size_t>(num_tokens) *
-                         _cfg.lm_cfg.hidden_size);
-      get_buffer(fmt::format("n{}_buffer1", num_tokens))
-          .download(destination.data());
+      _capture_dflash_hidden_state(
+          num_tokens, std::distance(capture_layers.begin(), capture));
     }
   }
   MLAModelWithBuffer::run_queue();
@@ -512,8 +565,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
       override_max_num_tokens.value_or(_max_num_tokens);
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
   if (input_token_ids.empty() || input_token_ids.size() >= max_length ||
-      input_token_ids.size() + block_size >
-          _cfg.pipeline_cfg.max_num_tokens) {
+      input_token_ids.size() > _cfg.pipeline_cfg.max_num_tokens) {
     return std::nullopt;
   }
 
@@ -550,8 +602,12 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   const uint16_t prefill_width =
       _use_group_token_models ? _cfg.pipeline_cfg.input_token_group_size
                               : block_size;
-  uint32_t anchor =
-      cached_tokens == prompt_len ? _cached_first_generated_token : 0;
+  uint32_t anchor = 0;
+  if (cached_tokens == prompt_len) {
+    anchor = cached_tokens < _cached_token_ids.size()
+                 ? _cached_token_ids[cached_tokens]
+                 : _cached_first_generated_token;
+  }
   for (uint16_t offset = cached_tokens; offset < prompt_len;
        offset += prefill_width) {
     const uint16_t valid =
@@ -618,18 +674,23 @@ LanguageModel::_run_model_dflash_speculative_decoding(
       }
     }
     const uint16_t committed_rows = static_cast<uint16_t>(produced);
+    if (_capture_state_checkpoints) {
+      auto boundary = std::upper_bound(_checkpoint_boundaries.begin(),
+                                       _checkpoint_boundaries.end(),
+                                       verify_start + committed_rows);
+      if (boundary != _checkpoint_boundaries.begin()) {
+        --boundary;
+        if (*boundary > verify_start) {
+          _save_dflash_state_checkpoint(*boundary, *boundary - verify_start,
+                                        false);
+        }
+      }
+    }
     _commit_dflash_linear_state(committed_rows);
     _kv_cache_len = verify_start + committed_rows;
     draft_lm._kv_cache_len = verify_start;
     draft_lm._append_dflash_context(*this, block_size, verify_start,
                                     committed_rows);
-    if (_capture_state_checkpoints &&
-        std::binary_search(_checkpoint_boundaries.begin(),
-                           _checkpoint_boundaries.end(), _kv_cache_len)) {
-      _save_state_checkpoint(_kv_cache_len, block_size, committed_rows,
-                             false);
-    }
-
     const double duration = iteration_timer.stop();
     for (size_t index = 0; index < produced; ++index) {
       const auto token = emitted[index];

@@ -1314,14 +1314,18 @@ uint32_t LanguageModel::run_model_once(
             );
             if (it != capture_layers.end()) {
                 MLAModelWithBuffer::run_queue();
-                if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
-                    _eagle3_intermediate_hidden_states.resize(capture_layers.size());
-                }
                 const size_t capture_idx = std::distance(capture_layers.begin(), it);
-                auto& buffer = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-                auto& capture = _eagle3_intermediate_hidden_states[capture_idx];
-                capture.resize(static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size);
-                buffer.download(capture.data());
+                if (_cfg.lm_cfg.is_dflash()) {
+                    _capture_dflash_hidden_state(num_tokens, capture_idx);
+                } else {
+                    if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
+                        _eagle3_intermediate_hidden_states.resize(capture_layers.size());
+                    }
+                    auto& buffer = get_buffer(fmt::format("n{}_buffer1", num_tokens));
+                    auto& capture = _eagle3_intermediate_hidden_states[capture_idx];
+                    capture.resize(static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size);
+                    buffer.download(capture.data());
+                }
             }
         }
     }
@@ -1354,10 +1358,17 @@ uint32_t LanguageModel::run_model_once(
             _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), next_token_idx
         )
     ) {
-        // A partial prefill group can land exactly on a checkpoint boundary.
-        _save_state_checkpoint(
-            next_token_idx, num_tokens, next_token_idx - token_idx, token_idx < num_input_tokens
-        );
+        if (has_dflash_prefix_states) {
+            _save_dflash_state_checkpoint(
+                next_token_idx, next_token_idx - token_idx, token_idx < num_input_tokens
+            );
+        } else {
+            // A partial prefill group can land exactly on a checkpoint boundary.
+            _save_state_checkpoint(
+                next_token_idx, num_tokens, next_token_idx - token_idx,
+                token_idx < num_input_tokens
+            );
+        }
     }
 
     if (logits_ptr) {
@@ -1653,11 +1664,11 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
 }
 
 
-void LanguageModel::_save_state_checkpoint(
-    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
+std::optional<size_t> LanguageModel::_select_state_checkpoint_slot(
+    uint16_t token_count, bool is_prefill
 ) {
     if (token_count < _system_checkpoint_position)
-        return;
+        return std::nullopt;
 
     size_t checkpoint_slot = 0;
     if (token_count != _system_checkpoint_position) {
@@ -1682,6 +1693,16 @@ void LanguageModel::_save_state_checkpoint(
         }
         checkpoint_slot = _rolling_checkpoint_slot;
     }
+    return checkpoint_slot;
+}
+
+
+void LanguageModel::_save_state_checkpoint(
+    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
+) {
+    const auto checkpoint_slot = _select_state_checkpoint_slot(token_count, is_prefill);
+    if (!checkpoint_slot.has_value())
+        return;
 
     // Save the L-1 tail of each stateful layer's MLA buffer
     // so a future prefill can resume from this boundary without replay.
@@ -1702,13 +1723,13 @@ void LanguageModel::_save_state_checkpoint(
             buf.invalidate_cache();
             auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
             std::memcpy(
-                state.checkpoints[layer_slot][checkpoint_slot].data(),
+                state.checkpoints[layer_slot][*checkpoint_slot].data(),
                 ptr + src_offset_bytes,
                 state.tail_bytes
             );
         }
     }
-    _state_checkpoint_positions[checkpoint_slot] = token_count;
+    _state_checkpoint_positions[*checkpoint_slot] = token_count;
 }
 
 
@@ -1969,6 +1990,16 @@ void LanguageModel::_define_buffers() {
         define_buffer(
             fmt::format("n{}_buffer1", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
         );
+        if (_cfg.lm_cfg.is_dflash() && !is_draft) {
+            const auto capture_count =
+                _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size();
+            for (size_t index = 0; index < capture_count; ++index) {
+                define_buffer(
+                    fmt::format("dflash_target_hidden_n{}_{}", num_tokens, index),
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                );
+            }
+        }
 
         // Pre output and cache input.
         define_buffer(
@@ -2010,18 +2041,10 @@ void LanguageModel::_define_buffers() {
                     {num_tokens, _cfg.lm_cfg.hidden_size}
                 );
             }
-            const size_t fc_input_count = _cfg.lm_cfg.is_dflash()
-                ? _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size()
-                : 1;
-            for (size_t index = 0; index < fc_input_count; ++index) {
+            if (!_cfg.lm_cfg.is_dflash()) {
                 define_buffer(
-                    _cfg.lm_cfg.is_dflash()
-                        ? fmt::format("fc_n{}_input{}", num_tokens, index)
-                        : fmt::format("fc_n{}_input", num_tokens),
-                    {
-                        num_tokens,
-                        _cfg.lm_cfg.hidden_size * (_cfg.lm_cfg.is_dflash() ? 1 : 3)
-                    }
+                    fmt::format("fc_n{}_input", num_tokens),
+                    {num_tokens, _cfg.lm_cfg.hidden_size * 3}
                 );
             }
             define_buffer(

@@ -701,9 +701,7 @@ void LanguageModel::_define_draft_fc_models() {
             for (size_t index = 0;
                  index < _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size();
                  ++index) {
-                ifms.emplace_back(MLABufferSlice{
-                    &get_buffer(fmt::format("fc_n{}_input{}", num_tokens, index))
-                });
+                ifms.emplace_back(MLABufferSlice{});
             }
         } else {
             ifms.emplace_back(MLABufferSlice{

@@ -527,6 +527,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 [1],
                 [1],
             )
+        if num_blocks == 1:
+            return inverse_blocks[(0, 0)]
 
         for span in range(1, num_blocks):
             span_targets = [(row, row - span) for row in range(span, num_blocks)]
@@ -597,45 +599,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
         out = builder.create_batch_matmul_node(query, state, transpose_a=False, transpose_b=False)
         return out, state
 
-    def _build_sima_prefix_states(
-        self,
-        builder: SimaBuilder,
-        key: NodeOrHandle,
-        value: NodeOrHandle,
-        beta: NodeOrHandle,
-        g: NodeOrHandle,
-        initial_state: NodeOrHandle,
-    ) -> NodeOrHandle:
-        """Return the recurrent state after every token, packed on the head axis."""
-        state = initial_state
-        states = []
-        for token_idx in range(self.num_tokens):
-            key_token = builder.create_slice_node(
-                key, [token_idx], [token_idx + 1], [1], [2]
-            )
-            value_token = builder.create_slice_node(
-                value, [token_idx], [token_idx + 1], [1], [2]
-            )
-            beta_token = builder.create_slice_node(
-                beta, [token_idx], [token_idx + 1], [1], [2]
-            )
-            g_token = builder.create_slice_node(
-                g, [token_idx], [token_idx + 1], [1], [2]
-            )
-            state = builder.create_mul_node(state, builder.create_exp_node(g_token))
-            kv_mem = builder.create_batch_matmul_node(
-                key_token, state, transpose_a=False, transpose_b=False
-            )
-            delta = builder.create_subtract_node(value_token, kv_mem)
-            delta = builder.create_mul_node(delta, beta_token)
-            state_add = builder.create_batch_matmul_node(
-                key_token, delta, transpose_a=True, transpose_b=False
-            )
-            state = builder.create_add_node(state, state_add)
-            states.append(state)
-
-        return builder.create_concat_node(states, 1)
-
     def _build_sima_group_delta(
         self,
         builder: SimaBuilder,
@@ -648,6 +611,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         g: NodeOrHandle,
         state: NodeOrHandle,
         quantizable: bool,
+        emit_prefix_states: bool = False,
     ) -> tuple[NodeOrHandle, NodeOrHandle]:
         """Build the grouped prefill computation in NHWC head-major layout."""
         g_cum = self._build_sima_static_triangular_sums(builder, g, upper=True, quantizable=quantizable)
@@ -775,6 +739,30 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
         state_base = builder.create_mul_node(state, final_g_exp)
         linear_delta_state_out = builder.create_add_node(state_base, state_updates)
+
+        if emit_prefix_states:
+            # Share the grouped solve with the logits. Keep the existing final
+            # state as SB, including its suffix-sum BF16 evaluation order.
+            states = []
+            for prefix_idx in range(self.num_tokens - 1):
+                prefix_mask = builder.create_slice_node(
+                    decay_mask, [prefix_idx], [prefix_idx + 1], [1], [2]
+                )
+                prefix_mask = builder.create_transpose_node(
+                    prefix_mask, [0, 1, 3, 2]
+                )
+                weighted = builder.create_mul_node(v_new, prefix_mask)
+                updates = builder.create_einsum_node(
+                    key, weighted, equation="nhcw,nhcq->nhwq", layout="NHWC"
+                )
+                prefix_decay = builder.create_slice_node(
+                    g_exp, [prefix_idx], [prefix_idx + 1], [1], [2]
+                )
+                base = builder.create_mul_node(state, prefix_decay)
+                states.append(builder.create_add_node(base, updates))
+            linear_delta_state_out = builder.create_concat_node(
+                [*states, linear_delta_state_out], 1
+            )
 
         return core_attn_out, linear_delta_state_out
 
@@ -1029,16 +1017,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 g,
                 mla_delta_state,
                 quantizable,
+                emit_prefix_states=self._emit_dflash_prefix_states,
             )
-            if self._emit_dflash_prefix_states:
-                linear_delta_state_out = self._build_sima_prefix_states(
-                    builder,
-                    key,
-                    value,
-                    beta,
-                    g,
-                    mla_delta_state,
-                )
 
         z_heads = builder.create_slice_concat_node(
             z,
@@ -1399,8 +1379,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
         # Fold all diagonal blocks into the head axis and invert them together.
         inverse_blocks: dict[tuple[int, int], OnnxNode] = {}
         diag_blocks = [attn_blocks[(block_idx, block_idx)] for block_idx in range(num_blocks)]
-        folded_diag = self._onnx_builder.build_op(
-            f"{base_name}.diag.fold", diag_blocks, "Concat", axis=2
+        folded_diag = (
+            diag_blocks[0]
+            if len(diag_blocks) == 1
+            else self._onnx_builder.build_op(
+                f"{base_name}.diag.fold", diag_blocks, "Concat", axis=2
+            )
         )
         folded_diag_inv = self._build_direct_chunk_inverse(
             f"{base_name}.diag.inverse", folded_diag, block_size
@@ -1418,6 +1402,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 ],
                 "Slice",
             )
+        if num_blocks == 1:
+            return inverse_blocks[(0, 0)]
 
         # Build wider off-diagonal spans from already-computed narrower spans.
         for span in range(1, num_blocks):
@@ -1533,76 +1519,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
         return out, state
 
-    def _build_prefix_states(
-        self,
-        base_name: str,
-        key: OnnxNode,
-        value: OnnxNode,
-        beta: OnnxNode,
-        g: OnnxNode,
-        initial_state: OnnxNode,
-    ) -> OnnxNode:
-        """Return the recurrent state after every token, packed on the head axis."""
-        state = initial_state
-        states = []
-        for token_idx in range(self.num_tokens):
-            def token_slice(name: str, node: OnnxNode) -> OnnxNode:
-                return self._onnx_builder.build_op(
-                    f"{base_name}.{name}.{token_idx}",
-                    [
-                        node,
-                        np.array([token_idx], dtype=np.int64),
-                        np.array([token_idx + 1], dtype=np.int64),
-                        np.array([3], dtype=np.int64),
-                    ],
-                    "Slice",
-                )
-
-            key_token = token_slice("key", key)
-            value_token = token_slice("value", value)
-            beta_token = token_slice("beta", beta)
-            g_token = token_slice("g", g)
-            decay = self._onnx_builder.build_op(
-                f"{base_name}.decay.{token_idx}", [g_token], "Exp"
-            )
-            state = self._onnx_builder.build_op(
-                f"{base_name}.state_decay.{token_idx}", [state, decay], "Mul"
-            )
-            value_token = self._onnx_builder.build_op(
-                f"{base_name}.value_token_major.{token_idx}",
-                [value_token],
-                "Transpose",
-                perm=[0, 3, 2, 1],
-            )
-            kv_mem = self._onnx_builder.build_op(
-                f"{base_name}.kv_mem.{token_idx}",
-                [state, key_token],
-                "Einsum",
-                equation="nchw,nchq->nqhw",
-            )
-            delta = self._onnx_builder.build_op(
-                f"{base_name}.delta.{token_idx}", [value_token, kv_mem], "Sub"
-            )
-            delta = self._onnx_builder.build_op(
-                f"{base_name}.delta_beta.{token_idx}", [delta, beta_token], "Mul"
-            )
-            state_add = self._onnx_builder.build_op(
-                f"{base_name}.state_add_mul.{token_idx}",
-                [key_token, delta],
-                "Mul",
-            )
-            state = self._onnx_builder.build_op(
-                f"{base_name}.state.{token_idx}", [state, state_add], "Add"
-            )
-            states.append(state)
-
-        packed = self._onnx_builder.build_op(
-            f"{base_name}.packed", states, "Concat", axis=2
-        )
-        return self._onnx_builder.build_op(
-            f"{base_name}.to_vhk", [packed], "Transpose", perm=[0, 3, 2, 1]
-        )
-
     def _build_group_delta(
         self,
         base_name: str,
@@ -1614,6 +1530,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         beta: OnnxNode,
         g: OnnxNode,
         state: OnnxNode,
+        emit_prefix_states: bool = False,
     ) -> tuple[OnnxNode, OnnxNode]:
         """Build the grouped prefill Gated DeltaNet computation.
 
@@ -1777,6 +1694,52 @@ class LanguageLinearModel(LanguagePartBaseModel):
         linear_delta_state_out = self._onnx_builder.build_op(
             f"{base_name}.state.all", [state_base, state_updates], "Add"
         )
+        if emit_prefix_states:
+            # NCHW stores heads on axis 2; pack prefixes there without adding
+            # a fifth dimension. The common output transpose handles both paths.
+            states = []
+            for prefix_idx in range(self.num_tokens - 1):
+                prefix_name = f"{base_name}.prefix.{prefix_idx + 1}"
+                prefix_mask = self._onnx_builder.build_op(
+                    f"{prefix_name}.mask",
+                    [decay_mask, np.array([prefix_idx], dtype=np.int64),
+                     np.array([prefix_idx + 1], dtype=np.int64),
+                     np.array([3], dtype=np.int64)],
+                    "Slice",
+                )
+                prefix_mask = self._onnx_builder.build_op(
+                    f"{prefix_name}.mask.token_major", [prefix_mask],
+                    "Transpose", perm=[0, 3, 2, 1],
+                )
+                weighted = self._onnx_builder.build_op(
+                    f"{prefix_name}.weighted", [v_new, prefix_mask], "Mul"
+                )
+                weighted = self._onnx_builder.build_op(
+                    f"{prefix_name}.weighted.token_major", [weighted],
+                    "Transpose", perm=[0, 3, 2, 1],
+                )
+                updates = self._onnx_builder.build_op(
+                    f"{prefix_name}.updates", [weighted, key],
+                    "Einsum", equation="nchw,nqhc->nqhw",
+                )
+                prefix_decay = self._onnx_builder.build_op(
+                    f"{prefix_name}.decay",
+                    [g_exp, np.array([prefix_idx], dtype=np.int64),
+                     np.array([prefix_idx + 1], dtype=np.int64),
+                     np.array([3], dtype=np.int64)],
+                    "Slice",
+                )
+                base = self._onnx_builder.build_op(
+                    f"{prefix_name}.base", [state, prefix_decay], "Mul"
+                )
+                states.append(self._onnx_builder.build_op(
+                    f"{prefix_name}.state", [base, updates], "Add"
+                ))
+            linear_delta_state_out = self._onnx_builder.build_op(
+                f"{base_name}.prefix_states", [*states, linear_delta_state_out],
+                "Concat", axis=2,
+            )
+
         return core_attn_out, linear_delta_state_out
 
     def _build_onnx_nodes(self, base_layer: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
@@ -2024,16 +1987,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 beta,
                 g,
                 state_flat,
+                emit_prefix_states=self._emit_dflash_prefix_states,
             )
-            if self._emit_dflash_prefix_states:
-                linear_delta_state_out = self._build_prefix_states(
-                    f"{linear_base}.prefix_states",
-                    key,
-                    value,
-                    beta,
-                    g,
-                    state_flat,
-                )
 
         z_heads = self._onnx_builder.build_split_expand_concat(
             f"{linear_base}.z_heads.reshape",
@@ -2072,13 +2027,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
         add1 = self._onnx_builder.build_op(f"{base_layer}.add1", [input_nodes[0], out_proj], "Add")
         rms_norm2 = self._build_rms_norm(f"{base_layer}.post_attention_layernorm", add1)
         mlp = self._build_onnx_mlp(f"{base_layer}.mlp", [rms_norm2, add1], with_residual_add=True)
-        if not self._emit_dflash_prefix_states:
-            linear_delta_state_out = self._onnx_builder.build_op(
-                f"{linear_base}.state.to_vhk",
-                [linear_delta_state_out],
-                "Transpose",
-                perm=[0, 3, 2, 1],
-            )
+        linear_delta_state_out = self._onnx_builder.build_op(
+            f"{linear_base}.state.to_vhk",
+            [linear_delta_state_out],
+            "Transpose",
+            perm=[0, 3, 2, 1],
+        )
 
         output_nodes = [mlp, linear_conv_state_out, linear_delta_state_out]
         return output_nodes

@@ -273,7 +273,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
             LanguageModel& target_lm, uint16_t num_tokens,
             uint16_t token_idx, uint16_t valid_tokens
         );
+        void _capture_dflash_hidden_state(uint16_t num_tokens, size_t capture_idx);
         void _commit_dflash_linear_state(uint16_t prefix_tokens);
+        void _save_dflash_state_checkpoint(
+            uint16_t token_count, uint16_t prefix_tokens, bool is_prefill
+        );
         void _upload_dflash_attention_mask(
             uint16_t num_tokens, uint16_t token_idx,
             uint8_t layer_idx, bool bidirectional
@@ -387,6 +391,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
             uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
+        );
+        std::optional<size_t> _select_state_checkpoint_slot(
+            uint16_t token_count, bool is_prefill
         );
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
