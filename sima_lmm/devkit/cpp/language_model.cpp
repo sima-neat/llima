@@ -123,16 +123,17 @@ LanguageModel::LanguageModel(
     if (_use_group_token_models) {
         // Collect indices for all stateful layer families.
         std::vector<uint8_t> conv_layer_indices;
+        std::vector<uint8_t> linear_layer_indices;
         for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
             if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
                 conv_layer_indices.emplace_back(layer_idx);
+            } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+                linear_layer_indices.emplace_back(layer_idx);
             }
         }
-        // Future: collect mamba_layer_indices, deltanet_layer_indices, etc.
 
         // Build _checkpoint_boundaries once if ANY stateful layer family exists.
-        // Future: extend the condition with `|| !mamba_layer_indices.empty() || ...`.
-        if (!conv_layer_indices.empty()) {
+        if (!conv_layer_indices.empty() || !linear_layer_indices.empty()) {
             const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
             const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
             // Checkpoint at each grouped start offset stores the state tail before that block.
@@ -162,14 +163,60 @@ LanguageModel::LanguageModel(
             );
             conv_state.layer_indices = std::move(conv_layer_indices);
 
-            const auto num_boundaries = _checkpoint_boundaries.size();
             conv_state.checkpoints.resize(conv_state.layer_indices.size());
             for (auto& checkpoints: conv_state.checkpoints) {
-                checkpoints.resize(num_boundaries, std::vector<uint8_t>(conv_state.tail_bytes));
+                checkpoints.resize(
+                    _state_checkpoint_positions.size(),
+                    std::vector<uint8_t>(conv_state.tail_bytes)
+                );
             }
             _cached_states.emplace_back(std::move(conv_state));
         }
-        // Future: similar block for mamba/Deltanet families.
+        if (!linear_layer_indices.empty()) {
+            const auto& linear_cfg = _linear_attn_cfg();
+            LanguageModel::CachedState linear_conv_state;
+            linear_conv_state.buffer_name_prefix = "linear_conv_cache_history_l";
+            linear_conv_state.tail_len = static_cast<uint16_t>(linear_cfg.conv_kernel_dim - 1);
+            linear_conv_state.num_elems = linear_cfg.get_conv_dim();
+            linear_conv_state.elem_size = sizeof(Eigen::bfloat16);
+            linear_conv_state.tail_bytes = static_cast<size_t>(
+                linear_conv_state.tail_len
+                * linear_conv_state.num_elems
+                * linear_conv_state.elem_size
+            );
+            linear_conv_state.layer_indices = linear_layer_indices;
+
+            linear_conv_state.checkpoints.resize(linear_conv_state.layer_indices.size());
+            for (auto& checkpoints: linear_conv_state.checkpoints) {
+                checkpoints.resize(
+                    _state_checkpoint_positions.size(),
+                    std::vector<uint8_t>(linear_conv_state.tail_bytes)
+                );
+            }
+            _cached_states.emplace_back(std::move(linear_conv_state));
+
+            LanguageModel::CachedState linear_delta_state;
+            linear_delta_state.buffer_name_prefix = "linear_delta_state_history_l";
+            linear_delta_state.tail_len = 1;
+            linear_delta_state.num_elems = linear_cfg.get_recurrent_state_size();
+            linear_delta_state.elem_size = sizeof(Eigen::bfloat16);
+            linear_delta_state.prefill_single_output = true;
+            linear_delta_state.tail_bytes = static_cast<size_t>(
+                linear_delta_state.tail_len
+                * linear_delta_state.num_elems
+                * linear_delta_state.elem_size
+            );
+            linear_delta_state.layer_indices = std::move(linear_layer_indices);
+
+            linear_delta_state.checkpoints.resize(linear_delta_state.layer_indices.size());
+            for (auto& checkpoints: linear_delta_state.checkpoints) {
+                checkpoints.resize(
+                    _state_checkpoint_positions.size(),
+                    std::vector<uint8_t>(linear_delta_state.tail_bytes)
+                );
+            }
+            _cached_states.emplace_back(std::move(linear_delta_state));
+        }
     }
 
     // EAGLE3: build the constant tree_mask_init (eye(topk)) once. Only the
@@ -190,6 +237,27 @@ LanguageModel::LanguageModel(
     }
 
     _initialize();
+}
+
+
+bool LanguageModel::_has_linear_attention_layers() const {
+    return std::find(
+        _cfg.lm_cfg.layer_types.begin(),
+        _cfg.lm_cfg.layer_types.end(),
+        "linear_attention"
+    ) != _cfg.lm_cfg.layer_types.end();
+}
+
+
+const LinearAttentionConfig& LanguageModel::_linear_attn_cfg() const {
+    if (!_cfg.lm_cfg.linear_attn_cfg.has_value()) {
+        throw std::runtime_error("linear_attention layers require linear_attn_cfg");
+    }
+    const auto& linear_cfg = _cfg.lm_cfg.linear_attn_cfg.value();
+    if (linear_cfg.conv_kernel_dim <= 1) {
+        throw std::runtime_error("linear_attn_cfg.conv_kernel_dim must be greater than 1");
+    }
+    return linear_cfg;
 }
 
 
@@ -304,7 +372,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::span<const uint32_t> input_token_ids,
     std::optional<ChronoTimer> timer_ttft,
     std::optional<uint16_t> override_max_num_tokens,
-    std::optional<std::set<uint32_t>> override_stop_token_ids
+    std::optional<std::set<uint32_t>> override_stop_token_ids,
+    uint16_t stable_prefix_token_count
 ) {
     // Update the state.
     _is_running = true;
@@ -319,6 +388,21 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         _notify_cache_full();
         output_token_ids = std::vector<uint32_t>();
     } else {
+        if (!_cached_states.empty()) {
+            _capture_state_checkpoints = true;
+            _rolling_checkpoint_slot = 0;
+            _writable_checkpoint_slots = 0;
+            auto system_boundary = std::upper_bound(
+                _checkpoint_boundaries.begin(),
+                _checkpoint_boundaries.end(),
+                std::min<size_t>(stable_prefix_token_count, input_token_ids.size())
+            );
+            _system_checkpoint_position = system_boundary == _checkpoint_boundaries.begin()
+                ? 0 : *std::prev(system_boundary);
+            if (_system_checkpoint_position && _state_checkpoint_positions[0] != _system_checkpoint_position)
+                _state_checkpoint_positions[0] = 0;
+        }
+
         // Create input embeds from input token ids and image embeds.
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
 
@@ -338,6 +422,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
             );
         }
     }
+
+    _rolling_checkpoint_slot = 0;
+    _writable_checkpoint_slots = 0;
+    _capture_state_checkpoints = false;
 
     // Wait until all the streaming finishes.
     _text_streamer.wait_streaming();
@@ -369,9 +457,7 @@ uint32_t LanguageModel::run_model_prefill(
     uint16_t token_idx{};
     uint32_t next_token_id{};
     uint16_t last_group_valid_tokens = 0;
-    if (!_cached_states.empty()) {
-        num_cached_tokens = _prepare_state_checkpoints_for_prefill(num_cached_tokens);
-    }
+    num_cached_tokens = _prepare_state_checkpoints_for_prefill(num_cached_tokens);
 
     if (num_input_tokens == num_cached_tokens) {
         // All input tokens are already cached.
@@ -560,6 +646,7 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
             // Single-token scoring rewrites the model cache from token zero without going
             // through run_model_prefill(), so the cached-token metadata is no longer valid.
             _cached_token_ids.clear();
+            _prepare_state_checkpoints_for_prefill(0);
         }
         if (should_group_prefill) {
             create_input_buffers(input_token_ids);
@@ -725,6 +812,14 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
 
             ifm_map.clear();
             _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            LanguageModelMapKey linear_model_key(num_tokens, layer_idx, 0);
+            if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
+                _linear_model_map.at(linear_model_key)._bind_ifm(
+                    1, normal_scale_buf, {normal_input_row, 0}
+                );
+            }
+            _linear_model_map.at(linear_model_key).add_to_queue(&ifm_map);
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
@@ -733,15 +828,14 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
     }
 
     MLAModelWithBuffer::run_queue();
-
-    if (!_cached_states.empty()) {
-        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
-            if (_checkpoint_boundaries[i] == next_token_idx) {
-                _save_state_checkpoint(i, num_tokens, 1);
-                break;
-            }
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
+                get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
+            );
         }
     }
+
 }
 
 
@@ -835,6 +929,9 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
+    if (token_idx == 0 && logits_ptr)
+        _prepare_state_checkpoints_for_prefill(0);
+
     uint16_t next_token_idx;
     if (num_tokens > 1) {
         next_token_idx = std::min(num_input_tokens, uint16_t(token_idx + num_tokens));
@@ -931,6 +1028,13 @@ uint32_t LanguageModel::run_model_once(
         _per_layer_model_map.at(per_layer_key).add_to_queue(&per_layer_ifm_map);
     }
 
+    if (num_tokens > 1 && _has_linear_attention_layers()) {
+        const uint16_t valid_tokens = next_token_idx - token_idx;
+        std::vector<Eigen::bfloat16> valid_mask(num_tokens, Eigen::bfloat16(0.0f));
+        std::fill_n(valid_mask.begin(), valid_tokens, Eigen::bfloat16(1.0f));
+        get_buffer("linear_valid_mask").upload(valid_mask.data());
+    }
+
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
 
@@ -981,15 +1085,14 @@ uint32_t LanguageModel::run_model_once(
             // reuses n16 and binds a contiguous window containing the final row.
             if (num_tokens > 1 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
                 && !_cfg.lm_cfg.is_spec_decode()) {
+                const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
                 ifm_map.clear();
                 ifm_map.emplace(
                     std::piecewise_construct,
                     std::forward_as_tuple(0),
                     std::forward_as_tuple(
                         nullptr,
-                        std::vector<uint32_t>{
-                            static_cast<uint32_t>(num_input_tokens - 1 - token_idx), 0
-                        },
+                        std::vector<uint32_t>{last_valid_row, 0},
                         std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
                     )
                 );
@@ -998,15 +1101,63 @@ uint32_t LanguageModel::run_model_once(
                     std::forward_as_tuple(1),
                     std::forward_as_tuple(
                         nullptr,
-                        std::vector<uint32_t>{
-                            static_cast<uint32_t>(num_input_tokens - 1 - token_idx), 0
-                        },
+                        std::vector<uint32_t>{last_valid_row, 0},
                         std::vector<uint32_t>{
                             1,
                             _cfg.lm_cfg.attn_cfg.get_q_size(_cfg.lm_cfg.layer_types[layer_idx])
                         }
                     )
                 );
+                uint8_t post_ifm_idx = 2;
+                if (_uses_per_layer_inputs()) {
+                    const uint32_t layer_row_offset =
+                        static_cast<uint32_t>(layer_idx) * num_tokens;
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx++),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{layer_row_offset + last_valid_row, 0},
+                            std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size_per_layer_input}
+                        )
+                    );
+                }
+                if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx++),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{last_valid_row, 0},
+                            std::vector<uint32_t>{
+                                1,
+                                _cfg.lm_cfg.attn_cfg.get_q_size(
+                                    _cfg.lm_cfg.layer_types[layer_idx]
+                                )
+                            }
+                        )
+                    );
+                }
+                if (
+                    _cfg.vm_cfg.has_value()
+                    && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
+                ) {
+                    const auto buf_name = fmt::format(
+                        "deepstack_feature_l{}_cache", layer_idx
+                    );
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{token_idx + last_valid_row, 0},
+                            std::vector<uint32_t>{
+                                1,
+                                static_cast<uint32_t>(get_buffer(buf_name).get_shape().back())
+                            }
+                        )
+                    );
+                }
             }
             if (use_single_post_for_target_group) {
                 const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
@@ -1053,6 +1204,22 @@ uint32_t LanguageModel::run_model_once(
                         )
                     );
                 }
+                if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
+                    ifm_map.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(post_ifm_idx++),
+                        std::forward_as_tuple(
+                            nullptr,
+                            std::vector<uint32_t>{slice_start, 0},
+                            std::vector<uint32_t>{
+                                single_num_tokens,
+                                _cfg.lm_cfg.attn_cfg.get_q_size(
+                                    _cfg.lm_cfg.layer_types[layer_idx]
+                                )
+                            }
+                        )
+                    );
+                }
                 if (
                     _cfg.vm_cfg.has_value()
                     && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
@@ -1071,22 +1238,6 @@ uint32_t LanguageModel::run_model_once(
                         )
                     );
                 }
-            }
-            if (_uses_per_layer_inputs() && num_tokens > 1
-                && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
-                && !_cfg.lm_cfg.is_spec_decode()) {
-                uint32_t layer_row_offset = static_cast<uint32_t>(layer_idx) * num_tokens;
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(2),
-                    std::forward_as_tuple(
-                        nullptr,
-                        std::vector<uint32_t>{
-                            layer_row_offset + static_cast<uint32_t>(num_input_tokens - 1 - token_idx), 0
-                        },
-                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size_per_layer_input}
-                    )
-                );
             }
             if (_cfg.lm_cfg.is_moe()) {
                 _run_moe_post(model_key, &ifm_map, num_tokens, layer_idx);
@@ -1151,6 +1302,14 @@ uint32_t LanguageModel::run_model_once(
                 );
             }
             _conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
+        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            LanguageModelMapKey linear_model_key(num_tokens, layer_idx, 0);
+            if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
+                _linear_model_map.at(linear_model_key)._bind_ifm(
+                    1, normal_scale_buf, {normal_input_row, 0}
+                );
+            }
+            _linear_model_map.at(linear_model_key).add_to_queue(&ifm_map);
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
@@ -1160,17 +1319,25 @@ uint32_t LanguageModel::run_model_once(
 
     // Run all the queued models.
     MLAModelWithBuffer::run_queue();
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
+                get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
+            );
+        }
+    }
 
     // If this run landed exactly on a checkpoint boundary, save the tail.
-    if (!_cached_states.empty()) {
-        for (size_t i = 0; i < _checkpoint_boundaries.size(); ++i) {
-            if (_checkpoint_boundaries[i] == next_token_idx) {
-                // A partial prefill group can land exactly on a checkpoint boundary.
-                const uint16_t valid_tokens = next_token_idx - token_idx;
-                _save_state_checkpoint(i, num_tokens, valid_tokens);
-                break;
-            }
-        }
+    if (
+        _capture_state_checkpoints
+        && std::binary_search(
+            _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), next_token_idx
+        )
+    ) {
+        // A partial prefill group can land exactly on a checkpoint boundary.
+        _save_state_checkpoint(
+            next_token_idx, num_tokens, next_token_idx - token_idx, token_idx < num_input_tokens
+        );
     }
 
     if (logits_ptr) {
@@ -1437,6 +1604,10 @@ void LanguageModel::_initialize() {
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
+        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)).clear();
+            get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).clear();
+            get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)).clear();
         } else if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
             get_buffer(fmt::format("cache_key_l{}", layer_idx)).clear();
             get_buffer(fmt::format("cache_val_l{}", layer_idx)).clear();
@@ -1450,8 +1621,24 @@ void LanguageModel::_initialize() {
     _logger->info("Language model initialize completed");
 }
 
-// Restore the latest checkpoint <= num_cached_tokens so grouped prefill can resume from a saved position.
+// Restore the latest checkpoint, or clear state when checkpoints are unavailable.
 uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens) {
+    if (_cached_states.empty()) {
+        bool cleared_state = false;
+        for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+            if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
+                get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
+                cleared_state = true;
+            } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+                get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)).clear();
+                get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).clear();
+                get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)).clear();
+                cleared_state = true;
+            }
+        }
+        return cleared_state ? 0 : num_cached_tokens;
+    }
+
     // Manual clamp semantics: if cache reuse asks past the last grouped block,
     // clamp to last_offset + group_size before selecting a checkpoint boundary.
     const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
@@ -1461,11 +1648,15 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
         num_cached_tokens = clamp_token_count;
     }
 
-    // Restore latest checkpoint boundary <= requested cache length.
-    auto it = std::upper_bound(
-        _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), num_cached_tokens
-    );
-    if (it == _checkpoint_boundaries.begin()) {
+    // Invalidate checkpoints from the old conversation branch and select the newest match.
+    size_t checkpoint_slot = 0;
+    for (size_t i = 0; i < _state_checkpoint_positions.size(); ++i) {
+        if (_state_checkpoint_positions[i] > num_cached_tokens)
+            _state_checkpoint_positions[i] = 0;
+        if (_state_checkpoint_positions[i] > _state_checkpoint_positions[checkpoint_slot])
+            checkpoint_slot = i;
+    }
+    if (!_state_checkpoint_positions[checkpoint_slot]) {
         for (const auto& state: _cached_states) {
             for (const auto& layer_idx: state.layer_indices) {
                 get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx)).clear();
@@ -1473,20 +1664,19 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
         }
         return 0;
     }
-    --it;
-    uint16_t restored_token_count = *it;
-    auto requested_boundary = std::distance(_checkpoint_boundaries.begin(), it);
+    const auto restored_token_count = _state_checkpoint_positions[checkpoint_slot];
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
     for (auto& state: _cached_states) {
+        const uint32_t restore_row_offset = state.prefill_single_output ? 0 : tail_begin;
         const size_t dst_offset = static_cast<size_t>(
-            tail_begin * state.num_elems * state.elem_size
+            restore_row_offset * state.num_elems * state.elem_size
         );
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
             auto& checkpoints = state.checkpoints[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
             buf.upload_raw(
-                checkpoints[requested_boundary].data(),
+                checkpoints[checkpoint_slot].data(),
                 dst_offset,
                 state.tail_bytes,
                 true
@@ -1498,15 +1688,47 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
 
 
 void LanguageModel::_save_state_checkpoint(
-    size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
+    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
 ) {
+    if (token_count < _system_checkpoint_position)
+        return;
+
+    size_t checkpoint_slot = 0;
+    if (token_count != _system_checkpoint_position) {
+        if (!_writable_checkpoint_slots) {
+            const size_t first_slot = _system_checkpoint_position ? 1 : 0;
+            _rolling_checkpoint_slot = first_slot;
+            for (size_t i = first_slot; i < _state_checkpoint_positions.size(); ++i) {
+                if (!_state_checkpoint_positions[i])
+                    _writable_checkpoint_slots |= 1u << i;
+                if (_state_checkpoint_positions[i] < _state_checkpoint_positions[_rolling_checkpoint_slot])
+                    _rolling_checkpoint_slot = i;
+            }
+            _writable_checkpoint_slots |= 1u << _rolling_checkpoint_slot;
+        }
+        // Prefill keeps the latest boundaries in spare slots; decode advances only the newest one.
+        if (is_prefill) {
+            for (size_t i = 0; i < _state_checkpoint_positions.size(); ++i) {
+                if ((_writable_checkpoint_slots & (1u << i))
+                    && _state_checkpoint_positions[i] < _state_checkpoint_positions[_rolling_checkpoint_slot])
+                    _rolling_checkpoint_slot = i;
+            }
+        }
+        checkpoint_slot = _rolling_checkpoint_slot;
+    }
+
     // Save the L-1 tail of each stateful layer's MLA buffer
     // so a future prefill can resume from this boundary without replay.
-    const uint32_t tail_row_offset = (num_tokens > 1)
-        ? static_cast<uint32_t>(valid_tokens - 1)
-        : static_cast<uint32_t>(_cfg.pipeline_cfg.input_token_group_size - 1);
+    const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
 
     for (auto& state: _cached_states) {
+        const uint32_t tail_row_offset = state.prefill_single_output
+            ? 0
+            : (
+                num_tokens > 1
+                    ? static_cast<uint32_t>(valid_tokens - 1)
+                    : tail_begin
+            );
         const size_t src_offset_bytes = tail_row_offset * state.num_elems * state.elem_size;
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
@@ -1514,12 +1736,13 @@ void LanguageModel::_save_state_checkpoint(
             buf.invalidate_cache();
             auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
             std::memcpy(
-                state.checkpoints[layer_slot][boundary_idx].data(),
+                state.checkpoints[layer_slot][checkpoint_slot].data(),
                 ptr + src_offset_bytes,
                 state.tail_bytes
             );
         }
     }
+    _state_checkpoint_positions[checkpoint_slot] = token_count;
 }
 
 
@@ -1528,6 +1751,9 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
     //  where the decode MLAModel expects it.
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
     for (auto& state: _cached_states) {
+        if (state.prefill_single_output) {
+            continue;
+        }
         const size_t src_offset_bytes = (valid_tokens - 1) * state.num_elems * state.elem_size;
         const size_t dst_offset_bytes = tail_begin * state.num_elems * state.elem_size;
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
@@ -1619,6 +1845,15 @@ void LanguageModel::_define_buffers() {
             "local", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention")
         );
 
+    if (_use_group_token_models && _has_linear_attention_layers()) {
+        define_buffer(
+            "linear_valid_mask",
+            {_cfg.pipeline_cfg.input_token_group_size, 1},
+            "bfloat16",
+            true
+        );
+    }
+
     // KV caches.
     std::vector<size_t> cache_shape;
     const uint16_t conv_working_len = _cfg.pipeline_cfg.input_token_group_size + _cfg.lm_cfg.conv_L_cache - 2;
@@ -1626,6 +1861,27 @@ void LanguageModel::_define_buffers() {
     for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
         if (_cfg.lm_cfg.layer_types[i] == "conv") {
             define_buffer(fmt::format("conv_cache_history_l{}", i), conv_cache_shape);
+        } else if (_cfg.lm_cfg.layer_types[i] == "linear_attention") {
+            const auto& linear_cfg = _linear_attn_cfg();
+            const uint16_t linear_conv_working_len = static_cast<uint16_t>(
+                _cfg.pipeline_cfg.input_token_group_size + linear_cfg.conv_kernel_dim - 2
+            );
+            define_buffer(
+                fmt::format("linear_conv_cache_history_l{}", i),
+                {linear_conv_working_len, linear_cfg.get_conv_dim()}
+            );
+            define_buffer(
+                fmt::format("linear_delta_state_history_l{}", i),
+                {
+                    1,
+                    linear_cfg.get_recurrent_state_size()
+                }
+            );
+            // Ping-pong state avoids MLA read-after-write corruption during grouped prefill.
+            define_buffer(
+                fmt::format("linear_delta_state_history_alt_l{}", i),
+                {1, linear_cfg.get_recurrent_state_size()}
+            );
         } else {
             if (_cfg.pipeline_cfg.use_strided_kv_cache) {
                 cache_shape = {
@@ -1788,6 +2044,14 @@ void LanguageModel::_define_buffers() {
                     {num_tokens, _cfg.lm_cfg.hidden_size}
                 );
             }
+        }
+
+        // Qwen3.5: transient gate buffer, written by Pre and consumed by Post within the same layer.
+        if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
+            define_buffer(
+                fmt::format("n{}_buffer_gate", num_tokens),
+                {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size("full_attention")}
+            );
         }
 
         // Draft-only buffers: second pre input, draft hidden states output, FC fusion buffers.
@@ -2124,6 +2388,7 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         2
         + static_cast<uint8_t>(post_uses_embedding_scale)
         + static_cast<uint8_t>(_uses_per_layer_inputs())
+        + static_cast<uint8_t>(_cfg.lm_cfg.attn_cfg.attn_output_gate)
     );
     if (
         _cfg.vm_cfg.has_value()
@@ -2656,7 +2921,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
     uint32_t token_idx = 0;
     uint32_t num_images = 0;
     uint16_t num_cached_tokens = 0;
-    while(token_idx < num_input_tokens) {
+    while (token_idx < num_input_tokens) {
         const auto& token_id = input_token_ids[token_idx];
         if (_image_token_id.has_value() && token_id == _image_token_id.value()) {
             auto next_token_idx = token_idx + _cfg.mm_cfg.value().mm_tokens_per_image;
@@ -2688,8 +2953,9 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
                 && token_idx == num_cached_tokens
                 && token_idx < _cached_token_ids.size()
                 && token_id == _cached_token_ids[token_idx]
-            )
+            ) {
                 ++num_cached_tokens;
+            }
             token_idx = next_token_idx;
         }
     }
