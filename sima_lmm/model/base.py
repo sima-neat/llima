@@ -651,7 +651,7 @@ class BaseModel(ABC):
         """
         return self.hf_model.param_exists(name)
 
-    def get_hf_param(self, name: str) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    def get_hf_param(self, name: str) -> np.ndarray | tuple:
         """Gets the parameter tensor from the LocalHuggingFaceModel object
         or GgufModel object.
 
@@ -660,7 +660,8 @@ class BaseModel(ABC):
 
         Returns:
             The parameter tensor in numpy array. For GGUF model or llm-compressor
-            quantized weights, two numpy arrays are returned: (scales, quantized_weight).
+            quantized weights return scales and quantized weight, followed by an
+            explicit group size when the source uses grouped quantization.
             
         """
         assert isinstance(self.hf_model, (LocalHuggingFaceModel, GgufModel)), \
