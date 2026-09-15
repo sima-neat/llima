@@ -540,7 +540,10 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
 
     auto score_current_logits = [this](uint32_t target_token_id) -> LogLikelihoodResult {
         MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-        buf_ptr->invalidate_cache();
+        buf_ptr->invalidate_cache(
+            0, static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+                sizeof(Eigen::bfloat16)
+        );
 
         const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
             buf_ptr->get_virtual_addr()
@@ -700,12 +703,12 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
-            const auto cache_key = _bind_attn_models(
+            const auto attn_models = _bind_attn_models(
                 num_tokens, token_idx, layer_idx, normal_scale_buf, normal_input_row
             );
-            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
-            _cache_model_map.at(cache_key).add_to_queue();
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            attn_models.pre->add_to_queue(&ifm_map);
+            attn_models.cache->add_to_queue();
+            attn_models.post->add_to_queue(&ifm_map);
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
             if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
@@ -738,6 +741,7 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
             }
         }
     }
+
 }
 
 
@@ -754,7 +758,10 @@ LogLikelihoodResult LanguageModel::_run_model_once_for_loglikelihood(
     _run_model_once_for_loglikelihood_logits(token_idx, input_token_id);
 
     MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-    buf_ptr->invalidate_cache();
+    buf_ptr->invalidate_cache(
+        0, static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+            sizeof(Eigen::bfloat16)
+    );
 
     const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
         buf_ptr->get_virtual_addr()
@@ -926,7 +933,6 @@ uint32_t LanguageModel::run_model_once(
         }
         _per_layer_model_map.at(per_layer_key).add_to_queue(&per_layer_ifm_map);
     }
-
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
 
@@ -946,10 +952,10 @@ uint32_t LanguageModel::run_model_once(
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
-            const auto cache_key = _bind_attn_models(
+            const auto attn_models = _bind_attn_models(
                 num_tokens, token_idx, layer_idx, normal_scale_buf, normal_input_row
             );
-            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
+            attn_models.pre->add_to_queue(&ifm_map);
 
             if (
                 num_input_tokens > next_token_idx
@@ -958,7 +964,7 @@ uint32_t LanguageModel::run_model_once(
                 break;
             }
 
-            _cache_model_map.at(cache_key).add_to_queue();
+            attn_models.cache->add_to_queue();
 
             const bool is_draft = _cfg.lm_cfg.is_spec_decode()
                 && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
@@ -1084,7 +1090,7 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            attn_models.post->add_to_queue(&ifm_map);
 
             // Spec-decoding capture: download n128_buffer1 (this layer's hidden
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
@@ -1168,10 +1174,13 @@ uint32_t LanguageModel::run_model_once(
     if (logits_ptr) {
         assert(num_tokens == 1 && _cfg.pipeline_cfg.return_logits);
         MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-        buf_ptr->invalidate_cache();
+        buf_ptr->invalidate_cache(
+            0, static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+                sizeof(Eigen::bfloat16)
+        );
 
         // Append the logits.
-        Eigen::bfloat16* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
+        auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
         logits_ptr->insert(logits_ptr->end(), ptr, ptr + _cfg.lm_cfg.token_cfg.vocab_size);
 
         // Return dummy token id.
@@ -1202,13 +1211,18 @@ uint32_t LanguageModel::run_model_once(
                 MLABuffer* buf_ptr = &get_buffer(
                     fmt::format("n{}_buffer4", logits_num_tokens)
                 );
-                buf_ptr->invalidate_cache();
-                auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
+                const size_t row_bytes =
+                    static_cast<size_t>(vocab_size) * sizeof(Eigen::bfloat16);
+                const size_t row_offset = static_cast<size_t>(row) * row_bytes;
+                buf_ptr->invalidate_cache(row_offset, row_bytes);
+                auto* ptr = reinterpret_cast<Eigen::bfloat16*>(
+                    static_cast<uint8_t*>(buf_ptr->get_virtual_addr()) + row_offset
+                );
                 uint32_t best_idx = 0;
-                Eigen::bfloat16 best_val = ptr[row * vocab_size];
+                Eigen::bfloat16 best_val = ptr[0];
                 for (uint32_t i = 1; i < vocab_size; ++i) {
-                    if (ptr[row * vocab_size + i] > best_val) {
-                        best_val = ptr[row * vocab_size + i];
+                    if (ptr[i] > best_val) {
+                        best_val = ptr[i];
                         best_idx = i;
                     }
                 }
@@ -1224,11 +1238,16 @@ uint32_t LanguageModel::run_model_once(
                     MLABuffer* buf_ptr = &get_buffer(
                         fmt::format("n{}_lm_split{}", logits_num_tokens, i)
                     );
-                    buf_ptr->invalidate_cache();
-                    auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
+                    const size_t row_bytes =
+                        static_cast<size_t>(split_size) * sizeof(Eigen::bfloat16);
+                    const size_t row_offset = static_cast<size_t>(row) * row_bytes;
+                    buf_ptr->invalidate_cache(row_offset, row_bytes);
+                    auto* ptr = reinterpret_cast<Eigen::bfloat16*>(
+                        static_cast<uint8_t*>(buf_ptr->get_virtual_addr()) + row_offset
+                    );
                     for (uint32_t j = 0; j < split_size; ++j) {
-                        if (ptr[row * split_size + j] > best_val) {
-                            best_val = ptr[row * split_size + j];
+                        if (ptr[j] > best_val) {
+                            best_val = ptr[j];
                             best_idx = split_begin + j;
                         }
                     }
@@ -1238,11 +1257,15 @@ uint32_t LanguageModel::run_model_once(
         } else {
             // Non-spec: read from single n1_buffer4
             MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-            buf_ptr->invalidate_cache();
+            const size_t result_bytes = _need_argmax
+                ? static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+                      sizeof(Eigen::bfloat16)
+                : sizeof(uint32_t);
+            buf_ptr->invalidate_cache(0, result_bytes);
             if (_need_argmax) {
                 next_token_id = _calc_next_token_id(buf_ptr);
             } else {
-                uint32_t* ptr = (uint32_t*)buf_ptr->get_virtual_addr();
+                auto* ptr = reinterpret_cast<uint32_t*>(buf_ptr->get_virtual_addr());
                 next_token_id = ptr[0];
             }
         }
@@ -1426,8 +1449,7 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
             buf.upload_raw(
                 checkpoints[requested_boundary].data(),
                 dst_offset,
-                state.tail_bytes,
-                true
+                state.tail_bytes
             );
         }
     }
@@ -1449,8 +1471,8 @@ void LanguageModel::_save_state_checkpoint(
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
-            auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
+            buf.invalidate_cache(src_offset_bytes, state.tail_bytes);
+            auto* ptr = static_cast<const uint8_t*>(buf.get_virtual_addr());
             std::memcpy(
                 state.checkpoints[layer_slot][boundary_idx].data(),
                 ptr + src_offset_bytes,
@@ -1471,10 +1493,19 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
-            auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
-            std::memmove(ptr + dst_offset_bytes, ptr + src_offset_bytes, state.tail_bytes);
-            buf.flush_cache();
+            const size_t access_begin = std::min(src_offset_bytes, dst_offset_bytes);
+            const size_t access_end = std::max(
+                src_offset_bytes + state.tail_bytes,
+                dst_offset_bytes + state.tail_bytes
+            );
+            buf.invalidate_cache(access_begin, access_end - access_begin);
+            auto* ptr = static_cast<uint8_t*>(buf.get_virtual_addr());
+            std::memmove(
+                ptr + dst_offset_bytes,
+                ptr + src_offset_bytes,
+                state.tail_bytes
+            );
+            buf.flush_cache(dst_offset_bytes, state.tail_bytes);
         }
     }
 }
@@ -1799,6 +1830,29 @@ void LanguageModel::_define_buffers() {
             }
         }
     }
+
+    _global_freq_real = &get_buffer("global_freq_real");
+    _global_freq_imag = &get_buffer("global_freq_imag");
+    if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        _local_freq_real = &get_buffer("local_freq_real");
+        _local_freq_imag = &get_buffer("local_freq_imag");
+    }
+    _attention_binding_buffers.resize(_cfg.lm_cfg.num_hidden_layers);
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") continue;
+        const auto source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
+        auto& buffers = _attention_binding_buffers[layer_idx];
+        buffers.key = &get_buffer(fmt::format("cache_key_l{}", source_layer));
+        buffers.value = &get_buffer(fmt::format("cache_val_l{}", source_layer));
+        if (_cfg.pipeline_cfg.quantize_kv_cache) {
+            buffers.key_scale = &get_buffer(
+                fmt::format("cache_key_scale_l{}", source_layer)
+            );
+            buffers.value_scale = &get_buffer(
+                fmt::format("cache_val_scale_l{}", source_layer)
+            );
+        }
+    }
 }
 
 
@@ -1875,7 +1929,7 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
 }
 
 
-LanguageModelMapKey LanguageModel::_bind_attn_models(
+LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
     uint16_t num_tokens,
     uint16_t token_idx,
     uint8_t layer_idx,
@@ -1891,14 +1945,12 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     auto& post_model = _post_model_map.at(pre_post_key);
 
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
+    const auto& binding_buffers = _attention_binding_buffers.at(layer_idx);
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     const bool is_single_model = num_tokens == single_num_tokens;
 
     uint16_t cache_token_idx_begin = 0;
-    const char* freq_prefix = "global";
     if (layer_type == "sliding_attention") {
-        freq_prefix = "local";
         cache_token_idx_begin = std::max(
             0,
             token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
@@ -1920,33 +1972,36 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     const uint8_t freq_ifm_idx = (
         1 + static_cast<uint8_t>(pre_uses_embedding_scale) + static_cast<uint8_t>(is_draft)
     );
-    auto& freq_real = get_buffer(fmt::format("{}_freq_real", freq_prefix));
-    auto& freq_imag = get_buffer(fmt::format("{}_freq_imag", freq_prefix));
-    pre_model._bind_ifm(freq_ifm_idx, &freq_real, {token_idx, 0});
-    pre_model._bind_ifm(freq_ifm_idx + 1, &freq_imag, {token_idx, 0});
+    MLABuffer* freq_real = layer_type == "sliding_attention"
+        ? _local_freq_real : _global_freq_real;
+    MLABuffer* freq_imag = layer_type == "sliding_attention"
+        ? _local_freq_imag : _global_freq_imag;
+    pre_model._bind_ifm(freq_ifm_idx, freq_real, {token_idx, 0});
+    pre_model._bind_ifm(freq_ifm_idx + 1, freq_imag, {token_idx, 0});
 
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         uint8_t ofm_idx = 1;
-        auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", layer_idx));
-        auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", layer_idx));
         if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-            pre_model._bind_ofm(ofm_idx++, &key_buffer, {0, token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.key, {0, token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
-                pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
+                pre_model._bind_ofm(
+                    ofm_idx++, binding_buffers.key_scale, {0, token_idx, 0}
+                );
             }
-            pre_model._bind_ofm(ofm_idx++, &val_buffer, {0, token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.value, {0, token_idx, 0});
         } else {
-            pre_model._bind_ofm(ofm_idx++, &key_buffer, {token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.key, {token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
-                pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
+                pre_model._bind_ofm(
+                    ofm_idx++, binding_buffers.key_scale, {0, token_idx, 0}
+                );
             }
-            pre_model._bind_ofm(ofm_idx++, &val_buffer, {token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.value, {token_idx, 0});
         }
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
-            pre_model._bind_ofm(ofm_idx, &scale, {0, token_idx, 0});
+            pre_model._bind_ofm(
+                ofm_idx, binding_buffers.value_scale, {0, token_idx, 0}
+            );
         }
     }
 
@@ -1964,18 +2019,20 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     // IFM 0 is the query buffer. Its pointer, begin, and shape are invariant
     // for a compact cache key, so only the layer-owned cache inputs are rebound.
     uint8_t cache_ifm_idx = 1;
-    auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", kv_source_layer));
-    auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", kv_source_layer));
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
-            cache_ifm_idx++, &key_buffer, {0, cache_token_idx_begin, 0}
+            cache_ifm_idx++, binding_buffers.key, {0, cache_token_idx_begin, 0}
         );
     } else {
-        cache_model._bind_ifm(cache_ifm_idx++, &key_buffer, {cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx++, binding_buffers.key, {cache_token_idx_begin, 0}
+        );
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer));
-        cache_model._bind_ifm(cache_ifm_idx++, &scale, {0, cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx++, binding_buffers.key_scale,
+            {0, cache_token_idx_begin, 0}
+        );
     }
     if (use_group_future_token_mask) {
         // Group-mask buffer, begin, and shape are fixed by the compact key.
@@ -1993,14 +2050,18 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     }
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
-            cache_ifm_idx++, &val_buffer, {0, cache_token_idx_begin, 0}
+            cache_ifm_idx++, binding_buffers.value, {0, cache_token_idx_begin, 0}
         );
     } else {
-        cache_model._bind_ifm(cache_ifm_idx++, &val_buffer, {cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx++, binding_buffers.value, {cache_token_idx_begin, 0}
+        );
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer));
-        cache_model._bind_ifm(cache_ifm_idx, &scale, {0, cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx, binding_buffers.value_scale,
+            {0, cache_token_idx_begin, 0}
+        );
     }
 
     if (post_uses_embedding_scale) {
@@ -2021,7 +2082,7 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         auto& deepstack = get_buffer(fmt::format("deepstack_feature_l{}_cache", layer_idx));
         post_model._bind_ifm(post_ifm_idx, &deepstack, {token_idx, 0});
     }
-    return cache_key;
+    return {&pre_model, &cache_model, &post_model};
 }
 
 
@@ -2376,23 +2437,9 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
 
     const uint16_t num_input_tokens = input_token_ids.size();
     if (_embedding_offload) _embedding_offload->prompt_ids.assign(input_token_ids.begin(), input_token_ids.end());
-    const size_t embeddings_elem_size = _cfg.pipeline_cfg.quantize_embeddings ? 1 : 2;
-    const size_t embeddings_row_size = _cfg.lm_cfg.hidden_size * embeddings_elem_size;
-    const uint8_t* embeddings_ptr = _embedding_offload ? nullptr
-        : reinterpret_cast<const uint8_t*>(get_buffer("embeddings").get_virtual_addr());
-
     MLABuffer& buf = get_buffer("input_embeds");
-    const size_t input_row_size = _cfg.lm_cfg.hidden_size * buf.get_elem_size();
-    MLABuffer* scales_buf = nullptr;
-    const MLABuffer* embedding_scales_buf = nullptr;
-    size_t scale_row_size = 0;
-    if (_cfg.pipeline_cfg.quantize_embeddings) {
-        scales_buf = &get_buffer("input_embedding_scales");
-        embedding_scales_buf = &get_buffer("embedding_scales");
-        scale_row_size = scales_buf->get_buf_len(std::vector<uint32_t>{1, 1});
-        if (_cfg.vm_cfg.has_value())
-            scales_buf->invalidate_cache();
-    }
+    MLABuffer* scales_buf = _cfg.pipeline_cfg.quantize_embeddings
+        ? &get_buffer("input_embedding_scales") : nullptr;
     uint32_t token_idx = 0;
     uint32_t num_images = 0;
     uint16_t num_cached_tokens = 0;
@@ -2404,40 +2451,29 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
             token_idx = next_token_idx;
         } else {
             auto next_token_idx = token_idx + 1;
-            if (!_embedding_offload) {
-                buf.upload_raw(
-                    embeddings_ptr + token_id * embeddings_row_size,
-                    token_idx * input_row_size,
-                    input_row_size,
-                    false
-                );
-                if (scales_buf != nullptr) {
-                    const auto* scale_src = reinterpret_cast<const uint8_t*>(
-                        embedding_scales_buf->get_virtual_addr()
-                    ) + static_cast<size_t>(token_id) * scale_row_size;
-                    scales_buf->upload_raw(
-                        scale_src,
-                        static_cast<size_t>(token_idx) * scale_row_size,
-                        scale_row_size,
-                        false
-                    );
-                }
-            }
-            if (
-                num_images == 0
-                && token_idx == num_cached_tokens
-                && token_idx < _cached_token_ids.size()
-                && token_id == _cached_token_ids[token_idx]
+            while (
+                next_token_idx < num_input_tokens
+                && (!_image_token_id
+                    || input_token_ids[next_token_idx] != *_image_token_id)
             )
-                ++num_cached_tokens;
+                ++next_token_idx;
+            if (!_embedding_offload)
+                _gather_embedding_rows(
+                    input_token_ids.subspan(token_idx, next_token_idx - token_idx),
+                    buf, scales_buf, token_idx
+                );
+            for (auto idx = token_idx; idx < next_token_idx; ++idx) {
+                if (
+                    num_images == 0
+                    && idx == num_cached_tokens
+                    && idx < _cached_token_ids.size()
+                    && input_token_ids[idx] == _cached_token_ids[idx]
+                )
+                    ++num_cached_tokens;
+            }
             token_idx = next_token_idx;
         }
     }
-    buf.flush_cache();
-    if (scales_buf != nullptr) {
-        scales_buf->flush_cache();
-    }
-
     // Update rope table if needed.
     if (
         _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type == "mrope"
@@ -2581,7 +2617,7 @@ void LanguageModel::_compute_and_upload_per_layer_inputs_prefill(
 
 
 uint32_t LanguageModel::_calc_next_token_id(MLABuffer* buf_ptr) {
-    Eigen::bfloat16* ptr = (Eigen::bfloat16*)buf_ptr->get_virtual_addr();
+    auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
     Eigen::bfloat16 max_val = ptr[0];
     uint32_t max_index = 0;
     #pragma omp parallel
