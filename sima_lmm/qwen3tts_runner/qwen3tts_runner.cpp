@@ -816,8 +816,12 @@ void Qwen3TtsRunner::reset_codec_caches() {
 }
 
 NativeTensor Qwen3TtsRunner::text_project(const NativeTensor &input) const {
-  return linear(silu(linear(input, *text_fc1_w_, text_fc1_b_)), *text_fc2_w_,
-                text_fc2_b_);
+  // Match the BF16 upstream module boundaries, keeping FP32 accumulation.
+  // Deferring every conversion until prefill upload changes conditioning.
+  const auto projected = bf16_rounded(
+      linear(bf16_rounded(input), *text_fc1_w_, text_fc1_b_));
+  const auto activated = bf16_rounded(silu(projected));
+  return bf16_rounded(linear(activated, *text_fc2_w_, text_fc2_b_));
 }
 
 NativeTensor Qwen3TtsRunner::build_prefill(const std::vector<uint32_t> &ids,
@@ -867,10 +871,12 @@ NativeTensor Qwen3TtsRunner::build_prefill(const std::vector<uint32_t> &ids,
   NativeTensor body({body_rows, kHidden});
   for (size_t i = 0; i < body.numel(); ++i)
     body.values[i] = body_base.values[i] + codec_input.values[i];
+  // Keep every role/codec-prefix row.  Upstream CustomVoice appends a
+  // provisional first-text row and removes *that* row in non-streaming mode;
+  // it does not remove the final row of this role/codec prefix.  Dropping it
+  // shifts every text token by one position and changes the conditioning seen
+  // by the autoregressive talker.
   const auto prefill_base = concatenate_rows({role, body});
-  NativeTensor prefill({prefill_base.dim(0) - 1, kHidden});
-  std::copy_n(prefill_base.values.begin(), prefill.numel(),
-              prefill.values.begin());
   std::vector<uint32_t> main(ids.begin() + 3, ids.end() - 5);
   const auto text_eos =
       concatenate_rows({text_project(gather(*text_embeddings_, main)), eos});
@@ -884,7 +890,7 @@ NativeTensor Qwen3TtsRunner::build_prefill(const std::vector<uint32_t> &ids,
   for (size_t i = 0; i < kHidden; ++i)
     final_row.values[i] = pad.values[i] + codec_bos.values[i];
   trailing = pad;
-  return bf16_rounded(concatenate_rows({prefill, final_text, final_row}));
+  return bf16_rounded(concatenate_rows({prefill_base, final_text, final_row}));
 }
 
 NativeTensor Qwen3TtsRunner::codec_embedding(int32_t token,
@@ -902,7 +908,9 @@ Qwen3TtsRunner::backbone_feedback(const std::array<int32_t, 16> &frame) const {
   NativeTensor result({1, kHidden});
   for (size_t codebook = 0; codebook < frame.size(); ++codebook)
     add_inplace(result, codec_embedding(frame[codebook], codebook));
-  return result;
+  // Upstream's BF16 reduction materializes before the text-pad addition.
+  // Keep FP32 accumulation, but do not fuse that addition into the reduction.
+  return bf16_rounded(result);
 }
 
 Qwen3TtsRunner::ModelPtr &Qwen3TtsRunner::backbone_pre(uint16_t layer,
@@ -1260,8 +1268,10 @@ NativeTensor Qwen3TtsRunner::run_backbone_prefill(const NativeTensor &prefill,
       prefill.dim(0) > kBackboneMax) {
     throw std::runtime_error("Invalid backbone prefill shape");
   }
+  // Static rows are the three chat-role tokens plus the codec control and
+  // speaker rows.  These must agree with build_prefill() exactly.
   const auto prefix_len =
-      static_cast<uint16_t>(lower(language) == "auto" ? 7 : 8);
+      static_cast<uint16_t>(lower(language) == "auto" ? 8 : 9);
   metrics.prefix_kv_static_tokens = prefix_len;
   const auto key = std::make_pair(lower(speaker), lower(language));
   const bool complete_static_prefix = prefill.dim(0) > prefix_len;
