@@ -19,6 +19,7 @@ from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.model import VisionLanguageModel
 from sima_lmm.model import vision_language_model
 from sima_lmm.model.language_model import LanguageModel
+from sima_lmm.host.configuration_helper import read_configuration_file
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -272,6 +273,34 @@ def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_p
     assert pre._layer_base_name == "layers.0"
     assert post._layer_base_name == "layers.0"
     assert model._get_part_model("dflash_context", 128, layer_idx=0).num_tokens == 128
+
+
+def test_configuration_identifies_speculative_draft_model(tmp_path):
+    configuration_file = tmp_path / "precision.py"
+    configuration_file.write_text(
+        "def get_layer_configuration(model_properties, _layer):\n"
+        "    precision = ('A_BF16_W_INT8' if model_properties['is_draft_model'] "
+        "else 'BF16')\n"
+        "    return {'precision': precision}\n"
+    )
+
+    layer_ids = [LayerID("single_pre", 0)]
+    target_cfg = SimpleNamespace(
+        lm_cfg=SimpleNamespace(num_hidden_layers=32, speculative_decoding_cfg=None),
+        get_layer_ids=lambda: layer_ids,
+    )
+    draft_cfg = SimpleNamespace(
+        lm_cfg=SimpleNamespace(
+            num_hidden_layers=6,
+            speculative_decoding_cfg=SimpleNamespace(is_draft=True),
+        ),
+        get_layer_ids=lambda: layer_ids,
+    )
+    target = read_configuration_file(SimpleNamespace(cfg=target_cfg), configuration_file)
+    draft = read_configuration_file(SimpleNamespace(cfg=draft_cfg), configuration_file)
+
+    assert set(target["precision"].values()) == {FileGenPrecision.BF16}
+    assert set(draft["precision"].values()) == {FileGenPrecision.A_BF16_W_INT8}
 
 
 def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(

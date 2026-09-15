@@ -175,7 +175,9 @@ Because these phases have different performance characteristics, you can apply d
 The `get_layer_configuration` function is called for each compiler unit and
 receives:
 
-- `model_properties`: Dictionary with `{"num_hidden_layers": int}`
+- `model_properties`: Dictionary with:
+  - `"num_hidden_layers"`: Number of language layers
+  - `"is_draft_model"`: `True` when configuring a speculative draft model
 
 - `layer`: Dictionary with:
   - `"part"`: Logical component such as `"PRE"`, `"CACHE"`, `"POST"`,
