@@ -160,6 +160,11 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
     }
+    if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
+        pre_ofms.emplace_back(
+            MLABufferSlice{&get_buffer(fmt::format("n{}_buffer_gate", num_tokens))}
+        );
+    }
     if (define_pre) {
         _define_model(
             "pre",
@@ -349,6 +354,11 @@ void LanguageModel::_define_attn_models_iter(
             }
         );
     }
+    if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
+        post_ifms.emplace_back(
+            MLABufferSlice{&get_buffer(fmt::format("n{}_buffer_gate", num_tokens))}
+        );
+    }
     if (
         _cfg.vm_cfg.has_value()
         && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
@@ -431,6 +441,8 @@ void LanguageModel::_define_attn_models_iter(
 void LanguageModel::_define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx) {
     if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
         _define_conv_models_iter(num_tokens, layer_idx);
+    } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+        _define_linear_models_iter(num_tokens, layer_idx);
     }
 }
 
@@ -505,6 +517,74 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
         _get_elf_path_conv_final(layer_idx),
         conv_final_ifms,
         conv_final_ofms
+    );
+}
+
+
+void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t layer_idx) {
+    const auto& linear_cfg = _linear_attn_cfg();
+    LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+    const uint16_t conv_tail_size = static_cast<uint16_t>(linear_cfg.conv_kernel_dim - 1);
+    const uint16_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
+
+    std::vector<MLABufferSlice> linear_ifms;
+    std::vector<MLABufferSlice> linear_ofms;
+    if (layer_idx) {
+        linear_ifms.emplace_back(
+            MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
+        );
+    } else {
+        linear_ifms.emplace_back(MLABufferSlice{});
+        if (_cfg.pipeline_cfg.quantize_embeddings) {
+            linear_ifms.emplace_back(
+                MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
+            );
+        }
+    }
+    linear_ifms.emplace_back(
+        MLABufferSlice{
+            &get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
+            {tail_begin, 0},
+            {conv_tail_size, linear_cfg.get_conv_dim()}
+        }
+    );
+    if (num_tokens > 1) {
+        linear_ifms.emplace_back(MLABufferSlice{&get_buffer("linear_valid_mask")});
+    }
+    linear_ifms.emplace_back(
+        MLABufferSlice{
+            &get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)),
+            {0, 0},
+            {1, linear_cfg.get_recurrent_state_size()}
+        }
+    );
+
+    linear_ofms.emplace_back(
+        MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
+    );
+    linear_ofms.emplace_back(
+        MLABufferSlice{
+            &get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
+            {num_tokens > 1 ? uint32_t{0} : static_cast<uint32_t>(tail_begin), 0},
+            {
+                static_cast<uint32_t>(num_tokens + conv_tail_size - 1),
+                linear_cfg.get_conv_dim()
+            }
+        }
+    );
+    linear_ofms.emplace_back(
+        MLABufferSlice{
+            &get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)),
+            {0, 0},
+            {1, linear_cfg.get_recurrent_state_size()}
+        }
+    );
+    _define_model(
+        "linear",
+        model_key,
+        _get_elf_path_linear(num_tokens, layer_idx),
+        linear_ifms,
+        linear_ofms
     );
 }
 
@@ -629,6 +709,8 @@ LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) {
         return _conv_final_model_map;
     } else if (model_type == "per_layer") {
         return _per_layer_model_map;
+    } else if (model_type == "linear") {
+        return _linear_model_map;
     } else {
         throw std::runtime_error(std::string("Invalid model type: ") + model_type);
     }
@@ -687,6 +769,19 @@ std::filesystem::path LanguageModel::_get_elf_path_conv_final(uint8_t layer_idx)
 std::filesystem::path LanguageModel::_get_elf_path_per_layer(uint16_t num_tokens) {
     auto elf_file_name = fmt::format(
         "{}_n{}_per_layer_stage1_mla.elf", _cfg.language_model_name, num_tokens
+    );
+    return _elf_dir / elf_file_name;
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_linear(
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    auto elf_file_name = fmt::format(
+        "{}_n{}_layer{}_linear_stage1_mla.elf",
+        _cfg.language_model_name,
+        num_tokens,
+        layer_idx
     );
     return _elf_dir / elf_file_name;
 }
