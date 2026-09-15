@@ -11,7 +11,7 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora,
+    SimaBuilder, build_conv, build_conv_from_dense_with_lora,
     build_activation, activation_type, activation_dtype
 )
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
