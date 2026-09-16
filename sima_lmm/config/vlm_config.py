@@ -702,7 +702,6 @@ class LanguageModelConfig(BaseConfig):
     draft_vocab_size: int = 0
     conv_L_cache: int = 3
     conv_bias: bool = False
-    qwen3tts_tail_parts: int = 27
     lora_cfg: LoraConfig | None  = None
     speculative_decoding_cfg: SpeculativeDecodingConfig | None = None
     linear_attn_cfg: LinearAttentionConfig | None = None
@@ -715,6 +714,11 @@ class LanguageModelConfig(BaseConfig):
 
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
+        # Older Qwen3-TTS builds serialized this fixed stage count for every
+        # architecture. Accept those files without propagating the extra field.
+        tail_parts = cfg.pop("qwen3tts_tail_parts", 27)
+        if cfg["arch"] == LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL and tail_parts != 27:
+            raise ValueError("Qwen3-TTS codec tail requires exactly 27 stages")
         cfg["token_cfg"] = TokenEmbedConfig(**cfg["token_cfg"])
         if cfg["rope_cfg"].get("rope_scaling") is not None:
             cfg["rope_cfg"]["rope_scaling"] = RopeScalingConfig(**cfg["rope_cfg"]["rope_scaling"])
@@ -781,7 +785,6 @@ class LanguageModelConfig(BaseConfig):
                 raise ValueError(
                     "Qwen3-TTS codec tail must preserve the raw runtime's 27-stage contract"
                 )
-            self.qwen3tts_tail_parts = 27
 
         for key in (
             "attn_logit_softcapping",
@@ -1308,7 +1311,7 @@ class VlmConfig(BaseConfig):
         if lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL:
             return [
                 LayerID("qwen3tts_tail", part_idx)
-                for part_idx in range(lm_cfg.qwen3tts_tail_parts)
+                for part_idx in range(27)
             ]
 
         layers = []

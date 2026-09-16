@@ -27,6 +27,22 @@ from sima_utils.logging.sima_logger import (
 MODEL_MANAGER = ModelManager()
 
 
+_QWEN3TTS_RUN_DEFAULTS = {
+    "prompt": None,
+    "speaker": "Vivian",
+    "language": "English",
+    "seed": 1,
+    "max_frames": 512,
+    "output_wav": Path("qwen3_tts.wav"),
+    "endpoint_silence_rms": None,
+    "endpoint_silence_frames": None,
+    "endpoint_end_pad_frames": None,
+    "endpoint_enable": False,
+    "do_sample": False,
+    "subtalker_do_sample": False,
+}
+
+
 # Common codes for both CLI and WEB modes.
 class DemoMode(str, Enum):
     CLI = "cli"
@@ -119,7 +135,17 @@ def run_model(args: argparse.Namespace) -> int:
     args.mode = DemoMode(args.mode)
     user_model_path = _resolve_run_model_path(args.model)
     if is_qwen3tts_package(user_model_path):
+        for name, default in _QWEN3TTS_RUN_DEFAULTS.items():
+            if not hasattr(args, name):
+                setattr(args, name, default)
         return _run_qwen3tts(args, user_model_path)
+    tts_options = [
+        "--" + name.replace("_", "-")
+        for name in _QWEN3TTS_RUN_DEFAULTS if hasattr(args, name)
+    ]
+    if tts_options:
+        print(f"Options require a Qwen3-TTS package: {', '.join(tts_options)}", flush=True)
+        return 1
     try:
         model_path, draft_model_path = model_manager.resolve_target_and_draft_paths(
             user_model_path
@@ -315,57 +341,53 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Path to the file with chat template.",
     )
     run_parser.add_argument("--log_level", type=str, default=None, help="Logging level")
-    run_parser.add_argument(
+    # Preserve whether an option was explicitly supplied, even at its default
+    # value. Only apply TTS defaults after detecting a Qwen3-TTS package.
+    tts_parser = run_parser.add_argument_group("Qwen3-TTS", argument_default=argparse.SUPPRESS)
+    tts_parser.add_argument(
         "--prompt",
         type=str,
-        default=None,
         help="Qwen3-TTS text. Omit to use interactive TTS prompting.",
     )
-    run_parser.add_argument("--speaker", type=str, default="Vivian", help="Qwen3-TTS speaker")
-    run_parser.add_argument("--language", type=str, default="English", help="Qwen3-TTS language")
-    run_parser.add_argument("--seed", type=int, default=1, help="Qwen3-TTS RNG seed")
-    run_parser.add_argument(
-        "--max-frames", type=int, default=512, help="Qwen3-TTS maximum codec frames"
+    tts_parser.add_argument("--speaker", type=str, help="Qwen3-TTS speaker")
+    tts_parser.add_argument("--language", type=str, help="Qwen3-TTS language")
+    tts_parser.add_argument("--seed", type=int, help="Qwen3-TTS RNG seed")
+    tts_parser.add_argument(
+        "--max-frames", type=int, help="Qwen3-TTS maximum codec frames"
     )
-    run_parser.add_argument(
+    tts_parser.add_argument(
         "--output-wav",
         type=Path,
-        default=Path("qwen3_tts.wav"),
         help="Qwen3-TTS output WAV path",
     )
-    run_parser.add_argument(
+    tts_parser.add_argument(
         "--endpoint-silence-rms",
         type=float,
-        default=None,
         help="Qwen3-TTS endpoint RMS threshold; omit to use the model-package default",
     )
-    run_parser.add_argument(
+    tts_parser.add_argument(
         "--endpoint-silence-frames",
         type=int,
-        default=None,
         help="Qwen3-TTS consecutive below-threshold frames required for endpointing",
     )
-    run_parser.add_argument(
+    tts_parser.add_argument(
         "--endpoint-end-pad-frames",
         type=int,
-        default=None,
         help="Qwen3-TTS trailing endpoint frames retained in the WAV",
     )
-    run_parser.add_argument(
+    tts_parser.add_argument(
         "--endpoint-enable",
         action="store_true",
         help="Enable Qwen3-TTS streaming endpoint detection (disabled by default)",
     )
-    run_parser.add_argument(
+    tts_parser.add_argument(
         "--do-sample",
         action=argparse.BooleanOptionalAction,
-        default=False,
         help="Enable Qwen3-TTS codebook-0 sampling",
     )
-    run_parser.add_argument(
+    tts_parser.add_argument(
         "--subtalker-do-sample",
         action=argparse.BooleanOptionalAction,
-        default=False,
         help="Enable Qwen3-TTS codebook 1-15 sampling",
     )
     run_parser.set_defaults(func=run_model)

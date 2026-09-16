@@ -85,8 +85,9 @@ class VisionLanguageModel(BaseModel):
         quantize_embeddings: bool = False,
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
-        qwen3tts_tail_wrapper: Callable[..., object] | None = None,
         target_model: "VisionLanguageModel | None" = None,
+        *,
+        qwen3tts_tail_wrapper: Callable[..., object] | None = None,
         qwen3tts_codec_tail: bool = False,
         qwen3tts_package_part: bool = False,
     ) -> "VisionLanguageModel":

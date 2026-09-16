@@ -58,6 +58,10 @@ modalix:~$ llima run <model> [options]
 
 For all available options, run `llima run -h`.
 
+Options in the **Qwen3-TTS** group (including `--prompt`, `--speaker`,
+`--output-wav`, sampling and endpoint controls) require a Qwen3-TTS package.
+They are rejected for other models; use the interactive prompt for LLMs/VLMs.
+
 To disable automatic embedding offloading and keep the tables in DRAM, run
 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
 

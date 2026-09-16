@@ -147,10 +147,6 @@ class LanguageModel(BaseModel):
             )
         )
         for layer_id, curr_precision in precision.items():
-            curr_cfg = {"precision": curr_precision}
-            if lora_mode:
-                curr_cfg["lora"] = lora_mode[layer_id]
-
             # Split during normal language-model graph construction. Each model has
             # the shared final trunk plus exactly one lm_head.N projection, so
             # it is independently generated, quantized, and compiled.
@@ -159,6 +155,9 @@ class LanguageModel(BaseModel):
                 and layer_id.part == "single_post"
                 and layer_id.part_idx == self.cfg.lm_cfg.num_hidden_layers - 1
             ):
+                curr_cfg = {"precision": curr_precision}
+                if lora_mode:
+                    curr_cfg["lora"] = lora_mode[layer_id]
                 for head_idx in range(self._code_predictor_head_count()):
                     model_list.append((
                         self._get_part_model(
@@ -239,6 +238,9 @@ class LanguageModel(BaseModel):
                 case _:
                     # Not a part of this model
                     continue
+            curr_cfg = {"precision": curr_precision}
+            if lora_mode:
+                curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
 
         # Finished creating the direct graph list.

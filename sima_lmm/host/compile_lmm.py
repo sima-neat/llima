@@ -56,7 +56,7 @@ def gen_files(
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None,
-    qwen3tts_tail_wrapper: object | None,
+    qwen3tts_tail_wrapper: object | None = None,
     *,
     qwen3tts_component_name: str | None = None,
     qwen3tts_codec_tail: bool = False,
