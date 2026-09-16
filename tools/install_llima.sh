@@ -223,8 +223,9 @@ done
 
 log "Validated ${#debs[@]} Debian package(s); LLiMa version ${expected_version}."
 
-log "Refreshing APT package indexes."
-run_sudo apt-get update
+# Skip APT refresh because the board must already have the required platform packages.
+# log "Refreshing APT package indexes."
+# run_sudo apt-get update
 
 simulate_output="$(mktemp /tmp/install-llima-apt-simulate.XXXXXX)"
 trap 'rm -f "${simulate_output}"' EXIT
