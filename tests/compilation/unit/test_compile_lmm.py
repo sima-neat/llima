@@ -226,7 +226,7 @@ def test_qwen3tts_package_guard_preserves_other_architectures_devkit():
         compile_lmm.LlmArchType.QWEN3_TTS_CODEC_DECODER,
         compile_lmm.LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL,
     }
-    for arch in compile_lmm.LlmArchType:
+    for arch in compile_lmm.LlmArchType.values():
         model = object.__new__(VisionLanguageModel)
         model.cfg = SimpleNamespace(lm_cfg=SimpleNamespace(arch=arch))
         calls = []
