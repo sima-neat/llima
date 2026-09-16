@@ -96,6 +96,10 @@ def _standard_model(
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
         )
+        # Compare layer 0 on both revisions. Older compilers default to a
+        # whole vision graph; newer compilers only expose per-layer models.
+        if hasattr(vision_model, "is_single_vision_model"):
+            vision_model.is_single_vision_model = False
         model = vision_model._get_part_model(LAYER_IDX)
     else:
         raise ValueError(f"Unsupported standard ONNX component: {case.component}")
