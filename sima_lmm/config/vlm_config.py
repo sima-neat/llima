@@ -7,11 +7,47 @@ import numpy as np
 from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.utils import ceil_div, ceil_div_row, mla_max_num_rows, round_up_to
+from sima_lmm.utils import ceil_div, round_up_to
 from sima_utils.logging.sima_logger import sima_log_warning
 
 LONG_CONTEXT_MIN_TOKENS = 2048
 LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE = 1024
+_VISION_MODEL_TYPE_ALIASES = {
+    "qwen2_5_vl_vision": "qwen2_5_vl",
+    "qwen3_vl_vision": "qwen3_vl",
+    "qwen3_5_vision": "qwen3_5",
+}
+
+
+def _normalize_attention_config(text_cfg: dict) -> dict:
+    """Translate Gemma 4 per-layer overrides into our full/sliding contract."""
+    if text_cfg.get("model_type") != "gemma4_text" or not text_cfg.get("per_layer_config"):
+        return text_cfg
+
+    layer_types = text_cfg["layer_types"]
+    # Transformers serializes indices with zero padding (e.g. "04").
+    overrides = {int(index): values for index, values in text_cfg["per_layer_config"].items()}
+    if any(not 0 <= index < len(layer_types) for index in overrides):
+        raise ValueError("Gemma 4 layer override index is out of range")
+
+    dimensions = {}
+    for index, layer_type in enumerate(layer_types):
+        if layer_type not in ("full_attention", "sliding_attention"):
+            raise ValueError(f"Unsupported Gemma 4 layer type: {layer_type}")
+        values = overrides.get(index, {})
+        for key, value in values.items():
+            if key != "head_dim" and value != text_cfg.get(key):
+                raise ValueError(f"Unsupported Gemma 4 layer {index} override: {key}={value!r}")
+        default = text_cfg.get("global_head_dim") if layer_type == "full_attention" else None
+        dimension = values.get("head_dim", default or text_cfg["head_dim"])
+        if dimensions.setdefault(layer_type, dimension) != dimension:
+            raise ValueError(f"Inconsistent Gemma 4 head dimensions for {layer_type}")
+
+    normalized = dict(text_cfg)
+    normalized["head_dim"] = dimensions.get("sliding_attention", text_cfg["head_dim"])
+    if "full_attention" in dimensions:
+        normalized["global_head_dim"] = dimensions["full_attention"]
+    return normalized
 
 
 class ExtensibleEnum:
@@ -65,6 +101,7 @@ class VlmArchType(str, ExtensibleEnum):
     LLM_GEMMA = "llm-gemma"
     LLM_GEMMA2 = "llm-gemma2"
     LLM_GEMMA3 = "llm-gemma3"
+    LLM_GPT_OSS = "llm-gpt_oss"
     LLM_LFM2 = "llm-lfm2"
     LLM_LLAMA = "llm-llama"
     LLM_MISTRAL = "llm-mistral"
@@ -79,6 +116,7 @@ class VlmArchType(str, ExtensibleEnum):
     VLM_PALIGEMMA = "vlm-paligemma"
     VLM_QWEN2_5_VL = "vlm-qwen2_5_vl"
     VLM_QWEN3_VL = "vlm-qwen3_vl"
+    VLM_QWEN3_5_VL = "vlm-qwen3_5"
 
 class VisionArchType(str, ExtensibleEnum):
     """Vision architecture type.
@@ -89,6 +127,7 @@ class VisionArchType(str, ExtensibleEnum):
     QWEN2_VISION_ENCODER = "qwen2_5_vl"
     QWEN3_VISION_ENCODER = "qwen3_vl"
     GEMMA4_VISION_ENCODER = "gemma4_vision"
+    QWEN3_5_VISION_ENCODER = "qwen3_5"
 
 
 class LlmArchType(str, ExtensibleEnum):
@@ -97,6 +136,7 @@ class LlmArchType(str, ExtensibleEnum):
     LLAMA = "llama"
     LFM = "lfm"
     GEMMA = "gemma"
+    GPT_OSS = "gpt_oss"
     PHI = "phi"
     QWEN = "qwen"
     MISTRAL = "mistral"
@@ -104,6 +144,7 @@ class LlmArchType(str, ExtensibleEnum):
     QWEN3_TTS_CODE_PREDICTOR = "qwen3_tts_talker_code_predictor"
     QWEN3_TTS_CODEC_DECODER = "qwen3_tts_tokenizer_v2_decoder"
     QWEN3_TTS_CODEC_DECODER_TAIL = "qwen3_tts_tokenizer_v2_decoder_tail"
+    OLMOE = "olmoe"
 
 
 class LlmDataType(str, ExtensibleEnum):
@@ -226,6 +267,7 @@ class VisionModelConfig(BaseConfig):
         if "num_hidden_layers" not in vision_cfg and "depth" in vision_cfg:
             vision_cfg["num_hidden_layers"] = vision_cfg["depth"]
         super().set_config(vision_cfg)
+        self.model_type = _VISION_MODEL_TYPE_ALIASES.get(self.model_type, self.model_type)
 
         self.arch = arch
         self.image_size = vision_cfg.get("image_size") or model_cfg.get("tile_size", 0)
@@ -451,6 +493,7 @@ class AttentionBlockConfig(BaseConfig):
     attention_bias: bool = False
     attention_dropout: float = 0.0
     query_pre_attn_scalar: int = 0
+    attn_output_gate: bool = False  # Qwen3.5: per-head sigmoid gate on attention output.
 
     def set_config(self, text_cfg: dict, layer_types: list[str]):
         super().set_config(text_cfg)
@@ -487,17 +530,71 @@ class MlpBlockConfig(BaseConfig):
         act: The type of activation.
         num_layers: The number of layers in MLP.
         mlp_bias: Reserved for future use.
+        swiglu_limit: Clamp limit for the gated SwiGLU activation (gpt_oss); None when
+            the model's activation is not clamped. Read from the model config.
     """
     intermediate_size: int = 0
     act: str = "silu"
     num_layers: int = 3
     mlp_bias: bool = False
+    swiglu_limit: float | None = None
 
     def set_config(self, text_cfg: dict, lm_arch: "LlmArchType"):
         super().set_config(text_cfg)
         self.act = (
             text_cfg.get("hidden_act") or text_cfg.get("hidden_activation")
             or ("gelu_pytorch_tanh" if lm_arch == LlmArchType.GEMMA else "silu")
+        )
+
+
+@dataclass
+class LinearAttentionConfig(BaseConfig):
+    """Configuration of Gated DeltaNet linear-attention layers (Qwen3.5)."""
+    conv_kernel_dim: int = 0
+    key_head_dim: int = 0
+    value_head_dim: int = 0
+    num_key_heads: int = 0
+    num_value_heads: int = 0
+
+    @property
+    def key_dim(self) -> int:
+        return self.num_key_heads * self.key_head_dim
+
+    @property
+    def value_dim(self) -> int:
+        return self.num_value_heads * self.value_head_dim
+
+    @property
+    def conv_dim(self) -> int:
+        return 2 * self.key_dim + self.value_dim
+
+    @property
+    def recurrent_state_size(self) -> int:
+        return self.num_value_heads * self.key_head_dim * self.value_head_dim
+
+
+@dataclass
+class MixtureOfExpertsConfig(BaseConfig):
+    """Configuration of a Mixture-of-Experts (MoE) feed-forward block.
+
+    For MoE models the dense MLP is replaced by a bank of expert MLPs plus a
+    router that activates a subset of experts per token. The per-expert MLP
+    dimensions and activation are described by the accompanying MlpBlockConfig.
+
+    Attributes:
+        num_experts: Total number of experts in each MoE layer.
+        num_experts_per_tok: Number of experts the router activates per token (top-k).
+    """
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+
+    def set_config(self, text_cfg: dict):
+        # gpt_oss/Mixtral use "num_local_experts"; OLMoE uses "num_experts".
+        self.num_experts = text_cfg.get(
+            "num_local_experts", text_cfg.get("num_experts", 0)
+        )
+        self.num_experts_per_tok = text_cfg.get(
+            "num_experts_per_tok", text_cfg.get("experts_per_token", 0)
         )
 
 
@@ -557,6 +654,7 @@ class LanguageModelConfig(BaseConfig):
         rope_cfg: The settings of RoPE.
         attn_cfg: The settings of attention block.
         mlp_cfg: The settings of MLP block.
+        moe_cfg: The Mixture-of-Experts routing settings; None for dense models.
         hidden_size: The dimension of the embedding.
         num_hidden_layers: The number of transformer blocks.
         max_position_embeddings: The context length.
@@ -587,6 +685,7 @@ class LanguageModelConfig(BaseConfig):
     rope_cfg: RoPEConfig = field(default_factory=RoPEConfig)
     attn_cfg: AttentionBlockConfig = field(default_factory=AttentionBlockConfig)
     mlp_cfg: MlpBlockConfig = field(default_factory=MlpBlockConfig)
+    moe_cfg: MixtureOfExpertsConfig | None = None
     hidden_size: int = 0
     num_hidden_layers: int = 0
     max_position_embeddings: int = 0
@@ -606,6 +705,7 @@ class LanguageModelConfig(BaseConfig):
     qwen3tts_tail_parts: int = 27
     lora_cfg: LoraConfig | None  = None
     speculative_decoding_cfg: SpeculativeDecodingConfig | None = None
+    linear_attn_cfg: LinearAttentionConfig | None = None
 
     def __post_init__(self):
         self.lm_head_split_dim = (
@@ -621,17 +721,22 @@ class LanguageModelConfig(BaseConfig):
         cfg["rope_cfg"] = RoPEConfig(**cfg["rope_cfg"])
         cfg["attn_cfg"] = AttentionBlockConfig(**cfg["attn_cfg"])
         cfg["mlp_cfg"] = MlpBlockConfig(**cfg["mlp_cfg"])
+        if cfg.get("moe_cfg") is not None:
+            cfg["moe_cfg"] = MixtureOfExpertsConfig(**cfg["moe_cfg"])
         cfg["data_type"] = LlmDataType(cfg["data_type"])
         cfg["arch"] = LlmArchType(cfg["arch"])
         if cfg.get("lora_cfg") is not None:
             cfg["lora_cfg"] = LoraConfig(**cfg["lora_cfg"])
         if cfg.get("speculative_decoding_cfg") is not None:
             cfg["speculative_decoding_cfg"] = SpeculativeDecodingConfig(**cfg["speculative_decoding_cfg"])
+        if cfg.get("linear_attn_cfg") is not None:
+            cfg["linear_attn_cfg"] = LinearAttentionConfig(**cfg["linear_attn_cfg"])
         lmc = LanguageModelConfig(**cfg)
         lmc._calc_lm_head_splits()
         return lmc
 
     def set_config(self, text_cfg: dict, dtype: "LlmDataType", lm_arch: "LlmArchType", model_format: "ModelFormat"):
+        text_cfg = _normalize_attention_config(text_cfg)
         self.model_type = text_cfg["model_type"]
         self.data_type = dtype
         self.arch = lm_arch
@@ -650,6 +755,12 @@ class LanguageModelConfig(BaseConfig):
         self.rope_cfg.set_config(text_cfg)
         self.attn_cfg.set_config(text_cfg, layer_types)
         self.mlp_cfg.set_config(text_cfg, lm_arch)
+        # gpt_oss/Mixtral advertise experts via "num_local_experts"; OLMoE via "num_experts".
+        # Dense models (e.g. Gemma) may still declare these keys with a null/0 value, so
+        # gate on a positive expert count rather than mere key presence.
+        if text_cfg.get("num_local_experts") or text_cfg.get("num_experts"):
+            self.moe_cfg = MixtureOfExpertsConfig()
+            self.moe_cfg.set_config(text_cfg)
 
         self.hidden_size = text_cfg.get("hidden_size", 0)
         self.num_hidden_layers = num_hidden_layers
@@ -657,8 +768,10 @@ class LanguageModelConfig(BaseConfig):
         self.rms_norm_eps = text_cfg.get("rms_norm_eps", text_cfg.get("norm_eps", 1e-05))
         self.rms_norm_unit_offset = (
             model_format == ModelFormat.FORMAT_HF
-            and lm_arch == LlmArchType.GEMMA
-            and not self.model_type.startswith("gemma4")
+            and (
+                (lm_arch == LlmArchType.GEMMA and not self.model_type.startswith("gemma4"))
+                or text_cfg.get("model_type") == "qwen3_5_text"
+            )
         )
         self.layer_types = layer_types
         self.draft_vocab_size = text_cfg.get("draft_vocab_size", 0)
@@ -699,6 +812,15 @@ class LanguageModelConfig(BaseConfig):
         rope_scaling_cfg = getattr(self.rope_cfg, "rope_scaling", None)
         if rope_scaling_cfg and getattr(rope_scaling_cfg, "mrope_section", None):
             rope_scaling_cfg.rope_type = "mrope"
+
+        if any(t == "linear_attention" for t in layer_types):
+            self.linear_attn_cfg = LinearAttentionConfig(
+                conv_kernel_dim=text_cfg.get("linear_conv_kernel_dim", 0),
+                key_head_dim=text_cfg.get("linear_key_head_dim", 0),
+                value_head_dim=text_cfg.get("linear_value_head_dim", 0),
+                num_key_heads=text_cfg.get("linear_num_key_heads", 0),
+                num_value_heads=text_cfg.get("linear_num_value_heads", 0),
+            )
         self._calc_lm_head_splits()
 
     def is_kv_shared_layer(self, layer_idx: int) -> bool:
@@ -721,6 +843,10 @@ class LanguageModelConfig(BaseConfig):
         if cfg is None:
             self.speculative_decoding_cfg = None
         else:
+            if self.linear_attn_cfg is not None:
+                raise ValueError(
+                    "EAGLE3 speculative decoding does not support linear-attention layers"
+                )
             if self.attn_cfg.swa_enable:
                 raise ValueError(
                     "EAGLE3 speculative decoding does not support sliding-window attention"
@@ -833,7 +959,6 @@ class PipelineConfig(BaseConfig):
         enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
         quantize_kv_cache: Enables KV cache quantization to reduce memory consumption.
-        split_mlp: Split the MLP into multiple stages in order to reduce TTFT.
     """
     system_prompt: str | None = None
     chat_template: str | None = None
@@ -846,7 +971,6 @@ class PipelineConfig(BaseConfig):
     enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
     quantize_kv_cache: bool = False
-    split_mlp: bool = False
 
     def set_system_prompt(self, prompt: str | None):
         self.system_prompt = prompt
@@ -911,9 +1035,6 @@ class PipelineConfig(BaseConfig):
 
     def set_quantize_kv_cache(self, quantize_kv_cache: bool):
         self.quantize_kv_cache = quantize_kv_cache
-
-    def set_split_mlp(self, split_mlp: bool):
-        self.split_mlp = split_mlp
 
 
 @dataclass
@@ -1027,6 +1148,7 @@ class VlmConfig(BaseConfig):
                     VisionArchType.QWEN2_VISION_ENCODER,
                     VisionArchType.QWEN3_VISION_ENCODER,
                     VisionArchType.GEMMA4_VISION_ENCODER,
+                    VisionArchType.QWEN3_5_VISION_ENCODER,
                 ):
                 raise RuntimeError(
                     f"{vlm_cfg.vm_cfg.arch} models require --input_height and --input_width arguments"
@@ -1039,7 +1161,12 @@ class VlmConfig(BaseConfig):
                     if height % 32 != 0 or width % 32 != 0:
                         raise RuntimeError(f"Input image dimensions ({height}x{width}) must be divisible by 32 for Siglip2 based models.")
                     vlm_cfg.vm_cfg.image_size = image_resolution
-                elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER, VisionArchType.GEMMA4_VISION_ENCODER):
+                elif vlm_cfg.vm_cfg.arch in (
+                    VisionArchType.QWEN2_VISION_ENCODER,
+                    VisionArchType.QWEN3_VISION_ENCODER,
+                    VisionArchType.GEMMA4_VISION_ENCODER,
+                    VisionArchType.QWEN3_5_VISION_ENCODER,
+                ):
                     height, width = image_resolution
                     divisor = vlm_cfg.vm_cfg.patch_size * vlm_cfg.vm_cfg.spatial_merge_size
                     if height % divisor != 0 or width % divisor != 0:
@@ -1047,17 +1174,6 @@ class VlmConfig(BaseConfig):
                             f"For {vlm_cfg.vm_cfg.arch}, image dimensions ({height}x{width}) must be divisible by "
                             f"(patch_size * spatial_merge_size), which is {divisor}."
                         )
-                    # Qwen per-layer graphs do not yet support split-ELF execution.
-                    if vlm_cfg.vm_cfg.arch in (
-                        VisionArchType.QWEN2_VISION_ENCODER,
-                        VisionArchType.QWEN3_VISION_ENCODER,
-                    ):
-                        seq_len = (height // vlm_cfg.vm_cfg.patch_size) * (width // vlm_cfg.vm_cfg.patch_size)
-                        if seq_len * ceil_div_row(seq_len) * 2 > mla_max_num_rows:
-                            raise RuntimeError(
-                                f"Input image resolution ({height}x{width}) exceeds the maximum allowed for "
-                                f"single-ELF vision encoding for {vlm_cfg.vm_cfg.arch} "
-                            )
                     vlm_cfg.vm_cfg.image_size = image_resolution
                 else:
                     sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2, Qwen-VL, or Gemma4 based.")
@@ -1074,7 +1190,12 @@ class VlmConfig(BaseConfig):
                         f"patch_size * downsample_factor ({ps * df})."
                     )
                 vlm_cfg.mm_cfg.mm_tokens_per_image = (h // ps // df) * (w // ps // df)
-            elif vlm_cfg.vm_cfg.arch in (VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER, VisionArchType.GEMMA4_VISION_ENCODER):
+            elif vlm_cfg.vm_cfg.arch in (
+                VisionArchType.QWEN2_VISION_ENCODER,
+                VisionArchType.QWEN3_VISION_ENCODER,
+                VisionArchType.GEMMA4_VISION_ENCODER,
+                VisionArchType.QWEN3_5_VISION_ENCODER,
+            ):
                 if isinstance(vlm_cfg.vm_cfg.image_size, list):
                     h, w = vlm_cfg.vm_cfg.image_size
                 else:
@@ -1126,6 +1247,21 @@ class VlmConfig(BaseConfig):
             and not (self.model_type == VlmArchType.VLM_GEMMA3 and self.vm_cfg.image_size > 448)
         )
 
+    @property
+    def num_vision_layers(self) -> int:
+        if self.vm_cfg is None:
+            return 0
+        # LLaVA consumes the penultimate vision hidden state.
+        return self.vm_cfg.num_hidden_layers - int(
+            self.model_type == VlmArchType.VLM_LLAVA
+        )
+
+    def get_vision_model_names(self, model_name: str) -> list[str]:
+        return [
+            f"{model_name}_layer{layer_idx}"
+            for layer_idx in range(self.num_vision_layers)
+        ]
+
     def config_pipeline(
         self,
         system_prompt: str | None,
@@ -1139,6 +1275,17 @@ class VlmConfig(BaseConfig):
         self.pipeline_cfg.set_max_num_tokens(max_num_tokens)
         self.pipeline_cfg.set_group_size(language_group_size)
         self.pipeline_cfg.set_future_token_mask_size(future_token_mask_size)
+
+        group_size = self.pipeline_cfg.input_token_group_size
+        if (
+            self.lm_cfg.linear_attn_cfg is not None
+            and group_size not in (1, 4, 8, 16)
+            and group_size % 32
+        ):
+            raise ValueError(
+                "language_group_size must be 1, 4, 8, 16, or a multiple of 32 "
+                "for linear-attention models"
+            )
 
         if (
             self.lm_cfg.attn_cfg.swa_enable
@@ -1188,11 +1335,36 @@ class VlmConfig(BaseConfig):
                     layers.append(LayerID("single_conv", i))
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
-                    layers.append(LayerID("group_pre", i))
-                    if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
-                        layers.append(LayerID("group_post", i))
-                    layers.append(LayerID("single_pre", i))
-                    layers.append(LayerID("single_post", i))
+                    if lm_cfg.moe_cfg is not None:
+                        # MoE layers replace the single post (MLP) part with a router
+                        # plus one model per expert, for both group and single paths.
+                        num_experts = lm_cfg.moe_cfg.num_experts
+                        layers.append(LayerID("group_pre", i))
+                        # The last layer's post (router/experts/combine, and the
+                        # combine's folded-in lm_head) runs single-token only,
+                        # mirroring the non-MoE path which skips group_post on the
+                        # last layer. So skip the group router/experts/combine there.
+                        if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
+                            layers.append(LayerID("group_router", i))
+                            layers.extend(
+                                LayerID("group_expert", i, e) for e in range(num_experts)
+                            )
+                            layers.append(LayerID("group_weightedsum", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_router", i))
+                        layers.extend(
+                            LayerID("single_expert", i, e) for e in range(num_experts)
+                        )
+                        layers.append(LayerID("single_weightedsum", i))
+                    else:
+                        layers.append(LayerID("group_pre", i))
+                        if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
+                            layers.append(LayerID("group_post", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_post", i))
+                elif t == "linear_attention":
+                    layers.append(LayerID("group_linear", i))
+                    layers.append(LayerID("single_linear", i))
                 else:
                     raise ValueError(f"Unsupported layer type: {t}")
             # Cache models are shared across layers; include only for kinds that exist
@@ -1282,7 +1454,10 @@ class VlmConfig(BaseConfig):
             layers.extend(LayerID("single_post", n) for n in range(lm_cfg.num_hidden_layers))
             layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
         if self.vm_cfg is not None and self.is_supported_multimodal:
-            layers.extend(LayerID("vision", n) for n in range(vision_model_layer_count(self.vm_cfg)))
+            layers.extend(
+                LayerID("vision", n)
+                for n in range(self.num_vision_layers)
+            )
         if is_speculative_draft:
             layers.append(LayerID("group_draft_fc", 0))
             layers.append(LayerID("single_draft_fc", 0))
@@ -1364,7 +1539,7 @@ def get_model_arch_gen(
     ):
         return None, LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL, ""
     t_reg = re.fullmatch(
-        r"(?P<arch>[a-zA-Z]+)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
+        r"(?P<arch>[a-zA-Z]+(?:_[a-zA-Z]+)*?)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
         text_type,
     )
     for arch in LlmArchType.values():
@@ -1376,6 +1551,7 @@ def get_model_arch_gen(
         raise NotImplementedError(f"Unsupported LLM architecture: {text_type}")
 
     if is_vlm:
+        vision_type = _VISION_MODEL_TYPE_ALIASES.get(vision_type, vision_type)
         vm_arch = VisionArchType(vision_type.split("_vision_model")[0])
     else:
         vm_arch = None
@@ -1565,32 +1741,6 @@ def single_shared_sliding_cache_model_indices(
     return sorted(set(single_cache_model_indices(cfg)) | set(
         single_sliding_cache_model_indices(cfg, sliding_window)
     ))
-
-
-def vision_model_layer_count(cfg: VisionModelConfig) -> int:
-    """
-    Get the number of layers in the vision model.
-    """
-    elem_size = 2
-    seq_len = cfg.seq_len
-    num_mla_rows_per_head = seq_len * ceil_div_row(seq_len) * elem_size
-    is_single_vision_model = num_mla_rows_per_head <= mla_max_num_rows
-
-    if is_single_vision_model:
-        return 1
-    elif cfg.model_type == VlmArchType.VLM_LLAVA:
-        # Last vision layer of LLAVA is unused
-        return cfg.num_hidden_layers - 1
-    else:
-        return cfg.num_hidden_layers
-
-
-def vision_model_names(cfg: VisionModelConfig, model_name: str) -> list[str]:
-    """Get the generated vision model artifact names in execution order."""
-    num_models = vision_model_layer_count(cfg)
-    if num_models == 1:
-        return [model_name]
-    return [f"{model_name}_layer{layer_idx}" for layer_idx in range(num_models)]
 
 
 if __name__ == "__main__":

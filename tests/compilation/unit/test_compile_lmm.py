@@ -1,6 +1,9 @@
+import inspect
 import sys
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
+import numpy as np
 import pytest
 
 from sima_lmm.host import compile_lmm
@@ -12,14 +15,14 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 @pytest.mark.parametrize(
     ("options", "expected"),
     [
-        ([], (False, True, True, True, False)),
+        ([], (False, True, True, False)),
         (
             ["--onnx", "--no-quantize_embeddings", "--no-quantize_kv_cache"],
-            (False, False, False, True, False),
+            (False, False, False, False),
         ),
         (
             ["--draft_model_path", "draft"],
-            (False, True, True, True, True),
+            (False, True, True, True),
         ),
         (
             [
@@ -27,7 +30,7 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
                 "--no-quantize_embeddings",
                 "--no-quantize_kv_cache",
             ],
-            (True, False, False, True, False),
+            (True, False, False, False),
         ),
     ],
 )
@@ -35,7 +38,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
     options: list[str],
-    expected: tuple[bool, bool, bool, bool, bool],
+    expected: tuple[bool, bool, bool, bool],
 ):
     calls = []
     monkeypatch.setattr(
@@ -56,7 +59,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     compile_lmm.main()
 
     args = calls[0]
-    assert (args[12], args[13], args[14], args[15], args[16]) == expected
+    assert (args[12], args[13], args[14], args[15]) == expected
 
 
 @pytest.mark.parametrize(
@@ -149,7 +152,8 @@ def test_qwen3tts_defaults_to_its_package_model_directory(
     assert calls[0][1] == package / "qwen3_model"
 
 
-def test_qwen3tts_component_roots_preserve_runner_elf_names():
+def test_qwen3tts_component_roots_preserve_runner_elf_names(monkeypatch, tmp_path):
+    from sima_lmm.model import qwen3tts_model
     from sima_lmm.model.qwen3tts_model import QWEN3TTS_COMPONENTS
 
     parts = [
@@ -162,6 +166,90 @@ def test_qwen3tts_component_roots_preserve_runner_elf_names():
         ("codec_decoder", "codec_decoder", False),
         ("codec_decoder", "codec_decoder_tail_full", True),
     ]
+
+    # Exercise the real composite caller against the current gen_files
+    # signature: removed/reordered shared arguments must not shift TTS options.
+    for directory, _, _ in parts:
+        source = tmp_path / "qwen3_components" / directory
+        source.mkdir(parents=True, exist_ok=True)
+        (source / "config.json").write_text("{}")
+        (source / "model.safetensors").touch()
+    output = tmp_path / "qwen3_model"
+    contract = output / "devkit" / "codec_tail_raw_mla_contract.json"
+    contract.parent.mkdir(parents=True)
+    contract.write_text("{}")
+    signature = inspect.signature(compile_lmm.gen_files)
+    generate = create_autospec(compile_lmm.gen_files)
+    monkeypatch.setattr(compile_lmm, "gen_files", generate)
+    monkeypatch.setattr(
+        qwen3tts_model, "Qwen3TTSPartModel",
+        lambda cfg, name, **kwargs: SimpleNamespace(
+            model_name=name, gen_files=lambda *args, **options: None
+        ),
+    )
+    wrapper = object()
+    compile_lmm.gen_qwen3tts(
+        tmp_path, output, compile_lmm.FileGenMode.ALL, 30, False, 1, wrapper
+    )
+    assert generate.call_count == len(parts)
+    for call, (directory, name, is_tail) in zip(generate.call_args_list, parts, strict=True):
+        arguments = signature.bind(*call.args, **call.kwargs).arguments
+        assert arguments["model_path"] == tmp_path / "qwen3_components" / directory
+        assert arguments["qwen3tts_component_name"] == name
+        assert arguments["qwen3tts_codec_tail"] == is_tail
+        assert arguments["qwen3tts_tail_wrapper"] is wrapper
+        assert arguments["quantize_embeddings"] is True
+        assert arguments["quantize_kv_cache"] is True
+        assert arguments["return_logits"] is False
+        assert arguments["log_level"] == 30
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "codec", "invalid-scale"])
+def test_qwen3tts_layer_scale_survives_unsplit_mlp(monkeypatch, mode):
+    from sima_lmm.model import sima_builder
+    from sima_lmm.model.language_part_base import LanguagePartBaseModel
+
+    calls = []
+
+    def conv(builder, get_param, check_param, name, node, rank, **kwargs):
+        calls.append((name, kwargs))
+        return name
+
+    monkeypatch.setattr(sima_builder, "build_conv_from_dense_with_lora", conv)
+    monkeypatch.setattr(sima_builder, "build_activation", lambda *args: "activation")
+    model = object.__new__(LanguagePartBaseModel)
+    model.cfg = SimpleNamespace(lm_cfg=SimpleNamespace(
+        arch=(compile_lmm.LlmArchType.QWEN3_TTS_CODEC_DECODER if mode == "codec"
+              else compile_lmm.LlmArchType.LLAMA),
+        lora_cfg=None, mlp_cfg=SimpleNamespace(act="silu"),
+    ))
+    model.check_hf_param = lambda name: False
+    model.get_hf_param = lambda name: None
+    builder = SimpleNamespace(
+        create_mul_node=lambda *args: "product",
+        create_add_node=lambda left, right: (left, right),
+    )
+    scale = None if mode == "ordinary" else np.array([2, 3], dtype=np.float32)
+    if mode == "invalid-scale":
+        with pytest.raises(AssertionError):
+            model._build_sima_mlp(builder, "mlp", ["input"], False, output_scale=scale)
+        return
+    result = model._build_sima_mlp(
+        builder, "mlp", ["input", "residual"], False,
+        with_residual_add=True, output_scale=scale,
+    )
+    assert result == ("residual", "mlp.down_proj")
+    assert [name for name, _ in calls] == ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
+    assert all("weight_slice" not in kwargs for _, kwargs in calls)
+    if mode == "ordinary":
+        assert all(kwargs == {"merged_lora": False} for _, kwargs in calls)
+    else:
+        kwargs = calls[-1][1]
+        np.testing.assert_array_equal(
+            kwargs["weight_process_func"](np.ones((2, 4, 1, 1))),
+            np.broadcast_to(scale.reshape(2, 1, 1, 1), (2, 4, 1, 1)),
+        )
+        np.testing.assert_array_equal(kwargs["bias_process_func"](np.ones(2)), scale)
 
 
 def test_standard_compilation_does_not_import_qwen3tts_compiler(

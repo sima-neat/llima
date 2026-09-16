@@ -68,11 +68,12 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 69
+- Expected cases: 105
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
 - Configuration parsing and validation.
+- Per-layer vision partitioning, tensor shapes, and deepstack routing.
 - Quantization configuration and precision selection.
 - Weight-name mapping.
 - Small pure-Python compiler checks.
@@ -84,7 +85,7 @@ offline mode, and reject network connections.
 
 - Location: `tests/compilation/configuration/`
 - Marker: `compiler_config`
-- Expected cases: 25
+- Expected cases: 26
 
 Generates `VlmConfig` objects from cached Hugging Face and GGUF sources and
 compares them with the checked-in JSON contracts under
@@ -119,7 +120,7 @@ shared across quantization variants where possible.
 
 - Location: `tests/compilation/onnx_regression/`
 - Marker: `compiler_onnx_regression`
-- Expected cases: 32
+- Expected cases: 37
 
 Every case:
 
@@ -291,12 +292,13 @@ the installed runtime and use the image and audio assets installed by
 
 ### GenAI model preparation
 
-The dedicated `Prepare GenAI models` step keeps the shared runtime fixtures
-aligned with Core and adds two LLiMa-specific reasoning fixtures:
+The dedicated `Prepare GenAI models` step keeps the shared text and VLM runtime
+fixtures aligned with Core. It adds a layered-encoder Whisper fixture and two
+LLiMa-specific reasoning fixtures:
 
 - `Qwen2.5-0.5B-Instruct-Autoround-a16w4`
 - `LFM2.5-VL-450M-Autoround-a16w4`
-- `whisper-small-a16w8`
+- `florianvoss/whisper-small-a16w8-layered-encoder`
 - `Qwen3-0.6B-Autoround-a16w4`
 - `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`
 
@@ -306,6 +308,7 @@ The shared environment contract is:
 - `SIMA_TEST_LLIMA_TEXT_MODEL`
 - `SIMA_TEST_LLIMA_VLM_MODEL`
 - `SIMA_TEST_LLIMA_ASR_MODEL`
+- `SIMA_TEST_LLIMA_ASR_REPO`
 - `SIMA_TEST_LLIMA_REASONING_QWEN_MODEL`
 - `SIMA_TEST_LLIMA_REASONING_GEMMA_MODEL`
 
@@ -323,6 +326,20 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.asr_transcription` | Whisper transcription using the installed sample audio |
 | `runtime.tool_call_parser` | Tool-call parsing safety and streaming provenance without model inference |
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
+| `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |
+| `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
+
+The embedding generation test requires raw embedding tables on local NVMe
+and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
+`SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
+and `auto`, verifies that automatic offloading saves DRAM, and checks allocation
+cleanup after teardown. The executable also accepts an explicit model directory
+and optionally a speculative draft model directory:
+
+```bash
+./lib/sima-lmm/tests/sima_lmm_embedding_offload_generation_test \
+  /media/nvme/llima/models/Gemma-4-E4B-it-GPTQ-a16w4
+```
 
 The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on

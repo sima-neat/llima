@@ -17,7 +17,6 @@ from sima_lmm.model.base import (
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
-from sima_lmm.utils import ceil_div_row, mla_max_num_rows
 from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
 
 
@@ -85,7 +84,6 @@ class VisionLanguageModel(BaseModel):
         enable_filter_sharing: bool = False,
         quantize_embeddings: bool = False,
         quantize_kv_cache: bool = False,
-        split_mlp: bool = False,
         image_resolution: list[int] | None = None,
         qwen3tts_tail_wrapper: Callable[..., object] | None = None,
         target_model: "VisionLanguageModel | None" = None,
@@ -107,7 +105,6 @@ class VisionLanguageModel(BaseModel):
                 enabled.
             quantize_embeddings: True if embedding table is quantized.
             quantize_kv_cache: True if KV cache is quantized.
-            split_mlp: True if mlp is being split into multiple parts.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
             qwen3tts_package_part: Require a Qwen3-TTS architecture for composite compilation.
@@ -143,11 +140,18 @@ class VisionLanguageModel(BaseModel):
         )
 
         vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)
-        vlm_cfg.pipeline_cfg.set_split_mlp(split_mlp)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)
 
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
+
+        # Mixture-of-Experts models are recognized and their configuration is
+        # parsed, but file generation and devkit execution are not yet ported.
+        if vlm_cfg.lm_cfg.moe_cfg is not None:
+            raise NotImplementedError(
+                "Mixture-of-Experts models are not yet supported: only "
+                "configuration parsing is implemented."
+            )
 
         if target_model is not None:
             # Some draft models use target model's tokenization scheme.
@@ -241,15 +245,9 @@ class VisionLanguageModel(BaseModel):
         with gen_context:
             if self.cfg.vm_cfg is not None and self.cfg.is_supported_multimodal:
                 # This model includes a vision model
-                elem_size = 2
-                seq_len = self.cfg.vm_cfg.seq_len
-                num_mla_rows_per_head = seq_len * ceil_div_row(seq_len) * elem_size
-                is_single_vision_model = num_mla_rows_per_head <= mla_max_num_rows
-
                 vision_model = VisionModel(
                     self.cfg, self.vision_model_name, onnx_path=self.onnx_path,
-                    sima_path=self.sima_path, hf_model=self.hf_model,
-                    is_single_vision_model=is_single_vision_model
+                    sima_path=self.sima_path, hf_model=self.hf_model
                 )
                 vision_model.gen_files(
                     gen_mode, gen_config=gen_config, log_level=log_level,

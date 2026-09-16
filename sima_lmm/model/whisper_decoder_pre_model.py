@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import ClassVar
 
 from sima_lmm.model.base import BaseModel, TensorTessellateParameters
 from sima_lmm.model.onnx_builder import OnnxNode
@@ -18,6 +19,7 @@ class WhisperDecoderPreModel(BaseModel):
     """
     num_tokens: int
     layer_idx: int
+    positioned_residual_output_idx: ClassVar[int] = 3
 
     def __post_init__(self):
         assert 0 <= self.layer_idx < self.cfg.decoder_layers
@@ -51,6 +53,16 @@ class WhisperDecoderPreModel(BaseModel):
             self._onnx_builder.get_node_output_name(output_nodes[2]),
             (1, self.cfg.d_model, 1, self.num_tokens)
         )
+        if self.layer_idx == 0:
+            # Layer 0 adds the learned position embedding before entering the decoder. Preserve
+            # that complete hidden state for the residual path in the separately compiled post
+            # model.
+            self._onnx_builder.create_output_node(
+                self._onnx_builder.get_node_output_name(
+                    output_nodes[self.positioned_residual_output_idx]
+                ),
+                (1, self.cfg.d_model, 1, self.num_tokens)
+            )
 
         self._onnx_builder.create_and_save_model()
 
@@ -58,11 +70,14 @@ class WhisperDecoderPreModel(BaseModel):
         self._onnx_builder = None
 
     def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
+        residual = input_nodes[0]
         if self.layer_idx == 0:
             assert len(input_nodes) == 2
-            add = self._onnx_builder.build_op(f"{base_name}.add_embed", input_nodes, "Add")
+            residual = self._onnx_builder.build_op(
+                f"{base_name}.add_embed", input_nodes, "Add"
+            )
             layer_norm = self._onnx_builder.build_layer_norm(
-                f"{base_name}.self_attn_layer_norm", add
+                f"{base_name}.self_attn_layer_norm", residual
             )
         else:
             assert len(input_nodes) == 1
@@ -82,7 +97,10 @@ class WhisperDecoderPreModel(BaseModel):
             f"{base_name}.self_attn.scaled_q_proj.reshape", scaled_q_proj,
             self.cfg.decoder_attention_heads, split_axis=1, concat_axis=2
         )
-        return [reshaped_q_proj, k_proj, v_proj]
+        output_nodes = [reshaped_q_proj, k_proj, v_proj]
+        if self.layer_idx == 0:
+            output_nodes.append(residual)
+        return output_nodes
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """

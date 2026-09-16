@@ -8,10 +8,10 @@ import pytest
 from sima_lmm.config.vlm_config import (
     ModelFormat,
     PipelineConfig,
+    VlmArchType,
     VlmConfig,
     group_cache_model_indices,
     single_cache_model_indices,
-    vision_model_names,
 )
 from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.model import VisionLanguageModel
@@ -54,6 +54,37 @@ def test_whisper_finds_generation_config_in_cache_root(tmp_path):
     assert config.num_languages == 2
 
 
+@pytest.mark.parametrize(
+    ("model_suppress_tokens", "generation_config", "expected_suppress_tokens"),
+    [
+        ([1], {"suppress_tokens": [2, 3]}, [2, 3]),
+        ([1], {}, [1]),
+        (None, {"suppress_tokens": [2, 3]}, [2, 3]),
+        (None, {}, []),
+        ([1], {"suppress_tokens": None}, []),
+    ],
+)
+def test_whisper_resolves_suppress_tokens_from_generation_config(
+    tmp_path,
+    model_suppress_tokens,
+    generation_config,
+    expected_suppress_tokens,
+):
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps(generation_config), encoding="utf-8"
+    )
+
+    config = WhisperConfig.from_hf_config(
+        tmp_path,
+        {
+            "architectures": ["WhisperForConditionalGeneration"],
+            "suppress_tokens": model_suppress_tokens,
+        },
+    )
+
+    assert config.suppress_tokens == expected_suppress_tokens
+
+
 def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp_path):
     config = _load_reference_config("qwen3_vl_vlm_config.json")
     hf_model = SimpleNamespace(config={})
@@ -93,18 +124,34 @@ def test_default_max_num_tokens():
     assert PipelineConfig().max_num_tokens == 4096
 
 
-def test_vision_model_names_describe_single_and_per_layer_artifacts():
+@pytest.mark.parametrize("image_size", ([224, 224], [960, 672]))
+def test_vision_model_names_are_always_per_layer(image_size: list[int]):
     config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
     model_name = "gemma4_vision"
 
-    config.vm_cfg.image_size = [224, 224]
-    assert vision_model_names(config.vm_cfg, model_name) == [model_name]
-
-    config.vm_cfg.image_size = [960, 672]
-    assert vision_model_names(config.vm_cfg, model_name) == [
+    config.vm_cfg.image_size = image_size
+    config.config_pipeline(None, None, 2048, 128, 128)
+    assert config.get_vision_model_names(model_name) == [
         f"{model_name}_layer{layer_idx}"
         for layer_idx in range(config.vm_cfg.num_hidden_layers)
     ]
+    assert _layer_indices(config, "vision") == list(
+        range(config.vm_cfg.num_hidden_layers)
+    )
+
+
+def test_vision_model_names_omit_unused_llava_layer():
+    config = _load_reference_config("gemma3_siglip448_vlm_config.json")
+    config.model_type = VlmArchType.VLM_LLAVA
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    assert config.get_vision_model_names("llava_vision") == [
+        f"llava_vision_layer{layer_idx}"
+        for layer_idx in range(config.vm_cfg.num_hidden_layers - 1)
+    ]
+    assert _layer_indices(config, "vision") == list(
+        range(config.vm_cfg.num_hidden_layers - 1)
+    )
 
 
 @pytest.mark.parametrize(
@@ -147,6 +194,31 @@ def test_speculative_decoding_rejects_sliding_attention():
         match="EAGLE3 speculative decoding does not support sliding-window attention",
     ):
         config.lm_cfg.set_speculative_decoding_config({})
+
+
+def test_speculative_decoding_rejects_linear_attention():
+    config = _load_reference_config("qwen3.5_vlm_config.json")
+
+    with pytest.raises(
+        ValueError,
+        match="EAGLE3 speculative decoding does not support linear-attention layers",
+    ):
+        config.lm_cfg.set_speculative_decoding_config({})
+
+
+def test_linear_attention_validates_group_size():
+    for group_size in (1, 4, 8, 16, 32, 128):
+        config = _load_reference_config("qwen3.5_vlm_config.json")
+        config.config_pipeline(None, None, 2048, group_size, 128)
+        assert config.pipeline_cfg.input_token_group_size == group_size
+
+    for group_size in (2, 12, 24, 48):
+        config = _load_reference_config("qwen3.5_vlm_config.json")
+        with pytest.raises(
+            ValueError,
+            match="language_group_size must be 1, 4, 8, 16, or a multiple of 32",
+        ):
+            config.config_pipeline(None, None, 2048, group_size, 128)
 
 
 def test_legacy_pipeline_config_uses_stored_mask_for_all_attention_types():

@@ -133,8 +133,8 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--resume` | Resume interrupted builds by skipping existing files. |
 | `-j, --jobs` | Number of parallel compilation jobs. Default: Number of physical CPU cores. |
 | `--log_level` | Logging level (DEBUG, INFO, WARNING, ERROR). Default: WARNING. |
-| `--input_height` | Input image height in pixels. Must be provided with `--input_width`. Required for Qwen 2 VL, Qwen 3 VL, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
-| `--input_width` | Input image width in pixels. Must be provided with `--input_height`. Required for Qwen 2 VL, Qwen 3 VL, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
+| `--input_height` | Input image height in pixels. Must be provided with `--input_width`. Required for Qwen 2 VL, Qwen 3 VL, Qwen3.5, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
+| `--input_width` | Input image width in pixels. Must be provided with `--input_height`. Required for Qwen 2 VL, Qwen 3 VL, Qwen3.5, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
 | `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
 | `--system_prompt_file` | Path to a text file containing the system prompt. |
 | `--chat_template` | Chat template string to store in the compiled model. Mutually exclusive with the system-prompt and chat-template file options. |

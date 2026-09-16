@@ -32,7 +32,6 @@ class Gemma4VisionLayerModel(BaseModel):
     """
 
     layer_idx: int
-    num_layers: int
     include_embeddings: bool
     include_mm_proj: bool
 
@@ -40,15 +39,25 @@ class Gemma4VisionLayerModel(BaseModel):
         self.create_onnx_builder()
 
         patch_feature_size = 3 * self.cfg.vm_cfg.patch_size * self.cfg.vm_cfg.patch_size
-        self._onnx_builder.create_input_node("input", (1, patch_feature_size, 1, self.cfg.vm_cfg.seq_len))
+        input_size = (
+            patch_feature_size if self.include_embeddings else self.cfg.vm_cfg.hidden_size
+        )
+        self._onnx_builder.create_input_node(
+            "input", (1, input_size, 1, self.cfg.vm_cfg.seq_len)
+        )
 
         output_nodes = self._build_onnx_nodes(self.hf_model.vision_model_param_base_name,
                                                self._onnx_builder.input_nodes)
 
+        output_shape = (
+            (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image)
+            if self.include_mm_proj
+            else (1, self.cfg.vm_cfg.hidden_size, 1, self.cfg.vm_cfg.seq_len)
+        )
         for node in output_nodes:
             self._onnx_builder.create_output_node(
                 self._onnx_builder.get_node_output_name(node),
-                (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image)
+                output_shape,
             )
 
         self._onnx_builder.create_and_save_model()
@@ -85,13 +94,12 @@ class Gemma4VisionLayerModel(BaseModel):
         else:
             x = input_nodes[0]
 
-        for i in range(self.layer_idx, self.layer_idx + self.num_layers):
-            layer_base = f"{base_name}.encoder.layers.{i}"
-            x = self._build_encoder_layer(
-                layer_base, x,
-                rope_cos_x_node, rope_sin_x_node,
-                rope_cos_y_node, rope_sin_y_node
-            )
+        layer_base = f"{base_name}.encoder.layers.{self.layer_idx}"
+        x = self._build_encoder_layer(
+            layer_base, x,
+            rope_cos_x_node, rope_sin_x_node,
+            rope_cos_y_node, rope_sin_y_node
+        )
 
         if self.include_mm_proj:
             x = self._build_pooler(base_name, x, grid_h)
@@ -425,11 +433,10 @@ class Gemma4VisionLayerModel(BaseModel):
         else:
             x = input_node
 
-        for i in range(self.layer_idx, self.layer_idx + self.num_layers):
-            x = self._build_sima_encoder_layer(
-                builder, f"{base_name}.encoder.layers.{i}", x,
-                rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y, quantizable
-            )
+        x = self._build_sima_encoder_layer(
+            builder, f"{base_name}.encoder.layers.{self.layer_idx}", x,
+            rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y, quantizable
+        )
 
         if self.include_mm_proj:
             x = self._build_sima_pooler(builder, base_name, x, grid_h, quantizable)

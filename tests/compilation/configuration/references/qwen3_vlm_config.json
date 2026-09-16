@@ -43,8 +43,10 @@
             "intermediate_size": 3072,
             "act": "silu",
             "num_layers": 3,
-            "mlp_bias": false
+            "mlp_bias": false,
+            "swiglu_limit": null
         },
+        "moe_cfg": null,
         "hidden_size": 1024,
         "num_hidden_layers": 28,
         "max_position_embeddings": 2048,
@@ -104,7 +106,6 @@
         "return_logits": false,
         "enable_filter_sharing": false,
         "quantize_embeddings": false,
-        "quantize_kv_cache": false,
-        "split_mlp": false
+        "quantize_kv_cache": false
     }
 }

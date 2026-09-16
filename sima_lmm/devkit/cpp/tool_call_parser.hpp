@@ -22,6 +22,7 @@ enum class ToolCallFormat {
     Mistral,
     Qwen,
     Llama,
+    Qwen35,
 };
 
 using PreservedToolCallTokens = std::vector<std::pair<uint32_t, std::string>>;

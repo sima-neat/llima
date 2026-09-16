@@ -517,10 +517,6 @@ class ModalixLM(HFLM):
             tensor=context, request_type="generate", max_num_tokens=max_length,
             stop_token_ids=stop_tokens
         )
-        # HFLM.generate_until expects causal generation to include the input context and removes it
-        # before decoding. The Modalix server returns the final context token followed by newly
-        # generated tokens, so discard that echoed context token before rebuilding the sequence.
-        generation = generation[:, 1:]
         generation = generation.to(device=context.device, dtype=context.dtype)
         return torch.cat((context, generation), dim=1)
 

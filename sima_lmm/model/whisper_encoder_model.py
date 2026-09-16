@@ -6,13 +6,35 @@ from sima_lmm.model.onnx_builder import OnnxNode
 
 @dataclass
 class WhisperEncoderModel(BaseModel):
+    layer_idx: int | None = None
+
     def gen_onnx_files(self):
         base_name = "model.encoder"
         self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.num_mel_bins, 1, self.cfg.max_source_positions * 2)
-        )
-        output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
+
+        if self.layer_idx is None:
+            input_shape = (
+                1, self.cfg.num_mel_bins, 1, self.cfg.max_source_positions * 2
+            )
+        else:
+            if not 0 <= self.layer_idx < self.cfg.encoder_layers:
+                raise ValueError(
+                    f"Invalid Whisper encoder layer index {self.layer_idx}; expected "
+                    f"0 <= layer_idx < {self.cfg.encoder_layers}"
+                )
+            input_shape = (
+                (1, self.cfg.num_mel_bins, 1, self.cfg.max_source_positions * 2)
+                if self.layer_idx == 0
+                else (1, self.cfg.d_model, 1, self.cfg.max_source_positions)
+            )
+
+        self._onnx_builder.create_input_node("input", input_shape)
+        if self.layer_idx is None:
+            output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
+        else:
+            output_nodes = self._build_layer_onnx_nodes(
+                base_name, self._onnx_builder.input_nodes
+            )
         self._onnx_builder.create_output_node(
             self._onnx_builder.get_node_output_name(output_nodes[0]),
             (1, self.cfg.d_model, 1, self.cfg.max_source_positions)
@@ -34,6 +56,23 @@ class WhisperEncoderModel(BaseModel):
 
         layer_norm = self._onnx_builder.build_layer_norm(f"{base_name}.layer_norm", encoder_output)
         return [layer_norm]
+
+    def _build_layer_onnx_nodes(
+        self, base_name: str, input_nodes: list[OnnxNode]
+    ) -> list[OnnxNode]:
+        assert self.layer_idx is not None
+        encoder_input = input_nodes[0]
+        if self.layer_idx == 0:
+            encoder_input = self._build_feature_extractor(base_name, encoder_input)
+
+        encoder_output = self._build_encoder_layer(
+            f"{base_name}.layers.{self.layer_idx}", encoder_input
+        )
+        if self.layer_idx == self.cfg.encoder_layers - 1:
+            encoder_output = self._onnx_builder.build_layer_norm(
+                f"{base_name}.layer_norm", encoder_output
+            )
+        return [encoder_output]
 
     def _build_feature_extractor(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
         conv1 = self._onnx_builder.build_conv(

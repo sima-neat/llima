@@ -303,7 +303,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
 
     // Upload audio_tensor and run the encoder model.
     get_buffer("encoder_ifm").upload(mel.data());
-    _encoder_model_ptr->run();
+    _run_encoder();
 
     auto language_detect_result = _run_language_detect();
 
@@ -398,7 +398,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
             }
             _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
             _decoder_cache_model_map.at(model_key).add_to_queue();
-            _decoder_post_model_map.at(model_key).add_to_queue(&ifm_map);
+            _decoder_post_model_map.at(model_key).add_to_queue();
         }
 
         MLAModelWithBuffer::run_queue();
@@ -531,7 +531,7 @@ void WhisperModel::_define_buffers() {
     define_buffer("decoder_future_token_mask", {2 * _cfg.max_target_positions});
     define_buffer("decoder_init", {_input_token_ids.size(), _cfg.d_model});
 
-    // Pre input (for layer_idx > 0 or init), post input and post output.
+    // Layer 0 positioned residual, pre input for later layers, and post input/output.
     define_buffer("decoder_n1_buffer1", {1, _cfg.d_model});
     // Pre output and cache input.
     define_buffer(
@@ -553,8 +553,12 @@ void WhisperModel::_define_model(
     const std::vector<MLABufferSlice>& ifms,
     const std::vector<MLABufferSlice>& ofms
 ) {
-    if (model_type == "encoder") {
-        _encoder_model_ptr = std::make_unique<MLAModelWithBuffer>(model_path, ifms, ofms);
+    if (model_type == "encoder_layer") {
+        _encoder_layer_model_map.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(std::get<uint8_t>(key)),
+            std::forward_as_tuple(model_path, ifms, ofms)
+        );
     } else if (model_type == "decoder_language_detect") {
         _decoder_language_detect_model_ptr = std::make_unique<MLAModelWithBuffer>(
             model_path, ifms, ofms
@@ -590,14 +594,57 @@ void WhisperModel::_define_model(
 
 
 void WhisperModel::_define_models() {
-    // Encoder model.
-    _define_model(
-        "encoder",
-        {},
-        _get_elf_path_encoder(),
-        std::vector<MLABufferSlice>{{&get_buffer("encoder_ifm")}},
-        std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}}
-    );
+    constexpr size_t positioned_residual_output_idx = 3;
+
+    std::vector<uint32_t> missing_encoder_layers;
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.encoder_layers; ++layer_idx) {
+        if (!std::filesystem::is_regular_file(_get_elf_path_encoder_layer(layer_idx)))
+            missing_encoder_layers.emplace_back(layer_idx);
+    }
+    if (!missing_encoder_layers.empty()) {
+        const auto legacy_encoder_path = _elf_dir / fmt::format(
+            "{}_encoder_stage1_mla.elf", _cfg.model_name
+        );
+        if (
+            missing_encoder_layers.size() == _cfg.encoder_layers
+            && std::filesystem::is_regular_file(legacy_encoder_path)
+        ) {
+            throw std::runtime_error(fmt::format(
+                "Unsupported legacy Whisper model at '{}': found monolithic encoder '{}'. "
+                "This LLiMa version requires {} layered encoder ELF files named "
+                "'{}_encoder_layer<N>_stage1_mla.elf'. Download a layered model or "
+                "recompile this model with the current LLiMa version.",
+                _devkit_dir.parent_path().string(),
+                legacy_encoder_path.filename().string(),
+                _cfg.encoder_layers,
+                _cfg.model_name
+            ));
+        }
+        const auto encoder_layer_elf_count =
+            _cfg.encoder_layers - missing_encoder_layers.size();
+        throw std::runtime_error(fmt::format(
+            "Incomplete layered Whisper encoder at '{}': found {} of {} expected ELF "
+            "files; missing layer indices [{}]. Expected files named "
+            "'{}_encoder_layer<N>_stage1_mla.elf'.",
+            _elf_dir.string(),
+            encoder_layer_elf_count,
+            _cfg.encoder_layers,
+            fmt::join(missing_encoder_layers, ", "),
+            _cfg.model_name
+        ));
+    }
+
+    _logger->info("Using layered Whisper encoder ({} ELF files)", _cfg.encoder_layers);
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.encoder_layers; ++layer_idx) {
+        auto& ifm = get_buffer(layer_idx == 0 ? "encoder_ifm" : "encoder_ofm");
+        _define_model(
+            "encoder_layer",
+            layer_idx,
+            _get_elf_path_encoder_layer(layer_idx),
+            std::vector<MLABufferSlice>{{&ifm}},
+            std::vector<MLABufferSlice>{{&get_buffer("encoder_ofm")}}
+        );
+    }
 
     _define_model(
         "decoder_language_detect",
@@ -686,6 +733,8 @@ void WhisperModel::_define_models() {
                 std::vector<uint32_t>{token_idx, 0},
                 std::vector<uint32_t>{1, _cfg.d_model}
             );
+            if (layer_idx == 0)
+                pre_ofms.emplace_back(&get_buffer("decoder_n1_buffer1"));
             _define_model(
                 "decoder_pre", model_key, _get_elf_path_decoder_pre(layer_idx), pre_ifms, pre_ofms
             );
@@ -741,7 +790,9 @@ void WhisperModel::_define_models() {
             }
 
             std::vector<MLABufferSlice> post_ifms{
-                pre_ifms[0],
+                layer_idx == 0
+                    ? pre_ofms.at(positioned_residual_output_idx)
+                    : pre_ifms[0],
                 cache_ofms[0],
                 {&get_buffer(fmt::format("encoder_cache_key{}", layer_idx))},
                 {&get_buffer(fmt::format("encoder_cache_val{}", layer_idx))},
@@ -766,8 +817,10 @@ void WhisperModel::_define_models() {
 }
 
 
-std::filesystem::path WhisperModel::_get_elf_path_encoder() const {
-    return _elf_dir / fmt::format("{}_encoder_stage1_mla.elf", _cfg.model_name);
+std::filesystem::path WhisperModel::_get_elf_path_encoder_layer(uint8_t layer_idx) const {
+    return _elf_dir / fmt::format(
+        "{}_encoder_layer{}_stage1_mla.elf", _cfg.model_name, layer_idx
+    );
 }
 
 
@@ -812,6 +865,15 @@ std::filesystem::path WhisperModel::_get_elf_path_decoder_language_detect() cons
 
 bool WhisperModel::_is_auto_language(const std::string& language) const {
     return language.empty() || language == "auto";
+}
+
+
+void WhisperModel::_run_encoder() {
+    for (auto& [layer_idx, encoder_layer_model] : _encoder_layer_model_map) {
+        _logger->debug("Queueing Whisper encoder layer {}", layer_idx);
+        encoder_layer_model.add_to_queue();
+    }
+    MLAModelWithBuffer::run_queue();
 }
 
 

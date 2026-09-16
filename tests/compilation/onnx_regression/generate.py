@@ -32,19 +32,19 @@ TOKEN_IDX = 2
 NUM_TOKENS = 1
 
 
-def _standard_model(
+def _standard_models(
     case: OnnxRegressionCase, vlm_model: VisionLanguageModel
-) -> tuple[object, FileGenPrecision]:
+) -> tuple[list[object], FileGenPrecision]:
     cfg = vlm_model.cfg
     if case.component == "pre":
         model = LanguagePreModel(
             cfg,
-            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_pre_layer{LAYER_IDX}",
+            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_pre_layer{case.layer_index}",
             onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
-            layer_idx=LAYER_IDX,
+            layer_idx=case.layer_index,
         )
     elif case.component == "cache":
         model = LanguageCacheModel(
@@ -60,13 +60,25 @@ def _standard_model(
     elif case.component == "post":
         model = LanguagePostModel(
             cfg,
-            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_post_layer{LAYER_IDX}",
+            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_post_layer{case.layer_index}",
             onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
-            layer_idx=LAYER_IDX,
+            layer_idx=case.layer_index,
             final_softcapping=None,
+        )
+    elif case.component == "linear":
+        from sima_lmm.model.language_linear_model import LanguageLinearModel
+
+        model = LanguageLinearModel(
+            cfg,
+            f"{vlm_model.model_name}_language_n{NUM_TOKENS}_layer{case.layer_index}_linear",
+            onnx_path=vlm_model.onnx_path,
+            sima_path=vlm_model.sima_path,
+            hf_model=vlm_model.hf_model,
+            num_tokens=NUM_TOKENS,
+            layer_idx=case.layer_index,
         )
     elif case.component == "per_layer":
         model = LanguagePerLayerModel(
@@ -96,15 +108,18 @@ def _standard_model(
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
         )
-        # Compare layer 0 on both revisions. Older compilers default to a
-        # whole vision graph; newer compilers only expose per-layer models.
-        if hasattr(vision_model, "is_single_vision_model"):
-            vision_model.is_single_vision_model = False
-        model = vision_model._get_part_model(LAYER_IDX)
+        if getattr(vision_model, "is_single_vision_model", False):
+            models = [vision_model._get_part_model(case.layer_index)]
+        else:
+            models = [
+                vision_model._get_part_model(layer_idx)
+                for layer_idx in range(vision_model.cfg.num_vision_layers)
+            ]
+        return models, FileGenPrecision.BF16
     else:
         raise ValueError(f"Unsupported standard ONNX component: {case.component}")
 
-    return model, FileGenPrecision.BF16
+    return [model], FileGenPrecision.BF16
 
 
 def _speculative_model(
@@ -163,20 +178,25 @@ def _speculative_model(
     return model, {"precision": {layer_id: FileGenPrecision.BF16}}
 
 
-def _record_model(
+def _record_models(
     manifest: dict,
     case: OnnxRegressionCase,
-    model,
+    models: list[object],
     output_dir: Path,
 ) -> None:
-    onnx_path = Path(model.onnx_file_name).resolve()
-    if not onnx_path.is_file():
-        raise FileNotFoundError(f"ONNX was not generated for {case.id}: {onnx_path}")
+    onnx_paths = [Path(model.onnx_file_name).resolve() for model in models]
+    missing_paths = [path for path in onnx_paths if not path.is_file()]
+    if missing_paths:
+        raise FileNotFoundError(
+            f"ONNX was not generated for {case.id}: {missing_paths}"
+        )
     manifest["cases"][case.id] = {
         "component": case.component,
         "mode": case.mode,
         "status": "available",
-        "onnx_path": str(onnx_path.relative_to(output_dir.resolve())),
+        "onnx_paths": [
+            str(path.relative_to(output_dir.resolve())) for path in onnx_paths
+        ],
     }
 
 
@@ -231,14 +251,15 @@ def _generate_standard_cases(
 
         for case in group_cases:
             try:
-                model, precision = _standard_model(case, vlm_model)
-                model.gen_files(
-                    FileGenMode.SOURCE_TO_ONNX,
-                    layer_cfg={"precision": precision},
-                    log_level=logging.WARNING,
-                    resume=False,
-                )
-                _record_model(manifest, case, model, output_dir)
+                models, precision = _standard_models(case, vlm_model)
+                for model in models:
+                    model.gen_files(
+                        FileGenMode.SOURCE_TO_ONNX,
+                        layer_cfg={"precision": precision},
+                        log_level=logging.WARNING,
+                        resume=False,
+                    )
+                _record_models(manifest, case, models, output_dir)
             except Exception as error:
                 if (
                     not allow_informative_unavailable
@@ -291,7 +312,7 @@ def _generate_speculative_cases(
                     log_level=logging.WARNING,
                     resume=False,
                 )
-                _record_model(manifest, case, model, output_dir)
+                _record_models(manifest, case, [model], output_dir)
             except Exception as error:
                 if (
                     not allow_informative_unavailable

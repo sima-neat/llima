@@ -1,3 +1,14 @@
+add_executable(sima_lmm_embedding_offload_generation_test embedding_offload_generation_test.cpp)
+target_link_libraries(sima_lmm_embedding_offload_generation_test PRIVATE sima_lmm_runtime)
+add_executable(sima_lmm_embedding_offload_test embedding_offload_test.cpp
+    "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp")
+target_include_directories(sima_lmm_embedding_offload_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+target_link_libraries(sima_lmm_embedding_offload_test PRIVATE OpenMP::OpenMP_CXX)
+add_test(NAME runtime.embedding_offload COMMAND sima_lmm_embedding_offload_test)
+set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
+add_test(NAME runtime.embedding_offload_generation COMMAND sima_lmm_embedding_offload_generation_test)
+set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK dispatcher TIMEOUT 900)
+
 add_executable(
     sima_lmm_dispatcher_lifecycle_test
     dispatcher_lifecycle_test.cpp
@@ -53,6 +64,8 @@ target_link_libraries(
         sima_lmm_runtime
 )
 set_target_properties(
+    sima_lmm_embedding_offload_generation_test
+    sima_lmm_embedding_offload_test
     sima_lmm_dispatcher_lifecycle_test
     sima_lmm_text_generation_test
     sima_lmm_vision_generation_test
@@ -133,6 +146,8 @@ set_tests_properties(
 
 install(
     TARGETS
+        sima_lmm_embedding_offload_generation_test
+        sima_lmm_embedding_offload_test
         sima_lmm_dispatcher_lifecycle_test
         sima_lmm_text_generation_test
         sima_lmm_vision_generation_test
@@ -152,6 +167,10 @@ install(
 install(
     FILES
         CMakeLists.txt
+        embedding_offload_generation_test.cpp
+        embedding_offload_test.cpp
+        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.hpp"
+        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp"
         asr_transcription_test.cpp
         dispatcher_lifecycle_test.cpp
         pytest.ini
