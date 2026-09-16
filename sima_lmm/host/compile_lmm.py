@@ -10,6 +10,7 @@ except ImportError:
 import argparse
 import importlib
 import logging
+import shutil
 from pathlib import Path
 import psutil
 
@@ -56,15 +57,20 @@ def gen_files(
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None,
     qwen3tts_tail_wrapper: object | None,
+    *,
+    model_name: str | None = None,
+    sima_path: Path | None = None,
+    qwen3tts_codec_tail: bool = False,
+    generate_devkit: bool = True,
 ):
     enable_verbose_error_messages()
     models = list()
 
     base_model = VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
-        model_name=model_path.name,
+        model_name=model_name or model_path.name,
         onnx_path=Path(output_path / "onnx_files"),
-        sima_path=Path(output_path / "sima_files"),
+        sima_path=Path(sima_path or output_path / "sima_files"),
         max_num_tokens=max_num_tokens,
         system_prompt=system_prompt,
         chat_template=chat_template,
@@ -77,6 +83,7 @@ def gen_files(
         split_mlp=split_mlp,
         image_resolution=image_resolution,
         qwen3tts_tail_wrapper=qwen3tts_tail_wrapper,
+        qwen3tts_codec_tail=qwen3tts_codec_tail,
     )
     models.append(base_model)
 
@@ -147,14 +154,133 @@ def gen_files(
                 _abort("ONNX generation mode not supported for GGUF models")
             modes = [file_gen_mode]
 
+        if not generate_devkit:
+            modes = [mode for mode in modes if mode != FileGenMode.DEVKIT]
+
         _print_precisions(gen_config["precision"], FileGenMode.SOURCE_TO_QUANT in modes or FileGenMode.FP_TO_QUANT in modes)
 
         for mode in modes:
             model.gen_files(
                 mode, gen_config=gen_config, log_level=log_level, num_processes=num_processes,
-                resume=resume
+                resume=resume, generate_devkit=generate_devkit
             )
             print(f"Generated mode={mode.name} files for {model.model_name}", flush=True)
+
+
+def gen_qwen3tts(
+    model_root: Path,
+    output_path: Path,
+    file_gen_mode: FileGenMode,
+    log_level: int,
+    resume: bool,
+    num_processes: int,
+    qwen3tts_tail_wrapper: object,
+) -> None:
+    """Compile all Qwen3-TTS parts into one runner-compatible ``qwen3_model``."""
+    from sima_lmm.config.vlm_config import BaseConfig
+    from sima_lmm.model.qwen3tts_model import (
+        CODEC_PREFIX_MODEL_NAME,
+        QWEN3TTS_COMPONENTS,
+        TALKER_HEAD_MODEL_NAME,
+        Qwen3TTSPartModel,
+    )
+    components_dir = model_root / "qwen3_components"
+    if not components_dir.is_dir():
+        _abort(f"Qwen3-TTS package is missing qwen3_components/: {model_root}")
+    if file_gen_mode != FileGenMode.ALL:
+        _abort(
+            "Qwen3-TTS is a composite model; use its default complete pipeline."
+        )
+    if qwen3tts_tail_wrapper is None:
+        _abort(
+            "Qwen3-TTS requires --qwen3tts-tail-wrapper MODULE:ATTRIBUTE "
+            "to compile its codec-decoder tail."
+        )
+
+    source_contract = (
+        model_root / "qwen3_model" / "devkit" / "codec_tail_raw_mla_contract.json"
+    )
+    if not source_contract.is_file():
+        _abort(
+            "Qwen3-TTS package is missing qwen3_model/devkit/"
+            "codec_tail_raw_mla_contract.json"
+        )
+    destination_contract = (
+        output_path / "devkit" / "codec_tail_raw_mla_contract.json"
+    )
+    if source_contract.resolve() != destination_contract.resolve():
+        destination_contract.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_contract, destination_contract)
+
+    # These names, 1024-token context, and 128-token grouped-cache contract
+    # are consumed directly by qwen3tts_runner.  They are package invariants,
+    # not per-component command-line choices.
+    for component in QWEN3TTS_COMPONENTS:
+        source_path = components_dir / component.source_directory
+        if not (source_path / "config.json").is_file() or not (
+            source_path / "model.safetensors"
+        ).is_file():
+            _abort(
+                f"Qwen3-TTS component is incomplete: {source_path}; "
+                "expected config.json and model.safetensors"
+            )
+        gen_files(
+            num_processes,
+            resume,
+            source_path,
+            None,
+            output_path,
+            FileGenMode.ALL,
+            None,
+            None,
+            None,
+            1024,
+            128,
+            128,
+            False,
+            True,
+            True,
+            True,
+            False,
+            log_level,
+            None,
+            None,
+            None,
+            qwen3tts_tail_wrapper,
+            model_name=component.model_name,
+            sima_path=output_path,
+            qwen3tts_codec_tail=component.is_codec_tail,
+            generate_devkit=False,
+        )
+
+    # The remaining non-transformer parts use the same direct FP -> BF16 ->
+    # MPK pipeline and share the package's qwen3_model output directory.
+    models = [
+        Qwen3TTSPartModel(
+            BaseConfig(),
+            CODEC_PREFIX_MODEL_NAME,
+            sima_path=output_path,
+            components_dir=components_dir,
+            part="codec_prefix",
+        ),
+        Qwen3TTSPartModel(
+            BaseConfig(),
+            TALKER_HEAD_MODEL_NAME,
+            sima_path=output_path,
+            components_dir=components_dir,
+            part="talker_head",
+        ),
+    ]
+    layer_cfg = {"precision": FileGenPrecision.BF16, "lora": None}
+    for mode in (
+        FileGenMode.SOURCE_TO_FP,
+        FileGenMode.FP_TO_QUANT,
+        FileGenMode.MODEL_SDK_COMPILE,
+    ):
+        for model in models:
+            model.gen_files(mode, layer_cfg=layer_cfg, log_level=log_level, resume=resume)
+            print(f"Generated mode={mode.name} files for {model.model_name}", flush=True)
+
 
 def _resolve_qwen3tts_tail_wrapper(specification: str | None) -> object | None:
     """Resolve the Qwen3-TTS-only 4D tail wrapper supplied by the caller."""
@@ -343,8 +469,18 @@ def main():
     group.add_argument(
         "--qwen3tts-tail-wrapper", metavar="MODULE:ATTRIBUTE",
         help=(
-            "Qwen3-TTS Tail4DWrapper factory used only when compiling "
-            "qwen3_tts_tokenizer_v2_decoder_tail."
+            "Qwen3-TTS Tail4DWrapper factory required by --qwen3tts and "
+            "the qwen3_tts_tokenizer_v2_decoder_tail component."
+        ),
+    )
+
+    group.add_argument(
+        "--qwen3tts",
+        action="store_true",
+        help=(
+            "Compile the complete Qwen3-TTS package rooted at model_path; "
+            "writes runner-compatible files to output (default: "
+            "model_path/qwen3_model)."
         ),
     )
 
@@ -381,7 +517,9 @@ def main():
         num_processes = psutil.cpu_count(logical=False)
 
     if args.output is None:
-        if args.draft_model_path is not None:
+        if args.qwen3tts:
+            base_output_path = args.model_path / "qwen3_model"
+        elif args.draft_model_path is not None:
             base_output_path = Path(f"{args.model_path.name}-speculative-decoding")
         else:
             base_output_path = Path(args.model_path.name)
@@ -395,7 +533,8 @@ def main():
         output_path = base_output_path
         draft_output_path = None
 
-    check_output_path_conflict(args.model_path, output_path)
+    if not args.qwen3tts:
+        check_output_path_conflict(args.model_path, output_path)
 
     try:
         log_level = _LOGGING_LEVELS[args.log_level]
@@ -454,6 +593,20 @@ def main():
     split_mlp = lora_path_for_base_model is None
     return_logits = args.return_logits or args.draft_model_path is not None
     qwen3tts_tail_wrapper = _resolve_qwen3tts_tail_wrapper(args.qwen3tts_tail_wrapper)
+
+    if args.qwen3tts:
+        if args.draft_model_path is not None or lora_path_for_base_model is not None:
+            _abort("Qwen3-TTS cannot be combined with draft-model or LoRA options.")
+        gen_qwen3tts(
+            args.model_path,
+            output_path,
+            mode_flag,
+            log_level,
+            args.resume,
+            num_processes,
+            qwen3tts_tail_wrapper,
+        )
+        return
 
     gen_files(
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,

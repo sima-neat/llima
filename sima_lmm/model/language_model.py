@@ -100,7 +100,7 @@ class LanguageModel(BaseModel):
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
         if self.cfg.lm_cfg.arch == LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL:
-            from sima_lmm.model.qwen3tts_codec_tail_model import Qwen3TTSCodecTailModel
+            from sima_lmm.model.qwen3tts_model import Qwen3TTSCodecTailModel
 
             if gen_mode not in (
                 FileGenMode.SOURCE_TO_ONNX,
@@ -121,7 +121,10 @@ class LanguageModel(BaseModel):
                 model_list.append((
                     Qwen3TTSCodecTailModel(
                         self.cfg,
-                        f"{self.model_name}_tail_part{layer_id.part_idx:02d}",
+                        (
+                            f"{self.model_name}_codec_tail_stage{layer_id.part_idx}"
+                            f"_part{layer_id.part_idx}"
+                        ),
                         onnx_path=self.onnx_path,
                         sima_path=self.sima_path,
                         hf_model=self.hf_model,

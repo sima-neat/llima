@@ -78,6 +78,7 @@ class VisionLanguageModel(BaseModel):
         image_resolution: list[int] | None = None,
         qwen3tts_tail_wrapper: Callable[..., object] | None = None,
         target_model: "VisionLanguageModel | None" = None,
+        qwen3tts_codec_tail: bool = False,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -108,6 +109,14 @@ class VisionLanguageModel(BaseModel):
             assert model_format == ModelFormat.FORMAT_GGUF
             hf_model = GgufModel(hf_cache_path)
             model_config = hf_model.model_config
+
+        if qwen3tts_codec_tail:
+            if model_config.get("model_type") != "qwen3_tts_tokenizer_v2_decoder":
+                raise ValueError(
+                    "Qwen3-TTS codec-tail generation requires the codec-decoder component"
+                )
+            model_config = dict(model_config)
+            model_config["model_type"] = "qwen3_tts_tokenizer_v2_decoder_tail"
 
         vlm_cfg = VlmConfig.from_hf_config(
             model_format, hf_cache_path, model_config, image_resolution=image_resolution
@@ -173,6 +182,7 @@ class VisionLanguageModel(BaseModel):
         log_level: int = logging.NOTSET,
         num_processes: int = 1,
         resume: bool = False,
+        generate_devkit: bool = True,
     ):
         """
         Generates files based on the provided file generation mode.
@@ -193,8 +203,10 @@ class VisionLanguageModel(BaseModel):
         precision = gen_config["precision"]
 
         if gen_mode == FileGenMode.DEVKIT:
-            return self.gen_devkit_files(precision=precision, resume=resume)
-        elif not (self.sima_devkit_path / "vlm_config.json").is_file():
+            if generate_devkit:
+                return self.gen_devkit_files(precision=precision, resume=resume)
+            return
+        elif generate_devkit and not (self.sima_devkit_path / "vlm_config.json").is_file():
             self.gen_devkit_files(precision=precision, resume=False)
 
         if (

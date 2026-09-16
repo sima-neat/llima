@@ -53,6 +53,9 @@ struct RequestOptions {
 };
 
 struct RunMetrics {
+  double talker_projection_time{};
+  uint32_t talker_projection_calls{};
+  std::string termination_reason{"max_frames"};
   uint32_t prompt_tokens{};
   uint32_t frames{};
   double prompt_time{};
@@ -113,6 +116,15 @@ public:
   RunResult run(const RequestOptions &request);
 
 private:
+  struct TalkerHead;
+  struct DensePrefix;
+
+  NativeTensor project_talker(const NativeTensor &hidden, RunMetrics &metrics);
+
+  std::unique_ptr<TalkerHead> talker_head_;
+  std::unique_ptr<DensePrefix> dense_prefix_;
+  std::filesystem::path talker_head_elf_;
+  std::filesystem::path dense_prefix_elf_;
   struct TensorFile;
   struct TailPart;
   struct ModelKey {

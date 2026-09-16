@@ -417,6 +417,9 @@ private:
   std::map<std::string, NativeTensorView> tensors_;
 };
 
+#include "dense_prefix.inc"
+#include "talker_head.inc"
+
 struct Qwen3TtsRunner::TailPart {
   uint16_t index{};
   std::filesystem::path elf;
@@ -435,6 +438,9 @@ Qwen3TtsRunner::Qwen3TtsRunner(std::filesystem::path model_dir,
       cp_head_elf_dir_(elf_dir_)
 #endif
 {
+  dense_prefix_elf_ =
+      elf_dir_ / "qwen3tts_codec_prefix_dense_f50_stage1_mla.elf";
+  talker_head_elf_ = elf_dir_ / "qwen3tts_talker_head_n1_stage1_mla.elf";
 }
 
 Qwen3TtsRunner::~Qwen3TtsRunner() { finalize(); }
@@ -624,6 +630,8 @@ void Qwen3TtsRunner::validate_elfs() const {
     if (!std::filesystem::is_regular_file(path))
       throw std::runtime_error("Missing required ELF: " + path.string());
   };
+  require(dense_prefix_elf_);
+  require(talker_head_elf_);
   for (uint16_t layer = 0; layer < kBackboneLayers; ++layer) {
     require(elf_path(elf_dir_, "backbone_language", "pre_layer", layer));
     require(elf_path(elf_dir_, "backbone_language", "post_layer", layer));
@@ -766,6 +774,8 @@ void Qwen3TtsRunner::initialize() {
 void Qwen3TtsRunner::finalize() {
   if (!initialized_)
     return;
+  dense_prefix_.reset();
+  talker_head_.reset();
   tail_models_.clear();
   backbone_pre_.clear();
   backbone_cache_.clear();
@@ -818,8 +828,8 @@ void Qwen3TtsRunner::reset_codec_caches() {
 NativeTensor Qwen3TtsRunner::text_project(const NativeTensor &input) const {
   // Match the BF16 upstream module boundaries, keeping FP32 accumulation.
   // Deferring every conversion until prefill upload changes conditioning.
-  const auto projected = bf16_rounded(
-      linear(bf16_rounded(input), *text_fc1_w_, text_fc1_b_));
+  const auto projected =
+      bf16_rounded(linear(bf16_rounded(input), *text_fc1_w_, text_fc1_b_));
   const auto activated = bf16_rounded(silu(projected));
   return bf16_rounded(linear(activated, *text_fc2_w_, text_fc2_b_));
 }
@@ -1732,8 +1742,8 @@ RunResult Qwen3TtsRunner::run(const RequestOptions &request) {
   result.metrics.prompt_time = seconds(prompt_start, prompt_end);
   result.metrics.ttft = seconds(e2e_start, prompt_end);
   std::vector<int32_t> previous_c0;
-  auto c0 = select_token(linear(hidden, *codec_head_weight_), previous_c0, true,
-                         request.do_sample, request.top_k, request.top_p,
+  auto c0 = select_token(project_talker(hidden, result.metrics), previous_c0,
+                         true, request.do_sample, request.top_k, request.top_p,
                          request.temperature, request.repetition_penalty);
   previous_c0.push_back(c0);
   const bool endpoint_enabled = request.streaming_endpoint &&
@@ -1745,8 +1755,10 @@ RunResult Qwen3TtsRunner::run(const RequestOptions &request) {
   std::optional<double> ttf_frame;
   const auto generation_start = now();
   for (uint32_t step = 0; step < request.max_frames; ++step) {
-    if (c0 == kCodecEos)
+    if (c0 == kCodecEos) {
+      result.metrics.termination_reason = "eos";
       break;
+    }
     const auto frame = run_code_predictor(hidden, c0, request, result.metrics);
     result.frames.push_back(frame);
     if (!ttf_frame)
@@ -1757,6 +1769,7 @@ RunResult Qwen3TtsRunner::run(const RequestOptions &request) {
       silence_run =
           prefix_rms < request.endpoint_silence_rms ? silence_run + 1 : 0;
       if (silence_run >= request.endpoint_silence_frames) {
+        result.metrics.termination_reason = "endpoint";
         const auto first_silent = result.frames.size() - silence_run;
         const auto retained_pad =
             std::min<size_t>(request.endpoint_end_pad_frames, silence_run);
@@ -1794,7 +1807,7 @@ RunResult Qwen3TtsRunner::run(const RequestOptions &request) {
         seconds(backbone_mla_start, backbone_mla_end);
     result.metrics.backbone_decode_time +=
         seconds(feedback_end, backbone_decode_end);
-    c0 = select_token(linear(hidden, *codec_head_weight_), previous_c0, true,
+    c0 = select_token(project_talker(hidden, result.metrics), previous_c0, true,
                       request.do_sample, request.top_k, request.top_p,
                       request.temperature, request.repetition_penalty);
     previous_c0.push_back(c0);
@@ -1815,7 +1828,9 @@ RunResult Qwen3TtsRunner::run(const RequestOptions &request) {
   result.metrics.frames_sha256 =
       sha256(raw_frames.data(), raw_frames.size() * sizeof(int32_t));
   const auto codec_start = now();
-  const auto prefix = run_codec_prefix(result.frames);
+  if (!dense_prefix_)
+    dense_prefix_ = std::make_unique<DensePrefix>(dense_prefix_elf_);
+  const auto prefix = dense_prefix_->run(*codec_weights_, result.frames);
   result.metrics.codec_prefix_sha256 = bf16_sha256(prefix);
   result.metrics.codec_n128_hybrid = request.codec_n128_hybrid;
   const auto tail_input = request.codec_n128_hybrid
