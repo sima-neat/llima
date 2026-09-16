@@ -58,11 +58,34 @@ void LanguageModel::_capture_dflash_hidden_state(uint16_t num_tokens,
                     "Failed to retain DFlash target hidden state");
 }
 
+void LanguageModel::_resolve_dflash_linear_state(uint16_t prefix_tokens) {
+  const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
+  if (prefix_tokens == 0 || prefix_tokens > block_size) {
+    throw std::invalid_argument("Invalid DFlash linear-state prefix length");
+  }
+  if (prefix_tokens == block_size || _dflash_resolved_prefix == prefix_tokens) {
+    return;
+  }
+
+  for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
+       ++layer_idx) {
+    if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+      continue;
+    }
+    _dflash_state_resolver_model_map
+        .at(LanguageModelMapKey{block_size, layer_idx, prefix_tokens})
+        .add_to_queue();
+  }
+  MLAModelWithBuffer::run_queue();
+  _dflash_resolved_prefix = prefix_tokens;
+}
+
 void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
   if (prefix_tokens == 0 || prefix_tokens > block_size) {
     throw std::invalid_argument("Invalid DFlash linear-state prefix length");
   }
+  _resolve_dflash_linear_state(prefix_tokens);
 
   const auto &linear_cfg = _linear_attn_cfg();
   const uint32_t prefix_index = prefix_tokens - 1;
@@ -84,11 +107,15 @@ void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
 
     auto &delta_state =
         get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx));
-    auto &delta_prefix =
-        get_buffer(fmt::format("linear_delta_prefix_states_l{}", layer_idx));
-    copy_buffer_slice(delta_state, {0, 0}, delta_prefix, {prefix_index, 0},
-                      {1, linear_cfg.get_recurrent_state_size()},
-                      "Failed to commit DFlash recurrent state");
+    const auto delta_source_name = prefix_tokens == block_size
+                                       ? fmt::format(
+                                             "linear_delta_state_history_alt_l{}",
+                                             layer_idx)
+                                       : fmt::format(
+                                             "linear_delta_resolver_output_l{}",
+                                             layer_idx);
+    auto &delta_source = get_buffer(delta_source_name);
+    delta_state.swap_storage(delta_source);
   }
 }
 
@@ -108,13 +135,19 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
   if (!checkpoint_slot.has_value()) {
     return;
   }
+  _resolve_dflash_linear_state(prefix_tokens);
   const uint32_t prefix_index = prefix_tokens - 1;
   for (auto &state : _cached_states) {
-    const char *source_prefix;
+    std::string source_prefix;
+    std::vector<uint32_t> source_begin;
     if (state.buffer_name_prefix == "linear_conv_cache_history_l") {
       source_prefix = "linear_conv_prefix_states_l";
+      source_begin = {prefix_index, 0};
     } else if (state.buffer_name_prefix == "linear_delta_state_history_l") {
-      source_prefix = "linear_delta_prefix_states_l";
+      source_prefix = prefix_tokens == block_size
+                          ? "linear_delta_state_history_alt_l"
+                          : "linear_delta_resolver_output_l";
+      source_begin = {0, 0};
     } else {
       throw std::runtime_error(
           "Unsupported state family in DFlash checkpoint capture");
@@ -124,8 +157,7 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
          ++layer_slot) {
       const auto layer_idx = state.layer_indices[layer_slot];
       auto &source = get_buffer(fmt::format("{}{}", source_prefix, layer_idx));
-      const size_t source_offset = source.get_buf_addr_offset(
-          std::vector<uint32_t>{prefix_index, 0});
+      const size_t source_offset = source.get_buf_addr_offset(source_begin);
       source.invalidate_cache(source_offset, state.tail_bytes);
       auto *source_ptr = reinterpret_cast<const uint8_t *>(
           source.get_virtual_addr());
@@ -422,6 +454,7 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
     throw std::invalid_argument(
         "DFlash verification input must match the block size");
   }
+  _dflash_resolved_prefix = 0;
   const bool quantized_embeddings = _cfg.pipeline_cfg.quantize_embeddings;
   auto &input =
       quantized_embeddings

@@ -21,6 +21,9 @@ from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
 from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
 from sima_lmm.model.language_dflash_context_model import LanguageDFlashContextModel
+from sima_lmm.model.language_dflash_state_resolver_model import (
+    LanguageDFlashStateResolverModel,
+)
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
@@ -188,6 +191,34 @@ class LanguageModel(BaseModel):
             if lora_mode:
                 curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
+
+        speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        if (
+            speculative_cfg is not None
+            and speculative_cfg.method == "dflash"
+            and not speculative_cfg.is_draft
+        ):
+            resolver_precision = next(
+                (
+                    curr_precision
+                    for layer_id, curr_precision in precision.items()
+                    if layer_id.part == "single_linear"
+                ),
+                None,
+            )
+            if resolver_precision is not None:
+                block_size = speculative_cfg.speculative_budget
+                for prefix_tokens in range(1, block_size):
+                    model_list.append(
+                        (
+                            self._get_part_model(
+                                "dflash_state_resolver",
+                                block_size,
+                                token_idx=prefix_tokens,
+                            ),
+                            {"precision": resolver_precision},
+                        )
+                    )
 
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
@@ -591,6 +622,20 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, onnx_path=self.onnx_path,
                     sima_path=self.sima_path, hf_model=self.hf_model,
                     num_tokens=num_tokens, layer_idx=layer_idx,
+                )
+            case "dflash_state_resolver":
+                assert token_idx is not None
+                model_name = (
+                    f"{self.model_name}_n{num_tokens}_dflash_state_resolver_p{token_idx}"
+                )
+                return LanguageDFlashStateResolverModel(
+                    self.cfg,
+                    model_name,
+                    onnx_path=self.onnx_path,
+                    sima_path=self.sima_path,
+                    hf_model=self.hf_model,
+                    block_size=num_tokens,
+                    prefix_tokens=token_idx,
                 )
             case "per_layer":
                 model_name = f"{self.model_name}_n{num_tokens}_per_layer"

@@ -40,9 +40,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
     Outputs are ONNX NCHW:
         - hidden: (1, hidden, 1, num_tokens)
         - linear_conv_state_out: (1, linear_conv_dim, 1, num_tokens + kernel - 2)
-        - linear_delta_state_out: (1, value_head_dim, num_value_heads, key_head_dim), or
-          (1, value_head_dim, num_tokens * num_value_heads, key_head_dim) for a
-          DFlash target verification graph.
+        - linear_delta_state_out: (1, value_head_dim, num_value_heads, key_head_dim)
 
     Direct SimaBuilder inputs are NHWC:
         - input: (1, 1, num_tokens, hidden)
@@ -54,9 +52,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
     Direct SimaBuilder outputs are NHWC:
         - hidden: (1, 1, num_tokens, hidden)
         - linear_conv_state_out: (1, 1, num_tokens + kernel - 2, linear_conv_dim)
-        - linear_delta_state_out: (1, num_value_heads, key_head_dim, value_head_dim), or
-          (1, num_tokens * num_value_heads, key_head_dim, value_head_dim) for a
-          DFlash target verification graph.
+        - linear_delta_state_out: (1, num_value_heads, key_head_dim, value_head_dim)
     """
 
     num_tokens: int
@@ -75,7 +71,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
 
     @property
-    def _emit_dflash_prefix_states(self) -> bool:
+    def _emit_dflash_resolver_inputs(self) -> bool:
         speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
         return (
             speculative_cfg is not None
@@ -148,11 +144,41 @@ class LanguageLinearModel(LanguagePartBaseModel):
             (
                 1,
                 self.cfg.lm_cfg.linear_attn_cfg.value_head_dim,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-                * (self.num_tokens if self._emit_dflash_prefix_states else 1),
+                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
                 self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
             ),
         )
+        if self._emit_dflash_resolver_inputs:
+            resolver_shapes = (
+                (
+                    1,
+                    self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
+                    self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    self.num_tokens,
+                ),
+                (
+                    1,
+                    self.cfg.lm_cfg.linear_attn_cfg.value_head_dim,
+                    self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    self.num_tokens,
+                ),
+                (
+                    1,
+                    1,
+                    self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    self.num_tokens,
+                ),
+                (
+                    1,
+                    self.num_tokens,
+                    self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    self.num_tokens,
+                ),
+            )
+            for output_node, shape in zip(output_nodes[3:], resolver_shapes):
+                self._onnx_builder.create_output_node(
+                    self._onnx_builder.get_node_output_name(output_node), shape
+                )
         self._onnx_builder.create_and_save_model()
         self._onnx_builder = None
 
@@ -611,8 +637,14 @@ class LanguageLinearModel(LanguagePartBaseModel):
         g: NodeOrHandle,
         state: NodeOrHandle,
         quantizable: bool,
-        emit_prefix_states: bool = False,
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+    ) -> tuple[
+        NodeOrHandle,
+        NodeOrHandle,
+        NodeOrHandle,
+        NodeOrHandle,
+        NodeOrHandle,
+        NodeOrHandle,
+    ]:
         """Build the grouped prefill computation in NHWC head-major layout."""
         g_cum = self._build_sima_static_triangular_sums(builder, g, upper=True, quantizable=quantizable)
         strict_lower = self._sima_constant(
@@ -740,69 +772,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         state_base = builder.create_mul_node(state, final_g_exp)
         linear_delta_state_out = builder.create_add_node(state_base, state_updates)
 
-        if emit_prefix_states:
-            # Share the grouped solve with the logits. Keep the existing final
-            # state as SB, including its suffix-sum BF16 evaluation order.
-            prefix_count = self.num_tokens - 1
-            num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-            folded_heads = prefix_count * num_heads
-
-            prefix_mask = builder.create_slice_node(
-                decay_mask, [0], [prefix_count], [1], [2]
-            )
-            prefix_mask = builder.create_transpose_node(prefix_mask, [0, 2, 1, 3])
-            prefix_mask = builder.create_reshape_node(
-                prefix_mask, [1, folded_heads, self.num_tokens, 1]
-            )
-            folded_value = builder.create_slice_concat_node(
-                v_new, axis=1, split_axis=1, split_block=1,
-                split_repeat=prefix_count,
-            )
-            folded_value = builder.create_mul_node(folded_value, prefix_mask)
-            folded_key = builder.create_slice_concat_node(
-                key, axis=1, split_axis=1, split_block=1,
-                split_repeat=prefix_count,
-            )
-            updates = builder.create_einsum_node(
-                folded_key, folded_value,
-                equation="nhcw,nhcq->nhwq", layout="NHWC",
-            )
-
-            prefix_decay = builder.create_slice_node(
-                g_exp, [0], [prefix_count], [1], [2]
-            )
-            prefix_decay = builder.create_transpose_node(prefix_decay, [0, 2, 1, 3])
-            prefix_decay = builder.create_reshape_node(
-                prefix_decay, [1, folded_heads, 1, 1]
-            )
-            prefix_states = [
-                builder.create_add_node(
-                    builder.create_mul_node(
-                        state,
-                        builder.create_slice_node(
-                            prefix_decay,
-                            [prefix_idx * num_heads],
-                            [(prefix_idx + 1) * num_heads],
-                            [1],
-                            [1],
-                        ),
-                    ),
-                    builder.create_slice_node(
-                        updates,
-                        [prefix_idx * num_heads],
-                        [(prefix_idx + 1) * num_heads],
-                        [1],
-                        [1],
-                    ),
-                )
-                for prefix_idx in range(prefix_count)
-            ]
-            states = builder.create_concat_node(prefix_states, 1)
-            linear_delta_state_out = builder.create_concat_node(
-                [states, linear_delta_state_out], 1
-            )
-
-        return core_attn_out, linear_delta_state_out
+        return core_attn_out, linear_delta_state_out, key, v_new, g_exp, decay_mask
 
     def _build_sima_nodes(
         self, base_layer: str, quantizable: bool, merged_lora: bool = False
@@ -1044,7 +1014,14 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 mla_delta_state,
             )
         else:
-            core_attn_out, linear_delta_state_out = self._build_sima_group_delta(
+            (
+                core_attn_out,
+                linear_delta_state_out,
+                resolver_key,
+                resolver_value,
+                resolver_initial_decay,
+                resolver_decay_mask,
+            ) = self._build_sima_group_delta(
                 builder,
                 query,
                 key,
@@ -1055,7 +1032,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 g,
                 mla_delta_state,
                 quantizable,
-                emit_prefix_states=self._emit_dflash_prefix_states,
             )
 
         z_heads = builder.create_slice_concat_node(
@@ -1102,7 +1078,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
             merged_lora=merged_lora,
             with_residual_add=True,
         )
-        _ = builder.create_tuple_node([mlp, linear_conv_state_out, linear_delta_state_out])
+        outputs = [mlp, linear_conv_state_out, linear_delta_state_out]
+        if self._emit_dflash_resolver_inputs:
+            outputs.extend(
+                [resolver_key, resolver_value, resolver_initial_decay, resolver_decay_mask]
+            )
+        _ = builder.create_tuple_node(outputs)
 
         mla_node = builder.finish_subnet("MLA_0")
         tuple_items = builder.create_tuple_get_item_nodes(mla_node)
@@ -1568,8 +1549,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         beta: OnnxNode,
         g: OnnxNode,
         state: OnnxNode,
-        emit_prefix_states: bool = False,
-    ) -> tuple[OnnxNode, OnnxNode]:
+    ) -> tuple[OnnxNode, OnnxNode, OnnxNode, OnnxNode, OnnxNode, OnnxNode]:
         """Build the grouped prefill Gated DeltaNet computation.
 
         This computes all token outputs and the final recurrent state for the group.
@@ -1732,84 +1712,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         linear_delta_state_out = self._onnx_builder.build_op(
             f"{base_name}.state.all", [state_base, state_updates], "Add"
         )
-        if emit_prefix_states:
-            # NCHW stores heads on axis 2; pack prefixes there without adding
-            # a fifth dimension. The common output transpose handles both paths.
-            prefix_name = f"{base_name}.prefix"
-            prefix_count = self.num_tokens - 1
-            num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-            folded_heads = prefix_count * num_heads
-
-            prefix_mask = self._onnx_builder.build_op(
-                f"{prefix_name}.mask",
-                [decay_mask, np.array([0], dtype=np.int64),
-                 np.array([prefix_count], dtype=np.int64),
-                 np.array([3], dtype=np.int64)],
-                "Slice",
-            )
-            prefix_mask = self._onnx_builder.build_op(
-                f"{prefix_name}.mask.prefix_major", [prefix_mask],
-                "Transpose", perm=[0, 3, 2, 1],
-            )
-            prefix_mask = self._onnx_builder.build_op(
-                f"{prefix_name}.mask.fold",
-                [prefix_mask, np.array(
-                    [1, 1, folded_heads, self.num_tokens], dtype=np.int64
-                )],
-                "Reshape",
-            )
-            folded_value = self._onnx_builder.build_op(
-                f"{prefix_name}.value.fold", [v_new] * prefix_count,
-                "Concat", axis=2,
-            )
-            folded_value = self._onnx_builder.build_op(
-                f"{prefix_name}.weighted", [folded_value, prefix_mask], "Mul"
-            )
-            folded_value = self._onnx_builder.build_op(
-                f"{prefix_name}.weighted.token_major", [folded_value],
-                "Transpose", perm=[0, 3, 2, 1],
-            )
-            folded_key = self._onnx_builder.build_op(
-                f"{prefix_name}.key.fold", [key] * prefix_count,
-                "Concat", axis=2,
-            )
-            updates = self._onnx_builder.build_op(
-                f"{prefix_name}.updates", [folded_value, folded_key],
-                "Einsum", equation="nchw,nqhc->nqhw",
-            )
-
-            prefix_decay = self._onnx_builder.build_op(
-                f"{prefix_name}.decay",
-                [g_exp, np.array([0], dtype=np.int64),
-                 np.array([prefix_count], dtype=np.int64),
-                 np.array([3], dtype=np.int64)],
-                "Slice",
-            )
-            prefix_decay = self._onnx_builder.build_op(
-                f"{prefix_name}.decay.prefix_major", [prefix_decay],
-                "Transpose", perm=[0, 3, 2, 1],
-            )
-            prefix_decay = self._onnx_builder.build_op(
-                f"{prefix_name}.decay.fold",
-                [prefix_decay, np.array([1, 1, folded_heads, 1], dtype=np.int64)],
-                "Reshape",
-            )
-            folded_state = self._onnx_builder.build_op(
-                f"{prefix_name}.initial_state.fold", [state] * prefix_count,
-                "Concat", axis=2,
-            )
-            base = self._onnx_builder.build_op(
-                f"{prefix_name}.base", [folded_state, prefix_decay], "Mul"
-            )
-            states = self._onnx_builder.build_op(
-                f"{prefix_name}.states", [base, updates], "Add"
-            )
-            linear_delta_state_out = self._onnx_builder.build_op(
-                f"{base_name}.prefix_states", [states, linear_delta_state_out],
-                "Concat", axis=2,
-            )
-
-        return core_attn_out, linear_delta_state_out
+        return core_attn_out, linear_delta_state_out, key, v_new, g_exp, decay_mask
 
     def _build_onnx_nodes(self, base_layer: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
         linear_base = f"{base_layer}.linear_attn"
@@ -2046,7 +1949,14 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 f"{linear_base}.decode", query, key, value, beta, decay, state_flat
             )
         else:
-            core_attn_out, linear_delta_state_out = self._build_group_delta(
+            (
+                core_attn_out,
+                linear_delta_state_out,
+                resolver_key,
+                resolver_value,
+                resolver_initial_decay,
+                resolver_decay_mask,
+            ) = self._build_group_delta(
                 f"{linear_base}.group",
                 query,
                 key,
@@ -2056,7 +1966,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 beta,
                 g,
                 state_flat,
-                emit_prefix_states=self._emit_dflash_prefix_states,
             )
 
         z_heads = self._onnx_builder.build_split_expand_concat(
@@ -2104,6 +2013,10 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
 
         output_nodes = [mlp, linear_conv_state_out, linear_delta_state_out]
+        if self._emit_dflash_resolver_inputs:
+            output_nodes.extend(
+                [resolver_key, resolver_value, resolver_initial_decay, resolver_decay_mask]
+            )
         return output_nodes
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:

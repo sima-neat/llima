@@ -372,6 +372,8 @@ def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(
         },
     )
     assert target_models[0][0].num_tokens == 8
+    assert [model.prefix_tokens for model, _ in target_models[1:]] == list(range(1, 8))
+    assert all(model.block_size == 8 for model, _ in target_models[1:])
 
     draft_cfg = _dflash_draft_config()
     draft = LanguageModel(
