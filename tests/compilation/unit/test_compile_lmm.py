@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -180,8 +181,97 @@ def test_standard_compilation_does_not_import_qwen3tts_compiler(
             "1",
         ],
     )
-    monkeypatch.setattr(compile_lmm, "gen_files", lambda *args: None)
+    load_calls = []
+    generation_calls = []
+    source = object.__new__(compile_lmm.LocalHuggingFaceModel)
+    monkeypatch.setattr(
+        compile_lmm.LocalHuggingFaceModel, "is_compressed_tensors_model", lambda self: False
+    )
+    model = SimpleNamespace(
+        model_name="ordinary-model",
+        hf_model=source,
+        cfg=SimpleNamespace(lm_cfg=SimpleNamespace(arch=compile_lmm.LlmArchType.LLAMA)),
+        gen_files=lambda mode, **kwargs: generation_calls.append((mode, kwargs)),
+    )
+
+    def load_model(**kwargs):
+        load_calls.append(kwargs)
+        return model
+
+    monkeypatch.setattr(compile_lmm.VisionLanguageModel, "from_hf_cache", load_model)
+    monkeypatch.setattr(compile_lmm, "default_configuration", lambda model: {"precision": {}})
 
     compile_lmm.main()
 
     assert qwen3tts_module not in sys.modules
+    assert load_calls[0]["model_name"] == "ordinary-model"
+    assert load_calls[0]["sima_path"] == tmp_path / "output" / "sima_files"
+    assert "qwen3tts_package_part" not in load_calls[0]
+    assert "qwen3tts_codec_tail" not in load_calls[0]
+    assert [mode for mode, _ in generation_calls] == [
+        compile_lmm.FileGenMode.DEVKIT,
+        compile_lmm.FileGenMode.SOURCE_TO_FP,
+        compile_lmm.FileGenMode.FP_TO_QUANT,
+        compile_lmm.FileGenMode.MODEL_SDK_COMPILE,
+    ]
+    assert all("qwen3tts_package_part" not in options for _, options in generation_calls)
+
+
+def test_qwen3tts_package_guard_preserves_other_architectures_devkit():
+    from sima_lmm.model.vision_language_model import VisionLanguageModel
+
+    qwen_arches = {
+        compile_lmm.LlmArchType.QWEN3_TTS_TALKER,
+        compile_lmm.LlmArchType.QWEN3_TTS_CODE_PREDICTOR,
+        compile_lmm.LlmArchType.QWEN3_TTS_CODEC_DECODER,
+        compile_lmm.LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL,
+    }
+    for arch in compile_lmm.LlmArchType:
+        model = object.__new__(VisionLanguageModel)
+        model.cfg = SimpleNamespace(lm_cfg=SimpleNamespace(arch=arch))
+        calls = []
+        model.gen_devkit_files = lambda **kwargs: calls.append(kwargs)
+        options = {"gen_config": {"precision": {}}}
+        if arch in qwen_arches:
+            model.gen_files(compile_lmm.FileGenMode.DEVKIT, qwen3tts_package_part=True, **options)
+        else:
+            with pytest.raises(ValueError, match="requires a Qwen3-TTS architecture"):
+                model.gen_files(compile_lmm.FileGenMode.DEVKIT, qwen3tts_package_part=True, **options)
+        assert calls == []
+        model.gen_files(compile_lmm.FileGenMode.DEVKIT, **options)
+        assert calls == [{"precision": {}, "resume": False}]
+
+
+def test_qwen3tts_package_rejects_non_tts_checkpoint_before_pipeline_setup(monkeypatch, tmp_path):
+    from sima_lmm.model import vision_language_model as vlm
+
+    monkeypatch.setattr(vlm, "model_file_type", lambda path: vlm.ModelFormat.FORMAT_HF)
+    monkeypatch.setattr(
+        vlm.LocalHuggingFaceModel, "create_from_directory",
+        lambda **kwargs: SimpleNamespace(config={"model_type": "qwen3"}),
+    )
+    monkeypatch.setattr(
+        vlm.VlmConfig, "from_hf_config",
+        lambda *args, **kwargs: SimpleNamespace(
+            lm_cfg=SimpleNamespace(arch=compile_lmm.LlmArchType.QWEN)
+        ),
+    )
+    with pytest.raises(ValueError, match="requires a Qwen3-TTS architecture"):
+        vlm.VisionLanguageModel.from_hf_cache(
+            model_name="qwen3tts-backbone",
+            hf_cache_path=tmp_path,
+            onnx_path=tmp_path / "onnx",
+            sima_path=tmp_path / "sima",
+            max_num_tokens=1024,
+            qwen3tts_package_part=True,
+        )
+    with pytest.raises(ValueError, match="requires the codec-decoder component"):
+        vlm.VisionLanguageModel.from_hf_cache(
+            model_name="qwen3tts-decoder",
+            hf_cache_path=tmp_path,
+            onnx_path=tmp_path / "onnx",
+            sima_path=tmp_path / "sima",
+            max_num_tokens=1024,
+            qwen3tts_codec_tail=True,
+            qwen3tts_package_part=True,
+        )

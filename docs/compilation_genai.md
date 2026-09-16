@@ -81,6 +81,24 @@ The agent records model and recipe provenance, follows the CLI contract of the
 installed release, and reports any unsupported model boundary or unavailable
 hardware validation instead of silently substituting another model or format.
 
+### Qwen3-TTS package compilation
+
+`--qwen3tts` selects the composite Qwen3-TTS package pipeline. The input root
+must contain `qwen3_components/` and
+`qwen3_model/devkit/codec_tail_raw_mla_contract.json`. The decoder tail also
+requires an importable `Tail4DWrapper` factory supplied through
+`--qwen3tts-tail-wrapper MODULE:ATTRIBUTE`.
+
+The pipeline compiles the backbone, code predictor, codec decoder and tail,
+codec prefix, and talker output head. Output defaults to `<model_path>/qwen3_model`;
+`-o` selects a different model output directory. Only complete-pipeline mode is
+supported for the composite command.
+
+Package-specific output paths and DevKit metadata handling require an exact
+Qwen3-TTS architecture. Ordinary Qwen LLMs and other architectures retain the
+standard compilation path; naming a directory `qwen3tts` does not enable these
+overrides.
+
 ### Compilation output
 
 The default complete pipeline generates the following directory structure:

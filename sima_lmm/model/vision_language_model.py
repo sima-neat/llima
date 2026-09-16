@@ -21,6 +21,17 @@ from sima_lmm.utils import ceil_div_row, mla_max_num_rows
 from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
 
 
+def _require_qwen3tts_architecture(arch: LlmArchType) -> None:
+    if arch not in (
+        LlmArchType.QWEN3_TTS_TALKER,
+        LlmArchType.QWEN3_TTS_CODE_PREDICTOR,
+        LlmArchType.QWEN3_TTS_CODEC_DECODER,
+        LlmArchType.QWEN3_TTS_CODEC_DECODER_TAIL,
+    ):
+        raise ValueError(
+            f"Qwen3-TTS package compilation requires a Qwen3-TTS architecture; got {arch}"
+        )
+
 
 class _TrivialContextManager:
     """
@@ -79,6 +90,7 @@ class VisionLanguageModel(BaseModel):
         qwen3tts_tail_wrapper: Callable[..., object] | None = None,
         target_model: "VisionLanguageModel | None" = None,
         qwen3tts_codec_tail: bool = False,
+        qwen3tts_package_part: bool = False,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -98,6 +110,7 @@ class VisionLanguageModel(BaseModel):
             split_mlp: True if mlp is being split into multiple parts.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
+            qwen3tts_package_part: Require a Qwen3-TTS architecture for composite compilation.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -121,6 +134,8 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg = VlmConfig.from_hf_config(
             model_format, hf_cache_path, model_config, image_resolution=image_resolution
         )
+        if qwen3tts_package_part:
+            _require_qwen3tts_architecture(vlm_cfg.lm_cfg.arch)
         # Set the token size and offsets for group processing.
         vlm_cfg.config_pipeline(
             system_prompt, chat_template, max_num_tokens, override_language_group_size,
@@ -182,7 +197,7 @@ class VisionLanguageModel(BaseModel):
         log_level: int = logging.NOTSET,
         num_processes: int = 1,
         resume: bool = False,
-        generate_devkit: bool = True,
+        qwen3tts_package_part: bool = False,
     ):
         """
         Generates files based on the provided file generation mode.
@@ -197,16 +212,21 @@ class VisionLanguageModel(BaseModel):
                 The lora dict is a map from layer ID to lora graph mode for each layer.
             log_level: Logging level.
             resume: Generate the files only if it does not exist.
+            qwen3tts_package_part: Use package-owned DevKit metadata. Valid only for
+                Qwen3-TTS architectures; ordinary compilation generates its own metadata.
         """
+        if qwen3tts_package_part:
+            _require_qwen3tts_architecture(self.cfg.lm_cfg.arch)
+
         sima_log_info("Generating %s files...", gen_mode)
 
         precision = gen_config["precision"]
 
         if gen_mode == FileGenMode.DEVKIT:
-            if generate_devkit:
+            if not qwen3tts_package_part:
                 return self.gen_devkit_files(precision=precision, resume=resume)
             return
-        elif generate_devkit and not (self.sima_devkit_path / "vlm_config.json").is_file():
+        elif not qwen3tts_package_part and not (self.sima_devkit_path / "vlm_config.json").is_file():
             self.gen_devkit_files(precision=precision, resume=False)
 
         if (

@@ -58,19 +58,27 @@ def gen_files(
     draft_output_path: Path | None,
     qwen3tts_tail_wrapper: object | None,
     *,
-    model_name: str | None = None,
-    sima_path: Path | None = None,
+    qwen3tts_component_name: str | None = None,
     qwen3tts_codec_tail: bool = False,
-    generate_devkit: bool = True,
 ):
     enable_verbose_error_messages()
     models = list()
+    qwen3tts_options = {}
+    if qwen3tts_component_name is not None:
+        if lora_path is not None or draft_model_path is not None:
+            _abort("Qwen3-TTS package parts cannot use LoRA or draft models.")
+        qwen3tts_options = {
+            "qwen3tts_codec_tail": qwen3tts_codec_tail,
+            "qwen3tts_package_part": True,
+        }
+    elif qwen3tts_codec_tail:
+        _abort("Qwen3-TTS codec-tail override requires a Qwen3-TTS package part.")
 
     base_model = VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
-        model_name=model_name or model_path.name,
+        model_name=qwen3tts_component_name or model_path.name,
         onnx_path=Path(output_path / "onnx_files"),
-        sima_path=Path(sima_path or output_path / "sima_files"),
+        sima_path=(output_path if qwen3tts_options else output_path / "sima_files"),
         max_num_tokens=max_num_tokens,
         system_prompt=system_prompt,
         chat_template=chat_template,
@@ -83,7 +91,7 @@ def gen_files(
         split_mlp=split_mlp,
         image_resolution=image_resolution,
         qwen3tts_tail_wrapper=qwen3tts_tail_wrapper,
-        qwen3tts_codec_tail=qwen3tts_codec_tail,
+        **qwen3tts_options,
     )
     models.append(base_model)
 
@@ -154,15 +162,17 @@ def gen_files(
                 _abort("ONNX generation mode not supported for GGUF models")
             modes = [file_gen_mode]
 
-        if not generate_devkit:
+        qwen3tts_generation_options = {}
+        if qwen3tts_options:
             modes = [mode for mode in modes if mode != FileGenMode.DEVKIT]
+            qwen3tts_generation_options["qwen3tts_package_part"] = True
 
         _print_precisions(gen_config["precision"], FileGenMode.SOURCE_TO_QUANT in modes or FileGenMode.FP_TO_QUANT in modes)
 
         for mode in modes:
             model.gen_files(
                 mode, gen_config=gen_config, log_level=log_level, num_processes=num_processes,
-                resume=resume, generate_devkit=generate_devkit
+                resume=resume, **qwen3tts_generation_options
             )
             print(f"Generated mode={mode.name} files for {model.model_name}", flush=True)
 
@@ -247,10 +257,8 @@ def gen_qwen3tts(
             None,
             None,
             qwen3tts_tail_wrapper,
-            model_name=component.model_name,
-            sima_path=output_path,
+            qwen3tts_component_name=component.model_name,
             qwen3tts_codec_tail=component.is_codec_tail,
-            generate_devkit=False,
         )
 
     # The remaining non-transformer parts use the same direct FP -> BF16 ->
