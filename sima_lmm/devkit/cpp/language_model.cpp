@@ -2620,7 +2620,8 @@ uint32_t LanguageModel::_calc_next_token_id(MLABuffer* buf_ptr) {
     auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
     Eigen::bfloat16 max_val = ptr[0];
     uint32_t max_index = 0;
-    #pragma omp parallel
+    // Keep the logits scan from waking a full CPU-sized team each token.
+    #pragma omp parallel num_threads(4)
     {
         // Other workers can already be updating the shared maximum below.
         Eigen::bfloat16 thread_max_val = ptr[0];
