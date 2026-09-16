@@ -442,6 +442,34 @@ def test_dflash_pair_validation_accepts_generic_target_taps():
     )
 
 
+def test_dflash_pair_validation_derives_llama_draft_topology():
+    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
+    target_cfg.lm_cfg.model_type = "llama"
+    target_cfg.lm_cfg.num_hidden_layers = 32
+    target_cfg.lm_cfg.layer_types = ["full_attention"] * 32
+    target_cfg.lm_cfg.linear_attn_cfg = None
+    target_cfg.config_pipeline(None, None, 2048, 128, 128)
+
+    draft_cfg = _dflash_draft_config()
+    draft_cfg.lm_cfg.num_hidden_layers = 5
+    draft_cfg.lm_cfg.layer_types = ["full_attention"] * 5
+    draft_cfg.lm_cfg.attn_cfg.swa_enable = False
+    draft_cfg.lm_cfg.attn_cfg.sliding_window = None
+
+    VisionLanguageModel._validate_dflash_pair(
+        SimpleNamespace(cfg=target_cfg),
+        draft_cfg,
+        {
+            "model_type": "qwen3",
+            "num_target_layers": 32,
+            "block_size": 10,
+        },
+        8,
+        [1, 8, 15, 22, 29],
+        128002,
+    )
+
+
 @pytest.mark.parametrize(
     ("draft_update", "message"),
     [

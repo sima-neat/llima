@@ -206,8 +206,6 @@ class VisionLanguageModel(BaseModel):
         mask_token_id: int,
     ):
         target_cfg = target_model.cfg.lm_cfg
-        if target_cfg.model_type != "qwen3_5_text":
-            raise ValueError("DFlash currently supports only Qwen3.5 target models")
         if draft_hf_cfg.get("model_type") != "qwen3":
             raise ValueError("DFlash draft model_type must be qwen3")
         if draft_cfg.lm_cfg.hidden_size != target_cfg.hidden_size:
@@ -230,7 +228,9 @@ class VisionLanguageModel(BaseModel):
             )
         if not 0 <= mask_token_id < target_cfg.token_cfg.vocab_size:
             raise ValueError("DFlash mask_token_id is missing or out of range")
-        checkpoint_block_size = draft_hf_cfg.get("dflash_config", {}).get("block_size", 0)
+        checkpoint_block_size = draft_hf_cfg.get("dflash_config", {}).get(
+            "block_size", draft_hf_cfg.get("block_size", 0)
+        )
         if block_size not in (4, 8, 16) or block_size > checkpoint_block_size:
             raise ValueError(
                 "DFlash speculative block size must be 4, 8, or 16 and no larger "
@@ -261,10 +261,18 @@ class VisionLanguageModel(BaseModel):
             raise ValueError(
                 "DFlash target and draft embedding quantization modes must match"
             )
-        if draft_cfg.lm_cfg.layer_types != ["sliding_attention"] * 5 + ["full_attention"]:
+        draft_layer_types = draft_cfg.lm_cfg.layer_types
+        if (
+            len(draft_layer_types) != draft_cfg.lm_cfg.num_hidden_layers
+            or not draft_layer_types
+            or any(
+                layer_type not in ("full_attention", "sliding_attention")
+                for layer_type in draft_layer_types
+            )
+        ):
             raise ValueError(
-                "DFlash draft must contain five sliding-attention layers followed by "
-                "one full-attention layer"
+                "DFlash draft layers must be full or sliding attention and match "
+                "num_hidden_layers"
             )
 
     def set_lora_adapter(self, lora_path: Path):

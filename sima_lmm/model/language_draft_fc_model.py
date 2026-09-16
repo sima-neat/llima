@@ -16,8 +16,9 @@ from sima_lmm.model.sima_builder import (
 class LanguageDraftFCModel(LanguagePartBaseModel):
     """Target-context fusion layer for a speculative draft model.
 
-    EAGLE3 projects one concatenated 3H tensor. DFlash accepts eight target-layer
-    tensors, concatenates them on device, projects 8H to H, and applies hidden_norm.
+    EAGLE3 projects one concatenated 3H tensor. DFlash accepts the configured
+    target-layer tensors, concatenates them on device, projects them to H, and
+    applies hidden_norm.
     """
     num_tokens: int
 

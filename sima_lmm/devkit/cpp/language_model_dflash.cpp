@@ -85,6 +85,9 @@ void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
   if (prefix_tokens == 0 || prefix_tokens > block_size) {
     throw std::invalid_argument("Invalid DFlash linear-state prefix length");
   }
+  if (!_has_linear_attention_layers()) {
+    return;
+  }
   _resolve_dflash_linear_state(prefix_tokens);
 
   const auto &linear_cfg = _linear_attn_cfg();
