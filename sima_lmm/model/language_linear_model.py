@@ -775,10 +775,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
             prefix_decay = builder.create_reshape_node(
                 prefix_decay, [1, folded_heads, 1, 1]
             )
-            folded_state = builder.create_slice_concat_node(
-                state, axis=1, split_axis=1, split_block=1,
-                split_repeat=prefix_count,
-            )
+            folded_state = builder.create_concat_node([state] * prefix_count, 1)
             states = builder.create_add_node(
                 builder.create_mul_node(folded_state, prefix_decay), updates
             )
