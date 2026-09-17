@@ -57,17 +57,24 @@ class LanguagePartBaseModel(BaseModel):
             # Clamped gated SwiGLU. de_interleave (gpt_oss only) splits the fused
             # interleaved gate_up into two projection convs at load time.
             de_interleave = self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
+            lora_ranks = {}
+            if self.cfg.lm_cfg.lora_cfg is not None:
+                lora_ranks = {
+                    name: self.cfg.lm_cfg.get_lora_rank(base_name, name)
+                    for name in ("gate_proj", "up_proj", "down_proj")
+                }
             gate = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.gate_proj", input_nodes[0], None,
+                f"{base_name}.gate_proj", input_nodes[0], lora_ranks.get("gate_proj"),
                 expert_idx=expert_idx, de_interleave=de_interleave,
             )
             up = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.up_proj", input_nodes[0], None,
+                f"{base_name}.up_proj", input_nodes[0], lora_ranks.get("up_proj"),
                 expert_idx=expert_idx, de_interleave=de_interleave,
             )
             act = self._onnx_builder.build_swiglu(f"{base_name}.act", gate, up, swiglu_limit)
             down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.down_proj", act, None, expert_idx=expert_idx
+                f"{base_name}.down_proj", act, lora_ranks.get("down_proj"),
+                expert_idx=expert_idx,
             )
             if with_residual_add:
                 down_proj = self._onnx_builder.build_op(
@@ -208,20 +215,26 @@ class LanguagePartBaseModel(BaseModel):
             self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx),
             swiglu_limit,
         )
+        lora_ranks = {}
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_ranks = {
+                name: self.cfg.lm_cfg.get_lora_rank(base_name, name)
+                for name in ("gate_proj", "up_proj", "down_proj")
+            }
         gate = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.gate_proj",
-            ifm, None, merged_lora=merged_lora,
+            ifm, lora_ranks.get("gate_proj"), merged_lora=merged_lora,
             expert_idx=expert_idx, de_interleave=de_interleave, activation=gate_clip,
         )
         up = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.up_proj",
-            ifm, None, merged_lora=merged_lora,
+            ifm, lora_ranks.get("up_proj"), merged_lora=merged_lora,
             expert_idx=expert_idx, de_interleave=de_interleave, activation=up_clip,
         )
         act = build_swiglu(builder, gate, up)
         down_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.down_proj",
-            act, None, merged_lora=merged_lora, expert_idx=expert_idx,
+            act, lora_ranks.get("down_proj"), merged_lora=merged_lora, expert_idx=expert_idx,
         )
         if with_residual_add:
             # Sums the MLP output with the residual stream.
