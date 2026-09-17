@@ -28,7 +28,7 @@ void VisionModel::run_model(
         return;
     }
 
-    // Each layer is a separate dispatcher job so other MLA workloads can run
+    // Each layer is a separate MLA job so other MLA workloads can run
     // between dependent vision layers.
     const uint8_t final_ofm_count = _cfg.pipeline_cfg.quantize_embeddings ? 2 : 1;
     for (size_t layer_idx = 0; layer_idx < _model_ptrs.size(); ++layer_idx) {

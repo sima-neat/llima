@@ -9,7 +9,7 @@ to a reusable workflow, while runtime tests run in a dedicated DevKit job.
 | Area | CI entry point | Runner | Tested artifact | Hardware |
 |------|----------------|--------|-----------------|----------|
 | Model compiler | `.github/workflows/model-compiler-tests.yml`, called by `test-model-compiler` in `vulcan-ci.yml` | Host test runner | Exact compiler wheel for the candidate commit | No DevKit |
-| Runtime | `test-devkit` in `.github/workflows/vulcan-ci.yml` | ARM64 Modalix runner | Exact LLiMa and Internals DEBs plus the runtime-test extras archive | Real DevKit and MLASHM dispatcher |
+| Runtime | `test-devkit` in `.github/workflows/vulcan-ci.yml` | ARM64 Modalix runner | Exact LLiMa DEBs plus the runtime-test extras archive | Real DevKit and MLA hardware |
 
 Compiler tests live under `tests/compilation/`. Runtime tests live under
 `tests/runtime/`. Runtime coverage never falls back to host-only execution or
@@ -265,8 +265,8 @@ used on a Modalix DevKit. It requires:
 
 - ARM64 Modalix hardware.
 - An active `simaai-appcomplex.service`.
-- The MLASHM dispatcher and MLA hardware.
-- Exact LLiMa and Internals packages from the candidate build.
+- MLA hardware initialized by the platform service.
+- Exact LLiMa packages from the candidate build.
 
 Missing models, packages, services, or the wrong architecture are failures,
 not skips or host-side fallbacks.
@@ -353,7 +353,6 @@ Pytest validates the installed package and external interfaces:
 |------|----------|
 | Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
 | CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
-| MLA memory cleanup | Runs Qwen four times through `llima run -> quit`, checks `/dev/simaai-mem` after every exit, and verifies that the daemon PID and allocation baseline remain stable |
 | Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
 | OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
@@ -373,21 +372,6 @@ subsequent execution:
 - Does not grow daemon thread or file-descriptor counts.
 - Reaps the `llima` process.
 - Returns CMA memory within the configured tolerance.
-
-The MLA memory cleanup regression test performs four sequential Qwen
-`llima run -> quit` cycles without restarting `simaai-appcomplex.service`.
-After every cycle it checks the allocation summary from `/dev/simaai-mem`
-against the initial baseline and reports stale 512 MiB target-2 buffers with
-their owner PIDs. The repeat count, run timeout, cleanup timeout, and log
-directory can be overridden with:
-
-- `SIMA_TEST_LLIMA_MEMORY_REPEAT_COUNT`
-- `SIMA_TEST_LLIMA_MEMORY_RUN_TIMEOUT_SECONDS`
-- `SIMA_TEST_LLIMA_MEMORY_CLEANUP_TIMEOUT_SECONDS`
-- `SIMA_TEST_LLIMA_MEMORY_LOG_DIR`
-
-When a persistent log directory is configured, each test invocation writes to
-its own `run-*` subdirectory so earlier results remain available.
 
 ### Cancellation and test isolation
 
@@ -411,8 +395,7 @@ Runtime test dependency installation uses `pip --no-cache-dir`.
 
 The runner deliberately retains:
 
-- Installed LLiMa and Internals Debian packages, which the next run
-  overwrites.
+- Installed LLiMa Debian packages, which the next run overwrites.
 - Downloaded Qwen, LFM2, and Whisper models.
 - The running `simaai-appcomplex.service`.
 
@@ -420,8 +403,8 @@ Runtime tests do not upload reports or generated outputs after execution.
 
 ### Running runtime tests on a DevKit
 
-Build and install the candidate LLiMa and Internals packages, then extract the
-extras archive:
+Build and install the candidate LLiMa packages, then extract the extras
+archive:
 
 ```bash
 mkdir -p _work/runtime-tests
@@ -495,14 +478,13 @@ When adding runtime coverage:
 ### Provenance
 
 - Compiler tests install the exact candidate wheel.
-- Runtime tests install the exact candidate LLiMa packages and resolved
-  Internals packages.
+- Runtime tests install the exact candidate LLiMa packages.
 - Build metadata and manifests tie packages and test extras to the candidate
   commit.
 
 ### Execution policy
 
-- Runtime tests execute serially against the dispatcher.
+- Runtime tests execute serially against MLA hardware.
 - High-memory compiler cases execute separately from the standard matrix.
 - Generated compiler payloads and extracted runtime-test workspaces are
   temporary.

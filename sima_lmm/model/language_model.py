@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from afe.ir.tensor_type import ScalarType
 from afe.ir.quantization_conv import block_quantize_weight_tensor
 
-from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
+from sima_lmm.logging import sima_log_info, sima_log_warning
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
