@@ -51,13 +51,26 @@ def _detect_speculative_method(draft_model_path: Path) -> str:
     """Detect the speculative decoding implementation for a draft model."""
     config_file = find_file(draft_model_path, "config.json", resolve=False)
     if config_file is None:
-        return SpeculativeDecodingMethod.EAGLE3
+        raise ValueError(
+            f"Cannot detect speculative method: no config.json found in {draft_model_path}"
+        )
 
     with config_file.open("r") as fp:
         draft_cfg = json.load(fp)
     if draft_cfg.get("model_type") == "gemma4_assistant":
         return SpeculativeDecodingMethod.GEMMA4_MTP
-    return SpeculativeDecodingMethod.EAGLE3
+
+    architectures = draft_cfg.get("architectures", [])
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if any("eagle3" in architecture.lower() for architecture in architectures):
+        return SpeculativeDecodingMethod.EAGLE3
+
+    raise ValueError(
+        "Unsupported speculative draft configuration: "
+        f"model_type={draft_cfg.get('model_type')!r}, architectures={architectures!r}. "
+        "Expected a Gemma4 MTP or EAGLE3 draft model."
+    )
 
 
 def gen_files(
@@ -67,7 +80,7 @@ def gen_files(
     language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None, speculative_method: str
+    draft_output_path: Path | None
 ):
     enable_verbose_error_messages()
     models = list()
@@ -96,8 +109,7 @@ def gen_files(
 
     # Check if draft model is provided
     if draft_model_path is not None:
-        if speculative_method == "auto":
-            speculative_method = _detect_speculative_method(draft_model_path)
+        speculative_method = _detect_speculative_method(draft_model_path)
         base_model.configure_speculative_decoding(
             is_draft=False, method=speculative_method
         )
@@ -332,16 +344,6 @@ def main():
         "--draft_model_path", type=Path,
         help="Path of the speculative draft/assistant model for the base (target) model."
     )
-    group.add_argument(
-        "--speculative_method",
-        choices=[
-            "auto", SpeculativeDecodingMethod.EAGLE3,
-            SpeculativeDecodingMethod.GEMMA4_MTP
-        ],
-        default="auto",
-        help="Speculative decoding implementation to use with --draft_model_path."
-    )
-
     group = parser.add_argument_group("Options to compile LoRA")
     group.add_argument(
         "--lora_name", type=str, dest="lora_names", action="append",
@@ -458,7 +460,7 @@ def main():
         args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
         args.quantize_kv_cache, return_logits, log_level, image_resolution,
-        args.draft_model_path, draft_output_path, args.speculative_method
+        args.draft_model_path, draft_output_path
     )
 
     # Compile LoRA weights if requested.

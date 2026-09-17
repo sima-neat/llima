@@ -67,17 +67,6 @@ To disable automatic embedding offloading and keep the tables in DRAM, run
 modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
 ```
 
-The Gemma4 MTP verification-mask, repeated-prompt, and prefix-cache fixes require
-updated runtime packages only; existing compiled MTP models can be reused. MTP
-retains committed target KV state for each cache ID and skips prefill groups
-covered by the matching prompt prefix. A fully matching prompt still reruns its
-final prefill group to refresh the next token and assistant's starting hidden
-state. Short prompts fitting in one group may therefore show cached tokens
-without a TTFT improvement. The reported cached-token count is the matching
-prefix length; a partially covered group is recomputed. After updating, check
-short, repeated, and partially matching prompts before comparing TTFT and
-generation speed.
-
 ## Interactive Commands
 
 Once `llima run` starts in CLI mode, use these commands at the prompt:

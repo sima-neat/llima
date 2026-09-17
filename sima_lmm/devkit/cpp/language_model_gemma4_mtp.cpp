@@ -920,7 +920,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         }
         // The assistant consumes the selected target's KV; it has no reusable
         // private KV or hidden state to restore between requests.
-        draft_lm._cached_token_ids.clear();
         draft_lm._kv_cache_len = 0;
 
         if (input_ids.size() >= max_length) {
@@ -1005,7 +1004,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             const auto processed_end = input_ids.begin()
                 + static_cast<std::ptrdiff_t>(processed_tokens);
             _cached_token_ids.assign(input_ids.begin(), processed_end);
-            draft_lm._cached_token_ids.assign(input_ids.begin(), processed_end);
             _kv_cache_len = checked_u16(
                 processed_tokens, "Gemma4 MTP committed KV length"
             );
@@ -1153,7 +1151,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     } catch (...) {
         _cached_token_ids.clear();
         _kv_cache_len = 0;
-        draft_lm._cached_token_ids.clear();
         draft_lm._kv_cache_len = 0;
         _is_running = false;
         draft_lm._is_running = false;
@@ -1164,7 +1161,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     if (!_is_running.load(std::memory_order_relaxed)) {
         _cached_token_ids.clear();
         _kv_cache_len = 0;
-        draft_lm._cached_token_ids.clear();
         draft_lm._kv_cache_len = 0;
         _notify_interrupt();
         _text_streamer.wait_streaming();
