@@ -614,14 +614,11 @@ class LanguageModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=num_tokens
                 )
             case "dflash_context":
-                model_name = (
-                    f"{self.model_name}_n{num_tokens}_dflash_context_layer{layer_idx}"
-                )
-                assert layer_idx is not None
+                model_name = f"{self.model_name}_n{num_tokens}_dflash_context_all_layers"
                 return LanguageDFlashContextModel(
                     self.cfg, model_name, onnx_path=self.onnx_path,
                     sima_path=self.sima_path, hf_model=self.hf_model,
-                    num_tokens=num_tokens, layer_idx=layer_idx,
+                    num_tokens=num_tokens, layer_idx=0,
                 )
             case "dflash_state_resolver":
                 assert token_idx is not None

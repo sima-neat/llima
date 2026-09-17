@@ -356,6 +356,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _define_linear_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_models();
         void _define_per_layer_models();
+        bool _uses_packed_dflash_cache() const {
+            return _cfg.lm_cfg.is_dflash()
+                && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+        }
+        uint32_t _kv_cache_head_offset(uint8_t layer_idx, bool value) const;
+        MLABuffer& _kv_cache_buffer(uint8_t layer_idx, bool value, bool scale = false);
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_cache(
             uint16_t num_tokens,
@@ -450,7 +456,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
         LanguageModelMap _linear_model_map;
-        // Draft-only context-fusion models indexed by their compiled width.
+        // EAGLE3-only context-fusion models indexed by their compiled width.
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
         LanguageModelMap _dflash_context_model_map;
         LanguageModelMap _dflash_state_resolver_model_map;
