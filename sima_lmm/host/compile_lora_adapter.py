@@ -32,7 +32,9 @@ _ITEMSIZE = {
     FileGenPrecision.A_BF16_W_INT4: 0.5
 }
 
-_MODEL_ID_PATTERN = r"_(n\d+)_(pre|post)_layer(\d+)_"
+_MODEL_ID_PATTERN = re.compile(
+    r"_(n\d+)_(?:(pre|post)_layer(\d+)|layer(\d+)_(conv|linear))(?:_|\.|$)"
+)
 
 _LOGGING_LEVELS: dict[str, int] = {
     "DEBUG": logging.DEBUG,
@@ -51,6 +53,22 @@ def _find_lora_adapter_layers(tensor_dict: dict[str, np.ndarray]):
         idx = int(res.groups()[0])
         max_layer_idx = idx if idx > max_layer_idx else max_layer_idx
     return max_layer_idx + 1
+
+
+def _layer_id_from_weight_map(weight_map_path: str | Path) -> LayerID:
+    """Derive the compiled language-model part from a relocation-map path."""
+    match = _MODEL_ID_PATTERN.search(Path(weight_map_path).name)
+    if match is None:
+        raise ValueError(
+            "Unable to derive a language-model part from LoRA relocation map: "
+            f"{weight_map_path}"
+        )
+
+    group, split_part, split_idx, fused_idx, fused_part = match.groups()
+    part = split_part or fused_part
+    part_idx = split_idx or fused_idx
+    model_size = "single" if group == "n1" else "group"
+    return LayerID(f"{model_size}_{part}", int(part_idx))
 
 
 def dense_matrix_to_conv_weight(m: np.ndarray) -> np.ndarray:
@@ -333,7 +351,10 @@ def compile_lora_adapter(
     Returns:
         None. Generated numpy files are written to disk.
     """
-    weight_map_paths = [str(p) for p in weight_map_path.rglob("*.json")]
+    weight_map_paths = sorted(str(p) for p in weight_map_path.rglob("*.json"))
+    layer_ids = list(
+        dict.fromkeys(_layer_id_from_weight_map(path) for path in weight_map_paths)
+    )
     model_format = model_file_type(base_path)
     assert model_format == ModelFormat.FORMAT_HF
     base_model = LocalHuggingFaceModel.create_from_directory(directory=base_path)
@@ -354,9 +375,13 @@ def compile_lora_adapter(
     num_adapter_layers = _find_lora_adapter_layers(adapter_dict)
     has_vision_adapter = False
     if configuration_path is None:
-        gen_cfg = default_configuration_lora(num_adapter_layers, has_vision_adapter)
+        gen_cfg = default_configuration_lora(
+            num_adapter_layers, has_vision_adapter, layer_ids=layer_ids
+        )
     else:
-        gen_cfg = read_configuration_file_lora(num_adapter_layers, configuration_path)
+        gen_cfg = read_configuration_file_lora(
+            num_adapter_layers, configuration_path, layer_ids=layer_ids
+        )
 
     precision = gen_cfg["precision"]
     lora_mode = gen_cfg["lora"]
@@ -371,11 +396,7 @@ def compile_lora_adapter(
     for weight_map_path in weight_map_paths:
 
         # Extract model segment information and look up for quantization precision.
-        res = re.search(_MODEL_ID_PATTERN, weight_map_path)
-        assert res and len(res.groups()) == 3
-        group, segment, part_idx = res.groups()
-        part = "single" if group == "n1" else "group"
-        layer_id = LayerID(f"{part}_{segment}", int(part_idx))
+        layer_id = _layer_id_from_weight_map(weight_map_path)
         curr_precision = precision[layer_id]
         curr_lora_mode = lora_mode[layer_id]
 

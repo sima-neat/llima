@@ -805,9 +805,9 @@ def _get_array_partition(
         i = element_size * index
         return a[i:i + element_size * span]
 
-    def get(a: np.ndarray | tuple[np.ndarray, np.ndarray]) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    def get(a: np.ndarray | tuple) -> np.ndarray | tuple:
         if isinstance(a, tuple):
-            return slice_array(a[0]), slice_array(a[1])
+            return slice_array(a[0]), slice_array(a[1]), *a[2:]
         # else
         return slice_array(a)
 

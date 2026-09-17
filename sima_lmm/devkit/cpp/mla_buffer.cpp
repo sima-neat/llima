@@ -286,6 +286,17 @@ void MLABuffer::invalidate_cache(size_t offset, size_t size) const {
 #endif
 }
 
+void MLABuffer::swap_storage(MLABuffer& other) {
+    if (_size_padded != other._size_padded) {
+        throw std::invalid_argument("Cannot swap MLA buffers with different allocation sizes");
+    }
+    std::swap(_simaai_dmabuf_ptr, other._simaai_dmabuf_ptr);
+    // Keep allocation identity with storage so MLA-RT refreshes cached imports.
+    std::swap(_allocation_generation, other._allocation_generation);
+    std::swap(_physical_addr, other._physical_addr);
+    std::swap(_virtual_addr, other._virtual_addr);
+}
+
 void MLABuffer::clear(bool flush) {
     if (!_simaai_dmabuf_ptr || !_virtual_addr) {
         throw std::logic_error("cannot clear an unallocated MLA buffer");
