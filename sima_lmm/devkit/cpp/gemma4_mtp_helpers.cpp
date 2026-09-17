@@ -83,16 +83,21 @@ std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
 ) {
     if (
         draft_token_ids.empty()
-        || target_next_token_ids.size() != draft_token_ids.size() + 1
+        || target_next_token_ids.empty()
+        || target_next_token_ids.size() > draft_token_ids.size() + 1
     ) {
         throw std::runtime_error(
-            "Gemma4 MTP verification requires one target result beyond the draft"
+            "Invalid Gemma4 MTP verification result"
         );
     }
 
     std::vector<std::pair<uint32_t, bool>> emitted_tokens;
     emitted_tokens.reserve(draft_token_ids.size() + 1);
-    for (size_t depth = 0; depth < draft_token_ids.size(); ++depth) {
+    for (size_t depth = 0; depth < target_next_token_ids.size(); ++depth) {
+        if (depth == draft_token_ids.size()) {
+            emitted_tokens.emplace_back(target_next_token_ids[depth], false);
+            return emitted_tokens;
+        }
         if (draft_token_ids[depth] != target_next_token_ids[depth]) {
             emitted_tokens.emplace_back(target_next_token_ids[depth], false);
             return emitted_tokens;
@@ -100,10 +105,9 @@ std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
         emitted_tokens.emplace_back(draft_token_ids[depth], true);
     }
 
-    // When every proposal matches, the last verification row supplies the
-    // target's bonus token. It remains unprocessed until the next round.
-    emitted_tokens.emplace_back(target_next_token_ids.back(), false);
-    return emitted_tokens;
+    throw std::runtime_error(
+        "Gemma4 MTP verification ended without a mismatch or bonus token"
+    );
 }
 
 std::vector<uint32_t> select_candidate_tokens(

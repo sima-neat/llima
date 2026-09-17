@@ -175,10 +175,7 @@ void LanguageModel::_define_attn_models_iter(
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     const uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
-    const bool is_single_model = (
-        num_tokens == single_num_tokens
-        || (_cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1)
-    );
+    const bool is_single_model = num_tokens == single_num_tokens;
     const bool use_sliding_cache = std::get<1>(cache_key) != 0;
     const std::string_view cache_layer_type = (
         use_sliding_cache ? "sliding_attention" : "full_attention"
@@ -547,9 +544,6 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
 void LanguageModel::_define_models() {
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     std::vector<uint16_t> num_tokens_vec = {single_num_tokens};
-    if (_cfg.lm_cfg.is_gemma4_mtp_target() && single_num_tokens != 1) {
-        num_tokens_vec.emplace_back(1);
-    }
     if (_use_group_token_models) {
         const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), group_num_tokens)
@@ -561,10 +555,7 @@ void LanguageModel::_define_models() {
         const auto& max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
         const auto& num_hidden_layers = _cfg.lm_cfg.num_hidden_layers;
 
-        const bool is_point_model = (
-            _cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1
-        );
-        if (num_tokens == single_num_tokens || is_point_model) {
+        if (num_tokens == single_num_tokens) {
             for (uint16_t token_idx = 0; token_idx < max_num_tokens; ++token_idx) {
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
                     if (
@@ -629,14 +620,10 @@ void LanguageModel::_define_per_layer_models() {
     if (!_uses_per_layer_inputs())
         return;
 
-    std::vector<uint16_t> num_tokens_vec = {1};
     const auto speculative_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    if (
-        _cfg.lm_cfg.is_gemma4_mtp_target()
-        && speculative_num_tokens != 1
-    ) {
-        num_tokens_vec.emplace_back(speculative_num_tokens);
-    }
+    std::vector<uint16_t> num_tokens_vec = {
+        _cfg.lm_cfg.is_gemma4_mtp_target() ? speculative_num_tokens : uint16_t{1}
+    };
     if (_use_group_token_models) {
         const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), group_num_tokens)

@@ -1287,6 +1287,11 @@ class VlmConfig(BaseConfig):
             is_speculative_draft
             and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
         )
+        is_gemma4_mtp_target = (
+            lm_cfg.speculative_decoding_cfg is not None
+            and not is_speculative_draft
+            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+        )
 
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
@@ -1442,35 +1447,10 @@ class VlmConfig(BaseConfig):
             and lm_cfg.hidden_size_per_layer_input > 0
         ):
             layers.append(LayerID("group_per_layer", 0))
-            layers.append(LayerID("single_per_layer", 0))
-            if (
-                lm_cfg.speculative_decoding_cfg is not None
-                and not lm_cfg.speculative_decoding_cfg.is_draft
-                and lm_cfg.speculative_decoding_cfg.method
-                == SpeculativeDecodingMethod.GEMMA4_MTP
-            ):
+            if is_gemma4_mtp_target:
                 layers.append(LayerID("speculative_per_layer", 0))
-
-        if (
-            self.model_type == VlmArchType.VLM_GEMMA4
-            and lm_cfg.speculative_decoding_cfg is not None
-            and not lm_cfg.speculative_decoding_cfg.is_draft
-            and lm_cfg.speculative_decoding_cfg.method
-            == SpeculativeDecodingMethod.GEMMA4_MTP
-        ):
-            layers.extend(LayerID("point_pre", n) for n in range(lm_cfg.num_hidden_layers))
-            layers.extend(LayerID("point_post", n) for n in range(lm_cfg.num_hidden_layers))
-            layers.extend(
-                LayerID("point_cache", n)
-                for n in single_cache_model_indices(pipeline_cfg)
-            )
-            if "sliding_attention" in layer_types:
-                layers.extend(
-                    LayerID("point_sliding_cache", n)
-                    for n in single_sliding_cache_model_indices(
-                        pipeline_cfg, lm_cfg.attn_cfg.sliding_window
-                    )
-                )
+            else:
+                layers.append(LayerID("single_per_layer", 0))
 
         return layers
 

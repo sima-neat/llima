@@ -191,11 +191,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::vector<Eigen::bfloat16> logits;         // (num_tokens, draft_vocab_size)
         };
 
-        struct Gemma4MtpTargetStepResult {
-            uint32_t next_token_id;
-            std::vector<Eigen::bfloat16> hidden_state;  // (backbone_hidden_size)
-        };
-
         struct Gemma4MtpTargetBatchResult {
             std::vector<uint32_t> next_token_ids;
             std::vector<Eigen::bfloat16> hidden_states;
@@ -503,7 +498,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids
         ) const;
         void _upload_per_layer_embedding_rows(
-            std::span<const uint32_t> token_ids, uint16_t num_tokens
+            std::span<const uint32_t> token_ids, uint16_t num_tokens,
+            uint16_t valid_tokens = 0
         );
         void _load_per_layer_embeddings();
         void _compute_and_upload_per_layer_inputs_prefill(
@@ -513,7 +509,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         uint32_t _argmax_lm_head_row(uint16_t num_tokens, uint16_t row);
         uint32_t _argmax_gemma4_mtp_masked_row(uint16_t num_tokens, uint16_t row);
         std::vector<uint32_t> _argmax_lm_head_rows(
-            uint16_t num_tokens, uint16_t valid_tokens
+            uint16_t num_tokens, uint16_t valid_tokens,
+            std::span<const uint32_t> expected_draft_tokens
         );
         std::vector<Eigen::bfloat16> _read_embedding_row_bf16(uint32_t token_id);
         std::vector<Eigen::bfloat16> _read_gemma4_mtp_target_hidden_rows(
@@ -539,9 +536,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t aligned_eff_num_cached_tokens,
             bool has_future_token_mask,
             std::string_view layer_type
-        );
-        Gemma4MtpTargetStepResult _run_gemma4_mtp_target_step(
-            uint16_t token_idx, uint32_t token_id
         );
         Gemma4MtpTargetBatchResult _run_gemma4_mtp_target_batch(
             uint16_t token_idx, std::span<const uint32_t> token_ids
@@ -597,6 +591,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         KVCacheSlot* _active_cache_slot = nullptr;
 
         std::vector<std::vector<Eigen::bfloat16>> _eagle3_intermediate_hidden_states;
+        std::optional<std::vector<Eigen::bfloat16>> _gemma4_mtp_prefill_hidden_state;
 
         std::atomic<bool> _is_running;
         std::optional<std::string> _reloc_name;

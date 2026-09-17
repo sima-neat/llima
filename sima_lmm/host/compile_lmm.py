@@ -67,7 +67,7 @@ def gen_files(
     language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None, speculative_method: str
+    draft_output_path: Path | None, speculative_method: str, draft_only: bool = False
 ):
     enable_verbose_error_messages()
     models = list()
@@ -89,6 +89,17 @@ def gen_files(
         image_resolution=image_resolution
     )
     models.append(base_model)
+
+    if draft_only:
+        if speculative_method == "auto":
+            speculative_method = _detect_speculative_method(model_path)
+        if speculative_method != SpeculativeDecodingMethod.GEMMA4_MTP:
+            _abort("--draft_only currently supports only Gemma4 MTP assistants")
+        if not base_model.cfg.lm_cfg.is_gemma4_assistant:
+            _abort("--draft_only requires a gemma4_assistant checkpoint")
+        base_model.configure_speculative_decoding(
+            is_draft=True, method=SpeculativeDecodingMethod.GEMMA4_MTP
+        )
 
     # Check if LoRA adapter is needed.
     if lora_path is not None:
@@ -332,6 +343,10 @@ def main():
         help="Path of the speculative draft/assistant model for the base (target) model."
     )
     group.add_argument(
+        "--draft_only", action="store_true",
+        help="Compile model_path as a standalone Gemma4 MTP assistant without a target model."
+    )
+    group.add_argument(
         "--speculative_method",
         choices=[
             "auto", SpeculativeDecodingMethod.EAGLE3,
@@ -368,6 +383,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.draft_only and args.draft_model_path is not None:
+        _abort("--draft_only cannot be combined with --draft_model_path")
 
     if args.jobs is None:
         print(
@@ -449,7 +467,7 @@ def main():
     elif args.lora_names is not None or args.lora_paths is not None:
         _abort("Number of --lora_name do not match the number of --lora_path")
 
-    return_logits = args.return_logits or args.draft_model_path is not None
+    return_logits = args.return_logits or args.draft_model_path is not None or args.draft_only
 
     gen_files(
         num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
@@ -457,7 +475,7 @@ def main():
         args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
         args.quantize_kv_cache, return_logits, log_level, image_resolution,
-        args.draft_model_path, draft_output_path, args.speculative_method
+        args.draft_model_path, draft_output_path, args.speculative_method, args.draft_only
     )
 
     # Compile LoRA weights if requested.

@@ -1726,6 +1726,18 @@ uint32_t LanguageModel::run_model_once(
                 }
                 next_token_id = best_idx;
             }
+            if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+                auto hidden_rows = _read_gemma4_mtp_target_hidden_rows(
+                    logits_num_tokens, static_cast<uint16_t>(row + 1)
+                );
+                const size_t hidden_size = _cfg.lm_cfg.hidden_size;
+                const auto row_begin = hidden_rows.begin()
+                    + static_cast<std::ptrdiff_t>(row * hidden_size);
+                _gemma4_mtp_prefill_hidden_state.emplace(
+                    row_begin,
+                    row_begin + static_cast<std::ptrdiff_t>(hidden_size)
+                );
+            }
         } else {
             // Non-spec: read from single n1_buffer4
             MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
@@ -2107,14 +2119,6 @@ void LanguageModel::_define_buffers() {
             fmt::format("eagle3_input_embedding_scales_n{}", single_num_tokens),
             {single_num_tokens, 1}
         );
-        if (_cfg.lm_cfg.is_gemma4_mtp_target() && single_num_tokens != 1) {
-            define_buffer(
-                "eagle3_input_embeds_n1",
-                {1, _cfg.lm_cfg.hidden_size},
-                "int8"
-            );
-            define_buffer("eagle3_input_embedding_scales_n1", {1, 1});
-        }
         const uint16_t group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         if (is_draft && _use_group_token_models && group_num_tokens != single_num_tokens) {
             define_buffer(
@@ -2189,12 +2193,6 @@ void LanguageModel::_define_buffers() {
 
     // Other buffers.
     std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
-    if (
-        _cfg.lm_cfg.is_gemma4_mtp_target()
-        && _cfg.lm_cfg.get_single_num_tokens() != 1
-    ) {
-        num_tokens_vec.emplace_back(1);
-    }
     if (_use_group_token_models) {
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), num_tokens)
@@ -2361,14 +2359,10 @@ void LanguageModel::_define_buffers() {
             _per_layer_embedding_shards.emplace_back(&get_buffer(name));
         }
         // MTP target verification consumes a native speculative-width projection.
-        std::vector<uint16_t> per_layer_num_tokens_vec{1};
         const auto speculative_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-        if (
-            _cfg.lm_cfg.is_gemma4_mtp_target()
-            && speculative_num_tokens != 1
-        ) {
-            per_layer_num_tokens_vec.emplace_back(speculative_num_tokens);
-        }
+        std::vector<uint16_t> per_layer_num_tokens_vec{
+            _cfg.lm_cfg.is_gemma4_mtp_target() ? speculative_num_tokens : uint16_t{1}
+        };
         if (_use_group_token_models) {
             const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
             if (
@@ -2394,15 +2388,6 @@ void LanguageModel::_define_buffers() {
                 );
             }
         }
-        if (
-            _cfg.lm_cfg.get_single_num_tokens() != 1
-            && !has_buffer("n1_per_layer_input")
-        ) {
-            define_buffer(
-                "n1_per_layer_input",
-                {_cfg.lm_cfg.num_hidden_layers, _cfg.lm_cfg.hidden_size_per_layer_input}
-            );
-        }
     }
 
     // Post output for last layer.
@@ -2420,7 +2405,6 @@ void LanguageModel::_define_buffers() {
             if (
                 !is_draft
                 && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
-                && !(_cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1)
             ) {
                 continue;
             }
@@ -2464,10 +2448,7 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     const uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    const bool is_single_model = (
-        num_tokens == single_num_tokens
-        || (_cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1)
-    );
+    const bool is_single_model = num_tokens == single_num_tokens;
     const uint16_t sliding_window = _cfg.lm_cfg.attn_cfg.sliding_window.value_or(0);
     const bool separate_sliding_cache = (
         layer_type == "sliding_attention"
@@ -2542,10 +2523,7 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    const bool is_single_model = (
-        num_tokens == single_num_tokens
-        || (_cfg.lm_cfg.is_gemma4_mtp_target() && num_tokens == 1)
-    );
+    const bool is_single_model = num_tokens == single_num_tokens;
 
     uint16_t cache_token_idx_begin = 0;
     const char* freq_prefix = "global";
@@ -3183,10 +3161,15 @@ void LanguageModel::_load_per_layer_embeddings() {
 
 
 void LanguageModel::_upload_per_layer_embedding_rows(
-    std::span<const uint32_t> token_ids, uint16_t num_tokens
+    std::span<const uint32_t> token_ids, uint16_t num_tokens,
+    uint16_t valid_tokens
 ) {
     if (!_uses_per_layer_inputs())
         return;
+    if (valid_tokens == 0)
+        valid_tokens = num_tokens;
+    if (valid_tokens > num_tokens || token_ids.size() < valid_tokens)
+        throw std::runtime_error("Invalid per-layer embedding staging row count");
     auto& staging = get_buffer(fmt::format("per_layer_emb_staging_n{}", num_tokens));
     const size_t row_size = staging.get_shape().back() * staging.get_elem_size();
     auto* dst = reinterpret_cast<uint8_t*>(staging.get_virtual_addr());
@@ -3205,9 +3188,11 @@ void LanguageModel::_upload_per_layer_embedding_rows(
         );
     }
     if (_embedding_offload) {
-        _embedding_offload->per_layer->gather(token_ids.first(num_tokens), dst, row_size);
+        _embedding_offload->per_layer->gather(
+            token_ids.first(valid_tokens), dst, row_size
+        );
     }
-    for (uint16_t i = 0; i < num_tokens; ++i) {
+    for (uint16_t i = 0; i < valid_tokens; ++i) {
         if (!_embedding_offload) {
             const size_t shard_idx = token_ids[i] / _per_layer_embedding_rows_per_shard;
             const size_t row_in_shard = token_ids[i] % _per_layer_embedding_rows_per_shard;

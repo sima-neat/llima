@@ -221,6 +221,16 @@ void test_verification_emits_the_first_target_mismatch() {
     );
 }
 
+void test_verification_accepts_an_early_exit_result() {
+    const std::vector<uint32_t> drafts = {10, 11, 12, 13, 14, 15};
+    const std::vector<uint32_t> target = {10, 21};
+    const auto emitted = resolve_draft_tokens(drafts, target);
+
+    expect(emitted.size() == 2, "early verification must stop at its mismatch");
+    expect(emitted[0] == std::pair<uint32_t, bool>{10, true}, "prefix accepted");
+    expect(emitted[1] == std::pair<uint32_t, bool>{21, false}, "target mismatch emitted");
+}
+
 void test_verification_emits_bonus_after_a_full_match() {
     const std::vector<uint32_t> drafts = {10, 11, 12, 13, 14, 15};
     const std::vector<uint32_t> target = {10, 11, 12, 13, 14, 15, 16};
@@ -262,6 +272,7 @@ int main() {
     test_partial_rejection_exposes_one_more_shared_kv_row_than_query_position();
     test_shared_kv_visibility_never_exceeds_computed_target_rows();
     test_verification_emits_the_first_target_mismatch();
+    test_verification_accepts_an_early_exit_result();
     test_verification_emits_bonus_after_a_full_match();
     test_verification_rejects_an_incomplete_target_result();
     return failures == 0 ? 0 : 1;

@@ -201,7 +201,7 @@ def test_speculative_decoding_rejects_sliding_attention():
         config.lm_cfg.set_speculative_decoding_config({})
 
 
-def test_gemma4_mtp_target_compiles_point_and_batched_decode_models():
+def test_gemma4_mtp_target_compiles_batched_decode_models_only():
     config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
     config.lm_cfg.set_speculative_decoding_config(
         {
@@ -212,16 +212,9 @@ def test_gemma4_mtp_target_compiles_point_and_batched_decode_models():
     )
     config.config_pipeline(None, None, 2048, 128, 128)
 
-    expected_layers = list(range(config.lm_cfg.num_hidden_layers))
     assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 7
-    assert _layer_indices(config, "point_pre") == expected_layers
-    assert _layer_indices(config, "point_post") == expected_layers
-    assert _layer_indices(config, "point_cache") == _layer_indices(
-        config, "single_cache"
-    )
-    assert _layer_indices(config, "point_sliding_cache") == _layer_indices(
-        config, "single_sliding_cache"
-    )
+    assert not any(layer.part.startswith("point_") for layer in config.get_layer_ids())
+    assert _layer_indices(config, "single_per_layer") == []
     assert _layer_indices(config, "speculative_per_layer") == [0]
     for layer_id in config.get_layer_ids():
         _encode_layer_id(layer_id)
