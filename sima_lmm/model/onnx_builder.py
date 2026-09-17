@@ -370,7 +370,7 @@ class OnnxBuilder:
             # MoE experts share one base_name, so qualify the branch with the expert
             # index to keep each expert's relocatable LoRA tensors distinct.
             expert_idx = kwargs.get("expert_idx", -1)
-            lora_name = base_name if expert_idx < 0 else f"{base_name}.expert{expert_idx}"
+            lora_name = base_name if expert_idx < 0 else f"{base_name}.expert.{expert_idx}"
             lora_a = self._build_conv_lora(
                 f"{lora_name}.lora_A", input_node, a_shape
             )

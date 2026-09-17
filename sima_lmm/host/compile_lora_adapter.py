@@ -262,8 +262,8 @@ def process_bundled_weights(
                         splits = {}
                         for e in range(w.shape[0]):
                             we = w[e]
-                            gate_name = name.replace(bundle, f"gate_proj.expert{e}")
-                            up_name = name.replace(bundle, f"up_proj.expert{e}")
+                            gate_name = name.replace(bundle, f"gate_proj.expert.{e}")
+                            up_name = name.replace(bundle, f"up_proj.expert.{e}")
                             if "lora_A" in name:
                                 splits[gate_name] = we
                                 splits[up_name] = we
@@ -272,7 +272,7 @@ def process_bundled_weights(
                                 splits[up_name] = we[1::2]
                     case "experts.down_proj":
                         splits = {
-                            name.replace(bundle, f"down_proj.expert{e}"): w[e]
+                            name.replace(bundle, f"down_proj.expert.{e}"): w[e]
                             for e in range(w.shape[0])
                         }
                     case "qkv_proj" if "lora_A" in name:
