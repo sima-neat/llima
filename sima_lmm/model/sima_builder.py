@@ -305,11 +305,15 @@ def build_conv_from_dense_with_lora(
         a_shape = (lora_rank, input_channels)
         b_shape = (output_channels, lora_rank)
 
+        # MoE experts share one base_name, so qualify the branch with the expert
+        # index to keep each expert's relocatable LoRA tensors distinct.
+        expert_idx = kwargs.get("expert_idx", -1)
+        lora_name = base_name if expert_idx < 0 else f"{base_name}.expert{expert_idx}"
         lora_a = _build_conv_lora(
-            builder, f"{base_name}.lora_A", ifm, a_shape
+            builder, f"{lora_name}.lora_A", ifm, a_shape
         )
         lora_b = _build_conv_lora(
-            builder, f"{base_name}.lora_B", lora_a, b_shape
+            builder, f"{lora_name}.lora_B", lora_a, b_shape
         )
         proj = builder.create_add_node(proj, lora_b)
     return proj

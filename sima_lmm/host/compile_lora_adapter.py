@@ -36,6 +36,11 @@ _MODEL_ID_PATTERN = re.compile(
     r"_(n\d+)_(?:(pre|post)_layer(\d+)|layer(\d+)_(conv|linear))(?:_|\.|$)"
 )
 
+# MoE parts. Tried before _MODEL_ID_PATTERN, which would otherwise match the
+# "post_layer<N>" prefix of an expert file and lose the expert index.
+_EXPERT_ID_PATTERN = re.compile(r"_(n\d+)_post_layer(\d+)_expert(\d+)(?:_|\.|$)")
+_ROUTER_ID_PATTERN = re.compile(r"_(n\d+)_router_layer(\d+)(?:_|\.|$)")
+
 _LOGGING_LEVELS: dict[str, int] = {
     "DEBUG": logging.DEBUG,
     "INFO": logging.INFO,
@@ -57,7 +62,21 @@ def _find_lora_adapter_layers(tensor_dict: dict[str, np.ndarray]):
 
 def _layer_id_from_weight_map(weight_map_path: str | Path) -> LayerID:
     """Derive the compiled language-model part from a relocation-map path."""
-    match = _MODEL_ID_PATTERN.search(Path(weight_map_path).name)
+    name = Path(weight_map_path).name
+
+    match = _EXPERT_ID_PATTERN.search(name)
+    if match:
+        group, layer_idx, expert_idx = match.groups()
+        model_size = "single" if group == "n1" else "group"
+        return LayerID(f"{model_size}_expert", int(layer_idx), int(expert_idx))
+
+    match = _ROUTER_ID_PATTERN.search(name)
+    if match:
+        group, layer_idx = match.groups()
+        model_size = "single" if group == "n1" else "group"
+        return LayerID(f"{model_size}_router", int(layer_idx))
+
+    match = _MODEL_ID_PATTERN.search(name)
     if match is None:
         raise ValueError(
             "Unable to derive a language-model part from LoRA relocation map: "
@@ -228,13 +247,34 @@ def process_bundled_weights(
     Returns:
         None.
     """
-    known_bundle_names = ["qkv_proj", "gate_up_proj"]
+    known_bundle_names = [
+        "experts.gate_up_proj", "experts.down_proj", "qkv_proj", "gate_up_proj"
+    ]
     all_names = list(tensors.keys())
     for name in all_names:
         for bundle in known_bundle_names:
             if bundle in name:
                 w = tensors[name]
                 match bundle:
+                    case "experts.gate_up_proj":
+                        # One fused tensor per layer, expert-major. gate and up are
+                        # interleaved on the output rows, as in _get_expert_weight.
+                        splits = {}
+                        for e in range(w.shape[0]):
+                            we = w[e]
+                            gate_name = name.replace(bundle, f"gate_proj.expert{e}")
+                            up_name = name.replace(bundle, f"up_proj.expert{e}")
+                            if "lora_A" in name:
+                                splits[gate_name] = we
+                                splits[up_name] = we
+                            else:
+                                splits[gate_name] = we[0::2]
+                                splits[up_name] = we[1::2]
+                    case "experts.down_proj":
+                        splits = {
+                            name.replace(bundle, f"down_proj.expert{e}"): w[e]
+                            for e in range(w.shape[0])
+                        }
                     case "qkv_proj" if "lora_A" in name:
                         splits = {
                             name.replace("qkv_proj", "q_proj"): w,
@@ -294,6 +334,9 @@ def process_bundled_weights(
                 tensors.update(splits)
                 del tensors[name]
                 sima_log_dbg(f"Weight {name} is split into {splits.keys()} {w.shape}")
+                # "gate_up_proj" also matches "experts.gate_up_proj"; stop before
+                # the next bundle re-reads the name just removed.
+                break
 
 
 def get_reloc_weight_shapes(reloc_file_paths: str) -> dict[str, tuple[int, int]]:

@@ -9,7 +9,7 @@ from afe.ir.build_node import NodeHandle, TopKRetType
 from afe.ir.tensor_type import ScalarType, TensorType
 
 from sima_lmm.config.vlm_config import LlmArchType
-from sima_lmm.model.base import LayerConfiguration
+from sima_lmm.model.base import LayerConfiguration, LoraGenMode
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
@@ -90,8 +90,13 @@ class LanguageMoeRouterModel(LanguagePartBaseModel):
             if self.check_hf_param(f"{base_name}.self_attn.out_proj.weight")
             else "o_proj"
         )
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(
+                f"{base_name}.self_attn", attn_out_name
+            )
         o_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.self_attn.{attn_out_name}", input_nodes[1], None
+            f"{base_name}.self_attn.{attn_out_name}", input_nodes[1], lora_rank
         )
         # h = input + o_proj(self_attn): residual the combine adds back.
         residual = self._onnx_builder.build_op(
@@ -100,13 +105,15 @@ class LanguageMoeRouterModel(LanguagePartBaseModel):
         x = self._build_rms_norm(f"{base_name}.post_attention_layernorm", residual)
 
         # Gating linear -> per-expert logits. OLMoE uses mlp.gate; others mlp.router.
-        router_weight_name = (
-            f"{base_name}.mlp.gate"
-            if self.check_hf_param(f"{base_name}.mlp.gate.weight")
-            else f"{base_name}.mlp.router"
+        gate_module = (
+            "gate" if self.check_hf_param(f"{base_name}.mlp.gate.weight") else "router"
         )
+        router_weight_name = f"{base_name}.mlp.{gate_module}"
+        gate_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            gate_rank = self.cfg.lm_cfg.get_lora_rank(f"{base_name}.mlp", gate_module)
         logits = self._onnx_builder.build_conv_from_dense_with_lora(
-            router_weight_name, x, None
+            router_weight_name, x, gate_rank
         )
         top_k = self.cfg.lm_cfg.moe_cfg.num_experts_per_tok
 
@@ -160,13 +167,14 @@ class LanguageMoeRouterModel(LanguagePartBaseModel):
         log_level: int,
         quantizable: bool,
     ):
-        g = self._build_sima_nodes(self._layer_base_name, quantizable)
+        merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
+        g = self._build_sima_nodes(self._layer_base_name, quantizable, merged_lora)
         save_awesomenet(
             g, self.model_name + (".fp32" if quantizable else ""),
             str(self.sima_model_sdk_path)
         )
 
-    def _build_sima_nodes(self, base_name: str, quantizable: bool):
+    def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         """Mirrors gen_onnx_files/_build_onnx_nodes on the SiMa Builder path.
 
         Tensors are (1, 1, num_tokens, C) here, so the experts lie on the last axis
@@ -227,9 +235,15 @@ class LanguageMoeRouterModel(LanguagePartBaseModel):
             if self.check_hf_param(f"{base_name}.self_attn.out_proj.weight")
             else "o_proj"
         )
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(
+                f"{base_name}.self_attn", attn_out_name
+            )
         o_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.self_attn.{attn_out_name}", mla_input_self_attn, None,
+            f"{base_name}.self_attn.{attn_out_name}", mla_input_self_attn, lora_rank,
+            merged_lora=merged_lora,
         )
         # h = input + o_proj(self_attn): residual the combine adds back.
         residual = builder.create_add_node(mla_input_input, o_proj)
@@ -238,13 +252,16 @@ class LanguageMoeRouterModel(LanguagePartBaseModel):
         )
 
         # Gating linear -> per-expert logits. OLMoE uses mlp.gate; others mlp.router.
-        router_weight_name = (
-            f"{base_name}.mlp.gate"
-            if self.check_hf_param(f"{base_name}.mlp.gate.weight")
-            else f"{base_name}.mlp.router"
+        gate_module = (
+            "gate" if self.check_hf_param(f"{base_name}.mlp.gate.weight") else "router"
         )
+        router_weight_name = f"{base_name}.mlp.{gate_module}"
+        gate_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            gate_rank = self.cfg.lm_cfg.get_lora_rank(f"{base_name}.mlp", gate_module)
         logits = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, router_weight_name, x, None,
+            builder, self.get_hf_param, self.check_hf_param, router_weight_name, x,
+            gate_rank, merged_lora=merged_lora,
         )
 
         # TopK cannot return values and indices from one node, so each branch builds
