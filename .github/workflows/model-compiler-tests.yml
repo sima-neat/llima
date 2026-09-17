@@ -213,7 +213,7 @@ jobs:
           set -euo pipefail
           test_stage="${RUNNER_TEMP}/llima-compiler-tests"
           junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
-          expected_test_count=94
+          expected_test_count=101
 
           rm -rf "${test_stage}"
           mkdir -p "${test_stage}"
@@ -278,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-config-junit.xml"
-          expected_test_count=25
+          expected_test_count=26
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -345,7 +345,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-onnx-regression-junit.xml"
-          expected_test_count=32
+          expected_test_count=37
           base_wheel_dir="${RUNNER_TEMP}/llima-base-wheel"
           base_package_root="${RUNNER_TEMP}/llima-base-package"
           base_resolution="${RUNNER_TEMP}/llima-base-resolution.json"

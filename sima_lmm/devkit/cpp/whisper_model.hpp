@@ -93,6 +93,9 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         void set_text_callback(TextStreamer::TextCallback callback) {
             _text_streamer->set_text_callback(callback);
         }
+        void set_performance_summary_enabled(bool enabled) {
+            _text_streamer->set_performance_summary_enabled(enabled);
+        }
         void wait_for_streamer_completion() {
             _text_streamer->wait_streaming();
         }
