@@ -128,40 +128,34 @@ void LanguageModel::_define_attn_models_iter(
         }
     );
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
-        auto key_offset = pre_kv_cache_offset;
-        auto value_offset = pre_kv_cache_offset;
-        if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-            key_offset[0] = _kv_cache_head_offset(layer_idx, false);
-            value_offset[0] = _kv_cache_head_offset(layer_idx, true);
-        }
         pre_ofms.emplace_back(
             MLABufferSlice(
-                &_kv_cache_buffer(layer_idx, false),
-                key_offset,
+                &get_buffer(fmt::format("cache_key_l{}", layer_idx)),
+                pre_kv_cache_offset,
                 pre_kv_cache_shape
             )
         );
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
             pre_ofms.emplace_back(
                 MLABufferSlice(
-                    &_kv_cache_buffer(layer_idx, false, true),
-                    {_kv_cache_head_offset(layer_idx, false), token_idx, 0},
+                    &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
+                    {0, token_idx, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
             );
         }
         pre_ofms.emplace_back(
             MLABufferSlice(
-                &_kv_cache_buffer(layer_idx, true),
-                value_offset,
+                &get_buffer(fmt::format("cache_val_l{}", layer_idx)),
+                pre_kv_cache_offset,
                 pre_kv_cache_shape
             )
         );
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
             pre_ofms.emplace_back(
                 MLABufferSlice(
-                    &_kv_cache_buffer(layer_idx, true, true),
-                    {_kv_cache_head_offset(layer_idx, true), token_idx, 0},
+                    &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
+                    {0, token_idx, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
             );
@@ -233,27 +227,16 @@ void LanguageModel::_define_attn_models_iter(
             }
         },
         MLABufferSlice{
-            &_kv_cache_buffer(kv_source_layer, false),
+            &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
             cache_kv_cache_offset,
             cache_kv_cache_shape
         },
     };
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-        cache_ifms.back() = MLABufferSlice{
-            &_kv_cache_buffer(kv_source_layer, false),
-            {
-                _kv_cache_head_offset(kv_source_layer, false),
-                cache_token_idx_begin,
-                0
-            },
-            cache_kv_cache_shape
-        };
-    }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
         cache_ifms.emplace_back(
             MLABufferSlice{
-                &_kv_cache_buffer(kv_source_layer, false, true),
-                {_kv_cache_head_offset(kv_source_layer, false), cache_token_idx_begin, 0},
+                &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
+                {0, cache_token_idx_begin, 0},
                 {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             }
         );
@@ -298,27 +281,16 @@ void LanguageModel::_define_attn_models_iter(
     }
     cache_ifms.emplace_back(
         MLABufferSlice{
-            &_kv_cache_buffer(kv_source_layer, true),
+            &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
             cache_kv_cache_offset,
             cache_kv_cache_shape
         }
     );
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-        cache_ifms.back() = MLABufferSlice{
-            &_kv_cache_buffer(kv_source_layer, true),
-            {
-                _kv_cache_head_offset(kv_source_layer, true),
-                cache_token_idx_begin,
-                0
-            },
-            cache_kv_cache_shape
-        };
-    }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
         cache_ifms.emplace_back(
             MLABufferSlice{
-                &_kv_cache_buffer(kv_source_layer, true, true),
-                {_kv_cache_head_offset(kv_source_layer, true), cache_token_idx_begin, 0},
+                &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
+                {0, cache_token_idx_begin, 0},
                 {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             }
         );
@@ -718,7 +690,7 @@ void LanguageModel::_define_models() {
     // Draft-only: FC fusion models.
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-    if (is_draft && !_cfg.lm_cfg.is_dflash()) {
+    if (is_draft) {
         _define_draft_fc_models();
     }
     if (_cfg.lm_cfg.is_dflash()) {
@@ -835,45 +807,64 @@ void LanguageModel::_define_dflash_models() {
         widths.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     for (const auto num_tokens : widths) {
-        std::vector<MLABufferSlice> inputs(
-            spec_cfg.target_layer_ids.size(), MLABufferSlice{}
-        );
-        const auto freq_dim =
-            _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("full_attention") / 2;
-        inputs.emplace_back(MLABufferSlice{
-            &get_buffer("global_freq_real"), {0, 0}, {num_tokens, freq_dim}
-        });
-        inputs.emplace_back(MLABufferSlice{
-            &get_buffer("global_freq_imag"), {0, 0}, {num_tokens, freq_dim}
-        });
-        const uint32_t packed_heads = 2
-            * _cfg.lm_cfg.num_hidden_layers
-            * _cfg.lm_cfg.attn_cfg.num_key_value_heads;
-        std::vector<MLABufferSlice> outputs{
-            MLABufferSlice{
-                &get_buffer("dflash_cache_kv"),
-                {0, 0, 0},
-                {packed_heads, num_tokens, _cfg.lm_cfg.attn_cfg.head_dim}
+        for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+            const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
+            const char* freq_prefix = layer_type == "sliding_attention" ? "local" : "global";
+            const auto freq_dim = _cfg.lm_cfg.rope_cfg.get_rope_dimension_count(layer_type) / 2;
+            std::vector<MLABufferSlice> outputs;
+            auto& key = get_buffer(fmt::format("cache_key_l{}", layer_idx));
+            auto& value = get_buffer(fmt::format("cache_val_l{}", layer_idx));
+            const std::vector<uint32_t> kv_begin = _cfg.pipeline_cfg.use_strided_kv_cache
+                ? std::vector<uint32_t>{0, 0, 0}
+                : std::vector<uint32_t>{0, 0};
+            const std::vector<uint32_t> kv_shape = _cfg.pipeline_cfg.use_strided_kv_cache
+                ? std::vector<uint32_t>{
+                    _cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                    num_tokens,
+                    _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
+                }
+                : std::vector<uint32_t>{
+                    num_tokens, _cfg.lm_cfg.attn_cfg.get_kv_size(layer_type)
+                };
+            outputs.emplace_back(MLABufferSlice{&key, kv_begin, kv_shape});
+            if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                outputs.emplace_back(MLABufferSlice{
+                    &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
+                    {0, 0, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, num_tokens, 1}
+                });
             }
-        };
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            outputs.emplace_back(MLABufferSlice{
-                &get_buffer("dflash_cache_kv_scale"),
-                {0, 0, 0},
-                {packed_heads, num_tokens, 1}
-            });
+            outputs.emplace_back(MLABufferSlice{&value, kv_begin, kv_shape});
+            if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                outputs.emplace_back(MLABufferSlice{
+                    &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
+                    {0, 0, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, num_tokens, 1}
+                });
+            }
+            const LanguageModelMapKey key_id{num_tokens, layer_idx, 0};
+            _dflash_context_model_map.emplace(
+                key_id,
+                MLAModelWithBuffer(
+                    _elf_dir / fmt::format(
+                        "{}_n{}_dflash_context_layer{}_stage1_mla.elf",
+                        _cfg.language_model_name, num_tokens, layer_idx
+                    ),
+                    {
+                        MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))},
+                        MLABufferSlice{
+                            &get_buffer(fmt::format("{}_freq_real", freq_prefix)),
+                            {0, 0}, {num_tokens, freq_dim}
+                        },
+                        MLABufferSlice{
+                            &get_buffer(fmt::format("{}_freq_imag", freq_prefix)),
+                            {0, 0}, {num_tokens, freq_dim}
+                        },
+                    },
+                    outputs
+                )
+            );
         }
-        _dflash_context_model_map.emplace(
-            LanguageModelMapKey{num_tokens, 0, 0},
-            MLAModelWithBuffer(
-                _elf_dir / fmt::format(
-                    "{}_n{}_dflash_context_all_layers_stage1_mla.elf",
-                    _cfg.language_model_name, num_tokens
-                ),
-                inputs,
-                outputs
-            )
-        );
     }
 }
 

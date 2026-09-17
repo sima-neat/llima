@@ -19,7 +19,7 @@ class LayerID:
             and for Mixture-of-Experts models 'group_router',
             'single_router', 'group_expert', 'single_expert',
             'group_weightedsum', 'single_weightedsum'.
-        part_idx: Index of the layer. For a combined DFlash context model this is 0.
+        part_idx: Index of the layer.
         expert_idx: Index of the expert within the layer, for the MoE
             'group_expert'/'single_expert' parts.  -1 for all non-expert parts.
     """

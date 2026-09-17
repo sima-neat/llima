@@ -329,25 +329,50 @@ void LanguageModel::_append_dflash_context(LanguageModel &target_lm,
     throw std::runtime_error("DFlash context write exceeds the draft cache");
   }
 
-  auto &model = _dflash_context_model_map.at(
-      LanguageModelMapKey{num_tokens, 0, 0});
+  auto &fc_model = _fc_model_map.at(num_tokens);
   for (size_t index = 0; index < expected; ++index) {
-    model._bind_ifm(
+    fc_model._bind_ifm(
         static_cast<uint8_t>(index),
         &target_lm.get_buffer(fmt::format(
             "dflash_target_hidden_n{}_{}", num_tokens, index)),
         {0, 0});
   }
-  const uint8_t freq_ifm = static_cast<uint8_t>(expected);
-  model._bind_ifm(freq_ifm, &get_buffer("global_freq_real"), {token_idx, 0});
-  model._bind_ifm(freq_ifm + 1, &get_buffer("global_freq_imag"),
-                  {token_idx, 0});
-  model._bind_ofm(0, &get_buffer("dflash_cache_kv"), {0, token_idx, 0});
-  if (_cfg.pipeline_cfg.quantize_kv_cache) {
-    model._bind_ofm(1, &get_buffer("dflash_cache_kv_scale"),
-                    {0, token_idx, 0});
+  fc_model.add_to_queue();
+
+  for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
+       ++layer_idx) {
+    const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
+    const char *freq_prefix =
+        layer_type == "sliding_attention" ? "local" : "global";
+    auto &model = _dflash_context_model_map.at(
+        LanguageModelMapKey{num_tokens, layer_idx, 0});
+    model._bind_ifm(1, &get_buffer(fmt::format("{}_freq_real", freq_prefix)),
+                    {token_idx, 0});
+    model._bind_ifm(2, &get_buffer(fmt::format("{}_freq_imag", freq_prefix)),
+                    {token_idx, 0});
+    uint8_t output = 0;
+    auto bind_kv = [&](const char *kind) {
+      auto &buffer = get_buffer(fmt::format("cache_{}_l{}", kind, layer_idx));
+      if (_cfg.pipeline_cfg.use_strided_kv_cache) {
+        model._bind_ofm(output++, &buffer, {0, token_idx, 0});
+      } else {
+        model._bind_ofm(output++, &buffer, {token_idx, 0});
+      }
+    };
+    bind_kv("key");
+    if (_cfg.pipeline_cfg.quantize_kv_cache) {
+      model._bind_ofm(
+          output++, &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
+          {0, token_idx, 0});
+    }
+    bind_kv("val");
+    if (_cfg.pipeline_cfg.quantize_kv_cache) {
+      model._bind_ofm(
+          output, &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
+          {0, token_idx, 0});
+    }
+    model.add_to_queue();
   }
-  model.add_to_queue();
   MLAModelWithBuffer::run_queue();
   _kv_cache_len = token_idx + valid_tokens;
 }

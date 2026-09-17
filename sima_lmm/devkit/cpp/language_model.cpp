@@ -66,27 +66,6 @@ namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
 }
 
-uint32_t LanguageModel::_kv_cache_head_offset(uint8_t layer_idx, bool value) const {
-    if (!_uses_packed_dflash_cache()) {
-        return 0;
-    }
-    const uint32_t layer = value
-        ? _cfg.lm_cfg.num_hidden_layers + layer_idx
-        : layer_idx;
-    return layer * _cfg.lm_cfg.attn_cfg.num_key_value_heads;
-}
-
-MLABuffer& LanguageModel::_kv_cache_buffer(
-    uint8_t layer_idx, bool value, bool scale
-) {
-    if (_uses_packed_dflash_cache()) {
-        return get_buffer(scale ? "dflash_cache_kv_scale" : "dflash_cache_kv");
-    }
-    return get_buffer(fmt::format(
-        "cache_{}{}_l{}", value ? "val" : "key", scale ? "_scale" : "", layer_idx
-    ));
-}
-
 LanguageModel::LanguageModel(
     std::filesystem::path model_path,
     std::set<uint32_t> stop_token_ids,
@@ -1603,12 +1582,6 @@ void LanguageModel::_initialize() {
         );
     }
     // Clear the KV caches and caches states.
-    if (_uses_packed_dflash_cache()) {
-        get_buffer("dflash_cache_kv").clear();
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            get_buffer("dflash_cache_kv_scale").clear();
-        }
-    }
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
@@ -1616,8 +1589,7 @@ void LanguageModel::_initialize() {
             get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)).clear();
             get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).clear();
             get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)).clear();
-        } else if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)
-                   && !_uses_packed_dflash_cache()) {
+        } else if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
             get_buffer(fmt::format("cache_key_l{}", layer_idx)).clear();
             get_buffer(fmt::format("cache_val_l{}", layer_idx)).clear();
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
@@ -1958,8 +1930,7 @@ void LanguageModel::_define_buffers() {
                     _cfg.lm_cfg.attn_cfg.get_kv_size(_cfg.lm_cfg.layer_types[i])
                 };
             }
-            if (!_cfg.lm_cfg.is_kv_shared_layer(i)
-                && !_uses_packed_dflash_cache()) {
+            if (!_cfg.lm_cfg.is_kv_shared_layer(i)) {
                 std::string kv_dtype = _cfg.pipeline_cfg.quantize_kv_cache ? "int8" : "bfloat16";
                 define_buffer(fmt::format("cache_key_l{}", i), cache_shape, kv_dtype);
                 define_buffer(fmt::format("cache_val_l{}", i), cache_shape, kv_dtype);
@@ -1975,29 +1946,6 @@ void LanguageModel::_define_buffers() {
                     define_buffer(fmt::format("cache_val_scale_l{}", i), scale_shape);
                 }
             }
-        }
-    }
-    if (_uses_packed_dflash_cache()) {
-        if (!_cfg.pipeline_cfg.use_strided_kv_cache) {
-            throw std::runtime_error("DFlash packed cache requires strided KV cache");
-        }
-        const size_t packed_heads = 2ULL
-            * _cfg.lm_cfg.num_hidden_layers
-            * _cfg.lm_cfg.attn_cfg.num_key_value_heads;
-        define_buffer(
-            "dflash_cache_kv",
-            {
-                packed_heads,
-                _cfg.pipeline_cfg.max_num_tokens,
-                _cfg.lm_cfg.attn_cfg.head_dim
-            },
-            _cfg.pipeline_cfg.quantize_kv_cache ? "int8" : "bfloat16"
-        );
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            define_buffer(
-                "dflash_cache_kv_scale",
-                {packed_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
-            );
         }
     }
 
@@ -2127,12 +2075,10 @@ void LanguageModel::_define_buffers() {
                     {num_tokens, _cfg.lm_cfg.hidden_size * 3}
                 );
             }
-            if (!_cfg.lm_cfg.is_dflash()) {
-                define_buffer(
-                    fmt::format("fc_n{}_output", num_tokens),
-                    {num_tokens, _cfg.lm_cfg.hidden_size}
-                );
-            }
+            define_buffer(
+                fmt::format("fc_n{}_output", num_tokens),
+                {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
         }
     }
 
@@ -2367,24 +2313,15 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
 
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         uint8_t ofm_idx = 1;
-        auto& key_buffer = _kv_cache_buffer(layer_idx, false);
-        auto& val_buffer = _kv_cache_buffer(layer_idx, true);
+        auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", layer_idx));
+        auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", layer_idx));
         if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-            pre_model._bind_ofm(
-                ofm_idx++, &key_buffer,
-                {_kv_cache_head_offset(layer_idx, false), token_idx, 0}
-            );
+            pre_model._bind_ofm(ofm_idx++, &key_buffer, {0, token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = _kv_cache_buffer(layer_idx, false, true);
-                pre_model._bind_ofm(
-                    ofm_idx++, &scale,
-                    {_kv_cache_head_offset(layer_idx, false), token_idx, 0}
-                );
+                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
+                pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
             }
-            pre_model._bind_ofm(
-                ofm_idx++, &val_buffer,
-                {_kv_cache_head_offset(layer_idx, true), token_idx, 0}
-            );
+            pre_model._bind_ofm(ofm_idx++, &val_buffer, {0, token_idx, 0});
         } else {
             pre_model._bind_ofm(ofm_idx++, &key_buffer, {token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
@@ -2394,11 +2331,8 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
             pre_model._bind_ofm(ofm_idx++, &val_buffer, {token_idx, 0});
         }
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            auto& scale = _kv_cache_buffer(layer_idx, true, true);
-            pre_model._bind_ofm(
-                ofm_idx, &scale,
-                {_kv_cache_head_offset(layer_idx, true), token_idx, 0}
-            );
+            auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
+            pre_model._bind_ofm(ofm_idx, &scale, {0, token_idx, 0});
         }
     }
 
@@ -2416,22 +2350,18 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     // IFM 0 is the query buffer. Its pointer, begin, and shape are invariant
     // for a compact cache key, so only the layer-owned cache inputs are rebound.
     uint8_t cache_ifm_idx = 1;
-    auto& key_buffer = _kv_cache_buffer(kv_source_layer, false);
-    auto& val_buffer = _kv_cache_buffer(kv_source_layer, true);
+    auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", kv_source_layer));
+    auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", kv_source_layer));
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
-            cache_ifm_idx++, &key_buffer,
-            {_kv_cache_head_offset(kv_source_layer, false), cache_token_idx_begin, 0}
+            cache_ifm_idx++, &key_buffer, {0, cache_token_idx_begin, 0}
         );
     } else {
         cache_model._bind_ifm(cache_ifm_idx++, &key_buffer, {cache_token_idx_begin, 0});
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = _kv_cache_buffer(kv_source_layer, false, true);
-        cache_model._bind_ifm(
-            cache_ifm_idx++, &scale,
-            {_kv_cache_head_offset(kv_source_layer, false), cache_token_idx_begin, 0}
-        );
+        auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer));
+        cache_model._bind_ifm(cache_ifm_idx++, &scale, {0, cache_token_idx_begin, 0});
     }
     if (use_group_future_token_mask) {
         // Group-mask buffer, begin, and shape are fixed by the compact key.
@@ -2452,18 +2382,14 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     }
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
-            cache_ifm_idx++, &val_buffer,
-            {_kv_cache_head_offset(kv_source_layer, true), cache_token_idx_begin, 0}
+            cache_ifm_idx++, &val_buffer, {0, cache_token_idx_begin, 0}
         );
     } else {
         cache_model._bind_ifm(cache_ifm_idx++, &val_buffer, {cache_token_idx_begin, 0});
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = _kv_cache_buffer(kv_source_layer, true, true);
-        cache_model._bind_ifm(
-            cache_ifm_idx, &scale,
-            {_kv_cache_head_offset(kv_source_layer, true), cache_token_idx_begin, 0}
-        );
+        auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer));
+        cache_model._bind_ifm(cache_ifm_idx, &scale, {0, cache_token_idx_begin, 0});
     }
 
     if (post_uses_embedding_scale) {
