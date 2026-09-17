@@ -21,6 +21,13 @@ bool is_attention(std::string_view layer_type) {
   return layer_type == "full_attention" || layer_type == "sliding_attention";
 }
 
+struct DFlashLogitView {
+  const uint8_t *data;
+  size_t row_stride;
+  uint32_t vocab_begin;
+  uint32_t width;
+};
+
 class ScopeExit {
 public:
   explicit ScopeExit(std::function<void()> callback)
@@ -47,6 +54,16 @@ void copy_buffer_slice(MLABuffer &destination,
 }
 
 } // namespace
+
+struct LanguageModel::DFlashScratch {
+  std::vector<uint32_t> draft_input_ids;
+  std::vector<uint32_t> proposals;
+  std::vector<uint32_t> verify_input;
+  std::vector<uint32_t> emitted;
+  std::vector<DFlashLogitView> logit_views;
+  std::vector<Eigen::bfloat16> attention_mask;
+  std::vector<Eigen::bfloat16> linear_valid_mask;
+};
 
 void LanguageModel::_capture_dflash_hidden_state(uint16_t num_tokens,
                                                   size_t capture_idx) {
@@ -175,7 +192,9 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
 void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
                                                   uint16_t token_idx,
                                                   uint8_t layer_idx,
-                                                  bool bidirectional) {
+                                                  bool bidirectional,
+                                                  std::vector<Eigen::bfloat16>
+                                                      &mask) {
   const auto &layer_type = _cfg.lm_cfg.layer_types.at(layer_idx);
   const uint16_t cache_begin =
       layer_type == "sliding_attention"
@@ -186,8 +205,7 @@ void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
   const auto cache_key = _get_cache_model_key(num_tokens, token_idx, layer_idx);
   const uint16_t aligned_context = std::get<2>(cache_key) + 1;
   const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
-  std::vector<Eigen::bfloat16> mask(
-      static_cast<size_t>(num_tokens) * aligned_context, neg_inf);
+  mask.assign(static_cast<size_t>(num_tokens) * aligned_context, neg_inf);
 
   for (uint16_t query = 0; query < num_tokens; ++query) {
     const uint16_t query_position = token_idx + query;
@@ -359,15 +377,15 @@ void LanguageModel::_append_dflash_context(LanguageModel &target_lm,
   _kv_cache_len = token_idx + valid_tokens;
 }
 
-std::vector<uint32_t> LanguageModel::_run_dflash_draft(LanguageModel &target_lm,
-                                                       uint32_t anchor_token,
-                                                       uint16_t token_idx) {
+const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
+    LanguageModel &target_lm, uint32_t anchor_token, uint16_t token_idx,
+    DFlashScratch &scratch) {
   const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
   const uint32_t hidden_size = _cfg.lm_cfg.hidden_size;
   const auto mask_token =
       _cfg.lm_cfg.speculative_decoding_cfg.value().mask_token_id;
-  std::vector<uint32_t> input_ids(num_tokens,
-                                  static_cast<uint32_t>(mask_token));
+  auto &input_ids = scratch.draft_input_ids;
+  input_ids.assign(num_tokens, static_cast<uint32_t>(mask_token));
   input_ids.front() = anchor_token;
 
   const bool quantized_embeddings = _cfg.pipeline_cfg.quantize_embeddings;
@@ -382,14 +400,22 @@ std::vector<uint32_t> LanguageModel::_run_dflash_draft(LanguageModel &target_lm,
           : nullptr;
   _stage_embedding_rows(target_lm, input_ids, input, input_scale);
 
+  std::optional<std::pair<std::string_view, bool>> active_mask;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
+    const bool bidirectional = layer_type == "full_attention";
+    const auto required_mask = std::pair{std::string_view(layer_type),
+                                         bidirectional};
+    if (!active_mask.has_value() || *active_mask != required_mask) {
+      MLAModelWithBuffer::run_queue();
+      _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx,
+                                    bidirectional, scratch.attention_mask);
+      active_mask = required_mask;
+    }
     const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
     const auto cache_key =
         _bind_attn_models(num_tokens, token_idx, layer_idx, input_scale);
-    _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx,
-                                  layer_type == "full_attention");
     std::map<uint8_t, MLABufferSlice> pre_inputs;
     if (layer_idx == 0) {
       pre_inputs.emplace(
@@ -399,49 +425,54 @@ std::vector<uint32_t> LanguageModel::_run_dflash_draft(LanguageModel &target_lm,
     _cache_model_map.at(cache_key).add_to_queue();
     _post_model_map.at(model_key).add_to_queue(layer_idx == 0 ? &pre_inputs
                                                               : nullptr);
-    // The last draft layer is bidirectional while the preceding layers are
-    // causal/sliding, so each layer must consume the mask uploaded above.
-    MLAModelWithBuffer::run_queue();
   }
+  MLAModelWithBuffer::run_queue();
 
   const uint32_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
-  std::vector<uint32_t> proposals(num_tokens - 1);
-  std::vector<float> best(proposals.size(),
-                          -std::numeric_limits<float>::infinity());
-  if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-    auto &buffer = get_buffer(fmt::format("n{}_buffer4", num_tokens));
-    std::vector<Eigen::bfloat16> logits(static_cast<size_t>(num_tokens - 1) *
-                                        vocab_size);
-    buffer.download(logits.data());
-    for (size_t row = 0; row < proposals.size(); ++row) {
-      for (uint32_t token = 0; token < vocab_size; ++token) {
-        const float value =
-            static_cast<float>(logits[row * vocab_size + token]);
-        if (value > best[row]) {
-          best[row] = value;
-          proposals[row] = token;
-        }
-      }
+  auto &proposals = scratch.proposals;
+  proposals.resize(num_tokens - 1);
+  auto &views = scratch.logit_views;
+  views.clear();
+  auto add_view = [&](MLABuffer &buffer, uint32_t begin, uint32_t width) {
+    if (buffer.get_dtype() != "bfloat16" || buffer.get_shape().size() != 2 ||
+        buffer.get_shape().front() != proposals.size() ||
+        buffer.get_shape().back() != width) {
+      throw std::runtime_error("Invalid DFlash draft logit buffer");
     }
+    buffer.invalidate_cache();
+    views.push_back(DFlashLogitView{
+        static_cast<const uint8_t *>(buffer.get_virtual_addr()),
+        buffer.get_buf_len(std::vector<uint32_t>{1, width}), begin, width});
+  };
+  if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+    add_view(get_buffer(fmt::format("n{}_buffer4", num_tokens)), 0,
+             vocab_size);
   } else {
     for (uint32_t split = 0, begin = 0; begin < vocab_size;
          begin += _cfg.lm_cfg.lm_head_split_dim, ++split) {
       const uint32_t width =
           std::min(_cfg.lm_cfg.lm_head_split_dim, vocab_size - begin);
-      std::vector<Eigen::bfloat16> logits(static_cast<size_t>(num_tokens - 1) *
-                                          width);
-      get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split))
-          .download(logits.data());
-      for (size_t row = 0; row < proposals.size(); ++row) {
-        for (uint32_t column = 0; column < width; ++column) {
-          const float value = static_cast<float>(logits[row * width + column]);
-          if (value > best[row]) {
-            best[row] = value;
-            proposals[row] = begin + column;
-          }
+      add_view(get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split)),
+               begin, width);
+    }
+  }
+
+#pragma omp parallel for schedule(static)
+  for (int row = 0; row < static_cast<int>(proposals.size()); ++row) {
+    float best = -std::numeric_limits<float>::infinity();
+    uint32_t best_token = 0;
+    for (const auto &view : views) {
+      const auto *logits = reinterpret_cast<const Eigen::bfloat16 *>(
+          view.data + static_cast<size_t>(row) * view.row_stride);
+      for (uint32_t column = 0; column < view.width; ++column) {
+        const float value = static_cast<float>(logits[column]);
+        if (value > best) {
+          best = value;
+          best_token = view.vocab_begin + column;
         }
       }
     }
+    proposals[row] = best_token;
   }
 
   // Drop the noisy block. The next accepted target context overwrites its rows.
@@ -449,9 +480,10 @@ std::vector<uint32_t> LanguageModel::_run_dflash_draft(LanguageModel &target_lm,
   return proposals;
 }
 
-std::vector<uint32_t>
+std::pair<uint16_t, uint32_t>
 LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
-                                         uint16_t token_idx) {
+                                         uint16_t token_idx,
+                                         DFlashScratch &scratch) {
   const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
   if (input_ids.size() != num_tokens) {
     throw std::invalid_argument(
@@ -470,13 +502,16 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
           : nullptr;
   _stage_embedding_rows(*this, input_ids, input, input_scale);
   if (_has_linear_attention_layers()) {
-    std::vector<Eigen::bfloat16> valid(num_tokens, Eigen::bfloat16{1.0f});
+    auto &valid = scratch.linear_valid_mask;
+    valid.assign(num_tokens, Eigen::bfloat16{1.0f});
     get_buffer("linear_valid_mask")
         .upload_raw(valid.data(), 0, valid.size() * sizeof(Eigen::bfloat16));
   }
 
   const auto &capture_layers =
       _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids;
+  MLABuffer *layer_input = nullptr;
+  std::optional<std::string_view> active_mask_type;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
@@ -485,81 +520,106 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
       inputs.emplace(0, MLABufferSlice{&input,
                                        {0, 0},
                                        {num_tokens, _cfg.lm_cfg.hidden_size}});
+    } else if (layer_input != nullptr) {
+      inputs.emplace(0, MLABufferSlice{layer_input,
+                                       {0, 0},
+                                       {num_tokens, _cfg.lm_cfg.hidden_size}});
     }
+    const auto capture =
+        std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
+    MLABuffer *capture_buffer = nullptr;
+    std::map<uint8_t, MLABufferSlice> outputs;
+    if (capture != capture_layers.end()) {
+      const auto capture_idx = std::distance(capture_layers.begin(), capture);
+      capture_buffer = &get_buffer(fmt::format(
+          "dflash_target_hidden_n{}_{}", num_tokens, capture_idx));
+      outputs.emplace(0, MLABufferSlice{capture_buffer,
+                                        {0, 0},
+                                        {num_tokens, _cfg.lm_cfg.hidden_size}});
+    }
+    auto *input_overrides = inputs.empty() ? nullptr : &inputs;
+    auto *output_overrides = outputs.empty() ? nullptr : &outputs;
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     if (is_attention(layer_type)) {
+      if (!active_mask_type.has_value() || *active_mask_type != layer_type) {
+        MLAModelWithBuffer::run_queue();
+        _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx, false,
+                                      scratch.attention_mask);
+        active_mask_type = layer_type;
+      }
       const auto cache_key =
           _bind_attn_models(num_tokens, token_idx, layer_idx, input_scale);
-      _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx, false);
-      _pre_model_map.at(model_key).add_to_queue(&inputs);
+      _pre_model_map.at(model_key).add_to_queue(input_overrides);
       _cache_model_map.at(cache_key).add_to_queue();
-      _post_model_map.at(model_key).add_to_queue(layer_idx == 0 ? &inputs
-                                                                : nullptr);
+      _post_model_map.at(model_key).add_to_queue(input_overrides,
+                                                  output_overrides);
     } else if (layer_type == "linear_attention") {
       auto &model = _linear_model_map.at(model_key);
       if (quantized_embeddings && layer_idx == 0) {
         model._bind_ifm(1, input_scale, {0, 0});
       }
-      model.add_to_queue(&inputs);
+      model.add_to_queue(input_overrides, output_overrides);
     } else if (layer_type == "conv") {
       auto &model = _conv_model_map.at(model_key);
       if (quantized_embeddings && layer_idx == 0) {
         model._bind_ifm(1, input_scale, {0, 0});
       }
-      model.add_to_queue(&inputs);
+      model.add_to_queue(input_overrides, output_overrides);
     } else {
       throw std::runtime_error("Unsupported DFlash target layer type: " +
                                layer_type);
     }
 
-    const auto capture =
-        std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
-    if (capture != capture_layers.end()) {
-      MLAModelWithBuffer::run_queue();
-      _capture_dflash_hidden_state(
-          num_tokens, std::distance(capture_layers.begin(), capture));
-    }
+    layer_input = capture_buffer;
   }
   MLAModelWithBuffer::run_queue();
 
   const uint32_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
-  std::vector<uint32_t> next(num_tokens);
-  std::vector<float> best(num_tokens, -std::numeric_limits<float>::infinity());
-  if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-    std::vector<Eigen::bfloat16> logits(static_cast<size_t>(num_tokens) *
-                                        vocab_size);
-    get_buffer(fmt::format("n{}_buffer4", num_tokens)).download(logits.data());
-    for (uint16_t row = 0; row < num_tokens; ++row) {
-      for (uint32_t token = 0; token < vocab_size; ++token) {
-        const float value =
-            static_cast<float>(logits[row * vocab_size + token]);
-        if (value > best[row]) {
-          best[row] = value;
-          next[row] = token;
-        }
-      }
+  auto &views = scratch.logit_views;
+  views.clear();
+  auto add_view = [&](MLABuffer &buffer, uint32_t begin, uint32_t width) {
+    if (buffer.get_dtype() != "bfloat16" || buffer.get_shape().size() != 2 ||
+        buffer.get_shape().front() != num_tokens ||
+        buffer.get_shape().back() != width) {
+      throw std::runtime_error("Invalid DFlash target logit buffer");
     }
+    buffer.invalidate_cache();
+    views.push_back(DFlashLogitView{
+        static_cast<const uint8_t *>(buffer.get_virtual_addr()),
+        buffer.get_buf_len(std::vector<uint32_t>{1, width}), begin, width});
+  };
+  if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+    add_view(get_buffer(fmt::format("n{}_buffer4", num_tokens)), 0,
+             vocab_size);
   } else {
     for (uint32_t split = 0, begin = 0; begin < vocab_size;
          begin += _cfg.lm_cfg.lm_head_split_dim, ++split) {
       const uint32_t width =
           std::min(_cfg.lm_cfg.lm_head_split_dim, vocab_size - begin);
-      std::vector<Eigen::bfloat16> logits(static_cast<size_t>(num_tokens) *
-                                          width);
-      get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split))
-          .download(logits.data());
-      for (uint16_t row = 0; row < num_tokens; ++row) {
-        for (uint32_t column = 0; column < width; ++column) {
-          const float value = static_cast<float>(logits[row * width + column]);
-          if (value > best[row]) {
-            best[row] = value;
-            next[row] = begin + column;
-          }
+      add_view(get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split)),
+               begin, width);
+    }
+  }
+
+  for (uint16_t row = 0; row < num_tokens; ++row) {
+    float best = -std::numeric_limits<float>::infinity();
+    uint32_t target_token = 0;
+    for (const auto &view : views) {
+      const auto *logits = reinterpret_cast<const Eigen::bfloat16 *>(
+          view.data + static_cast<size_t>(row) * view.row_stride);
+      for (uint32_t column = 0; column < view.width; ++column) {
+        const float value = static_cast<float>(logits[column]);
+        if (value > best) {
+          best = value;
+          target_token = view.vocab_begin + column;
         }
       }
     }
+    if (row == num_tokens - 1 || target_token != input_ids[row + 1]) {
+      return {row, target_token};
+    }
   }
-  return next;
+  throw std::runtime_error("DFlash verification did not produce a bonus token");
 }
 
 std::optional<std::vector<uint32_t>>
@@ -631,6 +691,12 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   }
   cached_tokens = _prepare_state_checkpoints_for_prefill(
       std::min(cached_tokens, draft_cached_tokens));
+  if (_use_group_token_models && cached_tokens < input_token_ids.size()) {
+    const auto &offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
+    const auto next_offset =
+        std::upper_bound(offsets.begin(), offsets.end(), cached_tokens);
+    cached_tokens = next_offset == offsets.begin() ? 0 : *std::prev(next_offset);
+  }
   _kv_cache_len = cached_tokens;
   draft_lm._kv_cache_len = cached_tokens;
 
@@ -676,6 +742,9 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   }
   bool stopped = _stop_token_ids.contains(anchor);
   bool cache_full = false;
+  DFlashScratch scratch;
+  scratch.verify_input.resize(block_size);
+  scratch.emitted.reserve(block_size);
 
   while (!stopped && _is_running.load(std::memory_order_relaxed) &&
          output.size() + prompt_len < max_length) {
@@ -686,20 +755,16 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     }
     ChronoTimer iteration_timer(true);
     const uint16_t verify_start = _kv_cache_len;
-    auto proposals = draft_lm._run_dflash_draft(*this, anchor, verify_start);
-    std::vector<uint32_t> verify_input(block_size, anchor);
+    const auto &proposals =
+        draft_lm._run_dflash_draft(*this, anchor, verify_start, scratch);
+    auto &verify_input = scratch.verify_input;
+    std::fill(verify_input.begin(), verify_input.end(), anchor);
     std::copy(proposals.begin(), proposals.end(), verify_input.begin() + 1);
-    auto target_tokens =
-        _run_dflash_target_verify(verify_input, verify_start);
-
-    size_t accepted = 0;
-    while (accepted < proposals.size() &&
-           proposals[accepted] == target_tokens[accepted]) {
-      ++accepted;
-    }
-    std::vector<uint32_t> emitted(proposals.begin(),
-                                  proposals.begin() + accepted);
-    emitted.push_back(target_tokens[accepted]);
+    const auto [accepted, bonus_token] =
+        _run_dflash_target_verify(verify_input, verify_start, scratch);
+    auto &emitted = scratch.emitted;
+    emitted.assign(proposals.begin(), proposals.begin() + accepted);
+    emitted.push_back(bonus_token);
     size_t produced = std::min<size_t>(
         emitted.size(), max_length - prompt_len - output.size());
     for (size_t index = 0; index < produced; ++index) {
@@ -731,7 +796,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     for (size_t index = 0; index < produced; ++index) {
       const auto token = emitted[index];
       output.push_back(token);
-      _notify_new_token(token, duration / produced);
+      _notify_new_token(token, duration / produced, index < accepted);
       if (performance_result != nullptr) {
         performance_result->token_durations.push_back(duration / produced);
         ++performance_result->generated_tokens;
@@ -744,7 +809,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     draft_lm._cached_first_generated_token = _cached_first_generated_token;
     if (performance_result != nullptr) {
       performance_result->accepted_draft_tokens.value() +=
-          std::min(accepted, produced);
+          std::min<size_t>(accepted, produced);
     }
     anchor = emitted[produced - 1];
     if (produced < emitted.size()) {

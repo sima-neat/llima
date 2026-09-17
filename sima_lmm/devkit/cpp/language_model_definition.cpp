@@ -736,6 +736,9 @@ void LanguageModel::_define_dflash_models() {
     const auto& spec_cfg = _cfg.lm_cfg.speculative_decoding_cfg.value();
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     if (!spec_cfg.is_draft) {
+        if (!_has_linear_attention_layers()) {
+            return;
+        }
         const auto& linear_cfg = _linear_attn_cfg();
         for (uint16_t prefix_tokens = 1; prefix_tokens < single_num_tokens;
              ++prefix_tokens) {

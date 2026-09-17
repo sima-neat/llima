@@ -273,6 +273,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             LanguageModel& target_lm, uint16_t num_tokens,
             uint16_t token_idx, uint16_t valid_tokens
         );
+        struct DFlashScratch;
         void _capture_dflash_hidden_state(uint16_t num_tokens, size_t capture_idx);
         void _resolve_dflash_linear_state(uint16_t prefix_tokens);
         void _commit_dflash_linear_state(uint16_t prefix_tokens);
@@ -281,13 +282,16 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         void _upload_dflash_attention_mask(
             uint16_t num_tokens, uint16_t token_idx,
-            uint8_t layer_idx, bool bidirectional
+            uint8_t layer_idx, bool bidirectional,
+            std::vector<Eigen::bfloat16>& mask
         );
-        std::vector<uint32_t> _run_dflash_target_verify(
-            std::span<const uint32_t> input_ids, uint16_t token_idx
+        std::pair<uint16_t, uint32_t> _run_dflash_target_verify(
+            std::span<const uint32_t> input_ids, uint16_t token_idx,
+            DFlashScratch& scratch
         );
-        std::vector<uint32_t> _run_dflash_draft(
-            LanguageModel& target_lm, uint32_t anchor_token, uint16_t token_idx
+        const std::vector<uint32_t>& _run_dflash_draft(
+            LanguageModel& target_lm, uint32_t anchor_token, uint16_t token_idx,
+            DFlashScratch& scratch
         );
         std::optional<std::vector<uint32_t>> _run_model_dflash_speculative_decoding(
             LanguageModel& draft_lm,
@@ -424,7 +428,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
 
         void _notify_first_token(uint32_t token_id, double duration);
-        void _notify_new_token(uint32_t token_id, double duration);
+        void _notify_new_token(
+            uint32_t token_id, double duration, bool from_draft = false
+        );
         void _notify_cache_full() const;
         void _notify_stop() const;
         void _notify_interrupt() const;

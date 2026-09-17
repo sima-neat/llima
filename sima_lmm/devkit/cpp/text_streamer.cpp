@@ -202,7 +202,7 @@ void TextStreamer::end() {
             const double accept_rate = 100.0 * static_cast<double>(_draft_token_count)
                                      / static_cast<double>(num_gen_tokens);
             messages.emplace_back(fmt::format(
-                "Number of tokens contributed by EAGLE3: {} ({:.2f}%)",
+                "Number of tokens contributed by draft model: {} ({:.2f}%)",
                 _draft_token_count, accept_rate
             ));
         }

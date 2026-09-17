@@ -1046,6 +1046,7 @@ uint32_t LanguageModel::run_model_once(
         );
     }
 
+    std::vector<Eigen::bfloat16> dflash_attention_mask;
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
 
@@ -1073,7 +1074,9 @@ uint32_t LanguageModel::run_model_once(
                 && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
                 && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
             ) {
-                _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx, false);
+                _upload_dflash_attention_mask(
+                    num_tokens, token_idx, layer_idx, false, dflash_attention_mask
+                );
             }
             _pre_model_map.at(model_key).add_to_queue(&ifm_map);
 
@@ -2747,13 +2750,28 @@ void LanguageModel::_stage_embedding_rows(
     MLABuffer& destination,
     MLABuffer* destination_scales
 ) {
-    destination.clear(false);
-    if (destination_scales) destination_scales->clear(false);
+    const bool fills_destination = (
+        destination.get_shape().size() == 2
+        && token_ids.size() == destination.get_shape().front()
+        && (
+            destination_scales == nullptr
+            || (
+                destination_scales->get_shape().size() == 2
+                && token_ids.size() == destination_scales->get_shape().front()
+            )
+        )
+    );
+    if (!fills_destination) {
+        destination.clear(false);
+        if (destination_scales) destination_scales->clear(false);
+    }
     source_model._gather_embedding_rows(token_ids, destination, destination_scales);
     // Speculative batches can have fewer valid rows than their MLA shape.
     // Publish the cleared padding as well as the gathered rows.
-    destination.flush_cache();
-    if (destination_scales) destination_scales->flush_cache();
+    if (!fills_destination) {
+        destination.flush_cache();
+        if (destination_scales) destination_scales->flush_cache();
+    }
 }
 
 
@@ -3006,9 +3024,11 @@ void LanguageModel::_notify_first_token(uint32_t token_id, double duration) {
 }
 
 
-void LanguageModel::_notify_new_token(uint32_t token_id, double duration) {
+void LanguageModel::_notify_new_token(
+    uint32_t token_id, double duration, bool from_draft
+) {
     _logger->info("Got token: {:d} in {:.5f}s", token_id, duration);
-    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration);
+    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration, from_draft);
 }
 
 
