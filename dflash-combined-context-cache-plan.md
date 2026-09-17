@@ -12,7 +12,7 @@ from one fusion graph plus five per-layer context graphs to one graph:
 
 ```text
 Current:  target hidden states -> fusion -> five K/V graphs -> 20 outputs
-Proposed: target hidden states -> combined graph          ->  2 outputs
+Proposed: target hidden states -> fusion -> one packed K/V projection -> 2 outputs
 ```
 
 This work applies only to a DFlash draft. Target models, ordinary generation,
@@ -95,11 +95,34 @@ Its internal calculation is:
 1. Concatenate the selected target hidden states.
 2. Apply the DFlash `fc` projection.
 3. Apply `hidden_norm` once.
-4. For every draft layer, apply its K and V projections.
-5. Apply RoPE to each K tensor.
-6. Dynamically quantize every K and V tensor independently.
-7. Concatenate quantized K tensors, followed by quantized V tensors, along the
-   folded head axis. Concatenate their scales in the same order.
+4. Concatenate every draft layer's K and V weights along the output-channel
+   axis and apply one packed K/V projection.
+5. Reshape the projection output into the folded layer/head layout and split
+   its K and V regions.
+6. Apply any model-specific, layer-specific K normalization, then apply RoPE
+   to the packed K region.
+7. Dynamically quantize packed K and packed V while retaining one scale per
+   head and token.
+8. Concatenate quantized K followed by quantized V, and concatenate their
+   scales in the same order.
+
+Let `KVD = num_key_value_heads * head_dim`. The packed projection has shape:
+
+```text
+hidden_size -> 2 * num_draft_layers * KVD
+```
+
+For the two initial checkpoints:
+
+| Draft | Packed K/V projection | Parameters | W8 payload |
+| --- | ---: | ---: | ---: |
+| Qwen3-4B | `2560 -> 10240` | 26.2M | 25 MiB |
+| Llama 3.1 8B | `4096 -> 10240` | 41.9M | 40 MiB |
+
+This projection replaces ten existing K/V projections. It does not add
+weights or arithmetic. Together with the existing fusion FC, the combined W8
+weight payload is approximately 56.25 MiB for Qwen3-4B and 120 MiB for Llama
+3.1 8B.
 
 It has two graph outputs:
 
@@ -108,8 +131,16 @@ packed_kv:       [1, 2 * L * H, N, D]  INT8
 packed_kv_scale: [1, 2 * L * H, N, 1]  BF16
 ```
 
-Independent per-tensor quantization must occur before concatenation so each K
-and V row retains the scale it has in the current implementation.
+The packed activation quantization must retain the current per-head,
+per-token scale behavior. It must not introduce one scale shared by all layers
+or by the full packed tensor.
+
+The compiler's W8 weight quantization is also a correctness boundary. A single
+concatenated weight tensor is equivalent when weight scales are per output
+channel. If the compiler uses a scale shared by an entire weight tensor, the
+builder must preserve the original K/V quantization domains explicitly. In
+that case, keep the K/V projections as separate nodes inside the combined
+graph rather than changing model accuracy merely to obtain one projection.
 
 If the compiler cannot efficiently concatenate K and V into two outputs, the
 bounded fallback is four packed outputs: all K, all K scales, all V, and all V
@@ -128,8 +159,17 @@ The new builder should reuse the existing projection, RMSNorm, RoPE, and
 dynamic-quantization helpers. It must load:
 
 - `fc` and `hidden_norm` from the DFlash checkpoint;
-- K/V weights from every draft layer; and
+- K/V weights from every draft layer and concatenate them in deterministic
+  K-layer order followed by V-layer order;
+- layer-specific K-normalization weights where the architecture defines them;
 - the configured target-layer count rather than assuming five inputs.
+
+Construct one packed K/V Conv/FC node when the selected precision preserves
+the current per-output-channel weight scales. Split or reshape its output only
+after the projection. Llama can apply RoPE to its complete packed K region.
+Qwen must preserve its layer-specific K normalization before the packed RoPE
+operation; use separate normalization operations if a folded operation cannot
+represent the checkpoint exactly.
 
 Keep `LanguageDraftFCModel` available for EAGLE3. Remove its DFlash-only branch
 and the old per-layer DFlash context builder after the combined path passes
@@ -250,6 +290,10 @@ target rollback state remain unchanged.
 - Assert the input count derives from `target_layer_ids`.
 - Assert the packed output shapes for N8, N16, and N128.
 - Verify the K-then-V layer/head ordering and scale ordering.
+- Assert that the packed projection has output width
+  `2 * num_draft_layers * num_key_value_heads * head_dim`.
+- Verify concatenated weight slices against every original K/V tensor and
+  verify that W8 scales retain their original quantization granularity.
 - Compare the combined graph numerically with the current fusion plus
   per-layer graphs using identical hidden states and RoPE inputs.
 - Check every packed slice against its corresponding old per-layer K/V output.
@@ -259,6 +303,8 @@ target rollback state remain unchanged.
 
 - Compile a small combined graph first and confirm the packed HWC16 OFM store.
 - Inspect scheduling for spills of the fused hidden tensor.
+- Confirm that the compiler emits one packed K/V projection rather than
+  expanding it into ten redundant input reads.
 - Compare ELF/filter size and graph latency with the six existing graphs.
 - Compile Qwen3-4B DFlash N8 and N16 with filter sharing enabled.
 - Confirm that N128 artifacts remain reusable between N8 and N16 packages.
@@ -288,8 +334,8 @@ Each prefill chunk or verification round changes from six queued models to one.
 The fused target representation no longer crosses an ELF boundary, and the
 runtime exposes two packed outputs instead of twenty per-layer outputs. Total
 K/V data written is unchanged. The actual speedup depends on whether the
-compiler keeps the shared fused representation on-chip and schedules the ten
-K/V projection branches efficiently.
+compiler keeps the shared fused representation on-chip and tiles the 25 MiB
+Qwen or 40 MiB Llama packed K/V projection efficiently.
 
 ## Non-goals
 
