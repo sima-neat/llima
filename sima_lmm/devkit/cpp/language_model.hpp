@@ -506,7 +506,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
-        uint32_t _argmax_lm_head_row(uint16_t num_tokens, uint16_t row);
         uint32_t _argmax_gemma4_mtp_masked_row(uint16_t num_tokens, uint16_t row);
         std::vector<uint32_t> _argmax_lm_head_rows(
             uint16_t num_tokens, uint16_t valid_tokens,
@@ -549,7 +548,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
 
         void _notify_first_token(uint32_t token_id, double duration);
-        void _notify_new_token(uint32_t token_id, double duration);
+        void _notify_new_token(
+            uint32_t token_id, double duration, bool from_draft = false
+        );
         void _notify_cache_full() const;
         void _notify_stop() const;
         void _notify_interrupt() const;

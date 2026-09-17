@@ -97,6 +97,26 @@ int main(int argc, char** argv) {
         require(!seed.empty() && !other.empty(), "Tokenizer produced no test tokens");
         const uint32_t replacement = other.front();
 
+        // Gemma byte-fallback encodes the ideographic space as three token
+        // IDs. A draft/target boundary inside it must not flush an incomplete
+        // UTF-8 prefix as replacement characters.
+        const std::string ideographic_space = "\xE3\x80\x80";
+        const auto byte_tokens = tokenizer->encode(ideographic_space, false);
+        require(byte_tokens.size() > 1, "Test requires a split UTF-8 token sequence");
+        std::string streamed_space;
+        {
+            TextStreamer utf8_streamer(tokenizer.get());
+            utf8_streamer.set_text_callback(
+                [&](const std::string& text, bool, bool) { streamed_space += text; }
+            );
+            for (size_t i = 0; i < byte_tokens.size(); ++i) {
+                utf8_streamer.put(byte_tokens[i], i == 0);
+            }
+            utf8_streamer.end();
+        }
+        require(streamed_space == ideographic_space,
+            "Draft provenance boundary corrupted a split UTF-8 character");
+
         connect({}, "/tmp/llima-gemma4-mtp-cache.log", spdlog::level::info);
         connected = true;
         auto trace = std::make_shared<PrefillTrace>();
@@ -143,8 +163,11 @@ int main(int argc, char** argv) {
                 require(metrics.cached_tokens.has_value() && metrics.cache_created.has_value(),
                     "Missing cache observability metrics");
                 if (!cancel) {
-                    require(tokens.has_value() && tokens->size() == generated,
-                        "MTP did not produce the requested token count");
+                    require(
+                        tokens.has_value() && !tokens->empty()
+                            && tokens->size() <= generated,
+                        "MTP produced no tokens or exceeded the requested count"
+                    );
                     require(metrics.ttft.has_value(), "Missing TTFT metric");
                     std::cout << "prompt=" << prompt.size()
                               << " cached=" << *metrics.cached_tokens

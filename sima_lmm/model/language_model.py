@@ -161,8 +161,6 @@ class LanguageModel(BaseModel):
                 case "group_per_layer":
                     part_model = self._get_part_model("per_layer", num_tokens)
                 case "single_per_layer":
-                    part_model = self._get_part_model("per_layer", 1)
-                case "speculative_per_layer":
                     part_model = self._get_part_model(
                         "per_layer", single_model_num_tokens
                     )

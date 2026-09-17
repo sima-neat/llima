@@ -29,7 +29,6 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_draft_fc": (False, "DRAFT_FC"),
     "group_per_layer": (True, "PER_LAYER"),
     "single_per_layer": (False, "PER_LAYER"),
-    "speculative_per_layer": (False, "PER_LAYER"),
 }
 
 

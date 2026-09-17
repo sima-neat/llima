@@ -12,7 +12,7 @@ using simaai::llima::gemma4_mtp_helpers::build_causal_mask;
 using simaai::llima::gemma4_mtp_helpers::draft_query_position;
 using simaai::llima::gemma4_mtp_helpers::draft_visible_shared_kv_len;
 using simaai::llima::gemma4_mtp_helpers::resolve_draft_tokens;
-using simaai::llima::gemma4_mtp_helpers::select_masked_token;
+using simaai::llima::gemma4_mtp_helpers::select_candidate_tokens;
 
 int failures = 0;
 
@@ -84,17 +84,7 @@ void test_causal_mask_keeps_padding_masked_and_rejects_invalid_ranges() {
     expect_runtime_error([] { build_causal_mask(7, 127, 7, 0, 128); }, "insufficient compiled width");
 }
 
-void test_selects_only_from_active_centroids() {
-    const std::vector<Eigen::bfloat16> token_logits = {
-        Eigen::bfloat16{100.0f},
-        Eigen::bfloat16{1.0f},
-        Eigen::bfloat16{7.0f},
-        Eigen::bfloat16{3.0f},
-        Eigen::bfloat16{4.0f},
-        Eigen::bfloat16{5.0f},
-        Eigen::bfloat16{6.0f},
-        Eigen::bfloat16{9.0f},
-    };
+void test_selects_tokens_from_the_highest_scoring_centroids() {
     const std::vector<Eigen::bfloat16> centroid_logits = {
         Eigen::bfloat16{1.0f},
         Eigen::bfloat16{10.0f},
@@ -103,56 +93,39 @@ void test_selects_only_from_active_centroids() {
     };
     const std::vector<uint32_t> token_ordering = {0, 1, 4, 5, 2, 3, 6, 7};
 
-    expect(
-        select_masked_token(
-            token_logits, centroid_logits, token_ordering, 2
-        ) == 7,
-        "the global maximum must be ignored when its centroid is inactive"
-    );
+    const std::vector<uint32_t> expected = {4, 5, 6, 7};
+    expect(select_candidate_tokens(centroid_logits, token_ordering, 2) == expected,
+        "candidate tokens must follow the highest-scoring centroids");
 }
 
-void test_uses_canonical_token_ids_and_deterministic_ties() {
-    const std::vector<Eigen::bfloat16> token_logits = {
-        Eigen::bfloat16{0.0f},
-        Eigen::bfloat16{0.0f},
-        Eigen::bfloat16{0.0f},
-        Eigen::bfloat16{0.0f},
-        Eigen::bfloat16{9.0f},
-        Eigen::bfloat16{0.0f},
-        Eigen::bfloat16{0.0f},
-        Eigen::bfloat16{9.0f},
-    };
+void test_centroid_ties_use_the_lower_index_first() {
     const std::vector<Eigen::bfloat16> centroid_logits = {
         Eigen::bfloat16{1.0f},
         Eigen::bfloat16{10.0f},
         Eigen::bfloat16{2.0f},
-        Eigen::bfloat16{9.0f},
+        Eigen::bfloat16{10.0f},
     };
     const std::vector<uint32_t> token_ordering = {0, 1, 7, 5, 2, 3, 6, 4};
 
-    expect(
-        select_masked_token(
-            token_logits, centroid_logits, token_ordering, 2
-        ) == 4,
-        "equal candidate logits must choose the lower canonical token ID"
-    );
+    const std::vector<uint32_t> expected = {7, 5, 6, 4};
+    expect(select_candidate_tokens(centroid_logits, token_ordering, 2) == expected,
+        "equal centroid logits must use the lower centroid index first");
 }
 
 void test_rejects_invalid_metadata() {
-    const std::vector<Eigen::bfloat16> token_logits(8, Eigen::bfloat16{0.0f});
     const std::vector<Eigen::bfloat16> centroid_logits(4, Eigen::bfloat16{0.0f});
     const std::vector<uint32_t> ordering = {0, 1, 2, 3, 4, 5, 6, 7};
 
     expect_runtime_error(
-        [&] { select_masked_token(token_logits, centroid_logits, ordering, 0); },
+        [&] { select_candidate_tokens(centroid_logits, ordering, 0); },
         "zero centroid top-k must be rejected"
     );
     auto out_of_range = ordering;
     out_of_range[0] = 8;
     expect_runtime_error(
         [&] {
-            select_masked_token(
-                token_logits, centroid_logits, out_of_range, centroid_logits.size()
+            select_candidate_tokens(
+                centroid_logits, out_of_range, centroid_logits.size()
             );
         },
         "out-of-range canonical token IDs must be rejected"
@@ -265,8 +238,8 @@ int main() {
     test_causal_mask_spans_a_context_bucket_boundary();
     test_causal_mask_uses_relative_sliding_columns();
     test_causal_mask_keeps_padding_masked_and_rejects_invalid_ranges();
-    test_selects_only_from_active_centroids();
-    test_uses_canonical_token_ids_and_deterministic_ties();
+    test_selects_tokens_from_the_highest_scoring_centroids();
+    test_centroid_ties_use_the_lower_index_first();
     test_rejects_invalid_metadata();
     test_draft_query_position_follows_the_input_length();
     test_partial_rejection_exposes_one_more_shared_kv_row_than_query_position();

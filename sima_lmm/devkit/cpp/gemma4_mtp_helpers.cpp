@@ -166,36 +166,6 @@ std::vector<uint32_t> select_candidate_tokens(
     return candidate_tokens;
 }
 
-uint32_t select_masked_token(
-    std::span<const Eigen::bfloat16> token_logits,
-    std::span<const Eigen::bfloat16> centroid_logits,
-    std::span<const uint32_t> token_ordering,
-    uint32_t top_k_centroids
-) {
-    if (token_logits.empty() || token_logits.size() != token_ordering.size()) {
-        throw std::runtime_error(
-            "Gemma4 masked lm_head requires one token-ordering entry per logit"
-        );
-    }
-
-    const auto candidate_tokens = select_candidate_tokens(
-        centroid_logits, token_ordering, top_k_centroids
-    );
-    uint32_t best_token = std::numeric_limits<uint32_t>::max();
-    float best_value = -std::numeric_limits<float>::infinity();
-    for (const uint32_t token : candidate_tokens) {
-        const float value = static_cast<float>(token_logits[token]);
-        if (
-            value > best_value
-            || (value == best_value && token < best_token)
-        ) {
-            best_value = value;
-            best_token = token;
-        }
-    }
-    return best_token;
-}
-
 } // namespace gemma4_mtp_helpers
 } // namespace llima
 } // namespace simaai

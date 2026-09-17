@@ -1287,12 +1287,6 @@ class VlmConfig(BaseConfig):
             is_speculative_draft
             and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
         )
-        is_gemma4_mtp_target = (
-            lm_cfg.speculative_decoding_cfg is not None
-            and not is_speculative_draft
-            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
-        )
-
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
                 raise ValueError(
@@ -1447,10 +1441,7 @@ class VlmConfig(BaseConfig):
             and lm_cfg.hidden_size_per_layer_input > 0
         ):
             layers.append(LayerID("group_per_layer", 0))
-            if is_gemma4_mtp_target:
-                layers.append(LayerID("speculative_per_layer", 0))
-            else:
-                layers.append(LayerID("single_per_layer", 0))
+            layers.append(LayerID("single_per_layer", 0))
 
         return layers
 

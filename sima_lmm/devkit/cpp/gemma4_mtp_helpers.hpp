@@ -42,13 +42,6 @@ std::vector<uint32_t> select_candidate_tokens(
     uint32_t top_k_centroids
 );
 
-uint32_t select_masked_token(
-    std::span<const Eigen::bfloat16> token_logits,
-    std::span<const Eigen::bfloat16> centroid_logits,
-    std::span<const uint32_t> token_ordering,
-    uint32_t top_k_centroids
-);
-
 } // namespace gemma4_mtp_helpers
 } // namespace llima
 } // namespace simaai

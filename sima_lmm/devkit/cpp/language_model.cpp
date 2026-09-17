@@ -3264,9 +3264,11 @@ void LanguageModel::_notify_first_token(uint32_t token_id, double duration) {
 }
 
 
-void LanguageModel::_notify_new_token(uint32_t token_id, double duration) {
+void LanguageModel::_notify_new_token(
+    uint32_t token_id, double duration, bool from_draft
+) {
     _logger->info("Got token: {:d} in {:.5f}s", token_id, duration);
-    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration);
+    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration, from_draft);
 }
 
 

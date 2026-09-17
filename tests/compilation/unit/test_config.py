@@ -214,8 +214,7 @@ def test_gemma4_mtp_target_compiles_batched_decode_models_only():
 
     assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 7
     assert not any(layer.part.startswith("point_") for layer in config.get_layer_ids())
-    assert _layer_indices(config, "single_per_layer") == []
-    assert _layer_indices(config, "speculative_per_layer") == [0]
+    assert _layer_indices(config, "single_per_layer") == [0]
     for layer_id in config.get_layer_ids():
         _encode_layer_id(layer_id)
 
