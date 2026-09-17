@@ -30,7 +30,7 @@ struct RequestOptions {
   std::string language{"English"};
   uint32_t seed{1};
   uint32_t max_frames{50};
-  bool do_sample{false};
+  bool do_sample{true};
   uint32_t top_k{50};
   float top_p{1.0F};
   float temperature{0.9F};

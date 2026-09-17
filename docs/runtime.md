@@ -62,6 +62,14 @@ Options in the **Qwen3-TTS** group (including `--prompt`, `--speaker`,
 `--output-wav`, sampling and endpoint controls) require a Qwen3-TTS package.
 They are rejected for other models; use the interactive prompt for LLMs/VLMs.
 
+For Qwen3-TTS, sampling is enabled by default in both generation stages.
+Use `llima run <model> --no-do-sample --no-subtalker-do-sample` for greedy
+generation, or `qwen3tts --no-sample --subtalker-no-sample` with the direct runner.
+The runner resets the sampling seed after warmup while
+retaining loaded models, so warmup does not consume the measured generation's
+random sequence. With the direct `qwen3tts --timed-runs N` interface, successive
+timed runs continue that sequence; they are not individually reseeded.
+
 To disable automatic embedding offloading and keep the tables in DRAM, run
 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
 

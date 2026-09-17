@@ -26,6 +26,7 @@ void usage() {
                "--seed N\n"
             << "  --no-sample | --sample --subtalker-sample | "
                "--subtalker-no-sample --prefill-mode prefix_kv|n1\n"
+            << "  Sampling is enabled by default for both generation stages.\n"
             << "  --codec-n128 | --codec-n1\n"
             << "  --endpoint-disable | --endpoint-silence-rms F "
                "--endpoint-silence-frames N --endpoint-end-pad-frames N\n"
@@ -193,14 +194,15 @@ int main(int argc, char **argv) {
     Qwen3TtsRunner engine(args.model_dir, args.components_dir,
                           args.preload_models);
     engine.initialize();
-    // Match the working Python launcher: seed once, then let warmup advance the
-    // code-predictor PCG stream before the timed request is rendered.
     engine.set_seed(args.request.seed);
     for (uint32_t i = 0; i < args.warmup_runs; ++i) {
       auto request = args.request;
       request.output_wav.clear();
       engine.run(request);
     }
+    // Warmup retains loaded models, but must not consume the timed sampling
+    // sequence. Keep successive timed runs on the same advancing RNG stream.
+    engine.set_seed(args.request.seed);
     nlohmann::json report;
     report["paths"] = {
         {"model_dir",

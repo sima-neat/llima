@@ -38,8 +38,8 @@ _QWEN3TTS_RUN_DEFAULTS = {
     "endpoint_silence_frames": None,
     "endpoint_end_pad_frames": None,
     "endpoint_enable": False,
-    "do_sample": False,
-    "subtalker_do_sample": False,
+    "do_sample": True,
+    "subtalker_do_sample": True,
 }
 
 
@@ -383,12 +383,12 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
     tts_parser.add_argument(
         "--do-sample",
         action=argparse.BooleanOptionalAction,
-        help="Enable Qwen3-TTS codebook-0 sampling",
+        help="Enable Qwen3-TTS codebook-0 sampling (enabled by default)",
     )
     tts_parser.add_argument(
         "--subtalker-do-sample",
         action=argparse.BooleanOptionalAction,
-        help="Enable Qwen3-TTS codebook 1-15 sampling",
+        help="Enable Qwen3-TTS codebook 1-15 sampling (enabled by default)",
     )
     run_parser.set_defaults(func=run_model)
 
