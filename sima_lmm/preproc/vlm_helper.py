@@ -18,7 +18,7 @@ from transformers.image_utils import load_images
 from transformers.utils import GENERATION_CONFIG_NAME
 
 from sima_lmm.config.vlm_config import VlmConfig,VisionArchType
-from sima_utils.logging.sima_logger import sima_log_warning, sima_log_info
+from sima_lmm.logging import sima_log_warning, sima_log_info
 
 class VlmHelper:
     """VLM helper class with processors."""
@@ -72,7 +72,12 @@ class VlmHelper:
                     self.hf_processor = AutoProcessor.from_pretrained(hf_path, **kwargs)
                     self.hf_tokenizer = self.hf_processor.tokenizer
                     assert isinstance(self.hf_processor, ProcessorMixin)
-                    if vlm_cfg.vm_cfg.arch in (VisionArchType.SIGLIP2, VisionArchType.QWEN2_VISION_ENCODER, VisionArchType.QWEN3_VISION_ENCODER):
+                    if vlm_cfg.vm_cfg.arch in (
+                        VisionArchType.SIGLIP2,
+                        VisionArchType.QWEN2_VISION_ENCODER,
+                        VisionArchType.QWEN3_VISION_ENCODER,
+                        VisionArchType.QWEN3_5_VISION_ENCODER,
+                    ):
                         self.input_res = vlm_cfg.vm_cfg.image_size # lfm2,qwen vl needs to be statically resized before hf preprocessor.
                 else:
                     self.hf_processor = None

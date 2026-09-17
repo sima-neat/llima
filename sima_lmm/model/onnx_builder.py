@@ -11,7 +11,7 @@ from onnxsim.onnxsim_cpp2py_export import simplify_path
 from pathlib import Path
 from typing import ClassVar
 
-from sima_utils.logging.sima_logger import sima_log_dbg
+from sima_lmm.logging import sima_log_dbg
 from sima_lmm.utils import (
     ceil_div_row, mla_max_num_rows, mla_row_size, round_up_to_row
 )
@@ -805,9 +805,9 @@ def _get_array_partition(
         i = element_size * index
         return a[i:i + element_size * span]
 
-    def get(a: np.ndarray | tuple[np.ndarray, np.ndarray]) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    def get(a: np.ndarray | tuple) -> np.ndarray | tuple:
         if isinstance(a, tuple):
-            return slice_array(a[0]), slice_array(a[1])
+            return slice_array(a[0]), slice_array(a[1]), *a[2:]
         # else
         return slice_array(a)
 

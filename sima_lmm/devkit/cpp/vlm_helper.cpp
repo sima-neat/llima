@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <fstream>
 #include <string_view>
 
@@ -52,7 +53,7 @@ VlmHelper::VlmHelper(
             std::ifstream(devkit_dir / "tokenizer_config.json")
         );
         _init_chat_template(devkit_dir, tokenizer_config_json, chat_template);
-        _init_stop_token_ids(devkit_dir);
+        _init_stop_token_ids(devkit_dir, &tokenizer_config_json);
         if (_vlm_cfg.is_multimodal()) {
             _init_image_token_id(tokenizer_config_json);
             _init_pad_token_id(tokenizer_config_json);
@@ -171,9 +172,49 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // Encode the formatted prompt to token ids.
     auto add_special_tokens = !formatted_prompt.starts_with(_bos_token);
     auto input_token_ids = _tokenizer_ptr->encode(formatted_prompt, add_special_tokens);
+
+    uint16_t stable_prefix_token_count = 0;
+    const auto& messages = chat.get_messages();
+    const auto& layer_types = _vlm_cfg.lm_cfg.layer_types;
+    const auto& group_offsets = _vlm_cfg.pipeline_cfg.input_token_group_offsets;
+    const bool uses_state_checkpoints = group_offsets.has_value() && !group_offsets->empty()
+        && std::any_of(
+            layer_types.begin(), layer_types.end(),
+            [](const auto& type) { return type == "conv" || type == "linear_attention"; }
+        );
+    if (
+        uses_state_checkpoints
+        && !messages.empty()
+        && (messages.front().value("role", "") == "system" || !inputs.tools.empty())
+    ) {
+        const auto first_user = std::find_if(
+            messages.begin(), messages.end(),
+            [](const auto& message) { return message.value("role", "") == "user"; }
+        );
+        if (first_user != messages.end()) {
+            auto stable_inputs = inputs;
+            stable_inputs.messages = nlohmann::ordered_json::array();
+            if (messages.front().value("role", "") == "system")
+                stable_inputs.messages.push_back(messages.front());
+            stable_inputs.messages.push_back(*first_user);
+            stable_inputs.messages.back()["content"] = "__llima_stable_prefix_end__";
+            auto stable_prompt = _chat_template_ptr->apply(stable_inputs);
+            auto stable_token_ids = _tokenizer_ptr->encode(
+                stable_prompt, !stable_prompt.starts_with(_bos_token)
+            );
+            const auto mismatch = std::mismatch(
+                stable_token_ids.begin(), stable_token_ids.end(),
+                input_token_ids.begin(), input_token_ids.end()
+            );
+            stable_prefix_token_count = static_cast<uint16_t>(
+                std::distance(stable_token_ids.begin(), mismatch.first)
+            );
+        }
+    }
     return {
         std::move(formatted_prompt),
         std::move(input_token_ids),
+        stable_prefix_token_count,
         std::move(image_tensors)
     };
 }
@@ -249,7 +290,10 @@ void VlmHelper::_init_chat_template(
 }
 
 
-void VlmHelper::_init_stop_token_ids(const std::filesystem::path& devkit_dir) {
+void VlmHelper::_init_stop_token_ids(
+    const std::filesystem::path& devkit_dir,
+    const nlohmann::json* tokenizer_config_json
+) {
     // Draft models use the target's tokenization scheme; stop tokens come from
     // the target model, not the draft.
     if (_vlm_cfg.lm_cfg.speculative_decoding_cfg.has_value()
@@ -261,16 +305,33 @@ void VlmHelper::_init_stop_token_ids(const std::filesystem::path& devkit_dir) {
     if (std::filesystem::is_regular_file(generation_config_file_name)) {
         auto json = nlohmann::json::parse(std::ifstream(generation_config_file_name));
         auto eos_token_id = json.at("eos_token_id");
-        if (eos_token_id.is_number_unsigned()) {
+        if (eos_token_id.is_number_integer() || eos_token_id.is_number_unsigned()) {
             _stop_token_ids.emplace(eos_token_id.get<uint32_t>());
         } else {
             eos_token_id.get_to(_stop_token_ids);
         }
+    } else if (tokenizer_config_json != nullptr) {
+        auto eos_token_json = tokenizer_config_json->at("eos_token");
+        std::string eos_token;
+        if (eos_token_json.is_string()) {
+            eos_token = eos_token_json.get<std::string>();
+        } else if (eos_token_json.contains("content")) {
+            eos_token = eos_token_json["content"].get<std::string>();
+        } else {
+            throw std::runtime_error("Failed to determine the eos token from tokenizer_config.json");
+        }
+        _stop_token_ids.emplace(_tokenizer_ptr->token_to_id(eos_token));
     } else if (!_vlm_cfg.gguf_file_name.empty()) {
         auto eos_token_id = _tokenizer_ptr->get_eos_token_id();
         _stop_token_ids.emplace(eos_token_id);
     } else {
         throw std::runtime_error("Failed to determine the stop token ids");
+    }
+
+    if (_vlm_cfg.model_type == "vlm-qwen3_5" && tokenizer_config_json != nullptr) {
+        _stop_token_ids.emplace(_tokenizer_ptr->token_to_id(
+            tokenizer_config_json->at("eos_token").get<std::string>()
+        ));
     }
 }
 

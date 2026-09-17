@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fnmatch
 import hashlib
 import http.client
 import json
@@ -420,16 +421,6 @@ def resolve_model_plan(
     ).lower()
     if not SHA256_PATTERN.fullmatch(selection_sha256):
         raise PreparationError(f"{context}: invalid selection SHA-256")
-    expected_patterns = source.file_patterns or SELECTION_PATTERNS.get(
-        source.payload_format, ()
-    )
-    if expected_patterns and selection_sha256 != selection_fingerprint(
-        source.payload_format, expected_patterns
-    ):
-        raise PreparationError(
-            f"{context}: cached file selection does not match source manifest"
-        )
-
     raw_files = manifest.get("files")
     if not isinstance(raw_files, list) or not raw_files:
         raise PreparationError(f"{context}: files must be a non-empty list")
@@ -467,6 +458,29 @@ def resolve_model_plan(
                 sha256=sha256.lower(),
                 download_uri=artifact_source.object_uri(expected_key),
             )
+        )
+
+    expected_patterns = source.file_patterns or SELECTION_PATTERNS.get(
+        source.payload_format, ()
+    )
+    if source.payload_format == "safetensors":
+        expected_patterns = (
+            *expected_patterns,
+            *sorted(
+                path.relative_path.as_posix()
+                for path in files
+                if path.relative_path.name.lower().endswith(".safetensors")
+                and not any(
+                    fnmatch.fnmatch(path.relative_path.as_posix(), pattern)
+                    for pattern in expected_patterns
+                )
+            ),
+        )
+    if expected_patterns and selection_sha256 != selection_fingerprint(
+        source.payload_format, expected_patterns
+    ):
+        raise PreparationError(
+            f"{context}: cached file selection does not match source manifest"
         )
 
     return ModelPlan(

@@ -35,6 +35,7 @@ def _make_post_model() -> LanguagePostModel:
             num_hidden_layers=2,
             hidden_size_per_layer_input=0,
             lora_cfg=None,
+            attn_cfg=SimpleNamespace(attn_output_gate=False),
             mlp_cfg=SimpleNamespace(act="gelu_pytorch_tanh"),
         ),
     )

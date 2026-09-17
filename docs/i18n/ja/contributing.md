@@ -96,6 +96,8 @@ python scripts/gen_models--openai--whisper.py \
 
 `--part` は、`all`、`encoder`、`language_detect`、`init`、`single_pre`、`single_post`、および `single_cache` を受け入れます。ログプローブを有効にしたデコーダーの出力をコンパイルするには、`--enable_log_probe` を追加します。完全なログプローブビルドを行うには、`--part all --enable_log_probe` を使用します。
 
+Whisper モデルリポジトリには、エンコーダーのレイヤーごとに 1 つの ELF が含まれます。ランタイムは、エンコーダー ELF が単一にまとめられた従来のリポジトリをサポートしていません。レイヤー化されたモデルをダウンロードするか、現在の LLiMa バージョンでチェックポイントを再コンパイルしてください。
+
 コンパイラの変更は通常、`sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py`、およびスクリプトに影響します。ランタイムの変更は、`sima_lmm/devkit/cpp/whisper_*` に影響します。`tests/README.md` に記載されているパッケージ化された C++ ASR ランタイムテストと、Modalix の代表的なオーディオを使用して検証します。これは、一般的な ASR アーキテクチャフレームワークではなく、Whisper に固有のパスです。
 
 ## テスト
@@ -137,7 +139,7 @@ python -P -m pytest \
 ./build.sh --all --clean
 ```
 
-これはビルドは行うものの、テストを実行しません。互換性のある候補であるLLiMaと、Modalix上の内部パッケージをインストールし、追加のアーカイブを抽出し、パッケージ化されたCTestとpytestを、`tests/README.md`に記載されているDevKitランタイムテストの手順に従って実行します。
+これはビルドのみを行い、テストは実行しません。Modalix に対応する候補の LLiMa パッケージをインストールし、追加のアーカイブを抽出して、`tests/README.md` に記載されている DevKit ランタイムテストの手順に従って、パッケージ化された CTest と pytest を実行します。
 
 モデルのロード、推論、トークン化、マルチモーダル前処理、推測デコーディング、CLI/HTTP/ZMQ、またはリソースのライフサイクルに変更があった場合に、関連するハードウェアテストを実行します。必要に応じて、代表的なスモークテストを追加してください。
 
