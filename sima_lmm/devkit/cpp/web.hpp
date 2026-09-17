@@ -37,15 +37,6 @@ class EXPORT WEB {
             std::optional<std::string> chat_template,
             bool enable_thinking = false
         );
-        WEB(
-            std::filesystem::path vlm_model_path,
-            std::optional<std::filesystem::path> whisper_model_path,
-            std::optional<std::filesystem::path> draft_model_path,
-            std::optional<std::string> system_prompt,
-            std::optional<std::string> chat_template,
-            bool enable_thinking,
-            size_t max_kv_cache_slots
-        );
         ~WEB();
 
         void run();
@@ -56,8 +47,6 @@ class EXPORT WEB {
         void _handle_stop(const httplib::Request& req, httplib::Response& res);
         void _handle_set_lora(const httplib::Request& req, httplib::Response& res);
         void _handle_unset_lora(const httplib::Request& req, httplib::Response& res);
-        void _handle_remove_cache(const httplib::Request& req, httplib::Response& res);
-        void _handle_clear_caches(const httplib::Request& req, httplib::Response& res);
 
         // Endpoints Handlers
         void _handle_chat_completions(
@@ -84,9 +73,7 @@ class EXPORT WEB {
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
             bool from_draft = false,
-            bool reasoning = false,
-            std::optional<uint32_t> cached_prompt_tokens = std::nullopt,
-            std::optional<bool> cache_created = std::nullopt
+            bool reasoning = false
         );
         std::string _format_ollama_ndjson_chunk(
             const std::string& content,
@@ -97,9 +84,7 @@ class EXPORT WEB {
             std::optional<double> ttft = std::nullopt,
             std::optional<double> tps = std::nullopt,
             bool from_draft = false,
-            bool reasoning = false,
-            std::optional<uint32_t> cached_prompt_tokens = std::nullopt,
-            std::optional<bool> cache_created = std::nullopt
+            bool reasoning = false
         );
         std::string _format_audio_sse_chunk(
             const std::string& text,
@@ -120,7 +105,6 @@ class EXPORT WEB {
             httplib::Response& res,
             std::string& model,
             bool& stream,
-            std::optional<std::string>& cache_id,
             ChatProtocol protocol
         );
 
@@ -128,7 +112,6 @@ class EXPORT WEB {
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            std::optional<std::string> cache_id,
             ChatProtocol protocol
         );
 
@@ -136,7 +119,6 @@ class EXPORT WEB {
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            std::optional<std::string> cache_id,
             ChatProtocol protocol
         );
         void _execute_streaming_audio_transcription(

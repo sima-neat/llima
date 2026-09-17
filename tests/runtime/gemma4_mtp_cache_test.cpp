@@ -58,7 +58,6 @@ private:
 
 struct Metrics {
     std::optional<uint32_t> cached_tokens;
-    std::optional<bool> cache_created;
     std::optional<double> ttft;
 };
 
@@ -140,14 +139,12 @@ int main(int argc, char** argv) {
             streamer.set_info_callback([&](const std::string& name, double value) {
                 std::lock_guard<std::mutex> lock(metrics_mutex);
                 if (name == "cached_prompt_tokens") metrics.cached_tokens = static_cast<uint32_t>(value);
-                else if (name == "cache_created") metrics.cache_created = value != 0;
                 else if (name == "ttft") metrics.ttft = value;
             });
-            LanguageModel target(target_dir, {}, std::nullopt, std::nullopt, streamer, 2);
-            LanguageModel draft(argv[2], {}, std::nullopt, std::nullopt, streamer, 2);
+            LanguageModel target(target_dir, {}, std::nullopt, std::nullopt, streamer);
+            LanguageModel draft(argv[2], {}, std::nullopt, std::nullopt, streamer);
 
             auto run = [&](const std::vector<uint32_t>& prompt,
-                           std::optional<std::string> cache_id = std::nullopt,
                            uint16_t generated = 16, bool cancel = false) {
                 target.create_input_buffers(prompt);
                 {
@@ -157,11 +154,10 @@ int main(int argc, char** argv) {
                 trace->reset(cancel ? &target : nullptr);
                 auto tokens = target.run_model_gemma4_mtp(
                     draft, prompt, static_cast<uint16_t>(prompt.size() + generated),
-                    std::nullopt, nullptr, cache_id
+                    std::nullopt, nullptr
                 );
                 std::lock_guard<std::mutex> lock(metrics_mutex);
-                require(metrics.cached_tokens.has_value() && metrics.cache_created.has_value(),
-                    "Missing cache observability metrics");
+                require(metrics.cached_tokens.has_value(), "Missing cache reuse metric");
                 if (!cancel) {
                     require(
                         tokens.has_value() && !tokens->empty()
@@ -176,16 +172,17 @@ int main(int argc, char** argv) {
                 }
                 return Result{std::move(tokens), metrics, trace->positions()};
             };
-            auto remove = [&](const std::string& id) {
-                target.remove_kv_cache(id);
-                draft.remove_kv_cache(id);
+            auto reset_cache = [&] {
+                target.clear_cached_token_ids();
+                draft.clear_cached_token_ids();
+                target.set_kv_cache_len(0);
+                draft.set_kv_cache_len(0);
             };
             auto cold_reference = [&](const std::vector<uint32_t>& prompt) {
-                remove("reference");
-                auto result = run(prompt, "reference");
-                remove("reference");
-                require(*result.metrics.cached_tokens == 0 && *result.metrics.cache_created,
-                    "Reference must use a cold cache");
+                reset_cache();
+                auto result = run(prompt);
+                require(*result.metrics.cached_tokens == 0,
+                    "Reference must start from a cold cache");
                 return result;
             };
             auto make_prompt = [&](size_t size) {
@@ -197,72 +194,44 @@ int main(int argc, char** argv) {
             // Verify group boundaries, including exact matches with no decode
             // round (one output token), where a saved next token can be stale.
             for (size_t length : {size_t{1}, group - 1, group, group + 1, 2 * group + 1}) {
-                target.clear_kv_caches();
-                draft.clear_kv_caches();
+                reset_cache();
                 const auto prompt = make_prompt(length);
-                const auto cold = run(prompt, std::nullopt, 1);
-                const auto warm = run(prompt, std::nullopt, 1);
+                const auto cold = run(prompt, 1);
+                const auto warm = run(prompt, 1);
                 require(cold.tokens == warm.tokens, "Repeated prompt changed its next token");
-                require(*cold.metrics.cached_tokens == 0 && *cold.metrics.cache_created,
-                    "Initial prompt should allocate a cold slot");
-                require(*warm.metrics.cached_tokens == length && !*warm.metrics.cache_created,
+                require(*cold.metrics.cached_tokens == 0,
+                    "Initial prompt should use a cold cache");
+                require(*warm.metrics.cached_tokens == length,
                     "Repeated prompt should match its committed prefix");
                 require(warm.prefill_positions == std::vector<size_t>{(length - 1) / group * group},
                     "Full match must run only the final prefill group");
             }
 
-            target.clear_kv_caches();
-            draft.clear_kv_caches();
+            reset_cache();
             const auto prompt_a = make_prompt(2 * group + 1);
-            auto prompt_b = prompt_a;
-            require(prompt_b.front() != replacement, "Test needs distinct first tokens");
-            prompt_b.front() = replacement;
             const auto a1 = run(prompt_a);
-            const auto b1 = run(prompt_b, "session-b");
-            const auto a2 = run(prompt_a);
-            const auto b2 = run(prompt_b, "session-b");
-            require(a1.tokens == a2.tokens && b1.tokens == b2.tokens,
-                "Switching cache slots changed generated tokens");
-            for (const auto* warm : {&a2, &b2}) {
-                require(*warm->metrics.cached_tokens == prompt_a.size() && !*warm->metrics.cache_created,
-                    "Switching slots lost the reusable prefix");
-                require(warm->prefill_positions == std::vector<size_t>{2 * group},
-                    "Switching slots must skip the first two prefill groups");
-            }
-            remove("session-b");
 
             // Include all returned tokens, including the final unprocessed
             // bonus. Reuse must stop at the committed KV length, even if the
             // physical buffer still contains extra verification rows.
             auto continuation = prompt_a;
-            continuation.insert(continuation.end(), a2.tokens->begin(), a2.tokens->end());
+            continuation.insert(continuation.end(), a1.tokens->begin(), a1.tokens->end());
             const auto committed = target.get_kv_cache_len();
-            const auto continuation_cold = cold_reference(continuation);
             const auto continuation_warm = run(continuation);
+            const auto continuation_cold = cold_reference(continuation);
             require(continuation_warm.tokens == continuation_cold.tokens,
                 "Continuation differs between warm and cold prefill");
             require(*continuation_warm.metrics.cached_tokens == committed,
                 "Continuation reused uncommitted speculative KV");
 
-            // End a new prompt exactly at the saved committed boundary. The
-            // original prompt's first_generated_token is not its next token.
-            auto committed_prompt = continuation;
-            committed_prompt.insert(committed_prompt.end(), continuation_warm.tokens->begin(),
-                continuation_warm.tokens->end());
-            committed_prompt.resize(target.get_kv_cache_len());
-            const auto committed_cold = cold_reference(committed_prompt);
-            const auto committed_warm = run(committed_prompt);
-            require(committed_warm.tokens == committed_cold.tokens,
-                "Fully cached continuation used a stale next token");
-            require(*committed_warm.metrics.cached_tokens == committed_prompt.size(),
-                "Fully cached continuation lost its prefix");
-
             auto partial = prompt_a;
             const size_t mismatch = group + 17;
             require(partial[mismatch] != replacement, "Test needs a distinct suffix token");
             partial[mismatch] = replacement;
-            const auto partial_cold = cold_reference(partial);
+            reset_cache();
+            run(prompt_a);
             const auto partial_warm = run(partial);
+            const auto partial_cold = cold_reference(partial);
             require(partial_warm.tokens == partial_cold.tokens,
                 "Partial-prefix reuse changed generated tokens");
             require(*partial_warm.metrics.cached_tokens == mismatch,
@@ -277,23 +246,20 @@ int main(int argc, char** argv) {
                 "Reuse exceeded the valid KV length after truncation");
 
             // Stop synchronously at the first prefill dispatch, then verify the
-            // selected slot is invalidated while another session survives.
-            const auto reference = run(prompt_b, "session-b");
-            const auto interrupted = run(prompt_a, std::nullopt, 16, true);
+            // single cache is invalidated and can recover cleanly.
+            const auto reference = cold_reference(prompt_a);
+            reset_cache();
+            const auto interrupted = run(prompt_a, 16, true);
             require(!interrupted.tokens.has_value(), "Prefill ignored cancellation");
             require(target.get_kv_cache_len() == 0, "Interrupted target KV remains valid");
             const auto recovered = run(prompt_a);
-            require(*recovered.metrics.cached_tokens == 0 && !*recovered.metrics.cache_created,
-                "Recovery must recompute in the existing slot");
-            require(recovered.tokens == a1.tokens, "Recovery changed generated tokens");
-            const auto unaffected = run(prompt_b, "session-b");
-            require(unaffected.tokens == reference.tokens && *unaffected.metrics.cached_tokens > 0,
-                "Cancelling one session invalidated another session");
+            require(*recovered.metrics.cached_tokens == 0,
+                "Recovery must recompute from an empty cache");
+            require(recovered.tokens == reference.tokens, "Recovery changed generated tokens");
 
             // Exercise reuse across sliding-window and long-context mask
             // buckets, rather than testing only short system prompts.
-            target.clear_kv_caches();
-            draft.clear_kv_caches();
+            reset_cache();
             const size_t long_group = std::min<size_t>(4096, cfg.pipeline_cfg.max_num_tokens / 2)
                 / group * group;
             require(std::find(offsets->begin(), offsets->end(), long_group) != offsets->end(),

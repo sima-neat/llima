@@ -130,7 +130,7 @@ void LanguageModel::_define_attn_models_iter(
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         pre_ofms.emplace_back(
             MLABufferSlice(
-                &_cache_buffer(fmt::format("cache_key_l{}", layer_idx)),
+                &get_buffer(fmt::format("cache_key_l{}", layer_idx)),
                 pre_kv_cache_offset,
                 pre_kv_cache_shape
             )
@@ -138,7 +138,7 @@ void LanguageModel::_define_attn_models_iter(
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
             pre_ofms.emplace_back(
                 MLABufferSlice(
-                    &_cache_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
+                    &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
@@ -146,7 +146,7 @@ void LanguageModel::_define_attn_models_iter(
         }
         pre_ofms.emplace_back(
             MLABufferSlice(
-                &_cache_buffer(fmt::format("cache_val_l{}", layer_idx)),
+                &get_buffer(fmt::format("cache_val_l{}", layer_idx)),
                 pre_kv_cache_offset,
                 pre_kv_cache_shape
             )
@@ -154,7 +154,7 @@ void LanguageModel::_define_attn_models_iter(
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
             pre_ofms.emplace_back(
                 MLABufferSlice(
-                    &_cache_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
+                    &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
@@ -224,7 +224,7 @@ void LanguageModel::_define_attn_models_iter(
         is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
             ? MLABufferSlice{}
             : MLABufferSlice{
-                &_cache_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
+                &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
                 cache_kv_cache_offset,
                 cache_kv_cache_shape
             },
@@ -234,7 +234,7 @@ void LanguageModel::_define_attn_models_iter(
             is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
                 ? MLABufferSlice{}
                 : MLABufferSlice{
-                    &_cache_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
+                    &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
                     {0, cache_token_idx_begin, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 }
@@ -282,7 +282,7 @@ void LanguageModel::_define_attn_models_iter(
         is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
             ? MLABufferSlice{}
             : MLABufferSlice{
-                &_cache_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
+                &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
                 cache_kv_cache_offset,
                 cache_kv_cache_shape
             }
@@ -292,7 +292,7 @@ void LanguageModel::_define_attn_models_iter(
             is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
                 ? MLABufferSlice{}
                 : MLABufferSlice{
-                    &_cache_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
+                    &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
                     {0, cache_token_idx_begin, 0},
                     {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
                 }
@@ -489,7 +489,7 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
     }
     conv_ifms.emplace_back(
         MLABufferSlice{
-            &_cache_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
+            &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
             {tail_begin, 0},
             {tail_size, _cfg.lm_cfg.hidden_size}
         }
@@ -497,7 +497,7 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
     conv_ofms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))});
     conv_ofms.emplace_back(
         MLABufferSlice(
-            &_cache_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
+            &get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)),
             {num_tokens > 1 ? 0 : tail_begin, 0},
             {
                 static_cast<uint32_t>(num_tokens + tail_size - 1),

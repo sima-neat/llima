@@ -350,8 +350,8 @@ the DevKit.
 The manual Gemma4 MTP prefix-cache test takes an individual deployed target and
 assistant directory. It checks exact generated-token parity for cold/warm
 requests, prefill group boundaries, partial prefixes, continuation through the
-committed KV boundary, alternating slots, cancellation recovery, and long-context
-reuse (4,097 tokens for an 8K model). It also
+committed KV boundary, cancellation recovery, and long-context reuse (4,097
+tokens for an 8K model). It also
 asserts the actual prefill dispatch positions from runtime logs, rather than
 relying only on reported cache hits, and prints TTFT for comparison:
 
@@ -360,7 +360,7 @@ relying only on reported cache hits, and prints TTFT for comparison:
   /path/to/deployed-mtp/target /path/to/deployed-mtp/assistant
 ```
 
-This test needs two cache slots and a target with at least three prefill groups.
+This test needs a target with at least three prefill groups.
 It is built and packaged with `./build.sh --all`, but is not in the automatic
 CTest suite until a compiled MTP pair is available in the CI fixture manifest.
 TTFT is reported without a timing threshold; dispatch counts establish that
@@ -373,10 +373,10 @@ Pytest validates the installed package and external interfaces:
 | Test | Coverage |
 |------|----------|
 | Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
-| CLI black box | Validates `llima run` cache-slot argument parsing; the temporarily disabled model-backed case starts `llima`, submits a real Qwen query, sends `quit`, and verifies teardown |
+| CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
 | MLA memory cleanup | Runs Qwen four times through `llima run -> quit`, checks `/dev/simaai-mem` after every exit, and verifies that the daemon PID and allocation baseline remain stable |
 | Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
-| OpenAI/Ollama HTTP | Recovery and cancellation, bounded reusable KV-cache sessions and lifecycle endpoints, plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
+| OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
 
 `tests/runtime/pytest.ini` is packaged with these tests and prevents compiler

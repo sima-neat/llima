@@ -426,7 +426,7 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
         std::piecewise_construct,
         std::forward_as_tuple(cache_ifm_idx++),
         std::forward_as_tuple(
-            &target_lm._cache_buffer(fmt::format("cache_key_l{}", source_layer)),
+            &target_lm.get_buffer(fmt::format("cache_key_l{}", source_layer)),
             kv_begin,
             kv_shape
         )
@@ -436,7 +436,7 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
             std::piecewise_construct,
             std::forward_as_tuple(cache_ifm_idx++),
             std::forward_as_tuple(
-                &target_lm._cache_buffer(fmt::format("cache_key_scale_l{}", source_layer)),
+                &target_lm.get_buffer(fmt::format("cache_key_scale_l{}", source_layer)),
                 std::vector<uint32_t>{0, cache_token_idx_begin, 0},
                 std::vector<uint32_t>{consumer_kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             )
@@ -449,7 +449,7 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
         std::piecewise_construct,
         std::forward_as_tuple(cache_ifm_idx),
         std::forward_as_tuple(
-            &target_lm._cache_buffer(fmt::format("cache_val_l{}", source_layer)),
+            &target_lm.get_buffer(fmt::format("cache_val_l{}", source_layer)),
             kv_begin,
             kv_shape
         )
@@ -459,7 +459,7 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
             std::piecewise_construct,
             std::forward_as_tuple(cache_ifm_idx + 1),
             std::forward_as_tuple(
-                &target_lm._cache_buffer(fmt::format("cache_val_scale_l{}", source_layer)),
+                &target_lm.get_buffer(fmt::format("cache_val_scale_l{}", source_layer)),
                 std::vector<uint32_t>{0, cache_token_idx_begin, 0},
                 std::vector<uint32_t>{consumer_kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             )
@@ -556,25 +556,25 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
 
         uint8_t ofm_idx = 1;
         if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
-            auto& key_buffer = _cache_buffer(fmt::format("cache_key_l{}", layer_idx));
-            auto& val_buffer = _cache_buffer(fmt::format("cache_val_l{}", layer_idx));
+            auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", layer_idx));
+            auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", layer_idx));
             if (_cfg.pipeline_cfg.use_strided_kv_cache) {
                 pre_model._bind_ofm(ofm_idx++, &key_buffer, {0, token_idx, 0});
                 if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                    auto& scale = _cache_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
+                    auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
                     pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
                 }
                 pre_model._bind_ofm(ofm_idx++, &val_buffer, {0, token_idx, 0});
             } else {
                 pre_model._bind_ofm(ofm_idx++, &key_buffer, {token_idx, 0});
                 if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                    auto& scale = _cache_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
+                    auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
                     pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
                 }
                 pre_model._bind_ofm(ofm_idx++, &val_buffer, {token_idx, 0});
             }
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = _cache_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
+                auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
                 pre_model._bind_ofm(ofm_idx, &scale, {0, token_idx, 0});
             }
         }
@@ -625,7 +625,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             std::piecewise_construct,
             std::forward_as_tuple(cache_ifm_idx++),
             std::forward_as_tuple(
-                &_cache_buffer(fmt::format("cache_key_l{}", kv_source_layer)), kv_begin, kv_shape
+                &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)), kv_begin, kv_shape
             )
         );
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
@@ -633,7 +633,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
                 std::piecewise_construct,
                 std::forward_as_tuple(cache_ifm_idx++),
                 std::forward_as_tuple(
-                    &_cache_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
+                    &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
                     std::vector<uint32_t>{0, cache_token_idx_begin, 0},
                     std::vector<uint32_t>{
                         _cfg.lm_cfg.attn_cfg.num_key_value_heads,
@@ -664,7 +664,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             std::piecewise_construct,
             std::forward_as_tuple(cache_ifm_idx++),
             std::forward_as_tuple(
-                &_cache_buffer(fmt::format("cache_val_l{}", kv_source_layer)), kv_begin, kv_shape
+                &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)), kv_begin, kv_shape
             )
         );
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
@@ -672,7 +672,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
                 std::piecewise_construct,
                 std::forward_as_tuple(cache_ifm_idx),
                 std::forward_as_tuple(
-                    &_cache_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
+                    &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
                     std::vector<uint32_t>{0, cache_token_idx_begin, 0},
                     std::vector<uint32_t>{
                         _cfg.lm_cfg.attn_cfg.num_key_value_heads,
@@ -702,9 +702,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
     }
 
     MLAModelWithBuffer::run_queue();
-    _active_cache().metadata.kv_cache_len = static_cast<uint16_t>(
-        token_idx + valid_tokens
-    );
+    _kv_cache_len = static_cast<uint16_t>(token_idx + valid_tokens);
     auto next_token_ids = _argmax_lm_head_rows(
         num_tokens, valid_tokens, token_ids.subspan(1)
     );
@@ -876,8 +874,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result,
-    std::optional<std::string> cache_id
+    GenerationPerformanceResult* performance_result
 ) {
     if (!_cfg.lm_cfg.is_gemma4_mtp_target()) {
         throw std::runtime_error("gemma4_mtp speculative decoding must run on the target model");
@@ -896,35 +893,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     if (input_token_ids.empty()) {
         throw std::runtime_error("Gemma4 MTP generation requires at least one input token");
     }
-
-    auto target_lease = _acquire_kv_cache(cache_id);
-    std::optional<KVCacheLease> draft_lease;
-    try {
-        draft_lease.emplace(draft_lm._acquire_kv_cache(cache_id));
-    } catch (...) {
-        const bool remove_target = target_lease.cache_created();
-        target_lease.reset();
-        if (remove_target) {
-            _remove_kv_cache(cache_id);
-        }
-        throw;
-    }
-
-    if (target_lease.cache_created() != draft_lease->cache_created()) {
-        target_lease.reset();
-        draft_lease->reset();
-        _remove_kv_cache(cache_id);
-        draft_lm._remove_kv_cache(cache_id);
-        throw std::runtime_error("Gemma4 MTP target and draft KV cache pools diverged");
-    }
-
-    ScopedActiveCache target_active(*this, target_lease.slot());
-    ScopedActiveCache draft_active(draft_lm, draft_lease->slot());
-    _text_streamer.push(
-        DecodeCallbackType::CACHE_CREATED,
-        0,
-        target_lease.cache_created() || draft_lease->cache_created() ? 1.0 : 0.0
-    );
 
     _is_running = true;
     draft_lm._is_running = true;
@@ -947,14 +915,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     try {
         // Only committed target rows can be matched on the next request. The
         // physical buffers can also contain rejected drafts or prefill padding.
-        auto& target_metadata = _active_cache().metadata;
-        if (target_metadata.token_ids.size() > target_metadata.kv_cache_len) {
-            target_metadata.token_ids.resize(target_metadata.kv_cache_len);
+        if (_cached_token_ids.size() > _kv_cache_len) {
+            _cached_token_ids.resize(_kv_cache_len);
         }
         // The assistant consumes the selected target's KV; it has no reusable
         // private KV or hidden state to restore between requests.
-        draft_lm._active_cache().metadata.token_ids.clear();
-        draft_lm._active_cache().metadata.kv_cache_len = 0;
+        draft_lm._cached_token_ids.clear();
+        draft_lm._kv_cache_len = 0;
 
         if (input_ids.size() >= max_length) {
             cache_full = true;
@@ -981,7 +948,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 std::chrono::steady_clock::now() - first_begin
             ).count();
             if (_is_running.load(std::memory_order_relaxed)) {
-                _active_cache().metadata.kv_cache_len = checked_u16(
+                _kv_cache_len = checked_u16(
                     input_ids.size(), "Gemma4 MTP prompt length"
                 );
 
@@ -1037,17 +1004,15 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         auto commit_processed_prefix = [&](size_t processed_tokens) {
             const auto processed_end = input_ids.begin()
                 + static_cast<std::ptrdiff_t>(processed_tokens);
-            _active_cache().metadata.token_ids.assign(input_ids.begin(), processed_end);
-            draft_lm._active_cache().metadata.token_ids.assign(
-                input_ids.begin(), processed_end
-            );
-            _active_cache().metadata.kv_cache_len = checked_u16(
+            _cached_token_ids.assign(input_ids.begin(), processed_end);
+            draft_lm._cached_token_ids.assign(input_ids.begin(), processed_end);
+            _kv_cache_len = checked_u16(
                 processed_tokens, "Gemma4 MTP committed KV length"
             );
-            draft_lm._active_cache().metadata.kv_cache_len = 0;
+            draft_lm._kv_cache_len = 0;
         };
 
-        uint16_t target_shared_kv_available_len = _active_cache().metadata.kv_cache_len;
+        uint16_t target_shared_kv_available_len = _kv_cache_len;
 
         while (
             !cache_full && !stopped
@@ -1115,7 +1080,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             auto verification = _run_gemma4_mtp_target_batch(
                 current_pos, verification_tokens
             );
-            target_shared_kv_available_len = _active_cache().metadata.kv_cache_len;
+            target_shared_kv_available_len = _kv_cache_len;
             const size_t meaningful_verification_rows = draft_token_ids.size() + 1;
             if (
                 verification.next_token_ids.empty()
@@ -1186,8 +1151,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             }
         }
     } catch (...) {
-        _invalidate_active_kv_cache();
-        draft_lm._invalidate_active_kv_cache();
+        _cached_token_ids.clear();
+        _kv_cache_len = 0;
+        draft_lm._cached_token_ids.clear();
+        draft_lm._kv_cache_len = 0;
         _is_running = false;
         draft_lm._is_running = false;
         set_max_num_tokens(original_max_num_tokens);
@@ -1195,8 +1162,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     }
 
     if (!_is_running.load(std::memory_order_relaxed)) {
-        _invalidate_active_kv_cache();
-        draft_lm._invalidate_active_kv_cache();
+        _cached_token_ids.clear();
+        _kv_cache_len = 0;
+        draft_lm._cached_token_ids.clear();
+        draft_lm._kv_cache_len = 0;
         _notify_interrupt();
         _text_streamer.wait_streaming();
         draft_lm._is_running = false;

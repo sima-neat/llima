@@ -18,10 +18,6 @@ add_executable(
     text_generation_test.cpp
 )
 add_executable(
-    sima_lmm_kv_cache_sessions_test
-    kv_cache_sessions_test.cpp
-)
-add_executable(
     sima_lmm_vision_generation_test
     vision_generation_test.cpp
 )
@@ -53,11 +49,6 @@ target_link_libraries(
 )
 target_link_libraries(
     sima_lmm_text_generation_test
-    PRIVATE
-        sima_lmm_runtime
-)
-target_link_libraries(
-    sima_lmm_kv_cache_sessions_test
     PRIVATE
         sima_lmm_runtime
 )
@@ -111,10 +102,6 @@ add_test(
     COMMAND "$<TARGET_FILE:sima_lmm_text_generation_test>"
 )
 add_test(
-    NAME runtime.kv_cache_sessions
-    COMMAND "$<TARGET_FILE:sima_lmm_kv_cache_sessions_test>"
-)
-add_test(
     NAME runtime.vision_generation
     COMMAND "$<TARGET_FILE:sima_lmm_vision_generation_test>"
 )
@@ -150,13 +137,6 @@ set_tests_properties(
         LABELS "devkit;runtime;dispatcher;genai;llm;long"
         RESOURCE_LOCK dispatcher
         TIMEOUT 900
-)
-set_tests_properties(
-    runtime.kv_cache_sessions
-    PROPERTIES
-        LABELS "devkit;runtime;dispatcher;genai;llm;kv-cache;long"
-        RESOURCE_LOCK dispatcher
-        TIMEOUT 1800
 )
 set_tests_properties(
     runtime.vision_generation
@@ -197,7 +177,6 @@ install(
         sima_lmm_embedding_offload_test
         sima_lmm_dispatcher_lifecycle_test
         sima_lmm_text_generation_test
-        sima_lmm_kv_cache_sessions_test
         sima_lmm_vision_generation_test
         sima_lmm_asr_transcription_test
         sima_lmm_tool_call_parser_test
@@ -233,7 +212,6 @@ install(
         test_model_manager.py
         test_python_runtime_lifecycle.py
         test_zmq_black_box.py
-        kv_cache_sessions_test.cpp
         text_generation_test.cpp
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/reasoning_parser.hpp"
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/gemma4_mtp_helpers.hpp"
