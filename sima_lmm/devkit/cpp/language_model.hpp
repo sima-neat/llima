@@ -275,7 +275,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         struct DFlashScratch;
         void _capture_dflash_hidden_state(uint16_t num_tokens, size_t capture_idx);
-        void _resolve_dflash_linear_state(uint16_t prefix_tokens);
         void _commit_dflash_linear_state(uint16_t prefix_tokens);
         void _save_dflash_state_checkpoint(
             uint16_t token_count, uint16_t prefix_tokens, bool is_prefill
@@ -453,8 +452,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         // Draft-only context-fusion models indexed by their compiled width.
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
         LanguageModelMap _dflash_context_model_map;
-        LanguageModelMap _dflash_state_resolver_model_map;
-        uint16_t _dflash_resolved_prefix = 0;
 
         RopeTable _master_rope_table;
         RopeTable _global_freq_host;  // pristine CPU copy; source for tree-RoPE rows

@@ -939,14 +939,6 @@ uint32_t LanguageModel::run_model_once(
     } else {
         next_token_idx = token_idx + 1;
     }
-    const bool has_dflash_verification_state = (
-        _cfg.lm_cfg.is_dflash()
-        && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
-        && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
-    );
-    if (has_dflash_verification_state) {
-        _dflash_resolved_prefix = 0;
-    }
     auto use_input_tokens = token_idx < num_input_tokens;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
@@ -1343,36 +1335,43 @@ uint32_t LanguageModel::run_model_once(
 
     // Run all the queued models.
     MLAModelWithBuffer::run_queue();
+    const bool has_dflash_prefix_states = (
+        _cfg.lm_cfg.is_dflash()
+        && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+        && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
+    );
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         if (
             _cfg.lm_cfg.layer_types[layer_idx] == "linear_attention"
-            && !has_dflash_verification_state
+            && !has_dflash_prefix_states
         ) {
             get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
                 get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
             );
         }
     }
+    if (has_dflash_prefix_states) {
+        _commit_dflash_linear_state(next_token_idx - token_idx);
+    }
+
     // If this run landed exactly on a checkpoint boundary, save the tail.
-    const bool save_checkpoint = (
+    if (
         _capture_state_checkpoints
         && std::binary_search(
             _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), next_token_idx
         )
-    );
-    if (save_checkpoint && has_dflash_verification_state) {
-        _save_dflash_state_checkpoint(
-            next_token_idx, next_token_idx - token_idx, token_idx < num_input_tokens
-        );
-    }
-    if (has_dflash_verification_state) {
-        _commit_dflash_linear_state(next_token_idx - token_idx);
-    } else if (save_checkpoint) {
-        // A partial prefill group can land exactly on a checkpoint boundary.
-        _save_state_checkpoint(
-            next_token_idx, num_tokens, next_token_idx - token_idx,
-            token_idx < num_input_tokens
-        );
+    ) {
+        if (has_dflash_prefix_states) {
+            _save_dflash_state_checkpoint(
+                next_token_idx, next_token_idx - token_idx, token_idx < num_input_tokens
+            );
+        } else {
+            // A partial prefill group can land exactly on a checkpoint boundary.
+            _save_state_checkpoint(
+                next_token_idx, num_tokens, next_token_idx - token_idx,
+                token_idx < num_input_tokens
+            );
+        }
     }
 
     if (logits_ptr) {
@@ -1889,32 +1888,8 @@ void LanguageModel::_define_buffers() {
                     {block_size + linear_cfg.conv_kernel_dim - 2, linear_cfg.get_conv_dim()}
                 );
                 define_buffer(
-                    fmt::format("linear_delta_resolver_output_l{}", i),
-                    {1, linear_cfg.get_recurrent_state_size()}
-                );
-                define_buffer(
-                    fmt::format("linear_delta_resolver_key_l{}", i),
-                    {
-                        linear_cfg.num_value_heads,
-                        block_size,
-                        linear_cfg.key_head_dim
-                    }
-                );
-                define_buffer(
-                    fmt::format("linear_delta_resolver_value_l{}", i),
-                    {
-                        linear_cfg.num_value_heads,
-                        block_size,
-                        linear_cfg.value_head_dim
-                    }
-                );
-                define_buffer(
-                    fmt::format("linear_delta_resolver_initial_decay_l{}", i),
-                    {linear_cfg.num_value_heads, block_size, 1}
-                );
-                define_buffer(
-                    fmt::format("linear_delta_resolver_decay_mask_l{}", i),
-                    {linear_cfg.num_value_heads, block_size, block_size}
+                    fmt::format("linear_delta_prefix_states_l{}", i),
+                    {block_size, linear_cfg.get_recurrent_state_size()}
                 );
             }
         } else {

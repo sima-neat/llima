@@ -606,32 +606,18 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     );
     linear_ofms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)),
+            &get_buffer(
+                is_dflash_target_verify
+                    ? fmt::format("linear_delta_prefix_states_l{}", layer_idx)
+                    : fmt::format("linear_delta_state_history_alt_l{}", layer_idx)
+            ),
             {0, 0},
             {
-                1,
+                static_cast<uint32_t>(is_dflash_target_verify ? num_tokens : 1),
                 linear_cfg.get_recurrent_state_size()
             }
         }
     );
-    if (is_dflash_target_verify) {
-        linear_ofms.emplace_back(MLABufferSlice{
-            &get_buffer(fmt::format("linear_delta_resolver_key_l{}", layer_idx))
-        });
-        linear_ofms.emplace_back(MLABufferSlice{
-            &get_buffer(fmt::format("linear_delta_resolver_value_l{}", layer_idx))
-        });
-        linear_ofms.emplace_back(MLABufferSlice{
-            &get_buffer(fmt::format(
-                "linear_delta_resolver_initial_decay_l{}", layer_idx
-            ))
-        });
-        linear_ofms.emplace_back(MLABufferSlice{
-            &get_buffer(fmt::format(
-                "linear_delta_resolver_decay_mask_l{}", layer_idx
-            ))
-        });
-    }
     _define_model(
         "linear",
         model_key,
@@ -736,69 +722,6 @@ void LanguageModel::_define_dflash_models() {
     const auto& spec_cfg = _cfg.lm_cfg.speculative_decoding_cfg.value();
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     if (!spec_cfg.is_draft) {
-        if (!_has_linear_attention_layers()) {
-            return;
-        }
-        const auto& linear_cfg = _linear_attn_cfg();
-        for (uint16_t prefix_tokens = 1; prefix_tokens < single_num_tokens;
-             ++prefix_tokens) {
-            const auto elf_path = _elf_dir / fmt::format(
-                "{}_n{}_dflash_state_resolver_p{}_stage1_mla.elf",
-                _cfg.language_model_name, single_num_tokens, prefix_tokens
-            );
-            for (uint8_t layer_idx = 0;
-                 layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-                if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
-                    continue;
-                }
-                _dflash_state_resolver_model_map.emplace(
-                    LanguageModelMapKey{
-                        single_num_tokens, layer_idx, prefix_tokens
-                    },
-                    MLAModelWithBuffer(
-                        elf_path,
-                        {
-                            MLABufferSlice{&get_buffer(fmt::format(
-                                "linear_delta_state_history_l{}", layer_idx
-                            ))},
-                            MLABufferSlice{
-                                &get_buffer(fmt::format(
-                                    "linear_delta_resolver_key_l{}", layer_idx
-                                )),
-                                {0, 0, 0},
-                                {
-                                    linear_cfg.num_value_heads,
-                                    prefix_tokens,
-                                    linear_cfg.key_head_dim
-                                }
-                            },
-                            MLABufferSlice{
-                                &get_buffer(fmt::format(
-                                    "linear_delta_resolver_value_l{}", layer_idx
-                                )),
-                                {0, 0, 0},
-                                {
-                                    linear_cfg.num_value_heads,
-                                    prefix_tokens,
-                                    linear_cfg.value_head_dim
-                                }
-                            },
-                            MLABufferSlice{&get_buffer(fmt::format(
-                                "linear_delta_resolver_initial_decay_l{}", layer_idx
-                            ))},
-                            MLABufferSlice{&get_buffer(fmt::format(
-                                "linear_delta_resolver_decay_mask_l{}", layer_idx
-                            ))},
-                        },
-                        {
-                            MLABufferSlice{&get_buffer(fmt::format(
-                                "linear_delta_resolver_output_l{}", layer_idx
-                            ))}
-                        }
-                    )
-                );
-            }
-        }
         return;
     }
 

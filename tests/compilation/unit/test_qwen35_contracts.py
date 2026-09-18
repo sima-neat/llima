@@ -63,19 +63,19 @@ def _linear_model(*, quantize_embeddings: bool, layer_idx: int = 0) -> LanguageL
     return model
 
 
-def test_linear_attention_emits_resolver_inputs_only_for_dflash_target_verification():
+def test_linear_attention_emits_prefix_states_only_for_dflash_target_verification():
     model = _linear_model(quantize_embeddings=False)
     model.num_tokens = 8
     model.cfg.lm_cfg.speculative_decoding_cfg = SimpleNamespace(
         method="dflash", is_draft=False, speculative_budget=8
     )
-    assert model._emit_dflash_resolver_inputs
+    assert model._emit_dflash_prefix_states
 
     model.num_tokens = 128
-    assert not model._emit_dflash_resolver_inputs
+    assert not model._emit_dflash_prefix_states
     model.num_tokens = 8
     model.cfg.lm_cfg.speculative_decoding_cfg.is_draft = True
-    assert not model._emit_dflash_resolver_inputs
+    assert not model._emit_dflash_prefix_states
 
 
 def test_linear_attention_selects_supported_delta_block_sizes():
