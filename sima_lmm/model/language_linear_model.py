@@ -775,29 +775,13 @@ class LanguageLinearModel(LanguagePartBaseModel):
             prefix_decay = builder.create_reshape_node(
                 prefix_decay, [1, folded_heads, 1, 1]
             )
-            prefix_states = [
-                builder.create_add_node(
-                    builder.create_mul_node(
-                        state,
-                        builder.create_slice_node(
-                            prefix_decay,
-                            [prefix_idx * num_heads],
-                            [(prefix_idx + 1) * num_heads],
-                            [1],
-                            [1],
-                        ),
-                    ),
-                    builder.create_slice_node(
-                        updates,
-                        [prefix_idx * num_heads],
-                        [(prefix_idx + 1) * num_heads],
-                        [1],
-                        [1],
-                    ),
-                )
-                for prefix_idx in range(prefix_count)
-            ]
-            states = builder.create_concat_node(prefix_states, 1)
+            folded_state = builder.create_slice_concat_node(
+                state, axis=1, split_axis=1, split_block=1,
+                split_repeat=prefix_count,
+            )
+            states = builder.create_add_node(
+                builder.create_mul_node(folded_state, prefix_decay), updates
+            )
             linear_delta_state_out = builder.create_concat_node(
                 [states, linear_delta_state_out], 1
             )
