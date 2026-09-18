@@ -194,6 +194,17 @@ void test_verification_emits_the_first_target_mismatch() {
     );
 }
 
+void test_verification_emits_target_token_without_drafts() {
+    const std::vector<uint32_t> drafts;
+    const std::vector<uint32_t> target = {21};
+    const auto emitted = resolve_draft_tokens(drafts, target);
+
+    expect(
+        emitted == std::vector<std::pair<uint32_t, bool>>{{21, false}},
+        "target-only verification must emit its token"
+    );
+}
+
 void test_verification_accepts_an_early_exit_result() {
     const std::vector<uint32_t> drafts = {10, 11, 12, 13, 14, 15};
     const std::vector<uint32_t> target = {10, 21};
@@ -245,6 +256,7 @@ int main() {
     test_partial_rejection_exposes_one_more_shared_kv_row_than_query_position();
     test_shared_kv_visibility_never_exceeds_computed_target_rows();
     test_verification_emits_the_first_target_mismatch();
+    test_verification_emits_target_token_without_drafts();
     test_verification_accepts_an_early_exit_result();
     test_verification_emits_bonus_after_a_full_match();
     test_verification_rejects_an_incomplete_target_result();

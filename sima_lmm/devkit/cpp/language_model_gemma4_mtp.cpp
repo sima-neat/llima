@@ -1022,50 +1022,57 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 input_ids.size() - 1, "Gemma4 MTP current position"
             );
             const uint32_t current_token = input_ids.back();
+            const size_t remaining_output_tokens = max_length - input_ids.size();
+            // Reserve one output slot for the target mismatch or bonus token.
+            // With one slot remaining, verify the anchor without drafting.
+            const uint16_t round_draft_tokens = static_cast<uint16_t>(std::min<size_t>(
+                runtime_draft_tokens, remaining_output_tokens - 1
+            ));
 
             const bool verification_fits = (
-                input_ids.size() + runtime_draft_tokens <= max_length
-                && static_cast<size_t>(current_pos) + verification_width
-                    <= _cfg.pipeline_cfg.max_num_tokens
+                static_cast<size_t>(current_pos) + verification_width
+                <= _cfg.pipeline_cfg.max_num_tokens
             );
             if (!verification_fits) {
                 cache_full = true;
                 break;
             }
 
-            if (!predecessor_hidden_state.has_value()) {
-                throw std::runtime_error(
-                    "Gemma4 MTP is missing the preceding target hidden state"
-                );
-            }
             std::vector<uint32_t> draft_token_ids;
-            draft_token_ids.reserve(runtime_draft_tokens);
-            uint32_t draft_input_token = current_token;
-            std::vector<Eigen::bfloat16> draft_hidden = std::move(
-                predecessor_hidden_state.value()
-            );
-            predecessor_hidden_state.reset();
-            const uint16_t query_position_id =
-                gemma4_mtp_helpers::draft_query_position(
-                    input_ids.size(), _cfg.pipeline_cfg.max_num_tokens
+            draft_token_ids.reserve(round_draft_tokens);
+            if (round_draft_tokens > 0) {
+                if (!predecessor_hidden_state.has_value()) {
+                    throw std::runtime_error(
+                        "Gemma4 MTP is missing the preceding target hidden state"
+                    );
+                }
+                uint32_t draft_input_token = current_token;
+                std::vector<Eigen::bfloat16> draft_hidden = std::move(
+                    predecessor_hidden_state.value()
                 );
-            const uint16_t shared_kv_len =
-                gemma4_mtp_helpers::draft_visible_shared_kv_len(
-                    input_ids.size(),
-                    target_shared_kv_available_len,
-                    _cfg.pipeline_cfg.max_num_tokens
-                );
-            while (draft_token_ids.size() < runtime_draft_tokens) {
-                auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
-                    *this,
-                    draft_input_token,
-                    draft_hidden,
-                    query_position_id,
-                    shared_kv_len
-                );
-                draft_input_token = draft_step.token_id;
-                draft_hidden = std::move(draft_step.projected_hidden_state);
-                draft_token_ids.emplace_back(draft_step.token_id);
+                predecessor_hidden_state.reset();
+                const uint16_t query_position_id =
+                    gemma4_mtp_helpers::draft_query_position(
+                        input_ids.size(), _cfg.pipeline_cfg.max_num_tokens
+                    );
+                const uint16_t shared_kv_len =
+                    gemma4_mtp_helpers::draft_visible_shared_kv_len(
+                        input_ids.size(),
+                        target_shared_kv_available_len,
+                        _cfg.pipeline_cfg.max_num_tokens
+                    );
+                while (draft_token_ids.size() < round_draft_tokens) {
+                    auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
+                        *this,
+                        draft_input_token,
+                        draft_hidden,
+                        query_position_id,
+                        shared_kv_len
+                    );
+                    draft_input_token = draft_step.token_id;
+                    draft_hidden = std::move(draft_step.projected_hidden_state);
+                    draft_token_ids.emplace_back(draft_step.token_id);
+                }
             }
 
             std::vector<uint32_t> verification_tokens;
