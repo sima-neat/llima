@@ -1033,9 +1033,7 @@ uint32_t LanguageModel::run_model_once(
         const uint16_t valid_tokens = next_token_idx - token_idx;
         std::vector<Eigen::bfloat16> valid_mask(num_tokens, Eigen::bfloat16(0.0f));
         std::fill_n(valid_mask.begin(), valid_tokens, Eigen::bfloat16(1.0f));
-        get_buffer("linear_valid_mask").upload_raw(
-            valid_mask.data(), 0, valid_mask.size() * sizeof(Eigen::bfloat16)
-        );
+        get_buffer("linear_valid_mask").upload(valid_mask.data());
     }
 
     const bool direct_dflash_capture = (

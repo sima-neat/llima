@@ -508,8 +508,7 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
       num_tokens == _cfg.pipeline_cfg.input_token_group_size) {
     auto &valid = scratch.linear_valid_mask;
     valid.assign(num_tokens, Eigen::bfloat16{1.0f});
-    get_buffer("linear_valid_mask")
-        .upload_raw(valid.data(), 0, valid.size() * sizeof(Eigen::bfloat16));
+    get_buffer("linear_valid_mask").upload(valid.data());
   }
 
   const auto &capture_layers =
