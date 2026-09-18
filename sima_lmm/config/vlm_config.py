@@ -1377,8 +1377,6 @@ class VlmConfig(BaseConfig):
             if has_attn:
                 group_cache_indices = group_cache_model_indices(pipeline_cfg)
                 single_cache_indices = single_cache_model_indices(pipeline_cfg)
-                if is_dflash_draft:
-                    group_cache_indices = []
                 has_sliding_attn = "sliding_attention" in layer_types
                 separate_sliding_cache = (
                     lm_cfg.attn_cfg.sliding_head_dim is not None
@@ -1408,22 +1406,26 @@ class VlmConfig(BaseConfig):
                         single_cache_indices = single_shared_sliding_cache_model_indices(
                             pipeline_cfg, sliding_window
                         )
-                layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
+                if not is_dflash_draft:
+                    layers.extend(
+                        LayerID("group_cache", n) for n in group_cache_indices
+                    )
                 layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
                 if separate_sliding_cache:
-                    layers.extend(
-                        LayerID("group_sliding_cache", n)
-                        for n in group_sliding_cache_model_indices(
-                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                    if not is_dflash_draft:
+                        layers.extend(
+                            LayerID("group_sliding_cache", n)
+                            for n in group_sliding_cache_model_indices(
+                                pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                            )
                         )
-                    )
                     layers.extend(
                         LayerID("single_sliding_cache", n)
                         for n in single_sliding_cache_model_indices(
                             pipeline_cfg, lm_cfg.attn_cfg.sliding_window
                         )
                     )
-                elif terminal_sliding_cache:
+                elif terminal_sliding_cache and not is_dflash_draft:
                     layers.append(LayerID(
                         "group_sliding_cache",
                         _cache_model_index(

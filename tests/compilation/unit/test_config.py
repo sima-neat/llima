@@ -260,6 +260,9 @@ def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_p
     assert _layer_indices(config, "single_dflash_context") == list(range(6))
     assert _layer_indices(config, "single_pre") == list(range(6))
     assert _layer_indices(config, "single_post") == list(range(6))
+    assert _layer_indices(config, "group_cache") == []
+    assert _layer_indices(config, "group_sliding_cache") == []
+    assert _layer_indices(config, "single_cache") == list(range(127, 2048, 128))
 
     model = LanguageModel(
         config,
