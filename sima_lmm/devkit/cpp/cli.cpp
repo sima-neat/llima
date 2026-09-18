@@ -92,7 +92,7 @@ void CLI::run() {
         if (!maybe_command) break;
         std::string command = std::move(*maybe_command);
         readline_support.add_to_history(command);
-        
+
         if (command == "quit") {
             break;
         } else if (command == "help") {

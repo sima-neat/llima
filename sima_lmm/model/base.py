@@ -47,6 +47,33 @@ from sima_utils.logging.sima_logger import (
     ScopedLogLevel, sima_log_exception, sima_log_dbg, sima_log_info
 )
 
+GEMMA4_TOKEN_ORDERING_FILE = "gemma4_token_ordering.npy"
+
+
+def validate_gemma4_token_ordering(
+    token_ordering: np.ndarray, vocab_size: int
+) -> np.ndarray:
+    """Validate and canonicalize the assistant's centroid-to-token permutation."""
+    if not isinstance(token_ordering, np.ndarray) or not np.issubdtype(
+        token_ordering.dtype, np.integer
+    ):
+        raise ValueError("Gemma4 token_ordering must be an integer tensor")
+    ordering = token_ordering.reshape(-1)
+    if ordering.size != vocab_size:
+        raise ValueError(
+            "Gemma4 token_ordering size does not match vocabulary size: "
+            f"ordering={ordering.size}, vocab_size={vocab_size}"
+        )
+    if (
+        np.any(ordering < 0)
+        or np.any(ordering >= vocab_size)
+        or np.unique(ordering).size != vocab_size
+    ):
+        raise ValueError(
+            "Gemma4 token_ordering must be a permutation of canonical token IDs"
+        )
+    return ordering.astype(np.int64, copy=False)
+
 
 class FileGenMode(Enum):
     """
@@ -528,13 +555,17 @@ class BaseModel(ABC):
             self.sima_devkit_path
             / f"{self.language_model_name}_per_layer_embedding_scales.bin"
         )
-        write_per_layer_embedding_scales = (
+        uses_per_layer_inputs = (
             self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.cfg.lm_cfg.hidden_size_per_layer_input > 0
+        )
+        write_per_layer_embedding_scales = (
+            uses_per_layer_inputs
             and self.cfg.pipeline_cfg.quantize_embeddings
             and not (resume and per_layer_embeddings_scale_file_name.is_file())
         )
         write_per_layer_embeddings = (
-            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            uses_per_layer_inputs
             and (
                 not (resume and per_layer_embeddings_file_name.is_file())
                 or write_per_layer_embedding_scales
@@ -595,6 +626,20 @@ class BaseModel(ABC):
                 if tensor_name in self.hf_model.weight_map:
                     tensor = self.hf_model.load_np_param(tensor_name)
                     np.save(out_path, tensor)
+
+            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                ordering_path = self.sima_devkit_path / GEMMA4_TOKEN_ORDERING_FILE
+                if not (resume and ordering_path.is_file()):
+                    tensor_name = "masked_embedding.token_ordering"
+                    if not self.hf_model.param_exists(tensor_name):
+                        raise ValueError(
+                            f"Gemma4 ordered embeddings require {tensor_name}"
+                        )
+                    ordering = validate_gemma4_token_ordering(
+                        self.hf_model.load_np_param(tensor_name),
+                        self.cfg.lm_cfg.token_cfg.vocab_size,
+                    )
+                    np.save(ordering_path, ordering)
         else:
             assert isinstance(self.hf_model, GgufModel)
             # Copy the GGUF file to construct the VlmHelper.

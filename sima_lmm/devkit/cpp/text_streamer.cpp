@@ -2,6 +2,7 @@
 #include <cassert>
 #include <iostream>
 #include <numeric>
+#include <string_view>
 
 #include <fmt/std.h>
 #include <nlohmann/json.hpp>
@@ -54,7 +55,10 @@ void TextStreamer::push(DecodeCallbackData data) {
     if (!_is_enabled)
         return;
 
-    if (data.type != DecodeCallbackType::TPS) {
+    if (
+        data.type != DecodeCallbackType::TPS
+        && data.type != DecodeCallbackType::CACHED_PROMPT_TOKENS
+    ) {
         _is_streaming.store(true);
     }
 
@@ -99,6 +103,9 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
                 _is_streaming.store(false);
                 _is_streaming.notify_one();
                 break;
+            case DecodeCallbackType::CACHED_PROMPT_TOKENS:
+                _callback_info("cached_prompt_tokens", data.token_id);
+                break;
             default:
                 throw std::runtime_error(
                     fmt::format("Unsupported callback type: {}", static_cast<uint32_t>(data.type))
@@ -126,12 +133,19 @@ void TextStreamer::put(uint32_t token_id, bool from_draft) {
         }
     }
 
-    // If from_draft flips mid-cache, force-flush the remaining buffered text
-    // before adopting the new color. Without this, draft-accepted tokens and
-    // the trailing bonus token end up sharing one chunk colored by whichever
-    // came first, defeating the highlight.
+    // If from_draft flips mid-cache, flush only at a complete UTF-8 boundary.
+    // Byte-fallback tokenizers can represent one character with several token
+    // IDs and decode an incomplete prefix as U+FFFD. Flushing that prefix
+    // permanently corrupts the streamed text. A deferred mixed-origin chunk
+    // is conservatively treated as target-originated.
     if (!_cached_token_ids.empty() && from_draft != _chunk_from_draft) {
-        _flush_cached_text();
+        const auto cached_text = _tokenizer_ptr->decode(_cached_token_ids, true);
+        constexpr std::string_view replacement_character = "\xEF\xBF\xBD";
+        if (!cached_text.empty() && !cached_text.ends_with(replacement_character)) {
+            _flush_cached_text();
+        } else {
+            _chunk_from_draft = false;
+        }
     }
     if (_cached_token_ids.empty()) {
         _chunk_from_draft = from_draft;
@@ -202,7 +216,7 @@ void TextStreamer::end() {
             const double accept_rate = 100.0 * static_cast<double>(_draft_token_count)
                                      / static_cast<double>(num_gen_tokens);
             messages.emplace_back(fmt::format(
-                "Number of tokens contributed by EAGLE3: {} ({:.2f}%)",
+                "Number of tokens contributed by speculative decoding: {} ({:.2f}%)",
                 _draft_token_count, accept_rate
             ));
         }

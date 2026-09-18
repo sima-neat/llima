@@ -90,7 +90,11 @@ LanguageModel::LanguageModel(
             "max_num_tokens must be a positive multiple of 1024"
         );
     }
-    if (_cfg.lm_cfg.is_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+    if (
+        _cfg.lm_cfg.is_spec_decode()
+        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_eagle3()
+        && _cfg.lm_cfg.attn_cfg.swa_enable
+    ) {
         throw std::runtime_error(
             "EAGLE3 speculative decoding does not support sliding-window attention"
         );
@@ -99,6 +103,10 @@ LanguageModel::LanguageModel(
     _use_group_token_models = (
         _cfg.pipeline_cfg.input_token_group_offsets.has_value()
         && _cfg.pipeline_cfg.input_token_group_offsets.value().size() > 0
+        // Gemma4 MTP assistants only execute their speculative-width path. Their
+        // serialized pipeline config retains target group offsets, but the compiler
+        // intentionally does not emit grouped assistant pre/cache/post models.
+        && !_cfg.lm_cfg.is_gemma4_mtp_draft()
     );
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
@@ -221,8 +229,7 @@ LanguageModel::LanguageModel(
 
     // EAGLE3: build the constant tree_mask_init (eye(topk)) once. Only the
     // draft uses it (consumed in topk_generate's depth loop seed and concat).
-    if (_cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft) {
+    if (_cfg.lm_cfg.is_eagle3_draft()) {
         const int topk = _cfg.lm_cfg.speculative_decoding_cfg.value().speculative_budget;
         _eagle3_tree_mask_init.data = std::vector<std::vector<std::vector<std::vector<float>>>>(
             1, std::vector<std::vector<std::vector<float>>>(
@@ -513,7 +520,7 @@ uint32_t LanguageModel::run_model_prefill(
             }
         }
         if (
-            !_cached_states.empty() 
+            !_cached_states.empty()
             && last_group_valid_tokens > 0
             && last_group_valid_tokens < group_size
         ) {
@@ -1241,7 +1248,7 @@ uint32_t LanguageModel::run_model_once(
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
             // into FC fusion.
             if (
-                _cfg.lm_cfg.is_spec_decode()
+                _cfg.lm_cfg.is_eagle3_spec_decode()
                 && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
             ) {
                 const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
@@ -1402,6 +1409,18 @@ uint32_t LanguageModel::run_model_once(
                 }
                 next_token_id = best_idx;
             }
+            if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+                auto hidden_rows = _read_gemma4_mtp_target_hidden_rows(
+                    logits_num_tokens, static_cast<uint16_t>(row + 1)
+                );
+                const size_t hidden_size = _cfg.lm_cfg.hidden_size;
+                const auto row_begin = hidden_rows.begin()
+                    + static_cast<std::ptrdiff_t>(row * hidden_size);
+                _gemma4_mtp_prefill_hidden_state.emplace(
+                    row_begin,
+                    row_begin + static_cast<std::ptrdiff_t>(hidden_size)
+                );
+            }
         } else {
             // Non-spec: read from single n1_buffer4
             MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
@@ -1454,6 +1473,7 @@ void LanguageModel::_initialize() {
     MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
     if (!draft_model) {
         if (!_embedding_offload) {
             auto embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
@@ -1472,8 +1492,8 @@ void LanguageModel::_initialize() {
             );
             get_buffer("embedding_scales").load_file(scale_file_name);
         }
-    } else {
-        // Load d2t mapping (int64 in npy, narrows to int32 — values fit easily).
+    } else if (is_eagle3_draft) {
+        // Load d2t mapping (int64 in npy, narrows to int32; values fit easily).
         auto d2t_file_name = _devkit_dir / "d2t.npy";
         auto d2t_tensor = cnpy::npy_load(d2t_file_name);
         const int64_t* src = d2t_tensor.data<int64_t>();
@@ -1483,6 +1503,58 @@ void LanguageModel::_initialize() {
             _d2t[i] = static_cast<int32_t>(src[i]);
         }
         _logger->info("Loaded d2t mapping with {} entries", _d2t.size());
+    } else if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+        const auto ordering_file_name = _devkit_dir / "gemma4_token_ordering.npy";
+        const auto ordering_tensor = cnpy::npy_load(ordering_file_name);
+        const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
+        if (
+            ordering_tensor.word_size != sizeof(int64_t)
+            || ordering_tensor.num_vals != vocab_size
+        ) {
+            throw std::runtime_error(fmt::format(
+                "Invalid Gemma4 MTP token ordering in {}: expected {} int64 entries",
+                ordering_file_name.string(),
+                vocab_size
+            ));
+        }
+        if (
+            _cfg.lm_cfg.assistant_num_centroids == 0
+            || vocab_size % _cfg.lm_cfg.assistant_num_centroids != 0
+            || _cfg.lm_cfg.assistant_centroid_intermediate_top_k == 0
+            || _cfg.lm_cfg.assistant_centroid_intermediate_top_k
+                > _cfg.lm_cfg.assistant_num_centroids
+        ) {
+            throw std::runtime_error("Invalid Gemma4 MTP ordered-embedding configuration");
+        }
+
+        const int64_t* source = ordering_tensor.data<int64_t>();
+        std::vector<uint8_t> seen(vocab_size, 0);
+        _gemma4_token_ordering.resize(vocab_size);
+        for (size_t index = 0; index < vocab_size; ++index) {
+            const int64_t token_id = source[index];
+            if (
+                token_id < 0 || static_cast<size_t>(token_id) >= vocab_size
+                || seen[static_cast<size_t>(token_id)] != 0
+            ) {
+                throw std::runtime_error(fmt::format(
+                    "Invalid Gemma4 MTP token ordering entry at index {}", index
+                ));
+            }
+            seen[static_cast<size_t>(token_id)] = 1;
+            _gemma4_token_ordering[index] = static_cast<uint32_t>(token_id);
+        }
+        _logger->info(
+            "Loaded Gemma4 MTP token ordering with {} entries",
+            _gemma4_token_ordering.size()
+        );
+    } else if (
+        _cfg.lm_cfg.is_gemma4_mtp_draft()
+        && _cfg.lm_cfg.assistant_use_ordered_embeddings
+    ) {
+        _logger->warn(
+            "Gemma4 MTP ordered embeddings are disabled for this legacy artifact; "
+            "recompile the model to enable masked LM-head selection"
+        );
     }
 
     // Upload freq real and imag.
@@ -1532,11 +1604,16 @@ void LanguageModel::_initialize() {
         );
         MLABuffer& future_token_mask_buf = get_buffer("future_token_mask");
         future_token_mask_buf.clear();
-        future_token_mask_buf.upload_raw(
-            future_token_mask.data(),
-            _cfg.pipeline_cfg.max_num_tokens * 2,
-            future_token_mask.size() * 2
-        );
+        // The pointwise Gemma4 MTP draft has exactly one max_num_tokens-wide
+        // mask row, with no legacy tail space. Its runtime mask is populated
+        // immediately before every draft execution.
+        if (!_cfg.lm_cfg.is_gemma4_mtp_draft()) {
+            future_token_mask_buf.upload_raw(
+                future_token_mask.data(),
+                _cfg.pipeline_cfg.max_num_tokens * 2,
+                future_token_mask.size() * 2
+            );
+        }
     }
     // Clear the KV caches and caches states.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
@@ -1729,8 +1806,9 @@ void LanguageModel::_define_buffer_freq_table(const std::string& name, uint32_t 
 
 void LanguageModel::_define_buffers() {
     // Embedding table. Drafts use the target's embeddings, so skip.
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
     if (!is_draft) {
         if (!_embedding_offload) define_buffer(
             "embeddings",
@@ -1866,7 +1944,10 @@ void LanguageModel::_define_buffers() {
     std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
     if (_use_group_token_models) {
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
-        num_tokens_vec.emplace_back(num_tokens);
+        if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), num_tokens)
+            == num_tokens_vec.end()) {
+            num_tokens_vec.emplace_back(num_tokens);
+        }
     }
     const uint16_t max_future_token_mask_size = _get_max_future_token_mask_size();
     if (max_future_token_mask_size > 1) {
@@ -1884,6 +1965,14 @@ void LanguageModel::_define_buffers() {
                 {full_token_mask_size}
             );
         }
+    }
+    if (_cfg.lm_cfg.is_gemma4_mtp_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+        // Full and sliding attention can use different compiled mask strides.
+        // They need separate storage because the entire transformer is queued.
+        define_buffer(
+            "gemma4_mtp_sliding_future_token_mask",
+            {_cfg.lm_cfg.get_single_num_tokens(), _cfg.pipeline_cfg.max_num_tokens}
+        );
     }
     const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
     if (
@@ -1942,6 +2031,13 @@ void LanguageModel::_define_buffers() {
             );
         }
 
+        if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+            define_buffer(
+                fmt::format("n{}_target_hidden_states", num_tokens),
+                {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+        }
+
         // Qwen3.5: transient gate buffer, written by Pre and consumed by Post within the same layer.
         if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
             define_buffer(
@@ -1950,8 +2046,8 @@ void LanguageModel::_define_buffers() {
             );
         }
 
-        // Draft-only buffers: second pre input, draft hidden states output, FC fusion buffers.
-        if (is_draft) {
+        // EAGLE3 draft-only buffers: second pre input, hidden-state output, FC fusion.
+        if (is_eagle3_draft) {
             define_buffer(
                 fmt::format("n{}_buffer1a", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
@@ -1968,6 +2064,21 @@ void LanguageModel::_define_buffers() {
                 fmt::format("fc_n{}_output", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
             );
+        } else if (is_gemma4_mtp_draft) {
+            define_buffer(
+                fmt::format("gemma4_mtp_input_n{}", num_tokens),
+                {num_tokens, 2 * _cfg.lm_cfg.assistant_backbone_hidden_size}
+            );
+            define_buffer(
+                fmt::format("n{}_buffer5", num_tokens),
+                {num_tokens, _cfg.lm_cfg.assistant_backbone_hidden_size}
+            );
+            if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+                define_buffer(
+                    fmt::format("n{}_gemma4_mtp_centroid_logits", num_tokens),
+                    {num_tokens, _cfg.lm_cfg.assistant_num_centroids}
+                );
+            }
         }
     }
 
@@ -2004,24 +2115,33 @@ void LanguageModel::_define_buffers() {
             );
             _per_layer_embedding_shards.emplace_back(&get_buffer(name));
         }
-        // Input staging for the standalone per-layer model, filled from token-id gathers.
-        define_buffer("per_layer_emb_staging_n1", {1, out_dim}, dtype);
-        if (_cfg.pipeline_cfg.quantize_embeddings) {
-            define_buffer("per_layer_emb_staging_scale_n1", {1, 1});
-        }
+        // MTP target verification consumes a native speculative-width projection.
+        const auto speculative_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+        std::vector<uint16_t> per_layer_num_tokens_vec{
+            _cfg.lm_cfg.is_gemma4_mtp_target() ? speculative_num_tokens : uint16_t{1}
+        };
         if (_use_group_token_models) {
+            const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
+            if (
+                std::find(
+                    per_layer_num_tokens_vec.begin(),
+                    per_layer_num_tokens_vec.end(),
+                    group_num_tokens
+                ) == per_layer_num_tokens_vec.end()
+            ) {
+                per_layer_num_tokens_vec.emplace_back(group_num_tokens);
+            }
+        }
+        for (const auto num_tokens: per_layer_num_tokens_vec) {
             define_buffer(
-                fmt::format("per_layer_emb_staging_n{}", _cfg.pipeline_cfg.input_token_group_size),
-                {_cfg.pipeline_cfg.input_token_group_size, out_dim},
+                fmt::format("per_layer_emb_staging_n{}", num_tokens),
+                {num_tokens, out_dim},
                 dtype
             );
             if (_cfg.pipeline_cfg.quantize_embeddings) {
                 define_buffer(
-                    fmt::format(
-                        "per_layer_emb_staging_scale_n{}",
-                        _cfg.pipeline_cfg.input_token_group_size
-                    ),
-                    {_cfg.pipeline_cfg.input_token_group_size, 1}
+                    fmt::format("per_layer_emb_staging_scale_n{}", num_tokens),
+                    {num_tokens, 1}
                 );
             }
         }
@@ -2039,7 +2159,10 @@ void LanguageModel::_define_buffers() {
         for (const auto& num_tokens: num_tokens_vec) {
             // Target prefill reuses the single-token-group final post model
             // (n16 for EAGLE3). Only drafts need group-width final-post outputs.
-            if (!is_draft && num_tokens != _cfg.lm_cfg.get_single_num_tokens()) {
+            if (
+                !is_draft
+                && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
+            ) {
                 continue;
             }
             if (_cfg.lm_cfg.lm_head_num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
@@ -2169,10 +2292,11 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         );
     }
 
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
     const bool pre_uses_embedding_scale = (
-        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
+        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 && !is_gemma4_mtp_draft
     );
     const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_draft;
     if (pre_uses_embedding_scale) {
@@ -2182,12 +2306,19 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         pre_model._bind_ifm(1, embedding_scale_buf, {embedding_scale_row, 0});
     }
     const uint8_t freq_ifm_idx = (
-        1 + static_cast<uint8_t>(pre_uses_embedding_scale) + static_cast<uint8_t>(is_draft)
+        1 + static_cast<uint8_t>(pre_uses_embedding_scale)
+        + static_cast<uint8_t>(is_eagle3_draft)
     );
     auto& freq_real = get_buffer(fmt::format("{}_freq_real", freq_prefix));
     auto& freq_imag = get_buffer(fmt::format("{}_freq_imag", freq_prefix));
     pre_model._bind_ifm(freq_ifm_idx, &freq_real, {token_idx, 0});
     pre_model._bind_ifm(freq_ifm_idx + 1, &freq_imag, {token_idx, 0});
+
+    if (is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
+        throw std::runtime_error(
+            "Gemma4 MTP shared-KV binding must use run_model_gemma4_mtp"
+        );
+    }
 
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         uint8_t ofm_idx = 1;
@@ -2719,6 +2850,9 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
     }
     _has_image_token = num_images > 0;
 
+    _text_streamer.push(
+        DecodeCallbackType::CACHED_PROMPT_TOKENS, num_cached_tokens, 0.0
+    );
     _logger->info("Number of tokens cached: {:d}", num_cached_tokens);
     return num_cached_tokens;
 }
@@ -2788,10 +2922,15 @@ void LanguageModel::_load_per_layer_embeddings() {
 
 
 void LanguageModel::_upload_per_layer_embedding_rows(
-    std::span<const uint32_t> token_ids, uint16_t num_tokens
+    std::span<const uint32_t> token_ids, uint16_t num_tokens,
+    uint16_t valid_tokens
 ) {
     if (!_uses_per_layer_inputs())
         return;
+    if (valid_tokens == 0)
+        valid_tokens = num_tokens;
+    if (valid_tokens > num_tokens || token_ids.size() < valid_tokens)
+        throw std::runtime_error("Invalid per-layer embedding staging row count");
     auto& staging = get_buffer(fmt::format("per_layer_emb_staging_n{}", num_tokens));
     const size_t row_size = staging.get_shape().back() * staging.get_elem_size();
     auto* dst = reinterpret_cast<uint8_t*>(staging.get_virtual_addr());
@@ -2810,9 +2949,11 @@ void LanguageModel::_upload_per_layer_embedding_rows(
         );
     }
     if (_embedding_offload) {
-        _embedding_offload->per_layer->gather(token_ids.first(num_tokens), dst, row_size);
+        _embedding_offload->per_layer->gather(
+            token_ids.first(valid_tokens), dst, row_size
+        );
     }
-    for (uint16_t i = 0; i < num_tokens; ++i) {
+    for (uint16_t i = 0; i < valid_tokens; ++i) {
         if (!_embedding_offload) {
             const size_t shard_idx = token_ids[i] / _per_layer_embedding_rows_per_shard;
             const size_t row_in_shard = token_ids[i] % _per_layer_embedding_rows_per_shard;
@@ -2884,9 +3025,11 @@ void LanguageModel::_notify_first_token(uint32_t token_id, double duration) {
 }
 
 
-void LanguageModel::_notify_new_token(uint32_t token_id, double duration) {
+void LanguageModel::_notify_new_token(
+    uint32_t token_id, double duration, bool from_draft
+) {
     _logger->info("Got token: {:d} in {:.5f}s", token_id, duration);
-    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration);
+    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration, from_draft);
 }
 
 

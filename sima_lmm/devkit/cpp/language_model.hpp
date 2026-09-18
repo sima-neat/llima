@@ -96,6 +96,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr
         );
+        std::optional<std::vector<uint32_t>> run_model_gemma4_mtp(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
+            std::optional<ChronoTimer> timer_ttft = std::nullopt,
+            GenerationPerformanceResult* performance_result = nullptr
+        );
         void stop_model() { _is_running = false; }
 
         void set_reloc(const std::string& reloc_name);
@@ -151,6 +158,16 @@ class LanguageModel : public BaseModel<VlmConfig> {
         struct DraftForwardResult {
             std::vector<Eigen::bfloat16> hidden_states;  // (seq_length, hidden_size)
             std::vector<Eigen::bfloat16> logits;         // (num_tokens, draft_vocab_size)
+        };
+
+        struct Gemma4MtpTargetBatchResult {
+            std::vector<uint32_t> next_token_ids;
+            std::vector<Eigen::bfloat16> hidden_states;
+        };
+
+        struct Gemma4MtpDraftStepResult {
+            uint32_t token_id;
+            std::vector<Eigen::bfloat16> projected_hidden_state;  // (backbone_hidden_size)
         };
 
         // Draft model forward with lm_head fused. is_prefill picks n128 (with FC
@@ -368,16 +385,59 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids
         ) const;
         void _upload_per_layer_embedding_rows(
-            std::span<const uint32_t> token_ids, uint16_t num_tokens
+            std::span<const uint32_t> token_ids, uint16_t num_tokens,
+            uint16_t valid_tokens = 0
         );
         void _load_per_layer_embeddings();
         void _compute_and_upload_per_layer_inputs_prefill(
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
+        uint32_t _argmax_gemma4_mtp_masked_row(uint16_t num_tokens, uint16_t row);
+        std::vector<uint32_t> _argmax_lm_head_rows(
+            uint16_t num_tokens, uint16_t valid_tokens,
+            std::span<const uint32_t> expected_draft_tokens
+        );
+        std::vector<Eigen::bfloat16> _read_embedding_row_bf16(uint32_t token_id);
+        std::vector<Eigen::bfloat16> _read_gemma4_mtp_target_hidden_rows(
+            uint16_t num_tokens, uint16_t valid_tokens
+        );
+        void _upload_gemma4_mtp_freq_rows(
+            uint16_t num_tokens, uint16_t position_id, uint16_t valid_tokens
+        );
+        void _upload_gemma4_mtp_causal_mask(
+            MLABuffer& buffer,
+            uint16_t num_tokens,
+            uint16_t first_visible_token_count,
+            uint16_t valid_tokens,
+            uint16_t cache_token_idx_begin,
+            uint16_t context_length
+        );
+        uint8_t _find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const;
+        void _bind_gemma4_mtp_shared_kv_cache(
+            LanguageModel& target_lm,
+            std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
+            uint8_t cache_ifm_idx,
+            uint16_t cache_token_idx_begin,
+            uint16_t aligned_eff_num_cached_tokens,
+            bool has_future_token_mask,
+            std::string_view layer_type
+        );
+        Gemma4MtpTargetBatchResult _run_gemma4_mtp_target_batch(
+            uint16_t token_idx, std::span<const uint32_t> token_ids
+        );
+        Gemma4MtpDraftStepResult _run_gemma4_mtp_draft_step(
+            LanguageModel& target_lm,
+            uint32_t token_id,
+            const std::vector<Eigen::bfloat16>& hidden_state,
+            uint16_t query_position_id,
+            uint16_t shared_kv_len
+        );
 
         void _notify_first_token(uint32_t token_id, double duration);
-        void _notify_new_token(uint32_t token_id, double duration);
+        void _notify_new_token(
+            uint32_t token_id, double duration, bool from_draft = false
+        );
         void _notify_cache_full() const;
         void _notify_stop() const;
         void _notify_interrupt() const;
@@ -422,6 +482,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _cached_eagle3_stable_kv = 0;
         uint16_t _kv_cache_len = 0;  // tokens in KV cache; set by prefill, advanced by decode
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
+        std::vector<uint32_t> _gemma4_token_ordering;
         std::vector<uint16_t> _checkpoint_boundaries;
         std::vector<CachedState> _cached_states;
         // Positions are zero for unused slots. Slot 0 is reserved only for a system/tool prefix.
@@ -432,6 +493,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _rolling_checkpoint_slot = 0;
 
         std::vector<std::vector<Eigen::bfloat16>> _eagle3_intermediate_hidden_states;
+        std::optional<std::vector<Eigen::bfloat16>> _gemma4_mtp_prefill_hidden_state;
 
         std::atomic<bool> _is_running;
         std::optional<std::string> _reloc_name;

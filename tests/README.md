@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 96
+- Expected cases: 104
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -328,13 +328,15 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
 | `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
+| `runtime.gemma4_mtp_helpers` | Packed causal masks at compiled context widths, sliding-window offsets, ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
 
 The embedding generation test requires raw embedding tables on local NVMe
 and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
 `SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
 and `auto`, verifies that automatic offloading saves DRAM, and checks allocation
 cleanup after teardown. The executable also accepts an explicit model directory
-and optionally a speculative draft model directory:
+and optionally a speculative draft model directory. With a draft, it also checks
+that repeating a prompt after speculative decoding returns the same response:
 
 ```bash
 ./lib/sima-lmm/tests/sima_lmm_embedding_offload_generation_test \
@@ -344,6 +346,25 @@ and optionally a speculative draft model directory:
 The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on
 the DevKit.
+
+The manual Gemma4 MTP prefix-cache test takes an individual deployed target and
+assistant directory. It checks exact generated-token parity for cold/warm
+requests, prefill group boundaries, partial prefixes, continuation through the
+committed KV boundary, cancellation recovery, and long-context reuse (4,097
+tokens for an 8K model). It also
+asserts the actual prefill dispatch positions from runtime logs, rather than
+relying only on reported cache hits, and prints TTFT for comparison:
+
+```bash
+./lib/sima-lmm/tests/sima_lmm_gemma4_mtp_cache_test \
+  /path/to/deployed-mtp/target /path/to/deployed-mtp/assistant
+```
+
+This test needs a target with at least three prefill groups.
+It is built and packaged with `./build.sh --all`, but is not in the automatic
+CTest suite until a compiled MTP pair is available in the CI fixture manifest.
+TTFT is reported without a timing threshold; dispatch counts establish that
+cached prefill work was skipped even when device timing varies.
 
 ### Python and black-box tests
 

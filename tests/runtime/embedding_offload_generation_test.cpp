@@ -119,6 +119,10 @@ int main(int argc, char** argv) {
                     const auto response = model.run_model(chat, 32);
                     if (!response || response->empty()) throw std::runtime_error("Empty speculative response");
                     compare("speculative", *response);
+                    const auto repeated = model.run_model(chat, 32);
+                    if (repeated != response)
+                        throw std::runtime_error("Repeated speculative request mismatch");
+                    compare("speculative_repeat", *repeated);
                     model.set_draft_vlm(nullptr);
                 }
             }

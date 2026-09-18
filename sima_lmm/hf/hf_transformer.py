@@ -278,8 +278,11 @@ class LocalHuggingFaceModel:
         config = hf_config.to_dict()
 
         # HF has head_dim to be None for Mistral model
-        if isinstance(hf_config, MistralConfig) and config["head_dim"] is None:
-            config["head_dim"] =  config["hidden_size"] // config["num_attention_heads"]
+        if (
+            isinstance(hf_config, MistralConfig)
+            and config["head_dim"] is None
+        ):
+            config["head_dim"] = config["hidden_size"] // config["num_attention_heads"]
 
         # Load and verify HF Index File
         # Some small models do not have an index file, so we need to build one here.

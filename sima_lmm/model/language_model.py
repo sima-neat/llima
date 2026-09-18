@@ -24,7 +24,12 @@ from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
+from sima_lmm.config.vlm_config import (
+    LlmArchType,
+    PipelineConfig,
+    SpeculativeDecodingMethod,
+    VlmArchType,
+)
 
 
 bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
@@ -131,7 +136,8 @@ class LanguageModel(BaseModel):
                     )
                 case "single_sliding_cache":
                     part_model = self._get_part_model(
-                        "sliding_cache", 1, token_idx=layer_id.part_idx
+                        "sliding_cache", single_model_num_tokens,
+                        token_idx=layer_id.part_idx
                     )
                 case "group_conv":
                     part_model = self._get_part_model(
@@ -164,7 +170,9 @@ class LanguageModel(BaseModel):
                 case "group_per_layer":
                     part_model = self._get_part_model("per_layer", num_tokens)
                 case "single_per_layer":
-                    part_model = self._get_part_model("per_layer", 1)
+                    part_model = self._get_part_model(
+                        "per_layer", single_model_num_tokens
+                    )
                 case _:
                     # Not a part of this model
                     continue
@@ -487,6 +495,14 @@ class LanguageModel(BaseModel):
     @property
     def _single_model_num_tokens(self) -> int:
         if self.cfg.lm_cfg.speculative_decoding_cfg is None:
+            return 1
+        if (
+            self.cfg.lm_cfg.speculative_decoding_cfg.method
+            == SpeculativeDecodingMethod.GEMMA4_MTP
+            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
+        ):
+            # Gemma4 MTP proposes `speculative_budget` tokens recurrently. Each
+            # assistant invocation consumes one token/hidden-state pair.
             return 1
         return self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
 

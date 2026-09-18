@@ -33,6 +33,15 @@ add_executable(
     sima_lmm_reasoning_parser_test
     reasoning_parser_test.cpp
 )
+add_executable(
+    sima_lmm_gemma4_mtp_helpers_test
+    gemma4_mtp_helpers_test.cpp
+)
+add_executable(
+    sima_lmm_gemma4_mtp_cache_test
+    gemma4_mtp_cache_test.cpp
+)
+target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime)
 target_link_libraries(
     sima_lmm_dispatcher_lifecycle_test
     PRIVATE
@@ -60,6 +69,11 @@ target_link_libraries(
 )
 target_link_libraries(
     sima_lmm_reasoning_parser_test
+    PRIVATE
+        sima_lmm_runtime
+)
+target_link_libraries(
+    sima_lmm_gemma4_mtp_helpers_test
     PRIVATE
         sima_lmm_runtime
 )
@@ -72,6 +86,8 @@ set_target_properties(
     sima_lmm_asr_transcription_test
     sima_lmm_tool_call_parser_test
     sima_lmm_reasoning_parser_test
+    sima_lmm_gemma4_mtp_helpers_test
+    sima_lmm_gemma4_mtp_cache_test
     PROPERTIES
         INSTALL_RPATH
             "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
@@ -102,6 +118,11 @@ add_test(
     NAME runtime.reasoning_parser
     COMMAND
         "$<TARGET_FILE:sima_lmm_reasoning_parser_test>"
+)
+add_test(
+    NAME runtime.gemma4_mtp_helpers
+    COMMAND
+        "$<TARGET_FILE:sima_lmm_gemma4_mtp_helpers_test>"
 )
 set_tests_properties(
     runtime.dispatcher_lifecycle
@@ -143,6 +164,12 @@ set_tests_properties(
         LABELS "devkit;runtime;unit"
         TIMEOUT 30
 )
+set_tests_properties(
+    runtime.gemma4_mtp_helpers
+    PROPERTIES
+        LABELS "devkit;runtime;unit;gemma4;speculative"
+        TIMEOUT 30
+)
 
 install(
     TARGETS
@@ -154,6 +181,8 @@ install(
         sima_lmm_asr_transcription_test
         sima_lmm_tool_call_parser_test
         sima_lmm_reasoning_parser_test
+        sima_lmm_gemma4_mtp_helpers_test
+        sima_lmm_gemma4_mtp_cache_test
     RUNTIME DESTINATION lib/sima-lmm/tests
     COMPONENT extras
 )
@@ -173,6 +202,8 @@ install(
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp"
         asr_transcription_test.cpp
         dispatcher_lifecycle_test.cpp
+        gemma4_mtp_helpers_test.cpp
+        gemma4_mtp_cache_test.cpp
         pytest.ini
         runtime_test_utils.hpp
         test_cli_black_box.py
@@ -183,6 +214,7 @@ install(
         test_zmq_black_box.py
         text_generation_test.cpp
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/reasoning_parser.hpp"
+        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/gemma4_mtp_helpers.hpp"
         reasoning_parser_test.cpp
         tool_call_parser_test.cpp
         vision_generation_test.cpp
