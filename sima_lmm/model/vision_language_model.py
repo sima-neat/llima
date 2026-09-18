@@ -149,10 +149,6 @@ class VisionLanguageModel(BaseModel):
                 budget = speculative_block_size or 8
                 target_layer_ids = dflash_cfg.get("target_layer_ids", [])
                 mask_token_id = dflash_cfg.get("mask_token_id", -1)
-                VisionLanguageModel._validate_dflash_pair(
-                    target_model, vlm_cfg, model_config, budget,
-                    target_layer_ids, mask_token_id,
-                )
                 spec_cfg = dict(
                     method=method,
                     speculative_budget=budget,
@@ -195,85 +191,6 @@ class VisionLanguageModel(BaseModel):
         if target_model is not None and method == "dflash":
             model.language_model.dflash_target_hf_model = target_model.hf_model
         return model
-
-    @staticmethod
-    def _validate_dflash_pair(
-        target_model: "VisionLanguageModel",
-        draft_cfg: VlmConfig,
-        draft_hf_cfg: dict,
-        block_size: int,
-        target_layer_ids: list[int],
-        mask_token_id: int,
-    ):
-        target_cfg = target_model.cfg.lm_cfg
-        if draft_hf_cfg.get("model_type") != "qwen3":
-            raise ValueError("DFlash draft model_type must be qwen3")
-        if draft_cfg.lm_cfg.hidden_size != target_cfg.hidden_size:
-            raise ValueError("DFlash target and draft hidden sizes must match")
-        if draft_cfg.lm_cfg.token_cfg.vocab_size != target_cfg.token_cfg.vocab_size:
-            raise ValueError("DFlash target and draft vocabulary sizes must match")
-        if draft_hf_cfg.get("num_target_layers") != target_cfg.num_hidden_layers:
-            raise ValueError("DFlash draft num_target_layers does not match the target")
-        if (
-            not target_layer_ids
-            or not all(isinstance(layer, int) for layer in target_layer_ids)
-            or target_layer_ids != sorted(set(target_layer_ids))
-            or not all(
-                0 <= layer < target_cfg.num_hidden_layers - 1
-                for layer in target_layer_ids
-            )
-        ):
-            raise ValueError(
-                "DFlash target_layer_ids must be non-empty, unique, sorted, and in range"
-            )
-        if not 0 <= mask_token_id < target_cfg.token_cfg.vocab_size:
-            raise ValueError("DFlash mask_token_id is missing or out of range")
-        checkpoint_block_size = draft_hf_cfg.get("dflash_config", {}).get(
-            "block_size", draft_hf_cfg.get("block_size", 0)
-        )
-        if block_size not in (4, 8, 16) or block_size > checkpoint_block_size:
-            raise ValueError(
-                "DFlash speculative block size must be 4, 8, or 16 and no larger "
-                "than the checkpoint block_size"
-            )
-        if (
-            target_model.cfg.pipeline_cfg.input_token_group_size
-            != draft_cfg.pipeline_cfg.input_token_group_size
-        ):
-            raise ValueError(
-                "DFlash target and draft language group sizes must match"
-            )
-        if target_model.cfg.pipeline_cfg.input_token_group_size < block_size:
-            raise ValueError(
-                "DFlash language group size must be at least the speculative block size"
-            )
-        if (
-            draft_cfg.pipeline_cfg.max_num_tokens
-            < target_model.cfg.pipeline_cfg.max_num_tokens
-        ):
-            raise ValueError(
-                "DFlash draft cache must be at least as large as the target cache"
-            )
-        if (
-            draft_cfg.pipeline_cfg.quantize_embeddings
-            != target_model.cfg.pipeline_cfg.quantize_embeddings
-        ):
-            raise ValueError(
-                "DFlash target and draft embedding quantization modes must match"
-            )
-        draft_layer_types = draft_cfg.lm_cfg.layer_types
-        if (
-            len(draft_layer_types) != draft_cfg.lm_cfg.num_hidden_layers
-            or not draft_layer_types
-            or any(
-                layer_type not in ("full_attention", "sliding_attention")
-                for layer_type in draft_layer_types
-            )
-        ):
-            raise ValueError(
-                "DFlash draft layers must be full or sliding attention and match "
-                "num_hidden_layers"
-            )
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)

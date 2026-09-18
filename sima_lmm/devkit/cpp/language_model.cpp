@@ -1038,7 +1038,13 @@ uint32_t LanguageModel::run_model_once(
         );
     }
 
-    std::vector<Eigen::bfloat16> dflash_attention_mask;
+    const bool direct_dflash_capture = (
+        _cfg.lm_cfg.is_dflash()
+        && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+        && num_tokens == _cfg.pipeline_cfg.input_token_group_size
+        && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
+    );
+    MLABuffer* dflash_layer_input = nullptr;
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
 
@@ -1053,7 +1059,41 @@ uint32_t LanguageModel::run_model_once(
                     std::vector<uint32_t>{normal_input_num_tokens, _cfg.lm_cfg.hidden_size}
                 )
             );
+        } else if (dflash_layer_input != nullptr) {
+            ifm_map.emplace(
+                0,
+                MLABufferSlice{
+                    dflash_layer_input,
+                    {0, 0},
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                }
+            );
         }
+
+        MLABuffer* dflash_capture_buffer = nullptr;
+        std::map<uint8_t, MLABufferSlice> ofm_map;
+        if (direct_dflash_capture && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1) {
+            const auto& capture_layers =
+                _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids;
+            const auto capture = std::find(
+                capture_layers.begin(), capture_layers.end(), layer_idx
+            );
+            if (capture != capture_layers.end()) {
+                const auto capture_idx = std::distance(capture_layers.begin(), capture);
+                dflash_capture_buffer = &get_buffer(fmt::format(
+                    "dflash_target_hidden_n{}_{}", num_tokens, capture_idx
+                ));
+                ofm_map.emplace(
+                    0,
+                    MLABufferSlice{
+                        dflash_capture_buffer,
+                        {0, 0},
+                        {num_tokens, _cfg.lm_cfg.hidden_size}
+                    }
+                );
+            }
+        }
+        auto* output_overrides = ofm_map.empty() ? nullptr : &ofm_map;
         if (
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
@@ -1061,15 +1101,6 @@ uint32_t LanguageModel::run_model_once(
             const auto cache_key = _bind_attn_models(
                 num_tokens, token_idx, layer_idx, normal_scale_buf, normal_input_row
             );
-            if (
-                _cfg.lm_cfg.is_dflash()
-                && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
-                && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
-            ) {
-                _upload_dflash_attention_mask(
-                    num_tokens, token_idx, layer_idx, false, dflash_attention_mask
-                );
-            }
             _pre_model_map.at(model_key).add_to_queue(&ifm_map);
 
             if (
@@ -1183,7 +1214,7 @@ uint32_t LanguageModel::run_model_once(
                     std::piecewise_construct,
                     std::forward_as_tuple(0),
                     std::forward_as_tuple(
-                        nullptr,
+                        dflash_layer_input,
                         std::vector<uint32_t>{slice_start, 0},
                         std::vector<uint32_t>{single_num_tokens, _cfg.lm_cfg.hidden_size}
                     )
@@ -1252,7 +1283,7 @@ uint32_t LanguageModel::run_model_once(
                     );
                 }
             }
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            _post_model_map.at(model_key).add_to_queue(&ifm_map, output_overrides);
 
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
@@ -1292,86 +1323,68 @@ uint32_t LanguageModel::run_model_once(
                     1, normal_scale_buf, {normal_input_row, 0}
                 );
             }
-            _linear_model_map.at(linear_model_key).add_to_queue(&ifm_map);
+            _linear_model_map.at(linear_model_key).add_to_queue(
+                &ifm_map, output_overrides
+            );
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
             );
         }
 
+        dflash_layer_input = dflash_capture_buffer;
+
         if (
             _cfg.lm_cfg.is_spec_decode()
             && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+            && !_cfg.lm_cfg.is_dflash()
             && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
         ) {
             const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
-            const auto capture_layers = _cfg.lm_cfg.is_dflash()
-                ? _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids
-                : std::vector<uint8_t>{
-                    2,
-                    static_cast<uint8_t>(num_layers / 2),
-                    static_cast<uint8_t>(num_layers - 3),
-                };
+            const std::vector<uint8_t> capture_layers{
+                2,
+                static_cast<uint8_t>(num_layers / 2),
+                static_cast<uint8_t>(num_layers - 3),
+            };
             const auto it = std::find(
                 capture_layers.begin(), capture_layers.end(), layer_idx
             );
             if (it != capture_layers.end()) {
                 MLAModelWithBuffer::run_queue();
                 const size_t capture_idx = std::distance(capture_layers.begin(), it);
-                if (_cfg.lm_cfg.is_dflash()) {
-                    _capture_dflash_hidden_state(num_tokens, capture_idx);
-                } else {
-                    if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
-                        _eagle3_intermediate_hidden_states.resize(capture_layers.size());
-                    }
-                    auto& buffer = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-                    auto& capture = _eagle3_intermediate_hidden_states[capture_idx];
-                    capture.resize(static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size);
-                    buffer.download(capture.data());
+                if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
+                    _eagle3_intermediate_hidden_states.resize(capture_layers.size());
                 }
+                auto& buffer = get_buffer(fmt::format("n{}_buffer1", num_tokens));
+                auto& capture = _eagle3_intermediate_hidden_states[capture_idx];
+                capture.resize(static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size);
+                buffer.download(capture.data());
             }
         }
     }
 
     // Run all the queued models.
     MLAModelWithBuffer::run_queue();
-    const bool has_dflash_prefix_states = (
-        _cfg.lm_cfg.is_dflash()
-        && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
-        && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
-    );
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        if (
-            _cfg.lm_cfg.layer_types[layer_idx] == "linear_attention"
-            && !has_dflash_prefix_states
-        ) {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
             get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
                 get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
             );
         }
     }
-    if (has_dflash_prefix_states) {
-        _commit_dflash_linear_state(next_token_idx - token_idx);
-    }
-
     // If this run landed exactly on a checkpoint boundary, save the tail.
-    if (
+    const bool save_checkpoint = (
         _capture_state_checkpoints
         && std::binary_search(
             _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), next_token_idx
         )
-    ) {
-        if (has_dflash_prefix_states) {
-            _save_dflash_state_checkpoint(
-                next_token_idx, next_token_idx - token_idx, token_idx < num_input_tokens
-            );
-        } else {
-            // A partial prefill group can land exactly on a checkpoint boundary.
-            _save_state_checkpoint(
-                next_token_idx, num_tokens, next_token_idx - token_idx,
-                token_idx < num_input_tokens
-            );
-        }
+    );
+    if (save_checkpoint) {
+        // A partial prefill group can land exactly on a checkpoint boundary.
+        _save_state_checkpoint(
+            next_token_idx, num_tokens, next_token_idx - token_idx,
+            token_idx < num_input_tokens
+        );
     }
 
     if (logits_ptr) {
@@ -1888,8 +1901,28 @@ void LanguageModel::_define_buffers() {
                     {block_size + linear_cfg.conv_kernel_dim - 2, linear_cfg.get_conv_dim()}
                 );
                 define_buffer(
-                    fmt::format("linear_delta_prefix_states_l{}", i),
-                    {block_size, linear_cfg.get_recurrent_state_size()}
+                    fmt::format("linear_delta_resolver_output_l{}", i),
+                    {1, linear_cfg.get_recurrent_state_size()}
+                );
+                define_buffer(
+                    fmt::format("linear_delta_resolver_key_l{}", i),
+                    {
+                        linear_cfg.num_value_heads,
+                        block_size,
+                        linear_cfg.key_head_dim
+                    }
+                );
+                define_buffer(
+                    fmt::format("linear_delta_resolver_value_l{}", i),
+                    {
+                        linear_cfg.num_value_heads,
+                        block_size,
+                        linear_cfg.value_head_dim
+                    }
+                );
+                define_buffer(
+                    fmt::format("linear_delta_resolver_decay_mask_l{}", i),
+                    {linear_cfg.num_value_heads, block_size, block_size}
                 );
             }
         } else {
@@ -1935,8 +1968,12 @@ void LanguageModel::_define_buffers() {
     }
 
     // Other buffers.
-    std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
-    if (_use_group_token_models) {
+    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+    std::vector<uint16_t> num_tokens_vec{single_num_tokens};
+    if (
+        _use_group_token_models
+        && _cfg.pipeline_cfg.input_token_group_size != single_num_tokens
+    ) {
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         num_tokens_vec.emplace_back(num_tokens);
     }

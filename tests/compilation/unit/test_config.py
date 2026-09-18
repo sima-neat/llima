@@ -371,8 +371,9 @@ def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(
             "precision": {LayerID("single_linear", 0): FileGenPrecision.BF16}
         },
     )
-    assert len(target_models) == 1
+    assert len(target_models) == 2
     assert target_models[0][0].num_tokens == 8
+    assert target_models[1][0].block_size == 8
 
     draft_cfg = _dflash_draft_config()
     draft = LanguageModel(
@@ -397,117 +398,6 @@ def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(
         },
     )
     assert draft_models[0][0].num_tokens == 8
-
-
-def test_dflash_pair_validation_accepts_published_contract():
-    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
-    target_cfg.lm_cfg.num_hidden_layers = 32
-    target_cfg.config_pipeline(None, None, 2048, 128, 128)
-    target = SimpleNamespace(cfg=target_cfg)
-    draft_cfg = _dflash_draft_config()
-    draft_hf_cfg = {
-        "model_type": "qwen3",
-        "num_target_layers": 32,
-        "dflash_config": {"block_size": 16},
-    }
-
-    VisionLanguageModel._validate_dflash_pair(
-        target,
-        draft_cfg,
-        draft_hf_cfg,
-        8,
-        [1, 5, 9, 13, 17, 21, 25, 29],
-        248077,
-    )
-
-
-def test_dflash_pair_validation_accepts_generic_target_taps():
-    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
-    target_cfg.lm_cfg.num_hidden_layers = 32
-    target_cfg.config_pipeline(None, None, 2048, 128, 128)
-    draft_cfg = _dflash_draft_config()
-
-    VisionLanguageModel._validate_dflash_pair(
-        SimpleNamespace(cfg=target_cfg),
-        draft_cfg,
-        {
-            "model_type": "qwen3",
-            "num_target_layers": 32,
-            "dflash_config": {"block_size": 16},
-        },
-        8,
-        [0, 7, 15, 23],
-        248077,
-    )
-
-
-def test_dflash_pair_validation_derives_llama_draft_topology():
-    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
-    target_cfg.lm_cfg.model_type = "llama"
-    target_cfg.lm_cfg.num_hidden_layers = 32
-    target_cfg.lm_cfg.layer_types = ["full_attention"] * 32
-    target_cfg.lm_cfg.linear_attn_cfg = None
-    target_cfg.config_pipeline(None, None, 2048, 128, 128)
-
-    draft_cfg = _dflash_draft_config()
-    draft_cfg.lm_cfg.num_hidden_layers = 5
-    draft_cfg.lm_cfg.layer_types = ["full_attention"] * 5
-    draft_cfg.lm_cfg.attn_cfg.swa_enable = False
-    draft_cfg.lm_cfg.attn_cfg.sliding_window = None
-
-    VisionLanguageModel._validate_dflash_pair(
-        SimpleNamespace(cfg=target_cfg),
-        draft_cfg,
-        {
-            "model_type": "qwen3",
-            "num_target_layers": 32,
-            "block_size": 10,
-        },
-        8,
-        [1, 8, 15, 22, 29],
-        128002,
-    )
-
-
-@pytest.mark.parametrize(
-    ("draft_update", "message"),
-    [
-        ({"group_size": 64}, "language group sizes must match"),
-        ({"max_num_tokens": 1024}, "draft cache must be at least as large"),
-        ({"quantize_embeddings": True}, "embedding quantization modes must match"),
-    ],
-)
-def test_dflash_pair_validation_rejects_incompatible_runtime_contract(
-    draft_update, message
-):
-    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
-    target_cfg.lm_cfg.num_hidden_layers = 32
-    target_cfg.config_pipeline(None, None, 2048, 128, 128)
-    draft_cfg = _dflash_draft_config()
-    if "group_size" in draft_update:
-        draft_cfg.config_pipeline(
-            None, None, 2048, draft_update["group_size"], 128
-        )
-    if "max_num_tokens" in draft_update:
-        draft_cfg.pipeline_cfg.max_num_tokens = draft_update["max_num_tokens"]
-    if "quantize_embeddings" in draft_update:
-        draft_cfg.pipeline_cfg.quantize_embeddings = draft_update[
-            "quantize_embeddings"
-        ]
-
-    with pytest.raises(ValueError, match=message):
-        VisionLanguageModel._validate_dflash_pair(
-            SimpleNamespace(cfg=target_cfg),
-            draft_cfg,
-            {
-                "model_type": "qwen3",
-                "num_target_layers": 32,
-                "dflash_config": {"block_size": 16},
-            },
-            8,
-            [1, 5, 9, 13, 17, 21, 25, 29],
-            248077,
-        )
 
 
 def test_linear_attention_validates_group_size():

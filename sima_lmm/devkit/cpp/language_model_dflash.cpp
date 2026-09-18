@@ -8,8 +8,6 @@
 #include <vector>
 
 #include <fmt/format.h>
-#include <simaai_memory.h>
-
 #include "language_model.hpp"
 
 namespace simaai {
@@ -38,21 +36,6 @@ private:
   std::function<void()> _callback;
 };
 
-void copy_buffer_slice(MLABuffer &destination,
-                       const std::vector<uint32_t> &dst_begin,
-                       MLABuffer &source,
-                       const std::vector<uint32_t> &src_begin,
-                       const std::vector<uint32_t> &shape,
-                       const char *operation) {
-  if (simaai_memcpy_part(destination.get_simaai_memory(),
-                         destination.get_buf_addr_offset(dst_begin),
-                         source.get_simaai_memory(),
-                         source.get_buf_addr_offset(src_begin),
-                         source.get_buf_len(shape)) == nullptr) {
-    throw std::runtime_error(operation);
-  }
-}
-
 } // namespace
 
 struct LanguageModel::DFlashScratch {
@@ -65,14 +48,70 @@ struct LanguageModel::DFlashScratch {
   std::vector<Eigen::bfloat16> linear_valid_mask;
 };
 
-void LanguageModel::_capture_dflash_hidden_state(uint16_t num_tokens,
-                                                  size_t capture_idx) {
-  auto &source = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-  auto &destination = get_buffer(
-      fmt::format("dflash_target_hidden_n{}_{}", num_tokens, capture_idx));
-  copy_buffer_slice(destination, {0, 0}, source, {0, 0},
-                    {num_tokens, _cfg.lm_cfg.hidden_size},
-                    "Failed to retain DFlash target hidden state");
+void LanguageModel::_bind_dflash_linear_conv_state(uint16_t prefix_tokens) {
+  const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
+  if (prefix_tokens > block_size) {
+    throw std::invalid_argument("Invalid DFlash convolution-state prefix length");
+  }
+  if (!_has_linear_attention_layers()) {
+    return;
+  }
+
+  const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
+  for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
+       ++layer_idx) {
+    if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+      continue;
+    }
+    auto &model = _linear_model_map.at(
+        LanguageModelMapKey{block_size, layer_idx, 0});
+    const uint8_t conv_ifm =
+        1 + (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0);
+    if (prefix_tokens == 0) {
+      model._bind_ifm(
+          conv_ifm,
+          &get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
+          {tail_begin, 0});
+    } else {
+      model._bind_ifm(
+          conv_ifm,
+          &get_buffer(fmt::format("linear_conv_prefix_states_l{}", layer_idx)),
+          {static_cast<uint32_t>(prefix_tokens - 1), 0});
+    }
+  }
+}
+
+void LanguageModel::_resolve_dflash_linear_state(uint16_t prefix_tokens) {
+  const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
+  if (prefix_tokens == 0 || prefix_tokens > block_size) {
+    throw std::invalid_argument("Invalid DFlash linear-state prefix length");
+  }
+  if (!_has_linear_attention_layers() ||
+      _dflash_resolved_prefix == prefix_tokens) {
+    return;
+  }
+  if (prefix_tokens == 1) {
+    _dflash_resolved_prefix = prefix_tokens;
+    return;
+  }
+
+  const uint32_t decay_row = prefix_tokens - 1;
+  for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
+       ++layer_idx) {
+    if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+      continue;
+    }
+    auto &model = _dflash_state_resolver_model_map.at(
+        LanguageModelMapKey{block_size, layer_idx, 0});
+    model._bind_ifm(
+        3,
+        &get_buffer(fmt::format("linear_delta_resolver_decay_mask_l{}",
+                                layer_idx)),
+        {0, decay_row, 0});
+    model.add_to_queue();
+  }
+  MLAModelWithBuffer::run_queue();
+  _dflash_resolved_prefix = prefix_tokens;
 }
 
 void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
@@ -83,33 +122,24 @@ void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
   if (!_has_linear_attention_layers()) {
     return;
   }
+  _resolve_dflash_linear_state(prefix_tokens);
 
-  const auto &linear_cfg = _linear_attn_cfg();
-  const uint32_t prefix_index = prefix_tokens - 1;
-  const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
       continue;
     }
 
-    auto &conv_state =
-        get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx));
-    auto &conv_prefix =
-        get_buffer(fmt::format("linear_conv_prefix_states_l{}", layer_idx));
-    copy_buffer_slice(
-        conv_state, {tail_begin, 0}, conv_prefix, {prefix_index, 0},
-        {linear_cfg.conv_kernel_dim - 1, linear_cfg.get_conv_dim()},
-        "Failed to commit DFlash convolution state");
-
     auto &delta_state =
         get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx));
-    auto &delta_prefix =
-        get_buffer(fmt::format("linear_delta_prefix_states_l{}", layer_idx));
-    copy_buffer_slice(delta_state, {0, 0}, delta_prefix, {prefix_index, 0},
-                      {1, linear_cfg.get_recurrent_state_size()},
-                      "Failed to commit DFlash recurrent state");
+    const auto delta_source_name =
+        prefix_tokens == 1
+            ? fmt::format("linear_delta_state_history_alt_l{}", layer_idx)
+            : fmt::format("linear_delta_resolver_output_l{}", layer_idx);
+    auto &delta_source = get_buffer(delta_source_name);
+    delta_state.swap_storage(delta_source);
   }
+  _bind_dflash_linear_conv_state(prefix_tokens);
 }
 
 void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
@@ -128,13 +158,19 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
   if (!checkpoint_slot.has_value()) {
     return;
   }
+  _resolve_dflash_linear_state(prefix_tokens);
   const uint32_t prefix_index = prefix_tokens - 1;
   for (auto &state : _cached_states) {
-    const char *source_prefix;
+    std::string source_prefix;
+    std::vector<uint32_t> source_begin;
     if (state.buffer_name_prefix == "linear_conv_cache_history_l") {
       source_prefix = "linear_conv_prefix_states_l";
+      source_begin = {prefix_index, 0};
     } else if (state.buffer_name_prefix == "linear_delta_state_history_l") {
-      source_prefix = "linear_delta_prefix_states_l";
+      source_prefix = prefix_tokens == 1
+                          ? "linear_delta_state_history_alt_l"
+                          : "linear_delta_resolver_output_l";
+      source_begin = {0, 0};
     } else {
       throw std::runtime_error(
           "Unsupported state family in DFlash checkpoint capture");
@@ -144,8 +180,7 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
          ++layer_slot) {
       const auto layer_idx = state.layer_indices[layer_slot];
       auto &source = get_buffer(fmt::format("{}{}", source_prefix, layer_idx));
-      const size_t source_offset = source.get_buf_addr_offset(
-          std::vector<uint32_t>{prefix_index, 0});
+      const size_t source_offset = source.get_buf_addr_offset(source_begin);
       source.invalidate_cache(source_offset, state.tail_bytes);
       auto *source_ptr = reinterpret_cast<const uint8_t *>(
           source.get_virtual_addr());
@@ -457,6 +492,7 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
     throw std::invalid_argument(
         "DFlash verification input must match the block size");
   }
+  _dflash_resolved_prefix = 0;
   const bool quantized_embeddings = _cfg.pipeline_cfg.quantize_embeddings;
   auto &input =
       quantized_embeddings
@@ -468,7 +504,8 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
                 fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
           : nullptr;
   _stage_embedding_rows(*this, input_ids, input, input_scale);
-  if (_has_linear_attention_layers()) {
+  if (_has_linear_attention_layers() &&
+      num_tokens == _cfg.pipeline_cfg.input_token_group_size) {
     auto &valid = scratch.linear_valid_mask;
     valid.assign(num_tokens, Eigen::bfloat16{1.0f});
     get_buffer("linear_valid_mask")
@@ -522,12 +559,6 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
                                                   output_overrides);
     } else if (layer_type == "linear_attention") {
       auto &model = _linear_model_map.at(model_key);
-      if (quantized_embeddings && layer_idx == 0) {
-        model._bind_ifm(1, input_scale, {0, 0});
-      }
-      model.add_to_queue(input_overrides, output_overrides);
-    } else if (layer_type == "conv") {
-      auto &model = _conv_model_map.at(model_key);
       if (quantized_embeddings && layer_idx == 0) {
         model._bind_ifm(1, input_scale, {0, 0});
       }
@@ -631,6 +662,10 @@ LanguageModel::_run_model_dflash_speculative_decoding(
       input_token_ids.size() > _cfg.pipeline_cfg.max_num_tokens) {
     return std::nullopt;
   }
+
+  // A prior DFlash request may leave the verification model bound to its
+  // accepted scratch tail. Prefill restores or clears the persistent state.
+  _bind_dflash_linear_conv_state(0);
 
   if (!_cached_states.empty()) {
     _capture_state_checkpoints = true;
