@@ -7,7 +7,7 @@ from pathlib import Path
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
     ModelFormat, SPECULATIVE_BUDGET, SpeculativeDecodingMethod, VisionArchType,
-    VlmConfig, model_file_type,
+    VlmArchType, VlmConfig, model_file_type,
 )
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
@@ -130,6 +130,8 @@ class VisionLanguageModel(BaseModel):
 
         if target_model is not None:
             if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:
+                if target_model.cfg.model_type != VlmArchType.VLM_GEMMA4:
+                    raise ValueError("gemma4_mtp speculative decoding requires a Gemma4 target model")
                 if not vlm_cfg.lm_cfg.is_gemma4_assistant:
                     raise ValueError(
                         "gemma4_mtp speculative decoding requires a gemma4_assistant draft model"

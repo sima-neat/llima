@@ -82,8 +82,7 @@ std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
     std::span<const uint32_t> target_next_token_ids
 ) {
     if (
-        draft_token_ids.empty()
-        || target_next_token_ids.empty()
+        target_next_token_ids.empty()
         || target_next_token_ids.size() > draft_token_ids.size() + 1
     ) {
         throw std::runtime_error(

@@ -510,9 +510,10 @@ class BaseModel(ABC):
             not (resume and embeddings_file_name.is_file())
             or write_embedding_scales
         )
-        # Keep runtime metadata in sync with the current compile flags even when
-        # large binary artifacts are reused by --resume.
-        write_cfg = True
+        write_cfg = (
+            not (resume and cfg_json_file_name.is_file())
+            or (write_embeddings and self.cfg.pipeline_cfg.quantize_embeddings)
+        )
         if write_embeddings or write_embedding_scales:
             embeddings, embeddings_scale = self.get_language_embeddings_tensor()
 
