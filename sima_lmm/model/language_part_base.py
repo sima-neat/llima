@@ -59,10 +59,16 @@ class LanguagePartBaseModel(BaseModel):
             de_interleave = self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
             lora_ranks = {}
             if self.cfg.lm_cfg.lora_cfg is not None:
-                lora_ranks = {
-                    name: self.cfg.lm_cfg.get_lora_rank(base_name, name)
-                    for name in ("gate_proj", "up_proj", "down_proj")
+                bundled = {
+                    "gate_proj": "experts.gate_up_proj",
+                    "up_proj": "experts.gate_up_proj",
+                    "down_proj": "experts.down_proj",
                 }
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    rank = self.cfg.lm_cfg.get_lora_rank(base_name, name)
+                    if rank is None and expert_idx >= 0:
+                        rank = self.cfg.lm_cfg.get_lora_rank(base_name, bundled[name])
+                    lora_ranks[name] = rank
             gate = self._onnx_builder.build_conv_from_dense_with_lora(
                 f"{base_name}.gate_proj", input_nodes[0], lora_ranks.get("gate_proj"),
                 expert_idx=expert_idx, de_interleave=de_interleave,
@@ -215,12 +221,26 @@ class LanguagePartBaseModel(BaseModel):
             self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx),
             swiglu_limit,
         )
+        if merged_lora and expert_idx >= 0 and not self.check_hf_param(
+            f"{base_name}.gate_proj.weight"
+        ):
+            raise NotImplementedError(
+                "LORA_MERGED is not supported for bundled MoE experts: the merged "
+                "weight would relocate under the batched gate_up_proj name that every "
+                "expert shares. Use LORA_BRANCH."
+            )
         lora_ranks = {}
         if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_ranks = {
-                name: self.cfg.lm_cfg.get_lora_rank(base_name, name)
-                for name in ("gate_proj", "up_proj", "down_proj")
+            bundled = {
+                "gate_proj": "experts.gate_up_proj",
+                "up_proj": "experts.gate_up_proj",
+                "down_proj": "experts.down_proj",
             }
+            for name in ("gate_proj", "up_proj", "down_proj"):
+                rank = self.cfg.lm_cfg.get_lora_rank(base_name, name)
+                if rank is None and expert_idx >= 0:
+                    rank = self.cfg.lm_cfg.get_lora_rank(base_name, bundled[name])
+                lora_ranks[name] = rank
         gate = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.gate_proj",
             ifm, lora_ranks.get("gate_proj"), merged_lora=merged_lora,
