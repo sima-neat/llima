@@ -70,10 +70,11 @@ void LanguageModel::_define_attn_models_iter(
     }
 
     // Draft pre takes an extra IFM (buffer1a) for the FC fusion output / target hidden state.
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
     const bool pre_uses_embedding_scale = (
-        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
+        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 && !is_gemma4_mtp_draft
     );
     const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_draft;
 
@@ -83,7 +84,7 @@ void LanguageModel::_define_attn_models_iter(
         pre_ifms.emplace_back(
             MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
         );
-        if (is_draft) {
+        if (is_eagle3_draft) {
             pre_ifms.emplace_back(
                 MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1a", num_tokens))}
             );
@@ -95,7 +96,7 @@ void LanguageModel::_define_attn_models_iter(
                 MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
             );
         }
-        if (is_draft) {
+        if (is_eagle3_draft) {
             pre_ifms.emplace_back(MLABufferSlice{});
         }
     }
@@ -225,19 +226,23 @@ void LanguageModel::_define_attn_models_iter(
                 _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
             }
         },
-        MLABufferSlice{
-            &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
-            cache_kv_cache_offset,
-            cache_kv_cache_shape
-        },
+        is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
+            ? MLABufferSlice{}
+            : MLABufferSlice{
+                &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
+                cache_kv_cache_offset,
+                cache_kv_cache_shape
+            },
     };
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
         cache_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
-                {0, cache_token_idx_begin, 0},
-                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
-            }
+            is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
+                ? MLABufferSlice{}
+                : MLABufferSlice{
+                    &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
+                    {0, cache_token_idx_begin, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                }
         );
     }
 
@@ -279,19 +284,23 @@ void LanguageModel::_define_attn_models_iter(
         }
     }
     cache_ifms.emplace_back(
-        MLABufferSlice{
-            &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
-            cache_kv_cache_offset,
-            cache_kv_cache_shape
-        }
+        is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
+            ? MLABufferSlice{}
+            : MLABufferSlice{
+                &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
+                cache_kv_cache_offset,
+                cache_kv_cache_shape
+            }
     );
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
         cache_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
-                {0, cache_token_idx_begin, 0},
-                {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
-            }
+            is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
+                ? MLABufferSlice{}
+                : MLABufferSlice{
+                    &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
+                    {0, cache_token_idx_begin, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                }
         );
     }
     std::vector<MLABufferSlice> cache_ofms{
@@ -315,7 +324,7 @@ void LanguageModel::_define_attn_models_iter(
     // embedding input as pre and therefore also needs its per-row scale.
     const size_t pre_hidden_state_idx = 1 + static_cast<size_t>(pre_uses_embedding_scale);
     std::vector<MLABufferSlice> post_ifms{
-        is_draft ? pre_ifms[pre_hidden_state_idx] : pre_ifms[0]
+        is_eagle3_draft ? pre_ifms[pre_hidden_state_idx] : pre_ifms[0]
     };
     if (post_uses_embedding_scale) {
         post_ifms.emplace_back(
@@ -324,9 +333,14 @@ void LanguageModel::_define_attn_models_iter(
     }
     const size_t post_self_attn_idx = post_ifms.size();
     post_ifms.emplace_back(cache_ofms[0]);
+    const bool is_group_model = (
+        _use_group_token_models
+        && num_tokens == _cfg.pipeline_cfg.input_token_group_size
+    );
     const bool use_single_post_for_target_group = (
         _cfg.lm_cfg.is_spec_decode()
         && !is_draft
+        && is_group_model
         && num_tokens != single_num_tokens
         && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
     );
@@ -423,6 +437,24 @@ void LanguageModel::_define_attn_models_iter(
                     );
                 }
             }
+        }
+
+        if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+            post_ofms.emplace_back(
+                MLABufferSlice{
+                    &get_buffer(fmt::format(
+                        "n{}_gemma4_mtp_centroid_logits", post_num_tokens
+                    ))
+                }
+            );
+        }
+
+        if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+            post_ofms.emplace_back(
+                MLABufferSlice{
+                    &get_buffer(fmt::format("n{}_target_hidden_states", post_num_tokens))
+                }
+            );
         }
 
         // Draft post produces an additional output: hidden states for next iteration.
@@ -593,7 +625,11 @@ void LanguageModel::_define_models() {
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     std::vector<uint16_t> num_tokens_vec = {single_num_tokens};
     if (_use_group_token_models) {
-        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+        const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
+        if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), group_num_tokens)
+            == num_tokens_vec.end()) {
+            num_tokens_vec.emplace_back(group_num_tokens);
+        }
     }
     for (const auto& num_tokens: num_tokens_vec) {
         const auto& max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
@@ -630,9 +666,7 @@ void LanguageModel::_define_models() {
     _define_per_layer_models();
 
     // Draft-only: FC fusion models.
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-    if (is_draft) {
+    if (_cfg.lm_cfg.is_eagle3_draft()) {
         _define_draft_fc_models();
     }
 }
@@ -666,9 +700,17 @@ void LanguageModel::_define_per_layer_models() {
     if (!_uses_per_layer_inputs())
         return;
 
-    std::vector<uint16_t> num_tokens_vec = {_cfg.lm_cfg.get_single_num_tokens()};
-    if (_use_group_token_models)
-        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+    const auto speculative_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+    std::vector<uint16_t> num_tokens_vec = {
+        _cfg.lm_cfg.is_gemma4_mtp_target() ? speculative_num_tokens : uint16_t{1}
+    };
+    if (_use_group_token_models) {
+        const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
+        if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), group_num_tokens)
+            == num_tokens_vec.end()) {
+            num_tokens_vec.emplace_back(group_num_tokens);
+        }
+    }
 
     for (auto num_tokens : num_tokens_vec) {
         LanguageModelMapKey key{num_tokens, 0, 0};

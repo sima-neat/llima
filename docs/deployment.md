@@ -74,7 +74,8 @@ modalix:~$ llima run <model_name>
 ## Speculative decoding models
 
 When `llima-compile` is given `--draft_model_path`, its output contains target and
-draft compiler outputs under one parent. Deploy the parent in one command:
+draft compiler outputs under one parent for EAGLE3 and Gemma4 MTP. Deploy the
+parent in one command:
 
 ``` console
 llima-deploy compiled-eagle3 spec-decoding-output

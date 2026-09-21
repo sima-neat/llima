@@ -3,19 +3,24 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from sima_lmm.config.vlm_config import (
     ModelFormat,
     PipelineConfig,
+    SPECULATIVE_BUDGET,
+    SpeculativeDecodingMethod,
     VlmArchType,
     VlmConfig,
     group_cache_model_indices,
     single_cache_model_indices,
 )
 from sima_lmm.config.whisper_config import WhisperConfig
-from sima_lmm.model import VisionLanguageModel
-from sima_lmm.model import vision_language_model
+from sima_lmm.host.configuration_helper import _encode_layer_id
+from sima_lmm.model import VisionLanguageModel, vision_language_model
+from sima_lmm.model.base import validate_gemma4_token_ordering
+from sima_lmm.model.language_model import LanguageModel
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -194,6 +199,65 @@ def test_speculative_decoding_rejects_sliding_attention():
         match="EAGLE3 speculative decoding does not support sliding-window attention",
     ):
         config.lm_cfg.set_speculative_decoding_config({})
+
+
+def test_gemma4_mtp_target_compiles_batched_decode_models_only():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": SpeculativeDecodingMethod.GEMMA4_MTP,
+            "is_draft": False,
+            "speculative_budget": SPECULATIVE_BUDGET["gemma4_mtp_target"],
+        }
+    )
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 7
+    assert not any(layer.part.startswith("point_") for layer in config.get_layer_ids())
+    assert _layer_indices(config, "single_per_layer") == [0]
+    for layer_id in config.get_layer_ids():
+        _encode_layer_id(layer_id)
+
+
+def test_gemma4_mtp_draft_uses_pointwise_execution_width():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": SpeculativeDecodingMethod.GEMMA4_MTP,
+            "is_draft": True,
+            "speculative_budget": SPECULATIVE_BUDGET["gemma4_mtp_draft"],
+        }
+    )
+    model = object.__new__(LanguageModel)
+    model.cfg = config
+
+    assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 6
+    assert model._single_model_num_tokens == 1
+
+
+def test_gemma4_ordered_embedding_metadata_and_token_ordering():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_gemma4_assistant_config(
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": config.lm_cfg.hidden_size,
+            "use_ordered_embeddings": True,
+            "num_centroids": 2048,
+            "centroid_intermediate_top_k": 32,
+        }
+    )
+
+    assert config.lm_cfg.assistant_masked_lm_head_enabled
+    assert config.lm_cfg.assistant_num_centroids == 2048
+    assert config.lm_cfg.assistant_centroid_intermediate_top_k == 32
+
+    ordering = np.arange(config.lm_cfg.token_cfg.vocab_size, dtype=np.int32)
+    validated = validate_gemma4_token_ordering(ordering, ordering.size)
+    assert validated.dtype == np.int64
+    with pytest.raises(ValueError, match="permutation"):
+        validate_gemma4_token_ordering(
+            np.zeros(ordering.size, dtype=np.int64), ordering.size
+        )
 
 
 def test_speculative_decoding_rejects_linear_attention():
