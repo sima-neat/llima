@@ -45,6 +45,8 @@ modalix:~$ llima run <model> [options]
 
 Щоб переглянути всі доступні варіанти, виконайте команду `llima run -h`.
 
+Щоб вимкнути автоматичне вивантаження вбудовувань і залишити таблиці в DRAM, виконайте `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
+
 **Приклади**
 
 ``` console
