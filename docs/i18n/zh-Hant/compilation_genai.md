@@ -91,8 +91,8 @@ output_directory/
 | `--resume` | 透過略過現有檔案來恢復中斷的建置程序。 |
 | `-j, --jobs` | 並行編譯作業的數量。預設值：實體 CPU 核心的數量。 |
 | `--log_level` | 日誌記錄層級（DEBUG、INFO、WARNING、ERROR）。預設值：WARNING。 |
-| `--input_height` | 輸入圖片的高度，以像素為單位。必須與 `--input_width` 一起提供。對於 Qwen 2 VL、Qwen 3 VL 和 Gemma 4 而言，這是必需的；對於覆寫 SigLIP2 模型已設定的大小而言，則是可選的。 |
-| `--input_width` | 輸入圖片的寬度，單位為像素。必須與 `--input_height` 一起提供。對於 Qwen 2 VL、Qwen 3 VL 和 Gemma 4 而言，這是必需的；對於覆寫 SigLIP2 模型已設定的大小而言，則是可選的。 |
+| `--input_height` | 輸入圖片的高度，以像素為單位。必須與 `--input_width` 一起提供。對於 Qwen 2 VL、Qwen 3 VL、Qwen3.5 和 Gemma 4 而言，這是必需的；對於覆寫 SigLIP2 模型已設定的大小而言，則是可選的。 |
+| `--input_width` | 輸入圖片的寬度，單位為像素。必須與 `--input_height` 一起提供。對於 Qwen 2 VL、Qwen 3 VL、Qwen3.5 和 Gemma 4 而言，這是必需的；對於覆寫 SigLIP2 模型已設定的大小而言，則是可選的。 |
 | `--system_prompt` | 系統提示，用於儲存以供 CLI 模式使用，以及用於模型預熱。 |
 | `--system_prompt_file` | 指向包含系統提示的文字檔案的路徑。 |
 | `--chat_template` | 聊天範本字串，用於儲存在編譯後的模型中。與「系統提示」和「聊天範本檔案」選項為互斥關係。 |

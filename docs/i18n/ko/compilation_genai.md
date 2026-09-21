@@ -90,8 +90,8 @@ output_directory/
 | `--resume` | 기존 파일을 건너뛰어 빌드를 재개하여 중단된 빌드를 이어갑니다. |
 | `-j, --jobs` | 동시에 실행되는 컴파일 작업의 수입니다. 기본값: 실제 CPU 코어의 수입니다. |
 | `--log_level` | 로그 기록 수준(DEBUG, INFO, WARNING, ERROR). 기본값: WARNING. |
-| `--input_height` | 픽셀 단위의 입력 이미지 높이입니다. `--input_width`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
-| `--input_width` | 픽셀 단위의 입력 이미지 너비입니다. `--input_height`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
+| `--input_height` | 픽셀 단위의 입력 이미지 높이입니다. `--input_width`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Qwen3.5, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
+| `--input_width` | 픽셀 단위의 입력 이미지 너비입니다. `--input_height`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Qwen3.5, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
 | `--system_prompt` | CLI 모드와 모델 초기화를 위해 저장할 시스템 프롬프트입니다. |
 | `--system_prompt_file` | 시스템 프롬프트를 포함하는 텍스트 파일의 경로입니다. |
 | `--chat_template` | 컴파일된 모델에 저장할 채팅 템플릿 문자열입니다. 시스템 프롬프트 및 채팅 템플릿 파일 옵션과 상호 배타적입니다. |
