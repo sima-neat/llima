@@ -2678,6 +2678,7 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         std::string model_type;
         uint16_t num_tokens;
         uint8_t layer_idx;
+        uint16_t expert_idx;
         auto operator<=>(const RelocMapType&) const = default;
     };
     using RelocMap = std::map<std::string, uint64_t>;
@@ -2700,14 +2701,19 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
             continue;
 
         // Extract the num_tokens and layer_idx from the file name.
-        std::regex pattern(R"(_n(\d+)_(pre|post)_layer(\d+)_)");
+        std::regex pattern(R"(_n(\d+)_(pre|post|router)_layer(\d+)(?:_expert(\d+))?_)");
         std::smatch match;
         RelocMapType model_key;
         if (std::regex_search(file_name_str, match, pattern)) {
             uint16_t num_tokens = std::stoi(match[1].str());
             std::string model_type = match[2].str();
             uint8_t layer_idx = std::stoi(match[3].str());
-            model_key = {model_type, num_tokens, layer_idx};
+            uint16_t expert_idx = 0;
+            if (match[4].matched) {
+                model_type = "expert";
+                expert_idx = std::stoi(match[4].str());
+            }
+            model_key = {model_type, num_tokens, layer_idx, expert_idx};
         } else {
             auto msg = fmt::format("Invalid file name for relocation: {}", file_name);
             throw std::runtime_error(msg);
@@ -2738,13 +2744,19 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
     // Relocation the dma descriptors
     for (const auto& [reloc_map_type, reloc_addr_map]: reloc_addr_maps) {
         // For each pre/post model, we only need to relocate the unique model once.
-        LanguageModelMapKey model_key{reloc_map_type.num_tokens, reloc_map_type.layer_idx, 0};
+        LanguageModelMapKey model_key{
+            reloc_map_type.num_tokens, reloc_map_type.layer_idx, reloc_map_type.expert_idx
+        };
 
         MLAModelWithBuffer* model_ptr;
         if (reloc_map_type.model_type == "pre") {
             model_ptr = &_pre_model_map.at(model_key);
         } else if (reloc_map_type.model_type == "post") {
             model_ptr = &_post_model_map.at(model_key);
+        } else if (reloc_map_type.model_type == "router") {
+            model_ptr = &_router_model_map.at(model_key);
+        } else if (reloc_map_type.model_type == "expert") {
+            model_ptr = &_expert_model_map.at(model_key);
         } else {
             auto msg = fmt::format(
                 "Relocate data for {} is not supported", reloc_map_type.model_type
