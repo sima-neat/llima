@@ -209,7 +209,12 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
             continue;
         }
 
-        const size_t retained = partial_marker_size(_end_marker);
+        size_t retained = partial_marker_size(_end_marker);
+        if (_channel_headers) {
+            // The role name reaches us before the header it belongs to, so hold it
+            // back until the next chunk shows whether a header follows.
+            retained = std::max(retained, gptoss_role_suffix_size(_pending));
+        }
         if (_mode == Mode::Reasoning) {
             emit(
                 events,
