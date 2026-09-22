@@ -39,6 +39,8 @@ void assert_no_markers(const ParsedText& parsed) {
     assert(combined.find("</think>") == std::string::npos);
     assert(combined.find("<|channel>") == std::string::npos);
     assert(combined.find("<channel|>") == std::string::npos);
+    assert(combined.find("<|channel|>") == std::string::npos);
+    assert(combined.find("<|message|>") == std::string::npos);
 }
 
 void test_model_mapping() {
@@ -102,6 +104,78 @@ void test_gemma_generated_and_prompt_opened_boundaries() {
     assert_no_markers(continued);
 }
 
+// gpt-oss tags every message with a channel header. Reasoning ends at any header,
+// and the role name that precedes it must not reach the output.
+void test_gptoss_analysis_to_final() {
+    ReasoningStreamParser parser(ReasoningFormat::GptOss, true);
+    ParsedText parsed;
+    append_events(parsed, parser.add("<|channel|>analysis<|message|>Need answer."));
+    // The role arrives before the header it belongs to, in its own chunk.
+    append_events(parsed, parser.add("assistant"));
+    append_events(parsed, parser.add("<|channel|>final<|message|>Paris.", true));
+
+    assert(parsed.reasoning == "Need answer.");
+    assert(parsed.content == "Paris.");
+    assert_no_markers(parsed);
+}
+
+void test_gptoss_commentary_is_hidden_but_final_survives() {
+    ReasoningStreamParser parser(ReasoningFormat::GptOss, true);
+    ParsedText parsed;
+    append_events(parsed, parser.add("<|channel|>analysis<|message|>thinking."));
+    append_events(parsed, parser.add("<|channel|>commentary<|message|>aside."));
+    append_events(parsed, parser.add("<|channel|>final<|message|>answer.", true));
+
+    // A plain commentary message is the model talking to itself.
+    assert(parsed.reasoning == "thinking.aside.");
+    assert(parsed.content == "answer.");
+    assert_no_markers(parsed);
+}
+
+void test_gptoss_tool_call_commentary_is_shown() {
+    ReasoningStreamParser parser(ReasoningFormat::GptOss, true);
+    ParsedText parsed;
+    append_events(parsed, parser.add("<|channel|>analysis<|message|>pick a tool."));
+    append_events(
+        parsed,
+        parser.add("<|channel|>commentary to=functions.get json<|message|>{\"a\":1}", true)
+    );
+
+    assert(parsed.reasoning == "pick a tool.");
+    assert(parsed.content == "{\"a\":1}");
+    assert_no_markers(parsed);
+}
+
+void test_gptoss_hidden_reasoning_still_yields_final() {
+    ReasoningStreamParser parser(ReasoningFormat::GptOss, false);
+    ParsedText parsed;
+    append_events(parsed, parser.add("<|channel|>analysis<|message|>thinking."));
+    append_events(parsed, parser.add("<|channel|>commentary<|message|>aside."));
+    append_events(parsed, parser.add("<|cha"));
+    append_events(parsed, parser.add("nnel|>final<|mess"));
+    append_events(parsed, parser.add("age|>answer.", true));
+
+    assert(parsed.reasoning.empty());
+    assert(parsed.content == "answer.");
+    assert_no_markers(parsed);
+}
+
+// A response that ends on commentary never reaches a final channel, so the answer
+// has to come out of the commentary message or it is lost.
+void test_gptoss_tool_call_commentary_without_final() {
+    ReasoningStreamParser parser(ReasoningFormat::GptOss, false);
+    ParsedText parsed;
+    append_events(parsed, parser.add("<|channel|>analysis<|message|>pick a tool."));
+    append_events(
+        parsed,
+        parser.add("<|channel|>commentary to=functions.get json<|message|>{\"a\":1}", true)
+    );
+
+    assert(parsed.reasoning.empty());
+    assert(parsed.content == "{\"a\":1}");
+    assert_no_markers(parsed);
+}
+
 void test_disabled_and_unsupported_pass_through() {
     for (auto parser : {
              ReasoningStreamParser(ReasoningFormat::Qwen, false),
@@ -122,6 +196,11 @@ int main() {
     test_qwen_generated_open_and_split_close();
     test_qwen_prompt_opened_and_truncated();
     test_gemma_generated_and_prompt_opened_boundaries();
+    test_gptoss_analysis_to_final();
+    test_gptoss_commentary_is_hidden_but_final_survives();
+    test_gptoss_tool_call_commentary_is_shown();
+    test_gptoss_hidden_reasoning_still_yields_final();
+    test_gptoss_tool_call_commentary_without_final();
     test_disabled_and_unsupported_pass_through();
     std::cout << "reasoning parser tests passed\n";
     return 0;
