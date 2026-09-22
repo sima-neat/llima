@@ -96,6 +96,8 @@ python scripts/gen_models--openai--whisper.py \
 
 `--part`는 `all`, `encoder`, `language_detect`, `init`, `single_pre`, `single_post` 및 `single_cache`를 허용합니다. 로그 프로브가 활성화된 디코더 출력을 컴파일하려면 `--enable_log_probe`를 추가합니다. 완전한 로그 프로브 빌드를 위해서는 `--part all --enable_log_probe`를 사용합니다.
 
+Whisper 모델 리포지토리에는 인코더 계층마다 하나의 ELF가 포함됩니다. 런타임은 인코더 ELF가 하나로 통합된 기존 리포지토리를 지원하지 않습니다. 계층화된 모델을 다운로드하거나 현재 LLiMa 버전으로 체크포인트를 다시 컴파일하십시오.
+
 컴파일러 변경 사항은 일반적으로 `sima_lmm/config/whisper_config.py`, `sima_lmm/model/whisper_*.py` 및 스크립트에 영향을 미치고, 런타임 변경 사항은 `sima_lmm/devkit/cpp/whisper_*`에 영향을 미칩니다. `tests/README.md`에 설명된 패키지된 C++ ASR 런타임 테스트와 Modalix의 대표 오디오를 사용하여 유효성을 검사합니다. 이것은 일반적인 ASR 아키텍처 프레임워크가 아닌 Whisper에 특정한 경로입니다.
 
 ## 테스트

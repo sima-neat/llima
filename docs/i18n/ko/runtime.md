@@ -45,6 +45,8 @@ modalix:~$ llima run <model> [options]
 
 사용 가능한 모든 옵션에 대해 `llima run -h`를 실행합니다.
 
+자동 임베딩 오프로드를 비활성화하고 테이블을 DRAM에 유지하려면 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`을 실행합니다.
+
 **예시**
 
 ``` console

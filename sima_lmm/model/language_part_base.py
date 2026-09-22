@@ -241,16 +241,28 @@ class LanguagePartBaseModel(BaseModel):
                 if rank is None and expert_idx >= 0:
                     rank = self.cfg.lm_cfg.get_lora_rank(base_name, bundled[name])
                 lora_ranks[name] = rank
+        # A branch-mode adapter is added after the convolution, so the clamp cannot be
+        # folded into it: the ONNX path clips the combined projection, not the base one.
+        gate_rank = lora_ranks.get("gate_proj")
+        branch_gate = bool(gate_rank) and not merged_lora
         gate = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.gate_proj",
-            ifm, lora_ranks.get("gate_proj"), merged_lora=merged_lora,
-            expert_idx=expert_idx, de_interleave=de_interleave, activation=gate_clip,
+            ifm, gate_rank, merged_lora=merged_lora,
+            expert_idx=expert_idx, de_interleave=de_interleave,
+            activation=None if branch_gate else gate_clip,
         )
+        if branch_gate:
+            gate = builder.create_clip_node(gate, gate_clip.a_min, gate_clip.a_max)
+        up_rank = lora_ranks.get("up_proj")
+        branch_up = bool(up_rank) and not merged_lora
         up = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.up_proj",
-            ifm, lora_ranks.get("up_proj"), merged_lora=merged_lora,
-            expert_idx=expert_idx, de_interleave=de_interleave, activation=up_clip,
+            ifm, up_rank, merged_lora=merged_lora,
+            expert_idx=expert_idx, de_interleave=de_interleave,
+            activation=None if branch_up else up_clip,
         )
+        if branch_up:
+            up = builder.create_clip_node(up, up_clip.a_min, up_clip.a_max)
         act = build_swiglu(builder, gate, up)
         down_proj = build_conv_from_dense_with_lora(
             builder, self.get_hf_param, self.check_hf_param, f"{base_name}.down_proj",

@@ -96,6 +96,8 @@ python scripts/gen_models--openai--whisper.py \
 
 `--part` は、`all`、`encoder`、`language_detect`、`init`、`single_pre`、`single_post`、および `single_cache` を受け入れます。ログプローブを有効にしたデコーダーの出力をコンパイルするには、`--enable_log_probe` を追加します。完全なログプローブビルドを行うには、`--part all --enable_log_probe` を使用します。
 
+Whisper モデルリポジトリには、エンコーダーのレイヤーごとに 1 つの ELF が含まれます。ランタイムは、エンコーダー ELF が単一にまとめられた従来のリポジトリをサポートしていません。レイヤー化されたモデルをダウンロードするか、現在の LLiMa バージョンでチェックポイントを再コンパイルしてください。
+
 コンパイラの変更は通常、`sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py`、およびスクリプトに影響します。ランタイムの変更は、`sima_lmm/devkit/cpp/whisper_*` に影響します。`tests/README.md` に記載されているパッケージ化された C++ ASR ランタイムテストと、Modalix の代表的なオーディオを使用して検証します。これは、一般的な ASR アーキテクチャフレームワークではなく、Whisper に固有のパスです。
 
 ## テスト

@@ -367,10 +367,13 @@ class OnnxBuilder:
             a_shape = (lora_rank, input_channels)
             b_shape = (output_channels, lora_rank)
 
-            # MoE experts share one base_name, so qualify the branch with the expert
-            # index to keep each expert's relocatable LoRA tensors distinct.
+            # Bundled experts share one base_name; a separated checkpoint already
+            # names the expert, and its adapter uses that name.
             expert_idx = kwargs.get("expert_idx", -1)
-            lora_name = base_name if expert_idx < 0 else f"{base_name}.expert.{expert_idx}"
+            bundled_expert = (
+                expert_idx >= 0 and not self.check_param_func(f"{base_name}.weight")
+            )
+            lora_name = f"{base_name}.expert.{expert_idx}" if bundled_expert else base_name
             lora_a = self._build_conv_lora(
                 f"{lora_name}.lora_A", input_node, a_shape
             )
