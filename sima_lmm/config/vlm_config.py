@@ -909,6 +909,9 @@ class LanguageModelConfig(BaseConfig):
         return bundle_name in self.lora_cfg.target_modules
 
     def get_lora_rank(self, base_name: str, module_name: str) -> int | None:
+        # A MoE expert's base name carries the expert index, which is not a layer
+        # index. Drop it so only the transformer layer index remains.
+        base_name = re.sub(r"\.experts\.\d+$", "", base_name)
         lora_rank = self.lora_cfg.r if self.is_lora_target_module(base_name, module_name) else None
         return lora_rank
 
