@@ -62,6 +62,8 @@ class ReasoningStreamParser {
         std::string_view _end_marker;
         Mode _mode = Mode::Content;
         bool _optional_start = false;
+        // gpt-oss ends a message at any channel header, not one fixed marker.
+        bool _channel_headers = false;
         std::string _pending;
         bool _pending_from_draft = false;
 };

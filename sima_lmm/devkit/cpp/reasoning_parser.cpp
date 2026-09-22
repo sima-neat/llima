@@ -12,7 +12,18 @@ constexpr std::string_view think_close = "</think>";
 constexpr std::string_view gemma_reasoning_open = "<|channel>thought\n";
 constexpr std::string_view gemma_reasoning_close = "<channel|>";
 constexpr std::string_view gptoss_reasoning_open = "<|channel|>analysis<|message|>";
-constexpr std::string_view gptoss_reasoning_close = "<|channel|>final<|message|>";
+constexpr std::string_view gptoss_channel = "<|channel|>";
+constexpr std::string_view gptoss_message = "<|message|>";
+
+// Content of a gpt-oss channel is shown when the channel is "final", or when it is
+// a commentary message carrying a tool call. A plain commentary message is the
+// model talking to itself, so it stays hidden like analysis.
+bool gptoss_channel_is_visible(std::string_view header) {
+    if (header.find("final") != std::string_view::npos) return true;
+    if (header.find("commentary") == std::string_view::npos) return false;
+    return header.find("to=") != std::string_view::npos
+        || header.find("json") != std::string_view::npos;
+}
 
 } // namespace
 
@@ -61,7 +72,8 @@ ReasoningStreamParser::ReasoningStreamParser(
         // Harmony always emits channels; analysis = reasoning, final = answer.
         // Parse even when thinking is off so only the final channel shows.
         _start_marker = gptoss_reasoning_open;
-        _end_marker = gptoss_reasoning_close;
+        _end_marker = gptoss_channel;
+        _channel_headers = true;
         _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
     } else if (!enabled || format == ReasoningFormat::None) {
         _mode = Mode::Content;
@@ -140,6 +152,33 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
         }
 
         const auto close_pos = _pending.find(_end_marker);
+        if (close_pos != std::string::npos && _channel_headers) {
+            // The header runs to the message marker; wait for the rest of it.
+            const auto header_pos = close_pos + _end_marker.size();
+            const auto message_pos = _pending.find(gptoss_message, header_pos);
+            if (message_pos == std::string::npos) {
+                if (_mode == Mode::Reasoning) {
+                    emit(events, _pending.substr(0, close_pos), true, _pending_from_draft);
+                }
+                _pending.erase(0, close_pos);
+                if (done) {
+                    _pending.clear();
+                    _mode = Mode::Done;
+                }
+                break;
+            }
+            const std::string_view header(
+                _pending.data() + header_pos, message_pos - header_pos
+            );
+            if (_mode == Mode::Reasoning) {
+                emit(events, _pending.substr(0, close_pos), true, _pending_from_draft);
+            }
+            _pending.erase(0, message_pos + gptoss_message.size());
+            _pending_from_draft = from_draft;
+            // A hidden channel leaves the mode alone, so its content stays hidden.
+            if (gptoss_channel_is_visible(header)) _mode = Mode::Content;
+            continue;
+        }
         if (close_pos != std::string::npos) {
             if (_mode == Mode::Reasoning) {
                 emit(events, _pending.substr(0, close_pos), true, _pending_from_draft);
