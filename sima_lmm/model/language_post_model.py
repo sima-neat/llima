@@ -11,16 +11,20 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora,
+    SimaBuilder, build_conv, build_conv_from_dense_with_lora,
     build_activation, activation_type, activation_dtype
 )
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
+from sima_lmm.gguf.gguf_conversion import GgufModel
+from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.utils import ceil_div
 
 
 @dataclass
 class LanguagePostModel(LanguagePostBaseModel):
     """Implementation for the post cache model of transformer-based language models."""
+
+    dflash_target_hf_model: LocalHuggingFaceModel | GgufModel | None = None
 
     def __post_init__(self):
         assert self.num_tokens >= 1
@@ -37,12 +41,52 @@ class LanguagePostModel(LanguagePostBaseModel):
     @property
     def uses_quantized_input_embeddings(self) -> bool:
         # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
-        return super().uses_quantized_input_embeddings and not self.is_draft
+        return super().uses_quantized_input_embeddings and not self.is_eagle3_draft
 
     @property
     def _layer_base_name(self) -> str:
+        if self.is_dflash_draft:
+            return f"layers.{self.layer_idx}"
         base = self.hf_model.language_model_param_base_name
-        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+        return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
+
+    def _dflash_target_output_embed_name(self) -> str:
+        if self.dflash_target_hf_model is None:
+            raise RuntimeError("DFlash draft is missing its paired target weight source")
+        candidates = (
+            "lm_head.weight",
+            "language_model.lm_head.weight",
+            "language_model.model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "model.lm_head.weight",
+        )
+        for name in candidates:
+            if self.dflash_target_hf_model.param_exists(name):
+                return name
+        raise RuntimeError("Cannot determine the DFlash target output embedding tensor")
+
+    def _get_dflash_target_param(self, name: str, *, dequantize: bool = False):
+        if self.dflash_target_hf_model is None:
+            raise RuntimeError("DFlash draft is missing its paired target weight source")
+        param = self.dflash_target_hf_model.load_np_param(name)
+        if not dequantize or not isinstance(param, tuple):
+            return param
+
+        scales, weights, *metadata = param
+        scales = np.asarray(scales, dtype=np.float32).reshape(weights.shape[0], -1)
+        group_size = metadata[0] if metadata else ceil_div(weights.shape[1], scales.shape[1])
+        group_indices = np.minimum(
+            np.arange(weights.shape[1]) // group_size,
+            scales.shape[1] - 1,
+        )
+        return weights.astype(np.float32) * scales[:, group_indices]
+
+    def _check_dflash_target_param(self, name: str) -> bool:
+        return (
+            self.dflash_target_hf_model is not None
+            and self.dflash_target_hf_model.param_exists(name)
+        )
 
     def gen_onnx_files(self):
         base_name = self._layer_base_name
@@ -75,6 +119,18 @@ class LanguagePostModel(LanguagePostBaseModel):
             self._onnx_builder.create_output_node(
                 output_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
             )
+        elif self.is_dflash_draft:
+            output_vocab_size = self.cfg.lm_cfg.token_cfg.vocab_size
+            for i, output in enumerate(output_nodes):
+                split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
+                split_size = min(
+                    output_vocab_size - split_begin,
+                    self.cfg.lm_cfg.lm_head_split_dim,
+                )
+                self._onnx_builder.create_output_node(
+                    self._onnx_builder.get_node_output_name(output),
+                    (1, split_size, 1, self.num_tokens - 1),
+                )
         else:
             self._create_final_layer_output_nodes(output_nodes)
 
@@ -159,6 +215,40 @@ class LanguagePostModel(LanguagePostBaseModel):
             )
         if self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1:
             return [final_output]
+
+        if self.is_dflash_draft:
+            normalized = self._build_rms_norm("norm", final_output)
+            proposals = self._onnx_builder.build_op(
+                "dflash.drop_anchor",
+                [
+                    normalized,
+                    np.array([1], dtype=np.int64),
+                    np.array([self.num_tokens], dtype=np.int64),
+                    np.array([3], dtype=np.int64),
+                ],
+                "Slice",
+            )
+            output_embed_name = self._dflash_target_output_embed_name()
+            output_param = self._get_dflash_target_param(
+                output_embed_name, dequantize=True
+            )
+            outputs = []
+            for index in range(self.cfg.lm_cfg.lm_head_num_splits):
+                begin = index * self.cfg.lm_cfg.lm_head_split_dim
+                end = min(
+                    begin + self.cfg.lm_cfg.lm_head_split_dim,
+                    output_param.shape[0],
+                )
+                weight = self._onnx_builder.create_initializer(
+                    f"dflash_lm_head.{index}.weight",
+                    self._onnx_builder.reshape_data(
+                        output_param[begin:end], "nc->nchw"
+                    ),
+                )
+                outputs.append(self._onnx_builder.build_op(
+                    f"dflash_lm_head.{index}", [proposals, weight], "Conv"
+                ))
+            return outputs
 
         # Include the operations after the last transformer layer into last post cache model.
         return self._build_onnx_post_transformer(base_name, final_output)
@@ -399,7 +489,48 @@ class LanguagePostModel(LanguagePostBaseModel):
             final_output = builder.create_add_node(final_output, mla_input_deepstack)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
-            outputs = self._build_post_transformer(builder, final_output, quantizable)
+            if self.is_dflash_draft:
+                normalized = self._build_sima_rms_norm(builder, "norm", final_output)
+                proposals = builder.create_slice_node(
+                    normalized, [1], [self.num_tokens], [1], [2]
+                )
+                output_embed_name = self._dflash_target_output_embed_name()
+                output_param = self._get_dflash_target_param(output_embed_name)
+                output_weight = (
+                    output_param[1] if isinstance(output_param, tuple) else output_param
+                )
+
+                def get_output_param(name: str):
+                    return self._get_dflash_target_param(
+                        name, dequantize=quantizable
+                    )
+
+                outputs = []
+                for index in range(self.cfg.lm_cfg.lm_head_num_splits):
+                    begin = index * self.cfg.lm_cfg.lm_head_split_dim
+                    end = min(
+                        begin + self.cfg.lm_cfg.lm_head_split_dim,
+                        output_weight.shape[0],
+                    )
+
+                    def slice_rows(value, start=begin, stop=end):
+                        return value[start:stop]
+
+                    outputs.append(build_conv(
+                        builder,
+                        get_output_param,
+                        self._check_dflash_target_param,
+                        f"dflash_lm_head.{index}",
+                        proposals,
+                        src_weight_name=output_embed_name,
+                        weight_process_func=slice_rows,
+                        scale_process_func=slice_rows,
+                        bias_process_func=slice_rows,
+                    ))
+            else:
+                outputs = self._build_post_transformer(
+                    builder, final_output, quantizable
+                )
             if len(outputs) > 1:
                 _ = builder.create_tuple_node(outputs)
 

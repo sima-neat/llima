@@ -102,7 +102,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
     def gen_onnx_files(self):
-        base_name = f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
+        base_name = (
+            f"dflash.token.{self.token_idx}"
+            if self.is_dflash_draft
+            else f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
+        )
 
         self.create_onnx_builder()
 
@@ -274,7 +278,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
         log_level: int,
         quantizable: bool,
     ):
-        base_name = f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
+        base_name = (
+            f"dflash.token.{self.token_idx}"
+            if self.is_dflash_draft
+            else f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
+        )
         g = self._build_sima_nodes(base_name, quantizable)
         save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
 

@@ -69,13 +69,14 @@ void LanguageModel::_define_attn_models_iter(
         pre_kv_cache_shape = {num_tokens, _cfg.lm_cfg.attn_cfg.get_kv_size(layer_type)};
     }
 
-    // Draft pre takes an extra IFM (buffer1a) for the FC fusion output / target hidden state.
+    // EAGLE3 pre takes an extra IFM for its fused target hidden state.
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_eagle3_draft = is_draft && !_cfg.lm_cfg.is_dflash();
     const bool pre_uses_embedding_scale = (
         _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
     );
-    const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_draft;
+    const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_eagle3_draft;
 
     std::vector<MLABufferSlice> pre_ifms;
     std::vector<MLABufferSlice> pre_ofms;
@@ -83,7 +84,7 @@ void LanguageModel::_define_attn_models_iter(
         pre_ifms.emplace_back(
             MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
         );
-        if (is_draft) {
+        if (is_eagle3_draft) {
             pre_ifms.emplace_back(
                 MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1a", num_tokens))}
             );
@@ -95,7 +96,7 @@ void LanguageModel::_define_attn_models_iter(
                 MLABufferSlice{nullptr, {0, 0}, {num_tokens, 1}}
             );
         }
-        if (is_draft) {
+        if (is_eagle3_draft) {
             pre_ifms.emplace_back(MLABufferSlice{});
         }
     }
@@ -315,7 +316,7 @@ void LanguageModel::_define_attn_models_iter(
     // embedding input as pre and therefore also needs its per-row scale.
     const size_t pre_hidden_state_idx = 1 + static_cast<size_t>(pre_uses_embedding_scale);
     std::vector<MLABufferSlice> post_ifms{
-        is_draft ? pre_ifms[pre_hidden_state_idx] : pre_ifms[0]
+        is_eagle3_draft ? pre_ifms[pre_hidden_state_idx] : pre_ifms[0]
     };
     if (post_uses_embedding_scale) {
         post_ifms.emplace_back(
@@ -391,7 +392,22 @@ void LanguageModel::_define_attn_models_iter(
             : (_cfg.lm_cfg.is_spec_decode() ? num_tokens : 1);
         post_elf_path = _get_elf_path_post(post_num_tokens, layer_idx);
 
-        if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+        if (is_draft && _cfg.lm_cfg.is_dflash()) {
+            if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+                post_ofms.emplace_back(MLABufferSlice{
+                    &get_buffer(fmt::format("n{}_buffer4", num_tokens))
+                });
+            } else {
+                uint32_t split = 0;
+                for (uint32_t begin = 0;
+                     begin < _cfg.lm_cfg.token_cfg.vocab_size;
+                     begin += _cfg.lm_cfg.lm_head_split_dim, ++split) {
+                    post_ofms.emplace_back(MLABufferSlice{
+                        &get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split))
+                    });
+                }
+            }
+        } else if (_cfg.lm_cfg.lm_head_num_splits == 1) {
             const std::string buf_name = _cfg.lm_cfg.is_spec_decode()
                 ? fmt::format("n{}_buffer4", post_num_tokens)
                 : std::string("n1_buffer4");
@@ -426,7 +442,7 @@ void LanguageModel::_define_attn_models_iter(
         }
 
         // Draft post produces an additional output: hidden states for next iteration.
-        if (is_draft) {
+        if (is_eagle3_draft) {
             post_ofms.emplace_back(
                 MLABufferSlice{&get_buffer(fmt::format("n{}_buffer5", num_tokens))}
             );
@@ -526,6 +542,16 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
     const uint16_t conv_tail_size = static_cast<uint16_t>(linear_cfg.conv_kernel_dim - 1);
     const uint16_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
+    const bool is_dflash_target_verify = (
+        _cfg.lm_cfg.is_dflash()
+        && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+        && num_tokens == _cfg.lm_cfg.get_single_num_tokens()
+    );
+    const bool uses_linear_valid_mask = (
+        num_tokens > 1
+        && (!is_dflash_target_verify
+            || num_tokens == _cfg.pipeline_cfg.input_token_group_size)
+    );
 
     std::vector<MLABufferSlice> linear_ifms;
     std::vector<MLABufferSlice> linear_ofms;
@@ -548,8 +574,10 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
             {conv_tail_size, linear_cfg.get_conv_dim()}
         }
     );
-    if (num_tokens > 1) {
-        linear_ifms.emplace_back(MLABufferSlice{&get_buffer("linear_valid_mask")});
+    if (uses_linear_valid_mask) {
+        linear_ifms.emplace_back(MLABufferSlice{
+            &get_buffer("linear_valid_mask"), {0, 0}, {num_tokens, 1}
+        });
     }
     linear_ifms.emplace_back(
         MLABufferSlice{
@@ -564,8 +592,17 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     );
     linear_ofms.emplace_back(
         MLABufferSlice{
-            &get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)),
-            {num_tokens > 1 ? uint32_t{0} : static_cast<uint32_t>(tail_begin), 0},
+            &get_buffer(
+                is_dflash_target_verify
+                    ? fmt::format("linear_conv_prefix_states_l{}", layer_idx)
+                    : fmt::format("linear_conv_cache_history_l{}", layer_idx)
+            ),
+            {
+                is_dflash_target_verify || num_tokens > 1
+                    ? uint32_t{0}
+                    : static_cast<uint32_t>(tail_begin),
+                0
+            },
             {
                 static_cast<uint32_t>(num_tokens + conv_tail_size - 1),
                 linear_cfg.get_conv_dim()
@@ -576,9 +613,25 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
         MLABufferSlice{
             &get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)),
             {0, 0},
-            {1, linear_cfg.get_recurrent_state_size()}
+            {
+                1,
+                linear_cfg.get_recurrent_state_size()
+            }
         }
     );
+    if (is_dflash_target_verify) {
+        linear_ofms.emplace_back(MLABufferSlice{
+            &get_buffer(fmt::format("linear_delta_resolver_key_l{}", layer_idx))
+        });
+        linear_ofms.emplace_back(MLABufferSlice{
+            &get_buffer(fmt::format("linear_delta_resolver_value_l{}", layer_idx))
+        });
+        linear_ofms.emplace_back(MLABufferSlice{
+            &get_buffer(fmt::format(
+                "linear_delta_resolver_decay_mask_l{}", layer_idx
+            ))
+        });
+    }
     _define_model(
         "linear",
         model_key,
@@ -592,13 +645,21 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
 void LanguageModel::_define_models() {
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     std::vector<uint16_t> num_tokens_vec = {single_num_tokens};
-    if (_use_group_token_models) {
+    if (
+        _use_group_token_models
+        && _cfg.pipeline_cfg.input_token_group_size != single_num_tokens
+    ) {
         num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     for (const auto& num_tokens: num_tokens_vec) {
         const auto& max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
         const auto& num_hidden_layers = _cfg.lm_cfg.num_hidden_layers;
 
+        const bool is_dflash_draft = _cfg.lm_cfg.is_dflash()
+            && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+        if (is_dflash_draft && num_tokens != single_num_tokens) {
+            continue;
+        }
         if (num_tokens == single_num_tokens) {
             for (uint16_t token_idx = 0; token_idx < max_num_tokens; ++token_idx) {
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
@@ -635,13 +696,19 @@ void LanguageModel::_define_models() {
     if (is_draft) {
         _define_draft_fc_models();
     }
+    if (_cfg.lm_cfg.is_dflash()) {
+        _define_dflash_models();
+    }
 }
 
 
 void LanguageModel::_define_draft_fc_models() {
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     std::vector<uint16_t> num_tokens_vec = {single_num_tokens};
-    if (_use_group_token_models) {
+    if (
+        _use_group_token_models
+        && _cfg.pipeline_cfg.input_token_group_size != single_num_tokens
+    ) {
         num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     for (const auto& num_tokens : num_tokens_vec) {
@@ -649,9 +716,18 @@ void LanguageModel::_define_draft_fc_models() {
             "{}_n{}_draft_fc_stage1_mla.elf",
             _cfg.language_model_name, num_tokens
         );
-        std::vector<MLABufferSlice> ifms{
-            MLABufferSlice{&get_buffer(fmt::format("fc_n{}_input", num_tokens))}
-        };
+        std::vector<MLABufferSlice> ifms;
+        if (_cfg.lm_cfg.is_dflash()) {
+            for (size_t index = 0;
+                 index < _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size();
+                 ++index) {
+                ifms.emplace_back(MLABufferSlice{});
+            }
+        } else {
+            ifms.emplace_back(MLABufferSlice{
+                &get_buffer(fmt::format("fc_n{}_input", num_tokens))
+            });
+        }
         std::vector<MLABufferSlice> ofms{
             MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))}
         };
@@ -662,12 +738,140 @@ void LanguageModel::_define_draft_fc_models() {
 }
 
 
+void LanguageModel::_define_dflash_models() {
+    const auto& spec_cfg = _cfg.lm_cfg.speculative_decoding_cfg.value();
+    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+    if (!spec_cfg.is_draft) {
+        if (!_has_linear_attention_layers()) {
+            return;
+        }
+        const auto& linear_cfg = _linear_attn_cfg();
+        const auto elf_path = _elf_dir / fmt::format(
+            "{}_n{}_dflash_state_resolver_stage1_mla.elf",
+            _cfg.language_model_name, single_num_tokens
+        );
+        for (uint8_t layer_idx = 0;
+             layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+            if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+                continue;
+            }
+            _dflash_state_resolver_model_map.emplace(
+                LanguageModelMapKey{single_num_tokens, layer_idx, 0},
+                MLAModelWithBuffer(
+                    elf_path,
+                    {
+                        MLABufferSlice{&get_buffer(fmt::format(
+                            "linear_delta_state_history_alt_l{}", layer_idx
+                        ))},
+                        MLABufferSlice{&get_buffer(fmt::format(
+                            "linear_delta_resolver_key_l{}", layer_idx
+                        ))},
+                        MLABufferSlice{&get_buffer(fmt::format(
+                            "linear_delta_resolver_value_l{}", layer_idx
+                        ))},
+                        MLABufferSlice{
+                            &get_buffer(fmt::format(
+                                "linear_delta_resolver_decay_mask_l{}", layer_idx
+                            )),
+                            {0, 0, 0},
+                            {
+                                linear_cfg.num_value_heads,
+                                1,
+                                single_num_tokens
+                            }
+                        },
+                    },
+                    {
+                        MLABufferSlice{&get_buffer(fmt::format(
+                            "linear_delta_resolver_output_l{}", layer_idx
+                        ))}
+                    }
+                )
+            );
+        }
+        return;
+    }
+
+    std::vector<uint16_t> widths{single_num_tokens};
+    if (
+        _use_group_token_models
+        && _cfg.pipeline_cfg.input_token_group_size != single_num_tokens
+    ) {
+        widths.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+    }
+    for (const auto num_tokens : widths) {
+        for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+            const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
+            const char* freq_prefix = layer_type == "sliding_attention" ? "local" : "global";
+            const auto freq_dim = _cfg.lm_cfg.rope_cfg.get_rope_dimension_count(layer_type) / 2;
+            std::vector<MLABufferSlice> outputs;
+            auto& key = get_buffer(fmt::format("cache_key_l{}", layer_idx));
+            auto& value = get_buffer(fmt::format("cache_val_l{}", layer_idx));
+            const std::vector<uint32_t> kv_begin = _cfg.pipeline_cfg.use_strided_kv_cache
+                ? std::vector<uint32_t>{0, 0, 0}
+                : std::vector<uint32_t>{0, 0};
+            const std::vector<uint32_t> kv_shape = _cfg.pipeline_cfg.use_strided_kv_cache
+                ? std::vector<uint32_t>{
+                    _cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                    num_tokens,
+                    _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
+                }
+                : std::vector<uint32_t>{
+                    num_tokens, _cfg.lm_cfg.attn_cfg.get_kv_size(layer_type)
+                };
+            outputs.emplace_back(MLABufferSlice{&key, kv_begin, kv_shape});
+            if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                outputs.emplace_back(MLABufferSlice{
+                    &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
+                    {0, 0, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, num_tokens, 1}
+                });
+            }
+            outputs.emplace_back(MLABufferSlice{&value, kv_begin, kv_shape});
+            if (_cfg.pipeline_cfg.quantize_kv_cache) {
+                outputs.emplace_back(MLABufferSlice{
+                    &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
+                    {0, 0, 0},
+                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, num_tokens, 1}
+                });
+            }
+            const LanguageModelMapKey key_id{num_tokens, layer_idx, 0};
+            _dflash_context_model_map.emplace(
+                key_id,
+                MLAModelWithBuffer(
+                    _elf_dir / fmt::format(
+                        "{}_n{}_dflash_context_layer{}_stage1_mla.elf",
+                        _cfg.language_model_name, num_tokens, layer_idx
+                    ),
+                    {
+                        MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))},
+                        MLABufferSlice{
+                            &get_buffer(fmt::format("{}_freq_real", freq_prefix)),
+                            {0, 0}, {num_tokens, freq_dim}
+                        },
+                        MLABufferSlice{
+                            &get_buffer(fmt::format("{}_freq_imag", freq_prefix)),
+                            {0, 0}, {num_tokens, freq_dim}
+                        },
+                    },
+                    outputs
+                )
+            );
+        }
+    }
+}
+
+
 void LanguageModel::_define_per_layer_models() {
     if (!_uses_per_layer_inputs())
         return;
 
-    std::vector<uint16_t> num_tokens_vec = {_cfg.lm_cfg.get_single_num_tokens()};
-    if (_use_group_token_models)
+    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+    std::vector<uint16_t> num_tokens_vec = {single_num_tokens};
+    if (
+        _use_group_token_models
+        && _cfg.pipeline_cfg.input_token_group_size != single_num_tokens
+    )
         num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
 
     for (auto num_tokens : num_tokens_vec) {

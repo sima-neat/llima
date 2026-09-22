@@ -630,12 +630,18 @@ class SpeculativeDecodingConfig(BaseConfig):
     """Configuration of a model in a speculative decoding setup.
 
     Attributes:
+        method: Speculative decoding algorithm. Existing archives default to eagle3.
         is_draft: True if the model is a draft model in a speculative decoding setup.
         speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
             16 for target, 5 for draft model.
+        target_layer_ids: Target transformer layers consumed by a DFlash draft.
+        mask_token_id: DFlash mask token used to fill the noisy proposal block.
     """
+    method: str = "eagle3"
     is_draft: bool = False
     speculative_budget: int = 16
+    target_layer_ids: list[int] = field(default_factory=list)
+    mask_token_id: int = -1
 
 
 @dataclass
@@ -831,16 +837,29 @@ class LanguageModelConfig(BaseConfig):
         if cfg is None:
             self.speculative_decoding_cfg = None
         else:
-            if self.linear_attn_cfg is not None:
+            speculative_cfg = SpeculativeDecodingConfig()
+            speculative_cfg.set_config(cfg)
+            if speculative_cfg.method not in ("eagle3", "dflash"):
+                raise ValueError(
+                    f"Unsupported speculative decoding method: {speculative_cfg.method}"
+                )
+            if speculative_cfg.speculative_budget <= 1:
+                raise ValueError("speculative_budget must be greater than one")
+            if speculative_cfg.method == "dflash" and speculative_cfg.speculative_budget not in (
+                4,
+                8,
+                16,
+            ):
+                raise ValueError("DFlash speculative_budget must be 4, 8, or 16")
+            if speculative_cfg.method == "eagle3" and self.linear_attn_cfg is not None:
                 raise ValueError(
                     "EAGLE3 speculative decoding does not support linear-attention layers"
                 )
-            if self.attn_cfg.swa_enable:
+            if speculative_cfg.method == "eagle3" and self.attn_cfg.swa_enable:
                 raise ValueError(
                     "EAGLE3 speculative decoding does not support sliding-window attention"
                 )
-            self.speculative_decoding_cfg = SpeculativeDecodingConfig()
-            self.speculative_decoding_cfg.set_config(cfg)
+            self.speculative_decoding_cfg = speculative_cfg
 
     def is_lora_target_module(self, base_name: str, module_name: str) -> bool:
         """
@@ -1290,6 +1309,10 @@ class VlmConfig(BaseConfig):
             lm_cfg.speculative_decoding_cfg is not None
             and lm_cfg.speculative_decoding_cfg.is_draft
         )
+        is_dflash_draft = (
+            is_speculative_draft
+            and lm_cfg.speculative_decoding_cfg.method == "dflash"
+        )
 
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
@@ -1308,6 +1331,16 @@ class VlmConfig(BaseConfig):
                     layers.append(LayerID("single_conv", i))
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
+                    if is_dflash_draft:
+                        if (
+                            pipeline_cfg.input_token_group_size
+                            != lm_cfg.speculative_decoding_cfg.speculative_budget
+                        ):
+                            layers.append(LayerID("group_dflash_context", i))
+                        layers.append(LayerID("single_dflash_context", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_post", i))
+                        continue
                     if lm_cfg.moe_cfg is not None:
                         # MoE layers replace the single post (MLP) part with a router
                         # plus one model per expert, for both group and single paths.
@@ -1373,22 +1406,26 @@ class VlmConfig(BaseConfig):
                         single_cache_indices = single_shared_sliding_cache_model_indices(
                             pipeline_cfg, sliding_window
                         )
-                layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
+                if not is_dflash_draft:
+                    layers.extend(
+                        LayerID("group_cache", n) for n in group_cache_indices
+                    )
                 layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
                 if separate_sliding_cache:
-                    layers.extend(
-                        LayerID("group_sliding_cache", n)
-                        for n in group_sliding_cache_model_indices(
-                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                    if not is_dflash_draft:
+                        layers.extend(
+                            LayerID("group_sliding_cache", n)
+                            for n in group_sliding_cache_model_indices(
+                                pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                            )
                         )
-                    )
                     layers.extend(
                         LayerID("single_sliding_cache", n)
                         for n in single_sliding_cache_model_indices(
                             pipeline_cfg, lm_cfg.attn_cfg.sliding_window
                         )
                     )
-                elif terminal_sliding_cache:
+                elif terminal_sliding_cache and not is_dflash_draft:
                     layers.append(LayerID(
                         "group_sliding_cache",
                         _cache_model_index(
@@ -1432,7 +1469,11 @@ class VlmConfig(BaseConfig):
                 for n in range(self.num_vision_layers)
             )
         if is_speculative_draft:
-            layers.append(LayerID("group_draft_fc", 0))
+            if (
+                pipeline_cfg.input_token_group_size
+                != lm_cfg.speculative_decoding_cfg.speculative_budget
+            ):
+                layers.append(LayerID("group_draft_fc", 0))
             layers.append(LayerID("single_draft_fc", 0))
 
         if (

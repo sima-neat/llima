@@ -45,10 +45,14 @@ def _linear_model(*, quantize_embeddings: bool, layer_idx: int = 0) -> LanguageL
     model.num_tokens = 1
     model.layer_idx = layer_idx
     model.cfg = SimpleNamespace(
-        pipeline_cfg=SimpleNamespace(quantize_embeddings=quantize_embeddings),
+        pipeline_cfg=SimpleNamespace(
+            quantize_embeddings=quantize_embeddings,
+            input_token_group_size=128,
+        ),
         lm_cfg=SimpleNamespace(
             hidden_size=16,
             num_hidden_layers=2,
+            speculative_decoding_cfg=None,
             linear_attn_cfg=SimpleNamespace(
                 conv_kernel_dim=4,
                 conv_dim=48,
@@ -60,6 +64,33 @@ def _linear_model(*, quantize_embeddings: bool, layer_idx: int = 0) -> LanguageL
         ),
     )
     return model
+
+
+def test_linear_attention_emits_resolver_inputs_only_for_dflash_target_verification():
+    model = _linear_model(quantize_embeddings=False)
+    model.num_tokens = 8
+    model.cfg.lm_cfg.speculative_decoding_cfg = SimpleNamespace(
+        method="dflash", is_draft=False, speculative_budget=8
+    )
+    assert model._emit_dflash_resolver_inputs
+
+    model.num_tokens = 128
+    assert not model._emit_dflash_resolver_inputs
+    model.num_tokens = 8
+    model.cfg.lm_cfg.speculative_decoding_cfg.is_draft = True
+    assert not model._emit_dflash_resolver_inputs
+
+
+def test_dflash_verification_omits_redundant_valid_mask():
+    model = _linear_model(quantize_embeddings=False)
+    model.num_tokens = 16
+    model.cfg.lm_cfg.speculative_decoding_cfg = SimpleNamespace(
+        method="dflash", is_draft=False, speculative_budget=16
+    )
+    assert not model._uses_linear_valid_mask
+
+    model.cfg.pipeline_cfg.input_token_group_size = 16
+    assert model._uses_linear_valid_mask
 
 
 def test_linear_attention_selects_supported_delta_block_sizes():

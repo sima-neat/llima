@@ -72,6 +72,8 @@ class VisionLanguageModel(BaseModel):
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
+        speculative_method: str | None = None,
+        speculative_block_size: int | None = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -136,10 +138,44 @@ class VisionLanguageModel(BaseModel):
             else:
                 vlm_helper = target_model.vlm_helper
 
-            # Set speculative decoding configs for the draft model
-            vlm_cfg.lm_cfg.set_speculative_decoding_config(
-                dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
-            )
+            is_dflash_checkpoint = "DFlashDraftModel" in model_config.get("architectures", [])
+            method = speculative_method or ("dflash" if is_dflash_checkpoint else "eagle3")
+            if method not in ("eagle3", "dflash"):
+                raise ValueError(f"Unsupported speculative decoding method: {method}")
+            if method == "dflash":
+                if not is_dflash_checkpoint:
+                    raise ValueError("DFlash requires a DFlashDraftModel checkpoint")
+                dflash_cfg = model_config.get("dflash_config", {})
+                budget = speculative_block_size or 8
+                target_layer_ids = dflash_cfg.get("target_layer_ids", [])
+                mask_token_id = dflash_cfg.get("mask_token_id", -1)
+                spec_cfg = dict(
+                    method=method,
+                    speculative_budget=budget,
+                    target_layer_ids=target_layer_ids,
+                    mask_token_id=mask_token_id,
+                )
+                target_model.cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=False)
+                )
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=True)
+                )
+                for pipeline_cfg in (
+                    target_model.cfg.pipeline_cfg,
+                    vlm_cfg.pipeline_cfg,
+                ):
+                    if pipeline_cfg.future_token_mask_size == 1:
+                        pipeline_cfg.set_future_token_mask_size(budget)
+            else:
+                if is_dflash_checkpoint:
+                    raise ValueError("DFlashDraftModel cannot be compiled as an EAGLE3 draft")
+                if speculative_block_size is not None:
+                    raise ValueError("--speculative_block_size is only valid for DFlash")
+                target_model.configure_speculative_decoding(is_draft=False)
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
+                )
 
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
@@ -152,6 +188,8 @@ class VisionLanguageModel(BaseModel):
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        if target_model is not None and method == "dflash":
+            model.language_model.dflash_target_hf_model = target_model.hf_model
         return model
 
     def set_lora_adapter(self, lora_path: Path):

@@ -183,9 +183,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 struct SpeculativeDecodingConfig {
     bool is_draft = false;
     uint16_t speculative_budget = 16;
+    std::string method = "eagle3";
+    std::vector<uint8_t> target_layer_ids = {};
+    int32_t mask_token_id = -1;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    SpeculativeDecodingConfig, is_draft, speculative_budget
+    SpeculativeDecodingConfig, is_draft, speculative_budget, method,
+    target_layer_ids, mask_token_id
 )
 
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
@@ -235,10 +239,15 @@ struct LanguageModelConfig {
         return speculative_decoding_cfg.has_value();
     }
 
+    bool is_dflash() const {
+        return speculative_decoding_cfg.has_value()
+            && speculative_decoding_cfg.value().method == "dflash";
+    }
+
     uint32_t get_lm_head_output_size() const {
         if (speculative_decoding_cfg.has_value()
             && speculative_decoding_cfg.value().is_draft){
-            return draft_vocab_size;
+            return is_dflash() ? token_cfg.vocab_size : draft_vocab_size;
         }
         return token_cfg.vocab_size;
     }

@@ -52,7 +52,8 @@ def gen_files(
     language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None
+    draft_output_path: Path | None, speculative_method: str | None = None,
+    speculative_block_size: int | None = None,
 ):
     enable_verbose_error_messages()
     models = list()
@@ -81,7 +82,6 @@ def gen_files(
 
     # Check if draft model is provided
     if draft_model_path is not None:
-        base_model.configure_speculative_decoding(is_draft=False)
         draft_model = VisionLanguageModel.from_hf_cache(
             hf_cache_path=draft_model_path,
             model_name=draft_model_path.name,
@@ -97,7 +97,9 @@ def gen_files(
             quantize_embeddings=quantize_embeddings,
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
-            target_model=base_model
+            target_model=base_model,
+            speculative_method=speculative_method,
+            speculative_block_size=speculative_block_size,
         )
         models.append(draft_model)
 
@@ -310,7 +312,15 @@ def main():
     )
     group.add_argument(
         "--draft_model_path", type=Path,
-        help="Path of the EAGLE3 draft model for the base (target) model."
+        help="Path of the EAGLE3 or DFlash draft model for the base (target) model."
+    )
+    group.add_argument(
+        "--speculative_method", choices=("eagle3", "dflash"),
+        help="Speculative decoding method. Inferred from the draft checkpoint by default."
+    )
+    group.add_argument(
+        "--speculative_block_size", type=int, choices=(4, 8, 16),
+        help="DFlash verification width (default: 8)."
     )
 
     group = parser.add_argument_group("Options to compile LoRA")
@@ -365,6 +375,11 @@ def main():
     else:
         output_path = base_output_path
         draft_output_path = None
+
+    if args.draft_model_path is None and (
+        args.speculative_method is not None or args.speculative_block_size is not None
+    ):
+        _abort("Speculative decoding options require --draft_model_path.")
 
     check_output_path_conflict(args.model_path, output_path)
 
@@ -429,7 +444,8 @@ def main():
         args.language_group_size, args.future_token_mask_size,
         args.enable_filter_sharing, args.quantize_embeddings,
         args.quantize_kv_cache, return_logits, log_level, image_resolution,
-        args.draft_model_path, draft_output_path
+        args.draft_model_path, draft_output_path,
+        args.speculative_method, args.speculative_block_size,
     )
 
     # Compile LoRA weights if requested.

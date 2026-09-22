@@ -96,6 +96,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr
         );
+        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            uint16_t stable_prefix_token_count
+        );
         void stop_model() { _is_running = false; }
 
         void set_reloc(const std::string& reloc_name);
@@ -260,6 +268,46 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         void _prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx);
         void _define_draft_fc_models();
+        void _define_dflash_models();
+        void _append_dflash_context(
+            LanguageModel& target_lm, uint16_t num_tokens,
+            uint16_t token_idx, uint16_t valid_tokens
+        );
+        struct DFlashScratch;
+        void _bind_dflash_linear_conv_state(uint16_t prefix_tokens);
+        void _resolve_dflash_linear_state(uint16_t prefix_tokens);
+        void _commit_dflash_linear_state(uint16_t prefix_tokens);
+        void _save_dflash_state_checkpoint(
+            uint16_t token_count, uint16_t prefix_tokens, bool is_prefill
+        );
+        void _upload_dflash_attention_mask(
+            uint16_t num_tokens, uint16_t token_idx,
+            uint8_t layer_idx, bool bidirectional,
+            std::vector<Eigen::bfloat16>& mask
+        );
+        std::pair<uint16_t, uint32_t> _run_dflash_target_verify(
+            std::span<const uint32_t> input_ids, uint16_t token_idx,
+            DFlashScratch& scratch
+        );
+        const std::vector<uint32_t>& _run_dflash_draft(
+            LanguageModel& target_lm, uint32_t anchor_token, uint16_t token_idx,
+            DFlashScratch& scratch
+        );
+        std::optional<std::vector<uint32_t>> _run_model_dflash_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            uint16_t stable_prefix_token_count
+        );
+        std::optional<std::vector<uint32_t>> _run_model_eagle3_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result
+        );
         struct CachedState {
             // Hidden-layer indices belonging to this stateful family.
             std::vector<uint8_t> layer_indices;
@@ -360,6 +408,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _save_state_checkpoint(
             uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
         );
+        std::optional<size_t> _select_state_checkpoint_slot(
+            uint16_t token_count, bool is_prefill
+        );
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
         uint16_t _set_input_text_embeds(std::span<const uint32_t> input_token_ids);
@@ -388,7 +439,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
 
         void _notify_first_token(uint32_t token_id, double duration);
-        void _notify_new_token(uint32_t token_id, double duration);
+        void _notify_new_token(
+            uint32_t token_id, double duration, bool from_draft = false
+        );
         void _notify_cache_full() const;
         void _notify_stop() const;
         void _notify_interrupt() const;
@@ -408,8 +461,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
         LanguageModelMap _linear_model_map;
-        // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
+        // Draft-only context-fusion models indexed by their compiled width.
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
+        LanguageModelMap _dflash_context_model_map;
+        LanguageModelMap _dflash_state_resolver_model_map;
+        uint16_t _dflash_resolved_prefix = 0;
 
         std::vector<AttentionBindingBuffers> _attention_binding_buffers;
         MLABuffer* _global_freq_real = nullptr;

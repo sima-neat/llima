@@ -3,6 +3,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from sima_lmm.config.vlm_config import (
@@ -13,9 +14,13 @@ from sima_lmm.config.vlm_config import (
     group_cache_model_indices,
     single_cache_model_indices,
 )
+from sima_lmm.config.layer_id import LayerID
+from sima_lmm.model import FileGenPrecision
 from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.model import VisionLanguageModel
 from sima_lmm.model import vision_language_model
+from sima_lmm.model.language_model import LanguageModel
+from sima_lmm.host.configuration_helper import read_configuration_file
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -204,6 +209,198 @@ def test_speculative_decoding_rejects_linear_attention():
         match="EAGLE3 speculative decoding does not support linear-attention layers",
     ):
         config.lm_cfg.set_speculative_decoding_config({})
+
+
+@pytest.mark.parametrize("block_size", [4, 8, 16])
+def test_dflash_accepts_qwen35_hybrid_attention(block_size: int):
+    config = _load_reference_config("qwen3.5_vlm_config.json")
+
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": "dflash",
+            "speculative_budget": block_size,
+            "target_layer_ids": [1, 5, 9, 13, 17, 21, 25, 29],
+            "mask_token_id": 248077,
+        }
+    )
+
+    assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == block_size
+
+
+def _dflash_draft_config() -> VlmConfig:
+    config = _load_reference_config("qwen3.5_vlm_config.json")
+    config.model_type = VlmArchType.LLM_QWEN3
+    config.vm_cfg = None
+    config.mm_cfg = None
+    config.lm_cfg.model_type = "qwen3"
+    config.lm_cfg.num_hidden_layers = 6
+    config.lm_cfg.layer_types = ["sliding_attention"] * 5 + ["full_attention"]
+    config.lm_cfg.linear_attn_cfg = None
+    config.lm_cfg.attn_cfg.swa_enable = True
+    config.lm_cfg.attn_cfg.sliding_window = 4096
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": "dflash",
+            "is_draft": True,
+            "speculative_budget": 8,
+            "target_layer_ids": [1, 5, 9, 13, 17, 21, 25, 29],
+            "mask_token_id": 248077,
+        }
+    )
+    config.config_pipeline(None, None, 2048, 128, 128)
+    return config
+
+
+def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_path):
+    config = _dflash_draft_config()
+
+    assert _layer_indices(config, "group_pre") == []
+    assert _layer_indices(config, "group_post") == []
+    assert _layer_indices(config, "group_dflash_context") == list(range(6))
+    assert _layer_indices(config, "single_dflash_context") == list(range(6))
+    assert _layer_indices(config, "single_pre") == list(range(6))
+    assert _layer_indices(config, "single_post") == list(range(6))
+    assert _layer_indices(config, "group_cache") == []
+    assert _layer_indices(config, "group_sliding_cache") == []
+    assert _layer_indices(config, "single_cache") == list(range(127, 2048, 128))
+
+    model = LanguageModel(
+        config,
+        "draft",
+        onnx_path=tmp_path / "onnx",
+        sima_path=tmp_path / "sima",
+        hf_model=SimpleNamespace(),
+    )
+    pre = model._get_part_model("pre", 8, layer_idx=0)
+    post = model._get_part_model("post", 8, layer_idx=0)
+    assert pre.num_tokens == 8
+    assert pre._layer_base_name == "layers.0"
+    assert post._layer_base_name == "layers.0"
+    assert model._get_part_model("dflash_context", 128, layer_idx=0).num_tokens == 128
+
+
+def test_dflash_draft_deduplicates_equal_group_and_block_widths():
+    config = _dflash_draft_config()
+    config.config_pipeline(None, None, 2048, 8, 8)
+
+    assert _layer_indices(config, "group_dflash_context") == []
+    assert _layer_indices(config, "single_dflash_context") == list(range(6))
+    assert _layer_indices(config, "group_draft_fc") == []
+    assert _layer_indices(config, "single_draft_fc") == [0]
+
+
+def test_dflash_final_post_uses_paired_target_head(tmp_path):
+    config = _dflash_draft_config()
+    quantized_head = (
+        np.array([[0.5, 0.25]], dtype=np.float32),
+        np.array([[2, 4, 8, 12]], dtype=np.int8),
+        2,
+    )
+    target_weights = SimpleNamespace(
+        param_exists=lambda name: name == "lm_head.weight",
+        load_np_param=lambda _name: quantized_head,
+    )
+    model = LanguageModel(
+        config,
+        "draft",
+        onnx_path=tmp_path / "onnx",
+        sima_path=tmp_path / "sima",
+        hf_model=SimpleNamespace(),
+        dflash_target_hf_model=target_weights,
+    )
+
+    post = model._get_part_model("post", 8, layer_idx=5)
+    assert post._dflash_target_output_embed_name() == "lm_head.weight"
+    np.testing.assert_array_equal(
+        post._get_dflash_target_param("lm_head.weight", dequantize=True),
+        np.array([[1, 2, 2, 3]], dtype=np.float32),
+    )
+
+
+def test_configuration_identifies_speculative_draft_model(tmp_path):
+    configuration_file = tmp_path / "precision.py"
+    configuration_file.write_text(
+        "def get_layer_configuration(model_properties, _layer):\n"
+        "    precision = ('A_BF16_W_INT8' if model_properties['is_draft_model'] "
+        "else 'BF16')\n"
+        "    return {'precision': precision}\n"
+    )
+
+    layer_ids = [LayerID("single_pre", 0)]
+    target_cfg = SimpleNamespace(
+        lm_cfg=SimpleNamespace(num_hidden_layers=32, speculative_decoding_cfg=None),
+        get_layer_ids=lambda: layer_ids,
+    )
+    draft_cfg = SimpleNamespace(
+        lm_cfg=SimpleNamespace(
+            num_hidden_layers=6,
+            speculative_decoding_cfg=SimpleNamespace(is_draft=True),
+        ),
+        get_layer_ids=lambda: layer_ids,
+    )
+    target = read_configuration_file(SimpleNamespace(cfg=target_cfg), configuration_file)
+    draft = read_configuration_file(SimpleNamespace(cfg=draft_cfg), configuration_file)
+
+    assert set(target["precision"].values()) == {FileGenPrecision.BF16}
+    assert set(draft["precision"].values()) == {FileGenPrecision.A_BF16_W_INT8}
+
+
+def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(
+    monkeypatch, tmp_path
+):
+    target_cfg = _load_reference_config("qwen3.5_vlm_config.json")
+    target_cfg.lm_cfg.set_speculative_decoding_config(
+        {"method": "dflash", "speculative_budget": 8}
+    )
+    target = LanguageModel(
+        target_cfg,
+        "target",
+        onnx_path=tmp_path / "target_onnx",
+        sima_path=tmp_path / "target_sima",
+        hf_model=SimpleNamespace(language_model_param_base_name="model"),
+    )
+    assert target._get_part_model("pre", 8, layer_idx=0)._layer_base_name == (
+        "model.layers.0"
+    )
+    target_models = []
+    monkeypatch.setattr(
+        target,
+        "gen_files_from_model_list",
+        lambda models, *_args: target_models.extend(models),
+    )
+    target.gen_files(
+        object(),
+        gen_config={
+            "precision": {LayerID("single_linear", 0): FileGenPrecision.BF16}
+        },
+    )
+    assert len(target_models) == 2
+    assert target_models[0][0].num_tokens == 8
+    assert target_models[1][0].block_size == 8
+
+    draft_cfg = _dflash_draft_config()
+    draft = LanguageModel(
+        draft_cfg,
+        "draft",
+        onnx_path=tmp_path / "draft_onnx",
+        sima_path=tmp_path / "draft_sima",
+        hf_model=SimpleNamespace(),
+    )
+    draft_models = []
+    monkeypatch.setattr(
+        draft,
+        "gen_files_from_model_list",
+        lambda models, *_args: draft_models.extend(models),
+    )
+    draft.gen_files(
+        object(),
+        gen_config={
+            "precision": {
+                LayerID("single_sliding_cache", 127): FileGenPrecision.BF16
+            }
+        },
+    )
+    assert draft_models[0][0].num_tokens == 8
 
 
 def test_linear_attention_validates_group_size():
