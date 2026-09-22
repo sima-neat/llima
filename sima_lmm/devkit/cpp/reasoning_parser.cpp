@@ -25,6 +25,14 @@ bool gptoss_channel_is_visible(std::string_view header) {
         || header.find("json") != std::string_view::npos;
 }
 
+// A channel header is preceded by "<|start|>assistant". Both control tokens decode
+// to nothing, so the role name arrives as ordinary text and would otherwise be
+// emitted as the tail of the previous message.
+size_t gptoss_role_suffix_size(std::string_view text) {
+    constexpr std::string_view role = "assistant";
+    return text.ends_with(role) ? role.size() : 0;
+}
+
 } // namespace
 
 ReasoningFormat reasoning_format_for_model(std::string_view model_type) {
@@ -158,7 +166,13 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
             const auto message_pos = _pending.find(gptoss_message, header_pos);
             if (message_pos == std::string::npos) {
                 if (_mode == Mode::Reasoning) {
-                    emit(events, _pending.substr(0, close_pos), true, _pending_from_draft);
+                    const std::string_view before(_pending.data(), close_pos);
+                    emit(
+                        events,
+                        _pending.substr(0, close_pos - gptoss_role_suffix_size(before)),
+                        true,
+                        _pending_from_draft
+                    );
                 }
                 _pending.erase(0, close_pos);
                 if (done) {
@@ -171,7 +185,13 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
                 _pending.data() + header_pos, message_pos - header_pos
             );
             if (_mode == Mode::Reasoning) {
-                emit(events, _pending.substr(0, close_pos), true, _pending_from_draft);
+                const std::string_view before(_pending.data(), close_pos);
+                emit(
+                    events,
+                    _pending.substr(0, close_pos - gptoss_role_suffix_size(before)),
+                    true,
+                    _pending_from_draft
+                );
             }
             _pending.erase(0, message_pos + gptoss_message.size());
             _pending_from_draft = from_draft;
