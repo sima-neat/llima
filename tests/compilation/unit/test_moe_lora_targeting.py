@@ -8,7 +8,7 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 RANK = 8
 
 
-def _language_config(layers_to_transform):
+def _language_config(layers_to_transform, target_modules=None):
     """A config carrying only the LoRA settings the target lookups read."""
     cfg = LanguageModelConfig.__new__(LanguageModelConfig)
     cfg.lora_cfg = LoraConfig()
@@ -16,7 +16,7 @@ def _language_config(layers_to_transform):
         "r": RANK,
         "lora_alpha": 2 * RANK,
         "layers_to_transform": layers_to_transform,
-        "target_modules": ["gate_proj", "up_proj", "down_proj"],
+        "target_modules": target_modules or ["gate_proj", "up_proj", "down_proj"],
     })
     return cfg
 
@@ -53,3 +53,19 @@ def test_layers_to_transform_selects_layers_not_experts(base_name, module_name, 
 def test_experts_are_adapted_when_no_layer_filter_is_set(base_name):
     cfg = _language_config(None)
     assert cfg.get_lora_rank(base_name, "gate_proj") == RANK
+
+
+@pytest.mark.parametrize(
+    ("base_name", "expected"),
+    [
+        ("model.layers.0.mlp.experts.3", RANK),
+        # A different expert must not match the qualified target.
+        ("model.layers.0.mlp.experts.4", None),
+        # Nor an unselected layer.
+        ("model.layers.1.mlp.experts.3", None),
+    ],
+)
+def test_expert_qualified_target_module_still_matches(base_name, expected):
+    """The expert path must survive matching, so qualified targets keep working."""
+    cfg = _language_config([0, 2], target_modules=["experts.3.gate_proj"])
+    assert cfg.get_lora_rank(base_name, "gate_proj") == expected

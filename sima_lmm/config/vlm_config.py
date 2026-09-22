@@ -874,9 +874,11 @@ class LanguageModelConfig(BaseConfig):
 
         # Check layer index if specified.
         if self.lora_cfg.layers_to_transform is not None:
-            idx = [int(word) for word in base_name.split(".") if word.isdigit()]
-            assert len(idx) == 1, f"Found unexpected layer index in base name {base_name}"
-            if idx[0] not in self.lora_cfg.layers_to_transform:
+            # Take the transformer layer index specifically: a MoE expert base name
+            # carries a second index that is not a layer.
+            match = re.search(r"\.layers\.(\d+)", base_name)
+            assert match, f"Found unexpected layer index in base name {base_name}"
+            if int(match.group(1)) not in self.lora_cfg.layers_to_transform:
                 return False
 
         # Check custom name pattern if specified.
@@ -909,9 +911,6 @@ class LanguageModelConfig(BaseConfig):
         return bundle_name in self.lora_cfg.target_modules
 
     def get_lora_rank(self, base_name: str, module_name: str) -> int | None:
-        # A MoE expert's base name carries the expert index, which is not a layer
-        # index. Drop it so only the transformer layer index remains.
-        base_name = re.sub(r"\.experts\.\d+$", "", base_name)
         lora_rank = self.lora_cfg.r if self.is_lora_target_module(base_name, module_name) else None
         return lora_rank
 
