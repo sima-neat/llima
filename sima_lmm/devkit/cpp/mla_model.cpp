@@ -442,25 +442,33 @@ void MLAModelWithBuffer::load_all_models(
         for (const auto& file_name: file_names) {
             paths.push_back(std::filesystem::absolute(file_name).string());
         }
-        auto handles = dispatcher->loadMany(paths);
-        if (handles.size() != file_names.size()) {
-            throw std::runtime_error(fmt::format(
-                "Bulk MLASHM model load returned {} handles for {} models ({})",
-                handles.size(),
-                file_names.size(),
-                dispatcher->lastErrorString()
-            ));
-        }
-        for (std::size_t i = 0; i < file_names.size(); ++i) {
-            _unique_model_ptrs[indices[i]] = handles[i];
-            if (!_unique_model_ptrs[indices[i]]) {
+        // Bulk loadMany has a per-request capacity; MoE compiles far more ELFs than one
+        // request holds, so load in fixed-size batches. Lower this if 128 still overflows.
+        constexpr std::size_t kLoadBatch = 128;
+        for (std::size_t off = 0; off < paths.size(); off += kLoadBatch) {
+            const std::size_t end = std::min(off + kLoadBatch, paths.size());
+            std::vector<std::string> chunk(paths.begin() + off, paths.begin() + end);
+            auto handles = dispatcher->loadMany(chunk);
+            if (handles.size() != chunk.size()) {
                 throw std::runtime_error(fmt::format(
-                    "Failed to bulk load model through MLASHM dispatcher: {} ({})",
-                    file_names[i],
+                    "Bulk MLASHM model load returned {} handles for {} models ({})",
+                    handles.size(),
+                    chunk.size(),
                     dispatcher->lastErrorString()
                 ));
             }
-            spdlog::info("Loaded model: {}", file_names[i]);
+            for (std::size_t j = 0; j < chunk.size(); ++j) {
+                const std::size_t i = off + j;
+                _unique_model_ptrs[indices[i]] = handles[j];
+                if (!_unique_model_ptrs[indices[i]]) {
+                    throw std::runtime_error(fmt::format(
+                        "Failed to bulk load model through MLASHM dispatcher: {} ({})",
+                        file_names[i],
+                        dispatcher->lastErrorString()
+                    ));
+                }
+                spdlog::info("Loaded model: {}", file_names[i]);
+            }
         }
         return;
     }
