@@ -489,14 +489,24 @@ class LanguageModel(BaseModel):
         values, indices, residual, norm_hidden = router_model.run_model(
             eval_mode, router_ifms
         )
-        vals = values[0, 0]                    # (num_tokens, top_k)
-        idxs = indices[0, 0].astype(np.int64)  # (num_tokens, top_k)
+        # The two paths lay the router outputs out differently: ONNX is NCHW
+        # (1, top_k, 1, num_tokens), Model SDK is (1, 1, num_tokens, top_k).
+        is_onnx = eval_mode == EvalMode.ONNX
+        if is_onnx:
+            vals = values[0, :, 0, :].T                    # (num_tokens, top_k)
+            idxs = indices[0, :, 0, :].T.astype(np.int64)  # (num_tokens, top_k)
+        else:
+            vals = values[0, 0]                    # (num_tokens, top_k)
+            idxs = indices[0, 0].astype(np.int64)  # (num_tokens, top_k)
 
         # Scatter the k routing weights into a dense (num_tokens, num_experts) tensor.
         router_weights = np.zeros((num_tokens, num_experts), dtype=np.float32)
         for t in range(num_tokens):
             router_weights[t, idxs[t]] = vals[t]
-        rw = router_weights[None, None]  # -> NCHW (1, num_experts, 1, num_tokens)
+        if is_onnx:
+            rw = router_weights.T[None, :, None, :]  # (1, num_experts, 1, num_tokens)
+        else:
+            rw = router_weights[None, None]          # (1, 1, num_tokens, num_experts)
 
         # Only run experts at least one token selected; the rest have weight 0.
         activated = set(int(e) for e in idxs.flatten())
@@ -510,9 +520,11 @@ class LanguageModel(BaseModel):
         expert_outs = []
         if num_tokens > 1:
             # Group combine consumes all num_experts slots; skipped ones are zeros.
-            zero = np.zeros(
-                (1, 1, num_tokens, self.cfg.lm_cfg.hidden_size), dtype=np.float32
+            zero_shape = (
+                (1, self.cfg.lm_cfg.hidden_size, 1, num_tokens) if is_onnx
+                else (1, 1, num_tokens, self.cfg.lm_cfg.hidden_size)
             )
+            zero = np.zeros(zero_shape, dtype=np.float32)
             for e in range(num_experts):
                 expert_outs.append(run_expert(e) if e in activated else zero)
         else:
