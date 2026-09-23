@@ -5,6 +5,7 @@
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -19,7 +20,22 @@ bool is_attention(std::string_view layer_type) {
   return layer_type == "full_attention" || layer_type == "sliding_attention";
 }
 
+std::pair<float, uint32_t>
+argmax_bf16(const Eigen::bfloat16 *values, uint32_t size) {
+  float best_value = -std::numeric_limits<float>::infinity();
+  uint32_t best_index = 0;
+  for (uint32_t index = 0; index < size; ++index) {
+    const float value = static_cast<float>(values[index]);
+    if (value > best_value) {
+      best_value = value;
+      best_index = index;
+    }
+  }
+  return {best_value, best_index};
+}
+
 struct DFlashLogitView {
+  MLABuffer *buffer;
   const uint8_t *data;
   size_t row_stride;
   uint32_t vocab_begin;
@@ -108,9 +124,8 @@ void LanguageModel::_resolve_dflash_linear_state(uint16_t prefix_tokens) {
         &get_buffer(fmt::format("linear_delta_resolver_decay_mask_l{}",
                                 layer_idx)),
         {0, decay_row, 0});
-    model.add_to_queue();
+    model.run();
   }
-  MLAModelWithBuffer::run_queue();
   _dflash_resolved_prefix = prefix_tokens;
 }
 
@@ -230,6 +245,93 @@ void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
   }
   get_buffer("future_token_mask")
       .upload_raw(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
+}
+
+std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
+    uint16_t num_tokens, uint16_t valid_tokens,
+    std::span<const uint32_t> expected_draft_tokens) {
+  if (valid_tokens == 0 || valid_tokens > num_tokens ||
+      expected_draft_tokens.size() + 1 != valid_tokens) {
+    throw std::runtime_error(fmt::format(
+        "Requested {} lm_head rows from n{} output", valid_tokens,
+        num_tokens));
+  }
+
+  const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
+  const uint16_t num_splits = _cfg.lm_cfg.lm_head_num_splits;
+  if (num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
+    auto &buf = get_buffer(fmt::format("n{}_buffer4", num_tokens));
+    buf.invalidate_cache();
+    const auto *output =
+        static_cast<const uint32_t *>(buf.get_virtual_addr());
+    std::vector<uint32_t> token_ids;
+    token_ids.reserve(valid_tokens);
+    for (uint16_t row = 0; row < valid_tokens; ++row) {
+      token_ids.emplace_back(output[row]);
+      if (row < expected_draft_tokens.size() &&
+          output[row] != expected_draft_tokens[row]) {
+        break;
+      }
+    }
+    return token_ids;
+  }
+
+  std::vector<DFlashLogitView> views;
+  views.reserve(num_splits);
+  auto add_view = [&](MLABuffer &buffer, uint32_t begin, uint32_t width) {
+    if (buffer.get_dtype() != "bfloat16" ||
+        buffer.get_shape() != std::vector<size_t>{num_tokens, width}) {
+      throw std::runtime_error("Invalid lm_head logit buffer");
+    }
+    views.push_back(DFlashLogitView{
+        &buffer,
+        static_cast<const uint8_t *>(buffer.get_virtual_addr()),
+        buffer.get_buf_len(std::vector<uint32_t>{1, width}), begin, width});
+  };
+  const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
+  for (uint16_t split_idx = 0; split_idx < num_splits; ++split_idx) {
+    const uint32_t split_begin =
+        static_cast<uint32_t>(split_idx) * split_dim;
+    const uint32_t split_size =
+        num_splits == 1
+            ? output_size
+            : std::min<uint32_t>(split_dim, output_size - split_begin);
+    const std::string buf_name =
+        num_splits == 1
+            ? fmt::format("n{}_buffer4", num_tokens)
+            : fmt::format("n{}_lm_split{}", num_tokens, split_idx);
+    add_view(get_buffer(buf_name), split_begin, split_size);
+  }
+
+  auto scan_row = [&](uint16_t row) {
+    uint32_t best_index = 0;
+    float best_value = -std::numeric_limits<float>::infinity();
+    for (const auto &view : views) {
+      const size_t row_offset = static_cast<size_t>(row) * view.row_stride;
+      view.buffer->invalidate_cache(row_offset, view.row_stride);
+      const auto *row_ptr = reinterpret_cast<const Eigen::bfloat16 *>(
+          view.data + row_offset);
+      const auto [split_value, split_index] =
+          argmax_bf16(row_ptr, view.width);
+      if (split_value > best_value) {
+        best_value = split_value;
+        best_index = view.vocab_begin + split_index;
+      }
+    }
+    return best_index;
+  };
+
+  std::vector<uint32_t> best_indices;
+  best_indices.reserve(valid_tokens);
+  for (uint16_t row = 0; row < valid_tokens; ++row) {
+    const uint32_t best_index = scan_row(row);
+    best_indices.emplace_back(best_index);
+    if (row < expected_draft_tokens.size() &&
+        best_index != expected_draft_tokens[row]) {
+      break;
+    }
+  }
+  return best_indices;
 }
 
 std::optional<std::vector<uint32_t>>
@@ -444,6 +546,7 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
     }
     buffer.invalidate_cache();
     views.push_back(DFlashLogitView{
+        &buffer,
         static_cast<const uint8_t *>(buffer.get_virtual_addr()),
         buffer.get_buf_len(std::vector<uint32_t>{1, width}), begin, width});
   };
@@ -571,52 +674,10 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
   }
   MLAModelWithBuffer::run_queue();
 
-  const uint32_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
-  auto &views = scratch.logit_views;
-  views.clear();
-  auto add_view = [&](MLABuffer &buffer, uint32_t begin, uint32_t width) {
-    if (buffer.get_dtype() != "bfloat16" || buffer.get_shape().size() != 2 ||
-        buffer.get_shape().front() != num_tokens ||
-        buffer.get_shape().back() != width) {
-      throw std::runtime_error("Invalid DFlash target logit buffer");
-    }
-    buffer.invalidate_cache();
-    views.push_back(DFlashLogitView{
-        static_cast<const uint8_t *>(buffer.get_virtual_addr()),
-        buffer.get_buf_len(std::vector<uint32_t>{1, width}), begin, width});
-  };
-  if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-    add_view(get_buffer(fmt::format("n{}_buffer4", num_tokens)), 0,
-             vocab_size);
-  } else {
-    for (uint32_t split = 0, begin = 0; begin < vocab_size;
-         begin += _cfg.lm_cfg.lm_head_split_dim, ++split) {
-      const uint32_t width =
-          std::min(_cfg.lm_cfg.lm_head_split_dim, vocab_size - begin);
-      add_view(get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split)),
-               begin, width);
-    }
-  }
-
-  for (uint16_t row = 0; row < num_tokens; ++row) {
-    float best = -std::numeric_limits<float>::infinity();
-    uint32_t target_token = 0;
-    for (const auto &view : views) {
-      const auto *logits = reinterpret_cast<const Eigen::bfloat16 *>(
-          view.data + static_cast<size_t>(row) * view.row_stride);
-      for (uint32_t column = 0; column < view.width; ++column) {
-        const float value = static_cast<float>(logits[column]);
-        if (value > best) {
-          best = value;
-          target_token = view.vocab_begin + column;
-        }
-      }
-    }
-    if (row == num_tokens - 1 || target_token != input_ids[row + 1]) {
-      return {row, target_token};
-    }
-  }
-  throw std::runtime_error("DFlash verification did not produce a bonus token");
+  const auto target_tokens =
+      _argmax_lm_head_rows(num_tokens, num_tokens, input_ids.subspan(1));
+  return {static_cast<uint16_t>(target_tokens.size() - 1),
+          target_tokens.back()};
 }
 
 std::optional<std::vector<uint32_t>>

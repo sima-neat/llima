@@ -267,6 +267,10 @@ class LanguageModel : public BaseModel<VlmConfig> {
             MLABuffer* scales, size_t row_begin = 0
         );
         void _prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx);
+        std::vector<uint32_t> _argmax_lm_head_rows(
+            uint16_t num_tokens, uint16_t valid_tokens,
+            std::span<const uint32_t> expected_draft_tokens
+        );
         void _define_draft_fc_models();
         void _define_dflash_models();
         void _append_dflash_context(
