@@ -14,7 +14,7 @@ from PIL import Image
 from ml_dtypes import bfloat16, int4
 from transformers import AutoConfig, MistralConfig
 from transformers.image_utils import load_images
-from sima_utils.logging.sima_logger import sima_log_info
+from sima_lmm.logging import sima_log_info
 
 
 HF_SINGLE_MODEL_FILENAME = 'model.safetensors'

@@ -88,7 +88,6 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(OpenSSL REQUIRED)
-find_package(NeatInternals CONFIG REQUIRED)
 find_package(nlohmann_json 3.11.2 REQUIRED)
 
 # FFTW3 does not provide cmake file so find_package cannot find it.
@@ -296,15 +295,21 @@ foreach(_sima_lmm_license_index RANGE ${_sima_lmm_extra_license_last})
 endforeach()
 
 find_library(
-    SIMAAI_DISPATCHER_LIB
-    NAMES neatdispatchercore simaaidispatcher
+    SIMA_LMM_MLART_LIBRARY
+    NAMES MLArt
     PATHS
-        "${SYSROOT}/usr/lib/aarch64-linux-gnu/neat/runtime"
         "${SYSROOT}/usr/lib/aarch64-linux-gnu"
         "${SYSROOT}/usr/lib"
     REQUIRED
 )
-set(SIMAAI_DISPATCHER_INSTALL_LIB_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/neat/runtime")
+find_library(
+    SIMA_LMM_HEAP_LIBRARY
+    NAMES simaai_heap
+    PATHS
+        "${SYSROOT}/usr/lib/aarch64-linux-gnu"
+        "${SYSROOT}/usr/lib"
+    REQUIRED
+)
 
 # Build the core library.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
@@ -320,11 +325,9 @@ set_target_properties(
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
 )
-message(STATUS "Using MLA dispatcher library: ${SIMAAI_DISPATCHER_LIB}")
-set_target_properties(
-    ${TARGET_RUNTIME} PROPERTIES
-    INSTALL_RPATH "\$ORIGIN;${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
-)
+message(STATUS "Using MLA-RT library: ${SIMA_LMM_MLART_LIBRARY}")
+message(STATUS "Using SiMa DMA heap library: ${SIMA_LMM_HEAP_LIBRARY}")
+set_target_properties(${TARGET_RUNTIME} PROPERTIES INSTALL_RPATH "\$ORIGIN")
 target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
 target_compile_definitions(
     ${TARGET_RUNTIME}
@@ -365,10 +368,9 @@ target_link_libraries(
         OpenSSL::Crypto
         PkgConfig::FFTW3
         cnpy-static
-        simaaimem
-        ${SIMAAI_DISPATCHER_LIB}
+        ${SIMA_LMM_HEAP_LIBRARY}
+        ${SIMA_LMM_MLART_LIBRARY}
     PUBLIC
-    NeatInternals::Headers
     opencv_core
     opencv_imgproc
     opencv_imgcodecs
@@ -410,7 +412,7 @@ if(SIMA_LMM_BUILD_PYTHON)
     )
     set_target_properties(
         ${TARGET_BIND} PROPERTIES
-        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
+        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR}"
     )
 endif()
 
@@ -513,6 +515,7 @@ patch: ${PROJECT_VERSION_PATCH}
     install(
         FILES
             "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/__init__.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/logging.py"
         DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
         COMPONENT cli
     )
@@ -572,22 +575,21 @@ set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
 
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
-    "neat-runtime, "
-    "simaai-memory-lib, "
-    "libcpp-httplib0.11, libfftw3-double3, "
-    "libopencv-core406, libopencv-imgproc406, libopencv-imgcodecs406, "
-    "libavcodec59, libavformat59, libavutil57, libswresample4, "
-    "libzmq5, libssl3, libreadline8, libgomp1, "
-    "libfmt9, libspdlog1.10")
+    "simaai-mlart-modalix, "
+    "simaai-heap (>= 3.0~), "
+    "libcpp-httplib0.18, libfftw3-double3, "
+    "libopencv-core410, libopencv-imgproc410, libopencv-imgcodecs410, "
+    "libavcodec61, libavformat61, libavutil59, libswresample5, "
+    "libzmq5, libssl3t64, libreadline8t64, libgomp1, "
+    "libfmt10, libspdlog1.15")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
-    "neat-internals-dev, "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
     "libssl-dev, cppzmq-dev, libzmq3-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_DEPENDS
-    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), simaai-utils, python3")
+    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), python3")
 
 set(CPACK_INSTALL_CMAKE_PROJECTS
     "${CMAKE_BINARY_DIR};${PROJECT_NAME};ALL;/"

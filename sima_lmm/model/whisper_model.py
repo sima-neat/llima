@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from ml_dtypes import bfloat16
 from pathlib import Path
 
-from sima_utils.logging.sima_logger import ScopedLogLevel, sima_log_info
+from sima_lmm.logging import ScopedLogLevel, sima_log_info
 from transformers.audio_utils import mel_filter_bank
 
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel, find_file
