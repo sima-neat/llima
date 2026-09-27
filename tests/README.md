@@ -264,7 +264,6 @@ Runtime CI validates installed artifacts through the same public entry points
 used on a Modalix DevKit. It requires:
 
 - ARM64 Modalix hardware.
-- An active `simaai-appcomplex.service`.
 - MLA hardware initialized by the platform service.
 - Exact LLiMa packages from the candidate build.
 
@@ -351,7 +350,7 @@ Pytest validates the installed package and external interfaces:
 
 | Test | Coverage |
 |------|----------|
-| Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
+| Installed Python lifecycle | Imports the installed extension and connects to and disconnects from MLA-RT |
 | CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
 | Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
 | OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
@@ -379,9 +378,8 @@ CTest and pytest run in dedicated process groups. Cancellation sends only
 `SIGINT` to active inference and waits for graceful shutdown; it never
 escalates to `SIGTERM` or `SIGKILL`.
 
-Runtime cases run serially against the same `simaai-appcomplex.service`
-process. They do not restart the service between cases, so retained dispatcher
-or MLA state is visible to subsequent tests.
+Runtime cases run serially against the same MLA hardware. They do not reset the
+platform between cases, so retained MLA state is visible to subsequent tests.
 
 ### Cleanup and retained state
 
@@ -397,7 +395,7 @@ The runner deliberately retains:
 
 - Installed LLiMa Debian packages, which the next run overwrites.
 - Downloaded Qwen, LFM2, and Whisper models.
-- The running `simaai-appcomplex.service`.
+- Platform-managed MLA runtime state.
 
 Runtime tests do not upload reports or generated outputs after execution.
 
