@@ -32,10 +32,6 @@ def _unused_tcp_port() -> int:
 
 def test_zmq_generate_request_and_remote_stop(tmp_path):
     assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
-    subprocess.run(
-        ["systemctl", "is-active", "--quiet", "simaai-appcomplex.service"],
-        check=True,
-    )
 
     models_path = Path(os.environ.get("LLIMA_MODELS_PATH", DEFAULT_MODELS_PATH))
     model_name = _text_model_name()
