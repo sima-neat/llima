@@ -52,7 +52,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::set<uint32_t> stop_token_ids,
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
-            TextStreamer& text_streamer
+            TextStreamer& text_streamer,
+            std::shared_ptr<FileProvider> file_provider = nullptr
         );
         virtual ~LanguageModel() override { _finalize(); }
 

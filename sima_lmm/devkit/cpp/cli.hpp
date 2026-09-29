@@ -8,6 +8,7 @@
 #include <string>
 
 #include "chat.hpp"
+#include "file_provider.hpp"
 #include "readline_helper.hpp"
 #include "utils.hpp"
 #include "vision_language_model.hpp"
@@ -24,7 +25,8 @@ class EXPORT CLI {
             std::optional<std::filesystem::path> whisper_model_path,
             std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
-            std::optional<std::string> chat_template
+            std::optional<std::string> chat_template,
+            std::shared_ptr<FileProvider> file_provider = nullptr
         );
         ~CLI();
 

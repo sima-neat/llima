@@ -15,6 +15,7 @@
 namespace simaai {
 namespace llima {
 
+class FileProvider;  // forward declaration; full type in file_provider.hpp
 class LanguageModel;
 
 void connect_mla_rt(const std::vector<std::string>& args);
@@ -45,7 +46,8 @@ class MLAModelWithBuffer {
 
         static void run_queue();
         static void load_all_models(
-            std::optional<std::filesystem::path> relative_dir = std::nullopt
+            std::optional<std::filesystem::path> relative_dir = std::nullopt,
+            FileProvider* files = nullptr
         );
         static void free_all_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt

@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "file_provider.hpp"
 #include "mla_buffer.hpp"
 #include "mla_model.hpp"
 #include "vlm_config.hpp"
@@ -27,15 +28,21 @@ namespace llima {
 template <typename T>
 class BaseModel {
     protected:
-        BaseModel(std::filesystem::path model_path) requires std::is_same_v<T, VlmConfig>
-          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
+        BaseModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<FileProvider> file_provider = nullptr
+        ) requires std::is_same_v<T, VlmConfig>
+          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit"),
+            _files(file_provider
+                ? std::move(file_provider)
+                : std::make_shared<DiskFileProvider>(model_path))
         {
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("VLM") : spdlog::default_logger();
 
-            std::filesystem::path config_file_name = _devkit_dir / "vlm_config.json";
+            const char* config_file_name = "devkit/vlm_config.json";
             try {
-                _cfg = nlohmann::json::parse(std::ifstream(config_file_name)).get<VlmConfig>();
+                _cfg = nlohmann::json::parse(*_files->open_stream(config_file_name)).get<VlmConfig>();
             } catch (const std::exception& e) {
                 std::cerr << "Failed to load vlm config: " << config_file_name << ", "
                     << e.what() << std::endl;
@@ -43,8 +50,14 @@ class BaseModel {
             }
         }
 
-        BaseModel(std::filesystem::path model_path) requires std::is_same_v<T, WhisperConfig>
-          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
+        BaseModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<FileProvider> file_provider = nullptr
+        ) requires std::is_same_v<T, WhisperConfig>
+          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit"),
+            _files(file_provider
+                ? std::move(file_provider)
+                : std::make_shared<DiskFileProvider>(model_path))
         {
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("Whisper") : spdlog::default_logger();
@@ -100,6 +113,11 @@ class BaseModel {
         T _cfg;
         std::filesystem::path _elf_dir;
         std::filesystem::path _devkit_dir;
+        // The seam between LLiMa and the files it loads (Approach B). Every
+        // text-path read routes through this. The default is a DiskFileProvider
+        // rooted at model_path, so today's behaviour is byte-for-byte the same.
+        // A PCIe provider can be injected via the constructor instead.
+        std::shared_ptr<FileProvider> _files;
         std::map<std::string, MLABuffer> _buf_map;
 
         // Logging.
