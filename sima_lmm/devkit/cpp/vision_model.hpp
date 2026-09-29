@@ -1,11 +1,13 @@
 #ifndef _SIMA_LLIMA_VISION_MODEL_
 #define _SIMA_LLIMA_VISION_MODEL_
 
+#include <memory>
 #include <vector>
 
 #include <Eigen/Dense>
 
 #include "base_model.hpp"
+#include "file_provider.hpp"
 #include "vlm_config.hpp"
 
 
@@ -14,7 +16,10 @@ namespace llima {
 
 class VisionModel : public BaseModel<VlmConfig> {
     public:
-        VisionModel(std::filesystem::path model_path);
+        VisionModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<FileProvider> file_provider = nullptr
+        );
         virtual ~VisionModel() { _finalize(); };
 
         void run_model(

@@ -32,9 +32,11 @@ CLI::CLI(
     std::optional<std::filesystem::path> whisper_model_path,
     std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
-    std::optional<std::string> chat_template
+    std::optional<std::string> chat_template,
+    std::shared_ptr<FileProvider> file_provider
 ) : _vision_language_model_ptr(
-        std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
+        std::make_unique<VisionLanguageModel>(
+            vlm_model_path, system_prompt, chat_template, std::move(file_provider))
     )
 {
     if (_singleton_ptr)

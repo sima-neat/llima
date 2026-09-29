@@ -70,6 +70,20 @@ if(SIMA_LMM_BUILD_PYTHON)
                 INTERFACE_LINK_LIBRARIES "${Python_LIBRARY}"
             )
         endif()
+        # nanobind's STABLE_ABI (abi3) path links Python::SABIModule when it exists.
+        # In this cross build FindPython's Development.SABIModule component is not
+        # available, so alias it to the manual Python::Module target above. Pass an
+        # empty Python_LIBRARY so no libpythonX.Y is linked: the abi3 module carries
+        # no version-specific NEEDED entry and imports on any CPython >= 3.12 (the
+        # board runs 3.13). Undefined Py* symbols resolve at dlopen (LDFLAGS keeps
+        # --allow-shlib-undefined).
+        if(NOT TARGET Python::SABIModule)
+            add_library(Python::SABIModule INTERFACE IMPORTED)
+            set_target_properties(Python::SABIModule PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${Python_INCLUDE_DIR}"
+                INTERFACE_LINK_LIBRARIES "${Python_LIBRARY}"
+            )
+        endif()
     else()
         find_package(Python 3.11 COMPONENTS Interpreter Development REQUIRED)
     endif()
@@ -310,12 +324,19 @@ find_library(
         "${SYSROOT}/usr/lib"
     REQUIRED
 )
+find_library(SIMAAI_SVC_LIBRARY
+    NAMES simaaipep simaai_svc simaai_pep
+    PATHS "${SYSROOT}/usr/lib/aarch64-linux-gnu" "${SYSROOT}/usr/lib")
+find_path(SIMAAI_SVC_INCLUDE_DIR simaai_svc.h
+    PATHS "${SYSROOT}/usr/include/simaai" "${SYSROOT}/usr/include")
+message(STATUS "Using simaai_svc library: ${SIMAAI_SVC_LIBRARY}")
 
 # Build the core library.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     "sima_lmm/devkit/cpp/*.cpp"
 )
 list(FILTER SOURCES EXCLUDE REGEX "sima_lmm/devkit/cpp/binding.cpp")
+list(FILTER SOURCES EXCLUDE REGEX "sima_lmm/devkit/cpp/pcie_file_provider.cpp")
 
 add_library(${TARGET_RUNTIME} SHARED ${SOURCES})
 set_target_properties(
@@ -398,17 +419,40 @@ target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
 )
 
 if(SIMA_LMM_BUILD_PYTHON)
+    # STABLE_ABI builds cpp_ext against the CPython limited API (floor 3.12) so the
+    # single cpp_ext.abi3.so imports on any CPython >= 3.12, including the board's
+    # 3.13. See the Python::SABIModule alias above and Ruling 7.
     nanobind_add_module(
         ${TARGET_BIND}
         NOMINSIZE
         LTO
+        STABLE_ABI
         sima_lmm/devkit/cpp/binding.cpp
+        sima_lmm/devkit/cpp/pcie_file_provider.cpp
     )
+    target_include_directories(${TARGET_BIND} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+    # simaai_svc.h is optional. Without it cpp_ext still builds and disk runs
+    # work; pcie_file_provider.cpp detects the missing header and --pcie then
+    # fails at run time with a clear message.
+    if(SIMAAI_SVC_INCLUDE_DIR)
+        target_include_directories(${TARGET_BIND} PRIVATE "${SIMAAI_SVC_INCLUDE_DIR}")
+    else()
+        message(WARNING "simaai_svc.h not found: cpp_ext is built WITHOUT PCIe "
+                        "support (llima run --pcie will not work).")
+    endif()
 
+    # Do NOT link ${SIMAAI_SVC_LIBRARY} here: pcie_file_provider.cpp resolves
+    # svc lazily with dlopen, so cpp_ext carries no DT_NEEDED on libsimaaipep.so
+    # and imports on boards with no PCIe stack (disk-only runs stay working).
+    # ${CMAKE_DL_LIBS} provides dlopen/dlsym (empty on glibc >= 2.34, where they
+    # live in libc, but kept for portability).
     target_link_libraries(
         ${TARGET_BIND}
         PRIVATE
         ${TARGET_RUNTIME}
+        ${CMAKE_DL_LIBS}
+        fmt::fmt
     )
     set_target_properties(
         ${TARGET_BIND} PROPERTIES
@@ -416,11 +460,47 @@ if(SIMA_LMM_BUILD_PYTHON)
     )
 endif()
 
+# PCIe GenAI card program. Its sources live in sima_lmm/devkit/pcie_backend/,
+# outside the core GLOB, so libsima_lmm_runtime.so stays svc-free. Like
+# cpp_ext, it compiles pcie_file_provider.cpp itself and does NOT link
+# ${SIMAAI_SVC_LIBRARY}: libsimaaipep.so is dlopen'ed RTLD_LOCAL at run time
+# (RTLD_GLOBAL broke large pulls with -EPROTO).
+if(SIMAAI_SVC_INCLUDE_DIR)
+    find_package(Threads REQUIRED)
+    add_executable(pcie-genai-backend
+        sima_lmm/devkit/pcie_backend/main.cpp
+        sima_lmm/devkit/pcie_backend/backend_loop.cpp
+        sima_lmm/devkit/pcie_backend/chat_policy.cpp
+        sima_lmm/devkit/pcie_backend/dl_svc_client.cpp
+        sima_lmm/devkit/pcie_backend/event_bridge.cpp
+        sima_lmm/devkit/pcie_backend/genai_protocol.cpp
+        sima_lmm/devkit/pcie_backend/lifecycle.cpp
+        sima_lmm/devkit/pcie_backend/recv_sweep.cpp
+        sima_lmm/devkit/pcie_backend/vlm_generator.cpp
+        sima_lmm/devkit/pcie_backend/vlm_image.cpp
+        sima_lmm/devkit/cpp/pcie_file_provider.cpp
+    )
+    target_include_directories(pcie-genai-backend PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit/cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit/pcie_backend"
+        "${SIMAAI_SVC_INCLUDE_DIR}")
+    target_link_libraries(pcie-genai-backend PRIVATE
+        ${TARGET_RUNTIME}
+        ${CMAKE_DL_LIBS}
+        fmt::fmt
+        spdlog::spdlog
+        nlohmann_json::nlohmann_json
+        Threads::Threads)
+    set_target_properties(pcie-genai-backend PROPERTIES
+        INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR}")
+endif()
+
 set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/base_model.hpp
     sima_lmm/devkit/cpp/chat.hpp
     sima_lmm/devkit/cpp/eagle_helpers.hpp
     sima_lmm/devkit/cpp/eigen_types.hpp
+    sima_lmm/devkit/cpp/file_provider.hpp
     sima_lmm/devkit/cpp/image_processor.hpp
     sima_lmm/devkit/cpp/language_model.hpp
     sima_lmm/devkit/cpp/mla_buffer.hpp

@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import sys
 import time
 import subprocess
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from sima_lmm.devkit import model_manager
 from sima_lmm.devkit.model_manager import ModelManager
+from sima_lmm.devkit.pcie_config import recv_root_from_pep_conf
 from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
 from sima_lmm.logging import (
     configure_runtime_logging,
@@ -78,26 +80,63 @@ def _kill_existing_llima_session() -> None:
 
 def run_model(args: argparse.Namespace) -> int:
     args.mode = DemoMode(args.mode)
-    user_model_path = _resolve_run_model_path(args.model)
-    try:
-        model_path, draft_model_path = model_manager.resolve_target_and_draft_paths(
-            user_model_path
-        )
-    except RuntimeError as e:
-        print(str(e), flush=True)
-        return 1
-    if not (model_path / "devkit").is_dir() or not (model_path / "elf_files").is_dir():
-        print(
-            "Model directory missing required 'devkit' or 'elf_files' directories.",
-            flush=True,
-        )
-        return 1
-    if not (model_path / "devkit" / "vlm_config.json").is_file():
-        print(
-            "Model directory missing required 'devkit/vlm_config.json' file.",
-            flush=True,
-        )
-        return 1
+
+    if args.pcie:
+        # Only the CLI builds the PCIe file provider; WEB would get an empty
+        # recv-root as its model path and fail with an unclear config error.
+        if args.mode != DemoMode.CLI:
+            print("--pcie is supported only with --mode cli.", flush=True)
+            return 1
+        # Whisper is not pulled over PCIe: it always reads a local folder.
+        if args.stt_model_path and not Path(args.stt_model_path).is_dir():
+            print(
+                f"--stt_model_path '{args.stt_model_path}' is not a local folder. "
+                "The speech model is not pulled over PCIe; give a local path.",
+                flush=True,
+            )
+            return 1
+        # The model's remote subfolder is just the positional model name (the
+        # host serves it under <serve-root>/<model>), so no separate flag.
+        # The receive dir defaults to the pep-daemon's default-recv root, so the
+        # value the daemon already owns need not be repeated on the command line.
+        pcie_recv_root = args.pcie_recv_root or recv_root_from_pep_conf()
+        if not pcie_recv_root:
+            print(
+                "--pcie could not determine the receive directory. Pass "
+                "--pcie-recv-root, or set 'default-recv' (and its [recv] path) "
+                "in /etc/simaai/simaai-pep-daemon.conf.",
+                flush=True,
+            )
+            return 1
+        # Parallel load needs the whole batch on disk at once; PCIe pulls one ELF
+        # at a time, so force the serial load path. This env var is read once into
+        # a static (mla_model.hpp), so it MUST be set before connect()/CLI() below.
+        os.environ["SIMA_LLIMA_RUN_DISABLE_PARALLEL_LOAD"] = "1"
+        model_path = Path(pcie_recv_root)        # provider recv-root == model_path
+        draft_model_path = None                  # draft-over-PCIe out of scope
+        model_path.mkdir(parents=True, exist_ok=True)
+        # Skip the local model-dir existence checks: files are not on the board yet.
+    else:
+        user_model_path = _resolve_run_model_path(args.model)
+        try:
+            model_path, draft_model_path = model_manager.resolve_target_and_draft_paths(
+                user_model_path
+            )
+        except RuntimeError as e:
+            print(str(e), flush=True)
+            return 1
+        if not (model_path / "devkit").is_dir() or not (model_path / "elf_files").is_dir():
+            print(
+                "Model directory missing required 'devkit' or 'elf_files' directories.",
+                flush=True,
+            )
+            return 1
+        if not (model_path / "devkit" / "vlm_config.json").is_file():
+            print(
+                "Model directory missing required 'devkit/vlm_config.json' file.",
+                flush=True,
+            )
+            return 1
 
     # Update logging config.
     _init_logging(args.mode, args.log_level)
@@ -132,6 +171,9 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
+                args.pcie_serve_root if args.pcie else None,
+                args.model if args.pcie else None,
+                str(model_path) if args.pcie else None,
             )
         else:
             demo = WEB(
@@ -274,6 +316,14 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Path to the file with chat template.",
     )
     run_parser.add_argument("--log_level", type=str, default=None, help="Logging level")
+    run_parser.add_argument("--pcie", action="store_true",
+        help="Pull model files over PCIe from the host instead of reading local disk.")
+    run_parser.add_argument("--pcie-serve-root", default="models",
+        help="Host serve-root name registered with simaai_svc (default: models).")
+    run_parser.add_argument("--pcie-recv-root", default=None,
+        help="Board directory where pulled files are staged one ELF at a time "
+             "(default: the pep-daemon's default-recv root from "
+             "/etc/simaai/simaai-pep-daemon.conf).")
     run_parser.set_defaults(func=run_model)
 
 

@@ -24,13 +24,15 @@ namespace llima {
 
 class CLI;
 class WEB;
+namespace pcie_backend { class VlmGenerator; }
 
 class VisionLanguageModel : public BaseModel<VlmConfig> {
     public:
         VisionLanguageModel(
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,
-            std::optional<std::string> chat_template = std::nullopt
+            std::optional<std::string> chat_template = std::nullopt,
+            std::shared_ptr<FileProvider> file_provider = nullptr
         );
         ~VisionLanguageModel() {}
 
@@ -93,6 +95,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
     private:
         friend class CLI;
         friend class WEB;
+        friend class pcie_backend::VlmGenerator;  // PCIe backend: thinking support check
         std::string_view model_type() const { return _cfg.model_type; }
 
         VlmHelper _vlm_helper;

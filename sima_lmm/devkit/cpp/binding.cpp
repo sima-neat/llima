@@ -13,6 +13,8 @@
 #include <spdlog/spdlog.h>
 
 #include "cli.hpp"
+#include "file_provider.hpp"
+#include "pcie_file_provider.hpp"
 #include "setup.hpp"
 #include "web.hpp"
 #include "zmq_server.hpp"
@@ -75,18 +77,41 @@ NB_MODULE(cpp_ext, m) {
 
     nb::class_<CLI>(m, "CLI")
         .def(
-            nb::init<
-                std::filesystem::path,
-                std::optional<std::filesystem::path>,
-                std::optional<std::filesystem::path>,
-                std::optional<std::string>,
-                std::optional<std::string>
-            >(),
+            "__init__",
+            [](
+                CLI* self,
+                std::filesystem::path model_path,
+                std::optional<std::filesystem::path> whisper_model_path,
+                std::optional<std::filesystem::path> draft_model_path,
+                std::optional<std::string> system_prompt,
+                std::optional<std::string> chat_template,
+                std::optional<std::string> pcie_serve_root,
+                std::optional<std::string> pcie_subfolder,
+                std::optional<std::filesystem::path> pcie_recv_root
+            ) {
+                // This is the only place we pick which provider to use.
+                // --pcie sends all three pcie_* values, so we make a
+                // PcieFileProvider (pulls files over PCIe). Disk mode sends
+                // none, so we pass nullptr and the CLI uses the default
+                // DiskFileProvider (reads local files).
+                std::shared_ptr<FileProvider> file_provider =
+                    (pcie_serve_root && pcie_subfolder && pcie_recv_root)
+                        ? std::make_shared<PcieFileProvider>(
+                              *pcie_recv_root, *pcie_serve_root, *pcie_subfolder)
+                        : nullptr;
+                new (self) CLI(
+                    std::move(model_path), std::move(whisper_model_path),
+                    std::move(draft_model_path), std::move(system_prompt),
+                    std::move(chat_template), std::move(file_provider));
+            },
             nb::arg("model_path"),
             nb::arg("whisper_model_path") = nb::none(),
             nb::arg("draft_model_path") = nb::none(),
             nb::arg("system_prompt") = nb::none(),
-            nb::arg("chat_template") = nb::none()
+            nb::arg("chat_template") = nb::none(),
+            nb::arg("pcie_serve_root") = nb::none(),
+            nb::arg("pcie_subfolder") = nb::none(),
+            nb::arg("pcie_recv_root") = nb::none()
         )
         .def("run", &CLI::run)
     ;

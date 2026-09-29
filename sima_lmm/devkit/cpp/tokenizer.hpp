@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <istream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -45,6 +47,10 @@ class Tokenizer {
             const std::filesystem::path tokenizer_json_file_name
         );
 
+        // Same as from_hf_json, but reads the tokenizer.json blob from a byte
+        // stream (the file seam's open_stream) instead of a path on disk.
+        static std::unique_ptr<Tokenizer> from_hf_json(std::istream& tokenizer_json_stream);
+
         static std::unique_ptr<Tokenizer> from_gguf(const std::filesystem::path gguf_file_name);
 };
 
@@ -59,6 +65,13 @@ class HFTokenizer : public Tokenizer {
             std::string blob(size, '\0');
             std::ifstream file(tokenizer_json_file_name, std::ios::binary);
             file.read(blob.data(), size);
+            _handle = tokenizers_new_from_str(blob.data(), blob.length());
+        }
+        explicit HFTokenizer(std::istream& tokenizer_json_stream) {
+            std::string blob(
+                (std::istreambuf_iterator<char>(tokenizer_json_stream)),
+                std::istreambuf_iterator<char>()
+            );
             _handle = tokenizers_new_from_str(blob.data(), blob.length());
         }
         HFTokenizer(const HFTokenizer& other) = delete;
