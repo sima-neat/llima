@@ -137,7 +137,9 @@ void set_status(const StatusWriter& writer, BackendStatus& status, std::string s
 
 // Start-up order, and why:
 //  1. claim the queue (pid file) - a second backend on the same queue stops
-//     here, before it can touch the log or the status file of the owner;
+//     here, before it can touch the log or the status file of the owner.
+//     A backend on ANOTHER queue gets its own log and status, then stops at
+//     the card claim (recv-root.pid), before it touches the recv root;
 //  2. send output to the queue log - the host started us with nohup;
 //  3. status "starting" - the host now sees that we are alive;
 //  4. open the two svc handles - fail fast if the pep daemon is not running,
@@ -171,6 +173,14 @@ int run(const Args& args) {
     status.started_at = now_utc_iso8601();
     set_status(writer, status, "starting", "loading model over PCIe");
 
+    // Only ONE backend per card, whatever its queue: all of them use the same
+    // recv root and the same file names (devkit/vlm_config.json, the ELFs), so
+    // a second one would overwrite or evict the first one's files, and its
+    // start-up sweep would delete them. Claimed first in the try below, before
+    // that sweep; released when this function returns.
+    QueueOwnership card_claim(run_dir / "recv-root.pid", run_dir / "recv-root.status",
+                              kProgramName);
+
     bool connected = false;
     // Leftovers in the recv root use RAM (it is a tmpfs) and once OOM-killed a
     // load. Clean at start (before our first pull, so none of OUR files can be
@@ -180,6 +190,13 @@ int run(const Args& args) {
     const long long min_mem_mib = env_non_negative("SIMA_NEAT_PCIE_MIN_MEM_MIB", 2048);
     std::optional<std::filesystem::path> recv_root;
     try {
+        try {
+            card_claim.acquire();
+        } catch (const QueueBusyError& e) {
+            throw std::runtime_error(fmt::format(
+                "another pcie-genai-backend is already running on this card ({}); only one can "
+                "run at a time, because they share the recv root", e.what()));
+        }
         recv_root = args.recv_root ? args.recv_root : recv_root_from_pep_conf();
         if (!recv_root) {
             throw std::runtime_error("cannot find the pep daemon recv root; pass --recv-root");
