@@ -493,6 +493,10 @@ if(SIMAAI_SVC_INCLUDE_DIR)
         Threads::Threads)
     set_target_properties(pcie-genai-backend PROPERTIES
         INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR}")
+    # The host starts /usr/bin/pcie-genai-backend over SSH, so ship it in the
+    # core package next to libsima_lmm_runtime.so, which it links.
+    install(TARGETS pcie-genai-backend
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT core)
 endif()
 
 set(SIMA_LMM_PUBLIC_HEADERS
