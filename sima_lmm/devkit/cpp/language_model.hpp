@@ -28,6 +28,7 @@ namespace simaai {
 namespace llima {
 
 struct EmbeddingOffload;
+class KvEviction;
 
 struct LogLikelihoodResult {
     double logprob;
@@ -97,6 +98,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
             GenerationPerformanceResult* performance_result = nullptr
         );
         void stop_model() { _is_running = false; }
+
+        // Enables, changes or disables KV cache eviction; drops the cached conversation.
+        void set_kv_eviction(const KvEvictionConfig& kv_eviction);
 
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
@@ -254,6 +258,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
     private:
         std::shared_ptr<EmbeddingOffload> _embedding_offload;
+        std::shared_ptr<KvEviction> _kv_eviction;
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,
             MLABuffer* scales, size_t row_begin = 0

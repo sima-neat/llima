@@ -182,8 +182,9 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
             layer_types.begin(), layer_types.end(),
             [](const auto& type) { return type == "conv" || type == "linear_attention"; }
         );
+    // KV cache eviction also pins the stable prefix.
     if (
-        uses_state_checkpoints
+        (uses_state_checkpoints || _vlm_cfg.pipeline_cfg.kv_eviction.enabled())
         && !messages.empty()
         && (messages.front().value("role", "") == "system" || !inputs.tools.empty())
     ) {

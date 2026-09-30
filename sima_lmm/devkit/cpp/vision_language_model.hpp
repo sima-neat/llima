@@ -59,6 +59,9 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         );
         void stop_model();
 
+        // Overrides pipeline_cfg.kv_eviction; drops the cached conversation.
+        void set_kv_eviction(const KvEvictionConfig& kv_eviction);
+
         // Configure a non-owning draft VLM for speculative decoding. When set,
         // run_model dispatches through the spec path automatically.
         void set_draft_vlm(VisionLanguageModel* draft_vlm) { _draft_vlm_ptr = draft_vlm; }

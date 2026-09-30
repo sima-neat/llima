@@ -269,6 +269,10 @@ jobs:
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./lib/sima-lmm/tests/sima_lmm_reasoning_parser_test" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_kv_eviction_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
+          "./lib/sima-lmm/tests/sima_lmm_kv_eviction_generation_test" >/dev/null
+        tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./share/sima-lmm/tests/runtime/pytest.ini" >/dev/null
         tar -tzf "dist/sima-lmm-${llima_version}-Linux-extras.tar.gz" \
           "./share/sima-lmm/tests/runtime/test_mla_memory_cleanup.py" >/dev/null
@@ -596,6 +600,8 @@ jobs:
           test -x "${test_dir}/sima_lmm_vision_generation_test"
           test -x "${test_dir}/sima_lmm_asr_transcription_test"
           test -x "${test_dir}/sima_lmm_tool_call_parser_test"
+          test -x "${test_dir}/sima_lmm_kv_eviction_test"
+          test -x "${test_dir}/sima_lmm_kv_eviction_generation_test"
 
           python3 - <<'PY'
           from pathlib import Path
@@ -607,6 +613,8 @@ jobs:
               "sima_lmm_vision_generation_test",
               "sima_lmm_asr_transcription_test",
               "sima_lmm_tool_call_parser_test",
+              "sima_lmm_kv_eviction_test",
+              "sima_lmm_kv_eviction_generation_test",
           )
 
           for name in test_binaries:
