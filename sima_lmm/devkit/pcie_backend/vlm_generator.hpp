@@ -39,6 +39,7 @@ class VlmGenerator final : public Generator {
     private:
         void _apply_settings(const std::string& system_prompt, bool enable_thinking);
         void _clear_history();
+        bool _supports_thinking() const;
 
         VisionLanguageModel& _vlm;
         std::filesystem::path _recv_root;
