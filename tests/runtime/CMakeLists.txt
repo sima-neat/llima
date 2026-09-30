@@ -57,8 +57,10 @@ set_tests_properties(runtime.pcie_genai_vlm_image PROPERTIES LABELS "runtime;uni
 
 # The pure chat rules VlmGenerator uses (no LLiMa runtime needed).
 add_executable(sima_lmm_pcie_genai_chat_policy_test pcie_genai_chat_policy_test.cpp
-    "${PCIE_BACKEND_DIR}/chat_policy.cpp")
-target_include_directories(sima_lmm_pcie_genai_chat_policy_test PRIVATE "${PCIE_BACKEND_DIR}")
+    "${PCIE_BACKEND_DIR}/chat_policy.cpp"
+    "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/reasoning_parser.cpp")
+target_include_directories(sima_lmm_pcie_genai_chat_policy_test PRIVATE "${PCIE_BACKEND_DIR}"
+    "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
 add_test(NAME runtime.pcie_genai_chat_policy COMMAND sima_lmm_pcie_genai_chat_policy_test)
 set_tests_properties(runtime.pcie_genai_chat_policy PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
 

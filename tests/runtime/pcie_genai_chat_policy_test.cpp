@@ -3,6 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "chat_policy.hpp"
 
@@ -55,11 +56,52 @@ void test_cap_max_new_tokens() {
            "context + cap never passes 65535");
 }
 
+// Feed chunks the way LLiMa streams them; collect what goes where.
+StreamSplit::Out feed(StreamSplit& split, const std::vector<std::string>& chunks) {
+    StreamSplit::Out all;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        const auto out = split.add(chunks[i], i + 1 == chunks.size(), false);
+        all.to_host += out.to_host;
+        all.to_answer += out.to_answer;
+    }
+    return all;
+}
+
+void test_stream_split() {
+    using simaai::llima::ReasoningFormat;
+    const std::vector<std::string> thought = {"<thi", "nk>secret plan", "</think>", "Hello", "!"};
+    // LFM2 with thinking off still reasons; that must not reach the host.
+    {
+        StreamSplit split(ReasoningFormat::Lfm2, false);
+        const auto out = feed(split, thought);
+        expect(out.to_host.find("secret") == std::string::npos &&
+                   out.to_host.find("<think>") == std::string::npos,
+               "hidden LFM2 reasoning is not sent: " + out.to_host);
+        expect(out.to_host == "Hello!", "the host gets the answer: " + out.to_host);
+        expect(out.to_answer == "Hello!", "the history gets the answer");
+    }
+    // Thinking on: the host still sees the raw text (markers show the thinking);
+    // the history keeps only the answer.
+    {
+        StreamSplit split(ReasoningFormat::Lfm2, true);
+        const auto out = feed(split, thought);
+        expect(out.to_host == "<think>secret plan</think>Hello!", "thinking on: raw to host");
+        expect(out.to_answer == "Hello!", "thinking on: answer only in history");
+    }
+    // A model without reasoning: everything is the answer.
+    {
+        StreamSplit split(ReasoningFormat::None, false);
+        const auto out = feed(split, {"Hel", "lo"});
+        expect(out.to_host == "Hello" && out.to_answer == "Hello", "no reasoning: pass-through");
+    }
+}
+
 int main() {
     test_effective_system_prompt();
     test_after_run();
     test_cap_max_new_tokens();
     test_kept_files();
+    test_stream_split();
     if (failures == 0) std::cout << "pcie_genai_chat_policy_test passed\n";
     return failures == 0 ? 0 : 1;
 }
