@@ -47,6 +47,9 @@ void test_refuses_bad_prompts() {
     expect(refuses([] { parse_prompt("[1]"); }), "non-object refused");
     expect(refuses([] { parse_prompt(R"({"id":"x"})"); }), "missing prompt refused");
     expect(refuses([] { parse_prompt(R"({"prompt":""})"); }), "empty prompt refused");
+    // A present id that is not a string: the answer could not be matched to it.
+    expect(refuses([] { parse_prompt(R"({"id":7,"prompt":"Hi"})"); }), "numeric id refused");
+    expect(refuses([] { parse_prompt(R"({"id":null,"prompt":"Hi"})"); }), "null id refused");
     expect(refuses([] { parse_prompt(R"({"prompt":"Hi","max_new_tokens":-1})"); }),
            "negative max_new_tokens refused");
     // A wrong-type system_prompt must not be ignored (that would silently use the
@@ -113,6 +116,7 @@ void test_parses_chat() {
     expect(refuses([] { parse_chat(R"({"id":"x","op":"nope"})"); }), "unknown op refused");
     expect(refuses([] { parse_chat(R"({"id":"x"})"); }), "missing op refused");
     expect(refuses([] { parse_chat("not json"); }), "bad JSON refused");
+    expect(refuses([] { parse_chat(R"({"id":["x"],"op":"print"})"); }), "non-string chat id refused");
     expect(refuses([] { parse_chat(R"({"op":"reset","system_prompt":5})"); }),
            "non-string system prompt refused");
     expect(refuses([] { parse_chat(R"({"op":"reset","enable_thinking":"true"})"); }),
