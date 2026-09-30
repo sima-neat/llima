@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <csignal>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
@@ -81,6 +83,64 @@ void test_stale_pid_file_is_taken_over() {
     expect(!std::filesystem::exists(status_path), "the stale status file is removed");
 }
 
+// The race an earlier version had: with a stale pid file, two starters both
+// saw it as stale, and the second removed the first one's NEW file. Now the
+// stale check runs only under the flock, so the second starter is refused and
+// leaves the first one's pid file alone. A child process holds the claim here,
+// like a second backend would.
+void test_stale_takeover_cannot_remove_a_new_claim() {
+    const auto dir = make_temp_dir();
+    const auto pid_path = dir / "recv-root.pid";
+    const auto status_path = dir / "recv-root.status";
+    std::ofstream(pid_path) << "1\n";  // stale: pid 1 is not our program
+    int ready[2];
+    if (::pipe(ready) != 0) throw std::runtime_error("pipe failed");
+    const pid_t child = ::fork();
+    if (child == 0) {
+        ::close(ready[0]);
+        QueueOwnership holder(pid_path, status_path, "no-such-program-name");
+        holder.acquire();
+        (void)!::write(ready[1], "x", 1);
+        ::sleep(30);
+        _exit(0);
+    }
+    ::close(ready[1]);
+    char c = 0;
+    expect(::read(ready[0], &c, 1) == 1, "the child took the claim");
+    ::close(ready[0]);
+    // Same (stale-looking) program name as the child: without the lock this
+    // second starter would take the child's file for stale and remove it.
+    QueueOwnership second(pid_path, status_path, "no-such-program-name");
+    bool busy = false;
+    std::string what;
+    try { second.acquire(); } catch (const QueueBusyError& e) { busy = true; what = e.what(); }
+    expect(busy, "a held lock makes the claim busy, whatever the pid file says");
+    expect(what.find("pid " + std::to_string(static_cast<long long>(child))) != std::string::npos,
+           "the busy message names the holder: " + what);
+    expect(std::stoll(read_file(pid_path)) == child, "the holder's pid file is left alone");
+    // The holder dies, but a second in-process claim keeps the lock: its busy
+    // message must not name the dead pid still in the file.
+    ::kill(child, SIGKILL);
+    ::waitpid(child, nullptr, 0);
+    {
+        QueueOwnership keeper(pid_path, status_path, "no-such-program-name");
+        keeper.acquire();
+        std::ofstream(pid_path) << child << "\n";  // as if not yet replaced
+        QueueOwnership probe(pid_path, status_path, "no-such-program-name");
+        std::string msg;
+        try { probe.acquire(); } catch (const QueueBusyError& e) { msg = e.what(); }
+        expect(!msg.empty() && msg.find("(pid ") == std::string::npos,
+               "a dead pid is not named as the holder: " + msg);
+    }
+    // The kernel dropped the dead child's lock; its pid file is stale now.
+    QueueOwnership third(pid_path, status_path, "no-such-program-name");
+    third.acquire();
+    expect(std::stoll(read_file(pid_path)) == ::getpid(), "a dead holder's claim is taken over");
+    third.release();
+    expect(std::filesystem::exists(QueueOwnership::lock_path_for(pid_path)),
+           "the lock file is never deleted");
+}
+
 void test_recv_root_from_pep_conf() {
     const auto dir = make_temp_dir();
     const auto conf = dir / "simaai-pep-daemon.conf";
@@ -111,6 +171,7 @@ int main() {
     test_status_file_matches_what_the_host_reads();
     test_queue_ownership();
     test_stale_pid_file_is_taken_over();
+    test_stale_takeover_cannot_remove_a_new_claim();
     test_recv_root_from_pep_conf();
     test_require_directory();
     if (failures == 0) std::cout << "pcie_genai_lifecycle_test passed\n";

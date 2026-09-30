@@ -14,6 +14,7 @@
 #include <system_error>
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -120,11 +121,60 @@ QueueOwnership::QueueOwnership(std::filesystem::path pid_path, std::filesystem::
 
 QueueOwnership::~QueueOwnership() { release(); }
 
+std::filesystem::path QueueOwnership::lock_path_for(const std::filesystem::path& pid_path) {
+    return pid_path.string() + ".lock";
+}
+
+// The real claim is an flock() on "<pid file>.lock", held until release() or
+// until this process dies (the kernel drops the lock then; a crash leaves
+// nothing stale). Only the lock holder may read, remove or write the pid file,
+// so the stale check below cannot race: two starters never both see the old
+// file as stale and remove each other's new one. The lock file is never
+// deleted: deleting it would let a new starter lock a new file while an old
+// holder still locks the deleted one.
+//
 // A pid file can be left behind after a crash, and the pid can later be reused
 // by another program. So the old file is a real owner only if its pid is alive
-// AND /proc/<pid>/cmdline shows our program. Otherwise it is stale: remove it
-// (and its old status file, so the host cannot read a stale "ready").
+// AND /proc/<pid>/cmdline shows our program (an older backend without the
+// lock). Otherwise it is stale: remove it (and its old status file, so the
+// host cannot read a stale "ready").
 void QueueOwnership::acquire() {
+    const std::filesystem::path lock_path = lock_path_for(_pid_path);
+    // O_RDONLY is enough for flock, and works on a lock file another user made.
+    const int lock_fd = ::open(lock_path.c_str(), O_RDONLY | O_CREAT | O_CLOEXEC,
+                               S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (lock_fd < 0) {
+        throw std::runtime_error("failed to open lock file " + lock_path.string() + ": " +
+                                 std::strerror(errno));
+    }
+    if (::flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        const int saved = errno;
+        ::close(lock_fd);
+        if (saved == EWOULDBLOCK) {
+            // Named only if alive: a new holder may not have replaced a dead
+            // holder's pid file yet.
+            std::string holder;
+            const std::optional<pid_t> pid = read_pid_file(_pid_path);
+            if (pid.has_value() && pid_is_live(*pid)) {
+                holder = " (pid " + std::to_string(static_cast<long long>(*pid)) + ")";
+            }
+            throw QueueBusyError(lock_path.string() + " is locked by another process" + holder);
+        }
+        throw std::runtime_error("failed to lock " + lock_path.string() + ": " +
+                                 std::strerror(saved));
+    }
+    _lock_fd = lock_fd;
+    try {
+        write_pid_file_locked();
+    } catch (...) {
+        ::close(_lock_fd);
+        _lock_fd = -1;
+        throw;
+    }
+    _owned = true;
+}
+
+void QueueOwnership::write_pid_file_locked() {
     if (std::filesystem::exists(_pid_path)) {
         const std::optional<pid_t> old_pid = read_pid_file(_pid_path);
         if (old_pid.has_value() && pid_is_live(*old_pid) &&
@@ -136,8 +186,8 @@ void QueueOwnership::acquire() {
         std::filesystem::remove(_pid_path, ec);
         std::filesystem::remove(_status_path, ec);
     }
-    // O_EXCL: if two backends start at the same time, only one can create the
-    // file. The other gets EEXIST and reports the queue as busy.
+    // O_EXCL: we hold the lock, so this only fails if an older backend without
+    // the lock made the file just now. That is reported as busy too.
     const int fd = ::open(_pid_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
                           S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     if (fd < 0) {
@@ -153,17 +203,20 @@ void QueueOwnership::acquire() {
         std::filesystem::remove(_pid_path, ec);
         throw std::runtime_error("failed to write pid file " + _pid_path.string());
     }
-    _owned = true;
 }
 
 void QueueOwnership::release() noexcept {
     if (!_owned) return;
-    // Remove the file only if it still has our pid: a newer owner may have
-    // taken over the queue, and its file must stay.
+    // Remove the file only if it still has our pid (the host's stop may have
+    // removed it already). Then drop the lock, last.
     const std::optional<pid_t> current = read_pid_file(_pid_path);
     if (current.has_value() && *current == ::getpid()) {
         std::error_code ec;
         std::filesystem::remove(_pid_path, ec);
+    }
+    if (_lock_fd >= 0) {
+        ::close(_lock_fd);
+        _lock_fd = -1;
     }
     _owned = false;
 }
