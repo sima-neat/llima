@@ -4,6 +4,7 @@
 #include <chrono>
 #include <fstream>
 #include <stdexcept>
+#include <utility>
 #include <system_error>
 
 #include <dlfcn.h>
@@ -275,6 +276,27 @@ void PcieFileProvider::release(std::string_view name) {
     if (const auto ec = _remove(abs)) {
         spdlog::warn("PCIe release could not remove {}: {}", abs.string(), ec.message());
     }
+}
+
+std::shared_ptr<FileProvider> pcie_provider_from_options(
+    const std::optional<std::string>& serve_root,
+    const std::optional<std::string>& subfolder,
+    const std::optional<std::filesystem::path>& recv_root) {
+    if (!serve_root && !subfolder && !recv_root) return nullptr;
+    if (serve_root && subfolder && recv_root) {
+        return std::make_shared<PcieFileProvider>(*recv_root, *serve_root, *subfolder);
+    }
+    std::string missing;
+    for (const auto& [set, name] : {std::pair{serve_root.has_value(), "pcie_serve_root"},
+                                    std::pair{subfolder.has_value(), "pcie_subfolder"},
+                                    std::pair{recv_root.has_value(), "pcie_recv_root"}}) {
+        if (set) continue;
+        if (!missing.empty()) missing += ", ";
+        missing += name;
+    }
+    throw std::invalid_argument(
+        "PCIe mode needs pcie_serve_root, pcie_subfolder and pcie_recv_root together; "
+        "missing: " + missing + " (give all three for PCIe, or none for the local disk)");
 }
 
 }  // namespace llima

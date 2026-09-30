@@ -90,15 +90,13 @@ NB_MODULE(cpp_ext, m) {
                 std::optional<std::filesystem::path> pcie_recv_root
             ) {
                 // This is the only place we pick which provider to use.
-                // --pcie sends all three pcie_* values, so we make a
-                // PcieFileProvider (pulls files over PCIe). Disk mode sends
-                // none, so we pass nullptr and the CLI uses the default
-                // DiskFileProvider (reads local files).
-                std::shared_ptr<FileProvider> file_provider =
-                    (pcie_serve_root && pcie_subfolder && pcie_recv_root)
-                        ? std::make_shared<PcieFileProvider>(
-                              *pcie_recv_root, *pcie_serve_root, *pcie_subfolder)
-                        : nullptr;
+                // --pcie sends all three pcie_* values: a PcieFileProvider
+                // (pulls files over PCIe). Disk mode sends none: nullptr, and
+                // the CLI uses the default DiskFileProvider (reads local
+                // files). Only some of them raise ValueError (see
+                // pcie_provider_from_options).
+                std::shared_ptr<FileProvider> file_provider = pcie_provider_from_options(
+                    pcie_serve_root, pcie_subfolder, pcie_recv_root);
                 new (self) CLI(
                     std::move(model_path), std::move(whisper_model_path),
                     std::move(draft_model_path), std::move(system_prompt),

@@ -11,6 +11,8 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -210,6 +212,33 @@ void test_get_path_other_errors_throw() {
 }
 }  // namespace
 
+// llima run's provider choice: all three PCIe values, or none. Some of them
+// is an error, never a silent fall back to the local disk.
+void test_provider_from_options_all_or_none() {
+    using simaai::llima::pcie_provider_from_options;
+    expect(pcie_provider_from_options(std::nullopt, std::nullopt, std::nullopt) == nullptr,
+           "no PCIe values = disk (nullptr)");
+    const auto p = pcie_provider_from_options(std::string("models"), std::string("m"),
+                                              std::filesystem::path("/tmp/pcie-recv"));
+    expect(p != nullptr && p->pulls_files(), "all three = a PCIe provider");
+    std::string what;
+    try {
+        pcie_provider_from_options(std::string("models"), std::string("m"), std::nullopt);
+    } catch (const std::invalid_argument& e) {
+        what = e.what();
+    }
+    expect(what.find("missing: pcie_recv_root") != std::string::npos,
+           "a missing recv root is refused and named: " + what);
+    what.clear();
+    try {
+        pcie_provider_from_options(std::nullopt, std::string("m"), std::nullopt);
+    } catch (const std::invalid_argument& e) {
+        what = e.what();
+    }
+    expect(what.find("pcie_serve_root, pcie_recv_root") != std::string::npos,
+           "every missing value is named: " + what);
+}
+
 int main() {
     try {
         test_reserve_does_not_fetch();
@@ -226,6 +255,7 @@ int main() {
         test_release_deletes_and_next_get_path_pulls();
         test_stale_file_from_earlier_run_is_pulled_fresh();
         test_pulls_files_is_true();
+        test_provider_from_options_all_or_none();
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
     if (failures == 0) { std::cout << "pcie_file_provider_test: all checks passed\n"; return 0; }
     std::cerr << "pcie_file_provider_test: " << failures << " failed\n"; return 1;

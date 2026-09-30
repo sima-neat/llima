@@ -5,6 +5,7 @@
 #include <istream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -66,6 +67,16 @@ class PcieFileProvider : public FileProvider {
         std::mutex _pulled_mutex;
         std::set<std::filesystem::path> _pulled;   // pulled in THIS process, still on disk
 };
+
+// The provider for `llima run`: all three PCIe values set = a
+// PcieFileProvider; none set = nullptr (the CLI then reads the local disk).
+// Only some set throws std::invalid_argument naming the missing ones: a
+// silent fall back to the disk could run a local model instead of the
+// requested PCIe model.
+std::shared_ptr<FileProvider> pcie_provider_from_options(
+    const std::optional<std::string>& serve_root,
+    const std::optional<std::string>& subfolder,
+    const std::optional<std::filesystem::path>& recv_root);
 
 }  // namespace llima
 }  // namespace simaai
