@@ -103,7 +103,14 @@ VlmHelper::VlmHelper(
     } else {
         // GGUf format.
         assert(!_vlm_cfg.is_multimodal());
-        _tokenizer_ptr = Tokenizer::from_gguf(files.get_path("devkit/" + _vlm_cfg.gguf_file_name));
+        const std::string gguf_name = "devkit/" + _vlm_cfg.gguf_file_name;
+        _tokenizer_ptr = Tokenizer::from_gguf(files.get_path(gguf_name));
+        // The tokenizer loads only the vocabulary (vocab_only: no tensors, no
+        // mmap) and keeps no hold on the file. For a model compiled from GGUF
+        // this file is the whole source model (GBs), so let a pulling provider
+        // (PCIe) delete it now instead of keeping it for the whole run. The
+        // disk provider keeps it (release() does nothing there).
+        files.release(gguf_name);
         auto chat_template_str = _tokenizer_ptr->get_chat_template();
         _bos_token = _tokenizer_ptr->get_bos_token();
         auto eos_token = _tokenizer_ptr->get_eos_token();
