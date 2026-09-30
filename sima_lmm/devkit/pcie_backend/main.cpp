@@ -102,14 +102,18 @@ long long env_non_negative(const char* name, long long fallback) {
 }
 
 // Delete leftovers in the recv root and log every decision. Never throws.
+// If some processes cannot be inspected (not running as root), delete nothing:
+// a file only they hold open, such as a transfer the root-owned pep daemon is
+// still writing for another client, would look unused and old enough to go.
 void clean_recv_root(const std::filesystem::path& root, std::chrono::seconds max_age,
                      const char* when) {
     try {
         const OpenFiles open = open_files_under(root);
         if (open.unreadable > 0) {
-            spdlog::warn("recv sweep ({}): could not inspect {} processes (not running as "
-                         "root?); a file only they hold open looks unused, so only the age "
-                         "rule protects it", when, open.unreadable);
+            spdlog::warn("recv sweep ({}): skipped, nothing deleted: could not inspect {} "
+                         "processes (not running as root?), so a file another program still "
+                         "has open would look unused", when, open.unreadable);
+            return;
         }
         const SweepResult r = sweep_recv_root(root, open.paths, max_age);
         for (const auto& e : r.deleted) {
