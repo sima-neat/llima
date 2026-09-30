@@ -27,6 +27,20 @@ set_tests_properties(
         TIMEOUT 900
 )
 
+# Loads a real model through a spy FileProvider: configs, tokenizers,
+# embeddings and ELFs must all go through the provider (the PCIe seam).
+add_test(
+    runtime.file_provider_routing
+    "./sima_lmm_file_provider_routing_test"
+)
+set_tests_properties(
+    runtime.file_provider_routing
+    PROPERTIES
+        LABELS "devkit;runtime;mla;genai;llm;long"
+        RESOURCE_LOCK mla
+        TIMEOUT 900
+)
+
 add_test(
     runtime.vision_generation
     "./sima_lmm_vision_generation_test"

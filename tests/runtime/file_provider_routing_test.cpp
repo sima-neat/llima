@@ -94,14 +94,6 @@ class SpyFileProvider : public simaai::llima::FileProvider {
             );
         }
 
-        // True if any requested name lies in the given top-level folder.
-        bool requested_in_folder(std::string_view folder) const {
-            return std::any_of(
-                _names.begin(), _names.end(),
-                [&](const std::string& n) { return n.rfind(folder, 0) == 0; }
-            );
-        }
-
     private:
         simaai::llima::DiskFileProvider _disk;
         std::vector<std::string> _names;
@@ -153,8 +145,8 @@ int main() {
         // reverted to a direct disk read, the spy would not have seen them.
         expect(spy->requested("devkit/vlm_config.json"),
                "vlm_config.json must be read through the provider (site 1)");
-        expect(spy->requested_in_folder("elf_files/"),
-               "at least one ELF must be resolved through the provider (site 9)");
+        // ELFs (site 9) are not get_path'd: they are reserve()d at define time
+        // and fetched at load time (a deferred pull), checked below.
         expect(spy->requested("tokenizer.json") || spy->requested(".gguf"),
                "the tokenizer source (tokenizer.json or GGUF) must go through "
                "the provider (sites 2/4)");
@@ -167,7 +159,8 @@ int main() {
             reserved.begin(), reserved.end(),
             [](const std::string& n) { return n.find("elf_files/") != std::string::npos; });
         expect(any_elf_reserved,
-               "ELF paths must be RESERVED at define time (deferred pull), not get_path'd");
+               "ELF paths must be RESERVED at define time (deferred pull), not get_path'd "
+               "(site 9)");
 
         // Guard against a silent no-op provider: a real load asks for many
         // files, so an almost-empty manifest means routing collapsed.
