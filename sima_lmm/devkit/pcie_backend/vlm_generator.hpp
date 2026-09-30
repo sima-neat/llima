@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <optional>
+#include <set>
 #include <string>
 
 #include "backend_loop.hpp"
@@ -46,6 +47,7 @@ class VlmGenerator final : public Generator {
         std::string _default_system_prompt;   // what create_chat() started with
         std::string _system_prompt;           // current effective prompt ("" = none)
         KeptFiles _kept_images;               // deletes pulled images on clear
+        std::set<std::string> _kept_image_leaves;  // their file names in recv_root
 };
 
 }  // namespace pcie_backend

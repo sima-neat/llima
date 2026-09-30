@@ -37,6 +37,7 @@ VlmGenerator::VlmGenerator(VisionLanguageModel& vlm, std::filesystem::path recv_
 void VlmGenerator::_clear_history() {
     _chat.clear_history();
     _kept_images.clear();
+    _kept_image_leaves.clear();
 }
 
 void VlmGenerator::_apply_settings(const std::string& system_prompt, bool enable_thinking) {
@@ -61,6 +62,20 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
     // anything is added, so the conversation is kept.
     if (!request.images.empty() && !_vlm.support_image()) {
         throw GenerationError("this model does not accept images", /*history_cleared=*/false);
+    }
+    // A different system prompt or thinking mode starts a new conversation.
+    const std::string system_prompt =
+        effective_system_prompt(request.system_prompt, _default_system_prompt);
+    const bool new_settings =
+        system_prompt != _system_prompt || request.enable_thinking != _chat.get_enable_thinking();
+    // Two images with the same file name would overwrite each other on the card.
+    // Refuse before anything is added, so the conversation is kept. With new
+    // settings the old images are about to be cleared, so only this request counts.
+    try {
+        check_image_leaves(request.images,
+                           new_settings ? std::set<std::string>{} : _kept_image_leaves);
+    } catch (const std::invalid_argument& e) {
+        throw GenerationError(e.what(), /*history_cleared=*/false);
     }
 
     // Only the final answer (no thinking) goes into the history, like cli.cpp:202-237.
@@ -90,10 +105,7 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
     });
 
     try {
-        // A different system prompt or thinking mode starts a new conversation.
-        const std::string system_prompt =
-            effective_system_prompt(request.system_prompt, _default_system_prompt);
-        if (system_prompt != _system_prompt || request.enable_thinking != _chat.get_enable_thinking()) {
+        if (new_settings) {
             _apply_settings(system_prompt, request.enable_thinking);
         }
 
@@ -104,6 +116,7 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
                 _recv_root, _image_serve_root, target.subfolder);
             const std::filesystem::path pulled = provider->get_path(target.filename);
             _kept_images.add([provider, pulled] { provider->evict(pulled); });
+            _kept_image_leaves.insert(target.filename);
             _chat.add_image(pulled);
         }
         _chat.add_query(request.prompt);
