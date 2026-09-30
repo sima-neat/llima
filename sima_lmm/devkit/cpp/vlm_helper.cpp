@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string_view>
+#include <utility>
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -25,6 +27,44 @@ uint32_t find_and_replace_all(
     }
     return num_replaced;
 }
+
+
+namespace {
+// The legacy VlmHelper constructor gets the devkit folder itself, while the
+// provider API names files from the model root ("devkit/tokenizer.json").
+// Drop that prefix and read from the given folder, whatever it is called.
+class DevkitDirProvider final : public FileProvider {
+    public:
+        explicit DevkitDirProvider(std::filesystem::path devkit_dir)
+            : _disk(std::move(devkit_dir)) {}
+        std::filesystem::path get_path(std::string_view name) override {
+            return _disk.get_path(_strip(name));
+        }
+        std::unique_ptr<std::istream> open_stream(std::string_view name) override {
+            return _disk.open_stream(_strip(name));
+        }
+    private:
+        static std::string_view _strip(std::string_view name) {
+            constexpr std::string_view prefix = "devkit/";
+            return name.substr(0, prefix.size()) == prefix ? name.substr(prefix.size()) : name;
+        }
+        DiskFileProvider _disk;
+};
+}  // namespace
+
+
+// The provider only lives for the delegated constructor: VlmHelper reads all
+// its files while it is built and keeps no reference to the provider.
+VlmHelper::VlmHelper(
+    const VlmConfig& vlm_cfg,
+    const std::filesystem::path& devkit_dir,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    bool enable_thinking
+) : VlmHelper(
+        vlm_cfg, *std::make_unique<DevkitDirProvider>(devkit_dir), std::move(system_prompt),
+        std::move(chat_template), enable_thinking
+    ) {}
 
 
 VlmHelper::VlmHelper(

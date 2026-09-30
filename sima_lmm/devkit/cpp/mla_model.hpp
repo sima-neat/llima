@@ -45,9 +45,15 @@ class MLAModelWithBuffer {
         void update_reloc(const std::map<std::string, uint64_t>& reloc_addr_map);
 
         static void run_queue();
+        // Loads from disk (the signature from before the FileProvider seam,
+        // kept so older builds still link).
         static void load_all_models(
-            std::optional<std::filesystem::path> relative_dir = std::nullopt,
-            FileProvider* files = nullptr
+            std::optional<std::filesystem::path> relative_dir = std::nullopt
+        );
+        // Loads through files (nullptr = from disk).
+        static void load_all_models(
+            std::optional<std::filesystem::path> relative_dir,
+            FileProvider* files
         );
         static void free_all_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt

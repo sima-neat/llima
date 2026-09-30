@@ -7,6 +7,9 @@
 namespace simaai {
 namespace llima {
 
+VisionModel::VisionModel(std::filesystem::path model_path)
+    : VisionModel(std::move(model_path), nullptr) {}
+
 VisionModel::VisionModel(
     std::filesystem::path model_path,
     std::shared_ptr<FileProvider> file_provider

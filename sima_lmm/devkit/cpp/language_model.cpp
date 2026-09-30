@@ -7,6 +7,7 @@
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <utility>
 #include <string_view>
 
 #include <Eigen/Dense>
@@ -78,6 +79,17 @@ void load_whole_file(MLABuffer& buffer, std::istream& stream, const std::string&
     }
 }
 }
+
+LanguageModel::LanguageModel(
+    std::filesystem::path model_path,
+    std::set<uint32_t> stop_token_ids,
+    std::optional<uint32_t> image_token_id,
+    std::optional<uint32_t> pad_token_id,
+    TextStreamer& text_streamer
+) : LanguageModel(
+        std::move(model_path), std::move(stop_token_ids), image_token_id, pad_token_id,
+        text_streamer, nullptr
+    ) {}
 
 LanguageModel::LanguageModel(
     std::filesystem::path model_path,
