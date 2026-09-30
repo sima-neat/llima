@@ -10,7 +10,11 @@ from pathlib import Path
 
 from sima_lmm.devkit import model_manager
 from sima_lmm.devkit.model_manager import ModelManager
-from sima_lmm.devkit.pcie_config import recv_root_from_pep_conf
+from sima_lmm.devkit.pcie_config import (
+    RecvRootBusyError,
+    claim_recv_root,
+    recv_root_from_pep_conf,
+)
 from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
 from sima_lmm.logging import (
     configure_runtime_logging,
@@ -144,6 +148,26 @@ def run_model(args: argparse.Namespace) -> int:
     # Kill any previous llima processes that may still be running
     _kill_existing_llima_session()
 
+    # One PCIe model user per card: pcie-genai-backend and other --pcie runs
+    # stage the same file names in the same recv root. Taken after the kill
+    # above, so a replaced old session has released it. The kernel drops the
+    # lock when this process exits.
+    recv_claim = None
+    if args.pcie:
+        try:
+            recv_claim = claim_recv_root()
+        except RecvRootBusyError as e:
+            print(
+                "Another PCIe model user (pcie-genai-backend or 'llima run --pcie') is "
+                f"running on this card: {e}. Only one can run at a time, because they "
+                "share the PCIe receive directory. Stop it first.",
+                flush=True,
+            )
+            return 1
+        except OSError as e:
+            print(f"--pcie could not take the card's receive-directory lock: {e}", flush=True)
+            return 1
+
     # Connect to cpp api.
     connect(logging.INFO if args.log_level is None else args.log_level)
 
@@ -211,6 +235,8 @@ def run_model(args: argparse.Namespace) -> int:
         sima_log_info("Finalize starting...")
         del demo
         disconnect()
+        if recv_claim is not None:
+            recv_claim.close()
         sima_log_info("Finalize done.")
 
     return 0
