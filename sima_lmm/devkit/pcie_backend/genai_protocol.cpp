@@ -48,6 +48,14 @@ bool read_enable_thinking(const nlohmann::json& j) {
     }
     return j["enable_thinking"].get<bool>();
 }
+// The request id. Absent = "" (the host always sends one). A present id that
+// is not a string is refused: the answer's tokens and final would carry
+// "id":"" and the host could not match them to its request.
+std::string read_id(const nlohmann::json& j) {
+    if (!j.contains("id")) return "";
+    if (!j["id"].is_string()) throw std::invalid_argument("\"id\" must be a string");
+    return j["id"].get<std::string>();
+}
 }  // namespace
 
 PromptRequest parse_prompt(std::string_view json) {
@@ -61,9 +69,7 @@ PromptRequest parse_prompt(std::string_view json) {
     }
     PromptRequest request;
     request.prompt = j["prompt"].get<std::string>();
-    if (j.contains("id") && j["id"].is_string()) {
-        request.id = j["id"].get<std::string>();
-    }
+    request.id = read_id(j);
     // Same rule as genai.chat: null (or absent) = the model default; any other
     // non-string is refused, not ignored, so the answer never silently uses a
     // different system prompt than the host asked for.
@@ -114,7 +120,7 @@ ChatRequest parse_chat(std::string_view json) {
         throw std::invalid_argument("genai.chat payload is not a JSON object");
     }
     ChatRequest request;
-    if (j.contains("id") && j["id"].is_string()) request.id = j["id"].get<std::string>();
+    request.id = read_id(j);
     const std::string op =
         j.contains("op") && j["op"].is_string() ? j["op"].get<std::string>() : std::string();
     if (op == "print") {
