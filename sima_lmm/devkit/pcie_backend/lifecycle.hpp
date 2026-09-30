@@ -49,8 +49,11 @@ class QueueBusyError : public std::runtime_error {
         using std::runtime_error::runtime_error;
 };
 
-// Claims a queue with an O_EXCL pid file. A pid file left by a dead process,
-// or by a live process that is not `program_name`, is stale and taken over.
+// Claims a queue (or the card's recv root) with an flock() on
+// "<pid_path>.lock", held for the life of this object, plus a pid file the
+// host reads. A pid file left by a dead process, or by a live process that is
+// not `program_name`, is stale and taken over, but only by the lock holder.
+// `llima run --pcie` (devkit_demo.py) takes the same recv-root lock.
 class QueueOwnership {
     public:
         QueueOwnership(std::filesystem::path pid_path, std::filesystem::path status_path,
@@ -61,10 +64,13 @@ class QueueOwnership {
 
         void acquire();           // throws QueueBusyError or std::runtime_error
         void release() noexcept;  // removes the pid file only if it is still ours
+        static std::filesystem::path lock_path_for(const std::filesystem::path& pid_path);
     private:
+        void write_pid_file_locked();
         std::filesystem::path _pid_path;
         std::filesystem::path _status_path;
         std::string _program_name;
+        int _lock_fd = -1;
         bool _owned = false;
 };
 
