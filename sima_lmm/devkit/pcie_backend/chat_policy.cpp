@@ -34,6 +34,21 @@ std::optional<uint16_t> cap_max_new_tokens(std::optional<uint16_t> requested,
     return std::min({*requested, context_tokens, room});
 }
 
+StreamSplit::StreamSplit(ReasoningFormat format, bool enable_thinking)
+  : _parser(format, enable_thinking),
+    _hide_reasoning(format == ReasoningFormat::Lfm2 && !enable_thinking) {}
+
+StreamSplit::Out StreamSplit::add(const std::string& text, bool stream_end, bool from_draft) {
+    Out out;
+    if (!_hide_reasoning) out.to_host = text;
+    for (const auto& event : _parser.add(text, stream_end, from_draft)) {
+        if (event.reasoning) continue;
+        out.to_answer += event.text;
+        if (_hide_reasoning) out.to_host += event.text;
+    }
+    return out;
+}
+
 KeptFiles::~KeptFiles() { clear(); }
 
 void KeptFiles::add(std::function<void()> remove) { _removers.push_back(std::move(remove)); }

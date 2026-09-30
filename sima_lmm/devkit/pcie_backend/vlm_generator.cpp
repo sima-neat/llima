@@ -91,14 +91,14 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
         throw GenerationError(e.what(), /*history_cleared=*/false);
     }
 
-    // Only the final answer (no thinking) goes into the history, like cli.cpp:202-237.
-    ReasoningStreamParser reasoning(reasoning_format_for_model(_vlm.model_type()),
-                                    request.enable_thinking);
+    // Only the final answer (no thinking) goes into the history, like
+    // cli.cpp:202-237; hidden LFM2 reasoning is not sent (see StreamSplit).
+    StreamSplit split(reasoning_format_for_model(_vlm.model_type()), request.enable_thinking);
     std::string answer;
 
     // Detach the callbacks on every exit path: the bridge must not hear from
     // LLiMa once this run is over (same guard idea as cli.cpp:244-249).
-    // Declared after `reasoning` / `answer`, so it is destroyed first.
+    // Declared after `split` / `answer`, so it is destroyed first.
     struct CallbackGuard {
         VisionLanguageModel& vlm;
         ~CallbackGuard() {
@@ -106,12 +106,11 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
             vlm.set_info_callback([](const std::string&, double) {});
         }
     } guard{_vlm};
-    _vlm.set_text_callback([&bridge, &reasoning, &answer](const std::string& text, bool stream_end,
-                                                          bool from_draft) {
-        bridge.on_text(text, stream_end, from_draft);
-        for (const auto& event : reasoning.add(text, stream_end, from_draft)) {
-            if (!event.reasoning) answer += event.text;
-        }
+    _vlm.set_text_callback([&bridge, &split, &answer](const std::string& text, bool stream_end,
+                                                      bool from_draft) {
+        const StreamSplit::Out out = split.add(text, stream_end, from_draft);
+        bridge.on_text(out.to_host, stream_end, from_draft);
+        answer += out.to_answer;
     });
     _vlm.set_info_callback([&bridge](const std::string& metric, double value) {
         bridge.on_info(metric, value);

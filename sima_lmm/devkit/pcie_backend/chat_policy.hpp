@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include "reasoning_parser.hpp"
+
 namespace simaai {
 namespace llima {
 namespace pcie_backend {
@@ -39,6 +41,26 @@ AfterRun after_run(bool completed, const std::string& answer);
 // context. nullopt (= the model default) stays nullopt.
 std::optional<uint16_t> cap_max_new_tokens(std::optional<uint16_t> requested,
                                            uint16_t context_tokens);
+
+// Splits LLiMa's streamed text into what the host sees (genai.token) and the
+// answer the history keeps (no thinking, like cli.cpp:202-237).
+// To the host: the raw text, so a model's <think> markers stay visible when
+// thinking is on. Only LFM2 with thinking off differs: it still reasons, and
+// the devkit CLI hides that reasoning, so the host gets only the answer.
+class StreamSplit {
+    public:
+        StreamSplit(ReasoningFormat format, bool enable_thinking);
+
+        struct Out {
+            std::string to_host;
+            std::string to_answer;
+        };
+        Out add(const std::string& text, bool stream_end, bool from_draft);
+
+    private:
+        ReasoningStreamParser _parser;
+        bool _hide_reasoning;
+};
 
 // Delete actions for the image files a chat keeps on the card. clear() runs
 // them all, in order, and forgets them; one that throws does not stop the
