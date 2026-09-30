@@ -53,7 +53,13 @@ PromptRequest parse_prompt(std::string_view json) {
     if (j.contains("id") && j["id"].is_string()) {
         request.id = j["id"].get<std::string>();
     }
-    if (j.contains("system_prompt") && j["system_prompt"].is_string()) {
+    // Same rule as genai.chat: null (or absent) = the model default; any other
+    // non-string is refused, not ignored, so the answer never silently uses a
+    // different system prompt than the host asked for.
+    if (j.contains("system_prompt") && !j["system_prompt"].is_null()) {
+        if (!j["system_prompt"].is_string()) {
+            throw std::invalid_argument("\"system_prompt\" must be a string");
+        }
         request.system_prompt = j["system_prompt"].get<std::string>();
     }
     if (j.contains("max_new_tokens") && !j["max_new_tokens"].is_null()) {

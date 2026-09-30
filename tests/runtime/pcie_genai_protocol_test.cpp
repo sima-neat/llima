@@ -49,6 +49,14 @@ void test_refuses_bad_prompts() {
     expect(refuses([] { parse_prompt(R"({"prompt":""})"); }), "empty prompt refused");
     expect(refuses([] { parse_prompt(R"({"prompt":"Hi","max_new_tokens":-1})"); }),
            "negative max_new_tokens refused");
+    // A wrong-type system_prompt must not be ignored (that would silently use the
+    // model's default prompt). null means "model default", like genai.chat.
+    expect(refuses([] { parse_prompt(R"({"prompt":"Hi","system_prompt":5})"); }),
+           "non-string system_prompt refused");
+    expect(refuses([] { parse_prompt(R"({"prompt":"Hi","system_prompt":["a"]})"); }),
+           "list system_prompt refused");
+    expect(!parse_prompt(R"({"prompt":"Hi","system_prompt":null})").system_prompt.has_value(),
+           "null system_prompt = model default");
 }
 
 void test_reads_image_names() {
