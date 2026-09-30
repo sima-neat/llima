@@ -37,6 +37,17 @@ void check_image_name(const std::string& name) {
         throw std::invalid_argument("\"images\" names must be relative paths with no \"..\"");
     }
 }
+
+// enable_thinking: absent or null = false; any other non-boolean is refused.
+// Reading a wrong type as false would change the thinking mode, which starts
+// a new conversation, so the card must not guess.
+bool read_enable_thinking(const nlohmann::json& j) {
+    if (!j.contains("enable_thinking") || j["enable_thinking"].is_null()) return false;
+    if (!j["enable_thinking"].is_boolean()) {
+        throw std::invalid_argument("\"enable_thinking\" must be true or false");
+    }
+    return j["enable_thinking"].get<bool>();
+}
 }  // namespace
 
 PromptRequest parse_prompt(std::string_view json) {
@@ -74,9 +85,7 @@ PromptRequest parse_prompt(std::string_view json) {
                 std::min<long long>(n, std::numeric_limits<uint16_t>::max()));
         }
     }
-    if (j.contains("enable_thinking") && j["enable_thinking"].is_boolean()) {
-        request.enable_thinking = j["enable_thinking"].get<bool>();
-    }
+    request.enable_thinking = read_enable_thinking(j);
     if (j.contains("image")) {
         // An older host sends one "image". Answering without it would be a
         // silent wrong answer, so say which side must be updated.
@@ -122,9 +131,7 @@ ChatRequest parse_chat(std::string_view json) {
         }
         request.system_prompt = j["system_prompt"].get<std::string>();
     }
-    if (j.contains("enable_thinking") && j["enable_thinking"].is_boolean()) {
-        request.enable_thinking = j["enable_thinking"].get<bool>();
-    }
+    request.enable_thinking = read_enable_thinking(j);
     return request;
 }
 

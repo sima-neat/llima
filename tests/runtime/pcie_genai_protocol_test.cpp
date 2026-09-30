@@ -57,6 +57,15 @@ void test_refuses_bad_prompts() {
            "list system_prompt refused");
     expect(!parse_prompt(R"({"prompt":"Hi","system_prompt":null})").system_prompt.has_value(),
            "null system_prompt = model default");
+    // Same for enable_thinking: a wrong type must not be read as false.
+    expect(refuses([] { parse_prompt(R"({"prompt":"Hi","enable_thinking":"true"})"); }),
+           "string enable_thinking refused");
+    expect(refuses([] { parse_prompt(R"({"prompt":"Hi","enable_thinking":1})"); }),
+           "number enable_thinking refused");
+    expect(!parse_prompt(R"({"prompt":"Hi","enable_thinking":null})").enable_thinking,
+           "null enable_thinking = false");
+    expect(parse_prompt(R"({"prompt":"Hi","enable_thinking":true})").enable_thinking,
+           "true enable_thinking read");
 }
 
 void test_reads_image_names() {
@@ -106,6 +115,10 @@ void test_parses_chat() {
     expect(refuses([] { parse_chat("not json"); }), "bad JSON refused");
     expect(refuses([] { parse_chat(R"({"op":"reset","system_prompt":5})"); }),
            "non-string system prompt refused");
+    expect(refuses([] { parse_chat(R"({"op":"reset","enable_thinking":"true"})"); }),
+           "non-boolean enable_thinking refused");
+    expect(!parse_chat(R"({"op":"reset","enable_thinking":null})").enable_thinking,
+           "null enable_thinking = false");
 }
 
 void test_reply_and_history_cleared_goldens() {
