@@ -111,8 +111,8 @@ Both sides need the PCIe service daemons running and configured:
   daemon writes the pulled files there.
 
 Limits: `--pcie` works only in CLI mode (`--mode cli`), no draft model for
-speculative decoding is used with `--pcie`, and `--stt_model_path` must be a
-local folder on the card.
+speculative decoding is used with `--pcie`, `--stt_model_path` must be a
+local folder on the card, and `set lora` is not supported yet.
 
 To chat with the card from the host instead, use the `pcie-genai` host CLI. It
 starts the card program `pcie-genai-backend` (installed in `/usr/bin` by the
