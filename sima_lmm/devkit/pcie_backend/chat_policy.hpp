@@ -5,6 +5,7 @@
 #define _SIMA_LLIMA_PCIE_BACKEND_CHAT_POLICY_
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -30,6 +31,14 @@ enum class AfterRun {
     ClearEmpty,        // no final answer: clear the history
 };
 AfterRun after_run(bool completed, const std::string& answer);
+
+// The max_new_tokens to give run_model. LLiMa adds the prompt length to it in
+// a uint16_t, so a very large value wraps around and the answer comes back
+// empty. An answer can never be longer than the model's context, so cap it
+// there; also keep context + cap <= 65535, since the prompt is at most the
+// context. nullopt (= the model default) stays nullopt.
+std::optional<uint16_t> cap_max_new_tokens(std::optional<uint16_t> requested,
+                                           uint16_t context_tokens);
 
 // Delete actions for the image files a chat keeps on the card. clear() runs
 // them all, in order, and forgets them; one that throws does not stop the

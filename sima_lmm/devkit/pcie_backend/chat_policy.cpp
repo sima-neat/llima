@@ -1,6 +1,8 @@
 // Pure chat rules for VlmGenerator. See chat_policy.hpp.
 #include "chat_policy.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <utility>
 
 namespace simaai {
@@ -23,6 +25,13 @@ std::string trim_answer(std::string_view text) {
 AfterRun after_run(bool completed, const std::string& answer) {
     if (!completed) return AfterRun::ClearInterrupted;
     return trim_answer(answer).empty() ? AfterRun::ClearEmpty : AfterRun::KeepAnswer;
+}
+
+std::optional<uint16_t> cap_max_new_tokens(std::optional<uint16_t> requested,
+                                           uint16_t context_tokens) {
+    if (!requested.has_value()) return std::nullopt;
+    const uint16_t room = static_cast<uint16_t>(UINT16_MAX - context_tokens);
+    return std::min({*requested, context_tokens, room});
 }
 
 KeptFiles::~KeptFiles() { clear(); }

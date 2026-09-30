@@ -44,9 +44,21 @@ void test_kept_files() {
 }
 }  // namespace
 
+void test_cap_max_new_tokens() {
+    expect(!cap_max_new_tokens(std::nullopt, 2048).has_value(), "no value = model default");
+    expect(cap_max_new_tokens(uint16_t{128}, 2048) == uint16_t{128}, "a normal value is kept");
+    expect(cap_max_new_tokens(uint16_t{65535}, 2048) == uint16_t{2048},
+           "a huge value is capped at the context (it used to wrap to an empty answer)");
+    expect(cap_max_new_tokens(uint16_t{2048}, 2048) == uint16_t{2048}, "exactly the context is kept");
+    // A context over half of uint16: context + cap must still fit.
+    expect(cap_max_new_tokens(uint16_t{65535}, 40000) == uint16_t{25535},
+           "context + cap never passes 65535");
+}
+
 int main() {
     test_effective_system_prompt();
     test_after_run();
+    test_cap_max_new_tokens();
     test_kept_files();
     if (failures == 0) std::cout << "pcie_genai_chat_policy_test passed\n";
     return failures == 0 ? 0 : 1;

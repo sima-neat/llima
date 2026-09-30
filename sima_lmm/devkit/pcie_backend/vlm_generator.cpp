@@ -121,7 +121,9 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
         }
         _chat.add_query(request.prompt);
 
-        const std::optional<std::string> response = _vlm.run_model(_chat, request.max_new_tokens);
+        const std::optional<std::string> response = _vlm.run_model(
+            _chat, cap_max_new_tokens(request.max_new_tokens,
+                                      _vlm._language_model_ptr->get_max_num_tokens()));
         // run_model can return before LLiMa's streamer thread has fired the last
         // text/info callbacks. Wait for it, so genai.final goes out after the last token.
         _vlm.wait_for_streamer_completion();
