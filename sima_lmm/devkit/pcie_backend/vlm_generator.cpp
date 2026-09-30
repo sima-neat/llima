@@ -20,6 +20,10 @@ namespace simaai {
 namespace llima {
 namespace pcie_backend {
 
+namespace {
+constexpr const char* kNoThinking = "Thinking is not supported for this model.";
+}  // namespace
+
 VlmGenerator::VlmGenerator(VisionLanguageModel& vlm, std::filesystem::path recv_root,
                            std::string image_serve_root)
     : _vlm(vlm), _recv_root(std::move(recv_root)),
@@ -32,6 +36,10 @@ VlmGenerator::VlmGenerator(VisionLanguageModel& vlm, std::filesystem::path recv_
         _default_system_prompt = messages[0]["content"].get<std::string>();
     }
     _system_prompt = _default_system_prompt;
+}
+
+bool VlmGenerator::_supports_thinking() const {
+    return reasoning_format_for_model(_vlm.model_type()) != ReasoningFormat::None;
 }
 
 void VlmGenerator::_clear_history() {
@@ -62,6 +70,11 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
     // anything is added, so the conversation is kept.
     if (!request.images.empty() && !_vlm.support_image()) {
         throw GenerationError("this model does not accept images", /*history_cleared=*/false);
+    }
+    // Thinking on a model without it: refuse before the settings change below
+    // clears the conversation (same check as reset()).
+    if (request.enable_thinking && !_supports_thinking()) {
+        throw GenerationError(kNoThinking, /*history_cleared=*/false);
     }
     // A different system prompt or thinking mode starts a new conversation.
     const std::string system_prompt =
@@ -153,9 +166,8 @@ void VlmGenerator::stop() { _vlm.stop_model(); }
 
 ChatReply VlmGenerator::reset(const std::optional<std::string>& system_prompt,
                               bool enable_thinking) {
-    if (enable_thinking &&
-        reasoning_format_for_model(_vlm.model_type()) == ReasoningFormat::None) {
-        return ChatReply{false, "Thinking is not supported for this model."};
+    if (enable_thinking && !_supports_thinking()) {
+        return ChatReply{false, kNoThinking};
     }
     _apply_settings(effective_system_prompt(system_prompt, _default_system_prompt), enable_thinking);
     return ChatReply{true, ""};
