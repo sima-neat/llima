@@ -2527,6 +2527,15 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         _logger->info("No relocation is needed");
         return;
     }
+    // The file list below comes from a directory listing on local disk. A
+    // provider that pulls files (PCIe) has no listing, so the folder is not
+    // there: say so, instead of "Relocation directory does not exist".
+    if (_files->pulls_files()) {
+        throw std::runtime_error(
+            "LoRA is not supported with --pcie yet: the npy_files folder cannot be listed "
+            "over PCIe"
+        );
+    }
 
     // Key to access the reloc addr maps.
     struct RelocMapType {
