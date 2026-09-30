@@ -177,11 +177,12 @@ int run(const Args& args) {
     status.started_at = now_utc_iso8601();
     set_status(writer, status, "starting", "loading model over PCIe");
 
-    // Only ONE backend per card, whatever its queue: all of them use the same
-    // recv root and the same file names (devkit/vlm_config.json, the ELFs), so
-    // a second one would overwrite or evict the first one's files, and its
-    // start-up sweep would delete them. Claimed first in the try below, before
-    // that sweep; released when this function returns.
+    // Only ONE PCIe model user per card, whatever its queue: all of them use the
+    // same recv root and the same file names (devkit/vlm_config.json, the ELFs),
+    // so a second one would overwrite or evict the first one's files, and its
+    // start-up sweep would delete them. `llima run --pcie` takes this same lock
+    // (recv-root.pid.lock, see devkit_demo.py). Claimed first in the try below,
+    // before that sweep; released when this function returns.
     QueueOwnership card_claim(run_dir / "recv-root.pid", run_dir / "recv-root.status",
                               kProgramName);
 
@@ -198,8 +199,9 @@ int run(const Args& args) {
             card_claim.acquire();
         } catch (const QueueBusyError& e) {
             throw std::runtime_error(fmt::format(
-                "another pcie-genai-backend is already running on this card ({}); only one can "
-                "run at a time, because they share the recv root", e.what()));
+                "another pcie-genai-backend or 'llima run --pcie' is already running on this "
+                "card ({}); only one can run at a time, because they share the recv root",
+                e.what()));
         }
         recv_root = args.recv_root ? args.recv_root : recv_root_from_pep_conf();
         if (!recv_root) {

@@ -1,4 +1,4 @@
-"""Unit tests for pcie_config.recv_root_from_pep_conf.
+"""Unit tests for pcie_config: recv_root_from_pep_conf and claim_recv_root.
 
 Pure-Python (no MLA / cpp_ext), so it runs on the host as well as the board.
 Proves the board's default receive directory is derived from the pep-daemon
@@ -6,9 +6,16 @@ config exactly the way the daemon resolves it: take `default-recv`, then map
 that name through the `[recv]` section to an absolute path. Section scoping
 matters — a same-named key in `[serve]` must never be picked up.
 """
+import os
+import signal
 import textwrap
+import time
 
-from sima_lmm.devkit.pcie_config import recv_root_from_pep_conf
+from sima_lmm.devkit.pcie_config import (
+    RecvRootBusyError,
+    claim_recv_root,
+    recv_root_from_pep_conf,
+)
 
 # A trimmed copy of the shape /etc/simaai/simaai-pep-daemon.conf ships with:
 # top-level keys before any section, comments, extra spaces, [recv]/[serve].
@@ -65,6 +72,67 @@ def test_no_default_recv_returns_none(tmp_path):
 def test_default_recv_name_absent_from_recv_section_returns_none(tmp_path):
     text = SAMPLE.replace("recv5g = /tmp/pcie-recv\n", "")
     assert recv_root_from_pep_conf(_write(tmp_path, text)) is None
+
+
+def test_recv_root_claim_is_exclusive_and_released(tmp_path):
+    # Same lock file as pcie-genai-backend's card claim (recv-root.pid.lock).
+    first = claim_recv_root(str(tmp_path))
+    assert (tmp_path / "recv-root.pid.lock").exists()
+    assert (tmp_path / "recv-root.pid").read_text().strip() == str(os.getpid())
+    # flock is per open file, so a second claim in this process is refused too.
+    try:
+        claim_recv_root(str(tmp_path))
+        raise AssertionError("a second claim must be refused while the first is held")
+    except RecvRootBusyError as e:
+        assert f"pid {os.getpid()}" in str(e), str(e)
+    first.close()
+    assert not (tmp_path / "recv-root.pid").exists()
+    # The lock file stays (deleting it would let two holders lock two files).
+    assert (tmp_path / "recv-root.pid.lock").exists()
+    claim_recv_root(str(tmp_path)).close()
+
+
+def test_recv_root_busy_message_skips_a_dead_pid(tmp_path):
+    # The holder may not have replaced a dead holder's pid file yet: a dead
+    # pid must not be named as the holder.
+    first = claim_recv_root(str(tmp_path))
+    child = os.fork()
+    if child == 0:
+        os._exit(0)
+    os.waitpid(child, 0)
+    (tmp_path / "recv-root.pid").write_text(f"{child}\n")
+    try:
+        claim_recv_root(str(tmp_path))
+        raise AssertionError("the held lock must be refused")
+    except RecvRootBusyError as e:
+        assert "pid" not in str(e).split("locked by")[-1], str(e)
+    first.close()
+
+
+def test_recv_root_claim_is_refused_while_another_process_holds_it(tmp_path):
+    # A child takes the lock and waits; the parent must be refused, then get it
+    # once the child exits (the kernel drops the lock with the process).
+    r, w = os.pipe()
+    child = os.fork()
+    if child == 0:
+        os.close(r)
+        claim = claim_recv_root(str(tmp_path))
+        os.write(w, b"x")
+        time.sleep(30)
+        claim.close()
+        os._exit(0)
+    os.close(w)
+    assert os.read(r, 1) == b"x"
+    try:
+        try:
+            claim_recv_root(str(tmp_path))
+            raise AssertionError("a lock held by another process must be refused")
+        except RecvRootBusyError as e:
+            assert f"pid {child}" in str(e), str(e)
+    finally:
+        os.kill(child, signal.SIGKILL)
+        os.waitpid(child, 0)
+    claim_recv_root(str(tmp_path)).close()
 
 
 if __name__ == "__main__":

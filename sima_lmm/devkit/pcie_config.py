@@ -1,14 +1,96 @@
 """Read PCIe transfer settings from the pep-daemon config.
 
-Kept free of MLA / cpp_ext imports so it can be unit-tested on any host. The
-sole entry point resolves the board's default receive directory the same way
-the daemon does, so `llima run --pcie` can default `--pcie-recv-root` instead
-of making the caller repeat a value that the daemon already owns.
+Kept free of MLA / cpp_ext imports so it can be unit-tested on any host.
+recv_root_from_pep_conf() resolves the board's default receive directory the
+same way the daemon does, so `llima run --pcie` can default `--pcie-recv-root`
+instead of making the caller repeat a value that the daemon already owns.
+claim_recv_root() takes the card-wide lock on that directory.
 """
+import fcntl
+import os
 from pathlib import Path
 from typing import Optional
 
 PEP_DAEMON_CONF = "/etc/simaai/simaai-pep-daemon.conf"
+
+# The card-wide claim on the pep recv root. pcie-genai-backend takes the same
+# lock (QueueOwnership on <run dir>/recv-root.pid, lifecycle.cpp), so only one
+# PCIe model user runs per card: they all stage the same file names
+# (devkit/vlm_config.json, elf_files/...) in the same recv root.
+PCIE_RUN_DIR_ENV = "SIMA_NEAT_PCIE_RUN_DIR"
+PCIE_RUN_DIR = "/run/sima-neat/pcie"
+RECV_ROOT_PID = "recv-root.pid"
+
+
+class RecvRootBusyError(RuntimeError):
+    """Another PCIe model user on this card holds the recv-root lock."""
+
+
+class RecvRootClaim:
+    """Holds the recv-root lock until close() or process exit.
+
+    The lock is an flock() on "<run dir>/recv-root.pid.lock"; the kernel drops
+    it when the process dies, so a crash leaves nothing stale. The pid file
+    next to it only says who holds the lock, for the error message.
+    """
+
+    def __init__(self, fd: int, pid_path: Path):
+        self._fd = fd
+        self._pid_path = pid_path
+
+    def close(self) -> None:
+        if self._fd < 0:
+            return
+        try:
+            if self._pid_path.read_text().strip() == str(os.getpid()):
+                self._pid_path.unlink()
+        except (OSError, ValueError):
+            pass
+        os.close(self._fd)
+        self._fd = -1
+
+
+def claim_recv_root(run_dir: Optional[str] = None) -> RecvRootClaim:
+    """Take the card-wide recv-root lock, or raise RecvRootBusyError.
+
+    Raises OSError if the run dir cannot be made or the lock file cannot be
+    opened.
+    """
+    run = Path(run_dir or os.environ.get(PCIE_RUN_DIR_ENV) or PCIE_RUN_DIR)
+    run.mkdir(parents=True, exist_ok=True)
+    pid_path = run / RECV_ROOT_PID
+    lock_path = run / (RECV_ROOT_PID + ".lock")
+    # O_RDONLY is enough for flock, and works on a lock file another user made.
+    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        # Named only if alive: a new holder may not have replaced a dead
+        # holder's pid file yet.
+        holder = ""
+        try:
+            pid = int(pid_path.read_text().strip())
+            if pid <= 0:
+                raise ValueError(pid)  # kill(0 or -1) would hit a whole group
+            try:
+                os.kill(pid, 0)
+            except PermissionError:
+                pass  # alive, another user's process
+            holder = f" (pid {pid})"
+        except (OSError, ValueError):
+            pass
+        raise RecvRootBusyError(f"{lock_path} is locked by another process{holder}") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    # Who holds the lock, for the busy message. Best effort: the lock is the claim.
+    try:
+        pid_path.unlink(missing_ok=True)
+        pid_path.write_text(f"{os.getpid()}\n")
+    except OSError:
+        pass
+    return RecvRootClaim(fd, pid_path)
 
 
 def recv_root_from_pep_conf(conf_path: str = PEP_DAEMON_CONF) -> Optional[str]:

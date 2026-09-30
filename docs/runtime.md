@@ -114,6 +114,11 @@ Limits: `--pcie` works only in CLI mode (`--mode cli`), no draft model for
 speculative decoding is used with `--pcie`, `--stt_model_path` must be a
 local folder on the card, and `set lora` is not supported yet.
 
+Only one PCIe model user runs on a card at a time, because all of them use the
+same receive folder. `llima run --pcie` stops with an error while
+`pcie-genai-backend` (or another `llima run --pcie`) is running, and the other
+way round. The lock is `/run/sima-neat/pcie/recv-root.pid.lock`.
+
 To chat with the card from the host instead, use the `pcie-genai` host CLI. It
 starts the card program `pcie-genai-backend` (installed in `/usr/bin` by the
 `sima-lmm-core` package) over SSH. See
