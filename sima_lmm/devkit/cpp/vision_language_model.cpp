@@ -1,6 +1,7 @@
 #include <spdlog/spdlog.h>
 
 #include <stdexcept>
+#include <utility>
 
 #include "reasoning_parser.hpp"
 #include "utils.hpp"
@@ -8,6 +9,14 @@
 
 namespace simaai {
 namespace llima {
+
+VisionLanguageModel::VisionLanguageModel(
+    std::filesystem::path model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template
+) : VisionLanguageModel(
+        std::move(model_path), std::move(system_prompt), std::move(chat_template), nullptr
+    ) {}
 
 VisionLanguageModel::VisionLanguageModel(
     std::filesystem::path model_path,

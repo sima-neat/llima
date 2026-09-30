@@ -533,6 +533,10 @@ void MLAModelWithBuffer::update_reloc(
     }
 }
 
+void MLAModelWithBuffer::load_all_models(std::optional<std::filesystem::path> relative_dir) {
+    load_all_models(std::move(relative_dir), nullptr);
+}
+
 void MLAModelWithBuffer::load_all_models(
     std::optional<std::filesystem::path> relative_dir,
     FileProvider* files
