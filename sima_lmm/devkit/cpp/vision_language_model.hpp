@@ -103,7 +103,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
     private:
         friend class CLI;
         friend class WEB;
-        friend class pcie_backend::VlmGenerator;  // PCIe backend: thinking support check
+        friend class pcie_backend::VlmGenerator;  // PCIe backend: thinking check, context size
         std::string_view model_type() const { return _cfg.model_type; }
 
         VlmHelper _vlm_helper;
