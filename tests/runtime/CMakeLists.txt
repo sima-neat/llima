@@ -273,9 +273,28 @@ install(
         sima_lmm_asr_transcription_test
         sima_lmm_tool_call_parser_test
         sima_lmm_reasoning_parser_test
+        sima_lmm_file_provider_test
+        sima_lmm_pcie_genai_protocol_test
+        sima_lmm_pcie_genai_vlm_image_test
+        sima_lmm_pcie_genai_chat_policy_test
+        sima_lmm_pcie_genai_event_bridge_test
+        sima_lmm_pcie_genai_backend_loop_test
+        sima_lmm_pcie_genai_lifecycle_test
+        sima_lmm_pcie_genai_recv_sweep_test
     RUNTIME DESTINATION lib/sima-lmm/tests
     COMPONENT extras
 )
+# Built only when simaai_svc.h is found; the packaged CTestTestfile.cmake
+# registers them only if the executable is there.
+if(SIMAAI_SVC_INCLUDE_DIR)
+    install(
+        TARGETS
+            sima_lmm_pcie_file_provider_test
+            sima_lmm_pcie_genai_dl_svc_client_test
+        RUNTIME DESTINATION lib/sima-lmm/tests
+        COMPONENT extras
+    )
+endif()
 
 install(
     FILES CTestTestfile.cmake
