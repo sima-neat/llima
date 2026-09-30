@@ -44,6 +44,15 @@ class BlockQuantization:
 DEFAULT_GGML_BLK_SIZE: int = 32
 GGML_SUPER_SIZE: int = 256
 
+# Number of superblocks that the K-quant value unpackers decode per loop iteration.
+# Unpacking a whole tensor in one numpy expression needs full-size temporaries next to the
+# result, and a tensor can hold a billion values, so each temporary would cost a gigabyte
+# of peak memory.  Decoding in chunks bounds the temporaries to a few megabytes (8192
+# superblocks are 2 MB of output), which keeps peak memory at about the size of the result
+# and also runs faster because the chunk stays in cache.  The loop overhead is negligible:
+# a billion values are 128 iterations.
+UNPACK_CHUNK_SUPERBLOCKS: int = 8192
+
 
 class GgufBaseQuant(BlockQuantization):
     """GGUF base quantization.
@@ -273,20 +282,30 @@ def unpack_q6_k_quants(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     assert lo.shape[1] == 128
     assert hi.shape[1] == 64
 
-    result = np.zeros((lo.shape[0], 256), dtype=np.int8)
-    for b in range(lo.shape[0]):
-        for n in range(2):
-            index1 = 128 * n
-            index2 = 64 * n
-            lo_e1 = lo[b, index2:index2+32]
-            lo_e2 = lo[b, index2 + 32:index2 + 64]
-            hi_e = hi[b, 32 * n:32 * n + 32]
-            result[b, index1:index1+32]     = ((lo_e1 & 0xf) | ((hi_e & 3)        << 4)).astype(np.int8) - 32
-            result[b, index1+32:index1+64]  = ((lo_e2 & 0xf) | (((hi_e >> 2) & 3) << 4)).astype(np.int8) - 32
-            result[b, index1+64:index1+96]  = ((lo_e1 >> 4)  | (((hi_e >> 4) & 3) << 4)).astype(np.int8) - 32
-            result[b, index1+96:index1+128] = ((lo_e2 >> 4)  | (((hi_e >> 6) & 3) << 4)).astype(np.int8) - 32
+    # Each superblock is two halves of 128 values.  Per half, the low nibbles come from
+    # two 32-byte groups (lo_e1, lo_e2) and the two high bits from one 32-byte group of hi,
+    # in the bit-pair order 0-1, 2-3, 4-5, 6-7.  Output group g of a half (32 values each)
+    # is assembled as (nibble | high_bits << 4), an unsigned 6-bit value, then offset by -32.
+    n_super = lo.shape[0]
+    result = np.empty((n_super, 2, 4, 32), dtype=np.int8)   # [:, half, group, byte]
+    unsigned = result.view(np.uint8)
 
-    return result
+    # The values are assembled directly in the output buffer, chunk by chunk, so that the
+    # temporaries of the bit operations never exceed a few megabytes.  See
+    # UNPACK_CHUNK_SUPERBLOCKS for why this matters.
+    for start in range(0, n_super, UNPACK_CHUNK_SUPERBLOCKS):
+        end = min(start + UNPACK_CHUNK_SUPERBLOCKS, n_super)
+        lo_halves = np.reshape(lo[start:end], (end - start, 2, 2, 32))   # [:, half, group, byte]
+        lo_e1 = lo_halves[:, :, 0, :]
+        lo_e2 = lo_halves[:, :, 1, :]
+        hi_e = np.reshape(hi[start:end], (end - start, 2, 32))          # [:, half, byte]
+        out = unsigned[start:end]
+        out[:, :, 0, :] = (lo_e1 & 0xf) | ((hi_e & 3) << 4)
+        out[:, :, 1, :] = (lo_e2 & 0xf) | (((hi_e >> 2) & 3) << 4)
+        out[:, :, 2, :] = (lo_e1 >> 4) | (((hi_e >> 4) & 3) << 4)
+        out[:, :, 3, :] = (lo_e2 >> 4) | (((hi_e >> 6) & 3) << 4)
+    result -= np.int8(32)   # 0..63 -> -32..31, in place
+    return result.reshape(n_super, 256)
 
 
 def unpack_q5_k_quants(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
@@ -300,19 +319,34 @@ def unpack_q5_k_quants(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     assert lo.shape[1] == 128
     assert hi.shape[1] == 32
 
-    result = np.zeros((lo.shape[0], 256), dtype=np.int8)
-    for b in range(lo.shape[0]):
-        for n in range(4):
-            hi_mask1 = 1 << (2*n)
-            hi_mask2 = 2 << (2*n)
-            index1 = 64 * n
-            index2 = 32 * n
-            result[b, index1:index1+32] = \
-                (lo[b, index2:index2+32] & 0xf) + np.where(hi[b, :] & hi_mask1, 16, 0)
-            result[b, index1 + 32:index1 + 64] = \
-                (lo[b, index2:index2+32] >> 4) + np.where(hi[b, :] & hi_mask2, 16, 0)
+    # Each superblock holds 4 groups of 32 bytes of low nibbles.  Group n takes its
+    # fifth bit from bit 2n (low-nibble values) and bit 2n+1 (high-nibble values)
+    # of the 32 hi bytes.
+    n_super = lo.shape[0]
+    shifts = np.arange(0, 8, 2, dtype=np.uint8).reshape(1, 4, 1)  # [1, group, 1]
+    result = np.empty((n_super, 4, 2, 32), dtype=np.int8)   # [:, group, nibble, byte]
+    unsigned = result.view(np.uint8)
 
-    return result
+    # The nibbles are split directly into the output buffer and the fifth bit is OR-ed in
+    # place, chunk by chunk, so that the temporaries of the bit operations never exceed a
+    # few megabytes.  See UNPACK_CHUNK_SUPERBLOCKS for why this matters.
+    for start in range(0, n_super, UNPACK_CHUNK_SUPERBLOCKS):
+        end = min(start + UNPACK_CHUNK_SUPERBLOCKS, n_super)
+        groups = np.reshape(lo[start:end], (end - start, 4, 32))   # [:, group, byte]
+        low_nibble_values = unsigned[start:end, :, 0, :]
+        high_nibble_values = unsigned[start:end, :, 1, :]
+        np.bitwise_and(groups, 0xf, out=low_nibble_values)
+        np.right_shift(groups, 4, out=high_nibble_values)
+
+        fifth_bits = hi[start:end, None, :] >> shifts   # [:, group, byte]; bit 0 -> low, bit 1 -> high
+        fifth_bit = fifth_bits & 1
+        fifth_bit <<= 4
+        low_nibble_values |= fifth_bit
+        fifth_bits >>= 1
+        fifth_bits &= 1
+        fifth_bits <<= 4
+        high_nibble_values |= fifth_bits
+    return result.reshape(n_super, 256)
 
 
 def unpack_q5_k_scales(data: np.ndarray) -> np.ndarray:
@@ -327,16 +361,17 @@ def unpack_q5_k_scales(data: np.ndarray) -> np.ndarray:
     assert data.shape[1] == 12
     n_scales = data.shape[0]
 
-    scales = np.zeros((n_scales, 8, 2), dtype=np.int8)
-    for block_i in range(n_scales):
-        # The first 4 and last 4 elements of a block are stored differently
-        for i in range(4):
-            scales[block_i, i, 0] = data[block_i, i] & 63
-            scales[block_i, i, 1] = data[block_i, i + 4] & 63
-        for i in range(4):
-            scales[block_i, i + 4, 0] = (data[block_i, i + 8] & 0xf) | ((data[block_i, i + 0] >> 6) << 4)
-            scales[block_i, i + 4, 1] = (data[block_i, i + 8] >> 4) | ((data[block_i, i + 4] >> 6) << 4)
-
+    # The first 4 and last 4 elements of a block are stored differently: bytes 0-3 and
+    # 4-7 hold the low 6 bits of scales 0-3 and mins 0-3, and their top 2 bits combine
+    # with the nibbles of bytes 8-11 to form scales 4-7 and mins 4-7.
+    first = data[:, 0:4]
+    second = data[:, 4:8]
+    third = data[:, 8:12]
+    scales = np.empty((n_scales, 8, 2), dtype=np.int8)
+    scales[:, 0:4, 0] = first & 63
+    scales[:, 0:4, 1] = second & 63
+    scales[:, 4:8, 0] = (third & 0xf) | ((first >> 6) << 4)
+    scales[:, 4:8, 1] = (third >> 4) | ((second >> 6) << 4)
     return scales
 
 
@@ -348,17 +383,16 @@ def unpack_q4_k_quants(lo: np.ndarray) -> np.ndarray:
     """
     assert lo.shape[1] == 128
 
-    result = np.zeros((lo.shape[0], 256), dtype=np.int8)
-    for b in range(lo.shape[0]):
-        for n in range(4):
-            hi_mask1 = 1 << (2*n)
-            hi_mask2 = 2 << (2*n)
-            index1 = 64*n
-            index2 = 32*n
-            result[b, index1:index1 + 32] = lo[b, index2:index2 + 32] & 0xf
-            result[b, index1 + 32:index1 + 64] = lo[b, index2:index2 + 32] >> 4
-
-    return result
+    # Each superblock holds 4 groups of 32 bytes.  Byte j of group n carries value
+    # 64*n + j in its low nibble and value 64*n + 32 + j in its high nibble.
+    # Split the nibbles directly into the output buffer (viewed as uint8); no temporaries.
+    n_super = lo.shape[0]
+    groups = np.reshape(lo, (n_super, 4, 32))               # [:, group, byte]
+    result = np.empty((n_super, 4, 2, 32), dtype=np.int8)   # [:, group, nibble, byte]
+    unsigned = result.view(np.uint8)
+    np.bitwise_and(groups, 0xf, out=unsigned[:, :, 0, :])
+    np.right_shift(groups, 4, out=unsigned[:, :, 1, :])
+    return result.reshape(n_super, 256)
 
 
 def unpack_q3_k_scales(data: np.ndarray) -> np.ndarray:
@@ -371,22 +405,24 @@ def unpack_q3_k_scales(data: np.ndarray) -> np.ndarray:
     kmask1 = np.uint32(0x03030303)  # Mask to extract 2 bits
     kmask2 = np.uint32(0x0f0f0f0f)  # Mask to extract 4 bits
 
-    result = np.ndarray((data.shape[0], 16), dtype=np.int8)
+    assert data.shape[1] == 12
+    n_super = data.shape[0]
 
-    dataq = np.ndarray((4,), dtype=np.uint32)
-    for b in range(data.shape[0]):
-        # Contents of dataq are dead at this point
-        dataq.view(dtype=np.uint8)[0:12] = data[b, :]
-        tmp = dataq[2]
-        dataq[2] = ((dataq[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
-        dataq[3] = ((dataq[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
-        dataq[0] = (dataq[0] & kmask2) | ((tmp & kmask1) << 4)
-        dataq[1] = (dataq[1] & kmask2) | (((tmp >> 2) & kmask1) << 4)
+    # View the 12 bytes of each block as three little-endian uint32 words.  Words 0 and 1
+    # hold the low 4 bits of the 16 scales; word 2 holds their upper 2 bits, 4 scales per
+    # byte, which are spread over 4 output words.
+    words = np.ascontiguousarray(data, dtype=np.uint8).view(np.uint32)   # (n_super, 3)
+    w0 = words[:, 0]
+    w1 = words[:, 1]
+    w2 = words[:, 2]
+    out_words = np.empty((n_super, 4), dtype=np.uint32)
+    out_words[:, 0] = (w0 & kmask2) | ((w2 & kmask1) << 4)
+    out_words[:, 1] = (w1 & kmask2) | (((w2 >> 2) & kmask1) << 4)
+    out_words[:, 2] = ((w0 >> 4) & kmask2) | (((w2 >> 4) & kmask1) << 4)
+    out_words[:, 3] = ((w1 >> 4) & kmask2) | (((w2 >> 6) & kmask1) << 4)
 
-        # Convert to signed int.  Subtract an offset.
-        result[b, :] = dataq.view(dtype=np.int8) - 32
-
-    return result
+    # Convert to signed int.  Subtract an offset.
+    return out_words.view(np.int8) - np.int8(32)
 
 
 def unpack_q3_k_quants(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
@@ -396,18 +432,35 @@ def unpack_q3_k_quants(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     The low bits are stored as 64 int8 values (2 bits per integer).
     The high bits are stored as 32 int8 values (1 bit per integer).
     """
-    result = np.zeros((lo.shape[0], 256), dtype=np.int8)
-    for b in range(lo.shape[0]):
-        for k in range(2):
-            for j in range(4):
-                lo_shift = 2*j
-                hi_mask = 1 << (4*k + j)
-                index1 = 128 * k + 32 * j
-                index2 = 32 * k
-                result[b, index1:index1 + 32] = \
-                    ((lo[b, index2:index2 + 32] >> lo_shift) & 3) - np.where(hi[b, :] & hi_mask, 0, 4)
+    assert lo.shape[1] == 64
+    assert hi.shape[1] == 32
 
-    return result
+    # Each superblock is two halves.  Half k has 32 lo bytes holding four 2-bit values
+    # each (bit pair j gives output group j), and its third bit comes from bit 4k+j of
+    # the 32 hi bytes.  A set hi bit means "add nothing", a clear one means "subtract 4",
+    # which is the same as assembling the unsigned 3-bit value (low_bits | hi_bit << 2)
+    # and subtracting 4.
+    n_super = lo.shape[0]
+    lo_shifts = np.arange(0, 8, 2, dtype=np.uint8).reshape(1, 1, 4, 1)   # [1, 1, group, 1]
+    hi_shifts = np.arange(8, dtype=np.uint8).reshape(1, 2, 4, 1)          # bit 4k + j
+    result = np.empty((n_super, 2, 4, 32), dtype=np.int8)   # [:, half, group, byte]
+    unsigned = result.view(np.uint8)
+
+    # The bits are assembled directly in the output buffer, chunk by chunk, so that the
+    # temporaries of the bit operations never exceed a few megabytes.  See
+    # UNPACK_CHUNK_SUPERBLOCKS for why this matters.
+    for start in range(0, n_super, UNPACK_CHUNK_SUPERBLOCKS):
+        end = min(start + UNPACK_CHUNK_SUPERBLOCKS, n_super)
+        lo_halves = np.reshape(lo[start:end], (end - start, 2, 1, 32))   # [:, half, 1, byte]
+        out = unsigned[start:end]
+        np.right_shift(lo_halves, lo_shifts, out=out)   # broadcasts over the group axis
+        out &= 3                                        # the two low bits
+        hi_bits = hi[start:end, None, None, :] >> hi_shifts   # [:, half, group, byte]
+        hi_bits &= 1
+        hi_bits <<= 2
+        out |= hi_bits                                  # 0..7
+    result -= np.int8(4)                                # -4..3, in place
+    return result.reshape(n_super, 256)
 
 
 def unpack_q2_k_scales(data: np.ndarray) -> np.ndarray:
@@ -417,11 +470,9 @@ def unpack_q2_k_scales(data: np.ndarray) -> np.ndarray:
     unpacked to a 4-bit scale and 4-bit min value.
     The return value is an int8 array of shape (N, 2).
     """
-    result = np.zeros((data.shape[0], 16, 2), dtype=np.int8)
-    for b in range(data.shape[0]):
-        result[b, :, 0] = data[b, :] & 0xf
-        result[b, :, 1] = data[b, :] >> 4
-
+    result = np.empty((data.shape[0], 16, 2), dtype=np.int8)
+    result[:, :, 0] = data & 0xf
+    result[:, :, 1] = data >> 4
     return result
 
 
@@ -430,15 +481,21 @@ def unpack_q2_k_quants(lo: np.ndarray) -> np.ndarray:
     Convert quantized values from Q2_K to int8 values.
     Four 2-bit values are packed into an 8-bit integer.
     """
-    result = np.zeros((lo.shape[0], 256), dtype=np.int8)
-    for b in range(lo.shape[0]):
-        for n in range(2):
-            for j in range(4):
-                index1 = 128 * n + 32 * j
-                index2 = 32 * n
-                result[b, index1:index1 + 32] = (lo[b,index2:index2 + 32] >> (2*j)) & 3
+    assert lo.shape[1] == 64
 
-    return result
+    # Each superblock is two halves of 32 bytes; bit pair j of each byte gives output
+    # group j of that half.
+    n_super = lo.shape[0]
+    halves = np.reshape(lo, (n_super, 2, 1, 32))                      # [:, half, 1, byte]
+    shifts = np.arange(0, 8, 2, dtype=np.uint8).reshape(1, 1, 4, 1)  # [1, 1, group, 1]
+
+    # Shift and mask directly into the output buffer (viewed as uint8) to avoid full-size
+    # temporaries; the values 0..3 are the same bytes as int8.
+    result = np.empty((n_super, 2, 4, 32), dtype=np.int8)             # [:, half, group, byte]
+    unsigned = result.view(np.uint8)
+    np.right_shift(halves, shifts, out=unsigned)
+    unsigned &= 3
+    return result.reshape(n_super, 256)
 
 
 @dataclass

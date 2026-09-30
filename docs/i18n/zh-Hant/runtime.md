@@ -45,6 +45,8 @@ modalix:~$ llima run <model> [options]
 
 若要查看所有可用的選項，請執行 `llima run -h`。
 
+若要停用自動嵌入卸載並將表格保留在 DRAM 中，請執行 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`。
+
 **範例**
 
 ``` console

@@ -87,3 +87,12 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
         self.assertIn('actual="$(read_devkit_platform_version', installer)
         self.assertIn('if [[ "${actual}" != "${expected}" ]]', installer)
         self.assertIn("Refusing to install before modifying apt packages", installer)
+
+    def test_modalix_3_runtime_checks_do_not_require_legacy_appcomplex(self) -> None:
+        for path in (
+            ".github/workflows/vulcan-ci.yml",
+            "tests/runtime/test_python_runtime_lifecycle.py",
+            "tests/runtime/test_zmq_black_box.py",
+            "tests/runtime/test_http_black_box.py",
+        ):
+            self.assertNotIn("simaai-appcomplex.service", read(path), path)

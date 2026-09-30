@@ -608,7 +608,6 @@ jobs:
           dpkg-query -W sima-lmm-core sima-lmm-cli sima-lmm-dev
           llima --help >/dev/null
           python3 -c 'import sima_lmm'
-          systemctl is-active --quiet simaai-appcomplex.service
 
       - name: Extract packaged runtime tests
         run: |
