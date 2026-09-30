@@ -72,16 +72,16 @@ if(SIMA_LMM_BUILD_PYTHON)
         endif()
         # nanobind's STABLE_ABI (abi3) path links Python::SABIModule when it exists.
         # In this cross build FindPython's Development.SABIModule component is not
-        # available, so alias it to the manual Python::Module target above. Pass an
-        # empty Python_LIBRARY so no libpythonX.Y is linked: the abi3 module carries
-        # no version-specific NEEDED entry and imports on any CPython >= 3.12 (the
-        # board runs 3.13). Undefined Py* symbols resolve at dlopen (LDFLAGS keeps
-        # --allow-shlib-undefined).
+        # available, so define it here with the headers only. It must NOT link
+        # Python_LIBRARY: build.sh passes the sysroot's versioned libpythonX.Y.so,
+        # and linking it would give the abi3 module a NEEDED entry for that one
+        # CPython version. Without it the module imports on any CPython >= 3.12
+        # (the board runs 3.13). Undefined Py* symbols resolve at dlopen (LDFLAGS
+        # keeps --allow-shlib-undefined).
         if(NOT TARGET Python::SABIModule)
             add_library(Python::SABIModule INTERFACE IMPORTED)
             set_target_properties(Python::SABIModule PROPERTIES
                 INTERFACE_INCLUDE_DIRECTORIES "${Python_INCLUDE_DIR}"
-                INTERFACE_LINK_LIBRARIES "${Python_LIBRARY}"
             )
         endif()
     else()
