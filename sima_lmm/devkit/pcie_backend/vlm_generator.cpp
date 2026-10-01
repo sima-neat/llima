@@ -154,6 +154,15 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
                 return RunResult{true, true};
         }
     } catch (const std::exception& e) {
+        // run_model can throw after it queued TTFT/TPS events but before its
+        // STOP. The streamer thread may then still be running, or about to run,
+        // the callbacks that use `split` and `answer` on this stack, and
+        // wait_for_streamer_completion() alone would wait forever for that
+        // STOP. So queue a STOP ourselves and wait for it: the queue is FIFO,
+        // so once it is handled no older event can call back into this frame
+        // (and none can reach the next request). The bridge ignores "END".
+        _vlm._text_streamer.push(DecodeCallbackType::STOP, 0, 0);
+        _vlm.wait_for_streamer_completion();
         // A failed question must not leave a half-added question or image behind.
         _clear_history();
         throw GenerationError(e.what(), /*history_cleared=*/true);
