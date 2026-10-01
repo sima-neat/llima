@@ -46,12 +46,19 @@ struct SweepResult {
     std::uintmax_t bytes_deleted = 0;
 };
 
-// Delete each regular file under `root` that is not in `in_use` and whose
-// ctime is more than `max_age` before `now`. ctime, not mtime: the rename
+// The only folders under the recv root that the sweep looks in: where the
+// PCIe pulls land (model files "devkit/...", "elf_files/...", and the host's
+// staged images "pcie-genai/..."). Anything else under the recv root is never
+// touched, so a recv root that is not only for PCIe (even /var/log) loses no
+// unrelated file.
+inline constexpr const char* kSweptRecvSubdirs[] = {"devkit", "elf_files", "pcie-genai"};
+
+// Delete each regular file under `root`/<kSweptRecvSubdirs> that is not in
+// `in_use` and whose ctime is more than `max_age` before `now`. ctime, not mtime: the rename
 // sets ctime to the moment the file became ready and nothing can set it back,
 // while mtime can be anything (touch -d, or svc XF_PRESERVE copies the
-// source's). Never deletes directories or symlinks, never follows symlinks,
-// never throws.
+// source's). A subfolder that is a symlink is skipped. Never deletes
+// directories or symlinks, never follows symlinks, never throws.
 SweepResult sweep_recv_root(const std::filesystem::path& root,
                             const std::set<std::filesystem::path>& in_use,
                             std::chrono::seconds max_age,

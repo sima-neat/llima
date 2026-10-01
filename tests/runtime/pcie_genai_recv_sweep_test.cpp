@@ -59,7 +59,7 @@ void test_old_unused_file_is_deleted() {
 
 void test_age_boundary() {
     const auto root = make_temp_dir();
-    const auto f = root / "b.bin";
+    const auto f = root / "devkit" / "b.bin";
     write_file(f, 10);
     auto r = sweep_recv_root(root, {}, 30s, ctime_of(f) + 30s);
     expect(fs::exists(f) && has(r.kept, f, "young"), "age == N is kept (only older than N is deleted)");
@@ -69,7 +69,7 @@ void test_age_boundary() {
 
 void test_young_file_is_kept() {
     const auto root = make_temp_dir();
-    const auto f = root / "fresh.bin";
+    const auto f = root / "devkit" / "fresh.bin";
     write_file(f, 10);
     const auto r = sweep_recv_root(root, {}, 30s);   // real now: ~0 s old
     expect(fs::exists(f) && has(r.kept, f, "young"), "a file just renamed into place must be kept");
@@ -77,7 +77,7 @@ void test_young_file_is_kept() {
 
 void test_in_use_file_is_kept_even_if_old() {
     const auto root = make_temp_dir();
-    const auto f = root / "held.bin";
+    const auto f = root / "elf_files" / "held.bin";
     write_file(f, 10);
     const auto r = sweep_recv_root(root, {f}, 30s, ctime_of(f) + 3600s);
     expect(fs::exists(f) && has(r.kept, f, "in use"), "an open or mapped file is never deleted");
@@ -88,12 +88,36 @@ void test_symlinks_are_not_followed_or_deleted() {
     const auto root = make_temp_dir();
     const auto outside = make_temp_dir() / "target.bin";
     write_file(outside, 10);
-    fs::create_symlink(outside, root / "link.bin");
-    fs::create_directory_symlink(outside.parent_path(), root / "linkdir");
+    fs::create_directories(root / "devkit");
+    fs::create_symlink(outside, root / "devkit" / "link.bin");
+    fs::create_directory_symlink(outside.parent_path(), root / "devkit" / "linkdir");
     const auto r = sweep_recv_root(root, {}, 30s, ctime_of(outside) + 3600s);
-    expect(fs::is_symlink(root / "link.bin"), "a symlink is not deleted");
+    expect(fs::is_symlink(root / "devkit" / "link.bin"), "a symlink is not deleted");
     expect(fs::exists(outside), "a symlink target outside the root is not touched");
     expect(r.deleted.empty(), "nothing is deleted through symlinks");
+}
+
+// Only the PCIe subfolders are swept. A recv root that also holds other files
+// (even /var/log by mistake) loses none of them, and a symlinked "devkit"
+// is not followed.
+void test_only_pcie_subfolders_are_swept() {
+    const auto root = make_temp_dir();
+    const auto at_root = root / "syslog.1";
+    const auto other = root / "nginx" / "access.log.1";
+    const auto image = root / "pcie-genai" / "h1-1-0.jpg";
+    write_file(at_root, 10);
+    write_file(other, 10);
+    write_file(image, 10);
+    const auto elsewhere = make_temp_dir();
+    const auto behind_link = elsewhere / "precious.bin";
+    write_file(behind_link, 10);
+    fs::create_directory_symlink(elsewhere, root / "elf_files");
+    const auto r = sweep_recv_root(root, {}, 30s, ctime_of(at_root) + 3600s);
+    expect(fs::exists(at_root), "a file directly in the recv root is never swept");
+    expect(fs::exists(other), "a file in another subfolder is never swept");
+    expect(!fs::exists(image), "an old staged image in pcie-genai/ is swept");
+    expect(fs::exists(behind_link), "a symlinked PCIe subfolder is not followed");
+    expect(r.deleted.size() == 1, "only the image was deleted");
 }
 
 // Review focus 4.
@@ -187,6 +211,7 @@ int main() {
     test_young_file_is_kept();
     test_in_use_file_is_kept_even_if_old();
     test_symlinks_are_not_followed_or_deleted();
+    test_only_pcie_subfolders_are_swept();
     test_missing_root();
     test_open_file_is_seen();
     test_mapped_file_is_seen_after_close();
