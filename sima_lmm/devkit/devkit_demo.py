@@ -12,8 +12,8 @@ from sima_lmm.devkit import model_manager
 from sima_lmm.devkit.model_manager import ModelManager
 from sima_lmm.devkit.pcie_config import (
     RecvRootBusyError,
+    checked_recv_root,
     claim_recv_root,
-    recv_root_from_pep_conf,
 )
 from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
 from sima_lmm.logging import (
@@ -103,14 +103,12 @@ def run_model(args: argparse.Namespace) -> int:
         # host serves it under <serve-root>/<model>), so no separate flag.
         # The receive dir defaults to the pep-daemon's default-recv root, so the
         # value the daemon already owns need not be repeated on the command line.
-        pcie_recv_root = args.pcie_recv_root or recv_root_from_pep_conf()
-        if not pcie_recv_root:
-            print(
-                "--pcie could not determine the receive directory. Pass "
-                "--pcie-recv-root, or set 'default-recv' (and its [recv] path) "
-                "in /etc/simaai/simaai-pep-daemon.conf.",
-                flush=True,
-            )
+        # An explicit --pcie-recv-root must be the daemon's folder too: the
+        # daemon writes the pulled files there.
+        try:
+            pcie_recv_root = checked_recv_root(args.pcie_recv_root or None)
+        except ValueError as e:
+            print(str(e), flush=True)
             return 1
         # Parallel load needs the whole batch on disk at once; PCIe pulls one ELF
         # at a time, so force the serial load path. This env var is read once into

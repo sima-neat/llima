@@ -13,6 +13,32 @@ from typing import Optional
 
 PEP_DAEMON_CONF = "/etc/simaai/simaai-pep-daemon.conf"
 
+def checked_recv_root(given: Optional[str], conf_path: str = PEP_DAEMON_CONF) -> str:
+    """The receive directory for `llima run --pcie`, or raise ValueError.
+
+    given = --pcie-recv-root. The daemon writes every pulled file under its
+    default-recv folder, so a given folder must be that same folder (compared
+    after resolving symlinks); otherwise the first model read would fail with
+    an unclear "file not found". With no given folder, default-recv is used.
+    """
+    from_conf = recv_root_from_pep_conf(conf_path)
+    if given is None:
+        if from_conf is None:
+            raise ValueError(
+                "--pcie could not determine the receive directory. Pass "
+                "--pcie-recv-root, or set 'default-recv' (and its [recv] path) "
+                f"in {conf_path}."
+            )
+        return from_conf
+    if from_conf is not None and os.path.realpath(given) != os.path.realpath(from_conf):
+        raise ValueError(
+            f"--pcie-recv-root {given} is not the pep daemon's default-recv folder "
+            f"{from_conf}; the daemon writes the pulled files there. Drop the flag, "
+            "or pass that folder."
+        )
+    return given
+
+
 # The card-wide claim on the pep recv root. pcie-genai-backend takes the same
 # lock (QueueOwnership on <run dir>/recv-root.pid, lifecycle.cpp), so only one
 # PCIe model user runs per card: they all stage the same file names
