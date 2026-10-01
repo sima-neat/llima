@@ -13,6 +13,7 @@ import time
 
 from sima_lmm.devkit.pcie_config import (
     RecvRootBusyError,
+    checked_recv_root,
     claim_recv_root,
     recv_root_from_pep_conf,
 )
@@ -72,6 +73,25 @@ def test_no_default_recv_returns_none(tmp_path):
 def test_default_recv_name_absent_from_recv_section_returns_none(tmp_path):
     text = SAMPLE.replace("recv5g = /tmp/pcie-recv\n", "")
     assert recv_root_from_pep_conf(_write(tmp_path, text)) is None
+
+
+def test_checked_recv_root(tmp_path):
+    conf = _write(tmp_path, SAMPLE)  # default-recv -> /tmp/pcie-recv
+    assert checked_recv_root(None, conf) == "/tmp/pcie-recv"
+    assert checked_recv_root("/tmp/pcie-recv", conf) == "/tmp/pcie-recv"
+    assert checked_recv_root("/tmp/pcie-recv/", conf) == "/tmp/pcie-recv/"  # same folder
+    try:
+        checked_recv_root("/data/other", conf)
+        raise AssertionError("a folder that is not default-recv must be refused")
+    except ValueError as e:
+        assert "not the pep daemon's default-recv folder /tmp/pcie-recv" in str(e), str(e)
+    missing = str(tmp_path / "missing.conf")
+    assert checked_recv_root("/data/any", missing) == "/data/any"  # no config: trust the flag
+    try:
+        checked_recv_root(None, missing)
+        raise AssertionError("no flag and no config must be refused")
+    except ValueError as e:
+        assert "--pcie-recv-root" in str(e)
 
 
 def test_recv_root_claim_is_exclusive_and_released(tmp_path):
