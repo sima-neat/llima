@@ -119,6 +119,13 @@ int main() {
             );
         std::cout << "LLIMA_LLM model_dir=" << model_dir << '\n';
 
+        // Embedding offload (on by default when the model is on local NVMe)
+        // reads the token-embedding table row by row straight from the disk,
+        // not through the provider. It is a disk-only feature: under --pcie the
+        // model is in the tmpfs recv root, so it never turns on there. Turn it
+        // off, so the resident path (sites 10/11) is the one under test.
+        ::setenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD", "off", 1);
+
         simaai::llima::connect(
             {},
             "/tmp/sima_lmm_file_provider_routing_test.log",
