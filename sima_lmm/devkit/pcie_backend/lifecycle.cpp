@@ -274,6 +274,36 @@ std::optional<std::filesystem::path> recv_root_from_pep_conf(const std::filesyst
     return std::filesystem::path(it->second);
 }
 
+std::filesystem::path checked_recv_root(const std::optional<std::filesystem::path>& given,
+                                        const std::optional<std::filesystem::path>& from_conf) {
+    const std::optional<std::filesystem::path>& chosen = given ? given : from_conf;
+    if (!chosen) {
+        throw std::runtime_error("cannot find the pep daemon recv root; pass --recv-root");
+    }
+    std::error_code ec;
+    const std::filesystem::path root = std::filesystem::canonical(*chosen, ec);
+    if (ec || !std::filesystem::is_directory(root, ec)) {
+        throw std::runtime_error("recv root " + chosen->string() + " is not an existing directory");
+    }
+    // "/" has no parts, "/tmp" one: both hold files of other programs, and
+    // the start-up sweep would delete their old files.
+    const auto rel = root.relative_path();
+    if (std::distance(rel.begin(), rel.end()) < 2) {
+        throw std::runtime_error(
+            "refusing recv root " + root.string() + ": the start-up sweep deletes old files "
+            "under it, so it must be a folder only for PCIe, such as /tmp/pcie-recv");
+    }
+    if (given && from_conf) {
+        const std::filesystem::path conf = std::filesystem::canonical(*from_conf, ec);
+        if (ec || conf != root) {
+            throw std::runtime_error(
+                "--recv-root " + given->string() + " is not the pep daemon's default-recv folder " +
+                from_conf->string() + "; the daemon writes the pulled files there");
+        }
+    }
+    return root;
+}
+
 }  // namespace pcie_backend
 }  // namespace llima
 }  // namespace simaai

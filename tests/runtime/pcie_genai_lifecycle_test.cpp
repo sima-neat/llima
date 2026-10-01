@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -158,6 +159,29 @@ void test_recv_root_from_pep_conf() {
     expect(!recv_root_from_pep_conf(bad).has_value(), "unknown name -> nullopt");
 }
 
+// The recv root is checked before the start-up sweep, which deletes old files
+// anywhere under it: "/" or a top-level folder must never be swept.
+void test_checked_recv_root() {
+    const auto refused = [](const std::optional<std::filesystem::path>& given,
+                            const std::optional<std::filesystem::path>& conf) {
+        try { checked_recv_root(given, conf); } catch (const std::runtime_error&) { return true; }
+        return false;
+    };
+    const auto dir = make_temp_dir();          // e.g. /tmp/llima_p4_XXXXXX: two levels
+    const auto recv = dir / "recv";
+    std::filesystem::create_directories(recv);
+    expect(checked_recv_root(std::nullopt, recv) == std::filesystem::canonical(recv),
+           "the daemon's folder is used and made canonical");
+    expect(checked_recv_root(recv, recv) == std::filesystem::canonical(recv),
+           "--recv-root equal to default-recv is accepted");
+    expect(refused(std::filesystem::path("/"), std::nullopt), "/ is refused");
+    expect(refused(std::nullopt, std::filesystem::path("/")), "a daemon config of / is refused");
+    expect(refused(std::filesystem::path("/tmp"), std::nullopt), "a top-level folder is refused");
+    expect(refused(recv / "missing", std::nullopt), "a missing folder is refused");
+    expect(refused(std::nullopt, std::nullopt), "no recv root at all is refused");
+    expect(refused(dir, recv), "--recv-root that is not default-recv is refused");
+}
+
 void test_require_directory() {
     const auto dir = make_temp_dir();
     bool threw = false;
@@ -174,6 +198,7 @@ int main() {
     test_stale_takeover_cannot_remove_a_new_claim();
     test_recv_root_from_pep_conf();
     test_require_directory();
+    test_checked_recv_root();
     if (failures == 0) std::cout << "pcie_genai_lifecycle_test passed\n";
     return failures == 0 ? 0 : 1;
 }
