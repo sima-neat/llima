@@ -84,6 +84,16 @@ void redirect_to_log(const std::filesystem::path& path);
 std::optional<std::filesystem::path> recv_root_from_pep_conf(
     const std::filesystem::path& conf = "/etc/simaai/simaai-pep-daemon.conf");
 
+// The recv root to use, checked before anything is swept from it (the start-up
+// sweep deletes old files anywhere under it). given = --recv-root, from_conf =
+// recv_root_from_pep_conf(). Throws std::runtime_error with the reason when:
+// none is known; it is not an existing directory; it is "/" or a top-level
+// folder like /tmp or /data (it must be a folder only for PCIe, such as
+// /tmp/pcie-recv); or --recv-root is not the daemon's default-recv folder
+// (the daemon writes the pulled files there). Returns the canonical path.
+std::filesystem::path checked_recv_root(const std::optional<std::filesystem::path>& given,
+                                        const std::optional<std::filesystem::path>& from_conf);
+
 }  // namespace pcie_backend
 }  // namespace llima
 }  // namespace simaai

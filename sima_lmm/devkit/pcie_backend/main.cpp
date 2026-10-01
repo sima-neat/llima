@@ -203,10 +203,9 @@ int run(const Args& args) {
                 "card ({}); only one can run at a time, because they share the recv root",
                 e.what()));
         }
-        recv_root = args.recv_root ? args.recv_root : recv_root_from_pep_conf();
-        if (!recv_root) {
-            throw std::runtime_error("cannot find the pep daemon recv root; pass --recv-root");
-        }
+        // Checked before the sweep below: a wrong root (a typo like "/", or a
+        // bad daemon config) would make the sweep delete other files.
+        recv_root = checked_recv_root(args.recv_root, recv_root_from_pep_conf());
         clean_recv_root(*recv_root, recv_max_age, "start");
         // Measured on mla-hl83 (Llama-3.2-3B): a load takes ~1.7 GiB of
         // MemAvailable. Fail now with a clear message instead of an OOM kill
