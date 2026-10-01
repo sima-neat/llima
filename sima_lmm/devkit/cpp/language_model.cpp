@@ -417,7 +417,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         // Create input embeds from input token ids and image embeds.
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
         if (_kv_eviction) {
-            // The system prompt and tool definitions are never evicted.
             num_cached_tokens = _kv_eviction->resume_or_reset(
                 num_cached_tokens, stable_prefix_token_count
             );

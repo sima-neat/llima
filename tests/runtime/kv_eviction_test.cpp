@@ -1,5 +1,3 @@
-// Unit tests for runtime KV cache eviction logic. No model or MLA access needed.
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -217,7 +215,6 @@ void test_keydiff_matches_reference() {
         for (int slot = 0; slot < kNumValid; ++slot) {
             require(std::abs(scores[slot] - expected[slot]) < 1e-5, "score differs from reference");
         }
-        // Same selection in every layout and dtype.
         for (const auto& [int8, strided, scale] : {
             std::tuple{false, false, 1}, std::tuple{false, true, 1}, std::tuple{true, false, 3},
             std::tuple{true, true, 2},

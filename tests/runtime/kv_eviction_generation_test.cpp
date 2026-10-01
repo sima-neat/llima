@@ -1,6 +1,3 @@
-// DevKit test for runtime KV cache eviction: runs past the compiled context on a text model and
-// checks the mechanics (not answer quality, which is evaluated separately).
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -40,8 +37,7 @@ std::string filler(size_t sentences) {
     return text;
 }
 
-// Runs the turns as one chat; returns the responses and fills `ttft` per turn. ("FULL" is also
-// reported when a response reaches max_new_tokens, so it is not checked here.)
+// Runs the turns as one chat; returns the responses and fills `ttft` per turn.
 std::vector<std::string> ask(VisionLanguageModel& model, simaai::llima::Chat& chat,
                              const std::vector<std::string>& turns, std::vector<double>* ttft = nullptr) {
     // Called from the streamer thread, also by later runs: capture the pointer, not this frame.
@@ -59,8 +55,7 @@ std::vector<std::string> ask(VisionLanguageModel& model, simaai::llima::Chat& ch
     return responses;
 }
 
-// A new chat with the system prompt, or none if it is empty. A new chat inherits the last system
-// prompt, and clearing it keeps the inherited system message, so the messages are reset too.
+// New chats inherit the last system prompt, and clearing it keeps the message: reset the messages.
 simaai::llima::Chat new_chat(VisionLanguageModel& model, const std::string& system_prompt) {
     auto chat = model.create_chat();
     chat.set_system_prompt(system_prompt);
@@ -107,9 +102,8 @@ void test_generation_continues_past_the_cache(VisionLanguageModel& model, uint16
 }
 
 void test_long_chat(VisionLanguageModel& model, uint16_t context) {
-    // The first turn is about twice the cache; the fact sits in the recent window. No system
-    // prompt: some templates (Mistral v0.3) move it to the latest user message, which changes the
-    // earlier tokens and re-processes the conversation by design.
+    // The first turn is about twice the cache, with the fact in the recent window. No system
+    // prompt: Mistral v0.3's template moves it to the latest user message, forcing a re-process.
     const std::string fact = " My flight number is LH 438. Reply with OK.";
     const std::vector<std::string> turns = {
         filler(static_cast<size_t>(context) * 2 / 9) + fact,
@@ -132,7 +126,6 @@ void test_long_chat(VisionLanguageModel& model, uint16_t context) {
             !recalls || responses[1].find("438") != std::string::npos,
             std::string(name) + ": not recalled"
         );
-        // Follow-up turns continue from the cache instead of re-processing the conversation.
         require(
             ttft[1] < 0.25 * ttft[0] && ttft[2] < 0.25 * ttft[0],
             std::string(name) + ": a follow-up turn re-processed the conversation"
@@ -145,7 +138,6 @@ void test_long_chat(VisionLanguageModel& model, uint16_t context) {
         chat.set_messages(messages);
         require(model.run_model(chat, 16).has_value(), "the edited chat was interrupted");
 
-        // Deterministic: a fresh run gives the same responses.
         model.set_kv_eviction({name});
         require(
             ask(model, turns, nullptr, "") == responses,

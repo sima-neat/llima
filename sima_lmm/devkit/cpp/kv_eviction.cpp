@@ -34,7 +34,6 @@ bool is_supported_rope_type(const std::string& rope_type) {
         || rope_type == "llama3";
 }
 
-// The trained context length from the Hugging Face config, if known.
 std::optional<uint32_t> read_trained_max_positions(const std::filesystem::path& devkit_dir) {
     std::ifstream stream(devkit_dir / "config.json");
     const auto config = nlohmann::json::parse(stream, nullptr, false);
@@ -456,7 +455,6 @@ void KvEviction::evict(uint16_t next_token_idx) {
     const uint16_t pinned = _pinned_tokens;
     const uint16_t recent = std::min<uint16_t>(_limits.recent_tokens, _limits.budget - pinned);
 
-    // Per layer: key, value, key scale and value scale (no scales without int8 caches).
     std::vector<std::array<MLABuffer*, 4>> layers;
     for (uint32_t layer_idx = 0; layer_idx < _num_layers; ++layer_idx) {
         const auto buffer = [&](const char* name) {
@@ -470,7 +468,6 @@ void KvEviction::evict(uint16_t next_token_idx) {
         });
     }
 
-    // Layers are independent.
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto& buffers = layers[i];
