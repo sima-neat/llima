@@ -421,7 +421,8 @@ target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
 if(SIMA_LMM_BUILD_PYTHON)
     # STABLE_ABI builds cpp_ext against the CPython limited API (floor 3.12) so the
     # single cpp_ext.abi3.so imports on any CPython >= 3.12, including the board's
-    # 3.13. See the Python::SABIModule alias above and Ruling 7.
+    # 3.13. See the Python::SABIModule alias above and Ruling 7. The sima-lmm-cli
+    # package that ships it therefore depends on python3 (>= 3.12).
     nanobind_add_module(
         ${TARGET_BIND}
         NOMINSIZE
@@ -680,8 +681,12 @@ string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "libcpp-httplib-dev, libjsoncpp-dev, libopencv-dev, libfftw3-dev, "
     "libavcodec-dev, libavformat-dev, libavutil-dev, libswresample-dev, "
     "libssl-dev, cppzmq-dev, libzmq3-dev")
+# >= 3.12: sima-lmm-cli ships cpp_ext.abi3.so, built for the CPython 3.12
+# limited API (STABLE_ABI below), so it cannot import on 3.11. The wheel's
+# requires-python (>= 3.11) is for the Model Compiler tools: the wheel has no
+# cpp_ext (wheel.cmake = false in pyproject.toml).
 set(CPACK_DEBIAN_CLI_PACKAGE_DEPENDS
-    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), python3")
+    "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), python3 (>= 3.12)")
 
 set(CPACK_INSTALL_CMAKE_PROJECTS
     "${CMAKE_BINARY_DIR};${PROJECT_NAME};ALL;/"
