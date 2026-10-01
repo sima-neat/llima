@@ -24,6 +24,9 @@ std::string dump(const ordered_json& j) {
 }
 
 // A pulled name must stay inside its serve root: not empty, not absolute, no "..".
+// It must also be "pcie-genai/<file>": the host stages every image there, and
+// the card pulls it to <recv root>/pcie-genai/<file>, the one image folder the
+// recv sweep cleans (and never next to the model's devkit/ or elf_files/).
 void check_image_name(const std::string& name) {
     const std::filesystem::path path(name);
     bool has_dotdot = false;
@@ -35,6 +38,14 @@ void check_image_name(const std::string& name) {
     }
     if (name.empty() || path.is_absolute() || has_dotdot) {
         throw std::invalid_argument("\"images\" names must be relative paths with no \"..\"");
+    }
+    const std::string folder = std::string(kImageFolder) + "/";
+    const std::string file = name.size() > folder.size() ? name.substr(folder.size()) : "";
+    if (name.compare(0, folder.size(), folder) != 0 || file.empty() ||
+        file.find('/') != std::string::npos || file == ".") {
+        throw std::invalid_argument("\"images\" names must be \"" + folder +
+                                    "<file>\" (the host's image stage folder), got \"" + name +
+                                    "\"");
     }
 }
 

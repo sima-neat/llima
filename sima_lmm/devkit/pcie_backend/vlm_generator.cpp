@@ -124,9 +124,11 @@ RunResult VlmGenerator::run(const PromptRequest& request, EventBridge& bridge) {
         // Pull each new image over PCIe and keep it until the history is cleared.
         for (const std::string& name : request.images) {
             const ImageTarget target = image_target_for(name);
-            auto provider = std::make_shared<PcieFileProvider>(
-                _recv_root, _image_serve_root, target.subfolder);
-            const std::filesystem::path pulled = provider->get_path(target.filename);
+            // No subfolder, the whole name: the image lands at
+            // <recv root>/pcie-genai/<file> (protocol-checked), the folder the
+            // recv sweep cleans, so an image left by a killed backend is freed.
+            auto provider = std::make_shared<PcieFileProvider>(_recv_root, _image_serve_root, "");
+            const std::filesystem::path pulled = provider->get_path(name);
             _kept_images.add([provider, pulled] { provider->evict(pulled); });
             _kept_image_leaves.insert(target.filename);
             _chat.add_image(pulled);
