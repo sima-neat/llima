@@ -1,0 +1,9 @@
+#!/bin/sh
+# sima-lmm-core postinst: make the pcie-genai-backend folders now, not only
+# at the next boot. A no-op if the package has no backend (no tmpfiles file).
+set -e
+conf=/usr/lib/tmpfiles.d/sima-lmm-pcie.conf
+if [ "$1" = configure ] && [ -f "$conf" ] && command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create "$conf" || true
+fi
+exit 0

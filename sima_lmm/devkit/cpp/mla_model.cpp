@@ -18,6 +18,7 @@
 #include <simaai/gst-api.h>
 #include <spdlog/spdlog.h>
 
+#include "file_provider.hpp"
 #include "mla_model.hpp"
 
 namespace simaai {
@@ -324,9 +325,10 @@ MLAModelWithBuffer::MLAModelWithBuffer(
     std::vector<MLABufferSlice> ofms
 ) : _ifms(std::move(ifms)), _ofms(std::move(ofms)) {
     model_path = std::filesystem::absolute(model_path).lexically_normal();
-    if (!std::filesystem::is_regular_file(model_path)) {
-        throw std::runtime_error(fmt::format("Model file does not exist: {}", model_path));
-    }
+    // Note: we do NOT require the file to exist here. Paths may be reserved
+    // at model-define time and only fetched over PCIe at load time (deferred
+    // pull). Presence is enforced by mla_load_model in load_all_models, which
+    // throws with a clear message if the file is missing.
     auto& state = runtime_state();
     std::lock_guard lock(state.registry_mutex);
     const auto [it, inserted] = state.path_to_index.emplace(model_path, state.paths.size());
@@ -531,15 +533,24 @@ void MLAModelWithBuffer::update_reloc(
     }
 }
 
+void MLAModelWithBuffer::load_all_models(std::optional<std::filesystem::path> relative_dir) {
+    load_all_models(std::move(relative_dir), nullptr);
+}
+
 void MLAModelWithBuffer::load_all_models(
-    std::optional<std::filesystem::path> relative_dir
+    std::optional<std::filesystem::path> relative_dir,
+    FileProvider* files
 ) {
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
     std::lock_guard registry_lock(state.registry_mutex);
     require_handle();
 
-    if (!_disable_parallel_load) {
+    // A provider that pulls files (PCIe) needs the serial fetch -> load ->
+    // evict loop below: the parallel batch load would read files that were
+    // never pulled. So force serial here, even if the env var was not set.
+    const bool must_pull = files != nullptr && files->pulls_files();
+    if (!_disable_parallel_load && !must_pull) {
         std::map<std::filesystem::path, uint16_t> batch_paths;
         for (const auto& [path, index] : state.path_to_index) {
             if (!state.models[index] && path_matches_family(path, relative_dir)) {
@@ -568,10 +579,13 @@ void MLAModelWithBuffer::load_all_models(
 
     for (const auto& [path, index] : state.path_to_index) {
         if (state.models[index] || !path_matches_family(path, relative_dir)) continue;
+        if (files) files->fetch(path);           // pull over PCIe (no-op on disk)
         state.models[index] = mla_load_model(state.handle, path.c_str());
         if (!state.models[index]) {
+            // Leave the fetched file in place for debugging on failure.
             throw std::runtime_error(fmt::format("MLA-RT failed to load model: {}", path));
         }
+        if (files) files->evict(path);           // delete disk copy (no-op on disk)
         spdlog::info("Loaded model: {}", path);
     }
 }

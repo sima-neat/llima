@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <utility>
 
 #include "cli.hpp"
 #include "reasoning_parser.hpp"
@@ -33,8 +34,22 @@ CLI::CLI(
     std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template
+) : CLI(
+        std::move(vlm_model_path), std::move(whisper_model_path),
+        std::move(draft_model_path), std::move(system_prompt),
+        std::move(chat_template), nullptr
+    ) {}
+
+CLI::CLI(
+    std::filesystem::path vlm_model_path,
+    std::optional<std::filesystem::path> whisper_model_path,
+    std::optional<std::filesystem::path> draft_model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    std::shared_ptr<FileProvider> file_provider
 ) : _vision_language_model_ptr(
-        std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
+        std::make_unique<VisionLanguageModel>(
+            vlm_model_path, system_prompt, chat_template, std::move(file_provider))
     )
 {
     if (_singleton_ptr)

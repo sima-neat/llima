@@ -7,6 +7,7 @@
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <utility>
 #include <string_view>
 
 #include <Eigen/Dense>
@@ -64,6 +65,19 @@ LogLikelihoodResult score_logits(
 
 namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
+
+// Load a whole .bin file into one buffer and check its size. The old
+// load_file() checked "file size == buffer size". load_stream() alone only
+// catches a file that is too SHORT, so we also check that no bytes are left
+// over (a file that is too LONG, e.g. from another model).
+void load_whole_file(MLABuffer& buffer, std::istream& stream, const std::string& name) {
+    buffer.load_stream(stream);
+    if (stream.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error(fmt::format(
+            "Invalid size for {}: file is larger than buffer {}", name, buffer.get_name()
+        ));
+    }
+}
 }
 
 LanguageModel::LanguageModel(
@@ -72,7 +86,19 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer
-) : BaseModel(model_path),
+) : LanguageModel(
+        std::move(model_path), std::move(stop_token_ids), image_token_id, pad_token_id,
+        text_streamer, nullptr
+    ) {}
+
+LanguageModel::LanguageModel(
+    std::filesystem::path model_path,
+    std::set<uint32_t> stop_token_ids,
+    std::optional<uint32_t> image_token_id,
+    std::optional<uint32_t> pad_token_id,
+    TextStreamer& text_streamer,
+    std::shared_ptr<FileProvider> file_provider
+) : BaseModel(model_path, std::move(file_provider)),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id),
@@ -1490,31 +1516,42 @@ void LanguageModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
+    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name, _files.get());
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
     if (!draft_model) {
         if (!_embedding_offload) {
-            auto embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
-            if (std::filesystem::exists(embeddings_file_name)) {
-                get_buffer("embeddings").load_file(embeddings_file_name);
+            const auto embeddings_bin = "devkit/" + _cfg.language_model_name + "_embeddings.bin";
+            // The .bin file is optional. Use exists() to check softly: if it
+            // is there, exists() pulls it and we use it; if it is missing we
+            // fall back to the required .npy below with get_path(), which
+            // pulls it and fails loudly if it is not there either. Both go
+            // through _files, so PCIe and disk take the same path. Do NOT use
+            // get_path() for the optional check — it throws when the file is
+            // missing.
+            if (_files->exists(embeddings_bin)) {
+                load_whole_file(get_buffer("embeddings"), *_files->open_stream(embeddings_bin),
+                                embeddings_bin);
             } else {
                 // Compatibility with packages generated before raw embedding files were introduced.
-                embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.npy");
-                auto embeddings_tensor = cnpy::npy_load(embeddings_file_name);
+                const auto embeddings_npy = "devkit/" + _cfg.language_model_name + "_embeddings.npy";
+                auto embeddings_tensor = cnpy::npy_load(_files->get_path(embeddings_npy));
+                // cnpy has read the whole file into memory, so the disk copy
+                // is no longer needed (over PCIe this frees recv_root space).
+                _files->release(embeddings_npy);
                 get_buffer("embeddings").upload(embeddings_tensor.data<void>());
             }
         }
         if (_cfg.pipeline_cfg.quantize_embeddings) {
-            const auto scale_file_name = (
-                _devkit_dir / (_cfg.language_model_name + "_embedding_scales.bin")
-            );
-            get_buffer("embedding_scales").load_file(scale_file_name);
+            const auto scale_file =
+                "devkit/" + _cfg.language_model_name + "_embedding_scales.bin";
+            load_whole_file(get_buffer("embedding_scales"), *_files->open_stream(scale_file),
+                            scale_file);
         }
     } else {
         // Load d2t mapping (int64 in npy, narrows to int32 — values fit easily).
-        auto d2t_file_name = _devkit_dir / "d2t.npy";
-        auto d2t_tensor = cnpy::npy_load(d2t_file_name);
+        auto d2t_tensor = cnpy::npy_load(_files->get_path("devkit/d2t.npy"));
+        _files->release("devkit/d2t.npy");   // already in memory
         const int64_t* src = d2t_tensor.data<int64_t>();
         const size_t n = d2t_tensor.num_vals;
         _d2t.resize(n);
@@ -2490,6 +2527,15 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         _logger->info("No relocation is needed");
         return;
     }
+    // The file list below comes from a directory listing on local disk. A
+    // provider that pulls files (PCIe) has no listing, so the folder is not
+    // there: say so, instead of "Relocation directory does not exist".
+    if (_files->pulls_files()) {
+        throw std::runtime_error(
+            "LoRA is not supported with --pcie yet: the npy_files folder cannot be listed "
+            "over PCIe"
+        );
+    }
 
     // Key to access the reloc addr maps.
     struct RelocMapType {
@@ -2535,8 +2581,12 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         if (!_use_group_token_models && model_key.num_tokens > 1)
             continue;
 
-        // Upload the tensor to the buffer.
-        auto tensor = cnpy::npy_load(file_name);
+        // Upload the tensor to the buffer. The directory listing above stays on
+        // disk (the seam has no listing API yet), but the file read routes
+        // through the provider by its model-root-relative name.
+        auto tensor = cnpy::npy_load(
+            _files->get_path("npy_files/" + reloc_name + "/" + file_name.filename().string())
+        );
         auto buffer_name = file_name.stem();
 
         // If the buffer does not exist, define and allocate it first.
@@ -2798,9 +2848,8 @@ std::vector<uint32_t> LanguageModel::_get_per_layer_token_ids(
 
 
 void LanguageModel::_load_per_layer_embeddings() {
-    const auto file_name = (
-        _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin")
-    );
+    const auto file_rel = "devkit/" + _cfg.language_model_name + "_per_layer_embeddings.bin";
+    const auto file_name = _files->get_path(file_rel);
     const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
     const size_t out_dim = static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers)
                          * _cfg.lm_cfg.hidden_size_per_layer_input;
@@ -2817,8 +2866,8 @@ void LanguageModel::_load_per_layer_embeddings() {
     }
 
     // Resident mode streams complete tables; offload mode has no table shards.
-    std::ifstream stream;
-    if (!_embedding_offload) stream.open(file_name, std::ios::binary);
+    std::unique_ptr<std::istream> stream;
+    if (!_embedding_offload) stream = _files->open_stream(file_rel);
     for (auto* shard : _per_layer_embedding_shards) {
         if (shard->get_buf_len() != shard->get_shape()[0] * token_row_size) {
             throw std::runtime_error(fmt::format(
@@ -2826,15 +2875,14 @@ void LanguageModel::_load_per_layer_embeddings() {
                 shard->get_name()
             ));
         }
-        shard->load_stream(stream);
+        shard->load_stream(*stream);
     }
 
     if (_cfg.pipeline_cfg.quantize_embeddings) {
-        const auto scale_file_name = (
-            _devkit_dir
-            / (_cfg.language_model_name + "_per_layer_embedding_scales.bin")
-        );
-        get_buffer("per_layer_embedding_scales").load_file(scale_file_name);
+        const auto scale_file =
+            "devkit/" + _cfg.language_model_name + "_per_layer_embedding_scales.bin";
+        load_whole_file(get_buffer("per_layer_embedding_scales"), *_files->open_stream(scale_file),
+                        scale_file);
     }
 }
 

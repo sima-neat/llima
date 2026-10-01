@@ -67,6 +67,64 @@ To disable automatic embedding offloading and keep the tables in DRAM, run
 modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
 ```
 
+## Running a Model over PCIe
+
+On a Modalix PCIe card, the model can stay on the x86 host. With `--pcie`,
+`llima run` on the card pulls each model file from the host over PCIe when it
+needs it. It loads the ELF files one at a time and deletes each one after it is
+loaded, so the card needs space for only the largest single file.
+
+``` console
+modalix:~$ llima run <model> --pcie [--pcie-serve-root models] [--pcie-recv-root <dir>]
+```
+
+| Argument | Description |
+|----|----|
+| `model` | The model folder name under the host serve root (e.g., `Llama-3.2-3B-Instruct-a16w4`). |
+| `--pcie` | Pull the model files over PCIe instead of reading the local disk. |
+| `--pcie-serve-root` | Name of the host serve root that holds the models (default: `models`). |
+| `--pcie-recv-root` | Card folder where pulled files land. Default: the pep daemon's `default-recv` folder. |
+
+Both sides need the PCIe service daemons running and configured:
+
+- **Host** (`simaai-mla-daemon`, `/etc/simaai/simaai-mla-daemon.conf`): a
+  `[serve]` root that holds the model folders. The model is read from
+  `<serve root>/<model>/`.
+
+  ``` ini
+  [serve]
+  models = /scratch/simaai/models
+  ```
+
+- **Card** (`simaai-pep-daemon`, `/etc/simaai/simaai-pep-daemon.conf`): a
+  receive folder, set as the default. It must have room for the largest model
+  file (for example, a large `embeddings.bin`).
+
+  ``` ini
+  default-recv = recv5g
+
+  [recv]
+  recv5g = /tmp/pcie-recv
+  ```
+
+  `--pcie-recv-root` must be the same folder as `default-recv`, because the
+  daemon writes the pulled files there.
+
+Limits: `--pcie` works only in CLI mode (`--mode cli`), no draft model for
+speculative decoding is used with `--pcie`, `--stt_model_path` must be a
+local folder on the card, and `set lora` is not supported yet.
+
+Only one PCIe model user runs on a card at a time, because all of them use the
+same receive folder. `llima run --pcie` stops with an error while
+`pcie-genai-backend` (or another `llima run --pcie`) is running, and the other
+way round. The lock is `/run/sima-neat/pcie/recv-root.pid.lock`.
+
+To chat with the card from the host instead, use the `pcie-genai` host CLI. It
+starts the card program `pcie-genai-backend` (installed in `/usr/bin` by the
+`sima-lmm-core` package) over SSH. See
+[HOW-TO-RUN-PCIE-GENAI.md](https://github.com/sima-neat/core/blob/release-3.0.0-prep/pcie_host/HOW-TO-RUN-PCIE-GENAI.md)
+in the Neat core repository.
+
 ## Interactive Commands
 
 Once `llima run` starts in CLI mode, use these commands at the prompt:

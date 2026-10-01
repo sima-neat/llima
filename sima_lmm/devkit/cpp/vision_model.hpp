@@ -1,11 +1,13 @@
 #ifndef _SIMA_LLIMA_VISION_MODEL_
 #define _SIMA_LLIMA_VISION_MODEL_
 
+#include <memory>
 #include <vector>
 
 #include <Eigen/Dense>
 
 #include "base_model.hpp"
+#include "file_provider.hpp"
 #include "vlm_config.hpp"
 
 
@@ -14,7 +16,14 @@ namespace llima {
 
 class VisionModel : public BaseModel<VlmConfig> {
     public:
+        // Reads the model files from disk (the signature from before the
+        // FileProvider seam, kept so older builds still link).
         VisionModel(std::filesystem::path model_path);
+        // Reads the model files through file_provider (nullptr = from disk).
+        VisionModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<FileProvider> file_provider
+        );
         virtual ~VisionModel() { _finalize(); };
 
         void run_model(

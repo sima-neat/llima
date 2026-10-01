@@ -24,13 +24,23 @@ namespace llima {
 
 class CLI;
 class WEB;
+namespace pcie_backend { class VlmGenerator; }
 
 class VisionLanguageModel : public BaseModel<VlmConfig> {
     public:
+        // Reads the model files from disk. Same signature as before the
+        // FileProvider seam, so code built against the older library still links.
         VisionLanguageModel(
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,
             std::optional<std::string> chat_template = std::nullopt
+        );
+        // Reads the model files through file_provider (nullptr = from disk).
+        VisionLanguageModel(
+            std::filesystem::path model_path,
+            std::optional<std::string> system_prompt,
+            std::optional<std::string> chat_template,
+            std::shared_ptr<FileProvider> file_provider
         );
         ~VisionLanguageModel() {}
 
@@ -93,6 +103,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
     private:
         friend class CLI;
         friend class WEB;
+        friend class pcie_backend::VlmGenerator;  // PCIe backend: thinking check, context size
         std::string_view model_type() const { return _cfg.model_type; }
 
         VlmHelper _vlm_helper;

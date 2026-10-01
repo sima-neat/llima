@@ -1,6 +1,7 @@
 #include <spdlog/spdlog.h>
 
 #include <stdexcept>
+#include <utility>
 
 #include "reasoning_parser.hpp"
 #include "utils.hpp"
@@ -13,20 +14,33 @@ VisionLanguageModel::VisionLanguageModel(
     std::filesystem::path model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template
-) : BaseModel(model_path),
-    _vlm_helper(_cfg, _devkit_dir, system_prompt, chat_template),
+) : VisionLanguageModel(
+        std::move(model_path), std::move(system_prompt), std::move(chat_template), nullptr
+    ) {}
+
+VisionLanguageModel::VisionLanguageModel(
+    std::filesystem::path model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    std::shared_ptr<FileProvider> file_provider
+) : BaseModel(model_path, file_provider),
+    _vlm_helper(_cfg, *_files, system_prompt, chat_template),
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
 {
     _tool_call_format = tool_call_format_for_model(_cfg.model_type);
     if (_cfg.support_image()) {
-        _vision_model_ptr = std::make_unique<VisionModel>(model_path);
+        // VisionModel loads its stage1 ELFs and vlm_config.json through the
+        // same FileProvider as the language path, so over PCIe they are pulled
+        // (fetch -> load -> evict), one ELF on disk at a time.
+        _vision_model_ptr = std::make_unique<VisionModel>(model_path, _files);
     }
     _language_model_ptr = std::make_unique<LanguageModel>(
         model_path,
         _vlm_helper.get_stop_token_ids(),
         _vlm_helper.get_image_token_id(),
         _vlm_helper.get_pad_token_id(),
-        _text_streamer
+        _text_streamer,
+        _files
     );
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
