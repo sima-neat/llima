@@ -95,40 +95,46 @@ SweepResult sweep_recv_root(const fs::path& root, const std::set<fs::path>& in_u
     const fs::path base = fs::weakly_canonical(root, ec);
     if (ec || !fs::is_directory(base, ec)) return result;
 
-    // Default options: directory symlinks are not followed.
-    fs::recursive_directory_iterator it(base, fs::directory_options::skip_permission_denied, ec);
-    for (const fs::recursive_directory_iterator end; !ec && it != end; it.increment(ec)) {
-        std::error_code st_ec;
-        const fs::file_status st = it->symlink_status(st_ec);
-        if (st_ec || !fs::is_regular_file(st)) continue;   // dirs, symlinks, sockets: never touched
+    for (const char* sub : kSweptRecvSubdirs) {
+        const fs::path dir = base / sub;
+        ec.clear();
+        // Only a real folder: a symlinked "devkit" could point anywhere.
+        if (!fs::is_directory(fs::symlink_status(dir, ec)) || ec) continue;
+        // Default options: directory symlinks are not followed.
+        fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+        for (const fs::recursive_directory_iterator end; !ec && it != end; it.increment(ec)) {
+            std::error_code st_ec;
+            const fs::file_status st = it->symlink_status(st_ec);
+            if (st_ec || !fs::is_regular_file(st)) continue;   // dirs, symlinks, sockets: never touched
 
-        const fs::path path = it->path().lexically_normal();
-        struct stat sb{};
-        if (::lstat(path.c_str(), &sb) != 0) continue;   // gone meanwhile (its consumer deleted it)
-        const auto ctime = to_time_point(sb.st_ctim);
+            const fs::path path = it->path().lexically_normal();
+            struct stat sb{};
+            if (::lstat(path.c_str(), &sb) != 0) continue;   // gone meanwhile (its consumer deleted it)
+            const auto ctime = to_time_point(sb.st_ctim);
 
-        SweepEntry entry;
-        entry.path = path;
-        entry.bytes = static_cast<std::uintmax_t>(sb.st_size);
-        entry.age_s = std::chrono::duration<double>(now - ctime).count();
+            SweepEntry entry;
+            entry.path = path;
+            entry.bytes = static_cast<std::uintmax_t>(sb.st_size);
+            entry.age_s = std::chrono::duration<double>(now - ctime).count();
 
-        if (in_use.count(path) != 0) {
-            entry.reason = "in use";
-            result.kept.push_back(std::move(entry));
-            continue;
-        }
-        if (now - ctime <= max_age) {
-            entry.reason = "young";
-            result.kept.push_back(std::move(entry));
-            continue;
-        }
-        std::error_code rm_ec;
-        if (fs::remove(path, rm_ec)) {
-            result.bytes_deleted += entry.bytes;
-            result.deleted.push_back(std::move(entry));
-        } else if (rm_ec) {
-            entry.reason = "delete failed: " + rm_ec.message();
-            result.kept.push_back(std::move(entry));
+            if (in_use.count(path) != 0) {
+                entry.reason = "in use";
+                result.kept.push_back(std::move(entry));
+                continue;
+            }
+            if (now - ctime <= max_age) {
+                entry.reason = "young";
+                result.kept.push_back(std::move(entry));
+                continue;
+            }
+            std::error_code rm_ec;
+            if (fs::remove(path, rm_ec)) {
+                result.bytes_deleted += entry.bytes;
+                result.deleted.push_back(std::move(entry));
+            } else if (rm_ec) {
+                entry.reason = "delete failed: " + rm_ec.message();
+                result.kept.push_back(std::move(entry));
+            }
         }
     }
     return result;
