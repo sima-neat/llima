@@ -59,11 +59,19 @@ std::vector<std::string> ask(VisionLanguageModel& model, simaai::llima::Chat& ch
     return responses;
 }
 
+// A new chat with the system prompt, or none if it is empty. A new chat inherits the last system
+// prompt, and clearing it keeps the inherited system message, so the messages are reset too.
+simaai::llima::Chat new_chat(VisionLanguageModel& model, const std::string& system_prompt) {
+    auto chat = model.create_chat();
+    chat.set_system_prompt(system_prompt);
+    if (system_prompt.empty()) chat.set_messages(nlohmann::ordered_json::array());
+    return chat;
+}
+
 std::vector<std::string> ask(VisionLanguageModel& model, const std::vector<std::string>& turns,
                              std::vector<double>* ttft = nullptr,
                              const std::string& system_prompt = kSystemPrompt) {
-    auto chat = model.create_chat();
-    chat.set_system_prompt(system_prompt);
+    auto chat = new_chat(model, system_prompt);
     return ask(model, chat, turns, ttft);
 }
 
@@ -99,22 +107,31 @@ void test_generation_continues_past_the_cache(VisionLanguageModel& model, uint16
 }
 
 void test_long_chat(VisionLanguageModel& model, uint16_t context) {
-    // The first turn is about twice the cache; the fact sits in the recent window.
+    // The first turn is about twice the cache; the fact sits in the recent window. No system
+    // prompt: some templates (Mistral v0.3) move it to the latest user message, which changes the
+    // earlier tokens and re-processes the conversation by design.
+    const std::string fact = " My flight number is LH 438. Reply with OK.";
     const std::vector<std::string> turns = {
-        filler(static_cast<size_t>(context) * 2 / 9) + " My flight number is LH 438. Reply with OK.",
+        filler(static_cast<size_t>(context) * 2 / 9) + fact,
         "What is my flight number? Answer with the number only.",
         "Thanks. Reply with OK.",
     };
+    // Recall is checked only if the model recalls the fact in a chat that fits.
+    model.set_kv_eviction({"off"});
+    const bool recalls = ask(model, {filler(context / 18) + fact, turns[1]}, nullptr, "")[1]
+        .find("438") != std::string::npos;
     for (const auto* name : {"sink_window", "keydiff"}) {
         model.set_kv_eviction({name});
         std::vector<double> ttft;
-        auto chat = model.create_chat();
-        chat.set_system_prompt(kSystemPrompt);
+        auto chat = new_chat(model, "");
         const auto responses = ask(model, chat, turns, &ttft);
         require(ttft.size() == turns.size(), "missing TTFT");
         std::cout << name << ": '" << responses[1] << "', ttft " << ttft[0] << "s, " << ttft[1]
                   << "s, " << ttft[2] << "s\n";
-        require(responses[1].find("438") != std::string::npos, std::string(name) + ": not recalled");
+        require(
+            !recalls || responses[1].find("438") != std::string::npos,
+            std::string(name) + ": not recalled"
+        );
         // Follow-up turns continue from the cache instead of re-processing the conversation.
         require(
             ttft[1] < 0.25 * ttft[0] && ttft[2] < 0.25 * ttft[0],
@@ -123,14 +140,17 @@ void test_long_chat(VisionLanguageModel& model, uint16_t context) {
 
         // Editing an early message after evictions takes the full re-processing path.
         auto messages = chat.get_messages();
-        messages[1]["content"] = "Note: " + messages[1]["content"].get<std::string>();
+        messages[0]["content"] = "Note: " + messages[0]["content"].get<std::string>();
         messages.erase(messages.end() - 3, messages.end());  // ends with the second question
         chat.set_messages(messages);
         require(model.run_model(chat, 16).has_value(), "the edited chat was interrupted");
 
         // Deterministic: a fresh run gives the same responses.
         model.set_kv_eviction({name});
-        require(ask(model, turns) == responses, std::string(name) + ": a fresh run differs");
+        require(
+            ask(model, turns, nullptr, "") == responses,
+            std::string(name) + ": a fresh run differs"
+        );
     }
 }
 

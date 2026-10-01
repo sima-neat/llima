@@ -133,11 +133,8 @@ KvEvictionLimits resolve_kv_eviction_limits(
             ));
         }
     } else {
-        // Measured on Modalix: keydiff recalls as well with half the cache and evicts less.
-        const uint32_t headroom = kv_eviction.policy == "keydiff"
-            ? capacity / 2
-            : std::max<uint32_t>(group_size, capacity / 8);
-        const uint32_t target = capacity - headroom;
+        // Each eviction frees an eighth of the cache, at least one prefill group.
+        const uint32_t target = capacity - std::max<uint32_t>(group_size, capacity / 8);
         if (use_groups) {
             for (const uint32_t offset : offsets) {
                 if (offset <= target) budget = std::max(budget, offset);
@@ -147,10 +144,12 @@ KvEvictionLimits resolve_kv_eviction_limits(
         }
     }
     if (budget < min_budget) {
+        // Group offsets ascend: suggest the first one that is large enough.
+        const auto smallest = std::lower_bound(offsets.begin(), offsets.end(), min_budget);
         reject(fmt::format(
             "budget of {} tokens is too small for this model (compiled cache {} tokens, "
             "prefill group {}); use at least {}",
-            budget, capacity, group_size, min_budget
+            budget, capacity, group_size, smallest != offsets.end() ? *smallest : min_budget
         ));
     }
     limits.budget = static_cast<uint16_t>(budget);

@@ -74,10 +74,10 @@ void test_budgets() {
     // {config, policy, trained positions, budget, recent tokens, max tokens}
     const std::vector<uint16_t> llama_offsets = {0, 320, 640, 704, 960, 1280, 1600, 1920};
     for (const auto& [config, kv_eviction, trained, budget, recent, max_tokens] : {
-        std::tuple{make_config(), policy("keydiff"), std::optional<uint32_t>{40960}, 1024, 256, 40960},
+        std::tuple{make_config(), policy("keydiff"), std::optional<uint32_t>{40960}, 1792, 448, 40960},
         std::tuple{make_config(), policy("sink_window"), std::optional<uint32_t>{40960}, 1792, 448, 40960},
         std::tuple{make_config(), policy("keydiff", 1536), std::optional<uint32_t>{}, 1536, 384, 65535 - 128},
-        std::tuple{make_config(320), policy("keydiff"), std::optional<uint32_t>{131072}, 960, 320, 65535 - 320},
+        std::tuple{make_config(320), policy("keydiff"), std::optional<uint32_t>{131072}, 1600, 400, 65535 - 320},
         // Deployed Llama-3.2-3B offsets: 704 is irregular, the group at 1920 overruns the cache.
         std::tuple{make_config(320, llama_offsets), policy("sink_window"), std::optional<uint32_t>{131072}, 1600, 400, 65535 - 320},
         std::tuple{make_config(320, llama_offsets), policy("keydiff", 704), std::optional<uint32_t>{131072}, 704, 320, 65535 - 320},
@@ -89,7 +89,7 @@ void test_budgets() {
     for (const auto& [budget, message] : {
         std::pair{1000, "must be a compiled prefill group offset"},
         std::pair{2048, "must be a compiled prefill group offset"},
-        std::pair{256, "too small"},
+        std::pair{256, "too small for this model (compiled cache 2048 tokens, prefill group 128); use at least 384"},
     }) {
         expect_rejected(
             [&] { resolve_kv_eviction_limits(make_config(), policy("keydiff", budget), 40960); },

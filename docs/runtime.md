@@ -110,7 +110,7 @@ To enable it, add `kv_eviction` to `pipeline_cfg` in the deployed
 | Field | Description |
 |----|----|
 | `policy` | `off` (default), `sink_window` (keep the newest tokens), or `keydiff` (keep the tokens whose keys differ most from the average key). |
-| `budget_tokens` | Optional. Tokens kept by each eviction; one of the model's compiled prefill group offsets (the error message lists them). By default, about half of the cache with `keydiff` and 7/8 with `sink_window`. |
+| `budget_tokens` | Optional. Tokens kept by each eviction; one of the model's compiled prefill group offsets (the error message lists them). By default, 7/8 of the cache: each eviction frees an eighth of it, at least one prefill group. |
 
 Eviction always keeps the system prompt and tool definitions, the first tokens,
 and the newest tokens. The system prompt and tool definitions must leave room
@@ -119,8 +119,9 @@ request fails.
 
 A new chat turn continues from the cache as long as the earlier messages are
 sent again unchanged. If an earlier message changes after evictions, for example
-because a client truncates the history or a chat template removes earlier Qwen3
-thinking blocks, the runtime re-processes the whole conversation.
+because a client truncates the history, a chat template removes earlier Qwen3
+thinking blocks, or a template moves the system prompt to the latest user
+message (Mistral v0.3), the runtime re-processes the whole conversation.
 
 Only text-only models whose layers all use full attention, with default, linear,
 or Llama 3 RoPE scaling, are supported; others fail to load with an error that
