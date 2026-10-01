@@ -84,10 +84,20 @@ void test_refuses_unsafe_image_names() {
     // Each name must stay inside the serve root the card pulls from.
     expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["/etc/passwd"]})"); }),
            "absolute image name refused");
-    expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["ok/a.jpg","../../secret"]})"); }),
+    expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["pcie-genai/a.jpg","../../secret"]})"); }),
            "one bad name refuses the whole prompt");
     expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["a/../../b"]})"); }),
            "embedded .. image name refused");
+    // Only the host's image stage folder: the card pulls to <recv root>/pcie-genai/,
+    // the folder its sweep cleans, never next to the model's devkit/ or elf_files/.
+    expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["a.jpg"]})"); }),
+           "an image outside pcie-genai/ is refused");
+    expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["devkit/vlm_config.json"]})"); }),
+           "an image named like a model file is refused");
+    expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["pcie-genai/sub/a.jpg"]})"); }),
+           "a nested image name is refused");
+    expect(refuses([] { parse_prompt(R"({"prompt":"x","images":["pcie-genai/"]})"); }),
+           "the folder alone is refused");
     expect(refuses([] { parse_prompt(R"({"prompt":"x","images":[""]})"); }),
            "empty image name refused");
     expect(refuses([] { parse_prompt(R"({"prompt":"x","images":[5]})"); }),

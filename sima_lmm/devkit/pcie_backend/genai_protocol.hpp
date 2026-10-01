@@ -15,6 +15,10 @@ namespace simaai {
 namespace llima {
 namespace pcie_backend {
 
+// The one folder images come from (on the host's data serve root) and land in
+// (under the card's recv root): "pcie-genai/<file>".
+inline constexpr const char* kImageFolder = "pcie-genai";
+
 // The eight simaai_svc tags between the host and this backend. They must match
 // the host (neat/core/pcie_host/src/genai/GenAIProtocol.h).
 inline constexpr const char* kTagPrompt  = "genai.prompt";   // host -> card, JSON
