@@ -20,13 +20,25 @@ namespace llima {
 
 class EXPORT CLI {
     public:
+        // Reads the model files from disk. Same signature as before the
+        // FileProvider seam: libsima_lmm_runtime exported it, so code built
+        // against the older library still links.
+        CLI(
+            std::filesystem::path vlm_model_path,
+            std::optional<std::filesystem::path> whisper_model_path,
+            std::optional<std::filesystem::path> draft_model_path,
+            std::optional<std::string> system_prompt,
+            std::optional<std::string> chat_template
+        );
+        // file_provider: nullptr = read from disk. No default, so no call
+        // can match both constructors.
         CLI(
             std::filesystem::path vlm_model_path,
             std::optional<std::filesystem::path> whisper_model_path,
             std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template,
-            std::shared_ptr<FileProvider> file_provider = nullptr
+            std::shared_ptr<FileProvider> file_provider
         );
         ~CLI();
 
