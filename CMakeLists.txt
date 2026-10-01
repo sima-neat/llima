@@ -497,6 +497,10 @@ if(SIMAAI_SVC_INCLUDE_DIR)
     # core package next to libsima_lmm_runtime.so, which it links.
     install(TARGETS pcie-genai-backend
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT core)
+    # /run/sima-neat/pcie and /var/log/sima-neat/pcie: the backend exits at
+    # once without them, and nothing else on a clean card makes them.
+    install(FILES sima_lmm/devkit/pcie_backend/packaging/sima-lmm-pcie.tmpfiles.conf
+        DESTINATION lib/tmpfiles.d RENAME sima-lmm-pcie.conf COMPONENT core)
 endif()
 
 set(SIMA_LMM_PUBLIC_HEADERS
@@ -657,6 +661,10 @@ set(CPACK_COMPONENT_CLI_DESCRIPTION
 set(CPACK_DEBIAN_CORE_PACKAGE_NAME "sima-lmm-core")
 set(CPACK_DEBIAN_DEV_PACKAGE_NAME "sima-lmm-dev")
 set(CPACK_DEBIAN_CLI_PACKAGE_NAME "sima-lmm-cli")
+# Makes the pcie-genai-backend folders at install time (see the tmpfiles file).
+set(CPACK_DEBIAN_CORE_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit/pcie_backend/packaging/postinst")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION ON)
 
 string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "simaai-mlart-modalix, "
