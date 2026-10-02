@@ -33,6 +33,14 @@ add_executable(
     sima_lmm_reasoning_parser_test
     reasoning_parser_test.cpp
 )
+add_executable(
+    sima_lmm_kv_eviction_test
+    kv_eviction_test.cpp
+)
+add_executable(
+    sima_lmm_kv_eviction_generation_test
+    kv_eviction_generation_test.cpp
+)
 target_link_libraries(
     sima_lmm_dispatcher_lifecycle_test
     PRIVATE
@@ -60,6 +68,16 @@ target_link_libraries(
 )
 target_link_libraries(
     sima_lmm_reasoning_parser_test
+    PRIVATE
+        sima_lmm_runtime
+)
+target_link_libraries(
+    sima_lmm_kv_eviction_test
+    PRIVATE
+        sima_lmm_runtime
+)
+target_link_libraries(
+    sima_lmm_kv_eviction_generation_test
     PRIVATE
         sima_lmm_runtime
 )
@@ -72,6 +90,8 @@ set_target_properties(
     sima_lmm_asr_transcription_test
     sima_lmm_tool_call_parser_test
     sima_lmm_reasoning_parser_test
+    sima_lmm_kv_eviction_test
+    sima_lmm_kv_eviction_generation_test
     PROPERTIES
         INSTALL_RPATH
             "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
@@ -102,6 +122,15 @@ add_test(
     NAME runtime.reasoning_parser
     COMMAND
         "$<TARGET_FILE:sima_lmm_reasoning_parser_test>"
+)
+add_test(
+    NAME runtime.kv_eviction
+    COMMAND
+        "$<TARGET_FILE:sima_lmm_kv_eviction_test>"
+)
+add_test(
+    NAME runtime.kv_eviction_generation
+    COMMAND "$<TARGET_FILE:sima_lmm_kv_eviction_generation_test>"
 )
 set_tests_properties(
     runtime.dispatcher_lifecycle
@@ -143,6 +172,19 @@ set_tests_properties(
         LABELS "devkit;runtime;unit"
         TIMEOUT 30
 )
+set_tests_properties(
+    runtime.kv_eviction
+    PROPERTIES
+        LABELS "devkit;runtime;unit"
+        TIMEOUT 30
+)
+set_tests_properties(
+    runtime.kv_eviction_generation
+    PROPERTIES
+        LABELS "devkit;runtime;dispatcher;genai;llm;long"
+        RESOURCE_LOCK dispatcher
+        TIMEOUT 900
+)
 
 install(
     TARGETS
@@ -154,6 +196,8 @@ install(
         sima_lmm_asr_transcription_test
         sima_lmm_tool_call_parser_test
         sima_lmm_reasoning_parser_test
+        sima_lmm_kv_eviction_test
+        sima_lmm_kv_eviction_generation_test
     RUNTIME DESTINATION lib/sima-lmm/tests
     COMPONENT extras
 )

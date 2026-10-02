@@ -17,6 +17,7 @@
 #include <spdlog/spdlog.h>
 
 #include "eagle_helpers.hpp"
+#include "kv_eviction.hpp"
 #include "language_model.hpp"
 #include "utils.hpp"
 
@@ -118,6 +119,10 @@ LanguageModel::LanguageModel(
         } else {
             _cfg.lm_cfg.layer_types.resize(_cfg.lm_cfg.num_hidden_layers, "full_attention");
         }
+    }
+
+    if (_cfg.pipeline_cfg.kv_eviction.enabled()) {
+        set_kv_eviction(_cfg.pipeline_cfg.kv_eviction);
     }
 
     if (_use_group_token_models) {
@@ -278,6 +283,12 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
             }
         }
     }
+    if (_kv_eviction) {
+        // After evictions, the last group can read up to one group past the prompt.
+        num_padded_input_tokens = std::max<uint16_t>(
+            num_padded_input_tokens, num_input_tokens + _kv_eviction->limits().group_size
+        );
+    }
 
     // Allocate the input embeds with padding to the buffer.
     if (_embedding_offload) {
@@ -405,6 +416,12 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
 
         // Create input embeds from input token ids and image embeds.
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
+        if (_kv_eviction) {
+            // The system prompt and tool definitions are never evicted.
+            num_cached_tokens = _kv_eviction->resume_or_reset(
+                num_cached_tokens, stable_prefix_token_count
+            );
+        }
 
         // Prefill.
         auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
@@ -466,13 +483,19 @@ uint32_t LanguageModel::run_model_prefill(
         else
             next_token_id = _cached_first_generated_token;
     } else if (_use_group_token_models) {
-        const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
+        // With KV eviction, offsets are cache slots: token index = offset + evicted().
+        const auto& offsets = _kv_eviction
+            ? _kv_eviction->limits().group_offsets
+            : _cfg.pipeline_cfg.input_token_group_offsets.value();
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
+        const auto evicted = [this]() -> uint16_t {
+            return _kv_eviction ? _kv_eviction->evicted() : 0;
+        };
         auto it = offsets.end();
         while (it != offsets.begin()) {
             --it;
-            token_idx = *it;
-            if (*it > num_cached_tokens)
+            token_idx = *it + evicted();
+            if (token_idx > num_cached_tokens)
                 continue;
             if (token_idx <= num_cached_tokens && token_idx + num_tokens > num_cached_tokens)
                 break;
@@ -483,9 +506,15 @@ uint32_t LanguageModel::run_model_prefill(
         }
 
         while (token_idx < num_input_tokens) {
+            if (
+                _kv_eviction && it == offsets.end()
+                && _kv_eviction->evict_for_prefill(token_idx, num_input_tokens)
+            ) {
+                it = std::find(offsets.begin(), offsets.end(), _kv_eviction->slot(token_idx));
+            }
             if (it != offsets.end()) {
-                assert(token_idx >= *it && token_idx < *it + num_tokens);
-                token_idx = *it;
+                assert(token_idx >= *it + evicted() && token_idx < *it + evicted() + num_tokens);
+                token_idx = *it + evicted();
                 last_group_valid_tokens = std::min(
                     num_input_tokens, static_cast<uint16_t>(token_idx + num_tokens)
                 ) - token_idx;
@@ -586,14 +615,23 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     if (input_token_ids.empty()) {
         throw std::runtime_error("Loglikelihood request must include at least one input token");
     }
-    if (input_token_ids.size() > _max_num_tokens) {
+    // Loglikelihood scoring never evicts, so it is limited by the compiled cache.
+    const uint16_t loglikelihood_limit = std::min(
+        _max_num_tokens, _cfg.pipeline_cfg.max_num_tokens
+    );
+    if (input_token_ids.size() > loglikelihood_limit) {
         throw std::runtime_error(
             fmt::format(
                 "Loglikelihood input length {} exceeds max_num_tokens {}",
                 input_token_ids.size(),
-                _max_num_tokens
+                loglikelihood_limit
             )
         );
+    }
+    if (_kv_eviction && _kv_eviction->evicted() > 0) {
+        // The cache no longer matches `_cached_token_ids`.
+        _kv_eviction->reset();
+        _cached_token_ids.clear();
     }
     if (continuation_token_ids.empty()) {
         throw std::runtime_error("Loglikelihood request must include continuation token ids");
@@ -937,7 +975,10 @@ uint32_t LanguageModel::run_model_once(
     auto use_input_tokens = token_idx < num_input_tokens;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
-    _upload_group_future_token_masks(num_tokens, token_idx);
+    // KV writes, attention models and masks use cache slots; inputs use token indices.
+    const uint16_t cache_slot = _kv_eviction
+        ? _kv_eviction->reserve_slots(token_idx, num_tokens) : token_idx;
+    _upload_group_future_token_masks(num_tokens, cache_slot);
 
     MLABuffer* normal_input_buf;
     MLABuffer* normal_scale_buf = nullptr;
@@ -1051,7 +1092,7 @@ uint32_t LanguageModel::run_model_once(
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
             const auto cache_key = _bind_attn_models(
-                num_tokens, token_idx, layer_idx, normal_scale_buf, normal_input_row
+                num_tokens, cache_slot, layer_idx, normal_scale_buf, normal_input_row
             );
             _pre_model_map.at(model_key).add_to_queue(&ifm_map);
 
@@ -2401,6 +2442,25 @@ void LanguageModel::compact_kv_after_accept(
 
 
 
+void LanguageModel::set_kv_eviction(const KvEvictionConfig& kv_eviction) {
+    std::shared_ptr<KvEviction> next;
+    if (kv_eviction.enabled()) {
+        next = std::make_shared<KvEviction>(
+            _cfg, kv_eviction, _devkit_dir,
+            [this](const std::string& name) -> MLABuffer& { return get_buffer(name); }, _logger
+        );
+    }
+    if (_kv_eviction) {
+        _kv_eviction->reset();
+    }
+    _kv_eviction = std::move(next);
+    _cached_token_ids.clear();
+    _cfg.pipeline_cfg.kv_eviction = kv_eviction;
+    _max_num_tokens = _kv_eviction
+        ? _kv_eviction->limits().max_tokens : _cfg.pipeline_cfg.max_num_tokens;
+}
+
+
 void LanguageModel::set_reloc(const std::string& reloc_name) {
     // Swap the model weights with the data from the `{_devkit_dir}/../npy_files/{reloc_name}`.
     // Instead of overwrite the dram space allocated by the mla-rt, allocate new buffers populated
@@ -2522,7 +2582,10 @@ void LanguageModel::unset_reloc() {
 uint16_t LanguageModel::set_max_num_tokens(std::optional<uint16_t> max_num_tokens) {
     auto original_max_num_tokens = _max_num_tokens;
     if (max_num_tokens.has_value()) {
-        _max_num_tokens = std::min(max_num_tokens.value(), _cfg.pipeline_cfg.max_num_tokens);
+        _max_num_tokens = std::min(
+            max_num_tokens.value(),
+            _kv_eviction ? _kv_eviction->limits().max_tokens : _cfg.pipeline_cfg.max_num_tokens
+        );
     }
     _logger->info("Setting max_num_tokens: {} -> {}", original_max_num_tokens, _max_num_tokens);
     return original_max_num_tokens;

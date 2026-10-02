@@ -72,3 +72,26 @@ set_tests_properties(
         LABELS "devkit;runtime;unit"
         TIMEOUT 30
 )
+
+add_test(
+    runtime.kv_eviction
+    "./sima_lmm_kv_eviction_test"
+)
+set_tests_properties(
+    runtime.kv_eviction
+    PROPERTIES
+        LABELS "devkit;runtime;unit"
+        TIMEOUT 30
+)
+
+add_test(
+    runtime.kv_eviction_generation
+    "./sima_lmm_kv_eviction_generation_test"
+)
+set_tests_properties(
+    runtime.kv_eviction_generation
+    PROPERTIES
+        LABELS "devkit;runtime;dispatcher;genai;llm;long"
+        RESOURCE_LOCK dispatcher
+        TIMEOUT 900
+)

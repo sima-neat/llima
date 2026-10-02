@@ -1,5 +1,6 @@
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 #include "reasoning_parser.hpp"
@@ -46,6 +47,18 @@ VisionLanguageModel::VisionLanguageModel(
 
     // Pre-warm OMP thread pool to avoid libgomp first-call cost.
     warmup_omp();
+}
+
+
+void VisionLanguageModel::set_kv_eviction(const KvEvictionConfig& kv_eviction) {
+    std::lock_guard<std::mutex> lock(_run_mutex);
+    if (kv_eviction.enabled() && _draft_vlm_ptr != nullptr) {
+        throw std::runtime_error(
+            "kv_eviction: speculative decoding (EAGLE3/MTP) is not supported with eviction"
+        );
+    }
+    _language_model_ptr->set_kv_eviction(kv_eviction);
+    _cfg.pipeline_cfg.kv_eviction = kv_eviction;
 }
 
 
@@ -111,8 +124,12 @@ std::optional<std::string> VisionLanguageModel::run_model(
     // (set_draft_vlm), dispatch to speculative decoding; otherwise run the
     // normal language-model decode loop.
     std::optional<uint16_t> max_num_tokens{};
-    if (max_new_tokens.has_value())
-        max_num_tokens = preprocessed_data.input_token_ids.size() + max_new_tokens.value();
+    if (max_new_tokens.has_value()) {
+        const size_t limit = preprocessed_data.input_token_ids.size() + max_new_tokens.value();
+        // With KV eviction, conversations past the compiled cache can overflow uint16_t.
+        max_num_tokens = _cfg.pipeline_cfg.kv_eviction.enabled()
+            ? std::min<size_t>(limit, UINT16_MAX) : limit;
+    }
 
     std::optional<std::vector<uint32_t>> output_token_ids;
     if (_draft_vlm_ptr != nullptr) {
