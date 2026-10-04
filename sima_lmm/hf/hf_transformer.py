@@ -372,7 +372,7 @@ class LocalHuggingFaceModel:
             param_name: Parameter name, as it appears in the HF Cache
 
         Returns:
-            The parameter as an numpy array, or (scales, weights, group size) if quantized.
+            The parameter as a numpy array, or (scales, weights[, group size]) if quantized.
         """
         if self.params and param_name in self.params:
             return self.params[param_name]
@@ -408,6 +408,8 @@ class LocalHuggingFaceModel:
                 )
             scale = scale.astype(np.float32)
             num_scale_groups = scale.size // original_shape[0]
+            if num_scale_groups == 1:
+                return scale, unpacked
             minimum_group_size = math.ceil(original_shape[1] / num_scale_groups)
             # Recover the configured block size by rounding up to the next power of two.
             group_size = 2 ** math.ceil(math.log2(minimum_group_size))
