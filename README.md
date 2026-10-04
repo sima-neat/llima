@@ -26,13 +26,6 @@ The Modalix DevKit runtime is delivered as three Debian packages:
 - `sima-lmm-cli`: Python CLI modules, internal nanobind bridge, and `llima`
   command-line entry point.
 
-C++ binary compatibility: `libsima_lmm_runtime.so` has no versioned soname.
-Release 3.0.0 changes the size of the model classes (`VisionLanguageModel`,
-`LanguageModel`, `VisionModel`). Rebuild code that uses them, such as Neat
-Core, against the 3.0.0 `sima-lmm-dev` headers. Source code written for the
-earlier constructors still compiles, and those constructor symbols are still
-exported, but an old binary must not be run with the 3.0.0 library.
-
 The Model Compiler tooling is delivered as a Python wheel:
 
 - `sima-lmm[sdk]`: compiler SDK dependencies, including internal SiMa packages.

@@ -94,19 +94,3 @@ After validating your model with `llima run`, see
 [GenAI Model](/develop-apps/development-workflow/genai-model/) to serve it
 through common API endpoints or use it directly from a C++ or Python
 application.
-## Embedding with an asset provider
-
-C++ integrations may supply the generic `FileProvider` interface for deferred
-model assets. The default `DiskFileProvider` preserves local-directory loading.
-LLM/VLM and Whisper route configuration, tokenizer, embeddings and MLA files
-through the provider. Deferred providers use serial fetch/load/release so the
-entire model need not be staged on disk at once.
-
-The provider must outlive all consumers and support the documented relative-path
-and release contract in `file_provider.hpp`. Rebuild C++ consumers with the matching
-runtime headers; the provider-aware classes change their private layout.
-
-PCIe transport and remote model workers belong to Core, not LLiMa. The experimental
-`llima run --pcie` and `pcie-genai-backend` have been removed. Use Core's
-`pcie::genai::GenAIModel` / `pyneatpcie.genai` API and its host CLI instead.
-The normal local `llima run` workflow is unchanged.
