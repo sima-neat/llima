@@ -62,9 +62,9 @@ class BaseModel {
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("Whisper") : spdlog::default_logger();
 
-            std::filesystem::path config_file_name = _devkit_dir / "whisper_config.json";
+            const char* config_file_name = "devkit/whisper_config.json";
             try {
-                _cfg = nlohmann::json::parse(std::ifstream(config_file_name)).get<WhisperConfig>();
+                _cfg = nlohmann::json::parse(*_files->open_stream(config_file_name)).get<WhisperConfig>();
             } catch (const std::exception& e) {
                 std::cerr << "Failed to load whisper config: " << config_file_name << ", "
                     << e.what() << std::endl;
@@ -113,10 +113,10 @@ class BaseModel {
         T _cfg;
         std::filesystem::path _elf_dir;
         std::filesystem::path _devkit_dir;
-        // The seam between LLiMa and the files it loads (Approach B). Every
+        // The seam between LLiMa and the files it loads. Every
         // text-path read routes through this. The default is a DiskFileProvider
         // rooted at model_path, so today's behaviour is byte-for-byte the same.
-        // A PCIe provider can be injected via the constructor instead.
+        // A deferred provider can be injected via the constructor instead.
         std::shared_ptr<FileProvider> _files;
         std::map<std::string, MLABuffer> _buf_map;
 

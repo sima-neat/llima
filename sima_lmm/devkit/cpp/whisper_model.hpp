@@ -34,6 +34,7 @@ namespace llima {
 class WhisperPreprocessor {
     public:
         WhisperPreprocessor(const std::filesystem::path& devkit_dir);
+        explicit WhisperPreprocessor(std::shared_ptr<FileProvider> files);
         ~WhisperPreprocessor();
 
         ArrayXXbf preprocess(const std::filesystem::path& audio_file_name);
@@ -74,6 +75,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         };
 
         WhisperModel(std::filesystem::path model_path);
+        WhisperModel(std::filesystem::path model_path, std::shared_ptr<FileProvider> files);
         virtual ~WhisperModel() { _finalize(); };
 
         TranscriptionResult run_model(

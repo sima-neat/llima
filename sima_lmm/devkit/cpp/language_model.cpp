@@ -2528,12 +2528,11 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         return;
     }
     // The file list below comes from a directory listing on local disk. A
-    // provider that pulls files (PCIe) has no listing, so the folder is not
+    // deferred provider has no listing, so the folder is not
     // there: say so, instead of "Relocation directory does not exist".
     if (_files->pulls_files()) {
         throw std::runtime_error(
-            "LoRA is not supported with --pcie yet: the npy_files folder cannot be listed "
-            "over PCIe"
+            "LoRA requires a local model directory; the asset provider cannot list npy_files"
         );
     }
 

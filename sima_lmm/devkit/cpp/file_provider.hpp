@@ -10,7 +10,7 @@ namespace simaai {
 namespace llima {
 
 // The seam between LLiMa and the files it loads. LLiMa asks a FileProvider
-// for each model file, in the order LLiMa chooses (Approach B). Names are
+// for each model file, in the order LLiMa chooses. Names are
 // relative to the model root and include the sub-folder, for example
 // "devkit/vlm_config.json" or "elf_files/model.elf". A name must never be
 // absolute.
@@ -22,7 +22,7 @@ namespace llima {
 //                  the HF tokenizer blob, .bin embeddings).
 //
 // release tells the provider the file is no longer needed. On disk this does
-// nothing; over PCIe it deletes the pulled temp file so the next large file
+// nothing; for a deferred provider it deletes the pulled temp file so the next large file
 // can land (the explicit-release contract).
 class FileProvider {
     public:
@@ -35,8 +35,8 @@ class FileProvider {
         // Probe for an OPTIONAL file. Callers with a fallback (e.g. the
         // embeddings ".bin" that falls back to ".npy") must use this, NOT
         // get_path: get_path treats a missing file as a hard error so a
-        // genuinely-missing required file — or, over PCIe, a mistyped
-        // serve-root/sub-folder — fails loudly instead of masquerading as a
+        // genuinely-missing required file — or, over PCIe, a misconfigured
+        // asset source — fails loudly instead of masquerading as a
         // corrupt model. The default reproduces the old probe (get_path never
         // fetches on disk, so this is exactly today's behaviour there).
         virtual bool exists(std::string_view name) {
@@ -57,7 +57,7 @@ class FileProvider {
         virtual void fetch(const std::filesystem::path& path) { (void)path; }
         virtual void evict(const std::filesystem::path& path) { (void)path; }
 
-        // True if files are NOT on disk until fetch() pulls them (PCIe).
+        // True if files are NOT on disk until fetch() fetches them.
         // The MLA loader then must use the serial fetch -> load -> evict path;
         // the parallel batch load would try to load files that are not there.
         virtual bool pulls_files() const { return false; }

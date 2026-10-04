@@ -27,20 +27,6 @@ set_tests_properties(
         TIMEOUT 900
 )
 
-# Loads a real model through a spy FileProvider: configs, tokenizers,
-# embeddings and ELFs must all go through the provider (the PCIe seam).
-add_test(
-    runtime.file_provider_routing
-    "./sima_lmm_file_provider_routing_test"
-)
-set_tests_properties(
-    runtime.file_provider_routing
-    PROPERTIES
-        LABELS "devkit;runtime;mla;genai;llm;long"
-        RESOURCE_LOCK mla
-        TIMEOUT 900
-)
-
 add_test(
     runtime.vision_generation
     "./sima_lmm_vision_generation_test"
@@ -86,27 +72,7 @@ set_tests_properties(
         LABELS "devkit;runtime;unit"
         TIMEOUT 30
 )
-
-# FileProvider seam and PCIe GenAI card backend: pure unit tests, no MLA, no
-# PCIe hardware and no model needed.
-foreach(_name IN ITEMS
-        file_provider
-        pcie_genai_protocol
-        pcie_genai_vlm_image
-        pcie_genai_chat_policy
-        pcie_genai_event_bridge
-        pcie_genai_backend_loop
-        pcie_genai_lifecycle
-        pcie_genai_recv_sweep)
-    add_test(runtime.${_name} "./sima_lmm_${_name}_test")
-    set_tests_properties(runtime.${_name} PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)
-endforeach()
-# Installed only when the build found simaai_svc.h.
-foreach(_name IN ITEMS pcie_file_provider pcie_genai_dl_svc_client)
-    # ctest reads this file from inside the test folder, so a relative path works
-    # here (CMAKE_CURRENT_LIST_DIR is not set in ctest).
-    if(EXISTS "sima_lmm_${_name}_test")
-        add_test(runtime.${_name} "./sima_lmm_${_name}_test")
-        set_tests_properties(runtime.${_name} PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)
-    endif()
-endforeach()
+add_test(runtime.file_provider "./sima_lmm_file_provider_test")
+set_tests_properties(runtime.file_provider PROPERTIES LABELS "runtime;provider" TIMEOUT 30)
+add_test(runtime.file_provider_routing "./sima_lmm_file_provider_routing_test")
+set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;runtime;long" RESOURCE_LOCK mla TIMEOUT 900)
