@@ -162,6 +162,7 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
 ) {
     // Given a list of input token ids, return a list of generated token ids. The text streamer is
     // disabled for this mode.
+    std::lock_guard<std::mutex> lock(_run_mutex);
     _text_streamer.set_tool_call_enabled(false);
     _text_streamer.disable();
 
@@ -179,6 +180,7 @@ std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
 ) {
     // Given a list of input token ids, return a list of computed logits for each input token id.
     // The text streamer is disabled for this mode.
+    std::lock_guard<std::mutex> lock(_run_mutex);
     _text_streamer.disable();
     std::vector<Eigen::bfloat16> logits;
     try {
@@ -201,6 +203,7 @@ LogLikelihoodResult VisionLanguageModel::run_model_for_loglikelihood(
     bool use_group_prefill
 ) {
     // Score only the continuation tokens needed by lm-eval.
+    std::lock_guard<std::mutex> lock(_run_mutex);
     _text_streamer.disable();
     try {
         auto result = _language_model_ptr->run_model_for_loglikelihood(
@@ -222,6 +225,7 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
 ) {
     // Given a list of input token ids, return a list of time in seconds for each generated token.
     // The text streamer is disabled for this mode.
+    std::lock_guard<std::mutex> lock(_run_mutex);
     _text_streamer.disable();
 
     _language_model_ptr->create_input_buffers(input_token_ids);
