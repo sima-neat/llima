@@ -362,6 +362,19 @@ class GgufModel:
                     # Assign all other mapped values directly
                     cfg[mapped_key] = value.contents()
 
+        # Reject MoE GGUFs: expert-count metadata isn't mapped into the config,
+        # so without this they would fall through to the dense path.
+        for key, value in self.gguf_proxy.get_fields().items():
+            _, param = key.split(".", maxsplit=1)
+            if param in ("expert_count", "expert_used_count"):
+                count = value.contents()
+                if isinstance(count, (list, np.ndarray)):
+                    count = int(np.max(count)) if len(count) else 0
+                if count:
+                    raise NotImplementedError(
+                        "Mixture-of-Experts GGUF models are not supported."
+                    )
+
         # Keep the base MLP width; shared Gemma4 layers widen it later.
         if isinstance(cfg.get("intermediate_size"), (list, np.ndarray)):
             intermediate_sizes = cfg["intermediate_size"]

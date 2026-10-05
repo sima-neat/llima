@@ -22,6 +22,7 @@ def gen_files(
     num_processes: int,
     resume: bool,
     part: str | None,
+    part_idx: int | None,
     enable_log_probe: bool,
 ):
     enable_verbose_error_messages()
@@ -45,6 +46,7 @@ def gen_files(
         log_level=logging.INFO,
         num_processes=num_processes,
         part=part,
+        part_idx=part_idx,
         resume=resume,
     )
 
@@ -76,6 +78,14 @@ if __name__ == "__main__":
         default="all",
         help="Whisper model part to compile.",
     )
+    parser.add_argument(
+        "--part_idx",
+        type=int,
+        default=None,
+        help=(
+            "Optional layer index for encoder/init/pre/post, or token index for cache."
+        ),
+    )
     parser.add_argument("--enable_log_probe", action="store_true", default=False)
     args = parser.parse_args()
     args.output_path = args.output_path or Path(".") / args.model_path.name
@@ -86,5 +96,6 @@ if __name__ == "__main__":
         args.num_processes,
         args.resume,
         args.part,
+        args.part_idx,
         args.enable_log_probe,
     )

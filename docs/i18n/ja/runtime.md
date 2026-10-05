@@ -32,7 +32,7 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 
 `llima run` を、Modalix 上で初期モデルの検証を行うためのシンプルなランタイムとして使用してください。
 
-CLIモードでは、チャット履歴がデフォルトで有効になっています。各プロンプトと応答は、`clear history` を使用して履歴をクリアするまで、次のターンで使用するためのコンテキストとして保持されます。
+CLIモードでは、チャット履歴がデフォルトで有効になっています。各プロンプトと応答は、`clear history` を使用して履歴をクリアするまで、次のターンで使用するためのコンテキストとして保持されます。プロンプトとともに送信された画像も、その履歴の一部として保持されます。`clear history` は送信済みのプロンプト、応答、およびすべての画像を削除します。設定済みのシステムプロンプトは、`clear system` で削除するか `set system` で置き換えるまで有効なままです。
 
 ``` console
 modalix:~$ llima run <model> [options]
@@ -44,6 +44,8 @@ modalix:~$ llima run <model> [options]
 | `--stt_model_path` | 音声認識モデルで使用するELFファイルのパス（オプション）。 |
 
 利用可能なすべてのオプションについては、`llima run -h` を実行してください。
+
+自動の埋め込みオフロードを無効にし、テーブルを DRAM に保持するには、`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>` を実行してください。
 
 **例**
 
@@ -58,10 +60,9 @@ CLIモードで`llima run`が起動したら、プロンプトで次のコマン
 | コマンド | 説明 |
 |----|----|
 | `add image <file>` | 現在のプロンプトのコンテキストに画像を追加します。 |
-| `clear image` | すべての画像を削除します。 |
 | `set system <prompt>` | システムプロンプトを設定します。 |
 | `clear system` | システムプロンプト、チャット履歴、画像をすべて削除します。 |
-| `clear history` | チャット履歴と画像をすべて削除します。 |
+| `clear history` | システムプロンプトを保持したまま、送信済みのプロンプト、応答、およびすべての画像を削除します。 |
 | `print history` | チャットの履歴を印刷します。 |
 | `set audio <file>` | 文字起こしする音声ファイルをクエリとして設定します。 |
 | `set language <lang>` | 文字起こしに使用する言語を設定します。 |

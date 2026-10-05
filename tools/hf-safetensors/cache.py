@@ -323,11 +323,22 @@ def find_downloaded_files(snapshot_path: Path) -> list[Path]:
 
 
 def has_safetensors(files: list[Path]) -> bool:
-    return any(
-        fnmatch.fnmatch(path.name, "*.safetensors")
-        or fnmatch.fnmatch(path.name, "*.safetensors.index.json")
-        for path in files
+    return any(path.name.lower().endswith(".safetensors") for path in files)
+
+
+def safetensors_allow_patterns(info: object) -> list[str]:
+    patterns = list(SAFETENSORS_ALLOW_PATTERNS)
+    patterns.extend(
+        sorted(
+            filename
+            for sibling in (getattr(info, "siblings", None) or [])
+            if (filename := getattr(sibling, "rfilename", "")).lower().endswith(
+                ".safetensors"
+            )
+            and not any(fnmatch.fnmatch(filename, pattern) for pattern in patterns)
+        )
     )
+    return patterns
 
 
 def build_manifest(
@@ -504,7 +515,7 @@ def process_model(api: HfApi, args: argparse.Namespace, spec: ModelSpec) -> str:
     elif spec.payload_format == "config":
         allow_patterns = CONFIG_ALLOW_PATTERNS
     else:
-        allow_patterns = SAFETENSORS_ALLOW_PATTERNS
+        allow_patterns = safetensors_allow_patterns(info)
     desired_selection_sha256 = selection_fingerprint(
         spec.payload_format, allow_patterns
     )

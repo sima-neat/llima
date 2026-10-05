@@ -124,6 +124,11 @@ class WhisperDecoderInitModel(BaseModel):
         else:
             pre_input_nodes = [input_nodes[0]]
         pre_output_nodes = pre_model._build_onnx_nodes(base_name, pre_input_nodes)
+        residual_input_node = (
+            pre_output_nodes[WhisperDecoderPreModel.positioned_residual_output_idx]
+            if self.layer_idx == 0
+            else pre_input_nodes[0]
+        )
 
         if self.layer_idx < self.cfg.decoder_layers - 1:
             cache_input_nodes = pre_output_nodes
@@ -145,22 +150,22 @@ class WhisperDecoderInitModel(BaseModel):
         cache_output_nodes = cache_model._build_onnx_nodes(base_name, cache_input_nodes)
 
         if self.layer_idx < self.cfg.decoder_layers - 1:
-            post_input_nodes = [pre_input_nodes[0], cache_output_nodes[0], input_nodes[-1]]
+            post_input_nodes = [residual_input_node, cache_output_nodes[0], input_nodes[-1]]
         else:
             slice_begin = self.token_idx + self.num_tokens - 1
             slice_end = slice_begin + 1
             slice_axis = 3
-            last_token_input_embed = self._onnx_builder.build_op(
-                f"{base_name}.last_token.slice_input_embed",
+            last_token_residual = self._onnx_builder.build_op(
+                f"{base_name}.last_token.slice_residual",
                 [
-                    pre_input_nodes[0],
+                    residual_input_node,
                     np.array([slice_begin], dtype=np.int32),
                     np.array([slice_end], dtype=np.int32),
                     np.array([slice_axis], dtype=np.int32),
                 ],
                 "Slice"
             )
-            post_input_nodes = [last_token_input_embed, cache_output_nodes[0], input_nodes[-1]]
+            post_input_nodes = [last_token_residual, cache_output_nodes[0], input_nodes[-1]]
         post_output_nodes = post_model._build_onnx_nodes(base_name, post_input_nodes)
         output_nodes = [
             # Decoder layer output or argmax output.

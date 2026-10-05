@@ -2,6 +2,7 @@
 #define _SIMA_LLIMA_LANGUAGE_MODEL_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -25,6 +26,8 @@
 
 namespace simaai {
 namespace llima {
+
+struct EmbeddingOffload;
 
 struct LogLikelihoodResult {
     double logprob;
@@ -60,7 +63,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
+            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt,
+            uint16_t stable_prefix_token_count = 0
         );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
@@ -103,6 +107,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::set<uint32_t> set_stop_token_ids(std::optional<std::set<uint32_t>> stop_token_ids);
         const auto& get_stop_token_ids() const { return _stop_token_ids; }
         void clear_cached_token_ids() { _cached_token_ids.clear(); }
+        uint32_t get_cached_first_generated_token() const {
+            return _cached_first_generated_token;
+        }
 
         // Captured hidden states from layers 2, N/2, N-3 during prefill (spec decoding).
         // Populated by run_model_once when queue is disabled and spec mode is active.
@@ -246,6 +253,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
+        std::shared_ptr<EmbeddingOffload> _embedding_offload;
+        void _gather_embedding_rows(
+            std::span<const uint32_t> ids, MLABuffer& destination,
+            MLABuffer* scales, size_t row_begin = 0
+        );
+        void _prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx);
         void _define_draft_fc_models();
         struct CachedState {
             // Hidden-layer indices belonging to this stateful family.
@@ -260,13 +273,17 @@ class LanguageModel : public BaseModel<VlmConfig> {
             size_t elem_size;
             // Bytes per tail snapshot = tail_len * num_elems * elem_size.
             size_t tail_bytes;
-            // Tail snapshots indexed as [layer_slot][boundary_idx][byte_offset].
+            // Group prefill models output only one final state row, not per-token state history.
+            bool prefill_single_output = false;
+            // Tail snapshots indexed as [layer_slot][checkpoint_slot][byte_offset].
             std::vector<std::vector<std::vector<uint8_t>>> checkpoints;
         };
 
         virtual void _initialize() override;
         virtual void _finalize() override;
         void _define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count);
+        bool _has_linear_attention_layers() const;
+        const LinearAttentionConfig& _linear_attn_cfg() const;
         virtual void _define_buffers() override;
         void _define_model(
             const std::string& model_type,
@@ -288,6 +305,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
+        void _define_linear_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_models();
         void _define_per_layer_models();
         std::filesystem::path _get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx);
@@ -300,6 +318,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
+        std::filesystem::path _get_elf_path_linear(uint16_t num_tokens, uint8_t layer_idx);
         static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
         static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
         uint16_t _get_cache_mask_size(
@@ -328,7 +347,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
         void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
-            size_t boundary_idx, uint16_t num_tokens, uint16_t valid_tokens
+            uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
         );
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
@@ -377,6 +396,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_model_map;
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
+        LanguageModelMap _linear_model_map;
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
 
@@ -404,6 +424,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
         std::vector<uint16_t> _checkpoint_boundaries;
         std::vector<CachedState> _cached_states;
+        // Positions are zero for unused slots. Slot 0 is reserved only for a system/tool prefix.
+        std::array<uint16_t, 4> _state_checkpoint_positions{};
+        bool _capture_state_checkpoints = false;
+        uint8_t _writable_checkpoint_slots = 0;
+        uint16_t _system_checkpoint_position = 0;
+        size_t _rolling_checkpoint_slot = 0;
 
         std::vector<std::vector<Eigen::bfloat16>> _eagle3_intermediate_hidden_states;
 

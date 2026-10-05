@@ -157,6 +157,15 @@ void MLABuffer::invalidate_cache(size_t offset, size_t size) const {
     );
 }
 
+void MLABuffer::swap_storage(MLABuffer& other) {
+    if (_size_padded != other._size_padded) {
+        throw std::invalid_argument("Cannot swap MLA buffers with different allocation sizes");
+    }
+    std::swap(_simaai_mem_ptr, other._simaai_mem_ptr);
+    std::swap(_physical_addr, other._physical_addr);
+    std::swap(_virtual_addr, other._virtual_addr);
+}
+
 void MLABuffer::clear(bool flush) {
     std::memset(_virtual_addr, 0, _size_padded);
     if (flush)

@@ -23,6 +23,8 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_post": (False, "POST"),
     "group_conv": (True, "POST"),
     "single_conv": (False, "POST"),
+    "group_linear": (True, "LINEAR"),
+    "single_linear": (False, "LINEAR"),
     "conv_post_final": (False, "POST"),
     "vision": (False, "VISION"),
     "group_draft_fc": (True, "DRAFT_FC"),
@@ -105,7 +107,10 @@ def _decode_layer_configuration(c: dict) -> LayerConfiguration | None:
     if not compile_flag:
         return None
 
-    return {"precision": precision_value, "lora": lora_value}
+    return {
+        "precision": precision_value,
+        "lora": lora_value,
+    }
 
 
 def _fetch_configuration(
@@ -177,20 +182,26 @@ def _get_lora_layer_ids(num_layers: int, adapter_is_multimodal: bool = False) ->
 
 
 def default_configuration_lora(
-    num_layers: int, is_multimodal: bool = False
+    num_layers: int,
+    is_multimodal: bool = False,
+    layer_ids: list[LayerID] | None = None,
 ) -> GenConfiguration:
-    layer_ids = _get_lora_layer_ids(num_layers, is_multimodal)
+    if layer_ids is None:
+        layer_ids = _get_lora_layer_ids(num_layers, is_multimodal)
     precision_dict = {l: FileGenPrecision.BF16 for l in layer_ids}
     lora_dict = {l: LoraGenMode.LORA_BRANCH for l in layer_ids}
     return {"precision": precision_dict, "lora": lora_dict}
 
 
 def read_configuration_file_lora(
-    num_layers: int, configuration_path: Path
+    num_layers: int,
+    configuration_path: Path,
+    layer_ids: list[LayerID] | None = None,
 ) -> GenConfiguration:
     """
     Read parameters for each layer from a configuration file.
     """
-    layer_ids = _get_lora_layer_ids(num_layers)
+    if layer_ids is None:
+        layer_ids = _get_lora_layer_ids(num_layers)
     configurations = _fetch_configuration(configuration_path, num_layers, layer_ids)
     return configurations

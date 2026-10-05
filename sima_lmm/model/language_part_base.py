@@ -9,7 +9,6 @@ from sima_lmm.model.base import BaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.sima_builder import SimaBuilder, build_conv, build_logit_softcapping
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
-from sima_lmm.utils import ceil_div
 
 
 @dataclass
@@ -58,69 +57,40 @@ class LanguagePartBaseModel(BaseModel):
         else:
             gate_name, up_name, down_name = "gate_proj", "up_proj", "down_proj"
 
-        max_ch = self.cfg.lm_cfg.hidden_size
-        if (
-            self.split_mlp
-            and (self.num_tokens != 1 or self.enable_filter_sharing)
-            and (self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1 or self.cfg.lm_cfg.speculative_decoding_cfg is not None)
-        ):
-            # Split MLP into multiple parts if intermediate_size is larger than max ch number
-            # in order to prevent Large Tensor Helper activation in n2a compiler.
-            # For single token models do splitting only if filter sharing is enabled.
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            num_parts = ceil_div(intermediate_size, max_ch)
-        else:
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            num_parts = 1
+        # The MLP is built unsplit; the n2a compiler auto-splits infeasible conv-bounded regions.
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, gate_name)
+        gate_proj = self._onnx_builder.build_conv_from_dense_with_lora(
+            f"{base_name}.{gate_name}", input_nodes[0], lora_rank
+        )
 
-        for part in range(num_parts):
-            part_idx = f".{part}" if num_parts > 1 else ""
-            offset = part * max_ch
-            size = min(max_ch, (intermediate_size - offset))
-            weight_slice_by_input_channels = (offset, size, 0, part) if num_parts > 1 else None
-            weight_slice_by_output_ch = (offset, size, 1, part) if num_parts > 1 else None
+        act = self._onnx_builder.build_activation(
+            f"{base_name}.act", gate_proj, self.cfg.lm_cfg.mlp_cfg.act
+        )
 
-            lora_rank = None
-            if self.cfg.lm_cfg.lora_cfg is not None:
-                lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, gate_name)
-            gate_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.{gate_name}", input_nodes[0], lora_rank,
-                weight_slice=weight_slice_by_input_channels
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, up_name)
+        up_proj = self._onnx_builder.build_conv_from_dense_with_lora(
+            f"{base_name}.{up_name}", input_nodes[0], lora_rank
+        )
+
+        mul2 = self._onnx_builder.build_op(f"{base_name}.mul2", [act, up_proj], "Mul")
+
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
+
+        down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
+            f"{base_name}.{down_name}", mul2, lora_rank
+        )
+
+        if with_residual_add:
+            # Sums the MLP output with the residual stream.
+            down_proj = self._onnx_builder.build_op(
+                f"{base_name}.add2", [input_nodes[1], down_proj], "Add"
             )
-
-            act = self._onnx_builder.build_activation(
-                f"{base_name}.act{part_idx}", gate_proj, self.cfg.lm_cfg.mlp_cfg.act
-            )
-
-            lora_rank = None
-            if self.cfg.lm_cfg.lora_cfg is not None:
-                lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, up_name)
-            up_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.{up_name}", input_nodes[0], lora_rank,
-                weight_slice=weight_slice_by_input_channels
-            )
-
-            mul2 = self._onnx_builder.build_op(f"{base_name}.mul2{part_idx}", [act, up_proj], "Mul")
-
-            lora_rank = None
-            if self.cfg.lm_cfg.lora_cfg is not None:
-                lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
-
-            down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.{down_name}", mul2, lora_rank, weight_slice=weight_slice_by_output_ch
-            )
-
-            if with_residual_add and part == 0:
-                # Sums the MLP output with the residual stream.
-                down_proj = self._onnx_builder.build_op(
-                    f"{base_name}.add2{part_idx}", [input_nodes[1], down_proj], "Add"
-                )
-            elif part > 0:
-                # Sums the MLP output with the output of previous MLP part output.
-                down_proj = self._onnx_builder.build_op(
-                    f"{base_name}.add_part{part_idx}", [prev_part_down_proj, down_proj], "Add"
-                )
-            prev_part_down_proj = down_proj
 
         return down_proj
 
@@ -143,61 +113,38 @@ class LanguagePartBaseModel(BaseModel):
         else:
             gate_name, up_name, down_name = "gate_proj", "up_proj", "down_proj"
 
-        max_ch = self.cfg.lm_cfg.hidden_size
-        if self.split_mlp and (self.num_tokens != 1 or self.enable_filter_sharing):
-            # Split MLP into multiple parts if intermediate_size is larger than max ch number
-            # in order to prevent Large Tensor Helper activation in n2a compiler.
-            # For single token models do splitting only if filter sharing is enabled.
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            num_parts = ceil_div(intermediate_size, max_ch)
-        else:
-            intermediate_size = self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx)
-            num_parts = 1
+        # The MLP is built unsplit; the n2a compiler auto-splits infeasible conv-bounded regions.
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, gate_name)
+        gate_proj = build_conv_from_dense_with_lora(
+            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{gate_name}",
+            input_nodes[0], lora_rank, merged_lora=merged_lora
+        )
 
-        for part in range(num_parts):
-            offset = part * max_ch
-            size = min(max_ch, (intermediate_size - offset ))
-            weight_slice_by_input_channels = (offset, size, -1, part) if num_parts > 1 else None
-            weight_slice_by_output_ch = (offset, size, -3, part) if num_parts > 1 else None
+        act = build_activation(builder, gate_proj, self.cfg.lm_cfg.mlp_cfg.act, quantizable)
 
-            lora_rank = None
-            if self.cfg.lm_cfg.lora_cfg is not None:
-                lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, gate_name)
-            gate_proj = build_conv_from_dense_with_lora(
-                builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{gate_name}",
-                input_nodes[0], lora_rank, merged_lora=merged_lora,
-                weight_slice=weight_slice_by_input_channels
-            )
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, up_name)
+        up_proj = build_conv_from_dense_with_lora(
+            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{up_name}",
+            input_nodes[0], lora_rank, merged_lora=merged_lora
+        )
 
-            act = build_activation(builder, gate_proj, self.cfg.lm_cfg.mlp_cfg.act, quantizable)
+        mul2 = builder.create_mul_node(act, up_proj)
 
-            lora_rank = None
-            if self.cfg.lm_cfg.lora_cfg is not None:
-                lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, up_name)
-            up_proj = build_conv_from_dense_with_lora(
-                builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{up_name}",
-                input_nodes[0], lora_rank, merged_lora=merged_lora,
-                weight_slice=weight_slice_by_input_channels
-            )
+        lora_rank = None
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
+        down_proj = build_conv_from_dense_with_lora(
+            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{down_name}", mul2,
+            lora_rank, merged_lora=merged_lora
+        )
 
-            mul2 = builder.create_mul_node(act, up_proj)
-
-            lora_rank = None
-            if self.cfg.lm_cfg.lora_cfg is not None:
-                lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
-            down_proj = build_conv_from_dense_with_lora(
-                builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{down_name}", mul2,
-                lora_rank, merged_lora=merged_lora, weight_slice=weight_slice_by_output_ch
-            )
-
-            if with_residual_add and part == 0:
-                # Sums the MLP output with the residual stream.
-                down_proj = builder.create_add_node(input_nodes[1], down_proj)
-
-            elif part > 0:
-                # Sums the MLP output with the output of previous MLP part output.
-                down_proj = builder.create_add_node(prev_part_down_proj, down_proj)
-            prev_part_down_proj = down_proj
+        if with_residual_add:
+            # Sums the MLP output with the residual stream.
+            down_proj = builder.create_add_node(input_nodes[1], down_proj)
 
         return down_proj
 

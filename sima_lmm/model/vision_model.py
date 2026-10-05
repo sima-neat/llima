@@ -1,9 +1,9 @@
 import logging
+import math
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
-from scipy.ndimage import zoom
 
 from afe.apis.defines import gen2_target, TensorDRAMLayout
 from afe.backends.backends import Backend
@@ -12,7 +12,8 @@ from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import (
-    BaseModel, FileGenMode, TensorTessellateParameters, GenConfiguration, LayerConfiguration
+    BaseModel, EvalMode, FileGenMode, TensorTessellateParameters, GenConfiguration,
+    LayerConfiguration
 )
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
@@ -26,18 +27,80 @@ from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import VisionArchType, VlmArchType
 
 
+def _resize_siglip2_position_embeddings(
+    position_embeddings: np.ndarray,
+    target_height: int,
+    target_width: int,
+) -> np.ndarray:
+    """Resize a square SigLIP2 position grid using the upstream interpolation contract."""
+    if target_height <= 0 or target_width <= 0:
+        raise ValueError("SigLIP2 position embedding dimensions must be positive")
+
+    sequence_length, embedding_dim = position_embeddings.shape
+    source_grid_size = math.isqrt(sequence_length)
+    if source_grid_size * source_grid_size != sequence_length:
+        raise ValueError(
+            "SigLIP2 position embeddings must contain a square source grid; "
+            f"received {sequence_length} positions"
+        )
+    if target_height == source_grid_size and target_width == source_grid_size:
+        return position_embeddings
+
+    def resampling_weights(source_size: int, target_size: int) -> np.ndarray:
+        # align_corners=False maps output pixel centers with a half-pixel offset.
+        scale = source_size / target_size
+        # Widen the linear filter while downsampling to match antialias=True.
+        filter_scale = max(scale, 1.0)
+        source_centers = np.arange(source_size, dtype=np.float32) + 0.5
+        target_centers = (np.arange(target_size, dtype=np.float32) + 0.5) * scale
+        weights = np.maximum(
+            0.0,
+            1.0
+            - np.abs(target_centers[:, None] - source_centers[None, :]) / filter_scale,
+        )
+        return weights / weights.sum(axis=1, keepdims=True)
+
+    source_dtype = position_embeddings.dtype
+    position_grid = position_embeddings.astype(np.float32).reshape(
+        source_grid_size, source_grid_size, embedding_dim
+    )
+    height_weights = resampling_weights(source_grid_size, target_height)
+    width_weights = resampling_weights(source_grid_size, target_width)
+    resized = np.einsum(
+        "hi,ijc,wj->hwc",
+        height_weights,
+        position_grid,
+        width_weights,
+        optimize=True,
+    )
+    return resized.reshape(target_height * target_width, embedding_dim).astype(source_dtype)
+
+
 @dataclass
 class VisionModel(BaseModel):
     """Vision model implementation."""
 
-    is_single_vision_model: bool = field(default=True, kw_only=True)
-    actual_num_hidden_layers: int = field(init=False)
+    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+        layer_ifms = ifms
+        deepstack_outputs: dict[int, np.ndarray] = {}
+        deepstack_indexes = self.cfg.vm_cfg.deepstack_visual_indexes
 
-    def __post_init__(self):
-        num_hidden_layers = self.cfg.vm_cfg.num_hidden_layers
-        if self.cfg.model_type == VlmArchType.VLM_LLAVA:
-            num_hidden_layers -= 1
-        self.actual_num_hidden_layers = num_hidden_layers
+        for layer_idx in range(self.cfg.num_vision_layers):
+            layer_outputs = list(
+                self._get_part_model(layer_idx).run_model(eval_mode, layer_ifms)
+            )
+            if (
+                self.cfg.model_type == VlmArchType.VLM_QWEN3_VL
+                and layer_idx in deepstack_indexes
+            ):
+                deepstack_idx = deepstack_indexes.index(layer_idx)
+                deepstack_outputs[deepstack_idx] = layer_outputs.pop()
+            layer_ifms = [layer_outputs[0]]
+
+        return [
+            *layer_outputs,
+            *(deepstack_outputs[idx] for idx in range(len(deepstack_indexes))),
+        ]
 
     def gen_files(
         self,
@@ -83,16 +146,14 @@ class VisionModel(BaseModel):
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
 
     def _get_part_model(self, layer_idx: int) -> BaseModel:
-        if self.is_single_vision_model:
-            include_embeddings = True
-            include_mm_proj = True
-            num_layers = self.actual_num_hidden_layers
-            model_name = self.model_name
-        else:
-            include_embeddings = layer_idx == 0
-            include_mm_proj = layer_idx == self.actual_num_hidden_layers - 1
-            num_layers = 1
-            model_name = f"{self.model_name}_layer{layer_idx}"
+        if not 0 <= layer_idx < self.cfg.num_vision_layers:
+            raise ValueError(
+                f"Vision layer index {layer_idx} is outside the valid range "
+                f"[0, {self.cfg.num_vision_layers})"
+            )
+        include_embeddings = layer_idx == 0
+        include_mm_proj = layer_idx == self.cfg.num_vision_layers - 1
+        model_name = f"{self.model_name}_layer{layer_idx}"
             
         kwargs = {
             "cfg": self.cfg,
@@ -101,13 +162,16 @@ class VisionModel(BaseModel):
             "sima_path": self.sima_path,
             "hf_model": self.hf_model,
             "layer_idx": layer_idx,
-            "num_layers": num_layers,
             "include_embeddings": include_embeddings,
             "include_mm_proj": include_mm_proj,
         }
 
         # Dispatch based on model type
-        if self.cfg.model_type in (VlmArchType.VLM_QWEN2_5_VL, VlmArchType.VLM_QWEN3_VL):
+        if self.cfg.model_type in (
+            VlmArchType.VLM_QWEN2_5_VL,
+            VlmArchType.VLM_QWEN3_VL,
+            VlmArchType.VLM_QWEN3_5_VL,
+        ):
             return QwenVisionLayerModel(**kwargs)
         elif self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             return Gemma4VisionLayerModel(**kwargs)
@@ -123,7 +187,6 @@ class StandardVisionLayerModel(BaseModel):
     """
 
     layer_idx: int
-    num_layers: int
     include_embeddings: bool
     include_mm_proj: bool
 
@@ -229,16 +292,9 @@ class StandardVisionLayerModel(BaseModel):
         else:
             encoder_input = input_nodes[0]
 
-        if self.num_layers > 1:
-            for layer_idx in range(self.num_layers):
-                encoder_input = self._build_encoder(
-                    f"{base_name}.encoder.layers.{layer_idx}", [encoder_input]
-                )
-            encoder_output = encoder_input
-        else:
-            encoder_output = self._build_encoder(
-                f"{base_name}.encoder.layers.{self.layer_idx}", [encoder_input]
-            )
+        encoder_output = self._build_encoder(
+            f"{base_name}.encoder.layers.{self.layer_idx}", [encoder_input]
+        )
 
         if not self.include_mm_proj:
             return encoder_output
@@ -290,24 +346,15 @@ class StandardVisionLayerModel(BaseModel):
                 f"{base_name}.position_embedding.weight"
             )
 
-            original_seq_len = position_embedding_weight.shape[0]
-            original_grid_size = int(original_seq_len**0.5)
             if isinstance(self.cfg.vm_cfg.num_patches, list):
                 target_grid_height = self.cfg.vm_cfg.num_patches[0]
                 target_grid_width = self.cfg.vm_cfg.num_patches[1]
             else:
                 target_grid_height = target_grid_width = self.cfg.vm_cfg.num_patches
-            target_seq_len = target_grid_height * target_grid_width
-            pos_emb_grid = position_embedding_weight.reshape(
-                original_grid_size, original_grid_size, self.cfg.vm_cfg.hidden_size
-            )
-
-            height_zoom = target_grid_height / original_grid_size
-            width_zoom = target_grid_width / original_grid_size
-            zoom_factors = (height_zoom, width_zoom, 1.0)
-            resized_pos_emb_grid = zoom(pos_emb_grid.astype(np.float32), zoom_factors, order=1)
-            final_pos_emb_weight = resized_pos_emb_grid.reshape(
-                target_seq_len, self.cfg.vm_cfg.hidden_size
+            final_pos_emb_weight = _resize_siglip2_position_embeddings(
+                position_embedding_weight,
+                target_grid_height,
+                target_grid_width,
             )
 
             position_embedding = self._onnx_builder.create_initializer(
@@ -559,16 +606,12 @@ class StandardVisionLayerModel(BaseModel):
         else:
             encoder_input = input_node
 
-        if self.num_layers > 1:
-            for layer_idx in range(self.num_layers):
-                encoder_input = self._build_sima_encoder(
-                    builder, f"{base_name}.encoder.layers.{layer_idx}", encoder_input, quantizable
-                )
-            encoder_output = encoder_input
-        else:
-            encoder_output = self._build_sima_encoder(
-                builder, f"{base_name}.encoder.layers.{self.layer_idx}", encoder_input, quantizable
-            )
+        encoder_output = self._build_sima_encoder(
+            builder,
+            f"{base_name}.encoder.layers.{self.layer_idx}",
+            encoder_input,
+            quantizable,
+        )
 
         if not self.include_mm_proj:
             return encoder_output
@@ -620,19 +663,15 @@ class StandardVisionLayerModel(BaseModel):
         # Position embedding — LFM2 may need bilinear resize if resolution differs from pretraining.
         position_embedding_weight = self.get_hf_param(f"{base_name}.position_embedding.weight")
         if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
-            original_grid_size = int(position_embedding_weight.shape[0] ** 0.5)
             if isinstance(self.cfg.vm_cfg.num_patches, list):
                 target_h, target_w = self.cfg.vm_cfg.num_patches
             else:
                 target_h = target_w = self.cfg.vm_cfg.num_patches
-            if target_h != original_grid_size or target_w != original_grid_size:
-                pos_grid = position_embedding_weight.reshape(
-                    original_grid_size, original_grid_size, self.cfg.vm_cfg.hidden_size
-                )
-                zoomed = zoom(pos_grid.astype(np.float32),
-                              (target_h / original_grid_size, target_w / original_grid_size, 1.0),
-                              order=1)
-                position_embedding_weight = zoomed.reshape(target_h * target_w, self.cfg.vm_cfg.hidden_size)
+            position_embedding_weight = _resize_siglip2_position_embeddings(
+                position_embedding_weight,
+                target_h,
+                target_w,
+            )
 
         # Reshape "wc->nhwc" and cast to the activation dtype (float32 in RELAY, bfloat16 in SIMA_QUANTIZED).
         pos_weight = position_embedding_weight.astype(activation_dtype(quantizable))

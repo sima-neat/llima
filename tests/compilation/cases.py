@@ -101,6 +101,12 @@ CONFIGURATION_CASES = (
         (448, 448),
     ),
     ConfigurationCase(
+        "models--Qwen--Qwen3.5-0.8B",
+        "qwen3.5_vlm_config.json",
+        "hf",
+        (448, 448),
+    ),
+    ConfigurationCase(
         "models--LiquidAI--LFM2-VL-450M",
         "lfm2_vl_vlm_config.json",
         "hf",
@@ -249,6 +255,7 @@ class OnnxRegressionCase:
     mode: RegressionMode = "required"
     atol: float = 0.0
     rtol: float = 0.0
+    layer_index: int = 0
 
     @property
     def id(self) -> str:
@@ -302,7 +309,41 @@ ONNX_REGRESSION_CASES = (
     OnnxRegressionCase(
         "models--Qwen--Qwen3-VL-2B-Instruct", "vision", (224, 224)
     ),
-    OnnxRegressionCase("models--LiquidAI--LFM2-VL-450M", "vision"),
+    OnnxRegressionCase(
+        "models--Qwen--Qwen3.5-0.8B",
+        "pre",
+        (224, 224),
+        mode="informative",
+        layer_index=3,
+    ),
+    OnnxRegressionCase(
+        "models--Qwen--Qwen3.5-0.8B",
+        "cache",
+        (224, 224),
+        mode="informative",
+    ),
+    OnnxRegressionCase(
+        "models--Qwen--Qwen3.5-0.8B",
+        "post",
+        (224, 224),
+        mode="informative",
+        layer_index=3,
+    ),
+    OnnxRegressionCase(
+        "models--Qwen--Qwen3.5-0.8B",
+        "linear",
+        (224, 224),
+        mode="informative",
+    ),
+    OnnxRegressionCase(
+        "models--Qwen--Qwen3.5-0.8B",
+        "vision",
+        (224, 224),
+        mode="informative",
+    ),
+    OnnxRegressionCase(
+        "models--LiquidAI--LFM2-VL-450M", "vision", mode="informative"
+    ),
     OnnxRegressionCase(
         "models--google--gemma-4-E2B-it", "vision", (240, 240)
     ),

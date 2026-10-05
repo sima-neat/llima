@@ -116,6 +116,10 @@ Run it in the Model Compiler environment with an explicit model path.
 log-probe-enabled decoder outputs; use `--part all --enable_log_probe` for a
 complete log-probe build.
 
+Whisper model repositories contain one ELF per encoder layer. The runtime does
+not support legacy repositories with a monolithic encoder ELF; download a
+layered model or recompile the checkpoint with the current LLiMa version.
+
 Compiler changes normally touch `sima_lmm/config/whisper_config.py`,
 `sima_lmm/model/whisper_*.py`, and the script; runtime changes touch
 `sima_lmm/devkit/cpp/whisper_*`. Validate with the packaged C++ ASR runtime

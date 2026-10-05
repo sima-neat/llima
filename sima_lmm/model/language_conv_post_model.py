@@ -28,10 +28,6 @@ class LanguageConvPostModel(LanguagePostBaseModel):
     @property
     def enable_filter_sharing(self) -> bool:
         return self.cfg.pipeline_cfg.enable_filter_sharing
-
-    @property
-    def split_mlp(self) -> bool:
-        return self.cfg.pipeline_cfg.split_mlp
         
     def gen_onnx_files(self):
         base_layer = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"

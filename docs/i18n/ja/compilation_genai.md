@@ -90,8 +90,8 @@ output_directory/
 | `--resume` | 既存のファイルをスキップすることで、中断されたビルドを再開します。 |
 | `-j, --jobs` | 並列コンパイルするジョブの数。デフォルト：物理CPUコアの数。 |
 | `--log_level` | ログレベル（DEBUG、INFO、WARNING、ERROR）。デフォルト：WARNING。 |
-| `--input_height` | 入力画像の高さ（ピクセル単位）。`--input_width` とともに指定する必要があります。Qwen 2 VL、Qwen 3 VL、および Gemma 4 の場合は必須ですが、SigLIP2 モデルの構成済みのサイズを上書きする場合はオプションです。 |
-| `--input_width` | 入力画像の幅をピクセル単位で指定します。`--input_height` とともに必ず指定してください。Qwen 2 VL、Qwen 3 VL、および Gemma 4 のモデルでは必須です。SigLIP2 モデルのデフォルトサイズを上書きする場合はオプションです。 |
+| `--input_height` | 入力画像の高さ（ピクセル単位）。`--input_width` とともに指定する必要があります。Qwen 2 VL、Qwen 3 VL、Qwen3.5、および Gemma 4 の場合は必須ですが、SigLIP2 モデルの構成済みのサイズを上書きする場合はオプションです。 |
+| `--input_width` | 入力画像の幅をピクセル単位で指定します。`--input_height` とともに必ず指定してください。Qwen 2 VL、Qwen 3 VL、Qwen3.5、および Gemma 4 のモデルでは必須です。SigLIP2 モデルのデフォルトサイズを上書きする場合はオプションです。 |
 | `--system_prompt` | CLIモードおよびモデルのウォームアップのために保存するシステムプロンプト。 |
 | `--system_prompt_file` | システムプロンプトが記述されたテキストファイルへのパス。 |
 | `--chat_template` | コンパイルされたモデルに保存するチャットテンプレート文字列です。システムプロンプトとチャットテンプレートファイルのオプションとは、どちらか一方のみを指定できます。 |
