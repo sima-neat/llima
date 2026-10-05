@@ -45,11 +45,10 @@ class WhisperDecoderInitModel(BaseModel):
         }
 
         graph = ModelGraph(self, shapes, quantizable)
-        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        outputs = self._build_sima_nodes(graph, list(graph.inputs.values()))
         graph.save(outputs)
 
-    def _build_sima_nodes(self, builder, inputs, quantizable):
-        graph = ModelGraph.from_builder(self, builder)
+    def _build_sima_nodes(self, graph, inputs):
         pre = WhisperDecoderPreModel(
             self.cfg,
             self.model_name,
@@ -82,16 +81,16 @@ class WhisperDecoderInitModel(BaseModel):
             pre_inputs.append(
                 graph.constant(positions.reshape(1, 1, self.num_tokens, self.cfg.d_model))
             )
-        pre_outputs = pre._build_sima_nodes(builder, pre_inputs, quantizable)
+        pre_outputs = pre._build_sima_nodes(graph, pre_inputs)
         query, key, value = pre_outputs[:3]
         residual = pre_outputs[pre.positioned_residual_output_idx] if self.layer_idx == 0 else inputs[0]
         if final_layer:
-            query = builder.create_slice_node(query, [self.num_tokens - 1], [self.num_tokens], [1], [2])
-            residual = builder.create_slice_node(
+            query = graph.slice(query, [self.num_tokens - 1], [self.num_tokens], [1], [2])
+            residual = graph.slice(
                 residual, [self.num_tokens - 1], [self.num_tokens], [1], [2]
             )
-        attn = cache._build_sima_nodes(builder, [query, key, value], quantizable)[0]
-        outputs = post._build_sima_nodes(builder, [residual, attn, inputs[1]], quantizable)
+        attn = cache._build_sima_nodes(graph, [query, key, value])[0]
+        outputs = post._build_sima_nodes(graph, [residual, attn, inputs[1]])
         # Hidden/token, optional logits, self K/V, encoder K/V.
         return [*outputs[:-2], key, value, *outputs[-2:]]
 

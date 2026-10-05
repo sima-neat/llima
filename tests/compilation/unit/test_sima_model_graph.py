@@ -7,12 +7,11 @@ from ml_dtypes import int4
 from afe.backends.backends import Backend
 from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.execute import create_node_executor, create_node_quant_executor
-from afe.ir.operations import BatchMatmulOp
+from afe.ir.operations import BatchMatmulOp, ConvAddActivationOp, StridedSliceOp
 from afe.ir.serializer import load_awesomenet
 from afe.ir.tensor_type import ScalarType, TensorType
 from sima_lmm.model.base import BaseModel
-from sima_lmm.model.model_graph import ModelGraph, tensor_type
-from sima_lmm.model.sima_builder import activation_dtype, activation_type
+from sima_lmm.model.model_graph import ModelGraph, tensor_type, activation_dtype, activation_type
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
@@ -38,7 +37,7 @@ def test_model_graph_preserves_inputs_and_selected_output_types(quantizable, mul
     shape = (1, 1, 2, 32)
     specs = {"hidden": shape, "cache": TensorType(ScalarType.int8, shape)}
     graph = ModelGraph(_source(), specs, quantizable)
-    builder, inputs = graph.raw, graph.inputs
+    builder, inputs = graph, graph.inputs
     outputs = [inputs["cache"], inputs["hidden"]] if multiple_outputs else [inputs["hidden"]]
     # Finishing must select the requested outputs, not the last node created.
     builder.create_constant_node(np.array([99], np.float32))
@@ -80,6 +79,43 @@ def test_model_graph_preserves_inputs_and_selected_output_types(quantizable, mul
 def test_model_graph_rejects_invalid_inputs(specs):
     with pytest.raises(ValueError, match="Invalid model input"):
         ModelGraph(_source(), specs, quantizable=True)
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize(
+    "begin,end,axis,operator",
+    [
+        (0, 16, 3, StridedSliceOp),
+        (0, 40, 3, ConvAddActivationOp),
+        (40, 80, -1, ConvAddActivationOp),
+        (1, 3, 2, StridedSliceOp),
+    ],
+)
+def test_slice_preserves_values_and_handles_channel_alignment(
+    quantizable, begin, end, axis, operator
+):
+    shape = (1, 1, 3, 80)
+    graph = ModelGraph(_source(), {"x": shape}, quantizable)
+    output = graph.slice(graph.inputs["x"], [begin], [end], [1], [axis])
+    assert isinstance(output.ir.operation, operator)
+    x = np.arange(np.prod(shape)).reshape(shape).astype(activation_dtype(quantizable))
+    selection = [slice(None)] * 4
+    selection[axis] = slice(begin, end)
+    execute = (
+        create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
+    )
+    actual = graph.finish([output]).run({"x": x}, node_callable=execute)
+    actual = actual[0] if isinstance(actual, (tuple, list)) else actual
+    np.testing.assert_array_equal(actual, x[tuple(selection)].astype(np.float32))
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+def test_slice_keeps_integer_channels_on_native_path(quantizable):
+    shape = (1, 1, 2, 80)
+    graph = ModelGraph(_source(), {"x": TensorType(ScalarType.int8, shape)}, quantizable)
+    output = graph.slice(graph.inputs["x"], [0], [40], [1], [3])
+    assert isinstance(output.ir.operation, StridedSliceOp)
+    assert tensor_type(output) == TensorType(ScalarType.int8, (1, 1, 2, 40))
 
 
 def test_model_graph_requires_an_output():
@@ -173,8 +209,11 @@ def test_linear_preserves_quantized_weight_layout_and_metadata(block_size):
     }
     graph = ModelGraph(_source(params), {"x": (1, 1, 2, 48)}, False)
     output = graph.linear(
-        "proj", graph.inputs["x"], relocatable=True,
-        lora_rank=4 if block_size else None, merged_lora=True,
+        "proj",
+        graph.inputs["x"],
+        relocatable=True,
+        lora_rank=4 if block_size else None,
+        merged_lora=True,
     )
     attrs = output.ir.quant_attrs
     np.testing.assert_array_equal(attrs.weight_quant_data.reshape(48, 16), weights.T)
@@ -210,7 +249,7 @@ def test_context_saves_constants_and_infers_tessellation_defaults(tmp_path, quan
     assert tensor_type(constant).scalar == activation_type(quantizable)
     integer = graph.constant([1], dtype=np.int32)
     assert tensor_type(integer).scalar == ScalarType.int32
-    graph.save([graph.raw.create_mul_node(graph.inputs["x"], constant), integer])
+    graph.save([graph.mul(graph.inputs["x"], constant), integer])
     net = load_awesomenet("component" + (".fp32" if quantizable else ""), str(tmp_path))
     assert net.status == (Status.RELAY if quantizable else Status.SIMA_QUANTIZED)
     # Components with ordinary layouts need no boilerplate tessellation overrides.
@@ -218,12 +257,11 @@ def test_context_saves_constants_and_infers_tessellation_defaults(tmp_path, quan
     assert BaseModel.get_mla_output_tessellate_params(_source()) == {}
 
 
-def test_cross_attention_projection_uses_query_length_for_packing():
+def test_cross_attention_projection_uses_basic_linear_and_head_split():
     params = {"proj.weight": np.zeros((64, 64), np.float32)}
     graph = ModelGraph(_source(params), {"audio": (1, 1, 1500, 64)}, True)
-    heads = graph.project_heads("proj", graph.inputs["audio"], 4, kv_len=1500, query_len=1)
-    assert len(heads) == 1
-    assert tensor_type(heads[0]).shape == (1, 4, 1500, 16)
+    heads = graph.split_heads(graph.linear("proj", graph.inputs["audio"]), 4)
+    assert tensor_type(heads).shape == (1, 4, 1500, 16)
 
 
 def test_split_and_merge_heads_preserve_tokens():
@@ -236,14 +274,252 @@ def test_split_and_merge_heads_preserve_tokens():
     np.testing.assert_array_equal(_run(graph.finish([output]), {"x": x}), x)
 
 
+def test_split_heads_repeats_each_head():
+    shape = (1, 1, 3, 32)
+    graph = ModelGraph(_source(), {"x": shape}, True)
+    output = graph.split_heads(graph.inputs["x"], 2, repeat=3)
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    expected = np.repeat(x.reshape(1, 3, 2, 16).transpose(0, 2, 1, 3), 3, axis=1)
+    np.testing.assert_array_equal(_run(graph.finish([output]), {"x": x}), expected)
+
+
+def test_unaligned_heads_split_and_merge_preserve_values():
+    shape = (1, 1, 3, 24)
+    graph = ModelGraph(_source(), {"x": shape}, True)
+    heads = graph.split_heads(graph.inputs["x"], 4)
+    assert tensor_type(heads).shape == (1, 4, 3, 6)
+    output = graph.merge_heads(heads)
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    np.testing.assert_array_equal(_run(graph.finish([output]), {"x": x}), x)
+
+
+@pytest.mark.parametrize("block_size", [None, 32])
+def test_linear_scaling_preserves_packed_weights_and_scales_bias(block_size):
+    weights = (np.arange(16 * 48).reshape(16, 48) % 15 - 7).astype(int4 if block_size else np.int8)
+    scales = np.ones((16, 2 if block_size else 1), dtype=np.float32)
+    bias = np.arange(16, dtype=np.float32)
+    params = {
+        "proj.weight": (scales, weights, block_size) if block_size else (scales, weights),
+        "proj.bias": bias,
+    }
+    graph = ModelGraph(_source(params), {"x": (1, 1, 2, 48)}, False)
+    output = graph.linear("proj", graph.inputs["x"], scale=0.125)
+    attrs = output.ir.quant_attrs
+    np.testing.assert_array_equal(attrs.weight_quant_data.reshape(48, 16), weights.T)
+    np.testing.assert_array_equal(attrs.requant.sc_correction, scales.T * 0.125)
+    np.testing.assert_array_equal(attrs.bias_quant_data, bias * 0.125)
+    assert attrs.c_block_size == (block_size or 48)
+
+
+@pytest.mark.parametrize(
+    "projection,start,end", [("q_proj", 0, 32), ("k_proj", 32, 48), ("v_proj", 48, 64)]
+)
+@pytest.mark.parametrize("precision", ["float32", "int8", "int4"])
+def test_bundled_linear_preserves_scaling_and_caller_transforms(projection, start, end, precision):
+    weights = (np.arange(64 * 48).reshape(64, 48) % 15 - 7).astype(
+        np.float32 if precision == "float32" else np.int8 if precision == "int8" else int4
+    )
+    block_size = 32 if precision == "int4" else None
+    scales = np.arange(1, 64 * (2 if block_size else 1) + 1, dtype=np.float32).reshape(64, -1)
+    bias = np.arange(64, dtype=np.float32)
+    source_weights = weights
+    if precision != "float32":
+        source_weights = (scales, weights, block_size) if block_size else (scales, weights)
+    params = {
+        "attn.qkv_proj.weight": source_weights,
+        "attn.qkv_proj.bias": bias,
+    }
+    shape = (1, 1, 1, 48)
+    graph = ModelGraph(_source(params), {"x": shape}, precision == "float32")
+    output = graph.linear(
+        f"attn.{projection}",
+        graph.inputs["x"],
+        scale=0.125,
+        q_size=32,
+        kv_size=16,
+        weight_process_func=lambda x: x[::-1],
+        scale_process_func=lambda x: x[::-1] * 2,
+        bias_process_func=lambda x: x[::-1] + 1,
+    )
+    expected_weights = weights[start:end][::-1]
+    expected_bias = (bias[start:end][::-1] + 1) * 0.125
+    if precision == "float32":
+        x = np.ones(shape, np.float32)
+        expected = x @ expected_weights.T * 0.125 + expected_bias
+        np.testing.assert_array_equal(_run(graph.finish([output]), {"x": x}), expected)
+    else:
+        attrs = output.ir.quant_attrs
+        np.testing.assert_array_equal(
+            attrs.weight_quant_data.reshape(48, end - start), expected_weights.T
+        )
+        np.testing.assert_array_equal(
+            attrs.requant.sc_correction, scales[start:end][::-1].T * 0.25
+        )
+        np.testing.assert_array_equal(attrs.bias_quant_data, expected_bias)
+        assert attrs.c_block_size == (block_size or 48)
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+def test_softcap_matches_tanh_and_preserves_zero(quantizable):
+    shape = (1, 1, 1, 32)
+    graph = ModelGraph(_source(), {"x": shape}, quantizable)
+    output = graph.softcap(graph.inputs["x"], 30.0)
+    x = np.linspace(-30, 30, 32).reshape(shape).astype(activation_dtype(quantizable))
+    x[..., 16] = 0
+    execute = create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
+    actual = graph.finish([output]).run({"x": x}, node_callable=execute)
+    actual = actual[0] if isinstance(actual, (tuple, list)) else actual
+    expected = 30 * np.tanh(x.astype(np.float32) / 30)
+    np.testing.assert_allclose(
+        actual, expected, rtol=2e-6 if quantizable else 0.03,
+        atol=2e-6 if quantizable else 0.25,
+    )
+    assert actual[..., 16].item() == 0
+
+
+@pytest.mark.parametrize("split_heads", [False, True])
+@pytest.mark.parametrize("mask_shape", [(1, 2, 3, 5), (1, 1, 1, 5), (5,), (1,)])
+def test_attention_preserves_broadcast_values_and_mask(monkeypatch, split_heads, mask_shape):
+    import sima_lmm.model.model_graph as graph_module
+
+    if split_heads:
+        monkeypatch.setattr(graph_module, "mla_max_num_rows", 1)
+    specs = {"q": (1, 2, 3, 16), "k": (1, 2, 5, 16), "v": (1, 1, 5, 16), "mask": mask_shape}
+    graph = ModelGraph(_source(), specs, True)
+    output = graph.attention(
+        graph.inputs["q"],
+        graph.inputs["k"],
+        graph.inputs["v"],
+        mask=graph.inputs["mask"],
+        score_scale=0.25,
+    )
+    net = graph.finish([output])
+    matmuls = [
+        node
+        for node in net.nodes["MLA_0"].ir.nodes.values()
+        if isinstance(node.ir.operation, BatchMatmulOp)
+    ]
+    assert len(matmuls) == (4 if split_heads else 2)
+    if split_heads:
+        assert all(tensor_type(node).shape[1] == 1 for node in matmuls)
+    rng = np.random.default_rng(5)
+    inputs = {name: rng.normal(size=shape).astype(np.float32) for name, shape in specs.items()}
+    scores = np.einsum("nhtc,nhsc->nhts", inputs["q"], inputs["k"]) * 0.25 + inputs["mask"]
+    probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    probs /= probs.sum(axis=-1, keepdims=True)
+    expected = np.matmul(probs, inputs["v"])
+    np.testing.assert_allclose(_run(net, inputs), expected, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("split_heads", [False, True])
+@pytest.mark.parametrize(
+    "mask_shape",
+    [(1, 3, 3, 5), (3, 3, 5), (3, 5), (2, 2, 3, 5), (1, 2, 4, 5), (1, 2, 3, 6), (1, 1, 2, 3, 5)],
+)
+def test_attention_rejects_masks_that_do_not_broadcast_to_scores(monkeypatch, split_heads, mask_shape):
+    import sima_lmm.model.model_graph as graph_module
+
+    if split_heads:
+        monkeypatch.setattr(graph_module, "mla_max_num_rows", 1)
+    specs = {"q": (1, 2, 3, 16), "k": (1, 2, 5, 16), "v": (1, 1, 5, 16), "mask": mask_shape}
+    graph = ModelGraph(_source(), specs, True)
+    with pytest.raises(ValueError, match="attention mask .* broadcast to score shape"):
+        graph.attention(*(graph.inputs[name] for name in ("q", "k", "v")), mask=graph.inputs["mask"])
+
+
+def test_rope2d_preserves_axis_pairing_with_unaligned_quarters():
+    specs = {"x": (1, 2, 3, 96)}
+    specs.update({name: (1, 1, 3, 24) for name in ("cos_x", "sin_x", "cos_y", "sin_y")})
+    graph = ModelGraph(_source(), specs, True)
+    output = graph.rope2d(*(graph.inputs[name] for name in specs))
+    rng = np.random.default_rng(4)
+    inputs = {name: rng.normal(size=shape).astype(np.float32) for name, shape in specs.items()}
+    xr, xi, yr, yi = np.split(inputs["x"], 4, axis=-1)
+    expected = np.concatenate(
+        [
+            xr * inputs["cos_x"] - xi * inputs["sin_x"],
+            xr * inputs["sin_x"] + xi * inputs["cos_x"],
+            yr * inputs["cos_y"] - yi * inputs["sin_y"],
+            yr * inputs["sin_y"] + yi * inputs["cos_y"],
+        ],
+        axis=-1,
+    )
+    np.testing.assert_array_equal(_run(graph.finish([output]), inputs), expected)
+
+
+def test_attention_scales_scores_before_adding_mask():
+    specs = {name: (1, 2, 3, 16) for name in ("q", "k", "v")}
+    specs["mask"] = (1, 1, 3, 3)
+    graph = ModelGraph(_source(), specs, True)
+    output = graph.attention(
+        graph.inputs["q"],
+        graph.inputs["k"],
+        graph.inputs["v"],
+        mask=graph.inputs["mask"],
+        score_scale=0.125,
+    )
+    rng = np.random.default_rng(4)
+    inputs = {name: rng.normal(size=shape).astype(np.float32) for name, shape in specs.items()}
+    inputs["mask"][..., -1] = -20
+    scores = np.einsum("nhtc,nhsc->nhts", inputs["q"], inputs["k"]) * 0.125 + inputs["mask"]
+    probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    probs /= probs.sum(axis=-1, keepdims=True)
+    expected = np.einsum("nhts,nhsc->nhtc", probs, inputs["v"])
+    np.testing.assert_allclose(_run(graph.finish([output]), inputs), expected, rtol=2e-5, atol=2e-6)
+
+
+def test_space_to_depth_preserves_spatial_block_order():
+    shape = (1, 4, 6, 16)
+    graph = ModelGraph(_source(), {"x": shape}, True)
+    output = graph.space_to_depth(graph.inputs["x"], 2)
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    expected = x.reshape(1, 2, 2, 3, 2, 16).transpose(0, 1, 3, 2, 4, 5).reshape(1, 2, 3, 64)
+    np.testing.assert_array_equal(_run(graph.finish([output]), {"x": x}), expected)
+
+
+def test_conv_transforms_rank_five_grouped_weights_without_changing_metadata():
+    weight = (np.arange(16 * 24).reshape(16, 3, 2, 2, 2) % 15 - 7).astype(int4)
+    scales = np.arange(1, 33, dtype=np.float32).reshape(16, 2) / 100
+    graph = ModelGraph(_source({"patch.weight": (scales, weight, 16)}), {"x": (1, 1, 2, 24)}, False)
+    output = graph.conv(
+        "patch",
+        graph.inputs["x"],
+        weight_process_func=lambda w: w.reshape(16, 24, 1, 1),
+        scale_process_func=lambda s: s,
+    )
+    attrs = output.ir.quant_attrs
+    assert attrs.c_block_size == 16
+    np.testing.assert_array_equal(attrs.weight_quant_data.reshape(24, 16), weight.reshape(16, 24).T)
+    np.testing.assert_array_equal(attrs.requant.sc_correction, scales.T)
+
+
+@pytest.mark.parametrize("repeat", [0, -1, 1.5])
+def test_split_heads_rejects_invalid_repetition(repeat):
+    graph = ModelGraph(_source(), {"x": (1, 1, 2, 32)}, True)
+    with pytest.raises(ValueError, match="positive integer repeat"):
+        graph.split_heads(graph.inputs["x"], 2, repeat=repeat)
+
+
+def test_rope2d_rejects_incompatible_tables():
+    graph = ModelGraph(_source(), {"x": (1, 2, 3, 96), "table": (1, 1, 4, 24)}, True)
+    with pytest.raises(ValueError, match="tables must broadcast"):
+        graph.rope2d(graph.inputs["x"], *(graph.inputs["table"] for _ in range(4)))
+
+
+def test_space_to_depth_rejects_partial_spatial_blocks():
+    graph = ModelGraph(_source(), {"x": (1, 3, 4, 16)}, True)
+    with pytest.raises(ValueError, match="H/W divisible"):
+        graph.space_to_depth(graph.inputs["x"], 2)
+
+
 @pytest.mark.parametrize("per_token", [True, False])
 def test_dynamic_quantization_infers_scale_shape_and_roundtrips(per_token):
     shape = (1, 1, 2, 32)
     graph = ModelGraph(_source(), {"x": shape}, False)
-    quantized, scale = graph.quantize(graph.inputs["x"], per_token=per_token)
+    quantized, scale = graph.quant(graph.inputs["x"], per_token=per_token)
     assert tensor_type(quantized) == TensorType(ScalarType.int8, shape)
     assert tensor_type(scale).shape == ((1, 1, 2, 1) if per_token else (1, 1, 1, 1))
-    output = graph.dequantize(quantized, scale)
+    output = graph.dequant(quantized, scale)
     x = np.linspace(-0.5, 0.5, np.prod(shape)).reshape(shape).astype(activation_dtype(False))
     actual = graph.finish([output]).run(
         {"x": x}, node_callable=create_node_quant_executor(False, False)

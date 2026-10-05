@@ -2,19 +2,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from afe.apis.defines import TensorDRAMLayout, gen2_target
-from afe.backends.backends import Backend
+from afe.apis.defines import TensorDRAMLayout
 from afe.ir.attributes import ClipAttrs
 from afe.ir.build_node import NodeOrHandle
-from afe.ir.defines import Status, get_expected_tensor_value
-from afe.ir.serializer import save_awesomenet
-from afe.ir.tensor_type import ScalarType, TensorType
+from afe.ir.defines import get_expected_tensor_value
 from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, activation_dtype, activation_type, build_activation, build_conv,
-    create_channel_slice, load_tensor_from_source
-)
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
 
 
 @dataclass
@@ -70,7 +64,7 @@ class Gemma4VisionLayerModel(BaseModel):
         quantizable: bool,
     ):
         g = self._build_sima_nodes(self.hf_model.vision_model_param_base_name, quantizable)
-        save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
+        save_model_graph(self, g, quantizable)
 
     def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
 
@@ -386,36 +380,17 @@ class Gemma4VisionLayerModel(BaseModel):
         else:
             input_shape = (1, 1, self.cfg.vm_cfg.seq_len, self.cfg.vm_cfg.hidden_size)
 
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        model_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
+        graph = ModelGraph(self, {"input": input_shape}, quantizable)
+        vision_output = self._build_sima_vision_model(
+            graph, base_name, graph.inputs["input"], quantizable
         )
-        builder.begin_subnet([model_input])
-        mla_input = builder.create_placeholder_node(
-            "MLA_0/input", TensorType(activation_type(quantizable), input_shape)
-        )
-
-        vision_output = self._build_sima_vision_model(builder, base_name, mla_input, quantizable)
         if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
-            vision_scale = builder.create_dynamic_quant_scale_node(
-                vision_output, per_token_quant=True
-            )
-            vision_output = builder.create_dynamic_quant_node(vision_output, vision_scale)
-            builder.create_tuple_node([vision_output, vision_scale])
-        mla_node = builder.finish_subnet("MLA_0")
-        if activation_type(quantizable) != ScalarType.float32:
-            if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
-                quantized_output, scale_output = builder.create_tuple_get_item_nodes(mla_node)
-                scale_output = builder.create_cast_node(
-                    scale_output, ScalarType.float32, backend=Backend.EV
-                )
-                builder.create_tuple_node([quantized_output, scale_output])
-            else:
-                _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
-        return builder.finish(self.model_name)
+            vision_output, vision_scale = graph.quant(vision_output)
+            return graph.finish([vision_output, vision_scale])
+        return graph.finish([vision_output])
 
     def _build_sima_vision_model(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
         if isinstance(self.cfg.vm_cfg.image_size, list):
             image_h, image_w = self.cfg.vm_cfg.image_size
@@ -425,82 +400,73 @@ class Gemma4VisionLayerModel(BaseModel):
         grid_h = image_h // self.cfg.vm_cfg.patch_size
         grid_w = image_w // self.cfg.vm_cfg.patch_size
         pos_embed, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y = self._precompute_sima_constants(
-            builder, base_name, grid_h, grid_w, quantizable
+            graph, base_name, grid_h, grid_w, quantizable
         )
 
         if self.include_embeddings:
-            x = self._build_sima_patch_embedder(builder, base_name, input_node, pos_embed, quantizable)
+            x = self._build_sima_patch_embedder(graph, base_name, input_node, pos_embed, quantizable)
         else:
             x = input_node
 
         x = self._build_sima_encoder_layer(
-            builder, f"{base_name}.encoder.layers.{self.layer_idx}", x,
-            rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y, quantizable
+            graph, f"{base_name}.encoder.layers.{self.layer_idx}", x,
+            rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y
         )
 
         if self.include_mm_proj:
-            x = self._build_sima_pooler(builder, base_name, x, grid_h, quantizable)
-            x = self._build_sima_multimodal_embedder(builder, base_name, x)
+            x = self._build_sima_pooler(graph, base_name, x, grid_h, quantizable)
+            x = self._build_sima_multimodal_embedder(graph, base_name, x)
         return x
 
     def _precompute_sima_constants(
-        self, builder: SimaBuilder, base_name: str, grid_h: int, grid_w: int, quantizable: bool
+        self, graph: ModelGraph, base_name: str, grid_h: int, grid_w: int, quantizable: bool
     ) -> tuple[NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle]:
         constants = self._calc_static_constants(base_name, grid_h, grid_w)
         dtype = activation_dtype(quantizable)
         return tuple(
-            builder.create_constant_node(c.transpose(0, 2, 3, 1).astype(dtype))
+            graph.constant(c.transpose(0, 2, 3, 1).astype(dtype))
             for c in constants
         )
 
     def _build_sima_patch_embedder(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle,
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle,
         pos_embed_node: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
         dtype = activation_dtype(quantizable)
-        sub = builder.create_subtract_node(
-            input_node, builder.create_constant_node(np.array([0.5], dtype=dtype))
+        sub = graph.sub(
+            input_node, graph.constant(np.array([0.5], dtype=dtype))
         )
-        scaled = builder.create_mul_node(
-            sub, builder.create_constant_node(np.array([2.0], dtype=dtype))
+        scaled = graph.mul(
+            sub, graph.constant(np.array([2.0], dtype=dtype))
         )
-        proj = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.patch_embedder.input_proj", scaled,
-            is_fc=True,
-        )
-        return builder.create_add_node(proj, pos_embed_node)
+        proj = graph.linear(f"{base_name}.patch_embedder.input_proj", scaled)
+        return graph.add(proj, pos_embed_node)
 
     def _build_sima_encoder_layer(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         rope_cos_x: NodeOrHandle,
         rope_sin_x: NodeOrHandle,
         rope_cos_y: NodeOrHandle,
         rope_sin_y: NodeOrHandle,
-        quantizable: bool,
     ) -> NodeOrHandle:
         eps = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        w = load_tensor_from_source(f"{base_name}.input_layernorm.weight", self.get_hf_param, self.check_hf_param)
-        x = builder.create_rms_norm_node(input_node, eps, w)
-        x = self._build_sima_attention(builder, base_name, x, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
-        w = load_tensor_from_source(f"{base_name}.post_attention_layernorm.weight", self.get_hf_param, self.check_hf_param)
-        x = builder.create_rms_norm_node(x, eps, w)
-        x = builder.create_add_node(input_node, x)
+        x = graph.rms_norm(f"{base_name}.input_layernorm", input_node, epsilon=eps)
+        x = self._build_sima_attention(graph, base_name, x, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
+        x = graph.rms_norm(f"{base_name}.post_attention_layernorm", x, epsilon=eps)
+        x = graph.add(input_node, x)
 
         residual = x
-        w = load_tensor_from_source(f"{base_name}.pre_feedforward_layernorm.weight", self.get_hf_param, self.check_hf_param)
-        x = builder.create_rms_norm_node(x, eps, w)
-        x = self._build_sima_mlp(builder, base_name, x, quantizable)
-        w = load_tensor_from_source(f"{base_name}.post_feedforward_layernorm.weight", self.get_hf_param, self.check_hf_param)
-        x = builder.create_rms_norm_node(x, eps, w)
-        return builder.create_add_node(residual, x)
+        x = graph.rms_norm(f"{base_name}.pre_feedforward_layernorm", x, epsilon=eps)
+        x = self._build_sima_mlp(graph, base_name, x)
+        x = graph.rms_norm(f"{base_name}.post_feedforward_layernorm", x, epsilon=eps)
+        return graph.add(residual, x)
 
     def _build_sima_attention(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         rope_cos_x: NodeOrHandle,
@@ -510,7 +476,6 @@ class Gemma4VisionLayerModel(BaseModel):
     ) -> NodeOrHandle:
         attn_base = f"{base_name}.self_attn"
         num_heads = self.cfg.vm_cfg.num_attention_heads
-        head_dim = self.cfg.vm_cfg.hidden_size // num_heads
 
         q_base = f"{attn_base}.q_proj"
         k_base = f"{attn_base}.k_proj"
@@ -521,70 +486,31 @@ class Gemma4VisionLayerModel(BaseModel):
             self._get_sima_clip_bounds(v_base, "input"),
         ]
         if qkv_bounds[0] is not None and all(bounds == qkv_bounds[0] for bounds in qkv_bounds):
-            shared_input = builder.create_clip_node(input_node, qkv_bounds[0][0], qkv_bounds[0][1])
-            q = self._build_sima_enc_conv(builder, q_base, shared_input, include_input_clip=False)
-            k = self._build_sima_enc_conv(builder, k_base, shared_input, include_input_clip=False)
-            v = self._build_sima_enc_conv(builder, v_base, shared_input, include_input_clip=False)
+            shared_input = graph.clip(input_node, qkv_bounds[0][0], qkv_bounds[0][1])
+            q = self._build_sima_enc_conv(graph, q_base, shared_input, include_input_clip=False)
+            k = self._build_sima_enc_conv(graph, k_base, shared_input, include_input_clip=False)
+            v = self._build_sima_enc_conv(graph, v_base, shared_input, include_input_clip=False)
         else:
-            q = self._build_sima_enc_conv(builder, q_base, input_node)
-            k = self._build_sima_enc_conv(builder, k_base, input_node)
-            v = self._build_sima_enc_conv(builder, v_base, input_node)
+            q = self._build_sima_enc_conv(graph, q_base, input_node)
+            k = self._build_sima_enc_conv(graph, k_base, input_node)
+            v = self._build_sima_enc_conv(graph, v_base, input_node)
 
-        q = builder.create_slice_concat_node(q, axis=1, split_axis=3, split_block=num_heads, split_repeat=1)
-        k = builder.create_slice_concat_node(k, axis=1, split_axis=3, split_block=num_heads, split_repeat=1)
-        v = builder.create_slice_concat_node(v, axis=1, split_axis=3, split_block=num_heads, split_repeat=1)
+        q = graph.split_heads(q, num_heads)
+        k = graph.split_heads(k, num_heads)
+        v = graph.split_heads(v, num_heads)
 
         eps = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        w = load_tensor_from_source(f"{attn_base}.q_norm.weight", self.get_hf_param, self.check_hf_param)
-        q = builder.create_rms_norm_node(q, eps, w)
-        w = load_tensor_from_source(f"{attn_base}.k_norm.weight", self.get_hf_param, self.check_hf_param)
-        k = builder.create_rms_norm_node(k, eps, w)
-        v = builder.create_rms_norm_node(v, eps, np.ones(head_dim, dtype=np.float32))
+        q = graph.rms_norm(f"{attn_base}.q_norm", q, epsilon=eps)
+        k = graph.rms_norm(f"{attn_base}.k_norm", k, epsilon=eps)
+        v = graph.rms_norm(None, v, epsilon=eps)
 
-        q = self._build_sima_apply_2d_rope(builder, q, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
-        k = self._build_sima_apply_2d_rope(builder, k, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
-
-        scores = builder.create_einsum_node(q, k, equation="nhwc,nhqc->nhwq", layout="NHWC")
-        probs = builder.create_softmax_node(scores, axis=3)
-        context = builder.create_einsum_node(probs, v, equation="nhwc,nhcq->nhwq", layout="NHWC")
-        merged = builder.create_slice_concat_node(context, axis=3, split_axis=1, split_block=num_heads, split_repeat=1)
-        return self._build_sima_enc_conv(builder, f"{attn_base}.o_proj", merged)
-
-    def _build_sima_apply_2d_rope(
-        self,
-        builder: SimaBuilder,
-        x: NodeOrHandle,
-        cos_x: NodeOrHandle,
-        sin_x: NodeOrHandle,
-        cos_y: NodeOrHandle,
-        sin_y: NodeOrHandle,
-    ) -> NodeOrHandle:
-        quarter_dim = self.cfg.vm_cfg.hidden_size // self.cfg.vm_cfg.num_attention_heads // 4
-        x_xr = create_channel_slice(builder, x, 0, quarter_dim)
-        x_xi = create_channel_slice(builder, x, quarter_dim, 2 * quarter_dim)
-        x_yr = create_channel_slice(builder, x, 2 * quarter_dim, 3 * quarter_dim)
-        x_yi = create_channel_slice(builder, x, 3 * quarter_dim, 4 * quarter_dim)
-
-        real_x = builder.create_subtract_node(
-            builder.create_mul_node(x_xr, cos_x),
-            builder.create_mul_node(x_xi, sin_x),
-        )
-        imag_x = builder.create_add_node(
-            builder.create_mul_node(x_xr, sin_x),
-            builder.create_mul_node(x_xi, cos_x),
-        )
-        real_y = builder.create_subtract_node(
-            builder.create_mul_node(x_yr, cos_y),
-            builder.create_mul_node(x_yi, sin_y),
-        )
-        imag_y = builder.create_add_node(
-            builder.create_mul_node(x_yr, sin_y),
-            builder.create_mul_node(x_yi, cos_y),
-        )
-        return builder.create_concat_node([real_x, imag_x, real_y, imag_y], axis=3)
+        q = graph.rope2d(q, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
+        k = graph.rope2d(k, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
+        context = graph.attention(q, k, v)
+        return self._build_sima_enc_conv(graph, f"{attn_base}.o_proj", graph.merge_heads(context))
 
     def _build_sima_mlp(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         mlp_base = f"{base_name}.mlp"
         gate_base = f"{mlp_base}.gate_proj"
@@ -592,59 +518,51 @@ class Gemma4VisionLayerModel(BaseModel):
         gate_bounds = self._get_sima_clip_bounds(gate_base, "input")
         up_bounds = self._get_sima_clip_bounds(up_base, "input")
         if gate_bounds is not None and gate_bounds == up_bounds:
-            shared_input = builder.create_clip_node(input_node, gate_bounds[0], gate_bounds[1])
-            gate = self._build_sima_enc_conv(builder, gate_base, shared_input, include_input_clip=False)
-            up = self._build_sima_enc_conv(builder, up_base, shared_input, include_input_clip=False)
+            shared_input = graph.clip(input_node, gate_bounds[0], gate_bounds[1])
+            gate = self._build_sima_enc_conv(graph, gate_base, shared_input, include_input_clip=False)
+            up = self._build_sima_enc_conv(graph, up_base, shared_input, include_input_clip=False)
         else:
-            gate = self._build_sima_enc_conv(builder, gate_base, input_node)
-            up = self._build_sima_enc_conv(builder, up_base, input_node)
-        act = build_activation(builder, gate, self.cfg.vm_cfg.hidden_act, quantizable)
-        mul = builder.create_mul_node(act, up)
-        return self._build_sima_enc_conv(builder, f"{mlp_base}.down_proj", mul)
+            gate = self._build_sima_enc_conv(graph, gate_base, input_node)
+            up = self._build_sima_enc_conv(graph, up_base, input_node)
+        act = graph.activation(gate, self.cfg.vm_cfg.hidden_act)
+        mul = graph.mul(act, up)
+        return self._build_sima_enc_conv(graph, f"{mlp_base}.down_proj", mul)
 
     def _build_sima_pooler(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle,
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle,
         grid_h: int, quantizable: bool
     ) -> NodeOrHandle:
         s = self.cfg.vm_cfg.spatial_merge_size
-        x = builder.create_slice_concat_node(
+        x = graph.split_concat(
             input_node, axis=1, split_axis=2, split_block=grid_h, split_repeat=1
         )
-        x = builder.create_avgpool2d_node(x, kernel_shape=(s, s), strides=(s, s))
-        x = builder.create_mul_node(
+        x = graph.avgpool2d(x, kernel_shape=(s, s), strides=(s, s))
+        x = graph.mul(
             x,
-            builder.create_constant_node(
+            graph.constant(
                 np.array([float(np.sqrt(self.cfg.vm_cfg.hidden_size))], dtype=activation_dtype(quantizable))
             ),
         )
-        return builder.create_slice_concat_node(
+        return graph.split_concat(
             x, axis=2, split_axis=1, split_block=grid_h // s, split_repeat=1
         )
 
     def _build_sima_multimodal_embedder(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
-        x = builder.create_rms_norm_node(
-            input_node,
-            float(np.float32(self.cfg.vm_cfg.layer_norm_eps)),
-            np.ones(self.cfg.vm_cfg.hidden_size, dtype=np.float32),
-        )
-        return build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            "model.embed_vision.embedding_projection", x,
-            is_fc=True,
-        )
+        x = graph.rms_norm(None, input_node, epsilon=self.cfg.vm_cfg.layer_norm_eps)
+        return graph.linear("model.embed_vision.embedding_projection", x)
 
     def _build_sima_enc_conv(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         include_input_clip: bool = True,
     ) -> NodeOrHandle:
         x = input_node
         if include_input_clip:
-            x = self._build_sima_maybe_clip(builder, base_name, x, "input")
+            x = self._build_sima_maybe_clip(graph, base_name, x, "input")
 
         activation = None
         out_bounds = self._get_sima_clip_bounds(base_name, "output")
@@ -659,22 +577,21 @@ class Gemma4VisionLayerModel(BaseModel):
                 scalar_type=ifm_type.scalar,
             )
 
-        x = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            base_name, x,
-            is_fc=True,
+        x = graph.linear(
+            base_name,
+            x,
             src_weight_name=f"{base_name}.linear.weight",
             activation=activation,
         )
         return x
 
     def _build_sima_maybe_clip(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, side: str
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, side: str
     ) -> NodeOrHandle:
         bounds = self._get_sima_clip_bounds(base_name, side)
         if bounds is None:
             return input_node
-        return builder.create_clip_node(input_node, bounds[0], bounds[1])
+        return graph.clip(input_node, bounds[0], bounds[1])
 
     def _get_sima_clip_bounds(self, base_name: str, side: str) -> tuple[float, float] | None:
         min_name = f"{base_name}.{side}_min"

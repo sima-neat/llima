@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-import numpy as np
 
 from sima_lmm.model.model_graph import ModelGraph
 from sima_lmm.model.base import BaseModel, LayerConfiguration
@@ -23,11 +22,10 @@ class WhisperEncoderModel(BaseModel):
         shapes = {"input": shape}
 
         graph = ModelGraph(self, shapes, quantizable)
-        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        outputs = self._build_sima_nodes(graph, list(graph.inputs.values()))
         graph.save(outputs)
 
-    def _build_sima_nodes(self, builder, inputs, quantizable):
-        graph = ModelGraph.from_builder(self, builder)
+    def _build_sima_nodes(self, graph, inputs):
         hidden = inputs[0]
         if self.layer_idx in (None, 0):
             for idx, stride in ((1, 1), (2, 2)):
@@ -42,29 +40,26 @@ class WhisperEncoderModel(BaseModel):
             positions = graph.constant(
                 positions.reshape(1, 1, self.cfg.max_source_positions, self.cfg.d_model)
             )
-            hidden = builder.create_add_node(hidden, positions)
+            hidden = graph.add(hidden, positions)
         layers = range(self.cfg.encoder_layers) if self.layer_idx is None else [self.layer_idx]
         for idx in layers:
             name = f"model.encoder.layers.{idx}"
             norm = graph.layer_norm(f"{name}.self_attn_layer_norm", hidden)
             queries, keys, values = [
-                graph.project_heads(
-                    f"{name}.self_attn.{proj}",
-                    norm,
+                graph.split_heads(
+                    graph.linear(
+                        f"{name}.self_attn.{proj}", norm,
+                        scale=self.cfg.encoder_head_dim**-0.5 if proj == "q_proj" else 1.0,
+                    ),
                     self.cfg.encoder_attention_heads,
-                    scale=self.cfg.encoder_head_dim**-0.5 if proj == "q_proj" else 1.0,
                 )
                 for proj in ("q_proj", "k_proj", "v_proj")
             ]
-            heads = []
-            for query, key, value in zip(queries, keys, values):
-                heads.append(graph.attention(query, key, value))
-            attn = graph.project_merged_heads(
-                f"{name}.self_attn.out_proj",
-                heads,
-                self.cfg.encoder_attention_heads,
+            context = graph.attention(queries, keys, values)
+            attn = graph.linear(
+                f"{name}.self_attn.out_proj", graph.merge_heads(context)
             )
-            hidden = builder.create_add_node(hidden, attn)
+            hidden = graph.add(hidden, attn)
             norm = graph.layer_norm(f"{name}.final_layer_norm", hidden)
             hidden = graph.mlp(name, norm, self.cfg.activation_function, residual=hidden)
         if self.layer_idx in (None, self.cfg.encoder_layers - 1):

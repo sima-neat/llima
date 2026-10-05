@@ -39,18 +39,17 @@ class WhisperDecoderPreModel(BaseModel):
             shapes["embed_positions"] = shape
 
         graph = ModelGraph(self, shapes, quantizable)
-        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        outputs = self._build_sima_nodes(graph, list(graph.inputs.values()))
         graph.save(outputs)
 
-    def _build_sima_nodes(self, builder, inputs, quantizable):
-        graph = ModelGraph.from_builder(self, builder)
+    def _build_sima_nodes(self, graph, inputs):
         name = f"model.decoder.layers.{self.layer_idx}"
-        residual = builder.create_add_node(*inputs) if self.layer_idx == 0 else inputs[0]
+        residual = graph.add(*inputs) if self.layer_idx == 0 else inputs[0]
         norm = graph.layer_norm(f"{name}.self_attn_layer_norm", residual)
         query, key, value = [
             graph.linear(f"{name}.self_attn.{proj}_proj", norm) for proj in ("q", "k", "v")
         ]
-        query = builder.create_mul_node(query, graph.constant(self.cfg.decoder_head_dim**-0.5))
+        query = graph.mul(query, graph.constant(self.cfg.decoder_head_dim**-0.5))
         query = graph.split_heads(query, self.cfg.decoder_attention_heads)
         outputs = [query, key, value]
         if self.layer_idx == 0:

@@ -7,15 +7,8 @@ from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import LayerConfiguration, LoraGenMode
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype, activation_type
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder,
-    activation_dtype,
-    activation_type,
-    build_conv,
-    create_channel_slice,
-)
 
 
 @dataclass
@@ -144,9 +137,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
         save_model_graph(self, graph, quantizable)
 
     def _sima_constant(
-        self, builder: SimaBuilder, value: np.ndarray | float, quantizable: bool
+        self, graph: ModelGraph, value: np.ndarray | float, quantizable: bool
     ) -> NodeOrHandle:
-        graph = ModelGraph.from_builder(self, builder)
         dtype = activation_dtype(quantizable)
         return graph.constant(np.asarray(value, dtype=dtype))
 
@@ -189,12 +181,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
     def _build_sima_ab_projections(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         linear_base: str,
         norm_input: NodeOrHandle,
         merged_lora: bool,
     ) -> tuple[NodeOrHandle, NodeOrHandle]:
-        graph = ModelGraph.from_builder(self, builder)
         lora_ranks = {"a": None, "b": None}
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_ranks = {
@@ -215,17 +206,16 @@ class LanguageLinearModel(LanguagePartBaseModel):
         if params is None:
             return tuple(graph.linear(f"{linear_base}.in_proj_{key}", norm_input) for key in ("a", "b"))
         # Fused A/B weights are synthesized locally, outside the model weight source.
-        ab = build_conv(
-            builder,
-            params.__getitem__,
-            params.__contains__,
+        ab = graph._build_conv(
             f"{linear_base}.in_proj_ab",
             norm_input,
+            get_param_func=params.__getitem__,
+            check_param_func=params.__contains__,
         )
         heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
         return (
-            create_channel_slice(builder, ab, 0, heads),
-            create_channel_slice(builder, ab, heads, 2 * heads),
+            graph.slice(ab, [0], [heads], [1], [3]),
+            graph.slice(ab, [heads], [2 * heads], [1], [3]),
         )
 
     def _build_onnx_ab_projections(
@@ -276,12 +266,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
 
     def _build_sima_static_triangular_sums(
-        self, builder: SimaBuilder, g: NodeOrHandle, upper: bool, quantizable: bool
+        self, graph: ModelGraph, g: NodeOrHandle, upper: bool, quantizable: bool
     ) -> NodeOrHandle:
         """Build NHWC prefix/suffix sums with one static triangular Einsum."""
         # The ONNX helper stores the mask as (sum_token, output_token). Here the
         # NHWC einsum stores it as (output_token, sum_token), so the triangle flips.
-        graph = ModelGraph.from_builder(self, builder)
         mask_fn = np.tril if upper else np.triu
         mask = mask_fn(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
         mask = np.broadcast_to(
@@ -293,13 +282,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 self.num_tokens,
             ),
         ).copy()
-        return graph.einsum("nhwc,nhcq->nhwq", self._sima_constant(builder, mask, quantizable), g)
+        return graph.einsum("nhwc,nhcq->nhwq", self._sima_constant(graph, mask, quantizable), g)
 
     def _build_sima_global_interval_decay_mask(
-        self, builder: SimaBuilder, g: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, g: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
         """Build NHWC pairwise decay in lower-triangular query/key orientation."""
-        graph = ModelGraph.from_builder(self, builder)
         interval_end_mask = np.tril(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
         interval_start_mask = np.tril(
             np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=-1
@@ -323,20 +311,19 @@ class LanguageLinearModel(LanguagePartBaseModel):
             ),
         ).copy()
 
-        interval_start = self._sima_constant(builder, interval_start_mask, quantizable)
-        interval_end = self._sima_constant(builder, interval_end_mask, quantizable)
+        interval_start = self._sima_constant(graph, interval_start_mask, quantizable)
+        interval_end = self._sima_constant(graph, interval_end_mask, quantizable)
 
         # Keep g on its native token axis: start_mask[t, i] multiplies g[t].
-        masked_g = builder.create_mul_node(interval_start, g)
+        masked_g = graph.mul(interval_start, g)
         interval_sum = graph.einsum("nhwc,nhcq->nhwq", interval_end, masked_g)
-        decay = builder.create_exp_node(interval_sum)
-        return builder.create_mul_node(decay, interval_end)
+        decay = graph.exp(interval_sum)
+        return graph.mul(decay, interval_end)
 
     def _build_sima_l2norm(
-        self, builder: SimaBuilder, input_node: NodeOrHandle, scale: float
+        self, graph: ModelGraph, input_node: NodeOrHandle, scale: float
     ) -> NodeOrHandle:
         """Normalize NHWC Q/K heads over the last dimension."""
-        graph = ModelGraph.from_builder(self, builder)
         norm = graph.rms_norm(
             None,
             input_node,
@@ -344,21 +331,20 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
         if scale == 1.0:
             return norm
-        return builder.create_mul_node(
+        return graph.mul(
             norm, graph.constant(np.array(scale, dtype=np.float32), dtype=np.float32)
         )
 
     def _sima_folded_matrix_mul(
-        self, builder: SimaBuilder, left_blocks: list[NodeOrHandle], right_blocks: list[NodeOrHandle]
+        self, graph: ModelGraph, left_blocks: list[NodeOrHandle], right_blocks: list[NodeOrHandle]
     ) -> list[NodeOrHandle]:
         """Batch independent NHWC block multiplications by folding blocks into head axis."""
-        graph = ModelGraph.from_builder(self, builder)
         assert len(left_blocks) == len(right_blocks)
         folded_left = (
-            left_blocks[0] if len(left_blocks) == 1 else builder.create_concat_node(left_blocks, 1)
+            left_blocks[0] if len(left_blocks) == 1 else graph.concat(left_blocks, 1)
         )
         folded_right = (
-            right_blocks[0] if len(right_blocks) == 1 else builder.create_concat_node(right_blocks, 1)
+            right_blocks[0] if len(right_blocks) == 1 else graph.concat(right_blocks, 1)
         )
         folded_out = graph.einsum("nhwc,nhcq->nhwq", folded_left, folded_right)
         if len(left_blocks) == 1:
@@ -368,7 +354,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
         for block_idx in range(len(left_blocks)):
             blocks.append(
-                builder.create_slice_node(
+                graph.slice(
                     folded_out,
                     [block_idx * num_heads],
                     [(block_idx + 1) * num_heads],
@@ -380,37 +366,36 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
     def _build_sima_direct_chunk_inverse(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         initial_attn: NodeOrHandle,
         chunk_size: int,
         quantizable: bool,
     ) -> NodeOrHandle:
         """Build the exact NHWC lower-triangular inverse for one folded token block."""
-        graph = ModelGraph.from_builder(self, builder)
         if chunk_size == 4:
             eye = self._sima_constant(
-                builder,
+                graph,
                 np.eye(chunk_size, dtype=np.float32).reshape(1, 1, chunk_size, chunk_size),
                 quantizable,
             )
             a_squared = graph.einsum("nhwc,nhcq->nhwq", initial_attn, initial_attn)
-            i_plus_a = builder.create_add_node(initial_attn, eye)
-            i_plus_a_squared = builder.create_add_node(a_squared, eye)
+            i_plus_a = graph.add(initial_attn, eye)
+            i_plus_a_squared = graph.add(a_squared, eye)
             return graph.einsum("nhwc,nhcq->nhwq", i_plus_a_squared, i_plus_a)
 
         half = chunk_size // 2
-        top_rows = builder.create_slice_node(initial_attn, [0], [half], [1], [2])
-        bottom_rows = builder.create_slice_node(initial_attn, [half], [chunk_size], [1], [2])
-        a00 = builder.create_slice_node(top_rows, [0], [half], [1], [3])
-        a10 = builder.create_slice_node(bottom_rows, [0], [half], [1], [3])
-        a11 = builder.create_slice_node(bottom_rows, [half], [chunk_size], [1], [3])
+        top_rows = graph.slice(initial_attn, [0], [half], [1], [2])
+        bottom_rows = graph.slice(initial_attn, [half], [chunk_size], [1], [2])
+        a00 = graph.slice(top_rows, [0], [half], [1], [3])
+        a10 = graph.slice(bottom_rows, [0], [half], [1], [3])
+        a11 = graph.slice(bottom_rows, [half], [chunk_size], [1], [3])
 
-        inv00 = self._build_sima_direct_chunk_inverse(builder, a00, half, quantizable)
-        inv11 = self._build_sima_direct_chunk_inverse(builder, a11, half, quantizable)
+        inv00 = self._build_sima_direct_chunk_inverse(graph, a00, half, quantizable)
+        inv11 = self._build_sima_direct_chunk_inverse(graph, a11, half, quantizable)
         a10_inv00 = graph.einsum("nhwc,nhcq->nhwq", a10, inv00)
         inv10 = graph.einsum("nhwc,nhcq->nhwq", inv11, a10_inv00)
         inv01 = self._sima_constant(
-            builder,
+            graph,
             np.zeros(
                 (
                     1,
@@ -423,12 +408,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
             ),
             quantizable,
         )
-        top = builder.create_concat_node([inv00, inv01], 3)
-        bottom = builder.create_concat_node([inv10, inv11], 3)
-        return builder.create_concat_node([top, bottom], 2)
+        top = graph.concat([inv00, inv01], 3)
+        bottom = graph.concat([inv10, inv11], 3)
+        return graph.concat([top, bottom], 2)
 
     def _build_sima_block_chunk_inverse(
-        self, builder: SimaBuilder, initial_attn: NodeOrHandle, quantizable: bool, block_size: int = 32
+        self, graph: ModelGraph, initial_attn: NodeOrHandle, quantizable: bool, block_size: int = 32
     ) -> NodeOrHandle:
         """Build the NHWC grouped lower-triangular inverse from fixed-size blocks."""
         assert self.num_tokens % block_size == 0
@@ -436,7 +421,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
         attn_blocks: dict[tuple[int, int], NodeOrHandle] = {}
         for row in range(num_blocks):
-            row_block = builder.create_slice_node(
+            row_block = graph.slice(
                 initial_attn,
                 [row * block_size],
                 [(row + 1) * block_size],
@@ -444,7 +429,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 [2],
             )
             for col in range(row + 1):
-                attn_blocks[(row, col)] = builder.create_slice_node(
+                attn_blocks[(row, col)] = graph.slice(
                     row_block,
                     [col * block_size],
                     [(col + 1) * block_size],
@@ -454,13 +439,13 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
         inverse_blocks: dict[tuple[int, int], NodeOrHandle] = {}
         diag_blocks = [attn_blocks[(block_idx, block_idx)] for block_idx in range(num_blocks)]
-        folded_diag = diag_blocks[0] if len(diag_blocks) == 1 else builder.create_concat_node(diag_blocks, 1)
+        folded_diag = diag_blocks[0] if len(diag_blocks) == 1 else graph.concat(diag_blocks, 1)
         folded_diag_inv = self._build_sima_direct_chunk_inverse(
-            builder, folded_diag, block_size, quantizable
+            graph, folded_diag, block_size, quantizable
         )
         num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
         for block_idx in range(num_blocks):
-            inverse_blocks[(block_idx, block_idx)] = builder.create_slice_node(
+            inverse_blocks[(block_idx, block_idx)] = graph.slice(
                 folded_diag_inv,
                 [block_idx * num_heads],
                 [(block_idx + 1) * num_heads],
@@ -476,7 +461,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 for mid in range(col, row)
             ]
             term_products = self._sima_folded_matrix_mul(
-                builder,
+                graph,
                 [attn_blocks[(row, mid)] for _, row, mid, _ in term_specs],
                 [inverse_blocks[(mid, col)] for _, _, mid, col in term_specs],
             )
@@ -488,11 +473,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
             for terms in grouped_terms:
                 merged = terms[0]
                 for term in terms[1:]:
-                    merged = builder.create_add_node(merged, term)
+                    merged = graph.add(merged, term)
                 merged_blocks.append(merged)
 
             span_inverse_blocks = self._sima_folded_matrix_mul(
-                builder,
+                graph,
                 [inverse_blocks[(row, row)] for row, _ in span_targets],
                 merged_blocks,
             )
@@ -500,14 +485,14 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 inverse_blocks[(row, col)] = inv_block
 
         zero_block = self._sima_constant(
-            builder,
+            graph,
             np.zeros((1, num_heads, block_size, block_size), dtype=np.float32),
             quantizable,
         )
         row_nodes = []
         for row in range(num_blocks):
             row_nodes.append(
-                builder.create_concat_node(
+                graph.concat(
                     [
                         inverse_blocks[(row, col)] if col <= row else zero_block
                         for col in range(num_blocks)
@@ -515,11 +500,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
                     3,
                 )
             )
-        return builder.create_concat_node(row_nodes, 2)
+        return graph.concat(row_nodes, 2)
 
     def _build_sima_decode_delta(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         query: NodeOrHandle,
         key: NodeOrHandle,
         value: NodeOrHandle,
@@ -528,18 +513,18 @@ class LanguageLinearModel(LanguagePartBaseModel):
         state: NodeOrHandle,
     ) -> tuple[NodeOrHandle, NodeOrHandle]:
         """Build the NHWC single-token recurrent Gated DeltaNet update."""
-        state = builder.create_mul_node(state, decay)
-        kv_mem = builder.create_batch_matmul_node(key, state, transpose_a=False, transpose_b=False)
-        delta = builder.create_subtract_node(value, kv_mem)
-        delta = builder.create_mul_node(delta, beta)
-        state_add = builder.create_batch_matmul_node(key, delta, transpose_a=True, transpose_b=False)
-        state = builder.create_add_node(state, state_add)
-        out = builder.create_batch_matmul_node(query, state, transpose_a=False, transpose_b=False)
+        state = graph.mul(state, decay)
+        kv_mem = graph.matmul(key, state, transpose_a=False, transpose_b=False)
+        delta = graph.sub(value, kv_mem)
+        delta = graph.mul(delta, beta)
+        state_add = graph.matmul(key, delta, transpose_a=True, transpose_b=False)
+        state = graph.add(state, state_add)
+        out = graph.matmul(query, state, transpose_a=False, transpose_b=False)
         return out, state
 
     def _build_sima_group_delta(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         query: NodeOrHandle,
         key: NodeOrHandle,
         query_unscaled: NodeOrHandle,
@@ -551,10 +536,9 @@ class LanguageLinearModel(LanguagePartBaseModel):
         quantizable: bool,
     ) -> tuple[NodeOrHandle, NodeOrHandle]:
         """Build the grouped prefill computation in NHWC head-major layout."""
-        graph = ModelGraph.from_builder(self, builder)
-        g_cum = self._build_sima_static_triangular_sums(builder, g, upper=True, quantizable=quantizable)
+        g_cum = self._build_sima_static_triangular_sums(graph, g, upper=True, quantizable=quantizable)
         strict_lower = self._sima_constant(
-            builder,
+            graph,
             np.broadcast_to(
                 np.tril(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=-1).reshape(
                     1, 1, self.num_tokens, self.num_tokens
@@ -568,41 +552,41 @@ class LanguageLinearModel(LanguagePartBaseModel):
             ).copy(),
             quantizable,
         )
-        decay_mask = self._build_sima_global_interval_decay_mask(builder, g, quantizable)
+        decay_mask = self._build_sima_global_interval_decay_mask(graph, g, quantizable)
 
-        v_beta = builder.create_mul_node(value, beta)
-        k_beta = builder.create_mul_node(key, beta)
+        v_beta = graph.mul(value, beta)
+        k_beta = graph.mul(key, beta)
         raw_kk = graph.einsum("nhwc,nhqc->nhwq", key_unscaled, key_unscaled)
-        beta_scaled = builder.create_mul_node(
+        beta_scaled = graph.mul(
             beta,
             self._sima_constant(
-                builder,
+                graph,
                 -1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
                 quantizable,
             ),
         )
-        kk = builder.create_mul_node(raw_kk, beta_scaled)
-        init_attn = builder.create_mul_node(kk, decay_mask)
-        init_attn = builder.create_mul_node(init_attn, strict_lower)
+        kk = graph.mul(raw_kk, beta_scaled)
+        init_attn = graph.mul(kk, decay_mask)
+        init_attn = graph.mul(init_attn, strict_lower)
         attn = self._build_sima_block_chunk_inverse(
-            builder,
+            graph,
             init_attn,
             quantizable,
             block_size=self._delta_block_size,
         )
 
         value_i = graph.einsum("nhwc,nhcq->nhwq", attn, v_beta)
-        g_exp = builder.create_exp_node(g_cum)
-        k_beta_exp = builder.create_mul_node(k_beta, g_exp)
+        g_exp = graph.exp(g_cum)
+        k_beta_exp = graph.mul(k_beta, g_exp)
         k_cumdecay = graph.einsum("nhwc,nhcq->nhwq", attn, k_beta_exp)
         v_prime = graph.einsum("nhwc,nhcq->nhwq", k_cumdecay, state)
-        v_new = builder.create_subtract_node(value_i, v_prime)
+        v_new = graph.sub(value_i, v_prime)
 
         raw_qk = graph.einsum("nhwc,nhqc->nhwq", query_unscaled, key_unscaled)
-        qk = builder.create_mul_node(
+        qk = graph.mul(
             raw_qk,
             self._sima_constant(
-                builder,
+                graph,
                 1.0
                 / (
                     self.cfg.lm_cfg.linear_attn_cfg.key_head_dim
@@ -611,28 +595,28 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 quantizable,
             ),
         )
-        qk = builder.create_mul_node(qk, decay_mask)
-        q_exp = builder.create_mul_node(query, g_exp)
+        qk = graph.mul(qk, decay_mask)
+        q_exp = graph.mul(query, g_exp)
         attn_inter = graph.einsum("nhwc,nhcq->nhwq", q_exp, state)
         attn_value = graph.einsum("nhwc,nhcq->nhwq", qk, v_new)
-        core_attn_out = builder.create_add_node(attn_inter, attn_value)
+        core_attn_out = graph.add(attn_inter, attn_value)
 
         suffix_g = self._build_sima_static_triangular_sums(
-            builder, g, upper=False, quantizable=quantizable
+            graph, g, upper=False, quantizable=quantizable
         )
-        suffix_g_exp = builder.create_exp_node(suffix_g)
-        final_g_exp = builder.create_slice_node(suffix_g_exp, [0], [1], [1], [2])
-        final_decay_mask = builder.create_slice_node(suffix_g_exp, [1], [self.num_tokens], [1], [2])
+        suffix_g_exp = graph.exp(suffix_g)
+        final_g_exp = graph.slice(suffix_g_exp, [0], [1], [1], [2])
+        final_decay_mask = graph.slice(suffix_g_exp, [1], [self.num_tokens], [1], [2])
         final_decay_mask_tail = self._sima_constant(
-            builder,
+            graph,
             np.ones((1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, 1, 1), dtype=np.float32),
             quantizable,
         )
-        final_decay_mask = builder.create_concat_node([final_decay_mask, final_decay_mask_tail], 2)
-        v_new_weighted = builder.create_mul_node(v_new, final_decay_mask)
+        final_decay_mask = graph.concat([final_decay_mask, final_decay_mask_tail], 2)
+        v_new_weighted = graph.mul(v_new, final_decay_mask)
         state_updates = graph.einsum("nhcw,nhcq->nhwq", key, v_new_weighted)
-        state_base = builder.create_mul_node(state, final_g_exp)
-        linear_delta_state_out = builder.create_add_node(state_base, state_updates)
+        state_base = graph.mul(state, final_g_exp)
+        linear_delta_state_out = graph.add(state_base, state_updates)
 
         return core_attn_out, linear_delta_state_out
 
@@ -667,7 +651,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
             input_specs["linear_valid_mask"] = valid_mask_shape
         input_specs["linear_delta_state"] = state_shape
         graph = ModelGraph(self, input_specs, quantizable)
-        builder = graph.raw
         mla_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             mla_input_scale = graph.inputs["input_scale"]
@@ -679,11 +662,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
         mla_delta_state = graph.inputs["linear_delta_state"]
 
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            residual = graph.dequantize(mla_input, mla_input_scale)
+            residual = graph.dequant(mla_input, mla_input_scale)
         else:
             residual = mla_input
 
-        norm_input = self._build_sima_rms_norm(builder, f"{base_layer}.input_layernorm", residual)
+        norm_input = self._build_sima_rms_norm(graph, f"{base_layer}.input_layernorm", residual)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_qkv")
@@ -696,10 +679,10 @@ class LanguageLinearModel(LanguagePartBaseModel):
         z = graph.linear(
             f"{linear_base}.in_proj_z", norm_input, lora_rank=lora_rank, merged_lora=merged_lora
         )
-        a, b = self._build_sima_ab_projections(builder, linear_base, norm_input, merged_lora)
+        a, b = self._build_sima_ab_projections(graph, linear_base, norm_input, merged_lora)
 
-        conv_tail = builder.create_concat_node([mla_conv_state, mixed_qkv], 2)
-        linear_conv_state_out = builder.create_slice_node(
+        conv_tail = graph.concat([mla_conv_state, mixed_qkv], 2)
+        linear_conv_state_out = graph.slice(
             conv_tail,
             [1],
             [self.num_tokens + self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim - 1],
@@ -709,19 +692,19 @@ class LanguageLinearModel(LanguagePartBaseModel):
         conv_out = graph.conv(f"{linear_base}.conv1d", conv_tail, is_depthwise=True)
         conv_out = graph.activation(conv_out, "silu")
         if mla_valid_mask is not None:
-            conv_out = builder.create_mul_node(conv_out, mla_valid_mask)
+            conv_out = graph.mul(conv_out, mla_valid_mask)
 
-        q_flat = builder.create_slice_node(
+        q_flat = graph.slice(
             conv_out, [0], [self.cfg.lm_cfg.linear_attn_cfg.key_dim], [1], [3]
         )
-        k_flat = builder.create_slice_node(
+        k_flat = graph.slice(
             conv_out,
             [self.cfg.lm_cfg.linear_attn_cfg.key_dim],
             [2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim],
             [1],
             [3],
         )
-        v_flat = builder.create_slice_node(
+        v_flat = graph.slice(
             conv_out,
             [2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim],
             [self.cfg.lm_cfg.linear_attn_cfg.conv_dim],
@@ -729,65 +712,57 @@ class LanguageLinearModel(LanguagePartBaseModel):
             [3],
         )
 
-        query = builder.create_slice_concat_node(
-            q_flat,
-            axis=1,
-            split_axis=3,
-            split_block=self.cfg.lm_cfg.linear_attn_cfg.num_key_heads,
-            split_repeat=repeat,
+        query = graph.split_heads(
+            q_flat, self.cfg.lm_cfg.linear_attn_cfg.num_key_heads, repeat=repeat
         )
-        key = builder.create_slice_concat_node(
-            k_flat,
-            axis=1,
-            split_axis=3,
-            split_block=self.cfg.lm_cfg.linear_attn_cfg.num_key_heads,
-            split_repeat=repeat,
+        key = graph.split_heads(
+            k_flat, self.cfg.lm_cfg.linear_attn_cfg.num_key_heads, repeat=repeat
         )
         value = graph.split_heads(v_flat, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads)
 
-        query_unscaled = self._build_sima_l2norm(builder, query, 1.0)
-        key_unscaled = self._build_sima_l2norm(builder, key, 1.0)
-        query = builder.create_mul_node(
+        query_unscaled = self._build_sima_l2norm(graph, query, 1.0)
+        key_unscaled = self._build_sima_l2norm(graph, key, 1.0)
+        query = graph.mul(
             query_unscaled,
             self._sima_constant(
-                builder, 1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim, quantizable
+                graph, 1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim, quantizable
             ),
         )
-        key = builder.create_mul_node(
+        key = graph.mul(
             key_unscaled,
             self._sima_constant(
-                builder,
+                graph,
                 1.0 / math.sqrt(self.cfg.lm_cfg.linear_attn_cfg.key_head_dim),
                 quantizable,
             ),
         )
 
-        beta = builder.create_sigmoid_node(b)
+        beta = graph.sigmoid(b)
         beta = graph.split_heads(beta, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads)
         if mla_valid_mask is not None:
-            beta = builder.create_mul_node(beta, mla_valid_mask)
+            beta = graph.mul(beta, mla_valid_mask)
 
         dt_bias = self._sima_constant(
-            builder,
+            graph,
             graph.parameter(f"{linear_base}.dt_bias").astype(np.float32).reshape(1, 1, 1, -1),
             quantizable,
         )
-        a_dt = builder.create_add_node(a, dt_bias)
-        softplus = builder.create_softplus_node(a_dt)
+        a_dt = graph.add(a, dt_bias)
+        softplus = graph.softplus(a_dt)
         neg_a = self._sima_constant(
-            builder,
+            graph,
             (-np.exp(graph.parameter(f"{linear_base}.A_log").astype(np.float32))).reshape(1, 1, 1, -1),
             quantizable,
         )
-        g = builder.create_mul_node(softplus, neg_a)
+        g = graph.mul(softplus, neg_a)
         g = graph.split_heads(g, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads)
         if mla_valid_mask is not None:
-            g = builder.create_mul_node(g, mla_valid_mask)
+            g = graph.mul(g, mla_valid_mask)
 
         if self.num_tokens == 1:
-            decay = builder.create_exp_node(g)
+            decay = graph.exp(g)
             core_attn_out, linear_delta_state_out = self._build_sima_decode_delta(
-                builder,
+                graph,
                 query,
                 key,
                 value,
@@ -797,7 +772,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
             )
         else:
             core_attn_out, linear_delta_state_out = self._build_sima_group_delta(
-                builder,
+                graph,
                 query,
                 key,
                 query_unscaled,
@@ -816,7 +791,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
             epsilon=self.cfg.lm_cfg.rms_norm_eps,
         )
         z_heads = graph.activation(z_heads, "silu")
-        core_attn_out = builder.create_mul_node(core_attn_out, z_heads)
+        core_attn_out = graph.mul(core_attn_out, z_heads)
         core_attn_out = graph.merge_heads(core_attn_out)
 
         lora_rank = None
@@ -825,13 +800,12 @@ class LanguageLinearModel(LanguagePartBaseModel):
         out_proj = graph.linear(
             f"{linear_base}.out_proj", core_attn_out, lora_rank=lora_rank, merged_lora=merged_lora
         )
-        add1 = builder.create_add_node(residual, out_proj)
-        rms_norm2 = self._build_sima_rms_norm(builder, f"{base_layer}.post_attention_layernorm", add1)
+        add1 = graph.add(residual, out_proj)
+        rms_norm2 = self._build_sima_rms_norm(graph, f"{base_layer}.post_attention_layernorm", add1)
         mlp = self._build_sima_mlp(
-            builder,
+            graph,
             f"{base_layer}.mlp",
             [rms_norm2, add1],
-            quantizable,
             merged_lora=merged_lora,
             with_residual_add=True,
         )

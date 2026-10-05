@@ -44,13 +44,10 @@ def test_whisper_layer_zero_pre_exposes_positioned_residual(monkeypatch):
         layer_idx=0,
     )
     builder = Mock()
-    builder.create_add_node.return_value = "positioned"
-    graph = Mock()
-    monkeypatch.setattr(
-        "sima_lmm.model.whisper_decoder_pre_model.ModelGraph.from_builder", lambda *_: graph
-    )
+    builder.add.return_value = "positioned"
+    graph = builder
     output_nodes = model._build_sima_nodes(
-        builder, ["token_embedding", "position_embedding"], quantizable=True,
+        builder, ["token_embedding", "position_embedding"],
     )
 
     assert len(output_nodes) == 4
@@ -58,7 +55,7 @@ def test_whisper_layer_zero_pre_exposes_positioned_residual(monkeypatch):
         output_nodes[WhisperDecoderPreModel.positioned_residual_output_idx]
         == "positioned"
     )
-    builder.create_add_node.assert_called_once_with("token_embedding", "position_embedding")
+    builder.add.assert_called_once_with("token_embedding", "position_embedding")
 
 
 def test_whisper_init_routes_positioned_residual_to_layer_zero_post(monkeypatch):
@@ -68,33 +65,30 @@ def test_whisper_init_routes_positioned_residual_to_layer_zero_post(monkeypatch)
         layer_idx=0,
     )
     builder = Mock()
-    graph = Mock()
+    graph = builder
     graph.parameter.return_value = np.zeros((4, model.cfg.d_model), np.float32)
     graph.constant.return_value = "position_embedding"
     monkeypatch.setattr(
-        "sima_lmm.model.whisper_decoder_init_model.ModelGraph.from_builder", lambda *_: graph
-    )
-    monkeypatch.setattr(
         WhisperDecoderPreModel,
         "_build_sima_nodes",
-        lambda self, builder, inputs, quantizable: ["query", "key", "value", "positioned"],
+        lambda self, builder, inputs: ["query", "key", "value", "positioned"],
     )
     monkeypatch.setattr(
         WhisperDecoderCacheModel,
         "_build_sima_nodes",
-        lambda self, builder, inputs, quantizable: ["self_attention"],
+        lambda self, builder, inputs: ["self_attention"],
     )
     post_inputs = []
 
-    def build_post(self, builder, inputs, quantizable):
-        del self, builder, quantizable
+    def build_post(self, builder, inputs):
+        del self, builder
         post_inputs.extend(inputs)
         return ["hidden", "encoder_key", "encoder_value"]
 
     monkeypatch.setattr(WhisperDecoderPostModel, "_build_sima_nodes", build_post)
 
     model._build_sima_nodes(
-        builder, ["token_embedding", "audio_features"], quantizable=True,
+        builder, ["token_embedding", "audio_features"],
     )
 
     assert post_inputs[0] == "positioned"

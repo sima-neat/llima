@@ -18,7 +18,8 @@ from mlc.compiler.tensor_format import TensorShape, TensorType
 
 from sima_lmm.config.vlm_config import ModelFormat, model_file_type
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.model import FileGenPrecision, sima_builder, LoraGenMode
+from sima_lmm.model import FileGenPrecision, LoraGenMode
+from sima_lmm.model.model_graph import _derive_lora_name_from_base_model, _layout_array
 from sima_lmm.hf.hf_transformer import find_file, LocalHuggingFaceModel
 from sima_lmm.logging import ScopedLogLevel, sima_log_dbg, sima_log_info
 from sima_lmm.host.configuration_helper import (
@@ -73,7 +74,7 @@ def _layer_id_from_weight_map(weight_map_path: str | Path) -> LayerID:
 
 def dense_matrix_to_conv_weight(m: np.ndarray) -> np.ndarray:
     assert len(m.shape) == 2
-    return sima_builder.layout_array(m, "oi", "hwigo")
+    return _layout_array(m, "oi", "hwigo")
 
 
 def get_lora_merged_weight_tensor(
@@ -85,7 +86,7 @@ def get_lora_merged_weight_tensor(
 
     w_merged = fp32(w_base) + (fp32(lora_B) @ fp32(lora_B)) * lora_scale
     """
-    lora_base_name = sima_builder.derive_lora_name_from_base_model(base_name)
+    lora_base_name = _derive_lora_name_from_base_model(base_name)
     lora_A_name = lora_base_name.replace(".weight", ".lora_A.weight")
     lora_B_name = lora_base_name.replace(".weight", ".lora_B.weight")
     w_A = adapter[lora_A_name].astype(np.float32)

@@ -60,19 +60,18 @@ class LanguageConvPostModel(LanguagePostBaseModel):
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         input_shape = (1, 1, 1, self.cfg.lm_cfg.hidden_size)
         graph = ModelGraph(self, {"input": input_shape}, quantizable)
-        builder = graph.raw
         mla_input_input = graph.inputs["input"]
 
-        rms_norm2 = self._build_sima_rms_norm(builder, f"{base_name}.ffn_norm", mla_input_input)
+        rms_norm2 = self._build_sima_rms_norm(graph, f"{base_name}.ffn_norm", mla_input_input)
 
         mlp_base = (
             f"{base_name}.feed_forward"
             if self.check_hf_param(f"{base_name}.feed_forward.w2.weight")
             else f"{base_name}.mlp"
         )
-        mlp = self._build_sima_mlp(builder, mlp_base, [rms_norm2], quantizable, merged_lora=merged_lora)
-        add2 = builder.create_add_node(mla_input_input, mlp)
+        mlp = self._build_sima_mlp(graph, mlp_base, [rms_norm2], merged_lora=merged_lora)
+        add2 = graph.add(mla_input_input, mlp)
 
-        outputs = self._build_post_transformer(builder, add2, quantizable)
+        outputs = self._build_post_transformer(graph, add2)
 
         return graph.finish(outputs)

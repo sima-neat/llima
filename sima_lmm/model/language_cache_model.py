@@ -8,8 +8,7 @@ from afe.ir.tensor_type import TensorType, ScalarType
 from sima_lmm.model.base import TensorTessellateParameters, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import activation_type
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph
+from sima_lmm.model.model_graph import activation_type, ModelGraph, save_model_graph
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
@@ -342,7 +341,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         if quantize_kv_cache:
             input_specs["cached_values_scale"] = kv_scale_shape
         graph = ModelGraph(self, input_specs, quantizable)
-        builder, inputs = graph.raw, graph.inputs
+        inputs = graph.inputs
         mla_input_input = inputs["input"]
         mla_input_cached_keys = inputs["cached_keys"]
         mla_input_cached_values = inputs["cached_values"]
@@ -350,33 +349,21 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         # Dequantize KV cache if needed.
         if quantize_kv_cache:
-            mla_input_cached_keys = graph.dequantize(mla_input_cached_keys, inputs["cached_keys_scale"])
-            mla_input_cached_values = graph.dequantize(
+            mla_input_cached_keys = graph.dequant(mla_input_cached_keys, inputs["cached_keys_scale"])
+            mla_input_cached_values = graph.dequant(
                 mla_input_cached_values, inputs["cached_values_scale"]
             )
 
         # First multiply (input * key)
         # BatchMatMul repeats the smaller H dimension for GQA.
-        bmm1 = builder.create_batch_matmul_node(
+        bmm1 = graph.matmul(
             mla_input_input, mla_input_cached_keys, transpose_a=False, transpose_b=True
         )
         assert get_expected_tensor_value(bmm1.get_type().output).shape == key_shape
 
         if self.logit_softcapping is not None:
             assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and self.cfg.lm_cfg.model_type == "gemma2"
-            soft_cap = self.cfg.lm_cfg.attn_logit_softcapping
-            mul_const_1 = graph.constant(
-                np.ndarray([2.0 / soft_cap], dtype=np.float32), dtype=np.float32
-            )
-            mul1 = builder.create_mul_node(bmm1, mul_const_1)
-            sig = builder.create_sigmoid_node(mul1)
-            mul_const_2 = graph.constant(
-                np.ndarray([2.0 * soft_cap], dtype=np.float32), dtype=np.float32
-            )
-            mul2 = builder.create_mul_node(sig, mul_const_2)
-            sub_const_1 = graph.constant(np.ndarray([-soft_cap], dtype=np.float32), dtype=np.float32)
-            last = builder.create_add_node(mul2, sub_const_1)
-            bmm1 = last
+            bmm1 = graph.softcap(bmm1, self.cfg.lm_cfg.attn_logit_softcapping)
 
         if self.num_tokens > 1:
             if (
@@ -387,7 +374,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 # For paligemma, the attention mask is dynamically determined.
                 # Speculative decoding uses num_tokens > 1 during decode time.
                 assert mla_input_attn_mask is not None
-                bmm1 = builder.create_add_node(bmm1, mla_input_attn_mask)
+                bmm1 = graph.add(bmm1, mla_input_attn_mask)
             else:
                 # Attention mask is a static constant.
                 mask = np.zeros((1, 1, self.num_tokens, self.context_length), dtype=np.float32)
@@ -397,35 +384,35 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 mask_const = graph.constant(
                     mask.astype(ScalarType.numpy_type(activation_type(quantizable)))
                 )
-                bmm1 = builder.create_add_node(bmm1, mask_const)
+                bmm1 = graph.add(bmm1, mask_const)
         elif self._cache_mask_size > 1:
             assert mla_input_attn_mask is not None
-            bmm1 = builder.create_add_node(bmm1, mla_input_attn_mask)
+            bmm1 = graph.add(bmm1, mla_input_attn_mask)
 
-        softmax = builder.create_softmax_node(bmm1, 3)
+        softmax = graph.softmax(bmm1, 3)
 
         # Second multiply ((input * key) * value)
         reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
         if len(reduction_ranges) == 1:
-            bmm2 = builder.create_batch_matmul_node(
+            bmm2 = graph.matmul(
                 softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
             )
         else:
             partial_bmm2 = []
             for start, end in reduction_ranges:
-                softmax_slice = builder.create_slice_node(softmax, [start], [end], [1], [3])
-                values_slice = builder.create_slice_node(
+                softmax_slice = graph.slice(softmax, [start], [end], [1], [3])
+                values_slice = graph.slice(
                     mla_input_cached_values, [start], [end], [1], [2]
                 )
                 partial_bmm2.append(
-                    builder.create_batch_matmul_node(
+                    graph.matmul(
                         softmax_slice, values_slice, transpose_a=False, transpose_b=False
                     )
                 )
 
             while len(partial_bmm2) > 1:
                 next_level = [
-                    builder.create_add_node(lhs, rhs)
+                    graph.add(lhs, rhs)
                     for lhs, rhs in zip(partial_bmm2[::2], partial_bmm2[1::2])
                 ]
                 if len(partial_bmm2) % 2:
@@ -484,8 +471,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
             idx += 1
 
         # attn_mask
-        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or \
-                (self._cache_mask_size > 1 and self.num_tokens == 1) or \
+        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or\
+                (self._cache_mask_size > 1 and self.num_tokens == 1) or\
                 self._is_speculative_decoding or self._uses_group_future_token_mask:
             attn_mask_tessellate_params = TensorTessellateParameters(
                 tile_shape=(0, 0, 0, 0),

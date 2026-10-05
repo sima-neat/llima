@@ -1,14 +1,21 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
+from ml_dtypes import int4
+
+from afe.ir.execute import create_node_executor, create_node_quant_executor
+from afe.ir.operations import ConvAddActivationOp
 
 from sima_lmm.config.vlm_config import VlmConfig
 from sima_lmm.model import EvalMode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
 from sima_lmm.model.vision_model import StandardVisionLayerModel, VisionModel
+from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -21,6 +28,67 @@ REFERENCE_CONFIGS_PATH = (
 def _load_reference_config(filename: str) -> VlmConfig:
     config = json.loads((REFERENCE_CONFIGS_PATH / filename).read_text())
     return VlmConfig.load(config)
+
+
+@pytest.mark.parametrize("head_dim", [24, 32])
+@pytest.mark.parametrize("precision", ["float32", "int8", "int4"])
+def test_standard_vision_head_padding_preserves_attention_and_grouped_weights(head_dim, precision):
+    heads, channels = 2, 2 * head_dim
+    rng = np.random.default_rng(12)
+    params, dequantized = {}, {}
+    for projection in ("q_proj", "k_proj", "v_proj", "out_proj"):
+        weight = rng.integers(-7, 8, (channels, channels))
+        bias = rng.normal(0, 0.02, channels).astype(np.float32)
+        if precision == "float32":
+            source = weight.astype(np.float32) * 0.005
+            dequantized[projection] = source
+        else:
+            scales = np.full((channels, 2 if precision == "int4" else 1), 0.005, np.float32)
+            weight = weight.astype(int4 if precision == "int4" else np.int8)
+            source = (scales, weight, 32) if precision == "int4" else (scales, weight)
+            dequantized[projection] = weight.astype(np.float32) * 0.005
+        params[f"attn.{projection}.weight"] = source
+        params[f"attn.{projection}.bias"] = bias
+    cfg = SimpleNamespace(vm_cfg=SimpleNamespace(num_attention_heads=heads, hidden_size=channels))
+    model = StandardVisionLayerModel(
+        cfg, "head_padding", layer_idx=0, include_embeddings=False, include_mm_proj=False
+    )
+    model.get_hf_param, model.check_hf_param = params.__getitem__, params.__contains__
+    shape = (1, 1, 3, channels)
+    quantizable = precision == "float32"
+    graph = ModelGraph(model, {"x": shape}, quantizable)
+    output = model._build_sima_encoder_attention(graph, "attn", graph.inputs["x"])
+    net = graph.finish([output])
+    convolutions = [
+        node for node in net.nodes["MLA_0"].ir.nodes.values()
+        if isinstance(node.ir.operation, ConvAddActivationOp)
+    ]
+    padded = head_dim == 24 and precision != "int4"
+    assert len(convolutions) == (10 if head_dim == 24 and not padded else 4)
+    if precision == "int4":
+        assert all(node.ir.quant_attrs.c_block_size == 32 for node in convolutions[:1])
+        np.testing.assert_array_equal(
+            convolutions[0].ir.quant_attrs.weight_quant_data.reshape(channels, channels),
+            params["attn.q_proj.weight"][1].T,
+        )
+    x = rng.normal(0, 0.2, shape).astype(activation_dtype(quantizable))
+    projections = []
+    for name in ("q_proj", "k_proj", "v_proj"):
+        values = x.astype(np.float32) @ dequantized[name].T + params[f"attn.{name}.bias"]
+        if name == "q_proj":
+            values *= head_dim ** -0.5
+        projections.append(values.reshape(1, 3, heads, head_dim).transpose(0, 2, 1, 3))
+    query, key, value = projections
+    scores = query @ key.swapaxes(-1, -2)
+    probabilities = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    context = (probabilities @ value).transpose(0, 2, 1, 3).reshape(shape)
+    expected = context @ dequantized["out_proj"].T + params["attn.out_proj.bias"]
+    execute = create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
+    actual = net.run({"x": x}, node_callable=execute)
+    actual = actual[0] if isinstance(actual, (tuple, list)) else actual
+    np.testing.assert_allclose(actual, expected, rtol=3e-6 if quantizable else 0.03,
+                               atol=2e-7 if quantizable else 0.002)
 
 
 @pytest.mark.parametrize(

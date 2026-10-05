@@ -2,8 +2,6 @@ import numpy as np
 
 from dataclasses import dataclass
 
-from afe.ir.tensor_type import ScalarType
-
 from sima_lmm.hf.hf_transformer import find_file
 from sima_lmm.model.model_graph import ModelGraph
 from sima_lmm.model.base import BaseModel, LayerConfiguration
@@ -58,60 +56,43 @@ class WhisperDecoderPostModel(BaseModel):
         }
 
         graph = ModelGraph(self, shapes, quantizable)
-        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        outputs = self._build_sima_nodes(graph, list(graph.inputs.values()))
         graph.save(outputs)
 
-    def _build_sima_transformer(self, builder, inputs, quantizable):
-        graph = ModelGraph.from_builder(self, builder)
+    def _build_sima_transformer(self, graph, inputs):
         name = f"model.decoder.layers.{self.layer_idx}"
         proj = graph.linear(f"{name}.self_attn.out_proj", inputs[1])
-        hidden = builder.create_add_node(inputs[0], proj)
+        hidden = graph.add(inputs[0], proj)
         norm = graph.layer_norm(f"{name}.encoder_attn_layer_norm", hidden)
         kv = inputs[2:4] if self.skip_encoder_kv_proj else [inputs[-1], inputs[-1]]
-        queries = graph.project_heads(
-            f"{name}.encoder_attn.q_proj",
-            norm,
+        queries = graph.split_heads(
+            graph.linear(
+                f"{name}.encoder_attn.q_proj", norm, scale=self.cfg.decoder_head_dim**-0.5,
+            ),
             self.cfg.decoder_attention_heads,
-            scale=self.cfg.decoder_head_dim**-0.5,
-            kv_len=self.cfg.max_source_positions,
         )
         kv_projs = []
         for proj, node in zip(("k_proj", "v_proj"), kv):
             if self.skip_encoder_kv_proj:
-                heads = (
-                    [node]
-                    if len(queries) == 1
-                    else [
-                        builder.create_slice_node(node, [i], [i + 1], [1], [1])
-                        for i in range(self.cfg.decoder_attention_heads)
-                    ]
-                )
+                heads = node
             else:
-                heads = graph.project_heads(
-                    f"{name}.encoder_attn.{proj}",
-                    node,
+                heads = graph.split_heads(
+                    graph.linear(f"{name}.encoder_attn.{proj}", node),
                     self.cfg.decoder_attention_heads,
-                    kv_len=self.cfg.max_source_positions,
-                    query_len=self.num_tokens,
                 )
             kv_projs.append(heads)
         keys, values = kv_projs
-        heads = []
-        for query, key, value in zip(queries, keys, values):
-            heads.append(graph.attention(query, key, value))
-        attn = graph.project_merged_heads(
-            f"{name}.encoder_attn.out_proj",
-            heads,
-            self.cfg.decoder_attention_heads,
+        context = graph.attention(queries, keys, values)
+        attn = graph.linear(
+            f"{name}.encoder_attn.out_proj", graph.merge_heads(context)
         )
-        hidden = builder.create_add_node(hidden, attn)
+        hidden = graph.add(hidden, attn)
         norm = graph.layer_norm(f"{name}.final_layer_norm", hidden)
         hidden = graph.mlp(name, norm, self.cfg.activation_function, residual=hidden)
         return hidden, keys, values
 
-    def _build_sima_nodes(self, builder, inputs, quantizable):
-        graph = ModelGraph.from_builder(self, builder)
-        hidden, keys, values = self._build_sima_transformer(builder, inputs, quantizable)
+    def _build_sima_nodes(self, graph, inputs):
+        hidden, keys, values = self._build_sima_transformer(graph, inputs)
         if self.layer_idx < self.cfg.decoder_layers - 1:
             outputs = [hidden]
         else:
@@ -122,13 +103,12 @@ class WhisperDecoderPostModel(BaseModel):
                 np.float32
             ).min
             mask = graph.constant(mask)
-            logits = builder.create_add_node(logits, mask)
-            outputs = [builder.create_argmax_node(logits, ScalarType.int32)]
+            logits = graph.add(logits, mask)
+            outputs = [graph.argmax(logits)]
             if self.enable_log_probe:
                 outputs.append(logits)
         if self.output_encoder_kv_cache:
-            assert len(keys) == len(values) == 1
-            outputs.extend([keys[0], values[0]])
+            outputs.extend([keys, values])
         return outputs
 
     def gen_onnx_files(self):

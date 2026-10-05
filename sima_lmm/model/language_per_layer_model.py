@@ -6,9 +6,8 @@ from afe.ir.tensor_type import TensorType, ScalarType
 
 from sima_lmm.model.base import LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import activation_dtype
 
 
 @dataclass
@@ -116,7 +115,6 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         if self.cfg.pipeline_cfg.quantize_embeddings:
             input_specs["input_scale"] = scale_shape
         graph = ModelGraph(self, input_specs, quantizable)
-        builder = graph.raw
         mla_input_staging = graph.inputs["per_layer_emb_staging"]
         if self.cfg.pipeline_cfg.quantize_embeddings:
             mla_input_staging_scale = graph.inputs["per_layer_emb_staging_scale"]
@@ -125,11 +123,11 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             mla_input_input_scale = graph.inputs["input_scale"]
 
         if self.uses_quantized_input_embeddings:
-            projection_input = graph.dequantize(mla_input_input, mla_input_input_scale)
+            projection_input = graph.dequant(mla_input_input, mla_input_input_scale)
         else:
             projection_input = mla_input_input
         proj = graph.linear(f"{lm_base}.per_layer_model_projection", projection_input, lora_rank=None)
-        proj = builder.create_mul_node(
+        proj = graph.mul(
             proj,
             graph.constant(
                 np.array(
@@ -138,7 +136,7 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
                 )
             ),
         )
-        proj = builder.create_slice_concat_node(
+        proj = graph.split_concat(
             proj,
             axis=2,
             split_axis=3,
@@ -146,24 +144,24 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             split_repeat=1,
         )
         proj_normed = self._build_sima_rms_norm(
-            builder,
+            graph,
             f"{lm_base}.per_layer_projection_norm",
             proj,
         )
 
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            staging = graph.dequantize(mla_input_staging, mla_input_staging_scale)
+            staging = graph.dequant(mla_input_staging, mla_input_staging_scale)
         else:
             staging = mla_input_staging
-        emb = builder.create_slice_concat_node(
+        emb = graph.split_concat(
             staging,
             axis=2,
             split_axis=3,
             split_block=L,
             split_repeat=1,
         )
-        combined = builder.create_add_node(emb, proj_normed)
-        output = builder.create_mul_node(
+        combined = graph.add(emb, proj_normed)
+        output = graph.mul(
             combined,
             graph.constant(np.array([2.0**-0.5], dtype=activation_dtype(quantizable))),
         )

@@ -15,7 +15,7 @@ from afe.ir.serializer import load_awesomenet
 from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import FileGenMode, FileGenPrecision
-from sima_lmm.model.sima_builder import activation_dtype
+from sima_lmm.model.model_graph import activation_dtype
 from sima_lmm.model.whisper_decoder_cache_model import WhisperDecoderCacheModel
 from sima_lmm.model.whisper_decoder_init_model import WhisperDecoderInitModel
 from sima_lmm.model.whisper_decoder_language_detect_model import WhisperDecoderLanguageDetectModel

@@ -1,22 +1,12 @@
-import logging
-import sys
 from dataclasses import dataclass
 
 import numpy as np
 
-from afe.apis.defines import TensorDRAMLayout, gen2_target
-from afe.backends.backends import Backend
-from afe.ir.serializer import save_awesomenet
-from afe.ir.defines import Status, TensorValue, TupleValue, get_expected_tensor_value
-from afe.ir.tensor_type import TensorType, ScalarType
+from afe.apis.defines import TensorDRAMLayout
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import BaseModel, TensorTessellateParameters, LayerConfiguration
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv, build_activation, activation_type,
-    activation_dtype, build_two_stage_layer_norm, create_channel_slice,
-    load_tensor_from_source
-)
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
 from sima_lmm.config.vlm_config import VlmArchType
 
 @dataclass
@@ -728,9 +718,8 @@ class QwenVisionLayerModel(BaseModel):
         log_level: int,
         quantizable: bool,
     ):
-        base_name = self.hf_model.vision_model_param_base_name
         g = self._build_sima_nodes(self.hf_model.vision_model_param_base_name, quantizable)
-        save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
+        save_model_graph(self, g, quantizable)
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool):
         patch_feature_size = (
@@ -741,80 +730,44 @@ class QwenVisionLayerModel(BaseModel):
         )
         input_shape = (1, 1, self.cfg.vm_cfg.seq_len, input_size)
 
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        model_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
-        )
-        builder.begin_subnet([model_input])
-        mla_input = builder.create_placeholder_node(
-            "MLA_0/input", TensorType(activation_type(quantizable), input_shape)
-        )
+        graph = ModelGraph(self, {"input": input_shape}, quantizable)
+        mla_input = graph.inputs["input"]
 
         if self.cfg.model_type in (VlmArchType.VLM_QWEN3_VL, VlmArchType.VLM_QWEN3_5_VL):
-            output_nodes = self._build_sima_qwen3_vision_model(builder, base_name, mla_input, quantizable)
+            output_nodes = self._build_sima_qwen3_vision_model(graph, base_name, mla_input, quantizable)
         else:
             output_nodes = [
-                self._build_sima_qwen2_vision_model(builder, base_name, mla_input, quantizable)
+                self._build_sima_qwen2_vision_model(graph, base_name, mla_input, quantizable)
             ]
 
         if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
-            vision_scale = builder.create_dynamic_quant_scale_node(
-                output_nodes[0], per_token_quant=True
-            )
-            quantized_vision_output = builder.create_dynamic_quant_node(
-                output_nodes[0], vision_scale
-            )
+            quantized_vision_output, vision_scale = graph.quant(output_nodes[0])
             output_nodes = [quantized_vision_output, vision_scale, *output_nodes[1:]]
-        if len(output_nodes) > 1:
-            builder.create_tuple_node(output_nodes)
-
-        mla_node = builder.finish_subnet("MLA_0")
-        if activation_type(quantizable) != ScalarType.float32:
-            self._cast_sima_subnet_outputs_to_fp32(builder, mla_node)
-        return builder.finish(self.model_name)
-
-    def _cast_sima_subnet_outputs_to_fp32(
-        self, builder: SimaBuilder, mla_node: NodeOrHandle
-    ) -> None:
-        match mla_node.get_type().output:
-            case TensorValue(value=t):
-                if t.scalar == ScalarType.bfloat16:
-                    _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
-            case TupleValue():
-                tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-                builder.create_tuple_node(
-                    [
-                        builder.create_cast_node(item, ScalarType.float32, backend=Backend.EV)
-                        if get_expected_tensor_value(item.get_type().output).scalar
-                        == ScalarType.bfloat16
-                        else item
-                        for item in tuple_items
-                    ]
-                )
+        return graph.finish(output_nodes)
 
     def _build_sima_qwen3_vision_model(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> list[NodeOrHandle]:
         cos_table, sin_table = self._prepare_sima_qwen3_rotary_tables(
-            builder, base_name, quantizable
+            graph, base_name, quantizable
         )
         hidden_states = input_node
         if self.include_embeddings:
             pos_embed = self._prepare_sima_qwen3_position_embedding(
-                builder, base_name, quantizable
+                graph, base_name, quantizable
             )
-            hidden_states = build_conv(
-                builder, self.get_hf_param, self.check_hf_param,
-                f"{base_name}.patch_embed.proj", hidden_states,
-                is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
+            hidden_states = graph.conv(
+                f"{base_name}.patch_embed.proj",
+                hidden_states,
+                weight_process_func=self._reshape_qwen_patch_embed_kernel,
                 scale_process_func=self._reshape_qwen_patch_embed_scales,
                 src_bias_name=f"{base_name}.patch_embed.proj.bias",
             )
-            hidden_states = builder.create_add_node(hidden_states, pos_embed)
+            hidden_states = graph.add(hidden_states, pos_embed)
 
         layer_base = f"{base_name}.blocks.{self.layer_idx}"
         hidden_states = self._build_sima_qwen3_vision_block(
-            builder, layer_base, hidden_states, cos_table, sin_table, quantizable
+            graph, layer_base, hidden_states, cos_table, sin_table
         )
         deepstack_outputs: list[NodeOrHandle] = []
         if self.layer_idx in self.cfg.vm_cfg.deepstack_visual_indexes:
@@ -822,13 +775,13 @@ class QwenVisionLayerModel(BaseModel):
             ds_base = f"{base_name}.deepstack_merger_list.{ds_idx}"
             deepstack_outputs.append(
                 self._build_sima_qwen3_deepstack_merger(
-                    builder, ds_base, hidden_states, quantizable
+                    graph, ds_base, hidden_states
                 )
             )
 
         primary_output = (
             self._build_sima_qwen3_merger(
-                builder, f"{base_name}.merger", hidden_states, quantizable
+                graph, f"{base_name}.merger", hidden_states
             )
             if self.include_mm_proj
             else hidden_states
@@ -836,17 +789,17 @@ class QwenVisionLayerModel(BaseModel):
         return [primary_output, *deepstack_outputs]
 
     def _build_sima_qwen2_vision_model(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
         hidden_states = input_node
         if self.include_embeddings:
-            hidden_states = build_conv(
-                builder, self.get_hf_param, self.check_hf_param,
-                f"{base_name}.patch_embed.proj", hidden_states,
-                is_fc=False, weight_process_func=self._reshape_qwen_patch_embed_kernel,
+            hidden_states = graph.conv(
+                f"{base_name}.patch_embed.proj",
+                hidden_states,
+                weight_process_func=self._reshape_qwen_patch_embed_kernel,
                 scale_process_func=self._reshape_qwen_patch_embed_scales,
             )
-        cos_table, sin_table, global_mask, windowed_mask = self._prepare_sima_qwen2_static_inputs(builder, quantizable)
+        cos_table, sin_table, global_mask, windowed_mask = self._prepare_sima_qwen2_static_inputs(graph, quantizable)
 
         layer_base = f"{base_name}.blocks.{self.layer_idx}"
         mask = (
@@ -855,199 +808,119 @@ class QwenVisionLayerModel(BaseModel):
             else windowed_mask
         )
         hidden_states = self._build_sima_qwen2_vision_block(
-            builder, layer_base, hidden_states, mask, cos_table, sin_table, quantizable
+            graph, layer_base, hidden_states, mask, cos_table, sin_table
         )
 
         if self.include_mm_proj:
-            return self._build_sima_qwen2_merger(builder, base_name, hidden_states, quantizable)
+            return self._build_sima_qwen2_merger(graph, base_name, hidden_states)
         return hidden_states
 
     def _build_sima_qwen3_vision_block(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         cos_table: NodeOrHandle,
         sin_table: NodeOrHandle,
-        quantizable: bool,
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        norm1 = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.norm1", input_node, -1, epsilon,
-        )
+        norm1 = graph.layer_norm(f"{base_name}.norm1", input_node, axis=-1, epsilon=epsilon)
         attn = self._build_sima_qwen_attention(
-            builder, f"{base_name}.attn", norm1, cos_table, sin_table,
-            quantizable=quantizable,
+            graph, f"{base_name}.attn", norm1, cos_table, sin_table,
         )
-        add1 = builder.create_add_node(input_node, attn)
-        norm2 = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.norm2", add1, -1, epsilon,
+        add1 = graph.add(input_node, attn)
+        norm2 = graph.layer_norm(f"{base_name}.norm2", add1, axis=-1, epsilon=epsilon)
+        mlp = graph.mlp(
+            f"{base_name}.mlp", norm2, self.cfg.vm_cfg.hidden_act,
+            projections=("linear_fc1", "linear_fc2"),
         )
-        mlp = self._build_sima_qwen3_mlp(builder, f"{base_name}.mlp", norm2, quantizable)
-        return builder.create_add_node(add1, mlp)
+        return graph.add(add1, mlp)
 
     def _build_sima_qwen2_vision_block(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         attention_mask: NodeOrHandle,
         cos_table: NodeOrHandle,
         sin_table: NodeOrHandle,
-        quantizable: bool,
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        w1 = load_tensor_from_source(f"{base_name}.norm1.weight", self.get_hf_param, self.check_hf_param)
-        norm1 = builder.create_rms_norm_node(input_node, epsilon, w1)
+        norm1 = graph.rms_norm(f"{base_name}.norm1", input_node, epsilon=epsilon)
         attn = self._build_sima_qwen_attention(
-            builder, f"{base_name}.attn", norm1, cos_table, sin_table,
-            quantizable=quantizable, attention_mask=attention_mask,
+            graph, f"{base_name}.attn", norm1, cos_table, sin_table,
+            attention_mask=attention_mask,
         )
-        add1 = builder.create_add_node(input_node, attn)
-        w2 = load_tensor_from_source(f"{base_name}.norm2.weight", self.get_hf_param, self.check_hf_param)
-        norm2 = builder.create_rms_norm_node(add1, epsilon, w2)
-        mlp = self._build_sima_qwen2_mlp(builder, f"{base_name}.mlp", norm2, quantizable)
-        return builder.create_add_node(add1, mlp)
+        add1 = graph.add(input_node, attn)
+        norm2 = graph.rms_norm(f"{base_name}.norm2", add1, epsilon=epsilon)
+        mlp = graph.mlp(
+            f"{base_name}.mlp", norm2, self.cfg.vm_cfg.hidden_act,
+            projections=("gate_proj", "up_proj", "down_proj"),
+        )
+        return graph.add(add1, mlp)
 
     def _build_sima_qwen_attention(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         cos_table: NodeOrHandle,
         sin_table: NodeOrHandle,
-        quantizable: bool,
         attention_mask: NodeOrHandle = None,
     ) -> NodeOrHandle:
         num_heads = self.cfg.vm_cfg.num_attention_heads
         hidden_size = self.cfg.vm_cfg.hidden_size
         head_dim = hidden_size // num_heads
-        dtype = activation_dtype(quantizable)
-        scaling = np.array([head_dim ** -0.5], dtype=dtype)
 
-        qkv = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.qkv", input_node
-        )
-        q = create_channel_slice(builder, qkv, 0, hidden_size)
-        k = create_channel_slice(builder, qkv, hidden_size, 2 * hidden_size)
-        v = create_channel_slice(builder, qkv, 2 * hidden_size, 3 * hidden_size)
+        qkv = graph.linear(f"{base_name}.qkv", input_node)
+        q = graph.slice(qkv, [0], [hidden_size], [1], [3])
+        k = graph.slice(qkv, [hidden_size], [2 * hidden_size], [1], [3])
+        v = graph.slice(qkv, [2 * hidden_size], [3 * hidden_size], [1], [3])
 
-        q_heads = builder.create_slice_concat_node(q, axis=1, split_axis=3, split_block=num_heads, split_repeat=1)
-        k_heads = builder.create_slice_concat_node(k, axis=1, split_axis=3, split_block=num_heads, split_repeat=1)
-        v_heads = builder.create_slice_concat_node(v, axis=1, split_axis=3, split_block=num_heads, split_repeat=1)
-
-        q_rope = self._build_sima_rotary_emb(builder, f"{base_name}.q_rope", q_heads, cos_table, sin_table)
-        k_rope = self._build_sima_rotary_emb(builder, f"{base_name}.k_rope", k_heads, cos_table, sin_table)
-
-        scores = builder.create_einsum_node(q_rope, k_rope, equation="nhwc,nhqc->nhwq", layout="NHWC")
-        scores = builder.create_mul_node(
-            scores, builder.create_constant_node(scaling)
+        q_heads = graph.split_heads(q, num_heads)
+        k_heads = graph.split_heads(k, num_heads)
+        v_heads = graph.split_heads(v, num_heads)
+        q_rope = graph.rope(q_heads, cos_table, sin_table)
+        k_rope = graph.rope(k_heads, cos_table, sin_table)
+        context = graph.attention(
+            q_rope, k_rope, v_heads, mask=attention_mask, score_scale=head_dim ** -0.5
         )
-        if attention_mask is not None:
-            scores = builder.create_add_node(scores, attention_mask)
-
-        probs = builder.create_softmax_node(scores, axis=3)
-        context = builder.create_einsum_node(probs, v_heads, equation="nhwc,nhcq->nhwq", layout="NHWC")
-        merged = builder.create_slice_concat_node(context, axis=3, split_axis=1, split_block=num_heads, split_repeat=1)
-
-        return build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.proj", merged
-        )
-
-    def _build_sima_rotary_emb(
-        self,
-        builder: SimaBuilder,
-        base_name: str,
-        input_node: NodeOrHandle,
-        cos_table: NodeOrHandle,
-        sin_table: NodeOrHandle,
-    ) -> NodeOrHandle:
-        head_dim = self.cfg.vm_cfg.hidden_size // self.cfg.vm_cfg.num_attention_heads
-        half_dim = head_dim // 2
-        real_in = create_channel_slice(builder, input_node, 0, half_dim)
-        imag_in = create_channel_slice(builder, input_node, half_dim, head_dim)
-        real_out = builder.create_subtract_node(
-            builder.create_mul_node(real_in, cos_table),
-            builder.create_mul_node(imag_in, sin_table),
-        )
-        imag_out = builder.create_add_node(
-            builder.create_mul_node(real_in, sin_table),
-            builder.create_mul_node(imag_in, cos_table),
-        )
-        return builder.create_concat_node([real_out, imag_out], axis=3)
-
-    def _build_sima_qwen3_mlp(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
-    ) -> NodeOrHandle:
-        fc1 = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.linear_fc1", input_node
-        )
-        act = build_activation(builder, fc1, self.cfg.vm_cfg.hidden_act, quantizable)
-        return build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.linear_fc2", act
-        )
-
-    def _build_sima_qwen2_mlp(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
-    ) -> NodeOrHandle:
-        gate = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.gate_proj", input_node
-        )
-        act = build_activation(builder, gate, self.cfg.vm_cfg.hidden_act, quantizable)
-        up = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.up_proj", input_node
-        )
-        gated = builder.create_mul_node(act, up)
-        return build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.down_proj", gated
-        )
+        return graph.linear(f"{base_name}.proj", graph.merge_heads(context))
 
     def _build_sima_qwen3_merger(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        norm = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.norm", input_node, -1, epsilon,
-        )
+        norm = graph.layer_norm(f"{base_name}.norm", input_node, axis=-1, epsilon=epsilon)
         factor = self.cfg.vm_cfg.spatial_merge_size ** 2
-        fc1 = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.linear_fc1", norm,
-            is_fc=False, stride=(1, factor),
+        fc1 = graph.conv(
+            f"{base_name}.linear_fc1",
+            norm,
+            stride=(1, factor),
             weight_process_func=self._reshape_merger_kernel,
             src_bias_name=f"{base_name}.linear_fc1.bias",
         )
-        act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)
-        return build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.linear_fc2", act
-        )
+        act = graph.activation(fc1, self.cfg.mm_cfg.hidden_act)
+        return graph.linear(f"{base_name}.linear_fc2", act)
 
     def _build_sima_qwen2_merger(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        w = load_tensor_from_source(
-            f"{base_name}.merger.ln_q.weight", self.get_hf_param, self.check_hf_param
-        )
-        norm = builder.create_rms_norm_node(input_node, epsilon, w)
+        norm = graph.rms_norm(f"{base_name}.merger.ln_q", input_node, epsilon=epsilon)
         factor = self.cfg.vm_cfg.spatial_merge_size ** 2
-        fc1 = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.merger.mlp.0", norm,
-            is_fc=False, stride=(1, factor),
+        fc1 = graph.conv(
+            f"{base_name}.merger.mlp.0",
+            norm,
+            stride=(1, factor),
             weight_process_func=self._reshape_merger_kernel,
             src_bias_name=f"{base_name}.merger.mlp.0.bias",
         )
-        act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)
-        return build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.merger.mlp.2", act
-        )
+        act = graph.activation(fc1, self.cfg.mm_cfg.hidden_act)
+        return graph.linear(f"{base_name}.merger.mlp.2", act)
 
     def _build_sima_qwen3_deepstack_merger(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, quantizable: bool
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         factor = self.cfg.vm_cfg.spatial_merge_size ** 2
         grouped_seq = self.cfg.vm_cfg.seq_len // factor
@@ -1056,49 +929,42 @@ class QwenVisionLayerModel(BaseModel):
         # NHWC (1, 1, seq, hidden) → (1, 1, grouped_seq, hidden*factor).
         # In NHWC, consecutive tokens are contiguous in memory, so a plain reshape
         # produces consecutive grouping — same semantics as PyTorch's `.view()`.
-        reshaped = builder.create_reshape_node(
+        reshaped = graph.reshape(
             input_node, [1, 1, grouped_seq, hidden * factor]
         )
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        norm = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.norm", reshaped, -1, epsilon,
-        )
-        fc1 = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.linear_fc1", norm
-        )
-        act = build_activation(builder, fc1, "gelu", quantizable)
-        return build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.linear_fc2", act
-        )
+        norm = graph.layer_norm(f"{base_name}.norm", reshaped, axis=-1, epsilon=epsilon)
+        fc1 = graph.linear(f"{base_name}.linear_fc1", norm)
+        act = graph.activation(fc1, "gelu")
+        return graph.linear(f"{base_name}.linear_fc2", act)
 
     def _prepare_sima_qwen3_rotary_tables(
-        self, builder: SimaBuilder, base_name: str, quantizable: bool
+        self, graph: ModelGraph, base_name: str, quantizable: bool
     ) -> tuple[NodeOrHandle, NodeOrHandle]:
         dtype = activation_dtype(quantizable)
         cos_np, sin_np = self._calc_qwen3_rotary_tables()
-        cos_node = builder.create_constant_node(cos_np.transpose(0, 2, 3, 1).astype(dtype))
-        sin_node = builder.create_constant_node(sin_np.transpose(0, 2, 3, 1).astype(dtype))
+        cos_node = graph.constant(cos_np.transpose(0, 2, 3, 1).astype(dtype))
+        sin_node = graph.constant(sin_np.transpose(0, 2, 3, 1).astype(dtype))
         return cos_node, sin_node
 
     def _prepare_sima_qwen3_position_embedding(
-        self, builder: SimaBuilder, base_name: str, quantizable: bool
+        self, graph: ModelGraph, base_name: str, quantizable: bool
     ) -> NodeOrHandle:
         pos_nchw = self._calc_qwen3_position_embeddings_array(base_name)
         pos_nhwc = pos_nchw.transpose(0, 2, 3, 1).astype(activation_dtype(quantizable))
-        return builder.create_constant_node(pos_nhwc)
+        return graph.constant(pos_nhwc)
 
     def _prepare_sima_qwen2_static_inputs(
-        self, builder: SimaBuilder, quantizable: bool
+        self, graph: ModelGraph, quantizable: bool
     ) -> tuple[NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle]:
         seq_len = self.cfg.vm_cfg.seq_len
         dtype = activation_dtype(quantizable)
         cos_np, sin_np = self._calc_qwen2_vision_rope_tables()
         half_dim = cos_np.shape[0]
-        cos_node = builder.create_constant_node(
+        cos_node = graph.constant(
             cos_np.reshape(1, half_dim, 1, seq_len).transpose(0, 2, 3, 1).astype(dtype)
         )
-        sin_node = builder.create_constant_node(
+        sin_node = graph.constant(
             sin_np.reshape(1, half_dim, 1, seq_len).transpose(0, 2, 3, 1).astype(dtype)
         )
 
@@ -1111,7 +977,7 @@ class QwenVisionLayerModel(BaseModel):
 
         mask_shape_nchw = (1, seq_len, 1, seq_len)
         global_mask_np = np.zeros(mask_shape_nchw, dtype=dtype)
-        global_mask = builder.create_constant_node(global_mask_np.transpose(0, 2, 3, 1))
+        global_mask = graph.constant(global_mask_np.transpose(0, 2, 3, 1))
 
         large_neg = np.array(np.finfo(np.float32).min, dtype=dtype)
         windowed_mask_np = np.zeros(mask_shape_nchw, dtype=dtype)
@@ -1119,7 +985,7 @@ class QwenVisionLayerModel(BaseModel):
             for j in range(seq_len):
                 if (i // window_size_patches) != (j // window_size_patches):
                     windowed_mask_np[0, j, 0, i] = large_neg
-        windowed_mask = builder.create_constant_node(windowed_mask_np.transpose(0, 2, 3, 1))
+        windowed_mask = graph.constant(windowed_mask_np.transpose(0, 2, 3, 1))
         return cos_node, sin_node, global_mask, windowed_mask
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:

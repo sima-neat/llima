@@ -6,7 +6,6 @@ from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import BaseModel
 from sima_lmm.model.model_graph import ModelGraph
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, build_logit_softcapping
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
@@ -20,7 +19,7 @@ class LanguagePartBaseModel(BaseModel):
 
     def _build_sima_rms_norm(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         weightless: bool = False,
@@ -29,7 +28,6 @@ class LanguagePartBaseModel(BaseModel):
         """
         Create an RMS norm with a multiplication applied to its outputs.
         """
-        graph = ModelGraph.from_builder(self, builder)
         weight_offset = 1.0 if self.cfg.lm_cfg.rms_norm_unit_offset else 0.0
         return graph.rms_norm(
             None if weightless else base_name, input_node,
@@ -90,8 +88,7 @@ class LanguagePartBaseModel(BaseModel):
         return down_proj
 
     def _build_sima_mlp(
-        self, builder, base_name: str, input_nodes: list[NodeOrHandle], quantizable: bool,
-        merged_lora: bool = False, with_residual_add: bool =  False
+        self, graph, base_name: str, input_nodes: list[NodeOrHandle], merged_lora: bool = False, with_residual_add: bool =  False
     ) -> NodeOrHandle:
         """Build SiMa nodes for the MLP block with optional splitting.
 
@@ -104,7 +101,6 @@ class LanguagePartBaseModel(BaseModel):
         ranks = {
             name: self.cfg.lm_cfg.get_lora_rank(base_name, name) for name in projections
         } if self.cfg.lm_cfg.lora_cfg is not None else None
-        graph = ModelGraph.from_builder(self, builder)
         return graph.mlp(
             base_name, input_nodes[0], self.cfg.lm_cfg.mlp_cfg.act,
             projections=projections, residual=input_nodes[1] if with_residual_add else None,
@@ -224,11 +220,8 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         else:
             return lm_heads
 
-    def _build_post_transformer(self, builder, input_node, quantizable) -> NodeOrHandle:
+    def _build_post_transformer(self, graph, input_node) -> NodeOrHandle:
         """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""
-        graph = ModelGraph.from_builder(self, builder)
-        from afe.ir.tensor_type import ScalarType
-
         # LFM2 uses embedding_norm instead of norm for the final normalization.
         base_prefix = self.hf_model.language_model_param_base_name
         final_norm_name = (
@@ -237,7 +230,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
         if self.is_draft:
             final_norm_full_name = final_norm_name
-        rms_norm = self._build_sima_rms_norm(builder, final_norm_full_name, input_node)
+        rms_norm = self._build_sima_rms_norm(graph, final_norm_full_name, input_node)
 
         # Find the last layer's size based on the weight tensor shape.
         output_embed_name = self._get_output_embed_name()
@@ -275,16 +268,14 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                     self.cfg.lm_cfg.model_type == "gemma2"
                     or self.cfg.model_type == VlmArchType.VLM_GEMMA4
                 )
-                lm_head = build_logit_softcapping(
-                    builder, lm_head, self.cfg.lm_cfg.final_logit_softcapping, quantizable
-                )
+                lm_head = graph.softcap(lm_head, self.cfg.lm_cfg.final_logit_softcapping)
             lm_heads.append(lm_head)
 
         if self.is_draft:
             lm_heads.append(input_node)
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
-            argmax = builder.create_argmax_node(lm_heads[0], ScalarType.int32)
+            argmax = graph.argmax(lm_heads[0])
             return [argmax]
         else:
             return lm_heads

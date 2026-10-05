@@ -7,14 +7,13 @@ from afe.ir.tensor_type import TensorType, ScalarType
 from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerConfiguration
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, activation_dtype
 from sima_lmm.config.vlm_config import VlmArchType
 
 
-bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
+_bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
 
 @dataclass
 class LanguagePreModel(LanguagePartBaseModel):
@@ -412,14 +411,14 @@ class LanguagePreModel(LanguagePartBaseModel):
             input_specs["hidden_states"] = input_shape
         input_specs.update(freq_real=freq_shape, freq_imag=freq_shape)
         graph = ModelGraph(self, input_specs, quantizable)
-        builder, inputs = graph.raw, graph.inputs
+        inputs = graph.inputs
         mla_input_input = inputs["input"]
         mla_input_freq_real = inputs["freq_real"]
         mla_input_freq_imag = inputs["freq_imag"]
 
         # Dequantize the selected embedding rows before the first layer consumes them.
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            rms_norm_in = graph.dequantize(mla_input_input, inputs["input_scale"])
+            rms_norm_in = graph.dequant(mla_input_input, inputs["input_scale"])
         else:
             rms_norm_in = mla_input_input
 
@@ -428,17 +427,17 @@ class LanguagePreModel(LanguagePartBaseModel):
             if self.check_hf_param(f"{base_name}.operator_norm.weight")
             else f"{base_name}.input_layernorm"
         )
-        rms_norm = self._build_sima_rms_norm(builder, norm_name, rms_norm_in)
+        rms_norm = self._build_sima_rms_norm(graph, norm_name, rms_norm_in)
         # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
         if self.is_draft:
             hidden_states_norm = self._build_sima_rms_norm(
-                builder, f"{base_name}.hidden_norm", inputs["hidden_states"]
+                graph, f"{base_name}.hidden_norm", inputs["hidden_states"]
             )
-            attn_input = builder.create_concat_node([rms_norm, hidden_states_norm], 3)
+            attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
         mla_q_result = self._build_sima_attn_query(
-            builder,
+            graph,
             f"{base_name}.self_attn",
             attn_input,
             mla_input_freq_real,
@@ -454,7 +453,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         output_nodes = [mla_q_out]
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
             mla_k_out = self._build_sima_attn_key(
-                builder,
+                graph,
                 f"{base_name}.self_attn",
                 attn_input,
                 mla_input_freq_real,
@@ -462,12 +461,12 @@ class LanguagePreModel(LanguagePartBaseModel):
                 merged_lora,
             )
             mla_v_out = self._build_sima_attn_value(
-                builder, f"{base_name}.self_attn", attn_input, merged_lora
+                graph, f"{base_name}.self_attn", attn_input, merged_lora
             )
 
             if self.cfg.pipeline_cfg.quantize_kv_cache:
-                k_quant, k_scale = graph.quantize(mla_k_out)
-                v_quant, v_scale = graph.quantize(mla_v_out)
+                k_quant, k_scale = graph.quant(mla_k_out)
+                v_quant, v_scale = graph.quant(mla_v_out)
                 output_nodes.extend([k_quant, k_scale, v_quant, v_scale])
             else:
                 output_nodes.extend([mla_k_out, mla_v_out])
@@ -477,12 +476,11 @@ class LanguagePreModel(LanguagePartBaseModel):
         return graph.finish(output_nodes)
 
     def _build_sima_rotary_emb(
-        self, builder: SimaBuilder, data: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle
+        self, graph: ModelGraph, data: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle
     ):
         """
         Create nodes that compute rotary embedding.
         """
-        graph = ModelGraph.from_builder(self, builder)
         return graph.rope(
             data,
             freq_real,
@@ -493,7 +491,7 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     def _build_sima_attn_query(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         rms_norm: NodeOrHandle,
         freq_real: NodeOrHandle,
@@ -501,7 +499,6 @@ class LanguagePreModel(LanguagePartBaseModel):
         quantizable: bool,
         merged_lora: bool = False,
     ) -> AwesomeNode:
-        graph = ModelGraph.from_builder(self, builder)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "q_proj")
@@ -518,8 +515,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
             q_fused = graph.split_heads(q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads)
             head_dim = self.cfg.lm_cfg.attn_cfg.head_dim
-            gate_out = builder.create_slice_node(q_fused, [head_dim], [2 * head_dim], [1], [3])
-            q_proj = builder.create_slice_node(q_fused, [0], [head_dim], [1], [3])
+            gate_out = graph.slice(q_fused, [head_dim], [2 * head_dim], [1], [3])
+            q_proj = graph.slice(q_fused, [0], [head_dim], [1], [3])
             gate_out = graph.merge_heads(gate_out)
             reshape1 = q_proj
         elif self.cfg.lm_cfg.attn_cfg.num_attention_heads > 1:
@@ -534,12 +531,12 @@ class LanguagePreModel(LanguagePartBaseModel):
                 break
 
         if q_norm_name:
-            reshape1 = self._build_sima_rms_norm(builder, q_norm_name, reshape1)
+            reshape1 = self._build_sima_rms_norm(graph, q_norm_name, reshape1)
 
-        rotary_emb = self._build_sima_rotary_emb(builder, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_sima_rotary_emb(graph, reshape1, freq_real, freq_imag)
 
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
-            rotary_emb = builder.create_mul_node(
+            rotary_emb = graph.mul(
                 rotary_emb,
                 graph.constant(np.array([self._head_dim**-0.5], dtype=activation_dtype(quantizable))),
             )
@@ -549,14 +546,13 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     def _build_sima_attn_key(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         rms_norm: NodeOrHandle,
         freq_real: NodeOrHandle,
         freq_imag: NodeOrHandle,
         merged_lora: bool = False,
     ) -> AwesomeNode:
-        graph = ModelGraph.from_builder(self, builder)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "k_proj")
@@ -578,16 +574,15 @@ class LanguagePreModel(LanguagePartBaseModel):
                 break
 
         if k_norm_name:
-            reshape1 = self._build_sima_rms_norm(builder, k_norm_name, reshape1)
+            reshape1 = self._build_sima_rms_norm(graph, k_norm_name, reshape1)
 
-        rotary_emb = self._build_sima_rotary_emb(builder, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_sima_rotary_emb(graph, reshape1, freq_real, freq_imag)
         return rotary_emb
 
 
     def _build_sima_attn_value(
-        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, merged_lora: bool = False
+        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, merged_lora: bool = False
     ) -> AwesomeNode:
-        graph = ModelGraph.from_builder(self, builder)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "v_proj")
@@ -606,7 +601,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         # Gemma4 applies value RMS norm per KV head before writing V to cache.
         split = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
         split = self._build_sima_rms_norm(
-            builder,
+            graph,
             f"{base_name}.v_norm",
             split,
             weightless=True,

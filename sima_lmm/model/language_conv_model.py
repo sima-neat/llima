@@ -5,9 +5,8 @@ from afe.ir.tensor_type import TensorType, ScalarType
 
 from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_type
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import activation_type, create_channel_slice
 
 
 @dataclass
@@ -177,17 +176,16 @@ class LanguageConvModel(LanguagePartBaseModel):
             input_specs["input_scale"] = scale_shape
         input_specs["conv_cache"] = cache_shape
         graph = ModelGraph(self, input_specs, quantizable)
-        builder = graph.raw
         mla_input_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             mla_input_scale = graph.inputs["input_scale"]
         mla_input_conv_cache = graph.inputs["conv_cache"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            residual = graph.dequantize(mla_input_input, mla_input_scale)
+            residual = graph.dequant(mla_input_input, mla_input_scale)
         else:
             residual = mla_input_input
 
-        norm_input = self._build_sima_rms_norm(builder, f"{base_layer}.operator_norm", residual)
+        norm_input = self._build_sima_rms_norm(graph, f"{base_layer}.operator_norm", residual)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "in_proj")
@@ -195,13 +193,13 @@ class LanguageConvModel(LanguagePartBaseModel):
             f"{base_name}.in_proj", norm_input, lora_rank=lora_rank, merged_lora=merged_lora
         )
 
-        b = create_channel_slice(builder, in_proj, 0, hidden_size)
-        c = create_channel_slice(builder, in_proj, hidden_size, 2 * hidden_size)
-        x = create_channel_slice(builder, in_proj, 2 * hidden_size, 3 * hidden_size)
-        bx = builder.create_mul_node(b, x)
+        b = graph.slice(in_proj, [0], [hidden_size], [1], [3])
+        c = graph.slice(in_proj, [hidden_size], [2 * hidden_size], [1], [3])
+        x = graph.slice(in_proj, [2 * hidden_size], [3 * hidden_size], [1], [3])
+        bx = graph.mul(b, x)
 
-        tail = builder.create_concat_node([mla_input_conv_cache, bx], 2)
-        conv_cache_out = builder.create_slice_node(
+        tail = graph.concat([mla_input_conv_cache, bx], 2)
+        conv_cache_out = graph.slice(
             tail,
             [1],
             [self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 1],
@@ -211,7 +209,7 @@ class LanguageConvModel(LanguagePartBaseModel):
 
         conv_out = graph.conv(f"{base_name}.conv", tail, is_depthwise=True)
 
-        gated = builder.create_mul_node(conv_out, c)
+        gated = graph.mul(conv_out, c)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "out_proj")
@@ -219,16 +217,16 @@ class LanguageConvModel(LanguagePartBaseModel):
             f"{base_name}.out_proj", gated, lora_rank=lora_rank, merged_lora=merged_lora
         )
 
-        add1 = builder.create_add_node(residual, out_proj)
+        add1 = graph.add(residual, out_proj)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
             outputs = [add1, conv_cache_out]
         else:
-            rms_norm2 = self._build_sima_rms_norm(builder, f"{base_layer}.ffn_norm", add1)
+            rms_norm2 = self._build_sima_rms_norm(graph, f"{base_layer}.ffn_norm", add1)
             mlp = self._build_sima_mlp(
-                builder, f"{base_layer}.feed_forward", [rms_norm2], quantizable, merged_lora
+                graph, f"{base_layer}.feed_forward", [rms_norm2], merged_lora
             )
-            add2 = builder.create_add_node(add1, mlp)
+            add2 = graph.add(add1, mlp)
             outputs = [add2, conv_cache_out]
 
         return graph.finish(outputs)

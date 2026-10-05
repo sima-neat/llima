@@ -6,9 +6,12 @@ from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph
+from sima_lmm.model.model_graph import (
+    ModelGraph,
+    save_model_graph,
+    activation_dtype,
+)
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, activation_type, activation_dtype
 from sima_lmm.config.vlm_config import VlmArchType
 
 
@@ -187,31 +190,30 @@ class LanguagePostModel(LanguagePostBaseModel):
 
     def _build_sima_per_layer_input_branch(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
         hidden_states: NodeOrHandle,
         per_layer_input: NodeOrHandle,
         quantizable: bool,
         merged_lora: bool = False,
     ) -> NodeOrHandle:
-        graph = ModelGraph.from_builder(self, builder)
         residual = hidden_states
         gate = graph.linear(
             f"{base_name}.per_layer_input_gate", hidden_states, merged_lora=merged_lora, lora_rank=None
         )
         act = graph.activation(gate, self.cfg.lm_cfg.mlp_cfg.act)
-        mul = builder.create_mul_node(act, per_layer_input)
+        mul = graph.mul(act, per_layer_input)
         proj = graph.linear(
             f"{base_name}.per_layer_projection", mul, merged_lora=merged_lora, lora_rank=None
         )
-        norm = self._build_sima_rms_norm(builder, f"{base_name}.post_per_layer_input_norm", proj)
-        add = builder.create_add_node(residual, norm)
+        norm = self._build_sima_rms_norm(graph, f"{base_name}.post_per_layer_input_norm", proj)
+        add = graph.add(residual, norm)
         layer_scalar = graph.constant(
             self.get_hf_param(f"{base_name}.layer_scalar")
             .astype(activation_dtype(quantizable))
             .reshape(1)
         )
-        return builder.create_mul_node(add, layer_scalar)
+        return graph.mul(add, layer_scalar)
 
     def gen_model_sdk_files_directly(
         self,
@@ -259,7 +261,6 @@ class LanguagePostModel(LanguagePostBaseModel):
         if needs_deepstack:
             input_specs["deepstack_features"] = input_shape
         graph = ModelGraph(self, input_specs, quantizable)
-        builder = graph.raw
         mla_input_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             mla_input_scale = graph.inputs["input_scale"]
@@ -284,24 +285,24 @@ class LanguagePostModel(LanguagePostBaseModel):
 
         attn_in = mla_input_self_attn
         if mla_input_gate is not None:
-            sig = builder.create_sigmoid_node(mla_input_gate)
-            attn_in = builder.create_mul_node(mla_input_self_attn, sig)
+            sig = graph.sigmoid(mla_input_gate)
+            attn_in = graph.mul(mla_input_self_attn, sig)
         o_proj = graph.linear(attn_out_full_name, attn_in, merged_lora=merged_lora, lora_rank=lora_rank)
 
         # Dequantize the selected embedding rows before the residual path consumes them.
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            rms_norm_in = graph.dequantize(mla_input_input, mla_input_scale)
+            rms_norm_in = graph.dequant(mla_input_input, mla_input_scale)
         else:
             rms_norm_in = mla_input_input
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
         if has_ffn_norms:
             rms_norm1 = self._build_sima_rms_norm(
-                builder, f"{base_name}.post_attention_layernorm", o_proj
+                graph, f"{base_name}.post_attention_layernorm", o_proj
             )
-            add1 = builder.create_add_node(rms_norm_in, rms_norm1)
+            add1 = graph.add(rms_norm_in, rms_norm1)
             rms_norm2 = self._build_sima_rms_norm(
-                builder, f"{base_name}.pre_feedforward_layernorm", add1
+                graph, f"{base_name}.pre_feedforward_layernorm", add1
             )
         else:
             if self.check_hf_param(f"{base_name}.ffn_norm.weight"):
@@ -311,8 +312,8 @@ class LanguagePostModel(LanguagePostBaseModel):
             else:
                 rms_norm_name = "post_attention_layernorm"
 
-            add1 = builder.create_add_node(rms_norm_in, o_proj)
-            rms_norm2 = self._build_sima_rms_norm(builder, f"{base_name}.{rms_norm_name}", add1)
+            add1 = graph.add(rms_norm_in, o_proj)
+            rms_norm2 = self._build_sima_rms_norm(graph, f"{base_name}.{rms_norm_name}", add1)
 
         # LFM2 uses feed_forward.{w1,w3,w2}; fall back to mlp.{gate,up,down}.
         mlp_base = (
@@ -324,19 +325,19 @@ class LanguagePostModel(LanguagePostBaseModel):
         )
 
         if has_ffn_norms:
-            mlp = self._build_sima_mlp(builder, mlp_base, [rms_norm2], quantizable, merged_lora)
-            mlp = self._build_sima_rms_norm(builder, f"{base_name}.post_feedforward_layernorm", mlp)
-            add2 = builder.create_add_node(add1, mlp)
+            mlp = self._build_sima_mlp(graph, mlp_base, [rms_norm2], merged_lora)
+            mlp = self._build_sima_rms_norm(graph, f"{base_name}.post_feedforward_layernorm", mlp)
+            add2 = graph.add(add1, mlp)
         else:
             add2 = self._build_sima_mlp(
-                builder, mlp_base, [rms_norm2, add1], quantizable, merged_lora, with_residual_add=True
+                graph, mlp_base, [rms_norm2, add1], merged_lora, with_residual_add=True
             )
 
         # Add deepstack features if needed
         final_output = add2
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
             final_output = self._build_sima_per_layer_input_branch(
-                builder,
+                graph,
                 base_name,
                 final_output,
                 mla_input_per_layer,
@@ -344,10 +345,10 @@ class LanguagePostModel(LanguagePostBaseModel):
                 merged_lora,
             )
         if needs_deepstack and mla_input_deepstack is not None:
-            final_output = builder.create_add_node(final_output, mla_input_deepstack)
+            final_output = graph.add(final_output, mla_input_deepstack)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
-            outputs = self._build_post_transformer(builder, final_output, quantizable)
+            outputs = self._build_post_transformer(graph, final_output)
         else:
             outputs = [final_output]
 

@@ -4,11 +4,10 @@ import numpy as np
 import pytest
 
 from sima_lmm.config.vlm_config import LanguageModelConfig, LoraConfig
-from sima_lmm.model import language_linear_model, sima_builder
+from sima_lmm.model import language_linear_model
 from sima_lmm.model.model_graph import ModelGraph
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
-
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
@@ -22,22 +21,16 @@ class _FakeNode:
         self.name = name
 
 
-class _FakeSimaBuilder:
+class _RecordingModelGraph(ModelGraph):
     instances = []
 
-    def __init__(self, *_args, **_kwargs):
-        self.status = _args[0]
-        self.subnet_input_names = []
+    def __init__(self, model, specs, quantizable):
+        super().__init__(model, specs, quantizable)
+        self.subnet_input_names = list(specs)
         self.dynamic_dequant_inputs = None
         self.__class__.instances.append(self)
 
-    def create_placeholder_node(self, name, _tensor_type):
-        return _FakeNode(name)
-
-    def begin_subnet(self, inputs):
-        self.subnet_input_names = [node.name for node in inputs]
-
-    def create_dynamic_dequant_node(self, input_node, scale_node):
+    def dequant(self, input_node, scale_node):
         self.dynamic_dequant_inputs = (input_node.name, scale_node.name)
         return _FakeNode("dequantized_input")
 
@@ -79,7 +72,7 @@ def test_linear_attention_selects_supported_delta_block_sizes():
 
 
 def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(monkeypatch):
-    monkeypatch.setattr(sima_builder, "SimaBuilder", _FakeSimaBuilder)
+    monkeypatch.setattr(language_linear_model, "ModelGraph", _RecordingModelGraph)
 
     def stop_after_input_contract(_self, _builder, _name, input_node):
         assert input_node.name in {"MLA_0/input", "dequantized_input"}
@@ -91,10 +84,10 @@ def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(mon
         stop_after_input_contract,
     )
 
-    _FakeSimaBuilder.instances.clear()
+    _RecordingModelGraph.instances.clear()
     with pytest.raises(_StopGraphBuild):
         _linear_model(quantize_embeddings=True)._build_sima_nodes("model.layers.0", False)
-    quantized_builder = _FakeSimaBuilder.instances[-1]
+    quantized_builder = _RecordingModelGraph.instances[-1]
     assert quantized_builder.subnet_input_names == [
         "input",
         "input_scale",
@@ -109,7 +102,7 @@ def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(mon
         _linear_model(quantize_embeddings=True, layer_idx=1)._build_sima_nodes(
             "model.layers.1", False
         )
-    bf16_builder = _FakeSimaBuilder.instances[-1]
+    bf16_builder = _RecordingModelGraph.instances[-1]
     assert bf16_builder.subnet_input_names == [
         "input",
         "linear_conv_state",
@@ -142,15 +135,11 @@ def test_linear_attention_lora_targets_disable_ab_projection_fusion(monkeypatch)
     model.check_hf_param = lambda _name: False
     calls = []
 
-    def build_projection(
-        _graph, base_name, _input, **kwargs
-    ):
+    def build_projection(_graph, base_name, _input, **kwargs):
         calls.append((base_name, kwargs))
         return _FakeNode(base_name)
 
-    monkeypatch.setattr(
-        ModelGraph, "linear", build_projection
-    )
+    monkeypatch.setattr(ModelGraph, "linear", build_projection)
     monkeypatch.setattr(
         LanguageLinearModel,
         "_get_ab_projection_params",
@@ -158,7 +147,10 @@ def test_linear_attention_lora_targets_disable_ab_projection_fusion(monkeypatch)
     )
 
     a, b = model._build_sima_ab_projections(
-        _FakeSimaBuilder(None), "model.layers.0.linear_attn", object(), merged_lora=True
+        ModelGraph(model, {"input": (1, 1, 1, 16)}, False),
+        "model.layers.0.linear_attn",
+        object(),
+        merged_lora=True,
     )
 
     assert (a.name, b.name) == (

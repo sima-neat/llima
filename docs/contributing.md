@@ -129,8 +129,9 @@ is a Whisper-specific path, not a general ASR architecture framework.
 ### Native graph components
 
 Use `ModelGraph` from `sima_lmm/model/model_graph.py`. It binds the component's
-source weights, precision and output path once. A component's implementation can
-then focus on its topology:
+source weights, precision and output path once. Graph-node construction lives
+in the class; independent array-layout and naming utilities remain module
+functions. Model components use the graph methods. A component's implementation can then focus on its topology:
 
 ```python
 from sima_lmm.model.model_graph import ModelGraph
@@ -154,40 +155,57 @@ width. Node names follow AFE's deterministic creation counter.
 outputs, casts BF16 outputs to FP32 on EV, and writes the standard artifact name
 (`.fp32` for a floating graph). Use `finish()` instead to obtain the completed
 network. Both accept `transform_subnet` for model-specific rewrites before the
-outer outputs are extracted. `ModelGraph.from_builder(self, builder)` binds the
-same operations inside an existing subnet without creating new inputs.
+outer outputs are extracted. Pass the graph itself to component helpers; inputs,
+precision and source weights remain bound to the same object.
 
-Common operations include `linear`, `conv`, `layer_norm`, `rms_norm`,
-`activation`, `mlp`, `rope`, `split_heads`, `merge_heads`, `quantize`, and
-`dequantize`. A gated MLP uses
+Common operations include `add`, `sub`, `mul`, `matmul`, `concat`, `slice`,
+`transpose`, `reshape`, `softmax`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`,
+`activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`,
+`clip`, `avgpool2d`, `space_to_depth`, `quant`, and `dequant`. A gated MLP uses
 `projections=("gate_proj", "up_proj", "down_proj")`; the default is
 `("fc1", "fc2")`. `rms_norm(None, input, epsilon=...)` infers weightless channels.
 RoPE supports full, partial and proportional split-half rotation.
+`rope2d(input, cos_x, sin_x, cos_y, sin_y)` rotates channel quarters in
+`[x-real, x-imag, y-real, y-imag]` order. `split_heads(input, heads, repeat=...)`
+repeats each head for grouped-query patterns. `split_concat()` exposes AFE's
+regrouping operation for spatial/token layouts that need more than a reshape.
+`space_to_depth(input, blocksize)` merges complete spatial blocks into channels.
+`quant(input)` returns `(int8_values, scale)`; `dequant(int8_values, scale)`
+restores the graph's activation precision. `argmax(input)` returns INT32 channel indices.
+`slice(input, begin, end, stride, axis)` automatically uses selector convolutions
+for unaligned, contiguous, single-axis channel slices of rank-four FP32/BF16 tensors; other
+slices retain AFE's native behavior.
 
 `linear("model.proj", input)` resolves `model.proj.weight` and its optional bias,
 converts OI source weights to SiMa's layout, and retains packed weight values,
 scales, nonaligned group sizes and relocation metadata. `conv()` infers OIW or
-OIHW source layouts. `WeightOptions` documents explicit source-name, layout,
+OIHW source layouts; an explicit transform can convert other source layouts,
+such as Qwen's five-dimensional patch weights. `WeightOptions` documents source-name, layout,
 weight/scale/bias transform and relocation overrides. When slicing grouped
 weights, supply the corresponding `scale_process_func`; groups must retain the
 checkpoint's actual size. LoRA rank and merged-adapter behavior are explicit
 arguments to `linear()` and `mlp()`.
 
-For multi-head attention, `project_heads()` preserves the existing MLA channel
-padding and packed-versus-separate-head selection; `project_merged_heads()`
-merges those outputs before projecting. Scale queries during projection:
+Build attention from projections and head layout operations. Fold query scaling
+into `linear()` to retain the existing projection rounding:
 
 ```python
-queries = graph.project_heads("attn.q_proj", hidden, heads, scale=head_dim ** -0.5)
-keys = graph.project_heads("attn.k_proj", hidden, heads)
-values = graph.project_heads("attn.v_proj", hidden, heads)
-outputs = [graph.attention(q, k, v) for q, k, v in zip(queries, keys, values)]
-output = graph.project_merged_heads("attn.out_proj", outputs, heads)
+queries = graph.split_heads(graph.linear("attn.q_proj", hidden, scale=head_dim ** -0.5), heads)
+keys = graph.split_heads(graph.linear("attn.k_proj", hidden), heads)
+values = graph.split_heads(graph.linear("attn.v_proj", hidden), heads)
+context = graph.attention(queries, keys, values)
+output = graph.linear("attn.out_proj", graph.merge_heads(context))
 ```
 
-For cross-attention, pass the same `query_len` and `kv_len` to all three
-projections. `attention()` accepts an additive `mask` and assumes queries are
-already scaled.
+`split_heads()` handles unaligned head channels through selector convolutions.
+Standard vision attention pads projection weights for unaligned heads to avoid these
+convolutions; grouped output weights retain their original layout.
+`attention()` uses query/key lengths to select separate head branches for large
+attention tensors, including cross-attention. It accepts an additive `mask` and
+assumes queries are already scaled unless `score_scale` is supplied. That scale is applied after
+Q×K and before the mask, preserving models such as Qwen vision's BF16 order.
+Masks must be rank-four, vectors or scalars and broadcast to `[N,H,T_query,T_key]`;
+unsupported shapes raise `ValueError`.
 
 `graph.einsum(equation, lhs, rhs)` supports the following NHWC contractions,
 including renamed labels and whitespace:
@@ -202,14 +220,23 @@ including renamed labels and whitespace:
 Each creates an MLA `BatchMatmulOp`. Unsupported equations, mismatched scalar
 or contraction dimensions, and non-singleton head mismatches raise `ValueError`;
 there is no alternative backend fallback. Batches must match. Heads may broadcast
-from one. Grouped-query head repetition uses the raw batch-matmul operation
+from one. Grouped-query head repetition uses `graph.matmul()`
 because its semantics differ from NumPy `einsum`.
 
-**Raw escape hatch:** use `graph.raw`, the original AFE `SimaBuilder`, for
-exceptional topology (for example grouped-query BMM, channel selection, or
-model-specific softcapping). Nodes created through either API can be mixed.
-Graphs with multiple MLA subnets can retain the raw lifecycle and bind common
-operations with `from_builder()`.
+`ModelGraph` extends AFE's `SimaBuilder`, so native operations are available
+on the same object as the common helpers:
+
+```python
+projected = graph.linear("model.proj", graph.inputs["hidden"])
+output = graph.add(projected, graph.inputs["hidden"])
+graph.save([output])
+```
+
+Concise primitive operations are direct aliases of AFE methods, retaining their
+signatures, type inference and deterministic naming. For uncommon operations,
+inherited `create_*` methods remain available on the same graph. Graphs requiring
+a custom multi-subnet lifecycle can still use AFE's `SimaBuilder` directly with
+the low-level operation helpers.
 
 Tessellation is inferred centrally in `sima_analysis.get_tessellate_parameters()`:
 HWC16 layout, automatic tile sizes and deterministic persistent buffer names.

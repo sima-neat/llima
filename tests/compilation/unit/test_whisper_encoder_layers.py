@@ -14,10 +14,8 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 @pytest.fixture
 def encoder_builder(monkeypatch):
     builder = Mock()
-    graph = Mock()
-    graph.project_heads.return_value = ["head"]
+    graph = builder
     graph.layer_norm.side_effect = lambda name, node, **kwargs: (name, node)
-    monkeypatch.setattr(encoder_module.ModelGraph, "from_builder", lambda *_: graph)
     return builder, graph.conv, graph.layer_norm
 
 
@@ -74,8 +72,8 @@ def test_encoder_layer_zero_includes_feature_extractor(monkeypatch, encoder_buil
     )
     builder, conv, norm = encoder_builder
     positions = Mock()
-    monkeypatch.setattr(encoder_module.ModelGraph.from_builder(model, builder), "parameter", lambda _: positions)
-    model._build_sima_nodes(builder, ["mel"], quantizable=True)
+    monkeypatch.setattr(builder, "parameter", lambda _: positions)
+    model._build_sima_nodes(builder, ["mel"])
 
     first, second = conv.call_args_list[:2]
     assert first.args[:2] == ("model.encoder.conv1", "mel")
@@ -93,7 +91,7 @@ def test_final_encoder_layer_includes_output_layer_norm(encoder_builder):
         layer_idx=2,
     )
     builder, conv, norm = encoder_builder
-    output = model._build_sima_nodes(builder, ["hidden"], quantizable=True)
+    output = model._build_sima_nodes(builder, ["hidden"])
 
     assert output == [norm.call_args.args[:2]]
     assert norm.call_args.args[0] == "model.encoder.layer_norm"

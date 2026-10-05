@@ -17,7 +17,6 @@ from afe.ir import build_node
 from afe.ir.execute import create_node_executor
 from afe.ir.net import AwesomeNet
 from afe.ir.operations import AddActivationOp, ConvAddActivationOp
-from afe.ir.tensor_type import ScalarType
 
 from sima_lmm.hf.hf_transformer import find_file
 from sima_lmm.model.model_graph import ModelGraph
@@ -27,7 +26,6 @@ from sima_lmm.model.whisper_decoder_cache_model import WhisperDecoderCacheModel
 from sima_lmm.model.whisper_decoder_post_model import WhisperDecoderPostModel
 from sima_lmm.model.whisper_decoder_pre_model import WhisperDecoderPreModel
 from sima_lmm.tokenizer.whisper_tokenizer import get_tokenizer
-from sima_lmm.model.sima_builder import create_channel_slice
 
 
 @dataclass
@@ -47,7 +45,7 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
         shapes = {"audio_features": (1, 1, self.cfg.max_source_positions, self.cfg.d_model)}
 
         graph = ModelGraph(self, shapes, quantizable)
-        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        outputs = self._build_sima_nodes(graph, list(graph.inputs.values()))
         graph.save(outputs, transform_subnet=self._fold_sot_prefix if quantizable else None)
 
     @staticmethod
@@ -83,8 +81,7 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
         net.topological_sort()
         net.nodes = {name: net.nodes[name] for name in net.execution_order}
 
-    def _build_sima_nodes(self, builder, inputs, quantizable):
-        graph = ModelGraph.from_builder(self, builder)
+    def _build_sima_nodes(self, graph, inputs):
         tokenizer = get_tokenizer(
             multilingual=True,
             num_languages=self.cfg.num_languages,
@@ -115,9 +112,9 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
                 num_tokens=1,
                 layer_idx=idx,
             )
-            pre_outputs = pre._build_sima_nodes(builder, hidden, quantizable)
+            pre_outputs = pre._build_sima_nodes(graph, hidden)
             residual = pre_outputs[pre.positioned_residual_output_idx] if idx == 0 else hidden[0]
-            attn = cache._build_sima_nodes(builder, pre_outputs, quantizable)[0]
+            attn = cache._build_sima_nodes(graph, pre_outputs)[0]
             post = WhisperDecoderPostModel(
                 self.cfg,
                 self.model_name,
@@ -128,13 +125,13 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
                 output_encoder_kv_cache=False,
             )
             output, _, _ = post._build_sima_transformer(
-                builder, [residual, attn, inputs[0]], quantizable
+                graph, [residual, attn, inputs[0]]
             )
             hidden = [output]
         norm = graph.layer_norm("model.decoder.layer_norm", hidden[0])
         logits = graph.linear("model.decoder.embed_tokens", norm)
-        language_logits = create_channel_slice(builder, logits, start, start + count)
-        return [builder.create_argmax_node(language_logits, ScalarType.int32), logits]
+        language_logits = graph.slice(logits, [start], [start + count], [1], [3])
+        return [graph.argmax(language_logits), logits]
 
     def gen_onnx_files(self):
         self.create_onnx_builder()

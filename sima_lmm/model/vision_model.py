@@ -7,7 +7,6 @@ import numpy as np
 
 from afe.apis.defines import TensorDRAMLayout
 from afe.ir.defines import get_expected_tensor_value
-from afe.ir.tensor_type import ScalarType
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import (
     BaseModel, EvalMode, FileGenMode, TensorTessellateParameters, GenConfiguration,
@@ -16,13 +15,12 @@ from sima_lmm.model.base import (
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv, build_activation, activation_type, activation_dtype,
-    build_merge_heads_and_matmul, build_matmul_and_split_heads, build_two_stage_layer_norm,
-    build_space_to_depth, load_tensor_from_source
+from sima_lmm.model.model_graph import (
+    ModelGraph,
+    save_model_graph,
+    activation_dtype,
+    load_tensor_from_source,
 )
-from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import VisionArchType, VlmArchType
 
 
@@ -536,19 +534,19 @@ class StandardVisionLayerModel(BaseModel):
             input_shape = (1, 1, self.cfg.vm_cfg.seq_len, self.cfg.vm_cfg.hidden_size)
 
         graph = ModelGraph(self, {"input": input_shape}, quantizable)
-        builder, inputs = graph.raw, graph.inputs
+        inputs = graph.inputs
         mla_input = inputs["input"]
 
         # Vision tower.
         vision_output = self._build_sima_vision_tower(
-            builder, self.hf_model.vision_model_param_base_name, mla_input, quantizable
+            graph, self.hf_model.vision_model_param_base_name, mla_input, quantizable
         )
 
         # MM projection.
         if self.include_mm_proj:
             if self.cfg.model_type == VlmArchType.VLM_LLAVA:
                 llava_o_shape = get_expected_tensor_value(vision_output.get_type().output).shape
-                vision_output = builder.create_slice_node(
+                vision_output = graph.slice(
                     vision_output,
                     begin=[0, 0, 1, 0],
                     end=list(llava_o_shape),
@@ -560,29 +558,27 @@ class StandardVisionLayerModel(BaseModel):
             else:
                 projector_base_name = "multi_modal_projector"
             vision_output = self._build_sima_mm_projector(
-                builder, projector_base_name, vision_output, quantizable
+                graph, projector_base_name, vision_output
             )
 
         outputs = [vision_output]
         if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
-            vision_scale = builder.create_dynamic_quant_scale_node(
-                vision_output, per_token_quant=True
-            )
-            vision_output = builder.create_dynamic_quant_node(vision_output, vision_scale)
+            vision_output, vision_scale = graph.quant(vision_output)
             outputs = [vision_output, vision_scale]
         return graph.finish(outputs)
 
-    def _build_sima_vision_tower(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
+    def _build_sima_vision_tower(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         if self.include_embeddings:
-            embeddings = self._build_sima_patch_embeddings(builder, f"{base_name}.embeddings", input_node, quantizable)
+            embeddings = self._build_sima_patch_embeddings(graph, f"{base_name}.embeddings", input_node, quantizable)
 
             if self.cfg.vm_cfg.arch == VisionArchType.CLIP:
                 # Note that the original source code has a typo in the layer norm node name.
-                encoder_input = build_two_stage_layer_norm(
-                    builder, self.get_hf_param, self.check_hf_param,
-                    f"{base_name}.pre_layrnorm", embeddings,
-                    -1, epsilon
+                encoder_input = graph.layer_norm(
+                    f"{base_name}.pre_layrnorm",
+                    embeddings,
+                    axis=-1,
+                    epsilon=epsilon,
                 )
             else:
                 encoder_input = embeddings
@@ -590,42 +586,40 @@ class StandardVisionLayerModel(BaseModel):
             encoder_input = input_node
 
         encoder_output = self._build_sima_encoder(
-            builder,
+            graph,
             f"{base_name}.encoder.layers.{self.layer_idx}",
             encoder_input,
-            quantizable,
         )
 
         if not self.include_mm_proj:
             return encoder_output
 
-        post_layer_norm = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.post_layernorm", encoder_output,
-            -1, epsilon
+        post_layer_norm = graph.layer_norm(
+            f"{base_name}.post_layernorm",
+            encoder_output,
+            axis=-1,
+            epsilon=epsilon,
         )
         return post_layer_norm
 
-    def _build_sima_patch_embeddings(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
+    def _build_sima_patch_embeddings(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
         node_name = f"{base_name}.patch_embedding"
 
         if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
             # LFM2: input is already pre-patchified (1, 1, seq_len, patch_dim) — FC projection only.
-            embeddings = build_conv(
-                builder, self.get_hf_param, self.check_hf_param, node_name, input_node,
-                is_fc=True
-            )
+            embeddings = graph.linear(node_name, input_node)
         else:
             if isinstance(self.cfg.vm_cfg.image_size, list):
                 image_h = self.cfg.vm_cfg.image_size[0]
             else:
                 image_h = self.cfg.vm_cfg.image_size
-            patch_embedding = build_conv(
-                builder, self.get_hf_param, self.check_hf_param, node_name, input_node,
-                is_fc=False, stride=(self.cfg.vm_cfg.patch_size,) * 2
+            patch_embedding = graph.conv(
+                node_name,
+                input_node,
+                stride=(self.cfg.vm_cfg.patch_size,) * 2,
             )
             # NHWC layout: split on axis H, concat on axis W → (1, 1, seq_len, hidden)
-            split_and_concat = builder.create_slice_concat_node(
+            split_and_concat = graph.split_concat(
                 patch_embedding, axis=2,
                 split_axis=1,
                 split_block=image_h // self.cfg.vm_cfg.patch_size,
@@ -638,8 +632,8 @@ class StandardVisionLayerModel(BaseModel):
                     self.get_hf_param, self.check_hf_param,
                     reshape_str="c->nhwc"
                 ).astype(activation_dtype(quantizable))
-                class_embedding = builder.create_constant_node(class_embedding_weight)
-                embeddings = builder.create_concat_node([class_embedding, split_and_concat], axis=2)
+                class_embedding = graph.constant(class_embedding_weight)
+                embeddings = graph.concat([class_embedding, split_and_concat], axis=2)
             else:
                 embeddings = split_and_concat
 
@@ -659,68 +653,47 @@ class StandardVisionLayerModel(BaseModel):
         # Reshape "wc->nhwc" and cast to the activation dtype (float32 in RELAY, bfloat16 in SIMA_QUANTIZED).
         pos_weight = position_embedding_weight.astype(activation_dtype(quantizable))
         pos_weight = pos_weight.reshape(1, 1, pos_weight.shape[0], pos_weight.shape[1])
-        position_embedding = builder.create_constant_node(pos_weight)
-        embeddings = builder.create_add_node(embeddings, position_embedding)
+        position_embedding = graph.constant(pos_weight)
+        embeddings = graph.add(embeddings, position_embedding)
         return embeddings
 
-    def _build_sima_encoder(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
+    def _build_sima_encoder(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-        layer_norm1 = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.layer_norm1", input_node,
-            -1, epsilon
+        layer_norm1 = graph.layer_norm(
+            f"{base_name}.layer_norm1",
+            input_node,
+            axis=-1,
+            epsilon=epsilon,
         )
-        self_attn = self._build_sima_encoder_attention(builder, f"{base_name}.self_attn", layer_norm1)
-        add1 = builder.create_add_node(input_node, self_attn)
-        layer_norm2 = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.layer_norm2", add1,
-            -1, epsilon
-        )
-        mlp = self._build_sima_encoder_mlp(builder, f"{base_name}.mlp", layer_norm2, quantizable)
-        add2 = builder.create_add_node(add1, mlp)
+        self_attn = self._build_sima_encoder_attention(graph, f"{base_name}.self_attn", layer_norm1)
+        add1 = graph.add(input_node, self_attn)
+        layer_norm2 = graph.layer_norm(f"{base_name}.layer_norm2", add1, axis=-1, epsilon=epsilon)
+        mlp = graph.mlp(f"{base_name}.mlp", layer_norm2, self.cfg.vm_cfg.hidden_act)
+        add2 = graph.add(add1, mlp)
         return add2
 
-    def _build_sima_encoder_attention(self, builder, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
+    def _build_sima_encoder_attention(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
         num_heads = self.cfg.vm_cfg.num_attention_heads
         head_dim = self.cfg.vm_cfg.hidden_size // num_heads
-
-        scaled_q_projs = build_matmul_and_split_heads(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.q_proj", input_node, num_heads, self.cfg.vm_cfg.seq_len,
-            post_matmul_scale=head_dim ** -0.5
-        )
-        k_projs = build_matmul_and_split_heads(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.k_proj", input_node, num_heads, self.cfg.vm_cfg.seq_len
-        )
-        v_projs = build_matmul_and_split_heads(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.v_proj", input_node, num_heads, self.cfg.vm_cfg.seq_len
+        projection_options, output_options = graph._head_padding_options(
+            f"{base_name}.out_proj", num_heads, head_dim
         )
 
-        graph = ModelGraph.from_builder(self, builder)
-        attn_outputs = [
-            graph.attention(query, key, value)
-            for query, key, value in zip(scaled_q_projs, k_projs, v_projs)
+        query, key, value = [
+            graph.split_heads(
+                graph.linear(
+                    f"{base_name}.{proj}", input_node,
+                    scale=head_dim ** -0.5 if proj == "q_proj" else 1.0,
+                    **projection_options,
+                ),
+                num_heads,
+            )
+            for proj in ("q_proj", "k_proj", "v_proj")
         ]
-        return build_merge_heads_and_matmul(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.out_proj", attn_outputs, num_heads
-        )
+        context = graph.attention(query, key, value)
+        return graph.linear(f"{base_name}.out_proj", graph.merge_heads(context), **output_options)
 
-    def _build_sima_encoder_mlp(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
-        graph = ModelGraph.from_builder(self, builder)
-        return graph.mlp(base_name, input_node, self.cfg.vm_cfg.hidden_act)
-
-    def _build_sima_rms_norm_with_offset(
-        self, builder, base_name: str, input_node: NodeOrHandle, epsilon: float, weight_offset: float
-    ) -> NodeOrHandle:
-        weight_tensor = load_tensor_from_source(f"{base_name}.weight", self.get_hf_param, self.check_hf_param)
-        weight_tensor += weight_offset
-        return builder.create_rms_norm_node(input_node, epsilon, weight_tensor)
-
-    def _build_sima_mm_projector(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
+    def _build_sima_mm_projector(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
         match self.cfg.model_type:
             case VlmArchType.VLM_LFM2_VL:
                 # NHWC: (1, 1, seq_len, hidden) → (1, num_patches_h, num_patches_w, hidden)
@@ -728,45 +701,33 @@ class StandardVisionLayerModel(BaseModel):
                     num_patches_h = self.cfg.vm_cfg.num_patches[0]
                 else:
                     num_patches_h = self.cfg.vm_cfg.num_patches
-                reshaped = builder.create_slice_concat_node(
+                reshaped = graph.split_concat(
                     input_node, axis=1,
                     split_axis=2,
                     split_block=num_patches_h,
                     split_repeat=1
                 )
                 factor = self.cfg.mm_cfg.downsample_factor
-                unshuffled = build_space_to_depth(builder, reshaped, factor)
+                unshuffled = graph.space_to_depth(reshaped, factor)
                 projector_input = unshuffled
                 if self.cfg.mm_cfg.projector_use_layernorm:
                     epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-                    projector_input = build_two_stage_layer_norm(
-                        builder, self.get_hf_param, self.check_hf_param,
-                        f"{base_name}.layer_norm", projector_input, -1, epsilon
+                    projector_input = graph.layer_norm(
+                        f"{base_name}.layer_norm",
+                        projector_input,
+                        axis=-1,
+                        epsilon=epsilon,
                     )
-                fc1 = build_conv(
-                    builder, self.get_hf_param, self.check_hf_param,
-                    f"{base_name}.linear_1", projector_input
-                )
-                act = build_activation(builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable)
-                last = build_conv(
-                    builder, self.get_hf_param, self.check_hf_param,
-                    f"{base_name}.linear_2", act
-                )
+                fc1 = graph.linear(f"{base_name}.linear_1", projector_input)
+                act = graph.activation(fc1, self.cfg.mm_cfg.hidden_act)
+                last = graph.linear(f"{base_name}.linear_2", act)
             case VlmArchType.VLM_LLAVA:
-                fc1 = build_conv(
-                    builder, self.get_hf_param, self.check_hf_param,
-                    f"{base_name}.linear_1", input_node
-                )
-                act = build_activation(
-                    builder, fc1, self.cfg.mm_cfg.hidden_act, quantizable
-                )
-                last = build_conv(
-                    builder, self.get_hf_param, self.check_hf_param,
-                    f"{base_name}.linear_2", act
-                )
+                fc1 = graph.linear(f"{base_name}.linear_1", input_node)
+                act = graph.activation(fc1, self.cfg.mm_cfg.hidden_act)
+                last = graph.linear(f"{base_name}.linear_2", act)
             case VlmArchType.VLM_GEMMA3:
                 # NHWC layout, split on axis W, concat on axis H
-                reshape1 = builder.create_slice_concat_node(
+                reshape1 = graph.split_concat(
                     input_node, axis=1,
                     split_axis=2,
                     split_block=self.cfg.vm_cfg.num_patches,
@@ -774,23 +735,21 @@ class StandardVisionLayerModel(BaseModel):
                 )
                 tokens_per_side = int(self.cfg.mm_cfg.mm_tokens_per_image ** 0.5)
                 kernel_shape = tuple([self.cfg.vm_cfg.num_patches // tokens_per_side] * 2)
-                avgpool = builder.create_avgpool2d_node(
+                avgpool = graph.avgpool2d(
                     reshape1, kernel_shape=kernel_shape, strides=kernel_shape
                 )
                 epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
-                norm = self._build_sima_rms_norm_with_offset(
-                    builder, f"{base_name}.mm_soft_emb_norm", avgpool, epsilon, 1.0
+                norm = graph.rms_norm(
+                    f"{base_name}.mm_soft_emb_norm", avgpool, epsilon=epsilon, weight_offset=1.0
                 )
-                last = build_conv(
-                    builder, self.get_hf_param, self.check_hf_param,
-                    f"{base_name}.proj", norm, reshape_str="io->oihw",
-                    src_weight_name="multi_modal_projector.mm_input_projection_weight"
+                last = graph.linear(
+                    f"{base_name}.proj",
+                    norm,
+                    reshape_str="io->oihw",
+                    src_weight_name="multi_modal_projector.mm_input_projection_weight",
                 )
             case VlmArchType.VLM_PALIGEMMA:
-                last = build_conv(
-                    builder, self.get_hf_param, self.check_hf_param,
-                    f"{base_name}.linear", input_node
-                )
+                last = graph.linear(f"{base_name}.linear", input_node)
             case _:
                 raise ValueError(
                     f"Multi-modal projection for {self.cfg.model_type} is not supported."

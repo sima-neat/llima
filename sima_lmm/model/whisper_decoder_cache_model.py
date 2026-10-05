@@ -38,11 +38,10 @@ class WhisperDecoderCacheModel(BaseModel):
             shapes["attn_mask"] = (1, 1, 1, self.token_idx + 1)
 
         graph = ModelGraph(self, shapes, quantizable)
-        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        outputs = self._build_sima_nodes(graph, list(graph.inputs.values()))
         graph.save(outputs)
 
-    def _build_sima_nodes(self, builder, inputs, quantizable):
-        graph = ModelGraph.from_builder(self, builder)
+    def _build_sima_nodes(self, graph, inputs):
         key, value = [graph.split_heads(node, self.cfg.decoder_attention_heads) for node in inputs[1:3]]
         mask = None
         if self.num_tokens > 1:
