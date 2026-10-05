@@ -5,11 +5,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from afe.apis.defines import gen2_target, TensorDRAMLayout
-from afe.backends.backends import Backend
-from afe.ir.serializer import save_awesomenet
-from afe.ir.defines import Status, get_expected_tensor_value
-from afe.ir.tensor_type import TensorType, ScalarType
+from afe.apis.defines import TensorDRAMLayout
+from afe.ir.defines import get_expected_tensor_value
+from afe.ir.tensor_type import ScalarType
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import (
     BaseModel, EvalMode, FileGenMode, TensorTessellateParameters, GenConfiguration,
@@ -18,6 +16,7 @@ from sima_lmm.model.base import (
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph
 from sima_lmm.model.sima_builder import (
     SimaBuilder, build_conv, build_activation, activation_type, activation_dtype,
     build_merge_heads_and_matmul, build_matmul_and_split_heads, build_two_stage_layer_norm,
@@ -520,7 +519,7 @@ class StandardVisionLayerModel(BaseModel):
         quantizable: bool
     ):
         g = self._build_sima_nodes(self.hf_model.vision_model_param_base_name, quantizable)
-        save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
+        save_model_graph(self, g, quantizable)
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool):
         if self.include_embeddings:
@@ -536,12 +535,9 @@ class StandardVisionLayerModel(BaseModel):
         else:
             input_shape = (1, 1, self.cfg.vm_cfg.seq_len, self.cfg.vm_cfg.hidden_size)
 
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        model_input = builder.create_placeholder_node("input", TensorType(activation_type(quantizable), input_shape))
-
-        # MLA subgraph inputs are the same as the model inputs, except the node names are different
-        builder.begin_subnet([model_input])
-        mla_input = builder.create_placeholder_node("MLA_0/input", TensorType(activation_type(quantizable), input_shape))
+        graph = ModelGraph(self, {"input": input_shape}, quantizable)
+        builder, inputs = graph.raw, graph.inputs
+        mla_input = inputs["input"]
 
         # Vision tower.
         vision_output = self._build_sima_vision_tower(
@@ -567,27 +563,14 @@ class StandardVisionLayerModel(BaseModel):
                 builder, projector_base_name, vision_output, quantizable
             )
 
+        outputs = [vision_output]
         if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
             vision_scale = builder.create_dynamic_quant_scale_node(
                 vision_output, per_token_quant=True
             )
             vision_output = builder.create_dynamic_quant_node(vision_output, vision_scale)
-            builder.create_tuple_node([vision_output, vision_scale])
-
-        mla_node = builder.finish_subnet("MLA_0")
-
-        # Ensure that output type is float32
-        if activation_type(quantizable) != ScalarType.float32:
-            if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
-                quantized_output, scale_output = builder.create_tuple_get_item_nodes(mla_node)
-                scale_output = builder.create_cast_node(
-                    scale_output, ScalarType.float32, backend=Backend.EV
-                )
-                builder.create_tuple_node([quantized_output, scale_output])
-            else:
-                _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
-        net = builder.finish(self.model_name)
-        return net
+            outputs = [vision_output, vision_scale]
+        return graph.finish(outputs)
 
     def _build_sima_vision_tower(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
@@ -716,38 +699,19 @@ class StandardVisionLayerModel(BaseModel):
             f"{base_name}.v_proj", input_node, num_heads, self.cfg.vm_cfg.seq_len
         )
 
-        attn_outputs = list()
-        for i, scaled_q_proj, k_proj, v_proj in zip(
-            range(num_heads), scaled_q_projs, k_projs, v_projs
-        ):
-            attn_weights = builder.create_einsum_node(
-                scaled_q_proj, k_proj, equation="nhwc,nhqc->nhwq", layout="NHWC",
-            )
-
-            softmax = builder.create_softmax_node(attn_weights, axis=3)
-
-            attn_outputs.append(
-                builder.create_einsum_node(
-                    softmax, v_proj, equation="nhwc,nhcq->nhwq", layout="NHWC",
-                )
-            )
+        graph = ModelGraph.from_builder(self, builder)
+        attn_outputs = [
+            graph.attention(query, key, value)
+            for query, key, value in zip(scaled_q_projs, k_projs, v_projs)
+        ]
         return build_merge_heads_and_matmul(
             builder, self.get_hf_param, self.check_hf_param,
             f"{base_name}.out_proj", attn_outputs, num_heads
         )
 
     def _build_sima_encoder_mlp(self, builder, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
-        fc1 = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.fc1", input_node
-        )
-        act = build_activation(
-            builder, fc1, self.cfg.vm_cfg.hidden_act, quantizable
-        )
-        fc2 = build_conv(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{base_name}.fc2", act)
-        return fc2
+        graph = ModelGraph.from_builder(self, builder)
+        return graph.mlp(base_name, input_node, self.cfg.vm_cfg.hidden_act)
 
     def _build_sima_rms_norm_with_offset(
         self, builder, base_name: str, input_node: NodeOrHandle, epsilon: float, weight_offset: float

@@ -2,15 +2,9 @@ import numpy as np
 
 from dataclasses import dataclass
 
-from afe.apis.defines import gen2_target
-from afe.backends.backends import Backend
-from afe.ir.defines import Status, get_expected_tensor_value
-from afe.ir.serializer import save_awesomenet
-from afe.ir.tensor_type import ScalarType, TensorType
-
-from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
+from sima_lmm.model.model_graph import ModelGraph
+from sima_lmm.model.base import BaseModel, LayerConfiguration
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, activation_type, activation_dtype
 
 
 @dataclass
@@ -43,56 +37,23 @@ class WhisperDecoderCacheModel(BaseModel):
         if self.use_future_token_mask and self.num_tokens == 1:
             shapes["attn_mask"] = (1, 1, 1, self.token_idx + 1)
 
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        model_inputs = [
-            builder.create_placeholder_node(name, TensorType(activation_type(quantizable), shape))
-            for name, shape in shapes.items()
-        ]
-        builder.begin_subnet(model_inputs)
-        inputs = [
-            builder.create_placeholder_node(
-                f"MLA_0/{name}", TensorType(activation_type(quantizable), shape)
-            )
-            for name, shape in shapes.items()
-        ]
-        outputs = self._build_sima_nodes(builder, inputs, quantizable)
-        if len(outputs) > 1:
-            builder.create_tuple_node(outputs)
-        mla = builder.finish_subnet("MLA_0")
-        outputs = builder.create_tuple_get_item_nodes(mla) if len(outputs) > 1 else [mla]
-        for i, output in enumerate(outputs):
-            if get_expected_tensor_value(output.get_type().output).scalar == ScalarType.bfloat16:
-                outputs[i] = builder.create_cast_node(output, ScalarType.float32, backend=Backend.EV)
-        if len(outputs) > 1:
-            builder.create_tuple_node(outputs)
-        net = builder.finish(self.model_name)
-        save_awesomenet(
-            net, self.model_name + (".fp32" if quantizable else ""),
-            str(self.sima_model_sdk_path),
-        )
+        graph = ModelGraph(self, shapes, quantizable)
+        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        graph.save(outputs)
 
     def _build_sima_nodes(self, builder, inputs, quantizable):
-        key, value = [
-            builder.create_slice_concat_node(
-                node, axis=1, split_axis=3, split_block=self.cfg.decoder_attention_heads,
-                split_repeat=1,
-            )
-            for node in inputs[1:3]
-        ]
-        scores = builder.create_einsum_node(inputs[0], key, "nhwc,nhqc->nhwq")
+        graph = ModelGraph.from_builder(self, builder)
+        key, value = [graph.split_heads(node, self.cfg.decoder_attention_heads) for node in inputs[1:3]]
+        mask = None
         if self.num_tokens > 1:
             mask = np.zeros((1, 1, self.num_tokens, self.token_idx + self.num_tokens), np.float32)
             for i in range(self.num_tokens):
-                mask[:, :, i, self.token_idx + i + 1:] = np.finfo(np.float32).min
-            mask = builder.create_constant_node(mask.astype(activation_dtype(quantizable)))
-            scores = builder.create_add_node(scores, mask)
+                mask[:, :, i, self.token_idx + i + 1 :] = np.finfo(np.float32).min
+            mask = graph.constant(mask)
         elif self.use_future_token_mask:
-            scores = builder.create_add_node(scores, inputs[3])
-        probs = builder.create_softmax_node(scores, axis=3)
-        attn = builder.create_einsum_node(probs, value, "nhwc,nhcq->nhwq")
-        return [builder.create_slice_concat_node(
-            attn, axis=3, split_axis=1, split_block=self.cfg.decoder_attention_heads, split_repeat=1
-        )]
+            mask = inputs[3]
+        attn = graph.attention(inputs[0], key, value, mask=mask)
+        return [graph.merge_heads(attn)]
 
     def gen_onnx_files(self):
         base_name = f"model.decoder.tokens.{self.token_idx}"
@@ -154,15 +115,3 @@ class WhisperDecoderCacheModel(BaseModel):
             split_axis=2, concat_axis=1
         )
         return [reshape_bmm2]
-
-    def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}
-
-    def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}

@@ -2,17 +2,9 @@ from dataclasses import dataclass
 from typing import ClassVar
 import numpy as np
 
-from afe.apis.defines import gen2_target
-from afe.backends.backends import Backend
-from afe.ir.defines import Status, get_expected_tensor_value
-from afe.ir.serializer import save_awesomenet
-from afe.ir.tensor_type import ScalarType, TensorType
-
-from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
+from sima_lmm.model.model_graph import ModelGraph
+from sima_lmm.model.base import BaseModel, LayerConfiguration
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, activation_type, activation_dtype, build_conv, build_two_stage_layer_norm,
-)
 
 
 @dataclass
@@ -46,54 +38,20 @@ class WhisperDecoderPreModel(BaseModel):
         if self.layer_idx == 0:
             shapes["embed_positions"] = shape
 
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        model_inputs = [
-            builder.create_placeholder_node(name, TensorType(activation_type(quantizable), shape))
-            for name, shape in shapes.items()
-        ]
-        builder.begin_subnet(model_inputs)
-        inputs = [
-            builder.create_placeholder_node(
-                f"MLA_0/{name}", TensorType(activation_type(quantizable), shape)
-            )
-            for name, shape in shapes.items()
-        ]
-        outputs = self._build_sima_nodes(builder, inputs, quantizable)
-        if len(outputs) > 1:
-            builder.create_tuple_node(outputs)
-        mla = builder.finish_subnet("MLA_0")
-        outputs = builder.create_tuple_get_item_nodes(mla) if len(outputs) > 1 else [mla]
-        for i, output in enumerate(outputs):
-            if get_expected_tensor_value(output.get_type().output).scalar == ScalarType.bfloat16:
-                outputs[i] = builder.create_cast_node(output, ScalarType.float32, backend=Backend.EV)
-        if len(outputs) > 1:
-            builder.create_tuple_node(outputs)
-        net = builder.finish(self.model_name)
-        save_awesomenet(
-            net, self.model_name + (".fp32" if quantizable else ""),
-            str(self.sima_model_sdk_path),
-        )
+        graph = ModelGraph(self, shapes, quantizable)
+        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        graph.save(outputs)
 
     def _build_sima_nodes(self, builder, inputs, quantizable):
+        graph = ModelGraph.from_builder(self, builder)
         name = f"model.decoder.layers.{self.layer_idx}"
         residual = builder.create_add_node(*inputs) if self.layer_idx == 0 else inputs[0]
-        norm = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            f"{name}.self_attn_layer_norm", residual, axis=-1, epsilon=float(np.float32(1e-5)),
-        )
+        norm = graph.layer_norm(f"{name}.self_attn_layer_norm", residual)
         query, key, value = [
-            build_conv(
-                builder, self.get_hf_param, self.check_hf_param, f"{name}.self_attn.{proj}_proj", norm
-            )
-            for proj in ("q", "k", "v")
+            graph.linear(f"{name}.self_attn.{proj}_proj", norm) for proj in ("q", "k", "v")
         ]
-        scale = builder.create_constant_node(
-            np.array(self.cfg.decoder_head_dim ** -0.5, dtype=activation_dtype(quantizable))
-        )
-        query = builder.create_mul_node(query, scale)
-        query = builder.create_slice_concat_node(
-            query, axis=1, split_axis=3, split_block=self.cfg.decoder_attention_heads, split_repeat=1
-        )
+        query = builder.create_mul_node(query, graph.constant(self.cfg.decoder_head_dim**-0.5))
+        query = graph.split_heads(query, self.cfg.decoder_attention_heads)
         outputs = [query, key, value]
         if self.layer_idx == 0:
             outputs.append(residual)
@@ -172,15 +130,3 @@ class WhisperDecoderPreModel(BaseModel):
         if self.layer_idx == 0:
             output_nodes.append(residual)
         return output_nodes
-
-    def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}
-
-    def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}

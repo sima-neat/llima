@@ -13,27 +13,21 @@ import numpy as np
 
 from dataclasses import dataclass, replace
 
-from afe.apis.defines import gen2_target
-from afe.backends.backends import Backend
 from afe.ir import build_node
-from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.execute import create_node_executor
 from afe.ir.net import AwesomeNet
 from afe.ir.operations import AddActivationOp, ConvAddActivationOp
-from afe.ir.serializer import save_awesomenet
-from afe.ir.tensor_type import ScalarType, TensorType
+from afe.ir.tensor_type import ScalarType
 
 from sima_lmm.hf.hf_transformer import find_file
-from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
+from sima_lmm.model.model_graph import ModelGraph
+from sima_lmm.model.base import BaseModel, LayerConfiguration
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.whisper_decoder_cache_model import WhisperDecoderCacheModel
 from sima_lmm.model.whisper_decoder_post_model import WhisperDecoderPostModel
 from sima_lmm.model.whisper_decoder_pre_model import WhisperDecoderPreModel
 from sima_lmm.tokenizer.whisper_tokenizer import get_tokenizer
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, activation_type, activation_dtype, build_conv,
-    build_two_stage_layer_norm, create_channel_slice,
-)
+from sima_lmm.model.sima_builder import create_channel_slice
 
 
 @dataclass
@@ -52,35 +46,9 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
     ):
         shapes = {"audio_features": (1, 1, self.cfg.max_source_positions, self.cfg.d_model)}
 
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        model_inputs = [
-            builder.create_placeholder_node(name, TensorType(activation_type(quantizable), shape))
-            for name, shape in shapes.items()
-        ]
-        builder.begin_subnet(model_inputs)
-        inputs = [
-            builder.create_placeholder_node(
-                f"MLA_0/{name}", TensorType(activation_type(quantizable), shape)
-            )
-            for name, shape in shapes.items()
-        ]
-        outputs = self._build_sima_nodes(builder, inputs, quantizable)
-        if len(outputs) > 1:
-            builder.create_tuple_node(outputs)
-        mla = builder.finish_subnet("MLA_0")
-        if quantizable:
-            self._fold_sot_prefix(mla.ir)
-        outputs = builder.create_tuple_get_item_nodes(mla) if len(outputs) > 1 else [mla]
-        for i, output in enumerate(outputs):
-            if get_expected_tensor_value(output.get_type().output).scalar == ScalarType.bfloat16:
-                outputs[i] = builder.create_cast_node(output, ScalarType.float32, backend=Backend.EV)
-        if len(outputs) > 1:
-            builder.create_tuple_node(outputs)
-        net = builder.finish(self.model_name)
-        save_awesomenet(
-            net, self.model_name + (".fp32" if quantizable else ""),
-            str(self.sima_model_sdk_path),
-        )
+        graph = ModelGraph(self, shapes, quantizable)
+        outputs = self._build_sima_nodes(graph.raw, list(graph.inputs.values()), quantizable)
+        graph.save(outputs, transform_subnet=self._fold_sot_prefix if quantizable else None)
 
     @staticmethod
     def _fold_sot_prefix(net: AwesomeNet):
@@ -116,8 +84,12 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
         net.nodes = {name: net.nodes[name] for name in net.execution_order}
 
     def _build_sima_nodes(self, builder, inputs, quantizable):
+        graph = ModelGraph.from_builder(self, builder)
         tokenizer = get_tokenizer(
-            multilingual=True, num_languages=self.cfg.num_languages, language=None, task=None,
+            multilingual=True,
+            num_languages=self.cfg.num_languages,
+            language=None,
+            task=None,
             hf_tokenizer_json_file=find_file(self.hf_model.hf_cache, "tokenizer.json"),
         )
         language_ids = tokenizer.all_language_tokens
@@ -126,35 +98,41 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             raise RuntimeError("Whisper language tokens must be contiguous.")
         hidden = []
         for name, index in (("embed_tokens", tokenizer.sot), ("embed_positions", 0)):
-            weight = self.get_hf_param(f"model.decoder.{name}.weight")[index]
-            hidden.append(builder.create_constant_node(
-                weight.reshape(1, 1, 1, self.cfg.d_model).astype(activation_dtype(quantizable))
-            ))
+            weight = graph.parameter(f"model.decoder.{name}.weight")[index]
+            hidden.append(graph.constant(weight.reshape(1, 1, 1, self.cfg.d_model)))
         cache = WhisperDecoderCacheModel(
-            self.cfg, self.model_name, num_tokens=1, token_idx=0, use_future_token_mask=False,
+            self.cfg,
+            self.model_name,
+            num_tokens=1,
+            token_idx=0,
+            use_future_token_mask=False,
         )
         for idx in range(self.cfg.decoder_layers):
             pre = WhisperDecoderPreModel(
-                self.cfg, self.model_name, hf_model=self.hf_model, num_tokens=1, layer_idx=idx,
+                self.cfg,
+                self.model_name,
+                hf_model=self.hf_model,
+                num_tokens=1,
+                layer_idx=idx,
             )
             pre_outputs = pre._build_sima_nodes(builder, hidden, quantizable)
             residual = pre_outputs[pre.positioned_residual_output_idx] if idx == 0 else hidden[0]
             attn = cache._build_sima_nodes(builder, pre_outputs, quantizable)[0]
             post = WhisperDecoderPostModel(
-                self.cfg, self.model_name, hf_model=self.hf_model, num_tokens=1, layer_idx=idx,
-                skip_encoder_kv_proj=False, output_encoder_kv_cache=False,
+                self.cfg,
+                self.model_name,
+                hf_model=self.hf_model,
+                num_tokens=1,
+                layer_idx=idx,
+                skip_encoder_kv_proj=False,
+                output_encoder_kv_cache=False,
             )
             output, _, _ = post._build_sima_transformer(
                 builder, [residual, attn, inputs[0]], quantizable
             )
             hidden = [output]
-        norm = build_two_stage_layer_norm(
-            builder, self.get_hf_param, self.check_hf_param,
-            "model.decoder.layer_norm", hidden[0], axis=-1, epsilon=float(np.float32(1e-5)),
-        )
-        logits = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, "model.decoder.embed_tokens", norm
-        )
+        norm = graph.layer_norm("model.decoder.layer_norm", hidden[0])
+        logits = graph.linear("model.decoder.embed_tokens", norm)
         language_logits = create_channel_slice(builder, logits, start, start + count)
         return [builder.create_argmax_node(language_logits, ScalarType.int32), logits]
 
@@ -306,15 +284,3 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             output_names=["detected_language_index"]
         )
         return [detected_language_index, full_lm_head_logits]
-
-    def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}
-
-    def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        """
-        Get the DRAM layouts to use for this model's output on the MLA.
-        """
-        return {}

@@ -1,19 +1,13 @@
 import numpy as np
 from dataclasses import dataclass
 
-from afe.backends.backends import Backend
-from afe.ir.serializer import save_awesomenet
-from afe.ir.defines import Status
-from afe.apis.defines import gen2_target, TensorDRAMLayout
 from afe.ir.tensor_type import TensorType, ScalarType
 
-from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerConfiguration
+from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv, build_conv_from_dense_with_lora,
-    build_activation, activation_type, activation_dtype, create_channel_slice,
-)
+from sima_lmm.model.sima_builder import activation_type, create_channel_slice
 
 
 @dataclass
@@ -168,7 +162,7 @@ class LanguageConvModel(LanguagePartBaseModel):
         base_name = f"{base_layer}.conv"
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         g = self._build_sima_nodes(base_layer, base_name, quantizable, merged_lora)
-        save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
+        save_model_graph(self, g, quantizable)
 
     def _build_sima_nodes(self, base_layer: str, base_name: str, quantizable: bool, merged_lora: bool):
         hidden_size = self.cfg.lm_cfg.hidden_size
@@ -177,62 +171,28 @@ class LanguageConvModel(LanguagePartBaseModel):
         scale_shape = (1, 1, self.num_tokens, 1)
         cache_shape = (1, 1, self.cfg.lm_cfg.conv_L_cache - 1, hidden_size)
 
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-
-        model_input_input = builder.create_placeholder_node(
-            "input",
-            TensorType(
-                ScalarType.int8
-                if self.uses_quantized_input_embeddings and self.layer_idx == 0
-                else activation_type(quantizable),
-                input_shape,
-            ),
-        )
+        input_specs = {"input": input_shape}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            model_input_scale = builder.create_placeholder_node(
-                "input_scale", TensorType(activation_type(quantizable), scale_shape)
-            )
-        model_input_conv_cache = builder.create_placeholder_node(
-            "conv_cache", TensorType(activation_type(quantizable), cache_shape)
-        )
-
-        subnet_inputs = [model_input_input]
+            input_specs["input"] = TensorType(ScalarType.int8, input_shape)
+            input_specs["input_scale"] = scale_shape
+        input_specs["conv_cache"] = cache_shape
+        graph = ModelGraph(self, input_specs, quantizable)
+        builder = graph.raw
+        mla_input_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            subnet_inputs.append(model_input_scale)
-        subnet_inputs.append(model_input_conv_cache)
-        builder.begin_subnet(subnet_inputs)
-
-        mla_input_input = builder.create_placeholder_node(
-            "input",
-            TensorType(
-                ScalarType.int8
-                if self.uses_quantized_input_embeddings and self.layer_idx == 0
-                else activation_type(quantizable),
-                input_shape,
-            ),
-        )
+            mla_input_scale = graph.inputs["input_scale"]
+        mla_input_conv_cache = graph.inputs["conv_cache"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            mla_input_scale = builder.create_placeholder_node(
-                "input_scale", TensorType(activation_type(quantizable), scale_shape)
-            )
-        mla_input_conv_cache = builder.create_placeholder_node(
-            "conv_cache", TensorType(activation_type(quantizable), cache_shape)
-        )
-        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            residual = builder.create_dynamic_dequant_node(
-                mla_input_input, mla_input_scale
-            )
+            residual = graph.dequantize(mla_input_input, mla_input_scale)
         else:
             residual = mla_input_input
 
-        norm_input = self._build_sima_rms_norm(
-            builder, f"{base_layer}.operator_norm", residual
-        )
+        norm_input = self._build_sima_rms_norm(builder, f"{base_layer}.operator_norm", residual)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "in_proj")
-        in_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.in_proj", norm_input, lora_rank=lora_rank, merged_lora=merged_lora
+        in_proj = graph.linear(
+            f"{base_name}.in_proj", norm_input, lora_rank=lora_rank, merged_lora=merged_lora
         )
 
         b = create_channel_slice(builder, in_proj, 0, hidden_size)
@@ -249,51 +209,26 @@ class LanguageConvModel(LanguagePartBaseModel):
             [2],
         )
 
-        conv_out = build_conv(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.conv", tail,
-            is_fc=False, is_depthwise=True
-        )
+        conv_out = graph.conv(f"{base_name}.conv", tail, is_depthwise=True)
 
         gated = builder.create_mul_node(conv_out, c)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "out_proj")
-        out_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.out_proj", gated, lora_rank=lora_rank, merged_lora=merged_lora
+        out_proj = graph.linear(
+            f"{base_name}.out_proj", gated, lora_rank=lora_rank, merged_lora=merged_lora
         )
 
         add1 = builder.create_add_node(residual, out_proj)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
-            _ = builder.create_tuple_node([add1, conv_cache_out])
+            outputs = [add1, conv_cache_out]
         else:
             rms_norm2 = self._build_sima_rms_norm(builder, f"{base_layer}.ffn_norm", add1)
             mlp = self._build_sima_mlp(
                 builder, f"{base_layer}.feed_forward", [rms_norm2], quantizable, merged_lora
             )
             add2 = builder.create_add_node(add1, mlp)
-            _ = builder.create_tuple_node([add2, conv_cache_out])
+            outputs = [add2, conv_cache_out]
 
-        mla_node = builder.finish_subnet("MLA_0")
-
-        tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-        if activation_type(quantizable) == ScalarType.float32:
-            builder.create_tuple_node(tuple_items)
-        else:
-            builder.create_tuple_node(
-                [
-                    builder.create_cast_node(item, ScalarType.float32, backend=Backend.EV)
-                    for item in tuple_items
-                ]
-            )
-
-        net = builder.finish(self.model_name)
-        return net
-
-    def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        """Use the default HWC16 tessellation for every fused conv input."""
-        return {}
-
-    def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        """Use the default HWC16 tessellation for every fused conv output."""
-        return {}
+        return graph.finish(outputs)

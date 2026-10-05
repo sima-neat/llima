@@ -1,21 +1,16 @@
 import numpy as np
 from dataclasses import dataclass
 
-from afe.apis.defines import gen2_target, TensorDRAMLayout
-from afe.backends.backends import Backend
-from afe.ir.serializer import save_awesomenet
-from afe.ir.defines import Status, get_expected_tensor_value
+from afe.apis.defines import TensorDRAMLayout
 from afe.ir.node import AwesomeNode
 from afe.ir.tensor_type import TensorType, ScalarType
-from afe.ir.build_node import NodeHandle, NodeOrHandle
+from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerConfiguration
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype,
-    create_channel_slice
-)
+from sima_lmm.model.sima_builder import SimaBuilder, activation_dtype
 from sima_lmm.config.vlm_config import VlmArchType
 
 
@@ -398,7 +393,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         g = self._build_sima_nodes(base_name, quantizable, merged_lora)
-        save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
+        save_model_graph(self, g, quantizable)
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
@@ -407,65 +402,24 @@ class LanguagePreModel(LanguagePartBaseModel):
             1,
             1,
             self.num_tokens,
-            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2
+            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2,
         )
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-
+        input_specs = {"input": input_shape}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            input_dtype = ScalarType.int8
-        else:
-            input_dtype = activation_type(quantizable)
-        model_input_input = builder.create_placeholder_node(
-            "input", TensorType(input_dtype, input_shape)
-        )
-        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            model_input_scale = builder.create_placeholder_node(
-                "input_scale", TensorType(activation_type(quantizable), scale_shape)
-            )
-        # EAGLE3 draft model has an extra hidden_states input
+            input_specs["input"] = TensorType(ScalarType.int8, input_shape)
+            input_specs["input_scale"] = scale_shape
         if self.is_draft:
-            model_input_hidden_states = builder.create_placeholder_node(
-                "hidden_states", TensorType(activation_type(quantizable), input_shape)
-            )
-        model_input_freq_real = builder.create_placeholder_node(
-            "freq_real", TensorType(activation_type(quantizable), freq_shape)
-        )
-        model_input_freq_imag = builder.create_placeholder_node(
-            "freq_imag", TensorType(activation_type(quantizable), freq_shape)
-        )
-
-        # MLA subgraph inputs are the same as the model inputs, except the node names are different
-        subnet_inputs = [model_input_input]
-        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            subnet_inputs.append(model_input_scale)
-        if self.is_draft:
-            subnet_inputs.append(model_input_hidden_states)
-        subnet_inputs.extend([model_input_freq_real, model_input_freq_imag])
-        builder.begin_subnet(subnet_inputs)
-        mla_input_input = builder.create_placeholder_node(
-            "MLA_0/input", TensorType(input_dtype, input_shape)
-        )
-        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            mla_input_scale = builder.create_placeholder_node(
-                "MLA_0/input_scale", TensorType(activation_type(quantizable), scale_shape)
-            )
-        # EAGLE3 draft model has an extra hidden_states input
-        if self.is_draft:
-            mla_input_hidden_states = builder.create_placeholder_node(
-                "MLA_0/hidden_states", TensorType(activation_type(quantizable), input_shape)
-            )
-        mla_input_freq_real = builder.create_placeholder_node(
-            "MLA_0/freq_real", TensorType(activation_type(quantizable), freq_shape)
-        )
-        mla_input_freq_imag = builder.create_placeholder_node(
-            "MLA_0/freq_imag", TensorType(activation_type(quantizable), freq_shape)
-        )
+            input_specs["hidden_states"] = input_shape
+        input_specs.update(freq_real=freq_shape, freq_imag=freq_shape)
+        graph = ModelGraph(self, input_specs, quantizable)
+        builder, inputs = graph.raw, graph.inputs
+        mla_input_input = inputs["input"]
+        mla_input_freq_real = inputs["freq_real"]
+        mla_input_freq_imag = inputs["freq_imag"]
 
         # Dequantize the selected embedding rows before the first layer consumes them.
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            rms_norm_in = builder.create_dynamic_dequant_node(
-                mla_input_input, mla_input_scale
-            )
+            rms_norm_in = graph.dequantize(mla_input_input, inputs["input_scale"])
         else:
             rms_norm_in = mla_input_input
 
@@ -474,20 +428,23 @@ class LanguagePreModel(LanguagePartBaseModel):
             if self.check_hf_param(f"{base_name}.operator_norm.weight")
             else f"{base_name}.input_layernorm"
         )
-        rms_norm = self._build_sima_rms_norm(
-            builder, norm_name, rms_norm_in
-        )
+        rms_norm = self._build_sima_rms_norm(builder, norm_name, rms_norm_in)
         # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
         if self.is_draft:
             hidden_states_norm = self._build_sima_rms_norm(
-                builder, f"{base_name}.hidden_norm", mla_input_hidden_states
+                builder, f"{base_name}.hidden_norm", inputs["hidden_states"]
             )
             attn_input = builder.create_concat_node([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
         mla_q_result = self._build_sima_attn_query(
-            builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real, mla_input_freq_imag,
-            quantizable, merged_lora
+            builder,
+            f"{base_name}.self_attn",
+            attn_input,
+            mla_input_freq_real,
+            mla_input_freq_imag,
+            quantizable,
+            merged_lora,
         )
         gate_out = None
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
@@ -497,128 +454,76 @@ class LanguagePreModel(LanguagePartBaseModel):
         output_nodes = [mla_q_out]
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
             mla_k_out = self._build_sima_attn_key(
-                builder, f"{base_name}.self_attn", attn_input, mla_input_freq_real,
-                mla_input_freq_imag, merged_lora
+                builder,
+                f"{base_name}.self_attn",
+                attn_input,
+                mla_input_freq_real,
+                mla_input_freq_imag,
+                merged_lora,
             )
             mla_v_out = self._build_sima_attn_value(
                 builder, f"{base_name}.self_attn", attn_input, merged_lora
             )
 
             if self.cfg.pipeline_cfg.quantize_kv_cache:
-                k_scale = builder.create_dynamic_quant_scale_node(mla_k_out, per_token_quant=True)
-                k_quant = builder.create_dynamic_quant_node(mla_k_out, k_scale)
-                v_scale = builder.create_dynamic_quant_scale_node(mla_v_out, per_token_quant=True)
-                v_quant = builder.create_dynamic_quant_node(mla_v_out, v_scale)
+                k_quant, k_scale = graph.quantize(mla_k_out)
+                v_quant, v_scale = graph.quantize(mla_v_out)
                 output_nodes.extend([k_quant, k_scale, v_quant, v_scale])
             else:
                 output_nodes.extend([mla_k_out, mla_v_out])
 
         if gate_out is not None:
             output_nodes.append(gate_out)
-        if len(output_nodes) > 1:
-            _ = builder.create_tuple_node(output_nodes)
-
-        mla_node = builder.finish_subnet("MLA_0")
-
-        if activation_type(quantizable) != ScalarType.float32:
-            if len(output_nodes) == 1:
-                builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
-            else:
-                tuple_items = builder.create_tuple_get_item_nodes(mla_node)
-                if (
-                    self.cfg.pipeline_cfg.quantize_kv_cache
-                    and not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx)
-                ):
-                    # Cast query and scale outputs, but not quantized K/V values.
-                    cast_items = [
-                        builder.create_cast_node(tuple_items[0], ScalarType.float32, backend=Backend.EV),  # mla_q_out
-                        tuple_items[1],  # k_quant (int8)
-                        builder.create_cast_node(tuple_items[2], ScalarType.float32, backend=Backend.EV),  # k_scale
-                        tuple_items[3],  # v_quant (int8)
-                        builder.create_cast_node(tuple_items[4], ScalarType.float32, backend=Backend.EV),  # v_scale
-                    ]
-                    if gate_out is not None:
-                        cast_items.append(
-                            builder.create_cast_node(tuple_items[5], ScalarType.float32, backend=Backend.EV)
-                        )
-                    builder.create_tuple_node(cast_items)
-                else:
-                    builder.create_tuple_node([
-                        builder.create_cast_node(x, ScalarType.float32, backend=Backend.EV)
-                        for x in tuple_items
-                    ])
-        net = builder.finish(self.model_name)
-        return net
+        return graph.finish(output_nodes)
 
     def _build_sima_rotary_emb(
-            self, builder: SimaBuilder,
-            data: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle
+        self, builder: SimaBuilder, data: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle
     ):
         """
         Create nodes that compute rotary embedding.
         """
-        layer_head_dim = self._head_dim
-        layer_rope_dimension_count = self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type)
-        half_rope_dim = layer_rope_dimension_count // 2
-        imag_start = layer_head_dim // 2 if self._is_proportional_rope_layer else half_rope_dim
-        imag_end = imag_start + half_rope_dim
-
-        real_in = create_channel_slice(builder, data, 0, half_rope_dim)
-        imag_in = create_channel_slice(builder, data, imag_start, imag_end)
-        real_out = builder.create_subtract_node(
-            builder.create_mul_node(real_in, freq_real),
-            builder.create_mul_node(imag_in, freq_imag)
+        graph = ModelGraph.from_builder(self, builder)
+        return graph.rope(
+            data,
+            freq_real,
+            freq_imag,
+            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type),
+            proportional=self._is_proportional_rope_layer,
         )
-        imag_out = builder.create_add_node(
-            builder.create_mul_node(real_in, freq_imag),
-            builder.create_mul_node(imag_in, freq_real)
-        )
-        if self._is_proportional_rope_layer:
-            mid1 = create_channel_slice(builder, data, half_rope_dim, layer_head_dim // 2)
-            mid2 = create_channel_slice(builder, data, imag_end, layer_head_dim)
-            return builder.create_concat_node([real_out, mid1, imag_out, mid2], 3)
-
-        rotary_out = builder.create_concat_node([real_out, imag_out], 3)
-        if layer_rope_dimension_count == layer_head_dim:
-            return rotary_out
-
-        tail = create_channel_slice(builder, data, layer_rope_dimension_count, layer_head_dim)
-        return builder.create_concat_node([rotary_out, tail], 3)
 
     def _build_sima_attn_query(
-            self, builder: SimaBuilder, base_name: str,
-            rms_norm: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle,
-            quantizable: bool, merged_lora: bool = False
+        self,
+        builder: SimaBuilder,
+        base_name: str,
+        rms_norm: NodeOrHandle,
+        freq_real: NodeOrHandle,
+        freq_imag: NodeOrHandle,
+        quantizable: bool,
+        merged_lora: bool = False,
     ) -> AwesomeNode:
+        graph = ModelGraph.from_builder(self, builder)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "q_proj")
-        q_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.q_proj", rms_norm,
-            lora_rank, merged_lora=merged_lora,
+        q_proj = graph.linear(
+            f"{base_name}.q_proj",
+            rms_norm,
+            merged_lora=merged_lora,
             q_size=self._q_size,
-            kv_size=self._kv_size
-         )
+            kv_size=self._kv_size,
+            lora_rank=lora_rank,
+        )
 
         gate_out = None
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            q_fused = builder.create_slice_concat_node(
-                q_proj, axis=1, split_axis=3,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
-            )
+            q_fused = graph.split_heads(q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads)
             head_dim = self.cfg.lm_cfg.attn_cfg.head_dim
             gate_out = builder.create_slice_node(q_fused, [head_dim], [2 * head_dim], [1], [3])
             q_proj = builder.create_slice_node(q_fused, [0], [head_dim], [1], [3])
-            gate_out = builder.create_slice_concat_node(
-                gate_out, axis=3, split_axis=1,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
-            )
+            gate_out = graph.merge_heads(gate_out)
             reshape1 = q_proj
         elif self.cfg.lm_cfg.attn_cfg.num_attention_heads > 1:
-            reshape1 = builder.create_slice_concat_node(
-                q_proj, axis=1, split_axis=3,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
-            )
+            reshape1 = graph.split_heads(q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads)
         else:
             reshape1 = q_proj
 
@@ -631,40 +536,40 @@ class LanguagePreModel(LanguagePartBaseModel):
         if q_norm_name:
             reshape1 = self._build_sima_rms_norm(builder, q_norm_name, reshape1)
 
-        rotary_emb = self._build_sima_rotary_emb(
-            builder, reshape1, freq_real, freq_imag
-        )
+        rotary_emb = self._build_sima_rotary_emb(builder, reshape1, freq_real, freq_imag)
 
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
             rotary_emb = builder.create_mul_node(
                 rotary_emb,
-                builder.create_constant_node(
-                    np.array([self._head_dim**-0.5], dtype=activation_dtype(quantizable))
-                )
+                graph.constant(np.array([self._head_dim**-0.5], dtype=activation_dtype(quantizable))),
             )
         if gate_out is not None:
             return rotary_emb, gate_out
         return rotary_emb
 
     def _build_sima_attn_key(
-            self, builder: SimaBuilder, base_name: str,
-            rms_norm: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle,
-            merged_lora: bool = False
+        self,
+        builder: SimaBuilder,
+        base_name: str,
+        rms_norm: NodeOrHandle,
+        freq_real: NodeOrHandle,
+        freq_imag: NodeOrHandle,
+        merged_lora: bool = False,
     ) -> AwesomeNode:
+        graph = ModelGraph.from_builder(self, builder)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "k_proj")
-        k_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.k_proj", rms_norm,
-            lora_rank, merged_lora=merged_lora,
+        k_proj = graph.linear(
+            f"{base_name}.k_proj",
+            rms_norm,
+            merged_lora=merged_lora,
             q_size=self._q_size,
-            kv_size=self._kv_size
+            kv_size=self._kv_size,
+            lora_rank=lora_rank,
         )
 
-        reshape1 = builder.create_slice_concat_node(
-            k_proj, axis=1, split_axis=3,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads, split_repeat=1
-        )
+        reshape1 = graph.split_heads(k_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
 
         k_norm_name = None
         for suffix in ("k_layernorm", "k_norm"):
@@ -675,40 +580,31 @@ class LanguagePreModel(LanguagePartBaseModel):
         if k_norm_name:
             reshape1 = self._build_sima_rms_norm(builder, k_norm_name, reshape1)
 
-        rotary_emb = self._build_sima_rotary_emb(
-            builder, reshape1, freq_real, freq_imag
-        )
+        rotary_emb = self._build_sima_rotary_emb(builder, reshape1, freq_real, freq_imag)
         return rotary_emb
 
 
     def _build_sima_attn_value(
-            self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, merged_lora: bool = False
+        self, builder: SimaBuilder, base_name: str, input_node: NodeOrHandle, merged_lora: bool = False
     ) -> AwesomeNode:
+        graph = ModelGraph.from_builder(self, builder)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "v_proj")
-        v_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.v_proj", input_node,
-            lora_rank, merged_lora=merged_lora,
+        v_proj = graph.linear(
+            f"{base_name}.v_proj",
+            input_node,
+            merged_lora=merged_lora,
             q_size=self._q_size,
-            kv_size=self._kv_size
+            kv_size=self._kv_size,
+            lora_rank=lora_rank,
         )
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
             # Strided cache stores KV heads explicitly instead of flattened into kv_size.
-            return builder.create_slice_concat_node(
-                v_proj, axis=1, split_axis=3,
-                split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                split_repeat=1
-            )
+            return graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
 
         # Gemma4 applies value RMS norm per KV head before writing V to cache.
-        split = builder.create_slice_concat_node(
-            v_proj,
-            axis=1,
-            split_axis=3,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            split_repeat=1,
-        )
+        split = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
         split = self._build_sima_rms_norm(
             builder,
             f"{base_name}.v_norm",
@@ -718,11 +614,6 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
         return split
 
-    def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """

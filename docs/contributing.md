@@ -126,6 +126,102 @@ Compiler changes normally touch `sima_lmm/config/whisper_config.py`,
 test documented in `tests/README.md` and representative audio on Modalix. This
 is a Whisper-specific path, not a general ASR architecture framework.
 
+### Native graph components
+
+Use `ModelGraph` from `sima_lmm/model/model_graph.py`. It binds the component's
+source weights, precision and output path once. A component's implementation can
+then focus on its topology:
+
+```python
+from sima_lmm.model.model_graph import ModelGraph
+
+def gen_model_sdk_files_directly(self, layer_cfg, log_level, quantizable):
+    graph = ModelGraph(self, {"hidden": (1, 1, self.num_tokens, self.cfg.d_model)}, quantizable)
+    hidden = graph.layer_norm("model.norm", graph.inputs["hidden"])
+    output = graph.mlp("model.mlp", hidden, "gelu", residual=graph.inputs["hidden"])
+    graph.save([output])
+```
+
+Shapes infer FP32 inputs for `quantizable=True` (a floating graph to quantize
+later), or BF16 for `False` (a direct graph using the source weight precision).
+Use `TensorType(ScalarType.int8, shape)` for integer caches. Input and output
+order follows the supplied specifications; shapes and output types come from
+AFE's inference. `constant()` casts floating data to the activation precision;
+use `dtype=np.int32`, for example, when integer constants require a specific
+width. Node names follow AFE's deterministic creation counter.
+
+`save()` finishes the MLA subnet and creates outer-graph output tuples, preserves integer
+outputs, casts BF16 outputs to FP32 on EV, and writes the standard artifact name
+(`.fp32` for a floating graph). Use `finish()` instead to obtain the completed
+network. Both accept `transform_subnet` for model-specific rewrites before the
+outer outputs are extracted. `ModelGraph.from_builder(self, builder)` binds the
+same operations inside an existing subnet without creating new inputs.
+
+Common operations include `linear`, `conv`, `layer_norm`, `rms_norm`,
+`activation`, `mlp`, `rope`, `split_heads`, `merge_heads`, `quantize`, and
+`dequantize`. A gated MLP uses
+`projections=("gate_proj", "up_proj", "down_proj")`; the default is
+`("fc1", "fc2")`. `rms_norm(None, input, epsilon=...)` infers weightless channels.
+RoPE supports full, partial and proportional split-half rotation.
+
+`linear("model.proj", input)` resolves `model.proj.weight` and its optional bias,
+converts OI source weights to SiMa's layout, and retains packed weight values,
+scales, nonaligned group sizes and relocation metadata. `conv()` infers OIW or
+OIHW source layouts. `WeightOptions` documents explicit source-name, layout,
+weight/scale/bias transform and relocation overrides. When slicing grouped
+weights, supply the corresponding `scale_process_func`; groups must retain the
+checkpoint's actual size. LoRA rank and merged-adapter behavior are explicit
+arguments to `linear()` and `mlp()`.
+
+For multi-head attention, `project_heads()` preserves the existing MLA channel
+padding and packed-versus-separate-head selection; `project_merged_heads()`
+merges those outputs before projecting. Scale queries during projection:
+
+```python
+queries = graph.project_heads("attn.q_proj", hidden, heads, scale=head_dim ** -0.5)
+keys = graph.project_heads("attn.k_proj", hidden, heads)
+values = graph.project_heads("attn.v_proj", hidden, heads)
+outputs = [graph.attention(q, k, v) for q, k, v in zip(queries, keys, values)]
+output = graph.project_merged_heads("attn.out_proj", outputs, heads)
+```
+
+For cross-attention, pass the same `query_len` and `kv_len` to all three
+projections. `attention()` accepts an additive `mask` and assumes queries are
+already scaled.
+
+`graph.einsum(equation, lhs, rhs)` supports the following NHWC contractions,
+including renamed labels and whitespace:
+
+| Equation | MLA transpose flags (A, B) |
+| --- | --- |
+| `nhwc,nhcq->nhwq` | false, false |
+| `nhwc,nhqc->nhwq` | false, true |
+| `nhcw,nhcq->nhwq` | true, false |
+| `nhcw,nhqc->nhwq` | true, true |
+
+Each creates an MLA `BatchMatmulOp`. Unsupported equations, mismatched scalar
+or contraction dimensions, and non-singleton head mismatches raise `ValueError`;
+there is no alternative backend fallback. Batches must match. Heads may broadcast
+from one. Grouped-query head repetition uses the raw batch-matmul operation
+because its semantics differ from NumPy `einsum`.
+
+**Raw escape hatch:** use `graph.raw`, the original AFE `SimaBuilder`, for
+exceptional topology (for example grouped-query BMM, channel selection, or
+model-specific softcapping). Nodes created through either API can be mixed.
+Graphs with multiple MLA subnets can retain the raw lifecycle and bind common
+operations with `from_builder()`.
+
+Tessellation is inferred centrally in `sima_analysis.get_tessellate_parameters()`:
+HWC16 layout, automatic tile sizes and deterministic persistent buffer names.
+Ordinary components inherit empty overrides from `BaseModel`. Exceptional
+layouts, such as strided KV caches, override the existing
+`get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` methods;
+keys are tensor indices (negative indices count from the end).
+
+Whisper components, all native language graph parts and the standard vision tower
+show this API in use; their attention, MLP and rotary helpers share the same
+implementations.
+
 ## Testing
 
 Choose tests by failure surface. A build does not replace behavioral

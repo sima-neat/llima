@@ -213,7 +213,7 @@ jobs:
           set -euo pipefail
           test_stage="${RUNNER_TEMP}/llima-compiler-tests"
           junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
-          expected_test_count=128
+          expected_test_count=170
 
           rm -rf "${test_stage}"
           mkdir -p "${test_stage}"

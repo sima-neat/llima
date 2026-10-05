@@ -2,6 +2,9 @@ import math
 import numpy as np
 from typing import Callable, Sequence
 
+from sima_utils.common import Platform
+
+from afe.apis.defines import gen2_target
 from afe.backends.backends import Backend
 import afe.ir.attributes as attributes
 from afe.ir.attributes import ConvAttrs
@@ -21,6 +24,58 @@ from sima_lmm.utils import (
 
 
 bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
+
+
+def create_model_graph(
+    input_specs: dict[str, tuple[int, ...] | TensorType], quantizable: bool,
+) -> tuple[SimaBuilder, dict[str, AwesomeNode]]:
+    """Create model and MLA_0 inputs in specification order.
+
+    Shapes use the graph's activation type; TensorType specifications override
+    it for inputs such as INT8 caches. The returned builder is the raw AFE API.
+    """
+    types = {}
+    for name, spec in input_specs.items():
+        shape = spec.shape if isinstance(spec, TensorType) else spec
+        if (not isinstance(name, str) or not name or not shape
+                or any(not isinstance(dim, int) or dim <= 0 for dim in shape)):
+            raise ValueError(f"Invalid model input {name!r}: expected a name and positive static dimensions, got {shape}")
+        tensor_type = spec if isinstance(spec, TensorType) else TensorType(activation_type(quantizable), shape)
+        types[name] = tensor_type
+    builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
+    outer_inputs = [builder.create_placeholder_node(name, spec) for name, spec in types.items()]
+    builder.begin_subnet(outer_inputs)
+    inputs = {
+        name: builder.create_placeholder_node(f"MLA_0/{name}", spec)
+        for name, spec in types.items()
+    }
+    return builder, inputs
+
+
+def finish_model_graph(
+    builder: SimaBuilder, outputs: Sequence[NodeOrHandle], model_name: str,
+    *, transform_subnet: Callable[[AwesomeNet], None] | None = None,
+) -> AwesomeNet:
+    """Finish MLA_0 and the model, preserving output order and integer types.
+
+    BF16 outputs are cast to FP32 on EV. An optional subnet transform runs
+    before output extraction, for model-specific rewrites such as constant folding.
+    Saving and tessellation overrides remain the model's responsibility.
+    """
+    if not outputs:
+        raise ValueError("A model graph needs at least one output")
+    # Explicitly select outputs even when they are not the last nodes created.
+    builder.create_tuple_node(list(outputs))
+    mla = builder.finish_subnet("MLA_0")
+    if transform_subnet is not None:
+        transform_subnet(mla.ir)
+    model_outputs = builder.create_tuple_get_item_nodes(mla)
+    for i, output in enumerate(model_outputs):
+        if get_expected_tensor_value(output.get_type().output).scalar == ScalarType.bfloat16:
+            model_outputs[i] = builder.create_cast_node(output, ScalarType.float32, backend=Backend.EV)
+    if len(model_outputs) > 1:
+        builder.create_tuple_node(model_outputs)
+    return builder.finish(model_name)
 
 
 def build_conv(
@@ -274,8 +329,9 @@ def build_conv_from_dense_with_lora(
         Created conv node or merged node of the conv and LoRA branch.
     """
     if lora_rank and merged_lora:
+        kwargs["relocatable"] = True
         proj = build_conv(
-            builder, get_param_func, check_param_func, base_name, ifm, relocatable=True, **kwargs
+            builder, get_param_func, check_param_func, base_name, ifm, **kwargs
         )
         return proj
 

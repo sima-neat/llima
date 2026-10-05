@@ -45,10 +45,10 @@ def test_whisper_layer_zero_pre_exposes_positioned_residual(monkeypatch):
     )
     builder = Mock()
     builder.create_add_node.return_value = "positioned"
+    graph = Mock()
     monkeypatch.setattr(
-        "sima_lmm.model.whisper_decoder_pre_model.build_two_stage_layer_norm", Mock()
+        "sima_lmm.model.whisper_decoder_pre_model.ModelGraph.from_builder", lambda *_: graph
     )
-    monkeypatch.setattr("sima_lmm.model.whisper_decoder_pre_model.build_conv", Mock())
     output_nodes = model._build_sima_nodes(
         builder, ["token_embedding", "position_embedding"], quantizable=True,
     )
@@ -68,9 +68,11 @@ def test_whisper_init_routes_positioned_residual_to_layer_zero_post(monkeypatch)
         layer_idx=0,
     )
     builder = Mock()
-    builder.create_constant_node.return_value = "position_embedding"
+    graph = Mock()
+    graph.parameter.return_value = np.zeros((4, model.cfg.d_model), np.float32)
+    graph.constant.return_value = "position_embedding"
     monkeypatch.setattr(
-        model, "get_hf_param", lambda _: np.zeros((4, model.cfg.d_model), np.float32),
+        "sima_lmm.model.whisper_decoder_init_model.ModelGraph.from_builder", lambda *_: graph
     )
     monkeypatch.setattr(
         WhisperDecoderPreModel,

@@ -12,17 +12,16 @@ def get_tessellate_parameters(
     model: SDKModel,
     input_params: dict[int, TensorTessellateParameters],
     output_params: dict[int, TensorTessellateParameters]
-) -> TensorTessellateParameters:
+) -> dict[str, TensorTessellateParameters]:
     """
     Determine tessellation parameters for an SDK model that has a single MLA partition.
     These can be used to compile the MLA partition in isolation.
 
     Args:
         model: SDK model to examine
-        input_params: DRAM layouts to use for the MLA partition's inputs.  The list
-            must have one item for each of the partition's input tensors.
-        output_params: DRAM layouts to use for the MLA partition's inputs.  The list
-            must have one item for each of the partition's input tensors.
+        input_params: Optional input overrides by tensor index, including negative indices.
+        output_params: Optional output overrides by tensor index. Omitted tensors use
+            HWC16 layout and automatic tile sizes.
     Returns:
         Tessellation parameters that can be used to compile the MLA segment
     """

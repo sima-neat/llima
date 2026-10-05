@@ -412,18 +412,20 @@ class BaseModel(ABC):
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """
         Get tessellate parameters to use for this model's inputs on the MLA.
-        This function is only meaningful for models that consist of one
-        network and can compile to one elf file.
+        Empty overrides infer standard HWC16 layouts and automatic tile sizes.
+        Override tensor indices for exceptional layouts such as strided caches.
+        This function applies to components with one MLA subnet.
         """
-        raise RuntimeError("get_mla_input_tessellate_params is not implemented")
+        return {}
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """
         Get tessellate parameters to use for this model's output on the MLA.
-        This function is only meaningful for models that consist of one
-        network and can compile to one elf file.
+        Empty overrides infer standard HWC16 layouts and automatic tile sizes.
+        Override tensor indices for exceptional layouts such as strided caches.
+        This function applies to components with one MLA subnet.
         """
-        raise RuntimeError("get_mla_output_tessellate_params is not implemented")
+        return {}
 
     @property
     def enable_filter_sharing(self) -> bool:

@@ -1,17 +1,15 @@
 import numpy as np
 from dataclasses import dataclass
 
-from afe.apis.defines import gen2_target, TensorDRAMLayout
-from afe.backends.backends import Backend
-from afe.ir.serializer import save_awesomenet
-from afe.ir.defines import Status, get_expected_tensor_value
-from afe.ir.node import AwesomeNode
+from afe.apis.defines import TensorDRAMLayout
+from afe.ir.defines import get_expected_tensor_value
 from afe.ir.tensor_type import TensorType, ScalarType
 
 from sima_lmm.model.base import TensorTessellateParameters, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, activation_type
+from sima_lmm.model.sima_builder import activation_type
+from sima_lmm.model.model_graph import ModelGraph, save_model_graph
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
@@ -276,14 +274,14 @@ class LanguageCacheModel(LanguagePartBaseModel):
     ):
         base_name = f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
         g = self._build_sima_nodes(base_name, quantizable)
-        save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
+        save_model_graph(self, g, quantizable)
 
     def _build_sima_nodes(self, base_name: str, quantizable: bool):
         # Expansion of KV to match number of attention heads:
         # (1, Head_Dim, n_kv, n_tokens) -> (1, Head_Dim, n_heads, n_tokens).
         assert (
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads
-            % self.cfg.lm_cfg.attn_cfg.num_key_value_heads == 0
+            self.cfg.lm_cfg.attn_cfg.num_attention_heads % self.cfg.lm_cfg.attn_cfg.num_key_value_heads
+            == 0
         )
         quantize_kv_cache = self.cfg.pipeline_cfg.quantize_kv_cache
 
@@ -292,21 +290,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
             1,
             self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
             self.context_length,
-            self._head_dim
+            self._head_dim,
         )
         # Shape of scale tensors for quantized KV cache (per-token)
-        kv_scale_shape = (
-            1,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            self.context_length,
-            1
-        )
-        input_shape = (
-            1,
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-            self.num_tokens,
-            self._head_dim
-        )
+        kv_scale_shape = (1, self.cfg.lm_cfg.attn_cfg.num_key_value_heads, self.context_length, 1)
+        input_shape = (1, self.cfg.lm_cfg.attn_cfg.num_attention_heads, self.num_tokens, self._head_dim)
         output_shape = (1, 1, self.num_tokens, self._q_size)
 
         # Shape of the result of the first matrix multiply (input * key)
@@ -314,16 +302,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
             1,
             self.cfg.lm_cfg.attn_cfg.num_attention_heads,
             self.num_tokens,
-            self.context_length
+            self.context_length,
         )
 
         # Shape of the result of the second matrix multiply ((input * key) * value)
-        value_shape = (
-            1,
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-            self.num_tokens,
-            self._head_dim
-        )
+        value_shape = (1, self.cfg.lm_cfg.attn_cfg.num_attention_heads, self.num_tokens, self._head_dim)
 
         # Shape of the attention mask
         if (
@@ -339,87 +322,37 @@ class LanguageCacheModel(LanguagePartBaseModel):
             # or they don't use an attention mask
             attn_shape = (1, 1, 1, self.token_idx + 1)
 
-        # Begin constructing a model graph
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-
-        model_input_input = builder.create_placeholder_node(
-            "input", TensorType(activation_type(quantizable), input_shape)
-        )
         kv_dtype = ScalarType.int8 if quantize_kv_cache else activation_type(quantizable)
-        model_input_cached_keys = builder.create_placeholder_node(
-            "cached_keys", TensorType(kv_dtype, kv_tensor_shape)
-        )
+        input_specs = {
+            "input": input_shape,
+            "cached_keys": TensorType(kv_dtype, kv_tensor_shape),
+        }
         if quantize_kv_cache:
-            model_input_cached_keys_scale = builder.create_placeholder_node(
-                "cached_keys_scale", TensorType(activation_type(quantizable), kv_scale_shape)
-            )
-        else:
-            model_input_cached_keys_scale = None
-        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1 or
-            self._cache_mask_size > 1 and self.num_tokens == 1 or
-            self._is_speculative_decoding or self._uses_group_future_token_mask):
-            # Dynamically computed attention mask for paligemma
-            # Dynamically computed attention mask for speculative decoding
-            # or the model runner's mask to remove the influence of future tokens
-            model_input_attn_mask = builder.create_placeholder_node(
-                "attn_mask", TensorType(activation_type(quantizable), attn_shape)
-            )
-        else:
-            model_input_attn_mask = None
-        model_input_cached_values = builder.create_placeholder_node(
-            "cached_values", TensorType(kv_dtype, kv_tensor_shape)
-        )
+            input_specs["cached_keys_scale"] = kv_scale_shape
+        if (
+            self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+            and self.num_tokens > 1
+            or self._cache_mask_size > 1
+            and self.num_tokens == 1
+            or self._is_speculative_decoding
+            or self._uses_group_future_token_mask
+        ):
+            input_specs["attn_mask"] = attn_shape
+        input_specs["cached_values"] = TensorType(kv_dtype, kv_tensor_shape)
         if quantize_kv_cache:
-            model_input_cached_values_scale = builder.create_placeholder_node(
-                "cached_values_scale", TensorType(activation_type(quantizable), kv_scale_shape)
-            )
-        else:
-            model_input_cached_values_scale = None
-
-        model_inputs = list(filter(None, [
-            model_input_input,
-            model_input_cached_keys,
-            model_input_cached_keys_scale,
-            model_input_attn_mask,
-            model_input_cached_values,
-            model_input_cached_values_scale
-        ]))
-
-        builder.begin_subnet(model_inputs)
-
-        # MLA subgraph inputs are the same as the model inputs, except the node names are different
-        mla_input_input = builder.create_placeholder_node(
-            "MLA_0/input", TensorType(activation_type(quantizable), input_shape)
-        )
-        mla_input_cached_keys = builder.create_placeholder_node(
-            "MLA_0/cached_keys", TensorType(kv_dtype, kv_tensor_shape)
-        )
-        if quantize_kv_cache:
-            mla_input_cached_keys_scale = builder.create_placeholder_node(
-                "MLA_0/cached_keys_scale", TensorType(activation_type(quantizable), kv_scale_shape)
-            )
-        if model_input_attn_mask is not None:
-            mla_input_attn_mask = builder.create_placeholder_node(
-                "MLA_0/attn_mask", TensorType(activation_type(quantizable), attn_shape)
-            )
-        else:
-            mla_input_attn_mask = None
-        mla_input_cached_values = builder.create_placeholder_node(
-            "MLA_0/cached_values", TensorType(kv_dtype, kv_tensor_shape)
-        )
-        if quantize_kv_cache:
-            mla_input_cached_values_scale = builder.create_placeholder_node(
-                "MLA_0/cached_values_scale",
-                TensorType(activation_type(quantizable), kv_scale_shape)
-            )
+            input_specs["cached_values_scale"] = kv_scale_shape
+        graph = ModelGraph(self, input_specs, quantizable)
+        builder, inputs = graph.raw, graph.inputs
+        mla_input_input = inputs["input"]
+        mla_input_cached_keys = inputs["cached_keys"]
+        mla_input_cached_values = inputs["cached_values"]
+        mla_input_attn_mask = inputs.get("attn_mask")
 
         # Dequantize KV cache if needed.
         if quantize_kv_cache:
-            mla_input_cached_keys = builder.create_dynamic_dequant_node(
-                mla_input_cached_keys, mla_input_cached_keys_scale
-            )
-            mla_input_cached_values = builder.create_dynamic_dequant_node(
-                mla_input_cached_values, mla_input_cached_values_scale
+            mla_input_cached_keys = graph.dequantize(mla_input_cached_keys, inputs["cached_keys_scale"])
+            mla_input_cached_values = graph.dequantize(
+                mla_input_cached_values, inputs["cached_values_scale"]
             )
 
         # First multiply (input * key)
@@ -432,16 +365,16 @@ class LanguageCacheModel(LanguagePartBaseModel):
         if self.logit_softcapping is not None:
             assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and self.cfg.lm_cfg.model_type == "gemma2"
             soft_cap = self.cfg.lm_cfg.attn_logit_softcapping
-            mul_const_1 = builder.create_constant_node(
-                np.ndarray([2.0 / soft_cap], dtype=np.float32)
+            mul_const_1 = graph.constant(
+                np.ndarray([2.0 / soft_cap], dtype=np.float32), dtype=np.float32
             )
             mul1 = builder.create_mul_node(bmm1, mul_const_1)
             sig = builder.create_sigmoid_node(mul1)
-            mul_const_2 = builder.create_constant_node(
-                np.ndarray([2.0 * soft_cap], dtype=np.float32)
+            mul_const_2 = graph.constant(
+                np.ndarray([2.0 * soft_cap], dtype=np.float32), dtype=np.float32
             )
             mul2 = builder.create_mul_node(sig, mul_const_2)
-            sub_const_1 = builder.create_constant_node(np.ndarray([-soft_cap], dtype=np.float32))
+            sub_const_1 = graph.constant(np.ndarray([-soft_cap], dtype=np.float32), dtype=np.float32)
             last = builder.create_add_node(mul2, sub_const_1)
             bmm1 = last
 
@@ -461,7 +394,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 for i in range(self.num_tokens):
                     for j in range(self.token_idx + i + 1, self.context_length):
                         mask[0, 0, i, j] = np.finfo(np.float32).min
-                mask_const = builder.create_constant_node(
+                mask_const = graph.constant(
                     mask.astype(ScalarType.numpy_type(activation_type(quantizable)))
                 )
                 bmm1 = builder.create_add_node(bmm1, mask_const)
@@ -500,19 +433,10 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 partial_bmm2 = next_level
             bmm2 = partial_bmm2[0]
         assert get_expected_tensor_value(bmm2.get_type().output).shape == value_shape
-        output = builder.create_slice_concat_node(
-            bmm2, axis=3, split_axis=1,
-            split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1
-        )
+        output = graph.merge_heads(bmm2)
         assert get_expected_tensor_value(output.get_type().output).shape == output_shape
 
-        mla_node = builder.finish_subnet("MLA_0")
-
-        # Ensure that output type is float32
-        if activation_type(quantizable) != ScalarType.float32:
-            _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
-        net = builder.finish(self.model_name)
-        return net
+        return graph.finish([output])
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """
@@ -592,10 +516,3 @@ class LanguageCacheModel(LanguagePartBaseModel):
             tessellate_params[idx] = v_scale_params
 
         return tessellate_params
-
-    def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        """
-        Get the custom tessellate params for model's output on the MLA.
-        """
-        # Use default tessellate params.
-        return {}

@@ -14,14 +14,11 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 @pytest.fixture
 def encoder_builder(monkeypatch):
     builder = Mock()
-    conv = Mock()
-    norm = Mock(side_effect=lambda builder, get, check, name, node, **kwargs: (name, node))
-    monkeypatch.setattr(encoder_module, "build_conv", conv)
-    monkeypatch.setattr(encoder_module, "build_two_stage_layer_norm", norm)
-    monkeypatch.setattr(encoder_module, "build_activation", Mock())
-    monkeypatch.setattr(encoder_module, "build_matmul_and_split_heads", Mock(return_value=["head"]))
-    monkeypatch.setattr(encoder_module, "build_merge_heads_and_matmul", Mock())
-    return builder, conv, norm
+    graph = Mock()
+    graph.project_heads.return_value = ["head"]
+    graph.layer_norm.side_effect = lambda name, node, **kwargs: (name, node)
+    monkeypatch.setattr(encoder_module.ModelGraph, "from_builder", lambda *_: graph)
+    return builder, graph.conv, graph.layer_norm
 
 
 def test_encoder_part_generates_one_model_per_layer(monkeypatch):
@@ -77,16 +74,16 @@ def test_encoder_layer_zero_includes_feature_extractor(monkeypatch, encoder_buil
     )
     builder, conv, norm = encoder_builder
     positions = Mock()
-    monkeypatch.setattr(model, "get_hf_param", lambda _: positions)
+    monkeypatch.setattr(encoder_module.ModelGraph.from_builder(model, builder), "parameter", lambda _: positions)
     model._build_sima_nodes(builder, ["mel"], quantizable=True)
 
     first, second = conv.call_args_list[:2]
-    assert first.args[3:5] == ("model.encoder.conv1", "mel")
-    assert second.args[3] == "model.encoder.conv2"
+    assert first.args[:2] == ("model.encoder.conv1", "mel")
+    assert second.args[0] == "model.encoder.conv2"
     assert first.kwargs["stride"] == (1, 1)
     assert second.kwargs["stride"] == (1, 2)
     assert first.kwargs["padding"] == second.kwargs["padding"] == ((0, 0), (1, 1))
-    assert "model.encoder.layer_norm" not in [call.args[3] for call in norm.call_args_list]
+    assert "model.encoder.layer_norm" not in [call.args[0] for call in norm.call_args_list]
 
 
 def test_final_encoder_layer_includes_output_layer_norm(encoder_builder):
@@ -98,6 +95,6 @@ def test_final_encoder_layer_includes_output_layer_norm(encoder_builder):
     builder, conv, norm = encoder_builder
     output = model._build_sima_nodes(builder, ["hidden"], quantizable=True)
 
-    assert output == [norm.call_args.args[3:5]]
-    assert norm.call_args.args[3] == "model.encoder.layer_norm"
-    assert all(call.args[3].startswith("model.encoder.layers.2.") for call in conv.call_args_list)
+    assert output == [norm.call_args.args[:2]]
+    assert norm.call_args.args[0] == "model.encoder.layer_norm"
+    assert all(call.args[0].startswith("model.encoder.layers.2.") for call in conv.call_args_list)
