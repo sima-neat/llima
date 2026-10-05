@@ -85,6 +85,12 @@ KvEvictionLimits resolve_kv_eviction_limits(
             rope_type
         ));
     }
+    if (!trained_max_positions.has_value()) {
+        reject(
+            "the model's trained context length is unknown: devkit/config.json has no "
+            "max_position_embeddings (GGUF models are not supported yet)"
+        );
+    }
 
     const auto& pipeline_cfg = cfg.pipeline_cfg;
     const bool use_groups = pipeline_cfg.input_token_group_offsets.has_value()
@@ -158,7 +164,7 @@ KvEvictionLimits resolve_kv_eviction_limits(
 
     // Token indices are uint16_t, with room for one padded group.
     const uint32_t type_limit = std::numeric_limits<uint16_t>::max() - group_size;
-    const uint32_t max_tokens = std::min(trained_max_positions.value_or(type_limit), type_limit);
+    const uint32_t max_tokens = std::min(trained_max_positions.value(), type_limit);
     if (max_tokens <= capacity) {
         reject(fmt::format(
             "the model's trained context ({} tokens) already fits in the compiled cache ({} "
@@ -362,12 +368,6 @@ KvEviction::KvEviction(
     _head_dim = lm_cfg.attn_cfg.get_head_dim("full_attention");
     _keys_int8 = cfg.pipeline_cfg.quantize_kv_cache;
 
-    if (!trained_max_positions.has_value()) {
-        _logger->warn(
-            "KV eviction: devkit/config.json has no max_position_embeddings; conversations are "
-            "limited to {} tokens only by the runtime", _limits.max_tokens
-        );
-    }
     _logger->info(
         "KV eviction enabled: policy={} cache={} budget={} recent={} max_tokens={}",
         settings.policy, _limits.capacity, _limits.budget, _limits.recent_tokens,

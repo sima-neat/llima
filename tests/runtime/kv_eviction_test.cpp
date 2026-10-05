@@ -74,7 +74,7 @@ void test_budgets() {
     for (const auto& [config, kv_eviction, trained, budget, recent, max_tokens] : {
         std::tuple{make_config(), policy("keydiff"), std::optional<uint32_t>{40960}, 1792, 448, 40960},
         std::tuple{make_config(), policy("sink_window"), std::optional<uint32_t>{40960}, 1792, 448, 40960},
-        std::tuple{make_config(), policy("keydiff", 1536), std::optional<uint32_t>{}, 1536, 384, 65535 - 128},
+        std::tuple{make_config(), policy("keydiff", 1536), std::optional<uint32_t>{131072}, 1536, 384, 65535 - 128},
         std::tuple{make_config(320), policy("keydiff"), std::optional<uint32_t>{131072}, 1600, 400, 65535 - 320},
         // Deployed Llama-3.2-3B offsets: 704 is irregular, the group at 1920 overruns the cache.
         std::tuple{make_config(320, llama_offsets), policy("sink_window"), std::optional<uint32_t>{131072}, 1600, 400, 65535 - 320},
@@ -118,6 +118,10 @@ void test_rejects_unsupported_models() {
     expect_rejected([] { make_kv_eviction_policy("h2o"); }, "unknown policy 'h2o'");
     expect_rejected(
         [] { resolve_kv_eviction_limits(make_config(), policy("keydiff"), 2048); }, "already fits"
+    );
+    expect_rejected(
+        [] { resolve_kv_eviction_limits(make_config(), policy("keydiff"), std::nullopt); },
+        "trained context length is unknown"
     );
 }
 

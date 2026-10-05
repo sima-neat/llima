@@ -125,8 +125,10 @@ message (Mistral v0.3), the runtime re-processes the whole conversation.
 
 Only text-only models whose layers all use full attention, with default, linear,
 or Llama 3 RoPE scaling, are supported; others fail to load with an error that
-names the unsupported feature. A long prompt still takes time proportional to
-its length. Runtimes without eviction support ignore the `kv_eviction` field.
+names the unsupported feature. GGUF models are not supported yet, because the
+deployed model does not record its trained context length. A long prompt still
+takes time proportional to its length. Runtimes without eviction support ignore
+the `kv_eviction` field.
 
 ## Build an Application with Neat
 
