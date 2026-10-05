@@ -326,6 +326,8 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.asr_transcription` | Whisper transcription using the installed sample audio |
 | `runtime.tool_call_parser` | Tool-call parsing safety and streaming provenance without model inference |
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
+| `runtime.kv_eviction` | KV cache eviction config parsing, model support checks, budgets, scoring and slot selection without model inference |
+| `runtime.kv_eviction_generation` | KV cache eviction on the text model: unchanged output when the chat fits, generation and prompts past the compiled context, determinism, follow-up turns, VLM rejection |
 | `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
 

@@ -88,6 +88,48 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `help` | Print available commands. |
 
 
+## KV Cache Eviction
+
+By default, the compiled context (`max_num_tokens`) is a hard limit: longer
+prompts are rejected and generation stops with "Cache full". With KV cache
+eviction, the runtime drops cached tokens instead, so conversations can continue
+up to the model's trained context length (at most about 65,000 tokens). Evicted
+tokens are gone: the model can no longer answer questions about them. While a
+conversation fits in the compiled context, output is unchanged.
+
+To enable it, add `kv_eviction` to `pipeline_cfg` in the deployed
+`devkit/vlm_config.json`, or call `VisionLanguageModel::set_kv_eviction()`:
+
+``` json
+"pipeline_cfg": {
+    "max_num_tokens": 2048,
+    "kv_eviction": { "policy": "keydiff" }
+}
+```
+
+| Field | Description |
+|----|----|
+| `policy` | `off` (default), `sink_window` (keep the newest tokens), or `keydiff` (keep the tokens whose keys differ most from the average key). |
+| `budget_tokens` | Optional. Tokens kept by each eviction; one of the model's compiled prefill group offsets (the error message lists them). By default, 7/8 of the cache: each eviction frees an eighth of it, at least one prefill group. |
+
+Eviction always keeps the system prompt and tool definitions, the first tokens,
+and the newest tokens. The system prompt and tool definitions must leave room
+for one prefill group (at least 128 tokens) in the budget; otherwise every
+request fails.
+
+A new chat turn continues from the cache as long as the earlier messages are
+sent again unchanged. If an earlier message changes after evictions, for example
+because a client truncates the history, a chat template removes earlier Qwen3
+thinking blocks, or a template moves the system prompt to the latest user
+message (Mistral v0.3), the runtime re-processes the whole conversation.
+
+Only text-only models whose layers all use full attention, with default, linear,
+or Llama 3 RoPE scaling, are supported; others fail to load with an error that
+names the unsupported feature. GGUF models are not supported yet, because the
+deployed model does not record its trained context length. A long prompt still
+takes time proportional to its length. Runtimes without eviction support ignore
+the `kv_eviction` field.
+
 ## Build an Application with Neat
 
 After validating your model with `llima run`, see
