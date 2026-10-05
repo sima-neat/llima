@@ -13,7 +13,7 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
     [
         ([], (False, True, True, False)),
         (
-            ["--onnx", "--no-quantize_embeddings", "--no-quantize_kv_cache"],
+            ["--source_to_fp", "--no-quantize_embeddings", "--no-quantize_kv_cache"],
             (False, False, False, False),
         ),
         (
@@ -56,39 +56,3 @@ def test_memory_optimization_cli_defaults_and_overrides(
 
     args = calls[0]
     assert (args[12], args[13], args[14], args[15]) == expected
-
-
-@pytest.mark.parametrize(
-    ("options", "expected_error"),
-    [
-        (
-            ["--onnx"],
-            "Pass --no-quantize_embeddings --no-quantize_kv_cache.",
-        ),
-    ],
-)
-def test_incompatible_quantization_defaults_report_disable_flags(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-    capsys: pytest.CaptureFixture[str],
-    options: list[str],
-    expected_error: str,
-):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "llima-compile",
-            str(tmp_path / "model"),
-            "-o",
-            str(tmp_path / "output"),
-            "-j",
-            "1",
-            *options,
-        ],
-    )
-
-    with pytest.raises(SystemExit):
-        compile_lmm.main()
-
-    assert expected_error in capsys.readouterr().err

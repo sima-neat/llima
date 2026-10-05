@@ -284,8 +284,9 @@ Configure required inputs instead of accepting fixture skips.
 
 The test matrix, expected counts, and baseline policy live in
 `tests/README.md`; CI invocation lives in
-`.github/workflows/model-compiler-tests.yml`. Generate ONNX and numerical
-comparison artifacts during the run rather than committing binary baselines.
+`.github/workflows/model-compiler-tests.yml`. Generate native SDK graphs and
+numerical comparison artifacts during the run rather than committing binary
+baselines.
 
 ### Runtime validation
 

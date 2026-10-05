@@ -128,14 +128,14 @@ def test_speculative_staged_and_direct_generation_are_equivalent(
     ]
 
     draft_model.gen_files(
-        FileGenMode.SOURCE_TO_ONNX,
+        FileGenMode.SOURCE_TO_FP,
         gen_config=gen_config,
         num_processes=1,
         log_level=logging.WARNING,
         resume=False,
     )
     draft_model.gen_files(
-        FileGenMode.ONNX_TO_QUANT,
+        FileGenMode.FP_TO_QUANT,
         gen_config=gen_config,
         num_processes=1,
         log_level=logging.WARNING,
