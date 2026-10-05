@@ -76,7 +76,7 @@ class WhisperModel(BaseModel):
         part: str | None = None,
         part_idx: int | None = None,
         resume: bool = False,
-        model_sdk: bool = False,
+        model_sdk: bool = True,
     ):
         """
         Generates files based on the provided file generation mode.
@@ -89,7 +89,8 @@ class WhisperModel(BaseModel):
             part_idx: Specific index of the part to be generated. For encoder, pre, post, and init
                 models, the index is the layer index; for cache model, it is the token index.
             resume: Generate the files if missing.
-            model_sdk: Use direct SiMaBuilder generation instead of ONNX for ALL mode.
+            model_sdk: Use direct SiMaBuilder generation for ALL mode (default).
+                Set False to use ONNX instead.
         """
         if gen_mode == FileGenMode.ALL:
             source_modes = (

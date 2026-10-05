@@ -1,5 +1,7 @@
 import pytest
+import numpy as np
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.model.base import FileGenMode
@@ -13,8 +15,8 @@ from sima_lmm.model.whisper_model import WhisperModel
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
 
-@pytest.mark.parametrize("model_sdk", [False, True])
-def test_whisper_native_generation_is_opt_in(monkeypatch, model_sdk):
+@pytest.mark.parametrize("model_sdk", [None, True])
+def test_whisper_native_generation_is_default(monkeypatch, model_sdk):
     model = WhisperModel(
         WhisperConfig(encoder_layers=1), "whisper", use_future_token_mask=True,
         hf_model=SimpleNamespace(load_all_params=lambda: None, unload_all_params=lambda: None),
@@ -24,53 +26,39 @@ def test_whisper_native_generation_is_opt_in(monkeypatch, model_sdk):
     monkeypatch.setattr(
         model, "gen_files_from_model_list", lambda _models, mode, *_args: modes.append(mode)
     )
-    model.gen_files(FileGenMode.ALL, part="encoder", part_idx=0, model_sdk=model_sdk)
+    kwargs = {} if model_sdk is None else {"model_sdk": model_sdk}
+    model.gen_files(FileGenMode.ALL, part="encoder", part_idx=0, **kwargs)
     assert modes == [
         FileGenMode.DEVKIT,
-        FileGenMode.SOURCE_TO_FP if model_sdk else FileGenMode.SOURCE_TO_ONNX,
-        FileGenMode.FP_TO_QUANT if model_sdk else FileGenMode.ONNX_TO_QUANT,
+        FileGenMode.SOURCE_TO_FP,
+        FileGenMode.FP_TO_QUANT,
         FileGenMode.MODEL_SDK_COMPILE,
     ]
 
 
-class _WhisperPreBuilder:
-    def build_op(self, name, input_nodes, op_type, **kwargs):
-        del input_nodes, op_type, kwargs
-        return name
-
-    def build_layer_norm(self, name, input_node):
-        del input_node
-        return name
-
-    def build_conv(self, name, input_node):
-        del input_node
-        return name
-
-    def build_split_and_concat(
-        self, name, input_node, num_splits, split_axis, concat_axis
-    ):
-        del input_node, num_splits, split_axis, concat_axis
-        return name
-
-
-def test_whisper_layer_zero_pre_exposes_positioned_residual():
+def test_whisper_layer_zero_pre_exposes_positioned_residual(monkeypatch):
     model = WhisperDecoderPreModel(
         WhisperConfig(decoder_layers=2),
         "whisper_decoder_n1_pre_layer0",
         num_tokens=1,
         layer_idx=0,
     )
-    model._onnx_builder = _WhisperPreBuilder()
-
-    output_nodes = model._build_onnx_nodes(
-        "model.decoder.layers.0", ["token_embedding", "position_embedding"]
+    builder = Mock()
+    builder.create_add_node.return_value = "positioned"
+    monkeypatch.setattr(
+        "sima_lmm.model.whisper_decoder_pre_model.build_two_stage_layer_norm", Mock()
+    )
+    monkeypatch.setattr("sima_lmm.model.whisper_decoder_pre_model.build_conv", Mock())
+    output_nodes = model._build_sima_nodes(
+        builder, ["token_embedding", "position_embedding"], quantizable=True,
     )
 
     assert len(output_nodes) == 4
     assert (
         output_nodes[WhisperDecoderPreModel.positioned_residual_output_idx]
-        == "model.decoder.layers.0.add_embed"
+        == "positioned"
     )
+    builder.create_add_node.assert_called_once_with("token_embedding", "position_embedding")
 
 
 def test_whisper_init_routes_positioned_residual_to_layer_zero_post(monkeypatch):
@@ -79,33 +67,32 @@ def test_whisper_init_routes_positioned_residual_to_layer_zero_post(monkeypatch)
         "whisper_decoder_init_layer0",
         layer_idx=0,
     )
-    model._onnx_builder = object()
+    builder = Mock()
+    builder.create_constant_node.return_value = "position_embedding"
     monkeypatch.setattr(
-        WhisperDecoderInitModel,
-        "_build_position_embeddings",
-        lambda self: "position_embedding",
+        model, "get_hf_param", lambda _: np.zeros((4, model.cfg.d_model), np.float32),
     )
     monkeypatch.setattr(
         WhisperDecoderPreModel,
-        "_build_onnx_nodes",
-        lambda self, base_name, input_nodes: ["query", "key", "value", "positioned"],
+        "_build_sima_nodes",
+        lambda self, builder, inputs, quantizable: ["query", "key", "value", "positioned"],
     )
     monkeypatch.setattr(
         WhisperDecoderCacheModel,
-        "_build_onnx_nodes",
-        lambda self, base_name, input_nodes: ["self_attention"],
+        "_build_sima_nodes",
+        lambda self, builder, inputs, quantizable: ["self_attention"],
     )
     post_inputs = []
 
-    def build_post(self, base_name, input_nodes):
-        del self, base_name
-        post_inputs.extend(input_nodes)
+    def build_post(self, builder, inputs, quantizable):
+        del self, builder, quantizable
+        post_inputs.extend(inputs)
         return ["hidden", "encoder_key", "encoder_value"]
 
-    monkeypatch.setattr(WhisperDecoderPostModel, "_build_onnx_nodes", build_post)
+    monkeypatch.setattr(WhisperDecoderPostModel, "_build_sima_nodes", build_post)
 
-    model._build_onnx_nodes(
-        "model.decoder.layers.0", ["token_embedding", "audio_features"]
+    model._build_sima_nodes(
+        builder, ["token_embedding", "audio_features"], quantizable=True,
     )
 
     assert post_inputs[0] == "positioned"

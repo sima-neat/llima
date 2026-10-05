@@ -160,7 +160,7 @@ This group validates:
 
 - Embedding quantization and dequantization wiring.
 - Staged source-to-ONNX-to-quant generation versus direct generation.
-- Whisper ONNX/native numerical and output-contract comparisons, including native
+- Whisper SiMa graph numerical and output-contract comparisons against Hugging Face, including
   BF16/INT8 quantization, using deterministic synthetic weights.
 - GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
 - Speculative pre, cache, post, and draft-FC graph generation.

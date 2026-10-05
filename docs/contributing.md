@@ -116,18 +116,6 @@ Run it in the Model Compiler environment with an explicit model path.
 log-probe-enabled decoder outputs; use `--part all --enable_log_probe` for a
 complete log-probe build.
 
-The script uses ONNX by default. Add `--model_sdk` to generate FP32 SiMaIR with
-SiMaBuilder, then quantize and compile it using the same precision settings.
-Both paths cover the layered encoder, decoder initialization, pre/cache/post
-graphs, language detection, and optional log-probe outputs. Use separate output
-directories when comparing paths; the compiled artifact names and runtime
-interfaces are the same, and `--resume` does not distinguish their origin.
-Language detection folds the constant start-token branch in FP32 before
-quantization, including its residual addition, matching the ONNX path.
-Native token outputs use INT32, matching quantized ArgMax and the MLA runtime;
-the unquantized ONNX reference uses INT64. Numerical comparisons for all
-Whisper components are in `tests/compilation/graph_integration/test_whisper_paths.py`.
-
 Whisper model repositories contain one ELF per encoder layer. The runtime does
 not support legacy repositories with a monolithic encoder ELF; download a
 layered model or recompile the checkpoint with the current LLiMa version.

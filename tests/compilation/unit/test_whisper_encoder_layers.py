@@ -1,17 +1,27 @@
 import pytest
+from unittest.mock import Mock
 
 from sima_lmm.config.whisper_config import WhisperConfig
 from sima_lmm.model.base import FileGenMode
 from sima_lmm.model.whisper_encoder_model import WhisperEncoderModel
 from sima_lmm.model.whisper_model import WhisperModel
+import sima_lmm.model.whisper_encoder_model as encoder_module
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
 
-class _EncoderBuilder:
-    def build_layer_norm(self, name, input_node):
-        return (name, input_node)
+@pytest.fixture
+def encoder_builder(monkeypatch):
+    builder = Mock()
+    conv = Mock()
+    norm = Mock(side_effect=lambda builder, get, check, name, node, **kwargs: (name, node))
+    monkeypatch.setattr(encoder_module, "build_conv", conv)
+    monkeypatch.setattr(encoder_module, "build_two_stage_layer_norm", norm)
+    monkeypatch.setattr(encoder_module, "build_activation", Mock())
+    monkeypatch.setattr(encoder_module, "build_matmul_and_split_heads", Mock(return_value=["head"]))
+    monkeypatch.setattr(encoder_module, "build_merge_heads_and_matmul", Mock())
+    return builder, conv, norm
 
 
 def test_encoder_part_generates_one_model_per_layer(monkeypatch):
@@ -59,49 +69,35 @@ def test_encoder_part_idx_generates_only_requested_layer(monkeypatch):
     ]
 
 
-def test_encoder_layer_zero_includes_feature_extractor(monkeypatch):
+def test_encoder_layer_zero_includes_feature_extractor(monkeypatch, encoder_builder):
     model = WhisperEncoderModel(
         WhisperConfig(encoder_layers=3),
         "whisper_encoder_layer0",
         layer_idx=0,
     )
-    model._onnx_builder = _EncoderBuilder()
-    calls = []
-    monkeypatch.setattr(
-        model,
-        "_build_feature_extractor",
-        lambda base_name, input_node: calls.append((base_name, input_node)) or "features",
-    )
-    monkeypatch.setattr(
-        model,
-        "_build_encoder_layer",
-        lambda base_name, input_node: (base_name, input_node),
-    )
+    builder, conv, norm = encoder_builder
+    positions = Mock()
+    monkeypatch.setattr(model, "get_hf_param", lambda _: positions)
+    model._build_sima_nodes(builder, ["mel"], quantizable=True)
 
-    output = model._build_layer_onnx_nodes("model.encoder", ["mel"])
-
-    assert calls == [("model.encoder", "mel")]
-    assert output == [("model.encoder.layers.0", "features")]
+    first, second = conv.call_args_list[:2]
+    assert first.args[3:5] == ("model.encoder.conv1", "mel")
+    assert second.args[3] == "model.encoder.conv2"
+    assert first.kwargs["stride"] == (1, 1)
+    assert second.kwargs["stride"] == (1, 2)
+    assert first.kwargs["padding"] == second.kwargs["padding"] == ((0, 0), (1, 1))
+    assert "model.encoder.layer_norm" not in [call.args[3] for call in norm.call_args_list]
 
 
-def test_final_encoder_layer_includes_output_layer_norm(monkeypatch):
+def test_final_encoder_layer_includes_output_layer_norm(encoder_builder):
     model = WhisperEncoderModel(
         WhisperConfig(encoder_layers=3),
         "whisper_encoder_layer2",
         layer_idx=2,
     )
-    model._onnx_builder = _EncoderBuilder()
-    monkeypatch.setattr(
-        model,
-        "_build_encoder_layer",
-        lambda base_name, input_node: (base_name, input_node),
-    )
+    builder, conv, norm = encoder_builder
+    output = model._build_sima_nodes(builder, ["hidden"], quantizable=True)
 
-    output = model._build_layer_onnx_nodes("model.encoder", ["hidden"])
-
-    assert output == [
-        (
-            "model.encoder.layer_norm",
-            ("model.encoder.layers.2", "hidden"),
-        )
-    ]
+    assert output == [norm.call_args.args[3:5]]
+    assert norm.call_args.args[3] == "model.encoder.layer_norm"
+    assert all(call.args[3].startswith("model.encoder.layers.2.") for call in conv.call_args_list)
