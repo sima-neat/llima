@@ -1,8 +1,18 @@
 from dataclasses import dataclass
 from typing import ClassVar
+import numpy as np
 
-from sima_lmm.model.base import BaseModel, TensorTessellateParameters
+from afe.apis.defines import gen2_target
+from afe.backends.backends import Backend
+from afe.ir.defines import Status, get_expected_tensor_value
+from afe.ir.serializer import save_awesomenet
+from afe.ir.tensor_type import ScalarType, TensorType
+
+from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
 from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.model.sima_builder import (
+    SimaBuilder, activation_type, activation_dtype, build_conv, build_two_stage_layer_norm,
+)
 
 
 @dataclass
@@ -27,6 +37,67 @@ class WhisperDecoderPreModel(BaseModel):
     @property
     def enable_filter_sharing(self) -> bool:
         return self.use_filter_sharing
+
+    def gen_model_sdk_files_directly(
+        self, layer_cfg: LayerConfiguration, log_level: int, quantizable: bool
+    ):
+        shape = (1, 1, self.num_tokens, self.cfg.d_model)
+        shapes = {"input": shape}
+        if self.layer_idx == 0:
+            shapes["embed_positions"] = shape
+
+        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
+        model_inputs = [
+            builder.create_placeholder_node(name, TensorType(activation_type(quantizable), shape))
+            for name, shape in shapes.items()
+        ]
+        builder.begin_subnet(model_inputs)
+        inputs = [
+            builder.create_placeholder_node(
+                f"MLA_0/{name}", TensorType(activation_type(quantizable), shape)
+            )
+            for name, shape in shapes.items()
+        ]
+        outputs = self._build_sima_nodes(builder, inputs, quantizable)
+        if len(outputs) > 1:
+            builder.create_tuple_node(outputs)
+        mla = builder.finish_subnet("MLA_0")
+        outputs = builder.create_tuple_get_item_nodes(mla) if len(outputs) > 1 else [mla]
+        for i, output in enumerate(outputs):
+            if get_expected_tensor_value(output.get_type().output).scalar == ScalarType.bfloat16:
+                outputs[i] = builder.create_cast_node(output, ScalarType.float32, backend=Backend.EV)
+        if len(outputs) > 1:
+            builder.create_tuple_node(outputs)
+        net = builder.finish(self.model_name)
+        save_awesomenet(
+            net, self.model_name + (".fp32" if quantizable else ""),
+            str(self.sima_model_sdk_path),
+        )
+
+    def _build_sima_nodes(self, builder, inputs, quantizable):
+        name = f"model.decoder.layers.{self.layer_idx}"
+        residual = builder.create_add_node(*inputs) if self.layer_idx == 0 else inputs[0]
+        norm = build_two_stage_layer_norm(
+            builder, self.get_hf_param, self.check_hf_param,
+            f"{name}.self_attn_layer_norm", residual, axis=-1, epsilon=float(np.float32(1e-5)),
+        )
+        query, key, value = [
+            build_conv(
+                builder, self.get_hf_param, self.check_hf_param, f"{name}.self_attn.{proj}_proj", norm
+            )
+            for proj in ("q", "k", "v")
+        ]
+        scale = builder.create_constant_node(
+            np.array(self.cfg.decoder_head_dim ** -0.5, dtype=activation_dtype(quantizable))
+        )
+        query = builder.create_mul_node(query, scale)
+        query = builder.create_slice_concat_node(
+            query, axis=1, split_axis=3, split_block=self.cfg.decoder_attention_heads, split_repeat=1
+        )
+        outputs = [query, key, value]
+        if self.layer_idx == 0:
+            outputs.append(residual)
+        return outputs
 
     def gen_onnx_files(self):
         base_name = f"model.decoder.layers.{self.layer_idx}"

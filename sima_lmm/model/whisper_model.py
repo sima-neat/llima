@@ -76,6 +76,7 @@ class WhisperModel(BaseModel):
         part: str | None = None,
         part_idx: int | None = None,
         resume: bool = False,
+        model_sdk: bool = False,
     ):
         """
         Generates files based on the provided file generation mode.
@@ -88,12 +89,14 @@ class WhisperModel(BaseModel):
             part_idx: Specific index of the part to be generated. For encoder, pre, post, and init
                 models, the index is the layer index; for cache model, it is the token index.
             resume: Generate the files if missing.
+            model_sdk: Use direct SiMaBuilder generation instead of ONNX for ALL mode.
         """
         if gen_mode == FileGenMode.ALL:
-            gen_modes = [
-                FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                FileGenMode.MODEL_SDK_COMPILE
-            ]
+            source_modes = (
+                [FileGenMode.SOURCE_TO_FP, FileGenMode.FP_TO_QUANT] if model_sdk else
+                [FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT]
+            )
+            gen_modes = [FileGenMode.DEVKIT, *source_modes, FileGenMode.MODEL_SDK_COMPILE]
             for gen_mode in gen_modes:
                 self.gen_files(
                     gen_mode, precision=precision, log_level=log_level, num_processes=num_processes,
@@ -180,7 +183,7 @@ class WhisperModel(BaseModel):
         single_post_precision = precision.get("single_post", single_precision)
         single_cache_precision = precision.get("single_cache", single_precision)
 
-        if gen_mode == FileGenMode.ONNX_TO_QUANT:
+        if gen_mode in (FileGenMode.ONNX_TO_QUANT, FileGenMode.FP_TO_QUANT):
             with ScopedLogLevel(log_level):
                 sima_log_info("Quantization precision:")
                 sima_log_info("  Encoder      = %s", encoder_precision)

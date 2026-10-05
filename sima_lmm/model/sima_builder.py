@@ -33,6 +33,7 @@ def build_conv(
         stride: tuple[int, ...] = (1, 1),
         relocatable: bool = False,
         is_depthwise: bool = False,
+        padding: tuple[tuple[int, int], ...] = ((0, 0), (0, 0)),
         **kwargs
 ) -> AwesomeNode:
     """
@@ -48,6 +49,7 @@ def build_conv(
         stride: Convolution stride.
         relocatable: If True, enable weight relocation.
         is_depthwise: If True, handle as depthwise convolution (groups=num_channels).
+        padding: Padding before and after each spatial dimension.
     """
     assert not (is_fc and is_depthwise), "is_fc and is_depthwise are mutually exclusive"
 
@@ -129,7 +131,7 @@ def build_conv(
     conv_attrs = attributes.ConvAttrs(
         stride=stride,
         dilation=(1,1),
-        padding=((0,0), (0,0)),
+        padding=padding,
         output_padding=((0,0), (0,0)),
         is_transposed=False,
         weight_shape=weight_tensor.shape,
@@ -563,7 +565,8 @@ def build_matmul_and_split_heads(
     input_node: NodeOrHandle,
     num_heads: int,
     seq_len: int,
-    post_matmul_scale: float = 1.0
+    post_matmul_scale: float = 1.0,
+    kv_len: int | None = None,
 ) -> list[NodeOrHandle]:
     """
     Build multi-head projection.
@@ -580,11 +583,12 @@ def build_matmul_and_split_heads(
         num_heads: The number of heads to split.
         seq_len: The length of token sequence.
         post_matmul_scale: The scaling factor after matrix multiply. Default is 1.0.
+        kv_len: Key/value sequence length for cross attention; defaults to seq_len.
 
     Returns:
         The list of output nodes.
     """
-    kv_len = seq_len
+    kv_len = seq_len if kv_len is None else kv_len
     elem_size = 2
     num_mla_rows_per_head = seq_len * ceil_div_row(kv_len) * elem_size
     concat_heads = num_mla_rows_per_head <= mla_max_num_rows

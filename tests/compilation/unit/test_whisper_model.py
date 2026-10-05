@@ -1,6 +1,8 @@
 import pytest
+from types import SimpleNamespace
 
 from sima_lmm.config.whisper_config import WhisperConfig
+from sima_lmm.model.base import FileGenMode
 from sima_lmm.model.whisper_decoder_cache_model import WhisperDecoderCacheModel
 from sima_lmm.model.whisper_decoder_init_model import WhisperDecoderInitModel
 from sima_lmm.model.whisper_decoder_post_model import WhisperDecoderPostModel
@@ -9,6 +11,26 @@ from sima_lmm.model.whisper_model import WhisperModel
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
+
+
+@pytest.mark.parametrize("model_sdk", [False, True])
+def test_whisper_native_generation_is_opt_in(monkeypatch, model_sdk):
+    model = WhisperModel(
+        WhisperConfig(encoder_layers=1), "whisper", use_future_token_mask=True,
+        hf_model=SimpleNamespace(load_all_params=lambda: None, unload_all_params=lambda: None),
+    )
+    modes = []
+    monkeypatch.setattr(model, "gen_devkit_files", lambda **_: modes.append(FileGenMode.DEVKIT))
+    monkeypatch.setattr(
+        model, "gen_files_from_model_list", lambda _models, mode, *_args: modes.append(mode)
+    )
+    model.gen_files(FileGenMode.ALL, part="encoder", part_idx=0, model_sdk=model_sdk)
+    assert modes == [
+        FileGenMode.DEVKIT,
+        FileGenMode.SOURCE_TO_FP if model_sdk else FileGenMode.SOURCE_TO_ONNX,
+        FileGenMode.FP_TO_QUANT if model_sdk else FileGenMode.ONNX_TO_QUANT,
+        FileGenMode.MODEL_SDK_COMPILE,
+    ]
 
 
 class _WhisperPreBuilder:

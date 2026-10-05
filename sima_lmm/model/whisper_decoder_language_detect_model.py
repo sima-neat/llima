@@ -11,15 +11,29 @@
 
 import numpy as np
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from afe.apis.defines import gen2_target
+from afe.backends.backends import Backend
+from afe.ir import build_node
+from afe.ir.defines import Status, get_expected_tensor_value
+from afe.ir.execute import create_node_executor
+from afe.ir.net import AwesomeNet
+from afe.ir.operations import AddActivationOp, ConvAddActivationOp
+from afe.ir.serializer import save_awesomenet
+from afe.ir.tensor_type import ScalarType, TensorType
 
 from sima_lmm.hf.hf_transformer import find_file
-from sima_lmm.model.base import BaseModel, TensorTessellateParameters
+from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
 from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.model.whisper_decoder_cache_model import WhisperDecoderCacheModel
 from sima_lmm.model.whisper_decoder_post_model import WhisperDecoderPostModel
 from sima_lmm.model.whisper_decoder_pre_model import WhisperDecoderPreModel
 from sima_lmm.tokenizer.whisper_tokenizer import get_tokenizer
+from sima_lmm.model.sima_builder import (
+    SimaBuilder, activation_type, activation_dtype, build_conv,
+    build_two_stage_layer_norm, create_channel_slice,
+)
 
 
 @dataclass
@@ -32,6 +46,117 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
     @property
     def enable_filter_sharing(self) -> bool:
         return self.use_filter_sharing
+
+    def gen_model_sdk_files_directly(
+        self, layer_cfg: LayerConfiguration, log_level: int, quantizable: bool
+    ):
+        shapes = {"audio_features": (1, 1, self.cfg.max_source_positions, self.cfg.d_model)}
+
+        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
+        model_inputs = [
+            builder.create_placeholder_node(name, TensorType(activation_type(quantizable), shape))
+            for name, shape in shapes.items()
+        ]
+        builder.begin_subnet(model_inputs)
+        inputs = [
+            builder.create_placeholder_node(
+                f"MLA_0/{name}", TensorType(activation_type(quantizable), shape)
+            )
+            for name, shape in shapes.items()
+        ]
+        outputs = self._build_sima_nodes(builder, inputs, quantizable)
+        if len(outputs) > 1:
+            builder.create_tuple_node(outputs)
+        mla = builder.finish_subnet("MLA_0")
+        if quantizable:
+            self._fold_sot_prefix(mla.ir)
+        outputs = builder.create_tuple_get_item_nodes(mla) if len(outputs) > 1 else [mla]
+        for i, output in enumerate(outputs):
+            if get_expected_tensor_value(output.get_type().output).scalar == ScalarType.bfloat16:
+                outputs[i] = builder.create_cast_node(output, ScalarType.float32, backend=Backend.EV)
+        if len(outputs) > 1:
+            builder.create_tuple_node(outputs)
+        net = builder.finish(self.model_name)
+        save_awesomenet(
+            net, self.model_name + (".fp32" if quantizable else ""),
+            str(self.sima_model_sdk_path),
+        )
+
+    @staticmethod
+    def _fold_sot_prefix(net: AwesomeNet):
+        """Fold the constant start-token branch in FP32, as the ONNX importer does."""
+        values = {}
+        execute = create_node_executor(fast_mode=False)
+        for name in net.execution_order:
+            node = net.nodes[name]
+            if all(producer in values for producer in node.input_node_names):
+                inputs = dict(zip(node.input_names, (values[p] for p in node.input_node_names)))
+                execute(node, inputs, values)
+                folded = build_node.create_constant_node(0, values[name], status=net.status)
+                net.nodes[name] = replace(folded, name=name)
+            elif isinstance(node.ir.operation, AddActivationOp):
+                lhs, rhs = (net.nodes[p] for p in node.input_node_names)
+                constant, conv = (lhs, rhs) if lhs.name in values else (rhs, lhs)
+                if constant.name not in values or not isinstance(conv.ir.operation, ConvAddActivationOp):
+                    continue
+                attrs = conv.ir.attrs
+                residual = values[constant.name]
+                if attrs.activ_attrs is not None or residual.shape != (1, 1, 1, attrs.conv_attrs.channels):
+                    continue
+                # Fold the constant residual into the projection bias before quantization.
+                bias = residual.reshape(-1)
+                if attrs.bias_attrs is not None:
+                    bias = bias + attrs.bias_attrs.data
+                folded = build_node.create_conv_node(
+                    net.nodes[conv.input_node_names[0]], 0, attrs.weights_attrs.data, bias,
+                    attrs.conv_attrs, node.ir.attrs.activ_attrs, status=net.status,
+                )
+                net.nodes[name] = replace(folded, name=name)
+        net.topological_sort()
+        net.nodes = {name: net.nodes[name] for name in net.execution_order}
+
+    def _build_sima_nodes(self, builder, inputs, quantizable):
+        tokenizer = get_tokenizer(
+            multilingual=True, num_languages=self.cfg.num_languages, language=None, task=None,
+            hf_tokenizer_json_file=find_file(self.hf_model.hf_cache, "tokenizer.json"),
+        )
+        language_ids = tokenizer.all_language_tokens
+        start, count = language_ids[0], len(language_ids)
+        if language_ids != tuple(range(start, start + count)):
+            raise RuntimeError("Whisper language tokens must be contiguous.")
+        hidden = []
+        for name, index in (("embed_tokens", tokenizer.sot), ("embed_positions", 0)):
+            weight = self.get_hf_param(f"model.decoder.{name}.weight")[index]
+            hidden.append(builder.create_constant_node(
+                weight.reshape(1, 1, 1, self.cfg.d_model).astype(activation_dtype(quantizable))
+            ))
+        cache = WhisperDecoderCacheModel(
+            self.cfg, self.model_name, num_tokens=1, token_idx=0, use_future_token_mask=False,
+        )
+        for idx in range(self.cfg.decoder_layers):
+            pre = WhisperDecoderPreModel(
+                self.cfg, self.model_name, hf_model=self.hf_model, num_tokens=1, layer_idx=idx,
+            )
+            pre_outputs = pre._build_sima_nodes(builder, hidden, quantizable)
+            residual = pre_outputs[pre.positioned_residual_output_idx] if idx == 0 else hidden[0]
+            attn = cache._build_sima_nodes(builder, pre_outputs, quantizable)[0]
+            post = WhisperDecoderPostModel(
+                self.cfg, self.model_name, hf_model=self.hf_model, num_tokens=1, layer_idx=idx,
+                skip_encoder_kv_proj=False, output_encoder_kv_cache=False,
+            )
+            output, _, _ = post._build_sima_transformer(
+                builder, [residual, attn, inputs[0]], quantizable
+            )
+            hidden = [output]
+        norm = build_two_stage_layer_norm(
+            builder, self.get_hf_param, self.check_hf_param,
+            "model.decoder.layer_norm", hidden[0], axis=-1, epsilon=float(np.float32(1e-5)),
+        )
+        logits = build_conv(
+            builder, self.get_hf_param, self.check_hf_param, "model.decoder.embed_tokens", norm
+        )
+        language_logits = create_channel_slice(builder, logits, start, start + count)
+        return [builder.create_argmax_node(language_logits, ScalarType.int32), logits]
 
     def gen_onnx_files(self):
         self.create_onnx_builder()

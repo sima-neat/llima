@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 126
+- Expected cases: 128
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -154,16 +154,18 @@ stored in the repository or artifact cache.
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 22 standard and 6 high-memory
+- Expected cases: 40 standard and 6 high-memory
 
 This group validates:
 
 - Embedding quantization and dequantization wiring.
 - Staged source-to-ONNX-to-quant generation versus direct generation.
+- Whisper ONNX/native numerical and output-contract comparisons, including native
+  BF16/INT8 quantization, using deterministic synthetic weights.
 - GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
 - Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are serial and high-memory. CI runs the 22
+The speculative-decoding cases are serial and high-memory. CI runs the 40
 standard cases first and the 6 high-memory cases separately.
 
 #### Selected-model full compilation E2E

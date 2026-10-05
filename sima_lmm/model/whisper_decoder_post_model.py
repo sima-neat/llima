@@ -2,9 +2,19 @@ import numpy as np
 
 from dataclasses import dataclass
 
+from afe.apis.defines import gen2_target
+from afe.backends.backends import Backend
+from afe.ir.defines import Status, get_expected_tensor_value
+from afe.ir.serializer import save_awesomenet
+from afe.ir.tensor_type import ScalarType, TensorType
+
 from sima_lmm.hf.hf_transformer import find_file
-from sima_lmm.model.base import BaseModel, TensorTessellateParameters
+from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
 from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.model.sima_builder import (
+    SimaBuilder, activation_type, activation_dtype, build_conv, build_two_stage_layer_norm,
+    build_activation, build_matmul_and_split_heads, build_merge_heads_and_matmul,
+)
 from sima_lmm.tokenizer.whisper_tokenizer import get_tokenizer
 
 
@@ -35,6 +45,123 @@ class WhisperDecoderPostModel(BaseModel):
     @property
     def enable_filter_sharing(self) -> bool:
         return self.use_filter_sharing
+
+    def gen_model_sdk_files_directly(
+        self, layer_cfg: LayerConfiguration, log_level: int, quantizable: bool
+    ):
+        assert not self.output_encoder_kv_cache
+        hidden_shape = (1, 1, self.num_tokens, self.cfg.d_model)
+        cache_shape = (
+            1, self.cfg.decoder_attention_heads, self.cfg.max_source_positions,
+            self.cfg.decoder_head_dim,
+        )
+        shapes = {
+            "input": hidden_shape, "self_attn": hidden_shape,
+            "encoder_k_cache": cache_shape, "encoder_v_cache": cache_shape,
+        }
+
+        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
+        model_inputs = [
+            builder.create_placeholder_node(name, TensorType(activation_type(quantizable), shape))
+            for name, shape in shapes.items()
+        ]
+        builder.begin_subnet(model_inputs)
+        inputs = [
+            builder.create_placeholder_node(
+                f"MLA_0/{name}", TensorType(activation_type(quantizable), shape)
+            )
+            for name, shape in shapes.items()
+        ]
+        outputs = self._build_sima_nodes(builder, inputs, quantizable)
+        if len(outputs) > 1:
+            builder.create_tuple_node(outputs)
+        mla = builder.finish_subnet("MLA_0")
+        outputs = builder.create_tuple_get_item_nodes(mla) if len(outputs) > 1 else [mla]
+        for i, output in enumerate(outputs):
+            if get_expected_tensor_value(output.get_type().output).scalar == ScalarType.bfloat16:
+                outputs[i] = builder.create_cast_node(output, ScalarType.float32, backend=Backend.EV)
+        if len(outputs) > 1:
+            builder.create_tuple_node(outputs)
+        net = builder.finish(self.model_name)
+        save_awesomenet(
+            net, self.model_name + (".fp32" if quantizable else ""),
+            str(self.sima_model_sdk_path),
+        )
+
+    def _build_sima_transformer(self, builder, inputs, quantizable):
+        name = f"model.decoder.layers.{self.layer_idx}"
+        proj = build_conv(
+            builder, self.get_hf_param, self.check_hf_param, f"{name}.self_attn.out_proj", inputs[1]
+        )
+        hidden = builder.create_add_node(inputs[0], proj)
+        norm = build_two_stage_layer_norm(
+            builder, self.get_hf_param, self.check_hf_param,
+            f"{name}.encoder_attn_layer_norm", hidden, axis=-1, epsilon=float(np.float32(1e-5)),
+        )
+        kv = inputs[2:4] if self.skip_encoder_kv_proj else [inputs[-1], inputs[-1]]
+        queries = build_matmul_and_split_heads(
+            builder, self.get_hf_param, self.check_hf_param, f"{name}.encoder_attn.q_proj", norm,
+            self.cfg.decoder_attention_heads, self.num_tokens,
+            post_matmul_scale=self.cfg.decoder_head_dim ** -0.5, kv_len=self.cfg.max_source_positions,
+        )
+        kv_projs = []
+        for proj, node in zip(("k_proj", "v_proj"), kv):
+            if self.skip_encoder_kv_proj:
+                heads = [node] if len(queries) == 1 else [
+                    builder.create_slice_node(node, [i], [i + 1], [1], [1])
+                    for i in range(self.cfg.decoder_attention_heads)
+                ]
+            else:
+                heads = build_matmul_and_split_heads(
+                    builder, self.get_hf_param, self.check_hf_param,
+                    f"{name}.encoder_attn.{proj}", node, self.cfg.decoder_attention_heads,
+                    self.num_tokens, kv_len=self.cfg.max_source_positions,
+                )
+            kv_projs.append(heads)
+        keys, values = kv_projs
+        heads = []
+        for query, key, value in zip(queries, keys, values):
+            scores = builder.create_einsum_node(query, key, "nhwc,nhqc->nhwq")
+            probs = builder.create_softmax_node(scores, axis=3)
+            heads.append(builder.create_einsum_node(probs, value, "nhwc,nhcq->nhwq"))
+        attn = build_merge_heads_and_matmul(
+            builder, self.get_hf_param, self.check_hf_param,
+            f"{name}.encoder_attn.out_proj", heads, self.cfg.decoder_attention_heads,
+        )
+        hidden = builder.create_add_node(hidden, attn)
+        norm = build_two_stage_layer_norm(
+            builder, self.get_hf_param, self.check_hf_param,
+            f"{name}.final_layer_norm", hidden, axis=-1, epsilon=float(np.float32(1e-5)),
+        )
+        fc1 = build_conv(builder, self.get_hf_param, self.check_hf_param, f"{name}.fc1", norm)
+        act = build_activation(builder, fc1, self.cfg.activation_function, quantizable)
+        fc2 = build_conv(builder, self.get_hf_param, self.check_hf_param, f"{name}.fc2", act)
+        hidden = builder.create_add_node(hidden, fc2)
+        return hidden, keys, values
+
+    def _build_sima_nodes(self, builder, inputs, quantizable):
+        hidden, keys, values = self._build_sima_transformer(builder, inputs, quantizable)
+        if self.layer_idx < self.cfg.decoder_layers - 1:
+            outputs = [hidden]
+        else:
+            norm = build_two_stage_layer_norm(
+                builder, self.get_hf_param, self.check_hf_param,
+                "model.decoder.layer_norm", hidden, axis=-1, epsilon=float(np.float32(1e-5)),
+            )
+            logits = build_conv(
+                builder, self.get_hf_param, self.check_hf_param, "model.decoder.embed_tokens", norm
+            )
+            mask = np.zeros((1, 1, 1, self.cfg.vocab_size), dtype=np.float32)
+            mask[..., self.cfg.suppress_tokens + self._get_extra_suppress_tokens()] = np.finfo(np.float32).min
+            mask = builder.create_constant_node(mask.astype(activation_dtype(quantizable)))
+            logits = builder.create_add_node(logits, mask)
+            outputs = [builder.create_argmax_node(logits, ScalarType.int32)]
+            if self.enable_log_probe:
+                outputs.append(logits)
+        if self.output_encoder_kv_cache:
+            assert len(keys) == len(values) == 1
+            outputs.extend([keys[0], values[0]])
+        return outputs
 
     def gen_onnx_files(self):
         base_name = f"model.decoder.layers.{self.layer_idx}"

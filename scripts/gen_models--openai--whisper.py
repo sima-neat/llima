@@ -24,6 +24,7 @@ def gen_files(
     part: str | None,
     part_idx: int | None,
     enable_log_probe: bool,
+    model_sdk: bool = False,
 ):
     enable_verbose_error_messages()
 
@@ -48,6 +49,7 @@ def gen_files(
         part=part,
         part_idx=part_idx,
         resume=resume,
+        model_sdk=model_sdk,
     )
 
 
@@ -87,6 +89,10 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--enable_log_probe", action="store_true", default=False)
+    parser.add_argument(
+        "--model_sdk", action="store_true",
+        help="Generate directly with SiMaBuilder instead of the default ONNX path.",
+    )
     args = parser.parse_args()
     args.output_path = args.output_path or Path(".") / args.model_path.name
     print("Arguments:", args, flush=True)
@@ -98,4 +104,5 @@ if __name__ == "__main__":
         args.part,
         args.part_idx,
         args.enable_log_probe,
+        args.model_sdk,
     )
