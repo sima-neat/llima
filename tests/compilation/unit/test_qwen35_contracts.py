@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from afe.ir.execute import create_node_executor
+
 from sima_lmm.config.vlm_config import LanguageModelConfig, LoraConfig
 from sima_lmm.model import language_linear_model
 from sima_lmm.model.model_graph import ModelGraph
@@ -38,6 +40,7 @@ class _RecordingModelGraph(ModelGraph):
 def _linear_model(*, quantize_embeddings: bool, layer_idx: int = 0) -> LanguageLinearModel:
     model = object.__new__(LanguageLinearModel)
     model.num_tokens = 1
+    model.hf_model = SimpleNamespace(language_model_param_base_name="model")
     model.layer_idx = layer_idx
     model.cfg = SimpleNamespace(
         pipeline_cfg=SimpleNamespace(quantize_embeddings=quantize_embeddings),
@@ -71,6 +74,23 @@ def test_linear_attention_selects_supported_delta_block_sizes():
             model.__post_init__()
 
 
+@pytest.mark.parametrize("num_tokens", [4, 8, 16, 32])
+def test_linear_attention_single_block_inverse(num_tokens):
+    model = _linear_model(quantize_embeddings=False)
+    model.num_tokens = num_tokens
+    model.model_name = "single_block_inverse"
+    shape = (1, 1, num_tokens, num_tokens)
+    graph = ModelGraph(model, {"attn": shape}, quantizable=True)
+    inverse = model._build_block_chunk_inverse(graph, graph.inputs["attn"], block_size=num_tokens)
+    rng = np.random.default_rng(19)
+    attn = np.tril(rng.uniform(-0.1, 0.1, shape).astype(np.float32), k=-1)
+    expected = np.linalg.inv(np.eye(num_tokens, dtype=np.float32) - attn)
+    actual = graph.finish([inverse]).run({"attn": attn}, node_callable=create_node_executor(False))
+    if isinstance(actual, (list, tuple)):
+        actual = actual[0]
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-7)
+
+
 def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(monkeypatch):
     monkeypatch.setattr(language_linear_model, "ModelGraph", _RecordingModelGraph)
 
@@ -80,13 +100,13 @@ def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(mon
 
     monkeypatch.setattr(
         LanguageLinearModel,
-        "_build_sima_rms_norm",
+        "_build_rms_norm",
         stop_after_input_contract,
     )
 
     _RecordingModelGraph.instances.clear()
     with pytest.raises(_StopGraphBuild):
-        _linear_model(quantize_embeddings=True)._build_sima_nodes("model.layers.0", False)
+        _linear_model(quantize_embeddings=True).generate_graph({}, quantizable=False)
     quantized_builder = _RecordingModelGraph.instances[-1]
     assert quantized_builder.subnet_input_names == [
         "input",
@@ -99,8 +119,8 @@ def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(mon
     assert _linear_model(quantize_embeddings=True).get_mla_output_tessellate_params() == {}
 
     with pytest.raises(_StopGraphBuild):
-        _linear_model(quantize_embeddings=True, layer_idx=1)._build_sima_nodes(
-            "model.layers.1", False
+        _linear_model(quantize_embeddings=True, layer_idx=1).generate_graph(
+            {}, quantizable=False
         )
     bf16_builder = _RecordingModelGraph.instances[-1]
     assert bf16_builder.subnet_input_names == [
@@ -146,7 +166,7 @@ def test_linear_attention_lora_targets_disable_ab_projection_fusion(monkeypatch)
         lambda *_args: pytest.fail("targeted A/B projections must not be fused"),
     )
 
-    a, b = model._build_sima_ab_projections(
+    a, b = model._build_ab_projections(
         ModelGraph(model, {"input": (1, 1, 1, 16)}, False),
         "model.layers.0.linear_attn",
         object(),

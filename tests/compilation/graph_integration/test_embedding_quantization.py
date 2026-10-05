@@ -43,7 +43,6 @@ def gemma4_model(model_inputs_path: Path, tmp_path_factory) -> VisionLanguageMod
     return VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=output_path / "onnx",
         sima_path=output_path / "sima",
         max_num_tokens=1024,
         image_resolution=[240, 240],
@@ -58,7 +57,6 @@ def qwen3_vl_model(model_inputs_path: Path, tmp_path_factory) -> VisionLanguageM
     return VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=output_path / "onnx",
         sima_path=output_path / "sima",
         max_num_tokens=1024,
         image_resolution=[224, 224],
@@ -81,7 +79,6 @@ def _language_model(
     return LanguageModel(
         cfg,
         f"gemma4_{'vlm' if multimodal else 'llm'}",
-        onnx_path=tmp_path / "onnx",
         sima_path=tmp_path / "sima",
         hf_model=gemma4_model.hf_model,
         vlm_helper=gemma4_model.vlm_helper,
@@ -189,7 +186,7 @@ def test_non_gemma4_vlm_graph_dequantizes_embedding_rows_on_mla(
     )
     assert isinstance(pre_model, LanguagePreModel)
 
-    net = pre_model._build_sima_nodes(pre_model._layer_base_name, quantizable=False)
+    net = pre_model._build_nodes(pre_model._layer_base_name, quantizable=False)
 
     assert _input_scalar_type(net, "input") == ScalarType.int8
     assert _input_scalar_type(net, "input_scale") == ScalarType.bfloat16
@@ -207,7 +204,7 @@ def test_non_gemma4_vlm_graph_dequantizes_embedding_rows_on_mla(
         "post", num_tokens=1, layer_idx=0
     )
     assert isinstance(post_model, LanguagePostModel)
-    post_net = post_model._build_sima_nodes(
+    post_net = post_model._build_nodes(
         post_model._layer_base_name, quantizable=False
     )
     assert _input_names(post_net) == ["input", "input_scale", "self_attn"]
@@ -226,13 +223,12 @@ def test_per_layer_graph_embedding_inputs(
     model = LanguagePerLayerModel(
         language_model.cfg,
         f"gemma4_{'vlm' if multimodal else 'llm'}_per_layer",
-        onnx_path=language_model.onnx_path,
         sima_path=language_model.sima_path,
         hf_model=language_model.hf_model,
         num_tokens=1,
     )
 
-    net = model._build_sima_nodes(
+    net = model._build_nodes(
         language_model.hf_model.language_model_param_base_name,
         quantizable=False,
     )

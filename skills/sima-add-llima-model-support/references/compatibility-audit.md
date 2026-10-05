@@ -101,9 +101,8 @@ Before writing a transform, inspect:
 
 - `LocalHuggingFaceModel.param_exists`, `load_np_param`, and
   `language_model_param_base_name` in `sima_lmm/hf/hf_transformer.py`;
-- `find_alternate_weight` in `sima_lmm/model/onnx_builder.py`;
-- its ONNX and direct Model SDK call sites in `onnx_builder.py` and
-  `sima_builder.py`;
+- `ModelGraph._find_alternate_weight` and its `_build_conv` call site in
+  `sima_lmm/model/model_graph.py`;
 - conditional name selection in the nearest language or vision graph; and
 - existing configuration aliases in `sima_lmm/config/vlm_config.py`.
 

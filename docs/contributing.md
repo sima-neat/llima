@@ -136,12 +136,20 @@ functions. Model components use the graph methods. A component's implementation 
 ```python
 from sima_lmm.model.model_graph import ModelGraph
 
-def gen_model_sdk_files_directly(self, layer_cfg, log_level, quantizable):
+def generate_graph(self, layer_cfg, quantizable):
     graph = ModelGraph(self, {"hidden": (1, 1, self.num_tokens, self.cfg.d_model)}, quantizable)
     hidden = graph.layer_norm("model.norm", graph.inputs["hidden"])
     output = graph.mlp("model.mlp", hidden, "gelu", residual=graph.inputs["hidden"])
     graph.save([output])
 ```
+
+Define a standalone component's inputs, top-level topology and `graph.save()`
+inside `generate_graph()`. Keep `_build_nodes(graph, inputs)` for shared graph
+construction, such as Whisper's pre/cache/post parts used by its combined
+decoder graphs.
+
+Logging is scoped by `BaseModel.gen_files()`; graph construction does not need a
+separate logging argument.
 
 Shapes infer FP32 inputs for `quantizable=True` (a floating graph to quantize
 later), or BF16 for `False` (a direct graph using the source weight precision).
@@ -207,21 +215,17 @@ Q×K and before the mask, preserving models such as Qwen vision's BF16 order.
 Masks must be rank-four, vectors or scalars and broadcast to `[N,H,T_query,T_key]`;
 unsupported shapes raise `ValueError`.
 
-`graph.einsum(equation, lhs, rhs)` supports the following NHWC contractions,
-including renamed labels and whitespace:
+`graph.matmul(lhs, rhs)` creates an MLA batch matmul. Both transpose flags default
+to `False`; use `transpose_a=True` for Kᵀ×V or `transpose_b=True` for Q×Kᵀ.
+Inputs must be rank-four FP32/BF16 tensors with matching batches and contraction
+dimensions. Divisible head counts use implicit repetition for grouped-query
+attention; invalid shapes or types raise `ValueError`.
 
-| Equation | MLA transpose flags (A, B) |
-| --- | --- |
-| `nhwc,nhcq->nhwq` | false, false |
-| `nhwc,nhqc->nhwq` | false, true |
-| `nhcw,nhcq->nhwq` | true, false |
-| `nhcw,nhqc->nhwq` | true, true |
-
-Each creates an MLA `BatchMatmulOp`. Unsupported equations, mismatched scalar
-or contraction dimensions, and non-singleton head mismatches raise `ValueError`;
-there is no alternative backend fallback. Batches must match. Heads may broadcast
-from one. Grouped-query head repetition uses `graph.matmul()`
-because its semantics differ from NumPy `einsum`.
+`graph.softmax(x)` defaults to the last axis; an explicit `axis` is supported.
+Use `graph.slice(x, start=0, stop=128, axis=-1)` for a contiguous single-axis slice,
+or the existing `begin`/`end`/`stride`/`axis` lists for multi-axis slicing. The
+single-axis form defaults to start zero, requires an explicit axis and in-range
+nonempty bounds, and retains unaligned-channel handling. Do not mix the two forms.
 
 `ModelGraph` extends AFE's `SimaBuilder`, so native operations are available
 on the same object as the common helpers:

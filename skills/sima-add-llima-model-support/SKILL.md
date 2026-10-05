@@ -42,7 +42,7 @@ Combine routes only for independently proven differences. Then read
 - Extend existing name, tensor, graph, and packaging resolvers before adding a
   parallel model-specific implementation.
 - Keep format-specific normalization out of shared model computation.
-- Keep ONNX and direct Model SDK graphs aligned where both apply.
+- Use ModelGraph for native generation and validate staged and direct quantization.
 - Reject missing or ambiguous config/tensor layouts.
 - Add hermetic tests for pure logic and model-backed coverage for each affected
   compiler surface.

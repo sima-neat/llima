@@ -7,8 +7,7 @@ from afe.ir.tensor_type import TensorType, ScalarType
 
 from sima_lmm.model.base import TensorTessellateParameters, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.model_graph import activation_type, ModelGraph, save_model_graph
+from sima_lmm.model.model_graph import activation_type, ModelGraph
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
@@ -98,186 +97,11 @@ class LanguageCacheModel(LanguagePartBaseModel):
     def _kv_size(self) -> int:
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
-    def gen_onnx_files(self):
-        base_name = f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
-
-        self.create_onnx_builder()
-
-        self._onnx_builder.create_input_node(
-            "query",
-            (
-                1,
-                self._head_dim,
-                self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-                self.num_tokens
-            )
-        )
-
-        kv_cache_shape =  (
-            1,
-            self._head_dim,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            self.context_length
-        )
-        self._onnx_builder.create_input_node(f"cached_keys", kv_cache_shape)
-        if (
-            (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
-            or self._is_speculative_decoding
-            or self._uses_group_future_token_mask
-        ):
-            # For paligemma, the attention mask is dynamically determined.
-            # For speculative decoding, the attention mask is dynamically determined during decode time.
-            self._onnx_builder.create_input_node(
-                "attn_mask", (1, self.context_length, 1, self.num_tokens)
-            )
-        elif self._cache_mask_size > 1 and self.num_tokens == 1:
-            # Enable the future attention mask to reduce the total number of cache models.
-            self._onnx_builder.create_input_node("attn_mask", (1, self.token_idx + 1, 1, 1))
-        self._onnx_builder.create_input_node(f"cached_values", kv_cache_shape)
-
-        output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
-        output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
-        self._onnx_builder.create_output_node(
-            output_name, (1, self._q_size, 1, self.num_tokens)
-        )
-        self._onnx_builder.create_and_save_model()
-
-        # Set to None to deallocate the memory.
-        self._onnx_builder = None
-
-    def _build_reshape_kv(self, base_name: str, input_nodes: list[OnnxNode]):
-        # Expansion of K or V to match number of attention heads:
-        # (1, Head_Dim, n_kv, n_tokens) -> (1, Head_Dim, n_heads, n_tokens).
-        attn_heads = self.cfg.lm_cfg.attn_cfg.num_attention_heads
-        kv_heads = self.cfg.lm_cfg.attn_cfg.num_key_value_heads
-        assert attn_heads % kv_heads == 0
-        expansion_factor = attn_heads // kv_heads
-
-        assert len(input_nodes) == 1
-        kv_concat_shape = (
-            1,
-            self._head_dim,
-            attn_heads,
-            self.context_length
-        )
-        reshape_kv = self._onnx_builder.build_split_expand_concat(
-            f"{base_name}.reshape", input_nodes[0], kv_heads, expansion_factor,
-            split_axis=2, concat_axis=2, concat_shape=kv_concat_shape
-        )
-
-        return [reshape_kv]
-
-    def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        query = input_nodes[0]
-
-        # Expansion of KV to match number of attention heads
-        keys = self._build_reshape_kv(f"{base_name}.cached_keys", [input_nodes[1]])
-        values = self._build_reshape_kv(f"{base_name}.cached_values", [input_nodes[-1]])
-
-        assert len(keys) == len(values) == 1
-        bmm1 = self._onnx_builder.build_op(
-            f"{base_name}.bmm1", [query, keys[0]], "Einsum",
-            equation="nchw,nchq->nqhw"
-        )
-
-        if self.logit_softcapping is not None:
-            assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and self.cfg.lm_cfg.model_type == "gemma2"
-            bmm1 = self._onnx_builder.build_logit_softcapping(
-                f"{base_name}.softcap", bmm1, self.cfg.lm_cfg.attn_logit_softcapping
-            )
-
-        if self.num_tokens > 1:
-            if (
-                self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
-                or self._is_speculative_decoding
-                or self._uses_group_future_token_mask
-            ):
-                # For paligemma, the attention mask is dynamically determined.
-                # Speculative decoding uses num_tokens > 1 during decoding.
-                bmm1 = self._onnx_builder.build_op(
-                    f"{base_name}.masked_bmm1", [bmm1, input_nodes[2]], "Add"
-                )
-            else:
-                mask = np.zeros((1, self.context_length, 1, self.num_tokens), dtype=np.float32)
-                for i in range(self.num_tokens):
-                    for j in range(self.token_idx + i + 1, self.context_length):
-                        mask[0, j, 0, i] = np.finfo(np.float32).min
-                bmm1 = self._onnx_builder.build_op(f"{base_name}.masked_bmm1", [bmm1, mask], "Add")
-        elif self._cache_mask_size > 1:
-            bmm1 = self._onnx_builder.build_op(
-                f"{base_name}.masked_bmm1", [bmm1, input_nodes[2]], "Add"
-            )
-        softmax = self._onnx_builder.build_op(f"{base_name}.softmax", [bmm1], "Softmax", axis=1)
-        reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
-        if len(reduction_ranges) == 1:
-            bmm2 = self._onnx_builder.build_op(
-                f"{base_name}.bmm2", [softmax, values[0]], "Einsum",
-                equation="nchw,nqhc->nqhw"
-            )
-        else:
-            partial_bmm2 = []
-            for range_idx, (start, end) in enumerate(reduction_ranges):
-                slice_args = [
-                    np.array([start], dtype=np.int64),
-                    np.array([end], dtype=np.int64),
-                ]
-                softmax_slice = self._onnx_builder.build_op(
-                    f"{base_name}.bmm2.softmax_slice{range_idx}",
-                    [softmax, *slice_args, np.array([1], dtype=np.int64)],
-                    "Slice",
-                )
-                values_slice = self._onnx_builder.build_op(
-                    f"{base_name}.bmm2.values_slice{range_idx}",
-                    [values[0], *slice_args, np.array([3], dtype=np.int64)],
-                    "Slice",
-                )
-                partial_bmm2.append(
-                    self._onnx_builder.build_op(
-                        f"{base_name}.bmm2.partial{range_idx}",
-                        [softmax_slice, values_slice],
-                        "Einsum",
-                        equation="nchw,nqhc->nqhw",
-                    )
-                )
-
-            add_level = 0
-            while len(partial_bmm2) > 1:
-                next_level = [
-                    self._onnx_builder.build_op(
-                        f"{base_name}.bmm2.add_level{add_level}_pair{pair_idx}",
-                        [lhs, rhs],
-                        "Add",
-                    )
-                    for pair_idx, (lhs, rhs) in enumerate(
-                        zip(partial_bmm2[::2], partial_bmm2[1::2])
-                    )
-                ]
-                if len(partial_bmm2) % 2:
-                    next_level.append(partial_bmm2[-1])
-                partial_bmm2 = next_level
-                add_level += 1
-            bmm2 = partial_bmm2[0]
-
-        reshape_bmm2 = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.bmm2.reshape", bmm2,
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-            split_axis=2, concat_axis=1
-        )
-        return [reshape_bmm2]
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
-        base_name = f"{self.hf_model.language_model_param_base_name}.token.{self.token_idx}"
-        g = self._build_sima_nodes(base_name, quantizable)
-        save_model_graph(self, g, quantizable)
-
-    def _build_sima_nodes(self, base_name: str, quantizable: bool):
-        # Expansion of KV to match number of attention heads:
-        # (1, Head_Dim, n_kv, n_tokens) -> (1, Head_Dim, n_heads, n_tokens).
         assert (
             self.cfg.lm_cfg.attn_cfg.num_attention_heads % self.cfg.lm_cfg.attn_cfg.num_key_value_heads
             == 0
@@ -357,7 +181,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         # First multiply (input * key)
         # BatchMatMul repeats the smaller H dimension for GQA.
         bmm1 = graph.matmul(
-            mla_input_input, mla_input_cached_keys, transpose_a=False, transpose_b=True
+            mla_input_input, mla_input_cached_keys, transpose_b=True
         )
         assert get_expected_tensor_value(bmm1.get_type().output).shape == key_shape
 
@@ -394,9 +218,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         # Second multiply ((input * key) * value)
         reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
         if len(reduction_ranges) == 1:
-            bmm2 = graph.matmul(
-                softmax, mla_input_cached_values, transpose_a=False, transpose_b=False
-            )
+            bmm2 = graph.matmul(softmax, mla_input_cached_values)
         else:
             partial_bmm2 = []
             for start, end in reduction_ranges:
@@ -405,9 +227,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
                     mla_input_cached_values, [start], [end], [1], [2]
                 )
                 partial_bmm2.append(
-                    graph.matmul(
-                        softmax_slice, values_slice, transpose_a=False, transpose_b=False
-                    )
+                    graph.matmul(softmax_slice, values_slice)
                 )
 
             while len(partial_bmm2) > 1:
@@ -423,7 +243,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         output = graph.merge_heads(bmm2)
         assert get_expected_tensor_value(output.get_type().output).shape == output_shape
 
-        return graph.finish([output])
+        graph.save([output])
 
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """

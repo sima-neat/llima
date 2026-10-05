@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 243
+- Expected cases: 247
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -142,7 +142,9 @@ and tag builds validate the candidate only because those refs do not have a
 separate baseline artifact.
 
 Baseline generation uses develop's existing native SDK path; it does not
-require the new `ModelGraph` wrapper.
+require the new `ModelGraph` wrapper. The test model factory supplies the
+legacy constructor path only when the published baseline API requires it;
+no ONNX graph is generated or executed.
 
 Each case declares one regression mode in `tests/compilation/cases.py`:
 

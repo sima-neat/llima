@@ -14,9 +14,7 @@ from afe.ir.node import AwesomeNode
 from afe.ir.serializer import save_awesomenet
 from afe.ir.sima_builder import SimaBuilder
 from afe.ir.tensor_type import ScalarType, TensorType
-from afe.ir.utils import is_mla_supported_einsum_equation, transpose_flags_from_einsum_equation
 
-from sima_lmm.model.onnx_builder import find_alternate_weight
 from sima_lmm.utils import ceil_div_row, mla_max_num_rows, mla_row_size, round_up_to_row
 
 if TYPE_CHECKING:
@@ -73,15 +71,6 @@ def tensor_type(node: NodeOrHandle) -> TensorType:
     return get_expected_tensor_value(as_handle(node).type)
 
 
-def save_model_graph(model: "BaseModel", net: AwesomeNet, quantizable: bool) -> None:
-    """Save a completed graph using the component's standard artifact name."""
-    save_awesomenet(
-        net,
-        model.model_name + (".fp32" if quantizable else ""),
-        str(model.sima_model_sdk_path),
-    )
-
-
 class ModelGraph(SimaBuilder):
     """AFE SimaBuilder with model weights, precision and a single MLA subnet.
 
@@ -109,9 +98,24 @@ class ModelGraph(SimaBuilder):
         return self.create_mul_node(lhs, rhs)
 
     def matmul(
-        self, lhs: NodeOrHandle, rhs: NodeOrHandle, transpose_a: bool, transpose_b: bool
+        self, lhs: NodeOrHandle, rhs: NodeOrHandle,
+        transpose_a: bool = False, transpose_b: bool = False,
     ) -> NodeOrHandle:
-        """Multiply batched matrices, optionally transposing either matrix operand."""
+        """Multiply rank-four matrices, optionally transposing their last two axes.
+
+        Batches must match. Divisible head counts use MLA's implicit head repetition.
+        """
+        a, b = tensor_type(lhs), tensor_type(rhs)
+        if len(a.shape) != 4 or len(b.shape) != 4:
+            raise ValueError(f"matmul needs rank-four inputs; got {a.shape} and {b.shape}")
+        if a.scalar != b.scalar or a.scalar not in (ScalarType.float32, ScalarType.bfloat16):
+            raise ValueError(f"matmul needs matching FP32/BF16 inputs; got {a.scalar} and {b.scalar}")
+        if a.shape[0] != b.shape[0] or max(a.shape[1], b.shape[1]) % min(a.shape[1], b.shape[1]):
+            raise ValueError(
+                f"matmul needs equal batches and divisible head counts; got {a.shape} and {b.shape}"
+            )
+        if a.shape[2 if transpose_a else 3] != b.shape[3 if transpose_b else 2]:
+            raise ValueError(f"matmul has mismatched contraction dimensions: {a.shape} and {b.shape}")
         return self.create_batch_matmul_node(lhs, rhs, transpose_a, transpose_b)
 
     def concat(self, tensors: Sequence[NodeOrHandle], axis: int) -> NodeOrHandle:
@@ -126,8 +130,8 @@ class ModelGraph(SimaBuilder):
         """Change tensor shape while preserving element order."""
         return self.create_reshape_node(data, new_shape)
 
-    def softmax(self, data: NodeOrHandle, axis: int) -> NodeOrHandle:
-        """Convert values into probabilities along axis."""
+    def softmax(self, data: NodeOrHandle, axis: int = -1) -> NodeOrHandle:
+        """Convert values into probabilities along axis, defaulting to the last axis."""
         return self.create_softmax_node(data, axis)
 
     def sigmoid(self, data: NodeOrHandle) -> NodeOrHandle:
@@ -240,7 +244,11 @@ class ModelGraph(SimaBuilder):
     ) -> None:
         """Finish and save under the model's configured path and precision suffix."""
         net = self.finish(outputs, transform_subnet=transform_subnet)
-        save_model_graph(self.model, net, self.quantizable)
+        save_awesomenet(
+            net,
+            self.model.model_name + (".fp32" if self.quantizable else ""),
+            str(self.model.sima_model_sdk_path),
+        )
 
     def parameter(self, name: str) -> np.ndarray | tuple:
         """Load source data, retaining packed weights, scales and block metadata."""
@@ -311,13 +319,43 @@ class ModelGraph(SimaBuilder):
     def slice(
         self,
         data: NodeOrHandle,
-        begin: list[int],
-        end: list[int],
-        stride: list[int],
-        axis: list[int],
+        begin: list[int] | None = None,
+        end: list[int] | None = None,
+        stride: list[int] | None = None,
+        axis: int | list[int] | None = None,
+        *,
+        start: int | None = None,
+        stop: int | None = None,
     ) -> NodeOrHandle:
-        """Slice normally, using selector convolutions for unaligned activation channels."""
+        """Slice with axis lists or start/stop on one axis, with channel alignment handling.
+
+        The single-axis form defaults to start=0, requires axis and stop,
+        and uses stride one with 0 <= start < stop <= the axis length.
+        """
+        if axis is None:
+            raise ValueError("slice requires an explicit axis")
         spec = tensor_type(data)
+        if start is not None or stop is not None:
+            if any(value is not None for value in (begin, end, stride)):
+                raise ValueError("slice cannot mix start/stop with begin/end/stride")
+            if not isinstance(axis, int) or not -len(spec.shape) <= axis < len(spec.shape):
+                raise ValueError(
+                    f"slice axis must be an integer in [-{len(spec.shape)}, "
+                    f"{len(spec.shape) - 1}]; got {axis}"
+                )
+            start = 0 if start is None else start
+            if not isinstance(start, int) or not isinstance(stop, int):
+                raise ValueError("slice requires integer start/stop bounds; stop is required")
+            if not 0 <= start < stop <= spec.shape[axis]:
+                raise ValueError(
+                    f"slice needs 0 <= start < stop <= {spec.shape[axis]} on axis {axis}; "
+                    f"got start={start}, stop={stop}"
+                )
+            begin, end, stride, axis = [start], [stop], [1], [axis]
+        elif any(value is None for value in (begin, end, stride)) or isinstance(axis, int):
+            raise ValueError(
+                "slice requires begin/end/stride and axis lists, or start/stop with one axis"
+            )
         if (
             len(spec.shape) == 4
             and spec.scalar in (ScalarType.float32, ScalarType.bfloat16)
@@ -527,47 +565,6 @@ class ModelGraph(SimaBuilder):
             raise ValueError(f"merge_heads needs [N,H,T,C]; got {shape}")
         return self.split_concat(data, axis=3, split_axis=1, split_block=shape[1], split_repeat=1)
 
-    def einsum(self, equation: str, lhs: NodeOrHandle, rhs: NodeOrHandle) -> NodeOrHandle:
-        """Lower a supported rank-four contraction directly to MLA BatchMatmul.
-
-        Only the four NHWC matmul equations (and renamed labels) are supported.
-        Batch dimensions must match; heads may broadcast from one. Grouped-query
-        attention's head repetition is not NumPy einsum semantics: use raw BMM.
-        """
-        equation = "".join(equation.split())
-        try:
-            labels = equation.replace("->", ",").split(",")
-            supported = all(
-                len(set(label)) == 4 and label.isascii() and label.isalpha() for label in labels
-            ) and is_mla_supported_einsum_equation(equation, "NHWC")
-        except (ValueError, AssertionError, IndexError):
-            supported = False
-        if not supported:
-            raise ValueError(
-                f"Unsupported einsum {equation!r}; use rank-four NHWC batch matmul, e.g. nhwc,nhqc->nhwq"
-            )
-        a, b = tensor_type(lhs), tensor_type(rhs)
-        if len(a.shape) != 4 or len(b.shape) != 4:
-            raise ValueError(
-                f"einsum {equation!r} needs rank-four inputs; got {a.shape} and {b.shape}"
-            )
-        if a.scalar != b.scalar or a.scalar not in (ScalarType.float32, ScalarType.bfloat16):
-            raise ValueError(
-                f"einsum {equation!r} needs matching FP32/BF16 inputs; got {a.scalar} and {b.scalar}"
-            )
-        ta, tb = transpose_flags_from_einsum_equation(equation)
-        if a.shape[0] != b.shape[0] or (
-            a.shape[1] != b.shape[1] and min(a.shape[1], b.shape[1]) != 1
-        ):
-            raise ValueError(
-                f"einsum {equation!r} needs equal batches and equal or singleton heads; got {a.shape} and {b.shape}"
-            )
-        if a.shape[2 if ta else 3] != b.shape[3 if tb else 2]:
-            raise ValueError(
-                f"einsum {equation!r} has mismatched contraction dimensions: {a.shape} and {b.shape}"
-            )
-        return self.create_batch_matmul_node(lhs, rhs, transpose_a=ta, transpose_b=tb)
-
     def attention(
         self,
         query: NodeOrHandle,
@@ -624,12 +621,12 @@ class ModelGraph(SimaBuilder):
                     ],
                     axis=1,
                 )
-        scores = self.einsum("nhwc,nhqc->nhwq", query, key)
+        scores = self.matmul(query, key, transpose_b=True)
         if score_scale is not None:
             scores = self.mul(scores, self.constant([score_scale]))
         if mask is not None:
             scores = self.add(scores, mask)
-        return self.einsum("nhwc,nhcq->nhwq", self.softmax(scores, axis=3), value)
+        return self.matmul(self.softmax(scores, axis=3), value)
 
     def rope(
         self,
@@ -841,8 +838,8 @@ class ModelGraph(SimaBuilder):
 
         # Some models have bundled weights with a different name for a layer.
         if not check_param_func(src_weight_name):
-            src_weight_name, partition = find_alternate_weight(
-                get_param_func, src_weight_name, q_size, kv_size
+            src_weight_name, partition = self._find_alternate_weight(
+                src_weight_name, q_size, kv_size
             )
             src_bias_name = src_weight_name.replace("weight", "bias")
             # Select the projection before applying caller transforms, including scaling.
@@ -981,6 +978,88 @@ class ModelGraph(SimaBuilder):
             ifm, weight_tensor, bias_tensor, conv_attrs, None, scales=scales
         )
         return conv
+
+    @staticmethod
+    def _get_array_partition(
+        count: int, index: int, span: int
+    ) -> Callable[[np.ndarray | tuple[np.ndarray, np.ndarray]], np.ndarray | tuple[np.ndarray, np.ndarray]]:
+        """
+        Get a function that divides tensor data into parts along
+        axis 0 and returns one of the parts.
+
+        This is a helper for fused projection weights.
+
+        Args:
+            count: Number of parts that the data is logically divided into.
+            index: Index of the beginning of the part to return.
+            span: Number of parts to include in the returned array.
+        """
+        def slice_array(a: np.ndarray) -> np.ndarray:
+            size = a.shape[0]
+            assert size % count == 0
+            element_size = size // count
+            i = element_size * index
+            return a[i:i + element_size * span]
+
+        def get(a: np.ndarray | tuple) -> np.ndarray | tuple:
+            if isinstance(a, tuple):
+                return slice_array(a[0]), slice_array(a[1]), *a[2:]
+            return slice_array(a)
+
+        return get
+
+    @staticmethod
+    def _find_alternate_weight(
+        weight_name: str,
+        q_size: int | None,
+        kv_size: int | None
+    ) -> tuple[str, Callable[[np.ndarray | tuple[np.ndarray, np.ndarray]], np.ndarray | tuple[np.ndarray, np.ndarray]]]:
+        """
+        Some transformer models, like Microsoft Phi-3.5, have bundled weights.
+            - qkv_proj for q_proj, k_proj, and v_proj.
+            - gate_up_proj for gate_proj and up_proj.
+        If a weight name is not found, change it to the bundled weight name.
+
+        Args:
+            weight_name: The original name of a tensor weight, which may or may not exist.
+
+        Returns:
+            The alternate weight name and corresponding process function.
+        """
+        proj_name = weight_name.replace(".weight", "").split(".")[-1]
+        if proj_name in ("q_proj", "k_proj", "v_proj"):
+            assert q_size is not None
+            assert kv_size is not None
+            new_weight_name = weight_name.replace(proj_name, "qkv_proj")
+        elif proj_name in ("gate_proj", "up_proj"):
+            new_weight_name = weight_name.replace(proj_name, "gate_up_proj")
+        else:
+            raise NotImplementedError(f"{proj_name} not found in weight map.")
+        match proj_name:
+            case "q_proj":
+                parts = q_size + 2 * kv_size
+                index = 0
+                span = q_size
+            case "k_proj":
+                parts = q_size + 2 * kv_size
+                index = q_size
+                span = kv_size
+            case "v_proj":
+                parts = q_size + 2 * kv_size
+                index = q_size + kv_size
+                span = kv_size
+            case "gate_proj":
+                parts = 2
+                index = 0
+                span = 1
+            case "up_proj":
+                parts = 2
+                index = 1
+                span = 1
+
+        new_process_func = ModelGraph._get_array_partition(parts, index, span)
+
+        return new_weight_name, new_process_func
 
 
 def _derive_lora_name_from_base_model(base_name: str) -> str:

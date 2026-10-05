@@ -19,7 +19,7 @@ description: Make safe changes in the sima-neat/llima repository across GenAI co
    classifying new implementation work.
 6. Search for nearby implementations, fallback resolvers, tests, CLI
    definitions, and docs. When shared compiler code may affect both, trace the
-   ONNX and direct Model SDK generation paths before adding a new helper.
+   native generation and quantization paths before adding a new helper.
    Preserve unrelated work and vendored code.
 
 ## Implement

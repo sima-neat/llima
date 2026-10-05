@@ -42,7 +42,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguagePreModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_pre_layer{LAYER_INDEX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -60,7 +59,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguageCacheModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_cache_token{TOKEN_INDEX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -78,7 +76,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguagePostModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_post_layer{LAYER_INDEX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -94,7 +91,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguageDraftFCModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_draft_fc",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -169,7 +165,7 @@ def test_speculative_cache_graph_accepts_quantized_kv_and_scales(
     model, _, _ = _build_component(
         SpeculativeGraphCase("cache"), draft_model
     )
-    net = model._build_sima_nodes(
+    net = model._build_nodes(
         f"{draft_model.hf_model.language_model_param_base_name}.token.{TOKEN_INDEX}",
         quantizable=False,
     )
@@ -202,7 +198,7 @@ def test_speculative_embedding_graph_uses_target_rows_and_scales(
     pre_model, _, _ = _build_component(SpeculativeGraphCase("pre"), draft_model)
     post_model, _, _ = _build_component(SpeculativeGraphCase("post"), draft_model)
 
-    pre_net = pre_model._build_sima_nodes(
+    pre_net = pre_model._build_nodes(
         draft_model.hf_model.language_model_param_base_name,
         quantizable=False,
     )
@@ -216,7 +212,7 @@ def test_speculative_embedding_graph_uses_target_rows_and_scales(
         pre_net.nodes[NodeName("input_scale")].get_type().output
     ).scalar == ScalarType.bfloat16
 
-    post_net = post_model._build_sima_nodes(
+    post_net = post_model._build_nodes(
         draft_model.hf_model.language_model_param_base_name,
         quantizable=False,
     )

@@ -60,7 +60,7 @@ def test_standard_vision_head_padding_preserves_attention_and_grouped_weights(he
     shape = (1, 1, 3, channels)
     quantizable = precision == "float32"
     graph = ModelGraph(model, {"x": shape}, quantizable)
-    output = model._build_sima_encoder_attention(graph, "attn", graph.inputs["x"])
+    output = model._build_encoder_attention(graph, "attn", graph.inputs["x"])
     net = graph.finish([output])
     convolutions = [
         node for node in net.nodes["MLA_0"].ir.nodes.values()
@@ -176,18 +176,18 @@ def test_qwen2_layer_uses_its_source_block_and_attention_mode():
     graph.conv.side_effect = AssertionError("unexpected embedding")
     global_mask = object()
     windowed_mask = object()
-    model._prepare_sima_qwen2_static_inputs = Mock(
+    model._prepare_qwen2_static_inputs = Mock(
         return_value=(object(), object(), global_mask, windowed_mask)
     )
     layer_output = object()
-    model._build_sima_qwen2_vision_block = Mock(return_value=layer_output)
-    model._build_sima_qwen2_merger = Mock(side_effect=AssertionError("unexpected merger"))
+    model._build_qwen2_vision_block = Mock(return_value=layer_output)
+    model._build_qwen2_merger = Mock(side_effect=AssertionError("unexpected merger"))
     layer_input = object()
 
-    assert model._build_sima_qwen2_vision_model(
+    assert model._build_qwen2_vision_model(
         graph, "vision", layer_input, quantizable=False
     ) is layer_output
-    args = model._build_sima_qwen2_vision_block.call_args.args
+    args = model._build_qwen2_vision_block.call_args.args
     assert args[:4] == (graph, "vision.blocks.7", layer_input, global_mask)
 
 
@@ -199,24 +199,24 @@ def test_qwen3_layer_emits_its_deepstack_output_without_final_merger(
     model = VisionModel(config, "test_vision")._get_part_model(layer_idx)
     graph = Mock(spec=ModelGraph)
     graph.conv.side_effect = AssertionError("unexpected embedding")
-    model._prepare_sima_qwen3_rotary_tables = Mock(return_value=(object(), object()))
-    model._prepare_sima_qwen3_position_embedding = Mock(
+    model._prepare_qwen3_rotary_tables = Mock(return_value=(object(), object()))
+    model._prepare_qwen3_position_embedding = Mock(
         side_effect=AssertionError("unexpected position embedding")
     )
     layer_output = object()
     deepstack_output = object()
-    model._build_sima_qwen3_vision_block = Mock(return_value=layer_output)
-    model._build_sima_qwen3_deepstack_merger = Mock(return_value=deepstack_output)
-    model._build_sima_qwen3_merger = Mock(side_effect=AssertionError("unexpected final merger"))
+    model._build_qwen3_vision_block = Mock(return_value=layer_output)
+    model._build_qwen3_deepstack_merger = Mock(return_value=deepstack_output)
+    model._build_qwen3_merger = Mock(side_effect=AssertionError("unexpected final merger"))
 
-    assert model._build_sima_qwen3_vision_model(
+    assert model._build_qwen3_vision_model(
         graph, "vision", object(), quantizable=False
     ) == [
         layer_output,
         deepstack_output,
     ]
-    assert model._build_sima_qwen3_vision_block.call_args.args[1] == f"vision.blocks.{layer_idx}"
-    assert model._build_sima_qwen3_deepstack_merger.call_args.args[1] == (
+    assert model._build_qwen3_vision_block.call_args.args[1] == f"vision.blocks.{layer_idx}"
+    assert model._build_qwen3_deepstack_merger.call_args.args[1] == (
         f"vision.deepstack_merger_list.{deepstack_idx}"
     )
 
@@ -225,16 +225,16 @@ def test_qwen3_layer_emits_its_deepstack_output_without_final_merger(
     ("config_name", "constants_method", "block_method", "num_constants"),
     [
         (
-            "gemma4_e2b_it_vlm_config.json", "_precompute_sima_constants",
-            "_build_sima_encoder_layer", 5,
+            "gemma4_e2b_it_vlm_config.json", "_precompute_constants",
+            "_build_encoder_layer", 5,
         ),
         (
-            "qwen2.5_vl_vlm_config.json", "_prepare_sima_qwen2_static_inputs",
-            "_build_sima_qwen2_vision_block", 4,
+            "qwen2.5_vl_vlm_config.json", "_prepare_qwen2_static_inputs",
+            "_build_qwen2_vision_block", 4,
         ),
         (
-            "qwen3_vl_vlm_config.json", "_prepare_sima_qwen3_rotary_tables",
-            "_build_sima_qwen3_vision_block", 2,
+            "qwen3_vl_vlm_config.json", "_prepare_qwen3_rotary_tables",
+            "_build_qwen3_vision_block", 2,
         ),
     ],
 )
@@ -259,4 +259,5 @@ def test_nonfirst_native_layer_uses_hidden_state_shapes(
     hidden = np.random.default_rng(0).normal(0, 0.1, shape).astype(np.float32)
     outputs = net.run({"input": hidden}, node_callable=create_node_executor(False))
     assert len(outputs) == 1
-    np.testing.assert_array_equal(outputs[0], hidden, strict=True)
+    assert outputs[0].dtype == hidden.dtype
+    np.testing.assert_array_equal(outputs[0], hidden)

@@ -129,7 +129,7 @@ python -P -m pytest \
 `--model-inputs-path`と`LLIMA_HF_MODELS_PATH`は、準備されたHugging FaceのGGUF入力ルートを選択します。CIは、`tools/hf-safetensors/`の下にあるマニフェストを使用します。
 フィクスチャのスキップを受け入れる代わりに、必要な入力を設定します。
 
-テストマトリックス、期待されるカウント、およびベースラインポリシーは、`tests/README.md`にあります。CIの呼び出しは、`.github/workflows/model-compiler-tests.yml`にあります。実行中にONNXと数値比較アーティファクトを生成し、バイナリベースラインをコミットするのではなく、それらを使用します。
+テストマトリックス、期待されるカウント、およびベースラインポリシーは、`tests/README.md`にあります。CIの呼び出しは、`.github/workflows/model-compiler-tests.yml`にあります。実行中にModel SDKと数値比較アーティファクトを生成し、バイナリベースラインをコミットするのではなく、それらを使用します。
 
 ### ランタイムでの検証
 

@@ -6,8 +6,7 @@ from afe.ir.tensor_type import TensorType, ScalarType
 
 from sima_lmm.model.base import LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
-from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 
 
 @dataclass
@@ -33,72 +32,13 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             "LanguagePerLayerModel requires hidden_size_per_layer_input > 0"
         )
 
-    def gen_onnx_files(self):
-        lm_base = self.hf_model.language_model_param_base_name
-        L = self.cfg.lm_cfg.num_hidden_layers
-        H = self.cfg.lm_cfg.hidden_size_per_layer_input
-
-        self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "per_layer_emb_staging", (1, L * H, 1, self.num_tokens)
-        )
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-        )
-
-        output_node = self._build_onnx_per_layer_projection(
-            lm_base, self._onnx_builder.input_nodes
-        )
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_node),
-            (1, H, 1, L * self.num_tokens),
-        )
-
-        self._onnx_builder.create_and_save_model()
-        self._onnx_builder = None
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
-        del layer_cfg, log_level
-        g = self._build_sima_nodes(
-            self.hf_model.language_model_param_base_name,
-            quantizable,
-        )
-        save_model_graph(self, g, quantizable)
-
-    def _build_onnx_per_layer_projection(
-        self, lm_base: str, input_nodes: list[OnnxNode]
-    ) -> OnnxNode:
-        L = self.cfg.lm_cfg.num_hidden_layers
-
-        proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{lm_base}.per_layer_model_projection", input_nodes[1], None
-        )
-        proj = self._onnx_builder.build_op(
-            f"{lm_base}.per_layer_proj_scale",
-            [proj, self.cfg.lm_cfg.hidden_size ** -0.5],
-            "Mul",
-        )
-        proj = self._onnx_builder.build_split_and_concat(
-            f"{lm_base}.per_layer_proj_reshape", proj, L, split_axis=1, concat_axis=3
-        )
-        proj_normed = self._build_rms_norm(f"{lm_base}.per_layer_projection_norm", proj)
-
-        emb = self._onnx_builder.build_split_and_concat(
-            f"{lm_base}.per_layer_emb_reshape", input_nodes[0], L, split_axis=1, concat_axis=3
-        )
-        combined = self._onnx_builder.build_op(
-            f"{lm_base}.per_layer_combine", [emb, proj_normed], "Add"
-        )
-        return self._onnx_builder.build_op(
-            f"{lm_base}.per_layer_combine_scale", [combined, 2.0 ** -0.5], "Mul"
-        )
-
-    def _build_sima_nodes(self, lm_base: str, quantizable: bool):
+        del layer_cfg
+        lm_base = self.hf_model.language_model_param_base_name
         L = self.cfg.lm_cfg.num_hidden_layers
         H = self.cfg.lm_cfg.hidden_size_per_layer_input
         staging_shape = (1, 1, self.num_tokens, L * H)
@@ -143,7 +83,7 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             split_block=L,
             split_repeat=1,
         )
-        proj_normed = self._build_sima_rms_norm(
+        proj_normed = self._build_rms_norm(
             graph,
             f"{lm_base}.per_layer_projection_norm",
             proj,
@@ -166,4 +106,4 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             graph.constant(np.array([2.0**-0.5], dtype=activation_dtype(quantizable))),
         )
 
-        return graph.finish([output])
+        graph.save([output])

@@ -5,25 +5,18 @@ from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import BaseModel
 from sima_lmm.model.model_graph import ModelGraph
-from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
 @dataclass
 class LanguagePartBaseModel(BaseModel):
-    def _build_rms_norm(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        weight_offset = 1.0 if self.cfg.lm_cfg.rms_norm_unit_offset else 0.0
-        return self._onnx_builder.build_rms_norm(
-            base_name, input_node, self.cfg.lm_cfg.rms_norm_eps, weight_offset
-        )
 
-    def _build_sima_rms_norm(
+    def _build_rms_norm(
         self,
         graph: ModelGraph,
         base_name: str,
         input_node: NodeOrHandle,
         weightless: bool = False,
-        num_channels: int | None = None,
     ) -> NodeOrHandle:
         """
         Create an RMS norm with a multiplication applied to its outputs.
@@ -34,60 +27,7 @@ class LanguagePartBaseModel(BaseModel):
             epsilon=self.cfg.lm_cfg.rms_norm_eps, weight_offset=weight_offset,
         )
 
-    def _build_onnx_mlp(
-        self, base_name: str, input_nodes: list[OnnxNode], with_residual_add: bool = False
-    ) -> OnnxNode:
-        """Build ONNX nodes for the MLP block with optional splitting.
-
-        Handles both LFM2-style weights (w1/w2/w3) and standard weights (gate_proj/up_proj/down_proj).
-       """
-        # Make sure that there is residual add input if needed.
-        assert len(input_nodes) == (2 if with_residual_add else 1)
-
-        # Determine weight naming convention based on what exists in the model.
-        if self.check_hf_param(f"{base_name}.w2.weight"):
-            gate_name, up_name, down_name = "w1", "w3", "w2"
-        else:
-            gate_name, up_name, down_name = "gate_proj", "up_proj", "down_proj"
-
-        # The MLP is built unsplit; the n2a compiler auto-splits infeasible conv-bounded regions.
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, gate_name)
-        gate_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.{gate_name}", input_nodes[0], lora_rank
-        )
-
-        act = self._onnx_builder.build_activation(
-            f"{base_name}.act", gate_proj, self.cfg.lm_cfg.mlp_cfg.act
-        )
-
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, up_name)
-        up_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.{up_name}", input_nodes[0], lora_rank
-        )
-
-        mul2 = self._onnx_builder.build_op(f"{base_name}.mul2", [act, up_proj], "Mul")
-
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
-
-        down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.{down_name}", mul2, lora_rank
-        )
-
-        if with_residual_add:
-            # Sums the MLP output with the residual stream.
-            down_proj = self._onnx_builder.build_op(
-                f"{base_name}.add2", [input_nodes[1], down_proj], "Add"
-            )
-
-        return down_proj
-
-    def _build_sima_mlp(
+    def _build_mlp(
         self, graph, base_name: str, input_nodes: list[NodeOrHandle], merged_lora: bool = False, with_residual_add: bool =  False
     ) -> NodeOrHandle:
         """Build SiMa nodes for the MLP block with optional splitting.
@@ -134,92 +74,6 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
     layer_idx: int
     final_softcapping: float | None
 
-    def _create_final_layer_output_nodes(self, output_nodes: list[OnnxNode]):
-        """Create output nodes for the final transformer layer."""
-        if not self.is_draft and self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
-            output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
-            self._onnx_builder.create_output_node(output_name, (1, 1, 1, self.num_tokens), np.int64)
-        else:
-            # Find the last layer's size based on the weight tensor shape.
-            output_vocab_size = self.get_hf_param(self._get_output_embed_name()).shape[0]
-            assert 1 < output_vocab_size <= (
-                self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
-                else self.cfg.lm_cfg.token_cfg.vocab_size
-            )
-
-            for i in range(self.cfg.lm_cfg.lm_head_num_splits):
-                split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
-                split_size = min(
-                    output_vocab_size - split_begin,
-                    self.cfg.lm_cfg.lm_head_split_dim
-                )
-                output_name = self._onnx_builder.get_node_output_name(output_nodes[i])
-                self._onnx_builder.create_output_node(
-                    output_name, (1, split_size, 1, self.num_tokens)
-                )
-            if self.is_draft:
-                # EAGLE3 draft model also returns hidden_states as the last output
-                hidden_states_name = self._onnx_builder.get_node_output_name(output_nodes[-1])
-                self._onnx_builder.create_output_node(
-                    hidden_states_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-                )
-
-    def _build_onnx_post_transformer(self, base_name: str, input_node: OnnxNode) -> list[OnnxNode]:
-        """
-        Build ONNX nodes for the post-transformer projection (final norm + lm_head).
-        """
-        # LFM2 uses embedding_norm instead of norm for the final normalization.
-        base_prefix = self.hf_model.language_model_param_base_name
-        final_norm_name = (
-            "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
-        )
-        final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_draft:
-            final_norm_full_name = final_norm_name
-        rms_norm2 = self._build_rms_norm(final_norm_full_name, input_node)
-
-        # Find the last layer's size based on the weight tensor shape.
-        output_embed_name = self._get_output_embed_name()
-        output_vocab_size = self.get_hf_param(output_embed_name).shape[0]
-        assert 1 < output_vocab_size <= (
-            self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
-            else self.cfg.lm_cfg.token_cfg.vocab_size
-        )
-
-        lm_heads = list()
-        kwargs = dict()
-        kwargs["src_weight_name"] = output_embed_name
-        for i in range(self.cfg.lm_cfg.lm_head_num_splits):
-            split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
-            split_end = min(
-                split_begin + self.cfg.lm_cfg.lm_head_split_dim,
-                output_vocab_size
-            )
-            def param_process_func(x: np.ndarray) -> np.ndarray:
-                return x[split_begin:split_end]
-            kwargs["weight_process_func"] = param_process_func
-            kwargs["bias_process_func"] = param_process_func
-            lm_head = self._onnx_builder.build_conv(f"lm_head.{i}", rms_norm2, **kwargs)
-            if self.final_softcapping is not None:
-                assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and (
-                    self.cfg.model_type in (VlmArchType.LLM_GEMMA2, VlmArchType.VLM_GEMMA4)
-                )
-                lm_head = self._onnx_builder.build_logit_softcapping(
-                    f"{base_name}.final_softcap.{i}", lm_head, self.cfg.lm_cfg.final_logit_softcapping
-                )
-            lm_heads.append(lm_head)
-
-        if self.is_draft:
-            lm_heads.append(input_node)
-            return lm_heads
-        if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
-            argmax = self._onnx_builder.build_op(
-                "argmax", lm_heads, "ArgMax", axis=1, keepdims=1
-            )
-            return [argmax]
-        else:
-            return lm_heads
-
     def _build_post_transformer(self, graph, input_node) -> NodeOrHandle:
         """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""
         # LFM2 uses embedding_norm instead of norm for the final normalization.
@@ -230,7 +84,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
         if self.is_draft:
             final_norm_full_name = final_norm_name
-        rms_norm = self._build_sima_rms_norm(graph, final_norm_full_name, input_node)
+        rms_norm = self._build_rms_norm(graph, final_norm_full_name, input_node)
 
         # Find the last layer's size based on the weight tensor shape.
         output_embed_name = self._get_output_embed_name()

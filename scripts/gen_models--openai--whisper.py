@@ -24,14 +24,12 @@ def gen_files(
     part: str | None,
     part_idx: int | None,
     enable_log_probe: bool,
-    model_sdk: bool = True,
 ):
     enable_verbose_error_messages()
 
     model = WhisperModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=output_path / "onnx_files",
         sima_path=output_path / "sima_files",
         use_future_token_mask=True,
         enable_filter_sharing=True,
@@ -49,7 +47,6 @@ def gen_files(
         part=part,
         part_idx=part_idx,
         resume=resume,
-        model_sdk=model_sdk,
     )
 
 
@@ -89,10 +86,6 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--enable_log_probe", action="store_true", default=False)
-    parser.add_argument(
-        "--model_sdk", action=argparse.BooleanOptionalAction, default=True,
-        help="Generate directly with SiMaBuilder (default); --no-model_sdk uses ONNX.",
-    )
     args = parser.parse_args()
     args.output_path = args.output_path or Path(".") / args.model_path.name
     print("Arguments:", args, flush=True)
@@ -104,5 +97,4 @@ if __name__ == "__main__":
         args.part,
         args.part_idx,
         args.enable_log_probe,
-        args.model_sdk,
     )

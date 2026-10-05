@@ -110,7 +110,6 @@ def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp
     model = VisionLanguageModel.from_hf_cache(
         model_name="qwen3-vl",
         hf_cache_path=tmp_path / "model",
-        onnx_path=tmp_path / "onnx",
         sima_path=tmp_path / "sima",
         max_num_tokens=1024,
         quantize_embeddings=True,

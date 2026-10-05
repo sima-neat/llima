@@ -1,12 +1,10 @@
-import numpy as np
 from dataclasses import dataclass
 
 from afe.ir.tensor_type import TensorType, ScalarType
 
 from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_type
-from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.model.model_graph import ModelGraph
 
 
 @dataclass
@@ -42,128 +40,14 @@ class LanguageConvModel(LanguagePartBaseModel):
     def enable_filter_sharing(self) -> bool:
         return self.cfg.pipeline_cfg.enable_filter_sharing
 
-    def gen_onnx_files(self):
-        base_layer = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
-        base_name = f"{base_layer}.conv"
-
-        self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-        )
-        cache_shape = (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.lm_cfg.conv_L_cache - 1)
-        output_cache_shape = (
-            1,
-            self.cfg.lm_cfg.hidden_size,
-            1,
-            self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 2,
-        )
-
-        self._onnx_builder.create_input_node("conv_cache", cache_shape)
-
-        output_nodes = self._build_onnx_nodes(base_layer, base_name, self._onnx_builder.input_nodes)
-
-        out_name = self._onnx_builder.get_node_output_name(output_nodes[0])
-        self._onnx_builder.create_output_node(
-            out_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-        )
-
-        cache_out_name = self._onnx_builder.get_node_output_name(output_nodes[1])
-        self._onnx_builder.create_output_node(cache_out_name, output_cache_shape)
-
-        self._onnx_builder.create_and_save_model()
-        self._onnx_builder = None
-
-    def _build_onnx_nodes(
-        self, base_layer: str, base_name: str, input_nodes: list[OnnxNode]
-    ) -> list[OnnxNode]:
-
-        norm_input = self._build_rms_norm(f"{base_layer}.operator_norm", input_nodes[0])
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "in_proj")
-        in_proj = self._onnx_builder.build_conv_from_dense_with_lora(f"{base_name}.in_proj", norm_input, lora_rank=lora_rank)
-        split = self._onnx_builder.build_op(
-            f"{base_name}.in_proj.split",
-            [in_proj],
-            "Split",
-            axis=1,
-            output_names=[f"{base_name}.B", f"{base_name}.C", f"{base_name}.x"],
-        )
-        b = [split, 0]
-        c = [split, 1]
-        x = [split, 2]
-        bx = self._onnx_builder.build_op(f"{base_name}.mul_bx", [b, x], "Mul")
-
-        prev_last = input_nodes[1]
-        tail = self._onnx_builder.build_op(
-            f"{base_name}.tail.concat", [prev_last, bx], "Concat", axis=3
-        )
-        conv_cache_out = self._onnx_builder.build_op(
-            f"{base_name}.tail.window",
-            [
-                tail,
-                np.array([1], dtype=np.int64),
-                np.array([self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 1], dtype=np.int64),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
-
-        w_raw = self.get_hf_param(f"{base_name}.conv.weight")
-        if isinstance(w_raw, tuple):
-            w_raw = w_raw[1]
-        w_conv2d = w_raw.reshape(self.cfg.lm_cfg.hidden_size, 1, 1, self.cfg.lm_cfg.conv_L_cache)
-        w_node = self._onnx_builder.create_initializer(f"{base_name}.conv.weight", value=w_conv2d)
-
-        conv_inputs = [tail, w_node]
-        if self.check_hf_param(f"{base_name}.conv.bias"):
-            b_raw = self.get_hf_param(f"{base_name}.conv.bias")
-            if isinstance(b_raw, tuple):
-                b_raw = b_raw[1]
-            b_node = self._onnx_builder.create_initializer(f"{base_name}.conv.bias", value=b_raw)
-            conv_inputs.append(b_node)
-
-        conv_out = self._onnx_builder.build_op(
-            f"{base_name}.depthwise_conv2d",
-            conv_inputs,
-            "Conv",
-            dilations=[1, 1],
-            group=self.cfg.lm_cfg.hidden_size,
-            kernel_shape=[1, self.cfg.lm_cfg.conv_L_cache],
-            pads=[0, 0, 0, 0],
-            strides=[1, 1],
-        )
-
-        gated = self._onnx_builder.build_op(f"{base_name}.gate", [conv_out, c], "Mul")
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "out_proj")
-        out_proj = self._onnx_builder.build_conv_from_dense_with_lora(f"{base_name}.out_proj", gated, lora_rank=lora_rank)
-
-        add1 = self._onnx_builder.build_op(f"{base_name}.add1", [input_nodes[0], out_proj], "Add")
-
-        if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
-            return [add1, conv_cache_out]
-
-        rms_norm2 = self._build_rms_norm(f"{base_layer}.ffn_norm", add1)
-        mlp = self._build_onnx_mlp(f"{base_layer}.feed_forward", [rms_norm2])
-        add2 = self._onnx_builder.build_op(f"{base_name}.add2", [add1, mlp], "Add")
-
-        return [add2, conv_cache_out]
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
         base_layer = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
         base_name = f"{base_layer}.conv"
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
-        g = self._build_sima_nodes(base_layer, base_name, quantizable, merged_lora)
-        save_model_graph(self, g, quantizable)
-
-    def _build_sima_nodes(self, base_layer: str, base_name: str, quantizable: bool, merged_lora: bool):
         hidden_size = self.cfg.lm_cfg.hidden_size
 
         input_shape = (1, 1, self.num_tokens, hidden_size)
@@ -185,7 +69,7 @@ class LanguageConvModel(LanguagePartBaseModel):
         else:
             residual = mla_input_input
 
-        norm_input = self._build_sima_rms_norm(graph, f"{base_layer}.operator_norm", residual)
+        norm_input = self._build_rms_norm(graph, f"{base_layer}.operator_norm", residual)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "in_proj")
@@ -222,11 +106,11 @@ class LanguageConvModel(LanguagePartBaseModel):
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
             outputs = [add1, conv_cache_out]
         else:
-            rms_norm2 = self._build_sima_rms_norm(graph, f"{base_layer}.ffn_norm", add1)
-            mlp = self._build_sima_mlp(
+            rms_norm2 = self._build_rms_norm(graph, f"{base_layer}.ffn_norm", add1)
+            mlp = self._build_mlp(
                 graph, f"{base_layer}.feed_forward", [rms_norm2], merged_lora
             )
             add2 = graph.add(add1, mlp)
             outputs = [add2, conv_cache_out]
 
-        return graph.finish(outputs)
+        graph.save(outputs)

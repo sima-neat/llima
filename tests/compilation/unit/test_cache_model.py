@@ -9,7 +9,7 @@ from sima_lmm.model.language_cache_model import (
     LanguageCacheModel,
     _get_bmm2_reduction_ranges,
 )
-from sima_lmm.model.model_graph import activation_dtype
+from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -78,7 +78,7 @@ def test_group_size_one_reuses_single_cache_model():
 
 
 @pytest.mark.parametrize("quantizable", [True, False])
-def test_gemma2_native_cache_softcapping(quantizable):
+def test_gemma2_native_cache_softcapping(monkeypatch, quantizable):
     attention = SimpleNamespace(
         num_attention_heads=2,
         num_key_value_heads=1,
@@ -105,7 +105,12 @@ def test_gemma2_native_cache_softcapping(quantizable):
     model = LanguageCacheModel(
         cfg, "gemma2_cache", num_tokens=1, token_idx=31, logit_softcapping=50.0
     )
-    net = model._build_sima_nodes("gemma2_cache", quantizable)
+    saved = []
+    monkeypatch.setattr(
+        ModelGraph, "save", lambda graph, outputs: saved.append(graph.finish(outputs))
+    )
+    model.generate_graph({}, quantizable=quantizable)
+    net = saved[0]
     rng = np.random.default_rng(42)
     inputs = {
         name: rng.normal(0, 0.5, shape).astype(activation_dtype(quantizable))

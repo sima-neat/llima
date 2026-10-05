@@ -40,7 +40,6 @@ def _standard_models(
         model = LanguagePreModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_pre_layer{case.layer_index}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -50,7 +49,6 @@ def _standard_models(
         model = LanguageCacheModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_cache_token{LAYER_IDX}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -61,7 +59,6 @@ def _standard_models(
         model = LanguagePostModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_post_layer{case.layer_index}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -74,7 +71,6 @@ def _standard_models(
         model = LanguageLinearModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_layer{case.layer_index}_linear",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -84,7 +80,6 @@ def _standard_models(
         model = LanguagePerLayerModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_per_layer",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -93,7 +88,6 @@ def _standard_models(
         model = LanguageConvModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_layer{LAYER_IDX}_conv",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -104,7 +98,6 @@ def _standard_models(
         vision_model = VisionModel(
             cfg,
             vlm_model.vision_model_name,
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
         )
@@ -131,7 +124,6 @@ def _speculative_model(
         model = LanguagePreModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_pre_layer{LAYER_IDX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,
@@ -141,7 +133,6 @@ def _speculative_model(
         model = LanguageCacheModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_cache_token{TOKEN_IDX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,
@@ -152,7 +143,6 @@ def _speculative_model(
         model = LanguagePostModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_post_layer{LAYER_IDX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,
@@ -163,7 +153,6 @@ def _speculative_model(
         model = LanguageDraftFCModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_draft_fc",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,

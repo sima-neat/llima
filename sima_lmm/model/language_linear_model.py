@@ -7,33 +7,21 @@ from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import LayerConfiguration, LoraGenMode
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype, activation_type
-from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.model.model_graph import ModelGraph
 
 
 @dataclass
 class LanguageLinearModel(LanguagePartBaseModel):
     """Fused Qwen3.5 Gated DeltaNet layer.
 
-    Inputs are ONNX NCHW:
-        - input: (1, hidden, 1, num_tokens)
-        - linear_conv_state: (1, linear_conv_dim, 1, linear_conv_kernel_dim - 1)
-        - linear_valid_mask group only: (1, 1, 1, num_tokens)
-        - linear_delta_state: (1, value_head_dim, num_value_heads, key_head_dim)
-
-    Outputs are ONNX NCHW:
-        - hidden: (1, hidden, 1, num_tokens)
-        - linear_conv_state_out: (1, linear_conv_dim, 1, num_tokens + kernel - 2)
-        - linear_delta_state_out:  (1, value_head_dim, num_value_heads, key_head_dim)
-
-    Direct SimaBuilder inputs are NHWC:
+    Inputs are NHWC:
         - input: (1, 1, num_tokens, hidden)
         - input_scale layer 0 with quantized embeddings: (1, 1, num_tokens, 1)
         - linear_conv_state: (1, 1, linear_conv_kernel_dim - 1, linear_conv_dim)
         - linear_valid_mask group only: (1, 1, num_tokens, 1)
         - linear_delta_state: (1, num_value_heads, key_head_dim, value_head_dim)
 
-    Direct SimaBuilder outputs are NHWC:
+    Outputs are NHWC:
         - hidden: (1, 1, num_tokens, hidden)
         - linear_conv_state_out: (1, 1, num_tokens + kernel - 2, linear_conv_dim)
         - linear_delta_state_out: (1, num_value_heads, key_head_dim, value_head_dim)
@@ -66,561 +54,13 @@ class LanguageLinearModel(LanguagePartBaseModel):
     def _delta_block_size(self) -> int:
         return min(self.num_tokens, 32)
 
-    def gen_onnx_files(self):
-        """Create the ONNX graph for one fused Qwen3.5 linear-attention layer.
-
-        The graph exposes hidden input, convolution state, optional valid mask,
-        and recurrent delta state as runtime inputs.
-        """
-        base_layer = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
-
-        self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-        )
-        self._onnx_builder.create_input_node(
-            "linear_conv_state",
-            (
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.conv_dim,
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim - 1,
-            ),
-        )
-        if self.num_tokens > 1:
-            self._onnx_builder.create_input_node("linear_valid_mask", (1, 1, 1, self.num_tokens))
-        self._onnx_builder.create_input_node(
-            "linear_delta_state",
-            (
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.value_head_dim,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-            ),
-        )
-
-        output_nodes = self._build_onnx_nodes(base_layer, self._onnx_builder.input_nodes)
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[0]),
-            (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens),
-        )
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[1]),
-            (
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.conv_dim,
-                1,
-                self.num_tokens + self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim - 2,
-            ),
-        )
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[2]),
-            (
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.value_head_dim,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-            ),
-        )
-        self._onnx_builder.create_and_save_model()
-        self._onnx_builder = None
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
         base_layer = f"{self.hf_model.language_model_param_base_name}.layers.{self.layer_idx}"
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
-        graph = self._build_sima_nodes(base_layer, quantizable, merged_lora)
-        save_model_graph(self, graph, quantizable)
-
-    def _sima_constant(
-        self, graph: ModelGraph, value: np.ndarray | float, quantizable: bool
-    ) -> NodeOrHandle:
-        dtype = activation_dtype(quantizable)
-        return graph.constant(np.asarray(value, dtype=dtype))
-
-    def _get_ab_projection_params(
-        self, linear_base: str
-    ) -> dict[str, np.ndarray | tuple[np.ndarray, np.ndarray]] | None:
-        """Join output channels without changing weight precision or scale groups.
-
-        Mixed weight formats retain separate projections because one convolution
-        cannot represent both formats without requantizing one of them.
-        """
-        params = [self.get_hf_param(f"{linear_base}.in_proj_{key}.weight") for key in ("a", "b")]
-        quantized = [isinstance(param, tuple) for param in params]
-        if quantized[0] != quantized[1]:
-            return None
-        weights = [param[1] if isinstance(param, tuple) else param for param in params]
-        expected = (self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, self.cfg.lm_cfg.hidden_size)
-        if any(weight.shape != expected for weight in weights):
-            raise ValueError(f"{linear_base}: A/B projection weights must have shape {expected}")
-        if weights[0].dtype != weights[1].dtype:
-            return None
-        joined_weights = np.concatenate(weights, axis=0)
-        if quantized[0]:
-            # HF/GGUF scales are output-channel first, including grouped INT4.
-            scales = [param[0].reshape(expected[0], -1) for param in params]
-            if scales[0].shape != scales[1].shape or scales[0].dtype != scales[1].dtype:
-                return None
-            joined_weights = (np.concatenate(scales, axis=0), joined_weights)
-        fused_base = f"{linear_base}.in_proj_ab"
-        result = {f"{fused_base}.weight": joined_weights}
-        bias_names = [f"{linear_base}.in_proj_{key}.bias" for key in ("a", "b")]
-        if any(self.check_hf_param(name) for name in bias_names):
-            biases = [
-                self.get_hf_param(name) if self.check_hf_param(name)
-                else np.zeros(expected[0], dtype=np.float32)
-                for name in bias_names
-            ]
-            result[f"{fused_base}.bias"] = np.concatenate(biases)
-        return result
-
-    def _build_sima_ab_projections(
-        self,
-        graph: ModelGraph,
-        linear_base: str,
-        norm_input: NodeOrHandle,
-        merged_lora: bool,
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
-        lora_ranks = {"a": None, "b": None}
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_ranks = {
-                key: self.cfg.lm_cfg.get_lora_rank(linear_base, f"in_proj_{key}") for key in lora_ranks
-            }
-        if any(rank is not None for rank in lora_ranks.values()):
-            return tuple(
-                graph.linear(
-                    f"{linear_base}.in_proj_{key}",
-                    norm_input,
-                    lora_rank=lora_ranks[key],
-                    merged_lora=merged_lora,
-                )
-                for key in ("a", "b")
-            )
-
-        params = self._get_ab_projection_params(linear_base)
-        if params is None:
-            return tuple(graph.linear(f"{linear_base}.in_proj_{key}", norm_input) for key in ("a", "b"))
-        # Fused A/B weights are synthesized locally, outside the model weight source.
-        ab = graph._build_conv(
-            f"{linear_base}.in_proj_ab",
-            norm_input,
-            get_param_func=params.__getitem__,
-            check_param_func=params.__contains__,
-        )
-        heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-        return (
-            graph.slice(ab, [0], [heads], [1], [3]),
-            graph.slice(ab, [heads], [2 * heads], [1], [3]),
-        )
-
-    def _build_onnx_ab_projections(
-        self, linear_base: str, norm_input: OnnxNode
-    ) -> tuple[OnnxNode, OnnxNode]:
-        lora_ranks = {"a": None, "b": None}
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_ranks = {
-                key: self.cfg.lm_cfg.get_lora_rank(linear_base, f"in_proj_{key}")
-                for key in lora_ranks
-            }
-        if any(rank is not None for rank in lora_ranks.values()):
-            return tuple(
-                self._onnx_builder.build_conv_from_dense_with_lora(
-                    f"{linear_base}.in_proj_{key}",
-                    norm_input,
-                    lora_rank=lora_ranks[key],
-                )
-                for key in ("a", "b")
-            )
-
-        params = self._get_ab_projection_params(linear_base)
-        builder = self._onnx_builder
-        if params is None:
-            return tuple(
-                builder.build_conv_from_dense_with_lora(f"{linear_base}.in_proj_{key}", norm_input)
-                for key in ("a", "b")
-            )
-        fused_base = f"{linear_base}.in_proj_ab"
-        weights = params[f"{fused_base}.weight"]
-        if isinstance(weights, tuple):
-            raise ValueError("ONNX A/B projection generation requires unquantized weights")
-        inputs = [norm_input, builder.create_initializer(
-            f"{fused_base}.weight", weights, reshape_str="nc->nchw"
-        )]
-        if f"{fused_base}.bias" in params:
-            inputs.append(builder.create_initializer(f"{fused_base}.bias", params[f"{fused_base}.bias"]))
-        ab = builder.build_op(fused_base, inputs, "Conv")
-        heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-        return tuple(
-            builder.build_op(
-                f"{linear_base}.in_proj_{key}",
-                [ab, np.array([start], dtype=np.int64),
-                 np.array([start + heads], dtype=np.int64), np.array([1], dtype=np.int64)],
-                "Slice",
-            )
-            for key, start in (("a", 0), ("b", heads))
-        )
-
-    def _build_sima_static_triangular_sums(
-        self, graph: ModelGraph, g: NodeOrHandle, upper: bool, quantizable: bool
-    ) -> NodeOrHandle:
-        """Build NHWC prefix/suffix sums with one static triangular Einsum."""
-        # The ONNX helper stores the mask as (sum_token, output_token). Here the
-        # NHWC einsum stores it as (output_token, sum_token), so the triangle flips.
-        mask_fn = np.tril if upper else np.triu
-        mask = mask_fn(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
-        mask = np.broadcast_to(
-            mask.reshape(1, 1, self.num_tokens, self.num_tokens),
-            (
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                self.num_tokens,
-                self.num_tokens,
-            ),
-        ).copy()
-        return graph.einsum("nhwc,nhcq->nhwq", self._sima_constant(graph, mask, quantizable), g)
-
-    def _build_sima_global_interval_decay_mask(
-        self, graph: ModelGraph, g: NodeOrHandle, quantizable: bool
-    ) -> NodeOrHandle:
-        """Build NHWC pairwise decay in lower-triangular query/key orientation."""
-        interval_end_mask = np.tril(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
-        interval_start_mask = np.tril(
-            np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=-1
-        )
-        interval_start_mask = np.broadcast_to(
-            interval_start_mask.reshape(1, 1, self.num_tokens, self.num_tokens),
-            (
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                self.num_tokens,
-                self.num_tokens,
-            ),
-        ).copy()
-        interval_end_mask = np.broadcast_to(
-            interval_end_mask.reshape(1, 1, self.num_tokens, self.num_tokens),
-            (
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                self.num_tokens,
-                self.num_tokens,
-            ),
-        ).copy()
-
-        interval_start = self._sima_constant(graph, interval_start_mask, quantizable)
-        interval_end = self._sima_constant(graph, interval_end_mask, quantizable)
-
-        # Keep g on its native token axis: start_mask[t, i] multiplies g[t].
-        masked_g = graph.mul(interval_start, g)
-        interval_sum = graph.einsum("nhwc,nhcq->nhwq", interval_end, masked_g)
-        decay = graph.exp(interval_sum)
-        return graph.mul(decay, interval_end)
-
-    def _build_sima_l2norm(
-        self, graph: ModelGraph, input_node: NodeOrHandle, scale: float
-    ) -> NodeOrHandle:
-        """Normalize NHWC Q/K heads over the last dimension."""
-        norm = graph.rms_norm(
-            None,
-            input_node,
-            epsilon=1e-6 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-        )
-        if scale == 1.0:
-            return norm
-        return graph.mul(
-            norm, graph.constant(np.array(scale, dtype=np.float32), dtype=np.float32)
-        )
-
-    def _sima_folded_matrix_mul(
-        self, graph: ModelGraph, left_blocks: list[NodeOrHandle], right_blocks: list[NodeOrHandle]
-    ) -> list[NodeOrHandle]:
-        """Batch independent NHWC block multiplications by folding blocks into head axis."""
-        assert len(left_blocks) == len(right_blocks)
-        folded_left = (
-            left_blocks[0] if len(left_blocks) == 1 else graph.concat(left_blocks, 1)
-        )
-        folded_right = (
-            right_blocks[0] if len(right_blocks) == 1 else graph.concat(right_blocks, 1)
-        )
-        folded_out = graph.einsum("nhwc,nhcq->nhwq", folded_left, folded_right)
-        if len(left_blocks) == 1:
-            return [folded_out]
-
-        blocks = []
-        num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-        for block_idx in range(len(left_blocks)):
-            blocks.append(
-                graph.slice(
-                    folded_out,
-                    [block_idx * num_heads],
-                    [(block_idx + 1) * num_heads],
-                    [1],
-                    [1],
-                )
-            )
-        return blocks
-
-    def _build_sima_direct_chunk_inverse(
-        self,
-        graph: ModelGraph,
-        initial_attn: NodeOrHandle,
-        chunk_size: int,
-        quantizable: bool,
-    ) -> NodeOrHandle:
-        """Build the exact NHWC lower-triangular inverse for one folded token block."""
-        if chunk_size == 4:
-            eye = self._sima_constant(
-                graph,
-                np.eye(chunk_size, dtype=np.float32).reshape(1, 1, chunk_size, chunk_size),
-                quantizable,
-            )
-            a_squared = graph.einsum("nhwc,nhcq->nhwq", initial_attn, initial_attn)
-            i_plus_a = graph.add(initial_attn, eye)
-            i_plus_a_squared = graph.add(a_squared, eye)
-            return graph.einsum("nhwc,nhcq->nhwq", i_plus_a_squared, i_plus_a)
-
-        half = chunk_size // 2
-        top_rows = graph.slice(initial_attn, [0], [half], [1], [2])
-        bottom_rows = graph.slice(initial_attn, [half], [chunk_size], [1], [2])
-        a00 = graph.slice(top_rows, [0], [half], [1], [3])
-        a10 = graph.slice(bottom_rows, [0], [half], [1], [3])
-        a11 = graph.slice(bottom_rows, [half], [chunk_size], [1], [3])
-
-        inv00 = self._build_sima_direct_chunk_inverse(graph, a00, half, quantizable)
-        inv11 = self._build_sima_direct_chunk_inverse(graph, a11, half, quantizable)
-        a10_inv00 = graph.einsum("nhwc,nhcq->nhwq", a10, inv00)
-        inv10 = graph.einsum("nhwc,nhcq->nhwq", inv11, a10_inv00)
-        inv01 = self._sima_constant(
-            graph,
-            np.zeros(
-                (
-                    1,
-                    (self.num_tokens // self._delta_block_size)
-                    * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                    half,
-                    half,
-                ),
-                dtype=np.float32,
-            ),
-            quantizable,
-        )
-        top = graph.concat([inv00, inv01], 3)
-        bottom = graph.concat([inv10, inv11], 3)
-        return graph.concat([top, bottom], 2)
-
-    def _build_sima_block_chunk_inverse(
-        self, graph: ModelGraph, initial_attn: NodeOrHandle, quantizable: bool, block_size: int = 32
-    ) -> NodeOrHandle:
-        """Build the NHWC grouped lower-triangular inverse from fixed-size blocks."""
-        assert self.num_tokens % block_size == 0
-        num_blocks = self.num_tokens // block_size
-
-        attn_blocks: dict[tuple[int, int], NodeOrHandle] = {}
-        for row in range(num_blocks):
-            row_block = graph.slice(
-                initial_attn,
-                [row * block_size],
-                [(row + 1) * block_size],
-                [1],
-                [2],
-            )
-            for col in range(row + 1):
-                attn_blocks[(row, col)] = graph.slice(
-                    row_block,
-                    [col * block_size],
-                    [(col + 1) * block_size],
-                    [1],
-                    [3],
-                )
-
-        inverse_blocks: dict[tuple[int, int], NodeOrHandle] = {}
-        diag_blocks = [attn_blocks[(block_idx, block_idx)] for block_idx in range(num_blocks)]
-        folded_diag = diag_blocks[0] if len(diag_blocks) == 1 else graph.concat(diag_blocks, 1)
-        folded_diag_inv = self._build_sima_direct_chunk_inverse(
-            graph, folded_diag, block_size, quantizable
-        )
-        num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-        for block_idx in range(num_blocks):
-            inverse_blocks[(block_idx, block_idx)] = graph.slice(
-                folded_diag_inv,
-                [block_idx * num_heads],
-                [(block_idx + 1) * num_heads],
-                [1],
-                [1],
-            )
-
-        for span in range(1, num_blocks):
-            span_targets = [(row, row - span) for row in range(span, num_blocks)]
-            term_specs = [
-                (target_idx, row, mid, col)
-                for target_idx, (row, col) in enumerate(span_targets)
-                for mid in range(col, row)
-            ]
-            term_products = self._sima_folded_matrix_mul(
-                graph,
-                [attn_blocks[(row, mid)] for _, row, mid, _ in term_specs],
-                [inverse_blocks[(mid, col)] for _, _, mid, col in term_specs],
-            )
-            grouped_terms: list[list[NodeOrHandle]] = [[] for _ in span_targets]
-            for (target_idx, _, _, _), term in zip(term_specs, term_products):
-                grouped_terms[target_idx].append(term)
-
-            merged_blocks = []
-            for terms in grouped_terms:
-                merged = terms[0]
-                for term in terms[1:]:
-                    merged = graph.add(merged, term)
-                merged_blocks.append(merged)
-
-            span_inverse_blocks = self._sima_folded_matrix_mul(
-                graph,
-                [inverse_blocks[(row, row)] for row, _ in span_targets],
-                merged_blocks,
-            )
-            for (row, col), inv_block in zip(span_targets, span_inverse_blocks):
-                inverse_blocks[(row, col)] = inv_block
-
-        zero_block = self._sima_constant(
-            graph,
-            np.zeros((1, num_heads, block_size, block_size), dtype=np.float32),
-            quantizable,
-        )
-        row_nodes = []
-        for row in range(num_blocks):
-            row_nodes.append(
-                graph.concat(
-                    [
-                        inverse_blocks[(row, col)] if col <= row else zero_block
-                        for col in range(num_blocks)
-                    ],
-                    3,
-                )
-            )
-        return graph.concat(row_nodes, 2)
-
-    def _build_sima_decode_delta(
-        self,
-        graph: ModelGraph,
-        query: NodeOrHandle,
-        key: NodeOrHandle,
-        value: NodeOrHandle,
-        beta: NodeOrHandle,
-        decay: NodeOrHandle,
-        state: NodeOrHandle,
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
-        """Build the NHWC single-token recurrent Gated DeltaNet update."""
-        state = graph.mul(state, decay)
-        kv_mem = graph.matmul(key, state, transpose_a=False, transpose_b=False)
-        delta = graph.sub(value, kv_mem)
-        delta = graph.mul(delta, beta)
-        state_add = graph.matmul(key, delta, transpose_a=True, transpose_b=False)
-        state = graph.add(state, state_add)
-        out = graph.matmul(query, state, transpose_a=False, transpose_b=False)
-        return out, state
-
-    def _build_sima_group_delta(
-        self,
-        graph: ModelGraph,
-        query: NodeOrHandle,
-        key: NodeOrHandle,
-        query_unscaled: NodeOrHandle,
-        key_unscaled: NodeOrHandle,
-        value: NodeOrHandle,
-        beta: NodeOrHandle,
-        g: NodeOrHandle,
-        state: NodeOrHandle,
-        quantizable: bool,
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
-        """Build the grouped prefill computation in NHWC head-major layout."""
-        g_cum = self._build_sima_static_triangular_sums(graph, g, upper=True, quantizable=quantizable)
-        strict_lower = self._sima_constant(
-            graph,
-            np.broadcast_to(
-                np.tril(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=-1).reshape(
-                    1, 1, self.num_tokens, self.num_tokens
-                ),
-                (
-                    1,
-                    self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                    self.num_tokens,
-                    self.num_tokens,
-                ),
-            ).copy(),
-            quantizable,
-        )
-        decay_mask = self._build_sima_global_interval_decay_mask(graph, g, quantizable)
-
-        v_beta = graph.mul(value, beta)
-        k_beta = graph.mul(key, beta)
-        raw_kk = graph.einsum("nhwc,nhqc->nhwq", key_unscaled, key_unscaled)
-        beta_scaled = graph.mul(
-            beta,
-            self._sima_constant(
-                graph,
-                -1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-                quantizable,
-            ),
-        )
-        kk = graph.mul(raw_kk, beta_scaled)
-        init_attn = graph.mul(kk, decay_mask)
-        init_attn = graph.mul(init_attn, strict_lower)
-        attn = self._build_sima_block_chunk_inverse(
-            graph,
-            init_attn,
-            quantizable,
-            block_size=self._delta_block_size,
-        )
-
-        value_i = graph.einsum("nhwc,nhcq->nhwq", attn, v_beta)
-        g_exp = graph.exp(g_cum)
-        k_beta_exp = graph.mul(k_beta, g_exp)
-        k_cumdecay = graph.einsum("nhwc,nhcq->nhwq", attn, k_beta_exp)
-        v_prime = graph.einsum("nhwc,nhcq->nhwq", k_cumdecay, state)
-        v_new = graph.sub(value_i, v_prime)
-
-        raw_qk = graph.einsum("nhwc,nhqc->nhwq", query_unscaled, key_unscaled)
-        qk = graph.mul(
-            raw_qk,
-            self._sima_constant(
-                graph,
-                1.0
-                / (
-                    self.cfg.lm_cfg.linear_attn_cfg.key_head_dim
-                    * math.sqrt(self.cfg.lm_cfg.linear_attn_cfg.key_head_dim)
-                ),
-                quantizable,
-            ),
-        )
-        qk = graph.mul(qk, decay_mask)
-        q_exp = graph.mul(query, g_exp)
-        attn_inter = graph.einsum("nhwc,nhcq->nhwq", q_exp, state)
-        attn_value = graph.einsum("nhwc,nhcq->nhwq", qk, v_new)
-        core_attn_out = graph.add(attn_inter, attn_value)
-
-        suffix_g = self._build_sima_static_triangular_sums(
-            graph, g, upper=False, quantizable=quantizable
-        )
-        suffix_g_exp = graph.exp(suffix_g)
-        final_g_exp = graph.slice(suffix_g_exp, [0], [1], [1], [2])
-        final_decay_mask = graph.slice(suffix_g_exp, [1], [self.num_tokens], [1], [2])
-        final_decay_mask_tail = self._sima_constant(
-            graph,
-            np.ones((1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, 1, 1), dtype=np.float32),
-            quantizable,
-        )
-        final_decay_mask = graph.concat([final_decay_mask, final_decay_mask_tail], 2)
-        v_new_weighted = graph.mul(v_new, final_decay_mask)
-        state_updates = graph.einsum("nhcw,nhcq->nhwq", key, v_new_weighted)
-        state_base = graph.mul(state, final_g_exp)
-        linear_delta_state_out = graph.add(state_base, state_updates)
-
-        return core_attn_out, linear_delta_state_out
-
-    def _build_sima_nodes(self, base_layer: str, quantizable: bool, merged_lora: bool = False):
         linear_base = f"{base_layer}.linear_attn"
         repeat = (
             self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
@@ -666,7 +106,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         else:
             residual = mla_input
 
-        norm_input = self._build_sima_rms_norm(graph, f"{base_layer}.input_layernorm", residual)
+        norm_input = self._build_rms_norm(graph, f"{base_layer}.input_layernorm", residual)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_qkv")
@@ -679,7 +119,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         z = graph.linear(
             f"{linear_base}.in_proj_z", norm_input, lora_rank=lora_rank, merged_lora=merged_lora
         )
-        a, b = self._build_sima_ab_projections(graph, linear_base, norm_input, merged_lora)
+        a, b = self._build_ab_projections(graph, linear_base, norm_input, merged_lora)
 
         conv_tail = graph.concat([mla_conv_state, mixed_qkv], 2)
         linear_conv_state_out = graph.slice(
@@ -720,21 +160,15 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
         value = graph.split_heads(v_flat, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads)
 
-        query_unscaled = self._build_sima_l2norm(graph, query, 1.0)
-        key_unscaled = self._build_sima_l2norm(graph, key, 1.0)
+        query_unscaled = self._build_l2norm(graph, query, 1.0)
+        key_unscaled = self._build_l2norm(graph, key, 1.0)
         query = graph.mul(
             query_unscaled,
-            self._sima_constant(
-                graph, 1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim, quantizable
-            ),
+            graph.constant(1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim),
         )
         key = graph.mul(
             key_unscaled,
-            self._sima_constant(
-                graph,
-                1.0 / math.sqrt(self.cfg.lm_cfg.linear_attn_cfg.key_head_dim),
-                quantizable,
-            ),
+            graph.constant(1.0 / math.sqrt(self.cfg.lm_cfg.linear_attn_cfg.key_head_dim)),
         )
 
         beta = graph.sigmoid(b)
@@ -742,17 +176,13 @@ class LanguageLinearModel(LanguagePartBaseModel):
         if mla_valid_mask is not None:
             beta = graph.mul(beta, mla_valid_mask)
 
-        dt_bias = self._sima_constant(
-            graph,
+        dt_bias = graph.constant(
             graph.parameter(f"{linear_base}.dt_bias").astype(np.float32).reshape(1, 1, 1, -1),
-            quantizable,
         )
         a_dt = graph.add(a, dt_bias)
         softplus = graph.softplus(a_dt)
-        neg_a = self._sima_constant(
-            graph,
+        neg_a = graph.constant(
             (-np.exp(graph.parameter(f"{linear_base}.A_log").astype(np.float32))).reshape(1, 1, 1, -1),
-            quantizable,
         )
         g = graph.mul(softplus, neg_a)
         g = graph.split_heads(g, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads)
@@ -761,7 +191,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
         if self.num_tokens == 1:
             decay = graph.exp(g)
-            core_attn_out, linear_delta_state_out = self._build_sima_decode_delta(
+            core_attn_out, linear_delta_state_out = self._build_decode_delta(
                 graph,
                 query,
                 key,
@@ -771,7 +201,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 mla_delta_state,
             )
         else:
-            core_attn_out, linear_delta_state_out = self._build_sima_group_delta(
+            core_attn_out, linear_delta_state_out = self._build_group_delta(
                 graph,
                 query,
                 key,
@@ -781,7 +211,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 beta,
                 g,
                 mla_delta_state,
-                quantizable,
             )
 
         z_heads = graph.split_heads(z, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads)
@@ -801,916 +230,425 @@ class LanguageLinearModel(LanguagePartBaseModel):
             f"{linear_base}.out_proj", core_attn_out, lora_rank=lora_rank, merged_lora=merged_lora
         )
         add1 = graph.add(residual, out_proj)
-        rms_norm2 = self._build_sima_rms_norm(graph, f"{base_layer}.post_attention_layernorm", add1)
-        mlp = self._build_sima_mlp(
+        rms_norm2 = self._build_rms_norm(graph, f"{base_layer}.post_attention_layernorm", add1)
+        mlp = self._build_mlp(
             graph,
             f"{base_layer}.mlp",
             [rms_norm2, add1],
             merged_lora=merged_lora,
             with_residual_add=True,
         )
-        return graph.finish([mlp, linear_conv_state_out, linear_delta_state_out])
+        graph.save([mlp, linear_conv_state_out, linear_delta_state_out])
 
-    def _repeat_mask_to_value_heads(self, base_name: str, mask: OnnxNode) -> OnnxNode:
-        """Repeat a singleton-head static mask with Slice/Concat for AFE Einsum folding.
+    def _get_ab_projection_params(
+        self, linear_base: str
+    ) -> dict[str, np.ndarray | tuple[np.ndarray, np.ndarray]] | None:
+        """Join output channels without changing weight precision or scale groups.
+
+        Mixed weight formats retain separate projections because one convolution
+        cannot represent both formats without requantizing one of them.
         """
-        mask_heads = []
-        for head_idx in range(self.cfg.lm_cfg.linear_attn_cfg.num_value_heads):
-            mask_heads.append(
-                self._onnx_builder.build_op(
-                    f"{base_name}.head_{head_idx}",
-                    [
-                        mask,
-                        np.array([0], dtype=np.int64),
-                        np.array([1], dtype=np.int64),
-                        np.array([2], dtype=np.int64),
-                    ],
-                    "Slice",
+        params = [self.get_hf_param(f"{linear_base}.in_proj_{key}.weight") for key in ("a", "b")]
+        quantized = [isinstance(param, tuple) for param in params]
+        if quantized[0] != quantized[1]:
+            return None
+        weights = [param[1] if isinstance(param, tuple) else param for param in params]
+        expected = (self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, self.cfg.lm_cfg.hidden_size)
+        if any(weight.shape != expected for weight in weights):
+            raise ValueError(f"{linear_base}: A/B projection weights must have shape {expected}")
+        if weights[0].dtype != weights[1].dtype:
+            return None
+        joined_weights = np.concatenate(weights, axis=0)
+        if quantized[0]:
+            # HF/GGUF scales are output-channel first, including grouped INT4.
+            scales = [param[0].reshape(expected[0], -1) for param in params]
+            if scales[0].shape != scales[1].shape or scales[0].dtype != scales[1].dtype:
+                return None
+            joined_weights = (np.concatenate(scales, axis=0), joined_weights)
+        fused_base = f"{linear_base}.in_proj_ab"
+        result = {f"{fused_base}.weight": joined_weights}
+        bias_names = [f"{linear_base}.in_proj_{key}.bias" for key in ("a", "b")]
+        if any(self.check_hf_param(name) for name in bias_names):
+            biases = [
+                self.get_hf_param(name) if self.check_hf_param(name)
+                else np.zeros(expected[0], dtype=np.float32)
+                for name in bias_names
+            ]
+            result[f"{fused_base}.bias"] = np.concatenate(biases)
+        return result
+
+    def _build_ab_projections(
+        self,
+        graph: ModelGraph,
+        linear_base: str,
+        norm_input: NodeOrHandle,
+        merged_lora: bool,
+    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+        lora_ranks = {"a": None, "b": None}
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            lora_ranks = {
+                key: self.cfg.lm_cfg.get_lora_rank(linear_base, f"in_proj_{key}") for key in lora_ranks
+            }
+        if any(rank is not None for rank in lora_ranks.values()):
+            return tuple(
+                graph.linear(
+                    f"{linear_base}.in_proj_{key}",
+                    norm_input,
+                    lora_rank=lora_ranks[key],
+                    merged_lora=merged_lora,
                 )
+                for key in ("a", "b")
             )
-        return self._onnx_builder.build_op(f"{base_name}.repeat", mask_heads, "Concat", axis=2)
+
+        params = self._get_ab_projection_params(linear_base)
+        if params is None:
+            return tuple(graph.linear(f"{linear_base}.in_proj_{key}", norm_input) for key in ("a", "b"))
+        # Fused A/B weights are synthesized locally, outside the model weight source.
+        ab = graph._build_conv(
+            f"{linear_base}.in_proj_ab",
+            norm_input,
+            get_param_func=params.__getitem__,
+            check_param_func=params.__contains__,
+        )
+        heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
+        return (
+            graph.slice(ab, [0], [heads], [1], [3]),
+            graph.slice(ab, [heads], [2 * heads], [1], [3]),
+        )
 
     def _build_static_triangular_sums(
-        self, base_name: str, g: OnnxNode, upper: bool
-    ) -> OnnxNode:
-        """Build prefix/suffix sums with one static triangular mask and one Einsum.
-        """
-        mask = np.triu if upper else np.tril
-        mask_name = "prefix_mask" if upper else "suffix_mask"
-        mask_node = self._onnx_builder.create_initializer(
-            f"{base_name}.{mask_name}",
-            value=mask(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32)).reshape(
-                1, self.num_tokens, 1, self.num_tokens
+        self, graph: ModelGraph, g: NodeOrHandle, upper: bool
+    ) -> NodeOrHandle:
+        """Build NHWC prefix/suffix sums with a static triangular matrix multiplication."""
+        # The mask axes are (output_token, sum_token).
+        mask_fn = np.tril if upper else np.triu
+        mask = mask_fn(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
+        mask = np.broadcast_to(
+            mask.reshape(1, 1, self.num_tokens, self.num_tokens),
+            (
+                1,
+                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                self.num_tokens,
+                self.num_tokens,
             ),
-        )
-        mask_node = self._repeat_mask_to_value_heads(f"{base_name}.{mask_name}", mask_node)
-        return self._onnx_builder.build_op(
-            f"{base_name}.sum",
-            [mask_node, g],
-            "Einsum",
-            equation="nchw,nqhc->nqhw",
-        )
+        ).copy()
+        return graph.matmul(graph.constant(mask), g)
 
-    def _build_global_interval_decay_mask(self, base_name: str, g: OnnxNode) -> OnnxNode:
-        """Build pairwise decay from direct interval sums.
+    def _build_global_interval_decay_mask(
+        self, graph: ModelGraph, g: NodeOrHandle
+    ) -> NodeOrHandle:
+        """Build NHWC pairwise decay in lower-triangular query/key orientation."""
+        interval_end_mask = np.tril(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
+        interval_start_mask = np.tril(
+            np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=-1
+        )
+        interval_start_mask = np.broadcast_to(
+            interval_start_mask.reshape(1, 1, self.num_tokens, self.num_tokens),
+            (
+                1,
+                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                self.num_tokens,
+                self.num_tokens,
+            ),
+        ).copy()
+        interval_end_mask = np.broadcast_to(
+            interval_end_mask.reshape(1, 1, self.num_tokens, self.num_tokens),
+            (
+                1,
+                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                self.num_tokens,
+                self.num_tokens,
+            ),
+        ).copy()
 
-        The factorized masks compute sum(g[i + 1 : j + 1]) without subtracting
-        large prefix sums, which is much more stable in BF16.
-        """
-        interval_start_mask = np.triu(
-            np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=1
-        )
-        interval_end_mask = np.triu(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
+        interval_start = graph.constant(interval_start_mask)
+        interval_end = graph.constant(interval_end_mask)
 
-        interval_start_node = self._onnx_builder.create_initializer(
-            f"{base_name}.start_mask",
-            value=interval_start_mask.reshape(1, self.num_tokens, 1, self.num_tokens),
-        )
-        interval_end_node = self._onnx_builder.create_initializer(
-            f"{base_name}.end_mask",
-            value=interval_end_mask.reshape(1, self.num_tokens, 1, self.num_tokens),
-        )
-        interval_end_repeated = self._repeat_mask_to_value_heads(
-            f"{base_name}.end_mask", interval_end_node
-        )
-
-        masked_g = self._onnx_builder.build_op(
-            f"{base_name}.masked_g",
-            [interval_start_node, g],
-            "Mul",
-        )
-        interval_sum = self._onnx_builder.build_op(
-            f"{base_name}.sum",
-            [interval_end_repeated, masked_g],
-            "Einsum",
-            equation="nchw,nqhc->nqhw",
-        )
-        decay = self._onnx_builder.build_op(f"{base_name}.exp", [interval_sum], "Exp")
-        return self._onnx_builder.build_op(
-            f"{base_name}.decay",
-            [decay, interval_end_repeated],
-            "Mul",
-        )
+        # Keep g on its native token axis: start_mask[t, i] multiplies g[t].
+        masked_g = graph.mul(interval_start, g)
+        interval_sum = graph.matmul(interval_end, masked_g)
+        decay = graph.exp(interval_sum)
+        return graph.mul(decay, interval_end)
 
     def _build_l2norm(
-        self, base_name: str, input_node: OnnxNode, dim: int, scale: float = 1.0
-    ) -> OnnxNode:
-        """Normalize Q/K heads with an optional final scale.
-        """
-        square = self._onnx_builder.build_op(f"{base_name}.mul1", [input_node, input_node], "Mul")
-        mean = self._onnx_builder.build_op(
-            f"{base_name}.mean", [square], "ReduceMean", axes=[1], keepdims=1
+        self, graph: ModelGraph, input_node: NodeOrHandle, scale: float
+    ) -> NodeOrHandle:
+        """Normalize NHWC Q/K heads over the last dimension."""
+        norm = graph.rms_norm(
+            None,
+            input_node,
+            epsilon=1e-6 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
         )
-        add = self._onnx_builder.build_op(f"{base_name}.add", [mean, 1e-6 / dim], "Add")
-        sqrt = self._onnx_builder.build_op(f"{base_name}.sqrt", [add], "Sqrt")
-        div = self._onnx_builder.build_op(f"{base_name}.div", [input_node, sqrt], "Div")
-        weight = self._onnx_builder.create_initializer(
-            f"{base_name}.weight",
-            value=np.full((dim,), scale, dtype=np.float32),
-            reshape_str="c->nchw",
+        if scale == 1.0:
+            return norm
+        return graph.mul(
+            norm, graph.constant(np.array(scale, dtype=np.float32), dtype=np.float32)
         )
-        return self._onnx_builder.build_op(f"{base_name}.mul2", [div, weight], "Mul")
 
     def _folded_matrix_mul(
-        self, base_name: str, left_blocks: list[OnnxNode], right_blocks: list[OnnxNode]
-    ) -> list[OnnxNode]:
-        """Batch independent block multiplications by folding blocks into head axis.
-
-        The result is split back into one output block per input block pair.
-        """
+        self, graph: ModelGraph, left_blocks: list[NodeOrHandle], right_blocks: list[NodeOrHandle]
+    ) -> list[NodeOrHandle]:
+        """Batch independent NHWC block multiplications by folding blocks into head axis."""
         assert len(left_blocks) == len(right_blocks)
         folded_left = (
-            left_blocks[0]
-            if len(left_blocks) == 1
-            else self._onnx_builder.build_op(
-                f"{base_name}.left_fold", left_blocks, "Concat", axis=2
-            )
+            left_blocks[0] if len(left_blocks) == 1 else graph.concat(left_blocks, 1)
         )
         folded_right = (
-            right_blocks[0]
-            if len(right_blocks) == 1
-            else self._onnx_builder.build_op(
-                f"{base_name}.right_fold", right_blocks, "Concat", axis=2
-            )
+            right_blocks[0] if len(right_blocks) == 1 else graph.concat(right_blocks, 1)
         )
-        folded_out = self._onnx_builder.build_op(
-            f"{base_name}.mul",
-            [folded_right, folded_left],
-            "Einsum",
-            equation="nchw,nqhc->nqhw",
-        )
+        folded_out = graph.matmul(folded_left, folded_right)
         if len(left_blocks) == 1:
             return [folded_out]
 
-        split = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.split",
-            folded_out,
-            len(left_blocks),
-            split_axis=2,
-            concat_axis=None,
-        )
-        return [[split, block_idx] for block_idx in range(len(left_blocks))]
+        blocks = []
+        num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
+        for block_idx in range(len(left_blocks)):
+            blocks.append(
+                graph.slice(
+                    folded_out,
+                    [block_idx * num_heads],
+                    [(block_idx + 1) * num_heads],
+                    [1],
+                    [1],
+                )
+            )
+        return blocks
 
     def _build_direct_chunk_inverse(
         self,
-        base_name: str,
-        initial_attn: OnnxNode,
+        graph: ModelGraph,
+        initial_attn: NodeOrHandle,
         chunk_size: int,
-    ) -> OnnxNode:
-        """Build the exact upper-triangular inverse for one folded token block.
-
-        This recursively combines exact 4-token inverses and avoids the BF16-sensitive
-        repeated-squaring Taylor path.
-        """
+    ) -> NodeOrHandle:
+        """Build the exact NHWC lower-triangular inverse for one folded token block."""
         if chunk_size == 4:
-            eye = np.eye(chunk_size, dtype=np.float32).reshape(1, chunk_size, 1, chunk_size)
-            a_squared = self._onnx_builder.build_op(
-                f"{base_name}.a_squared",
-                [initial_attn, initial_attn],
-                "Einsum",
-                equation="nchw,nqhc->nqhw",
+            eye = graph.constant(
+                np.eye(chunk_size, dtype=np.float32).reshape(1, 1, chunk_size, chunk_size),
             )
-            i_plus_a = self._onnx_builder.build_op(
-                f"{base_name}.i_plus_a", [initial_attn, eye], "Add"
-            )
-            i_plus_a_squared = self._onnx_builder.build_op(
-                f"{base_name}.i_plus_a_squared", [a_squared, eye], "Add"
-            )
-            return self._onnx_builder.build_op(
-                f"{base_name}.base_inv",
-                [i_plus_a_squared, i_plus_a],
-                "Einsum",
-                equation="nchw,nqhc->nqhw",
-            )
+            a_squared = graph.matmul(initial_attn, initial_attn)
+            i_plus_a = graph.add(initial_attn, eye)
+            i_plus_a_squared = graph.add(a_squared, eye)
+            return graph.matmul(i_plus_a_squared, i_plus_a)
 
         half = chunk_size // 2
+        top_rows = graph.slice(initial_attn, [0], [half], [1], [2])
+        bottom_rows = graph.slice(initial_attn, [half], [chunk_size], [1], [2])
+        a00 = graph.slice(top_rows, [0], [half], [1], [3])
+        a10 = graph.slice(bottom_rows, [0], [half], [1], [3])
+        a11 = graph.slice(bottom_rows, [half], [chunk_size], [1], [3])
 
-        top_rows = self._onnx_builder.build_op(
-            f"{base_name}.top_rows",
-            [
-                initial_attn,
-                np.array([0], dtype=np.int64),
-                np.array([half], dtype=np.int64),
-                np.array([1], dtype=np.int64),
-            ],
-            "Slice",
-        )
-        bottom_rows = self._onnx_builder.build_op(
-            f"{base_name}.bottom_rows",
-            [
-                initial_attn,
-                np.array([half], dtype=np.int64),
-                np.array([chunk_size], dtype=np.int64),
-                np.array([1], dtype=np.int64),
-            ],
-            "Slice",
-        )
-
-        a00 = self._onnx_builder.build_op(
-            f"{base_name}.a00",
-            [
-                top_rows,
-                np.array([0], dtype=np.int64),
-                np.array([half], dtype=np.int64),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
-        a01 = self._onnx_builder.build_op(
-            f"{base_name}.a01",
-            [
-                top_rows,
-                np.array([half], dtype=np.int64),
-                np.array([chunk_size], dtype=np.int64),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
-        a11 = self._onnx_builder.build_op(
-            f"{base_name}.a11",
-            [
-                bottom_rows,
-                np.array([half], dtype=np.int64),
-                np.array([chunk_size], dtype=np.int64),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
-
-        inv00 = self._build_direct_chunk_inverse(f"{base_name}.inv00", a00, half)
-        inv11 = self._build_direct_chunk_inverse(f"{base_name}.inv11", a11, half)
-
-        a01_inv11 = self._onnx_builder.build_op(
-            f"{base_name}.a01_inv11",
-            [inv11, a01],
-            "Einsum",
-            equation="nchw,nqhc->nqhw",
-        )
-        inv01 = self._onnx_builder.build_op(
-            f"{base_name}.inv01",
-            [a01_inv11, inv00],
-            "Einsum",
-            equation="nchw,nqhc->nqhw",
-        )
-        inv10 = self._onnx_builder.create_initializer(
-            f"{base_name}.inv10_zero",
-            value=np.zeros(
+        inv00 = self._build_direct_chunk_inverse(graph, a00, half)
+        inv11 = self._build_direct_chunk_inverse(graph, a11, half)
+        a10_inv00 = graph.matmul(a10, inv00)
+        inv10 = graph.matmul(inv11, a10_inv00)
+        inv01 = graph.constant(
+            np.zeros(
                 (
                     1,
-                    half,
                     (self.num_tokens // self._delta_block_size)
                     * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    half,
                     half,
                 ),
                 dtype=np.float32,
             ),
         )
-
-        top = self._onnx_builder.build_op(f"{base_name}.top", [inv00, inv01], "Concat", axis=3)
-        bottom = self._onnx_builder.build_op(
-            f"{base_name}.bottom", [inv10, inv11], "Concat", axis=3
-        )
-        return self._onnx_builder.build_op(f"{base_name}.all", [top, bottom], "Concat", axis=1)
+        top = graph.concat([inv00, inv01], 3)
+        bottom = graph.concat([inv10, inv11], 3)
+        return graph.concat([top, bottom], 2)
 
     def _build_block_chunk_inverse(
-        self, base_name: str, initial_attn: OnnxNode, block_size: int = 32
-    ) -> OnnxNode:
-        """Build the full grouped triangular inverse from fixed-size blocks.
-
-        Diagonal blocks and off-diagonal spans are folded into the head axis to
-        reduce graph fragmentation while preserving triangular dependencies.
-        """
+        self, graph: ModelGraph, initial_attn: NodeOrHandle, block_size: int = 32
+    ) -> NodeOrHandle:
+        """Build the NHWC grouped lower-triangular inverse from fixed-size blocks."""
         assert self.num_tokens % block_size == 0
         num_blocks = self.num_tokens // block_size
 
-        # Slice the upper-triangular attention matrix into 32-token blocks.
-        attn_blocks: dict[tuple[int, int], OnnxNode] = {}
+        attn_blocks: dict[tuple[int, int], NodeOrHandle] = {}
         for row in range(num_blocks):
-            row_block = self._onnx_builder.build_op(
-                f"{base_name}.block_{row}.rows",
-                [
-                    initial_attn,
-                    np.array([row * block_size], dtype=np.int64),
-                    np.array([(row + 1) * block_size], dtype=np.int64),
-                    np.array([1], dtype=np.int64),
-                ],
-                "Slice",
+            row_block = graph.slice(
+                initial_attn,
+                [row * block_size],
+                [(row + 1) * block_size],
+                [1],
+                [2],
             )
-            for col in range(row, num_blocks):
-                attn_blocks[(row, col)] = self._onnx_builder.build_op(
-                    f"{base_name}.block_{row}_{col}.cols",
-                    [
-                        row_block,
-                        np.array([col * block_size], dtype=np.int64),
-                        np.array([(col + 1) * block_size], dtype=np.int64),
-                        np.array([3], dtype=np.int64),
-                    ],
-                    "Slice",
+            for col in range(row + 1):
+                attn_blocks[(row, col)] = graph.slice(
+                    row_block,
+                    [col * block_size],
+                    [(col + 1) * block_size],
+                    [1],
+                    [3],
                 )
 
-        # Fold all diagonal blocks into the head axis and invert them together.
-        inverse_blocks: dict[tuple[int, int], OnnxNode] = {}
+        inverse_blocks: dict[tuple[int, int], NodeOrHandle] = {}
         diag_blocks = [attn_blocks[(block_idx, block_idx)] for block_idx in range(num_blocks)]
-        folded_diag = self._onnx_builder.build_op(
-            f"{base_name}.diag.fold", diag_blocks, "Concat", axis=2
-        )
+        folded_diag = diag_blocks[0] if len(diag_blocks) == 1 else graph.concat(diag_blocks, 1)
         folded_diag_inv = self._build_direct_chunk_inverse(
-            f"{base_name}.diag.inverse", folded_diag, block_size
+            graph, folded_diag, block_size
         )
+        if num_blocks == 1:
+            return folded_diag_inv
+        num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
         for block_idx in range(num_blocks):
-            head_start = block_idx * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-            head_end = (block_idx + 1) * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-            inverse_blocks[(block_idx, block_idx)] = self._onnx_builder.build_op(
-                f"{base_name}.diag.unfold.{block_idx}",
-                [
-                    folded_diag_inv,
-                    np.array([head_start], dtype=np.int64),
-                    np.array([head_end], dtype=np.int64),
-                    np.array([2], dtype=np.int64),
-                ],
-                "Slice",
+            inverse_blocks[(block_idx, block_idx)] = graph.slice(
+                folded_diag_inv,
+                [block_idx * num_heads],
+                [(block_idx + 1) * num_heads],
+                [1],
+                [1],
             )
 
-        # Build wider off-diagonal spans from already-computed narrower spans.
         for span in range(1, num_blocks):
-            span_targets = [(row, row + span) for row in range(num_blocks - span)]
-
-            # First multiply every A(row, mid) @ inverse(mid, col) term in one batch.
+            span_targets = [(row, row - span) for row in range(span, num_blocks)]
             term_specs = [
                 (target_idx, row, mid, col)
                 for target_idx, (row, col) in enumerate(span_targets)
-                for mid in range(row + 1, col + 1)
+                for mid in range(col, row)
             ]
             term_products = self._folded_matrix_mul(
-                f"{base_name}.span_{span}.terms",
+                graph,
                 [attn_blocks[(row, mid)] for _, row, mid, _ in term_specs],
                 [inverse_blocks[(mid, col)] for _, _, mid, col in term_specs],
             )
-
-            grouped_terms: list[list[OnnxNode]] = [[] for _ in span_targets]
+            grouped_terms: list[list[NodeOrHandle]] = [[] for _ in span_targets]
             for (target_idx, _, _, _), term in zip(term_specs, term_products):
                 grouped_terms[target_idx].append(term)
 
-            # Sum all paths that contribute to the same output block.
             merged_blocks = []
-            for target_idx, terms in enumerate(grouped_terms):
+            for terms in grouped_terms:
                 merged = terms[0]
-                for term_idx, term in enumerate(terms[1:], start=1):
-                    merged = self._onnx_builder.build_op(
-                        f"{base_name}.span_{span}.target_{target_idx}.sum{term_idx}",
-                        [merged, term],
-                        "Add",
-                    )
+                for term in terms[1:]:
+                    merged = graph.add(merged, term)
                 merged_blocks.append(merged)
 
-            # Apply the row diagonal inverse to finish this span.
             span_inverse_blocks = self._folded_matrix_mul(
-                f"{base_name}.span_{span}.left_inv",
+                graph,
                 [inverse_blocks[(row, row)] for row, _ in span_targets],
                 merged_blocks,
             )
             for (row, col), inv_block in zip(span_targets, span_inverse_blocks):
                 inverse_blocks[(row, col)] = inv_block
 
-        # Reassemble the full upper-triangular inverse matrix.
-        zero_block = self._onnx_builder.create_initializer(
-            f"{base_name}.zero_block",
-            value=np.zeros(
-                (
-                    1,
-                    block_size,
-                    self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                    block_size,
-                ),
-                dtype=np.float32,
-            ),
+        zero_block = graph.constant(
+            np.zeros((1, num_heads, block_size, block_size), dtype=np.float32),
         )
         row_nodes = []
         for row in range(num_blocks):
-            row_blocks = []
-            for col in range(num_blocks):
-                block = inverse_blocks[(row, col)] if col >= row else zero_block
-                row_blocks.append(block)
             row_nodes.append(
-                self._onnx_builder.build_op(
-                    f"{base_name}.concat_row_{row}",
-                    row_blocks,
-                    "Concat",
-                    axis=3,
+                graph.concat(
+                    [
+                        inverse_blocks[(row, col)] if col <= row else zero_block
+                        for col in range(num_blocks)
+                    ],
+                    3,
                 )
             )
-
-        return self._onnx_builder.build_op(
-            f"{base_name}.concat_rows",
-            row_nodes,
-            "Concat",
-            axis=1,
-        )
+        return graph.concat(row_nodes, 2)
 
     def _build_decode_delta(
         self,
-        base_name: str,
-        query: OnnxNode,
-        key: OnnxNode,
-        value: OnnxNode,
-        beta: OnnxNode,
-        decay: OnnxNode,
-        state: OnnxNode,
-    ) -> tuple[OnnxNode, OnnxNode]:
-        """Build the single-token recurrent Gated DeltaNet update.
-
-        This is the decode path: update the delta state and produce one attention output.
-        """
-        state = self._onnx_builder.build_op(f"{base_name}.state_decay", [state, decay], "Mul")
-        value_token_major = self._onnx_builder.build_op(
-            f"{base_name}.value_token_major", [value], "Transpose", perm=[0, 3, 2, 1]
-        )
-        kv_mem = self._onnx_builder.build_op(
-            f"{base_name}.kv_mem",
-            [state, key],
-            "Einsum",
-            equation="nchw,nchq->nqhw",
-        )
-        delta = self._onnx_builder.build_op(
-            f"{base_name}.delta_sub", [value_token_major, kv_mem], "Sub"
-        )
-        delta = self._onnx_builder.build_op(f"{base_name}.delta_beta", [delta, beta], "Mul")
-        state_add = self._onnx_builder.build_op(f"{base_name}.state_add_mul", [key, delta], "Mul")
-        state = self._onnx_builder.build_op(f"{base_name}.state_add", [state, state_add], "Add")
-        out = self._onnx_builder.build_op(
-            f"{base_name}.out",
-            [query, state],
-            "Einsum",
-            equation="nchw,nchq->nqhw",
-        )
+        graph: ModelGraph,
+        query: NodeOrHandle,
+        key: NodeOrHandle,
+        value: NodeOrHandle,
+        beta: NodeOrHandle,
+        decay: NodeOrHandle,
+        state: NodeOrHandle,
+    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+        """Build the NHWC single-token recurrent Gated DeltaNet update."""
+        state = graph.mul(state, decay)
+        kv_mem = graph.matmul(key, state)
+        delta = graph.sub(value, kv_mem)
+        delta = graph.mul(delta, beta)
+        state_add = graph.matmul(key, delta, transpose_a=True)
+        state = graph.add(state, state_add)
+        out = graph.matmul(query, state)
         return out, state
 
     def _build_group_delta(
         self,
-        base_name: str,
-        query: OnnxNode,
-        key: OnnxNode,
-        query_unscaled: OnnxNode,
-        key_unscaled: OnnxNode,
-        value: OnnxNode,
-        beta: OnnxNode,
-        g: OnnxNode,
-        state: OnnxNode,
-    ) -> tuple[OnnxNode, OnnxNode]:
-        """Build the grouped prefill Gated DeltaNet computation.
+        graph: ModelGraph,
+        query: NodeOrHandle,
+        key: NodeOrHandle,
+        query_unscaled: NodeOrHandle,
+        key_unscaled: NodeOrHandle,
+        value: NodeOrHandle,
+        beta: NodeOrHandle,
+        g: NodeOrHandle,
+        state: NodeOrHandle,
+    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+        """Build the grouped prefill computation in NHWC head-major layout."""
+        g_cum = self._build_static_triangular_sums(graph, g, upper=True)
+        strict_lower = graph.constant(
+            np.broadcast_to(
+                np.tril(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=-1).reshape(
+                    1, 1, self.num_tokens, self.num_tokens
+                ),
+                (
+                    1,
+                    self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
+                    self.num_tokens,
+                    self.num_tokens,
+                ),
+            ).copy(),
+        )
+        decay_mask = self._build_global_interval_decay_mask(graph, g)
 
-        This computes all token outputs and the final recurrent state for the group.
-        """
-        g_cum = self._build_static_triangular_sums(f"{base_name}.g_cum", g, upper=True)
-
-        strict_lower = np.triu(
-            np.ones((self.num_tokens, self.num_tokens), dtype=np.float32), k=1
-        ).reshape(1, self.num_tokens, 1, self.num_tokens)
-        decay_mask = self._build_global_interval_decay_mask(
-            f"{base_name}.interval_decay", g
+        v_beta = graph.mul(value, beta)
+        k_beta = graph.mul(key, beta)
+        raw_kk = graph.matmul(key_unscaled, key_unscaled, transpose_b=True)
+        beta_scaled = graph.mul(
+            beta,
+            graph.constant(-1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim),
         )
-
-        v_beta = self._onnx_builder.build_op(f"{base_name}.v_beta", [value, beta], "Mul")
-        k_beta = self._onnx_builder.build_op(f"{base_name}.k_beta", [key, beta], "Mul")
-        raw_kk = self._onnx_builder.build_op(
-            f"{base_name}.raw_kk",
-            [key_unscaled, key_unscaled],
-            "Einsum",
-            equation="nchw,nchq->nqhw",
-        )
-        beta_scaled = self._onnx_builder.build_op(
-            f"{base_name}.beta_scaled",
-            [beta, -1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim],
-            "Mul",
-        )
-        kk = self._onnx_builder.build_op(
-            f"{base_name}.kk", [raw_kk, beta_scaled], "Mul"
-        )
-        init_attn = self._onnx_builder.build_op(
-            f"{base_name}.init_attn_decay", [kk, decay_mask], "Mul"
-        )
-        init_attn = self._onnx_builder.build_op(
-            f"{base_name}.init_attn_mask", [init_attn, strict_lower], "Mul"
-        )
+        kk = graph.mul(raw_kk, beta_scaled)
+        init_attn = graph.mul(kk, decay_mask)
+        init_attn = graph.mul(init_attn, strict_lower)
         attn = self._build_block_chunk_inverse(
-            f"{base_name}.tri_solve",
+            graph,
             init_attn,
             block_size=self._delta_block_size,
         )
 
-        value_i = self._onnx_builder.build_op(
-            f"{base_name}.value", [attn, v_beta], "Einsum", equation="nchw,nqhc->nqhw"
-        )
-        g_exp = self._onnx_builder.build_op(f"{base_name}.g_exp", [g_cum], "Exp")
-        k_beta_exp = self._onnx_builder.build_op(
-            f"{base_name}.k_beta_exp", [k_beta, g_exp], "Mul"
-        )
-        k_cumdecay = self._onnx_builder.build_op(
-            f"{base_name}.k_cumdecay",
-            [attn, k_beta_exp],
-            "Einsum",
-            equation="nchw,nqhc->nqhw",
-        )
-        v_prime = self._onnx_builder.build_op(
-            f"{base_name}.v_prime",
-            [k_cumdecay, state],
-            "Einsum",
-            equation="nchw,nchq->nqhw",
-        )
-        v_new = self._onnx_builder.build_op(f"{base_name}.v_new", [value_i, v_prime], "Sub")
+        value_i = graph.matmul(attn, v_beta)
+        g_exp = graph.exp(g_cum)
+        k_beta_exp = graph.mul(k_beta, g_exp)
+        k_cumdecay = graph.matmul(attn, k_beta_exp)
+        v_prime = graph.matmul(k_cumdecay, state)
+        v_new = graph.sub(value_i, v_prime)
 
-        raw_qk = self._onnx_builder.build_op(
-            f"{base_name}.raw_qk",
-            [query_unscaled, key_unscaled],
-            "Einsum",
-            equation="nchw,nchq->nqhw",
-        )
-        qk = self._onnx_builder.build_op(
-            f"{base_name}.qk",
-            [
-                raw_qk,
+        raw_qk = graph.matmul(query_unscaled, key_unscaled, transpose_b=True)
+        qk = graph.mul(
+            raw_qk,
+            graph.constant(
                 1.0
                 / (
                     self.cfg.lm_cfg.linear_attn_cfg.key_head_dim
                     * math.sqrt(self.cfg.lm_cfg.linear_attn_cfg.key_head_dim)
                 ),
-            ],
-            "Mul",
+            ),
         )
-        qk = self._onnx_builder.build_op(
-            f"{base_name}.qk_decay", [qk, decay_mask], "Mul"
-        )
-        q_exp = self._onnx_builder.build_op(f"{base_name}.q_exp", [query, g_exp], "Mul")
-        attn_inter = self._onnx_builder.build_op(
-            f"{base_name}.attn_inter",
-            [q_exp, state],
-            "Einsum",
-            equation="nchw,nchq->nqhw",
-        )
-        attn_value = self._onnx_builder.build_op(
-            f"{base_name}.attn_value", [qk, v_new], "Einsum", equation="nchw,nqhc->nqhw"
-        )
-        core_attn_out = self._onnx_builder.build_op(
-            f"{base_name}.out", [attn_inter, attn_value], "Add"
-        )
+        qk = graph.mul(qk, decay_mask)
+        q_exp = graph.mul(query, g_exp)
+        attn_inter = graph.matmul(q_exp, state)
+        attn_value = graph.matmul(qk, v_new)
+        core_attn_out = graph.add(attn_inter, attn_value)
 
         suffix_g = self._build_static_triangular_sums(
-            f"{base_name}.state_base.suffix_g", g, upper=False
+            graph, g, upper=False
         )
-        suffix_g_exp = self._onnx_builder.build_op(
-            f"{base_name}.state_base.suffix_g_exp", [suffix_g], "Exp"
+        suffix_g_exp = graph.exp(suffix_g)
+        final_g_exp = graph.slice(suffix_g_exp, [0], [1], [1], [2])
+        final_decay_mask = graph.slice(suffix_g_exp, [1], [self.num_tokens], [1], [2])
+        final_decay_mask_tail = graph.constant(
+            np.ones((1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, 1, 1), dtype=np.float32),
         )
+        final_decay_mask = graph.concat([final_decay_mask, final_decay_mask_tail], 2)
+        v_new_weighted = graph.mul(v_new, final_decay_mask)
+        state_updates = graph.matmul(key, v_new_weighted, transpose_a=True)
+        state_base = graph.mul(state, final_g_exp)
+        linear_delta_state_out = graph.add(state_base, state_updates)
 
-        final_g_exp = self._onnx_builder.build_op(
-            f"{base_name}.state_base.final_g_exp",
-            [
-                suffix_g_exp,
-                np.array([0], dtype=np.int64),
-                np.array([1], dtype=np.int64),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
-
-        final_decay_mask = self._onnx_builder.build_op(
-            f"{base_name}.state_update.final_decay_mask.exp_sliced",
-            [
-                suffix_g_exp,
-                np.array([1], dtype=np.int64),
-                np.array([self.num_tokens], dtype=np.int64),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
-        final_decay_mask_tail = self._onnx_builder.create_initializer(
-            f"{base_name}.state_update.final_decay_mask.tail",
-            value=np.ones(
-                (1, 1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, 1),
-                dtype=np.float32,
-            ),
-        )
-        final_decay_mask = self._onnx_builder.build_op(
-            f"{base_name}.state_update.final_decay_mask.concat",
-            [final_decay_mask, final_decay_mask_tail],
-            "Concat",
-            axis=3,
-        )
-        v_new_weighted = self._onnx_builder.build_op(
-            f"{base_name}.state_update.v_new_weighted",
-            [v_new, final_decay_mask],
-            "Mul",
-        )
-        v_new_weighted = self._onnx_builder.build_op(
-            f"{base_name}.state_update.v_new_weighted.token_major",
-            [v_new_weighted],
-            "Transpose",
-            perm=[0, 3, 2, 1],
-        )
-        state_updates = self._onnx_builder.build_op(
-            f"{base_name}.state_update.all",
-            [v_new_weighted, key],
-            "Einsum",
-            equation="nchw,nqhc->nqhw",
-        )
-        state_base = self._onnx_builder.build_op(
-            f"{base_name}.state_base.all", [state, final_g_exp], "Mul"
-        )
-
-        linear_delta_state_out = self._onnx_builder.build_op(
-            f"{base_name}.state.all", [state_base, state_updates], "Add"
-        )
         return core_attn_out, linear_delta_state_out
-
-    def _build_onnx_nodes(self, base_layer: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        linear_base = f"{base_layer}.linear_attn"
-        repeat = (
-            self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
-            // self.cfg.lm_cfg.linear_attn_cfg.num_key_heads
-        )
-        norm_input = self._build_rms_norm(f"{base_layer}.input_layernorm", input_nodes[0])
-
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_qkv")
-        mixed_qkv = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{linear_base}.in_proj_qkv", norm_input, lora_rank=lora_rank
-        )
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_z")
-        z = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{linear_base}.in_proj_z", norm_input, lora_rank=lora_rank
-        )
-        a, b = self._build_onnx_ab_projections(linear_base, norm_input)
-
-        conv_tail = self._onnx_builder.build_op(
-            f"{linear_base}.conv_tail.concat", [input_nodes[1], mixed_qkv], "Concat", axis=3
-        )
-        linear_conv_state_out = self._onnx_builder.build_op(
-            f"{linear_base}.conv_tail.window",
-            [
-                conv_tail,
-                np.array([1], dtype=np.int64),
-                np.array(
-                    [self.num_tokens + self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim - 1],
-                    dtype=np.int64,
-                ),
-                np.array([3], dtype=np.int64),
-            ],
-            "Slice",
-        )
-
-        w_raw = self.get_hf_param(f"{linear_base}.conv1d.weight")
-        if isinstance(w_raw, tuple):
-            w_raw = w_raw[1]
-        w_conv2d = w_raw.reshape(
-            self.cfg.lm_cfg.linear_attn_cfg.conv_dim,
-            1,
-            1,
-            self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim,
-        )
-        w_node = self._onnx_builder.create_initializer(
-            f"{linear_base}.conv1d.weight", value=w_conv2d
-        )
-        conv_inputs = [conv_tail, w_node]
-        if self.check_hf_param(f"{linear_base}.conv1d.bias"):
-            b_raw = self.get_hf_param(f"{linear_base}.conv1d.bias")
-            if isinstance(b_raw, tuple):
-                b_raw = b_raw[1]
-            b_node = self._onnx_builder.create_initializer(
-                f"{linear_base}.conv1d.bias", value=b_raw
-            )
-            conv_inputs.append(b_node)
-        conv_out = self._onnx_builder.build_op(
-            f"{linear_base}.depthwise_conv2d",
-            conv_inputs,
-            "Conv",
-            dilations=[1, 1],
-            group=self.cfg.lm_cfg.linear_attn_cfg.conv_dim,
-            kernel_shape=[1, self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim],
-            pads=[0, 0, 0, 0],
-            strides=[1, 1],
-        )
-        conv_out = self._onnx_builder.build_activation(
-            f"{linear_base}.conv_act", conv_out, "silu"
-        )
-        valid_mask = input_nodes[2] if self.num_tokens > 1 else None
-        if valid_mask is not None:
-            conv_out = self._onnx_builder.build_op(
-                f"{linear_base}.mask.conv_out", [conv_out, valid_mask], "Mul"
-            )
-
-        q_flat = self._onnx_builder.build_op(
-            f"{linear_base}.q",
-            [
-                conv_out,
-                np.array([0], dtype=np.int64),
-                np.array([self.cfg.lm_cfg.linear_attn_cfg.key_dim], dtype=np.int64),
-                np.array([1], dtype=np.int64),
-            ],
-            "Slice",
-        )
-        k_flat = self._onnx_builder.build_op(
-            f"{linear_base}.k",
-            [
-                conv_out,
-                np.array([self.cfg.lm_cfg.linear_attn_cfg.key_dim], dtype=np.int64),
-                np.array([2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim], dtype=np.int64),
-                np.array([1], dtype=np.int64),
-            ],
-            "Slice",
-        )
-        v_flat = self._onnx_builder.build_op(
-            f"{linear_base}.v",
-            [
-                conv_out,
-                np.array([2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim], dtype=np.int64),
-                np.array([self.cfg.lm_cfg.linear_attn_cfg.conv_dim], dtype=np.int64),
-                np.array([1], dtype=np.int64),
-            ],
-            "Slice",
-        )
-
-        query = self._onnx_builder.build_split_expand_concat(
-            f"{linear_base}.q_heads.reshape",
-            q_flat,
-            self.cfg.lm_cfg.linear_attn_cfg.num_key_heads,
-            repeat,
-            split_axis=1,
-            concat_axis=2,
-            concat_shape=(
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-                self.cfg.lm_cfg.linear_attn_cfg.num_key_heads * repeat,
-                self.num_tokens,
-            ),
-        )
-        key = self._onnx_builder.build_split_expand_concat(
-            f"{linear_base}.k_heads.reshape",
-            k_flat,
-            self.cfg.lm_cfg.linear_attn_cfg.num_key_heads,
-            repeat,
-            split_axis=1,
-            concat_axis=2,
-            concat_shape=(
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-                self.cfg.lm_cfg.linear_attn_cfg.num_key_heads * repeat,
-                self.num_tokens,
-            ),
-        )
-        value = self._onnx_builder.build_split_expand_concat(
-            f"{linear_base}.v_heads.reshape",
-            v_flat,
-            self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-            1,
-            split_axis=1,
-            concat_axis=2,
-            concat_shape=(
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.value_head_dim,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                self.num_tokens,
-            ),
-        )
-
-        query_unscaled = self._build_l2norm(
-            f"{linear_base}.q_l2norm_unscaled",
-            query,
-            self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-        )
-        key_unscaled = self._build_l2norm(
-            f"{linear_base}.k_l2norm_unscaled",
-            key,
-            self.cfg.lm_cfg.linear_attn_cfg.key_head_dim,
-        )
-        query = self._onnx_builder.build_op(
-            f"{linear_base}.q_scaled_global",
-            [query_unscaled, 1.0 / self.cfg.lm_cfg.linear_attn_cfg.key_head_dim],
-            "Mul",
-        )
-        key = self._onnx_builder.build_op(
-            f"{linear_base}.k_scaled_global",
-            [key_unscaled, 1.0 / math.sqrt(self.cfg.lm_cfg.linear_attn_cfg.key_head_dim)],
-            "Mul",
-        )
-
-        beta = self._onnx_builder.build_op(f"{linear_base}.beta", [b], "Sigmoid")
-        beta = self._onnx_builder.build_op(
-            f"{linear_base}.beta.reshape",
-            [
-                beta,
-                np.array(
-                    (1, 1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, self.num_tokens),
-                    dtype=np.int64,
-                ),
-            ],
-            "Reshape",
-        )
-        if valid_mask is not None:
-            beta = self._onnx_builder.build_op(
-                f"{linear_base}.mask.beta", [beta, valid_mask], "Mul"
-            )
-        a_dt = self._onnx_builder.build_op(
-            f"{linear_base}.a_dt",
-            [
-                a,
-                self._onnx_builder.create_initializer(
-                    f"{linear_base}.dt_bias", value=self.get_hf_param(f"{linear_base}.dt_bias"),
-                    reshape_str="c->nchw",
-                ),
-            ],
-            "Add",
-        )
-        softplus = self._onnx_builder.build_op(f"{linear_base}.softplus", [a_dt], "Softplus")
-        neg_a_exp = -np.exp(self.get_hf_param(f"{linear_base}.A_log").astype(np.float32))
-        neg_a_exp_node = self._onnx_builder.create_initializer(
-            f"{linear_base}.neg_A", value=neg_a_exp, reshape_str="c->nchw"
-        )
-        g_pre_mask = self._onnx_builder.build_op(
-            f"{linear_base}.g_mul", [softplus, neg_a_exp_node], "Mul"
-        )
-        g_pre_mask = self._onnx_builder.build_op(
-            f"{linear_base}.g.reshape",
-            [
-                g_pre_mask,
-                np.array(
-                    (1, 1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, self.num_tokens),
-                    dtype=np.int64,
-                ),
-            ],
-            "Reshape",
-        )
-        g = g_pre_mask
-        if valid_mask is not None:
-            g = self._onnx_builder.build_op(f"{linear_base}.mask.g", [g, valid_mask], "Mul")
-
-        state_flat = input_nodes[3] if self.num_tokens > 1 else input_nodes[2]
-        state_flat = self._onnx_builder.build_op(
-            f"{linear_base}.state.to_khv", [state_flat], "Transpose", perm=[0, 3, 2, 1]
-        )
-
-        if self.num_tokens == 1:
-            decay = self._onnx_builder.build_op(f"{linear_base}.decay", [g], "Exp")
-            core_attn_out, linear_delta_state_out = self._build_decode_delta(
-                f"{linear_base}.decode", query, key, value, beta, decay, state_flat
-            )
-        else:
-            core_attn_out, linear_delta_state_out = self._build_group_delta(
-                f"{linear_base}.group",
-                query,
-                key,
-                query_unscaled,
-                key_unscaled,
-                value,
-                beta,
-                g,
-                state_flat,
-            )
-
-        z_heads = self._onnx_builder.build_split_expand_concat(
-            f"{linear_base}.z_heads.reshape",
-            z,
-            self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-            1,
-            split_axis=1,
-            concat_axis=2,
-            concat_shape=(
-                1,
-                self.cfg.lm_cfg.linear_attn_cfg.value_head_dim,
-                self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                self.num_tokens,
-            ),
-        )
-        core_attn_out = self._onnx_builder.build_rms_norm(
-            f"{linear_base}.norm", core_attn_out, self.cfg.lm_cfg.rms_norm_eps, 0.0
-        )
-        z_heads = self._onnx_builder.build_activation(
-            f"{linear_base}.norm.gate_silu", z_heads, "silu"
-        )
-        core_attn_out = self._onnx_builder.build_op(
-            f"{linear_base}.norm.mul_gate", [core_attn_out, z_heads], "Mul"
-        )
-        core_attn_out = self._onnx_builder.build_split_and_concat(
-            f"{linear_base}.merge_heads.reshape",
-            core_attn_out,
-            self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-            split_axis=2,
-            concat_axis=1,
-        )
-
-        out_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{linear_base}.out_proj", core_attn_out
-        )
-        add1 = self._onnx_builder.build_op(f"{base_layer}.add1", [input_nodes[0], out_proj], "Add")
-        rms_norm2 = self._build_rms_norm(f"{base_layer}.post_attention_layernorm", add1)
-        mlp = self._build_onnx_mlp(f"{base_layer}.mlp", [rms_norm2, add1], with_residual_add=True)
-        linear_delta_state_out = self._onnx_builder.build_op(
-            f"{linear_base}.state.to_vhk",
-            [linear_delta_state_out],
-            "Transpose",
-            perm=[0, 3, 2, 1],
-        )
-
-        output_nodes = [mlp, linear_conv_state_out, linear_delta_state_out]
-        return output_nodes

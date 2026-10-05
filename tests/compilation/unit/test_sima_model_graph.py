@@ -96,26 +96,34 @@ def test_slice_preserves_values_and_handles_channel_alignment(
 ):
     shape = (1, 1, 3, 80)
     graph = ModelGraph(_source(), {"x": shape}, quantizable)
-    output = graph.slice(graph.inputs["x"], [begin], [end], [1], [axis])
-    assert isinstance(output.ir.operation, operator)
+    outputs = [
+        graph.slice(graph.inputs["x"], [begin], [end], [1], [axis]),
+        graph.slice(graph.inputs["x"], start=begin, stop=end, axis=axis),
+    ]
+    assert all(isinstance(output.ir.operation, operator) for output in outputs)
     x = np.arange(np.prod(shape)).reshape(shape).astype(activation_dtype(quantizable))
     selection = [slice(None)] * 4
     selection[axis] = slice(begin, end)
     execute = (
         create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
     )
-    actual = graph.finish([output]).run({"x": x}, node_callable=execute)
-    actual = actual[0] if isinstance(actual, (tuple, list)) else actual
-    np.testing.assert_array_equal(actual, x[tuple(selection)].astype(np.float32))
+    actual = graph.finish(outputs).run({"x": x}, node_callable=execute)
+    assert len(actual) == 2
+    for value in actual:
+        np.testing.assert_array_equal(value, x[tuple(selection)].astype(np.float32))
 
 
 @pytest.mark.parametrize("quantizable", [True, False])
 def test_slice_keeps_integer_channels_on_native_path(quantizable):
     shape = (1, 1, 2, 80)
     graph = ModelGraph(_source(), {"x": TensorType(ScalarType.int8, shape)}, quantizable)
-    output = graph.slice(graph.inputs["x"], [0], [40], [1], [3])
-    assert isinstance(output.ir.operation, StridedSliceOp)
-    assert tensor_type(output) == TensorType(ScalarType.int8, (1, 1, 2, 40))
+    outputs = [
+        graph.slice(graph.inputs["x"], [0], [40], [1], [3]),
+        graph.slice(graph.inputs["x"], stop=40, axis=-1),
+    ]
+    for output in outputs:
+        assert isinstance(output.ir.operation, StridedSliceOp)
+        assert tensor_type(output) == TensorType(ScalarType.int8, (1, 1, 2, 40))
 
 
 def test_model_graph_requires_an_output():
@@ -126,19 +134,21 @@ def test_model_graph_requires_an_output():
 
 @pytest.mark.parametrize("quantizable", [True, False])
 @pytest.mark.parametrize(
-    "transpose_a,transpose_b,equation",
+    "transpose_a,transpose_b",
     [
-        (False, False, "nhwc,nhcq->nhwq"),
-        (False, True, "nhwc,nhqc->nhwq"),
-        (True, False, "nhcw,nhcq->nhwq"),
-        (True, True, "nhcw,nhqc->nhwq"),
+        (False, False),
+        (False, True),
+        (True, False),
+        (True, True),
     ],
 )
-def test_einsum_lowers_to_mla_batch_matmul(quantizable, transpose_a, transpose_b, equation):
+def test_matmul_lowers_to_mla_batch_matmul(quantizable, transpose_a, transpose_b):
     lhs_shape = (1, 2, 16, 3) if transpose_a else (1, 2, 3, 16)
     rhs_shape = (1, 2, 5, 16) if transpose_b else (1, 2, 16, 5)
     graph = ModelGraph(_source(), {"lhs": lhs_shape, "rhs": rhs_shape}, quantizable)
-    output = graph.einsum(equation, graph.inputs["lhs"], graph.inputs["rhs"])
+    output = graph.matmul(
+        graph.inputs["lhs"], graph.inputs["rhs"], transpose_a=transpose_a, transpose_b=transpose_b
+    )
     assert isinstance(output.ir.operation, BatchMatmulOp)
     assert output.ir.backend == Backend.MLA
     assert (output.ir.attrs.transpose_a, output.ir.attrs.transpose_b) == (transpose_a, transpose_b)
@@ -153,8 +163,10 @@ def test_einsum_lowers_to_mla_batch_matmul(quantizable, transpose_a, transpose_b
         create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
     )
     actual = net.run(inputs, node_callable=execute)
-    expected = np.einsum(
-        equation, inputs["lhs"].astype(np.float32), inputs["rhs"].astype(np.float32)
+    lhs, rhs = inputs["lhs"].astype(np.float32), inputs["rhs"].astype(np.float32)
+    expected = np.matmul(
+        lhs.swapaxes(-1, -2) if transpose_a else lhs,
+        rhs.swapaxes(-1, -2) if transpose_b else rhs,
     )
     actual = actual[0] if isinstance(actual, (tuple, list)) else actual
     if quantizable:
@@ -164,36 +176,19 @@ def test_einsum_lowers_to_mla_batch_matmul(quantizable, transpose_a, transpose_b
 
 
 @pytest.mark.parametrize(
-    "equation",
-    [
-        "bad",
-        "nhwc,nhwc->nhwc",
-        "nhwc,nhwc->",
-        "...wc,...cq->...wq",
-        "nnwc,nnqc->nnwq",
-        "1234,1254->1235",
-    ],
-)
-def test_einsum_rejects_unsupported_equations(equation):
-    graph = ModelGraph(_source(), {"x": (1, 1, 16, 16)}, True)
-    with pytest.raises(ValueError, match="Unsupported einsum"):
-        graph.einsum(equation, graph.inputs["x"], graph.inputs["x"])
-
-
-@pytest.mark.parametrize(
     "lhs,rhs,error",
     [
         ((1, 2, 3, 16), (2, 2, 5, 16), "equal batches"),
-        ((1, 2, 3, 16), (1, 4, 5, 16), "singleton heads"),
+        ((1, 3, 3, 16), (1, 2, 5, 16), "divisible head counts"),
         ((1, 2, 3, 16), (1, 2, 5, 32), "contraction dimensions"),
         ((1, 3, 16), (1, 2, 5, 16), "rank-four"),
         (TensorType(ScalarType.int8, (1, 2, 3, 16)), (1, 2, 5, 16), "matching FP32/BF16"),
     ],
 )
-def test_einsum_rejects_invalid_types_and_shapes(lhs, rhs, error):
+def test_matmul_rejects_invalid_types_and_shapes(lhs, rhs, error):
     graph = ModelGraph(_source(), {"lhs": lhs, "rhs": rhs}, True)
     with pytest.raises(ValueError, match=error):
-        graph.einsum("nhwc,nhqc->nhwq", graph.inputs["lhs"], graph.inputs["rhs"])
+        graph.matmul(graph.inputs["lhs"], graph.inputs["rhs"], transpose_b=True)
 
 
 @pytest.mark.parametrize("block_size", [None, 32])
@@ -594,13 +589,12 @@ def test_unknown_weight_override_is_rejected():
         graph.linear("proj", graph.inputs["x"], src_weights_name="typo.weight")
 
 
-def test_einsum_accepts_renamed_labels_and_singleton_heads():
-    specs = {"query": (1, 2, 3, 16), "key": (1, 1, 5, 16)}
+def test_matmul_repeats_kv_heads_for_gqa():
+    specs = {"query": (1, 8, 3, 16), "key": (1, 2, 5, 16)}
     graph = ModelGraph(_source(), specs, True)
-    output = graph.einsum(
-        " b h t d, b h s d -> b h t s ", graph.inputs["query"], graph.inputs["key"]
-    )
+    output = graph.matmul(graph.inputs["query"], graph.inputs["key"], transpose_b=True)
     rng = np.random.default_rng(2)
     inputs = {name: rng.normal(0, 0.1, shape).astype(np.float32) for name, shape in specs.items()}
-    expected = np.einsum("bhtd,bhsd->bhts", inputs["query"], inputs["key"])
+    keys = np.repeat(inputs["key"], 4, axis=1)
+    expected = np.matmul(inputs["query"], keys.swapaxes(-1, -2))
     np.testing.assert_allclose(_run(graph.finish([output]), inputs), expected, atol=2e-8, rtol=2e-6)

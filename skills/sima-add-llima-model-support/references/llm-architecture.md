@@ -57,7 +57,7 @@ from a model name.
   `language_{pre,cache,post}_model.py` implementation.
 - Reuse shared attention, MLP, normalization, embedding, and LM-head builders;
   branch only where computation or state differs.
-- Keep ONNX and direct Model SDK implementations aligned where both apply.
+- Use ModelGraph and validate staged and direct quantization where both apply.
 - Preserve deterministic layer and model-part ordering.
 
 ## Runtime Contract
@@ -79,7 +79,7 @@ the execution contract cannot be expressed by existing configuration.
 - Test source ingestion and deterministic tensor transforms.
 - Compare affected prefill, decode, and state outputs with the reference.
 - Exercise group/single variants, boundary lengths, and cache transitions.
-- Run ONNX regression and direct graph parity where supported.
+- Run native graph regression and staged/direct quantization parity where supported.
 - Verify complete required-unit generation and graph integration.
 - Run multi-turn generation and clean teardown on Modalix.
 

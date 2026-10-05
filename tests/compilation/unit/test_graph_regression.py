@@ -92,7 +92,6 @@ def test_vision_regression_selects_same_intermediate_layer_for_both_revisions(mo
     source = SimpleNamespace(
         cfg=SimpleNamespace(num_vision_layers=26),
         vision_model_name="vision",
-        onnx_path="unused",
         sima_path="unused",
         hf_model=None,
     )

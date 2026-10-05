@@ -11,9 +11,7 @@ from sima_lmm.logging import sima_log_info, sima_log_warning
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.base import (
-    BaseModel, EvalMode, FileGenMode, FileGenPrecision, LoraGenMode, GenConfiguration
-)
+from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
@@ -23,8 +21,7 @@ from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
-from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
+from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
 bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
@@ -499,14 +496,14 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_pre_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguagePreModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                 )
             case "post":
                 model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguagePostModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
                 )
@@ -514,7 +511,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_cache_token{token_idx}"
                 assert token_idx is not None
                 return LanguageCacheModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping
                 )
@@ -522,7 +519,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_sliding_cache_token{token_idx}"
                 assert token_idx is not None
                 return LanguageCacheModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
                     layer_type="sliding_attention"
@@ -531,7 +528,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_conv"
                 assert layer_idx is not None
                 return LanguageConvModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
                 )
@@ -539,26 +536,26 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_linear"
                 assert layer_idx is not None
                 return LanguageLinearModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx
                 )
             case "conv_post_final":
                 model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}_conv_final"
                 assert layer_idx is not None
                 return LanguageConvPostModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
                 )
             case "draft_fc":
                 model_name = f"{self.model_name}_n{num_tokens}_draft_fc"
                 return LanguageDraftFCModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens
                 )
             case "per_layer":
                 model_name = f"{self.model_name}_n{num_tokens}_per_layer"
                 return LanguagePerLayerModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens,
                 )

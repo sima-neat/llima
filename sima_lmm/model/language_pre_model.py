@@ -7,9 +7,8 @@ from afe.ir.tensor_type import TensorType, ScalarType
 from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerConfiguration
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
+from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.onnx_builder import OnnxNode
 from sima_lmm.config.vlm_config import VlmArchType
 
 
@@ -63,338 +62,13 @@ class LanguagePreModel(LanguagePartBaseModel):
     def _kv_size(self) -> int:
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
-    def gen_onnx_files(self):
-        base_name = self._layer_base_name
-        self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-        )
-        if self.is_draft:
-            self._onnx_builder.create_input_node(
-                "hidden_states", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-            )
-        self._onnx_builder.create_input_node(
-            "freq_real", (1, self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2, 1, self.num_tokens)
-        )
-        self._onnx_builder.create_input_node(
-            "freq_imag", (1, self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2, 1, self.num_tokens)
-        )
-        output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
-
-        # RoPE embedded q_proj (1, Head_Dim, n_heads, n_tokens).
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[0]),
-            (
-                1,
-                self._head_dim,
-                self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-                self.num_tokens
-            )
-        )
-
-        if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
-            # RoPE embedded k_proj and v_proj (1, Head_Dim, n_kv, n_tokens).
-            kv_cache_shape = (
-                1,
-                self._head_dim,
-                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                self.num_tokens
-            )
-            self._onnx_builder.create_output_node(
-                self._onnx_builder.get_node_output_name(output_nodes[1]), kv_cache_shape
-            )
-            self._onnx_builder.create_output_node(
-                self._onnx_builder.get_node_output_name(output_nodes[2]), kv_cache_shape
-            )
-
-        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            self._onnx_builder.create_output_node(
-                self._onnx_builder.get_node_output_name(output_nodes[-1]),
-                (1, self._q_size, 1, self.num_tokens)
-            )
-
-        self._onnx_builder.create_and_save_model()
-
-        # Set to None to deallocate the memory.
-        self._onnx_builder = None
-
-    def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        # LFM2 uses 'operator_norm' instead of 'input_layernorm'.
-        norm_name = (
-            f"{base_name}.operator_norm"
-            if self.check_hf_param(f"{base_name}.operator_norm.weight")
-            else f"{base_name}.input_layernorm"
-        )
-        rms_norm = self._build_rms_norm(norm_name, input_nodes[0])
-        if self.is_draft:
-            # EAGLE3 draft model also normalizes the target hidden_states.
-            hidden_states_norm = self._build_rms_norm(
-                f"{base_name}.hidden_norm", input_nodes[1]
-            )
-            attn_input = self._onnx_builder.build_op(
-                base_name=f"{base_name}.concat",
-                input_nodes=[rms_norm, hidden_states_norm],
-                op_type="Concat",
-                axis=1,
-            )
-            freq_start = 2
-        else:
-            attn_input = rms_norm
-            freq_start = 1
-        q_result = self._build_onnx_attn_query(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
-        gate_out = None
-        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            q_out, gate_out = q_result
-        else:
-            q_out = q_result
-
-        output_nodes = [q_out]
-        if self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
-            if gate_out is not None:
-                output_nodes.append(gate_out)
-            return output_nodes
-        k_out = self._build_onnx_attn_key(f"{base_name}.self_attn", [attn_input, *input_nodes[freq_start:]])
-        v_out = self._build_onnx_attn_value(f"{base_name}.self_attn", attn_input)
-        output_nodes.extend([k_out, v_out])
-        if gate_out is not None:
-            output_nodes.append(gate_out)
-        return output_nodes
-
-    def _build_onnx_rotary_emb(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
-        layer_head_dim = self._head_dim
-        layer_rope_dimension_count = self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type)
-        imag_start = (
-            layer_head_dim // 2
-            if self._is_proportional_rope_layer
-            else layer_rope_dimension_count // 2
-        )
-        imag_end = (
-            layer_head_dim // 2 + layer_rope_dimension_count // 2
-            if self._is_proportional_rope_layer
-            else layer_rope_dimension_count
-        )
-        real_in = self._onnx_builder.build_op(
-            f"{base_name}.real_in",
-            [
-                input_nodes[0],
-                np.array([0], dtype=np.int64),
-                np.array([layer_rope_dimension_count // 2], dtype=np.int64),
-                np.array([1], dtype=np.int64)
-            ],
-            "Slice"
-        )
-        imag_in = self._onnx_builder.build_op(
-            f"{base_name}.imag_in",
-            [
-                input_nodes[0],
-                np.array([imag_start], dtype=np.int64),
-                np.array([imag_end], dtype=np.int64),
-                np.array([1], dtype=np.int64)
-            ],
-            "Slice"
-        )
-
-        mul_rr = self._onnx_builder.build_op(
-            f"{base_name}.mul_rr", [real_in, input_nodes[1]], "Mul"
-        )
-        mul_ii = self._onnx_builder.build_op(
-            f"{base_name}.mul_ii", [imag_in, input_nodes[2]], "Mul"
-        )
-        real_out = self._onnx_builder.build_op(f"{base_name}.real_out", [mul_rr, mul_ii], "Sub")
-
-        mul_ri = self._onnx_builder.build_op(
-            f"{base_name}.mul_ri", [real_in, input_nodes[2]], "Mul"
-        )
-        mul_ir = self._onnx_builder.build_op(
-            f"{base_name}.mul_ir", [imag_in, input_nodes[1]], "Mul"
-        )
-        imag_out = self._onnx_builder.build_op(f"{base_name}.imag_out", [mul_ri, mul_ir], "Add")
-        rotary_out = self._onnx_builder.build_op(
-            f"{base_name}.concat", [real_out, imag_out], "Concat", axis=1
-        )
-        if self._is_proportional_rope_layer:
-            mid1 = self._onnx_builder.build_op(
-                f"{base_name}.mid1",
-                [
-                    input_nodes[0],
-                    np.array([layer_rope_dimension_count // 2], dtype=np.int64),
-                    np.array([layer_head_dim // 2], dtype=np.int64),
-                    np.array([1], dtype=np.int64)
-                ],
-                "Slice"
-            )
-            mid2 = self._onnx_builder.build_op(
-                f"{base_name}.mid2",
-                [
-                    input_nodes[0],
-                    np.array([layer_head_dim // 2 + layer_rope_dimension_count // 2], dtype=np.int64),
-                    np.array([layer_head_dim], dtype=np.int64),
-                    np.array([1], dtype=np.int64)
-                ],
-                "Slice"
-            )
-            return self._onnx_builder.build_op(
-                f"{base_name}.concat_proportional",
-                [real_out, mid1, imag_out, mid2],
-                "Concat",
-                axis=1,
-            )
-
-        if layer_rope_dimension_count == layer_head_dim:
-            return rotary_out
-
-        tail = self._onnx_builder.build_op(
-            f"{base_name}.tail",
-            [
-                input_nodes[0],
-                np.array([layer_rope_dimension_count], dtype=np.int64),
-                np.array([layer_head_dim], dtype=np.int64),
-                np.array([1], dtype=np.int64)
-            ],
-            "Slice"
-        )
-        return self._onnx_builder.build_op(
-            f"{base_name}.concat_full", [rotary_out, tail], "Concat", axis=1
-        )
-
-    def _build_onnx_attn_query(self, base_name: str, input_nodes: list[OnnxNode]):
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "q_proj")
-        q_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.q_proj", input_nodes[0], lora_rank,
-            q_size=self._q_size,
-            kv_size=self._kv_size
-        )
-        gate_out = None
-        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            q_fused = self._onnx_builder.build_split_and_concat(
-                f"{base_name}.q_proj.reshape_q_gate",
-                q_proj,
-                self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-                split_axis=1,
-                concat_axis=2,
-            )
-            reshape = self._onnx_builder.build_op(
-                f"{base_name}.q_proj.q",
-                [
-                    q_fused,
-                    np.array([0], dtype=np.int64),
-                    np.array([self.cfg.lm_cfg.attn_cfg.head_dim], dtype=np.int64),
-                    np.array([1], dtype=np.int64),
-                ],
-                "Slice",
-            )
-            gate_out = self._onnx_builder.build_op(
-                f"{base_name}.q_proj.gate",
-                [
-                    q_fused,
-                    np.array([self.cfg.lm_cfg.attn_cfg.head_dim], dtype=np.int64),
-                    np.array([2 * self.cfg.lm_cfg.attn_cfg.head_dim], dtype=np.int64),
-                    np.array([1], dtype=np.int64),
-                ],
-                "Slice",
-            )
-            gate_out = self._onnx_builder.build_split_and_concat(
-                f"{base_name}.q_proj.gate.reshape",
-                gate_out,
-                self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-                split_axis=2,
-                concat_axis=1,
-            )
-        else:
-            reshape = self._onnx_builder.build_split_and_concat(
-                f"{base_name}.q_proj.reshape", q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads,
-                split_axis=1, concat_axis=2
-            )
-
-        q_norm_name = None
-        for suffix in ("q_layernorm", "q_norm"):
-            if self.check_hf_param(f"{base_name}.{suffix}.weight"):
-                q_norm_name = f"{base_name}.{suffix}"
-                break
-
-        if q_norm_name:
-            reshape = self._build_rms_norm(q_norm_name, reshape)
-
-        rotary_emb = self._build_onnx_rotary_emb(
-            f"{base_name}.q_proj.rotary", [reshape, input_nodes[1], input_nodes[2]]
-        )
-        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
-            rotary_emb = self._onnx_builder.build_op(
-                f"{base_name}.q_proj.scaled_rotary_emb",
-                [rotary_emb, self._head_dim**-0.5],
-                "Mul"
-            )
-        if gate_out is not None:
-            return rotary_emb, gate_out
-        return rotary_emb
-
-    def _build_onnx_attn_key(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "k_proj")
-        k_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.k_proj", input_nodes[0], lora_rank,
-            q_size=self._q_size,
-            kv_size=self._kv_size
-        )
-        reshape1 = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.k_proj.reshape1", k_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            split_axis=1, concat_axis=2
-        )
-
-        k_norm_name = None
-        for suffix in ("k_layernorm", "k_norm"):
-            if self.check_hf_param(f"{base_name}.{suffix}.weight"):
-                k_norm_name = f"{base_name}.{suffix}"
-                break
-
-        if k_norm_name:
-            reshape1 = self._build_rms_norm(k_norm_name, reshape1)
-
-        rotary_emb = self._build_onnx_rotary_emb(
-            f"{base_name}.k_proj", [reshape1, input_nodes[1], input_nodes[2]]
-        )
-        return rotary_emb
-
-    def _build_onnx_attn_value(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "v_proj")
-        v_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.v_proj", input_node, lora_rank,
-            q_size=self._q_size,
-            kv_size=self._kv_size
-        )
-
-        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
-            return self._onnx_builder.build_split_and_concat(
-                f"{base_name}.v_proj", v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                split_axis=1, concat_axis=2,
-            )
-
-        split = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.v_proj", v_proj,  self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            split_axis=1, concat_axis=2
-        )
-        split = self._onnx_builder.build_rms_norm(
-            f"{base_name}.v_norm", split, float(self.cfg.lm_cfg.rms_norm_eps),
-            weightless=True, num_channels=self._head_dim,
-        )
-        return split
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int, quantizable: bool
+        quantizable: bool
     ):
         base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
-        g = self._build_sima_nodes(base_name, quantizable, merged_lora)
-        save_model_graph(self, g, quantizable)
-
-    def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
         freq_shape = (
@@ -427,16 +101,16 @@ class LanguagePreModel(LanguagePartBaseModel):
             if self.check_hf_param(f"{base_name}.operator_norm.weight")
             else f"{base_name}.input_layernorm"
         )
-        rms_norm = self._build_sima_rms_norm(graph, norm_name, rms_norm_in)
+        rms_norm = self._build_rms_norm(graph, norm_name, rms_norm_in)
         # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
         if self.is_draft:
-            hidden_states_norm = self._build_sima_rms_norm(
+            hidden_states_norm = self._build_rms_norm(
                 graph, f"{base_name}.hidden_norm", inputs["hidden_states"]
             )
             attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
-        mla_q_result = self._build_sima_attn_query(
+        mla_q_result = self._build_attn_query(
             graph,
             f"{base_name}.self_attn",
             attn_input,
@@ -452,7 +126,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             mla_q_out = mla_q_result
         output_nodes = [mla_q_out]
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
-            mla_k_out = self._build_sima_attn_key(
+            mla_k_out = self._build_attn_key(
                 graph,
                 f"{base_name}.self_attn",
                 attn_input,
@@ -460,7 +134,7 @@ class LanguagePreModel(LanguagePartBaseModel):
                 mla_input_freq_imag,
                 merged_lora,
             )
-            mla_v_out = self._build_sima_attn_value(
+            mla_v_out = self._build_attn_value(
                 graph, f"{base_name}.self_attn", attn_input, merged_lora
             )
 
@@ -473,9 +147,9 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         if gate_out is not None:
             output_nodes.append(gate_out)
-        return graph.finish(output_nodes)
+        graph.save(output_nodes)
 
-    def _build_sima_rotary_emb(
+    def _build_rotary_emb(
         self, graph: ModelGraph, data: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle
     ):
         """
@@ -489,7 +163,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             proportional=self._is_proportional_rope_layer,
         )
 
-    def _build_sima_attn_query(
+    def _build_attn_query(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -531,9 +205,9 @@ class LanguagePreModel(LanguagePartBaseModel):
                 break
 
         if q_norm_name:
-            reshape1 = self._build_sima_rms_norm(graph, q_norm_name, reshape1)
+            reshape1 = self._build_rms_norm(graph, q_norm_name, reshape1)
 
-        rotary_emb = self._build_sima_rotary_emb(graph, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
 
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
             rotary_emb = graph.mul(
@@ -544,7 +218,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             return rotary_emb, gate_out
         return rotary_emb
 
-    def _build_sima_attn_key(
+    def _build_attn_key(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -574,13 +248,12 @@ class LanguagePreModel(LanguagePartBaseModel):
                 break
 
         if k_norm_name:
-            reshape1 = self._build_sima_rms_norm(graph, k_norm_name, reshape1)
+            reshape1 = self._build_rms_norm(graph, k_norm_name, reshape1)
 
-        rotary_emb = self._build_sima_rotary_emb(graph, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
         return rotary_emb
 
-
-    def _build_sima_attn_value(
+    def _build_attn_value(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, merged_lora: bool = False
     ) -> AwesomeNode:
         lora_rank = None
@@ -600,15 +273,13 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         # Gemma4 applies value RMS norm per KV head before writing V to cache.
         split = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
-        split = self._build_sima_rms_norm(
+        split = self._build_rms_norm(
             graph,
             f"{base_name}.v_norm",
             split,
             weightless=True,
-            num_channels=self._head_dim,
         )
         return split
-
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """

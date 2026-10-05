@@ -22,6 +22,6 @@ differences before editing.
   deep-stack features, and upstream processor output.
 - Reuse common Qwen layers; add only Qwen3-specific paths/contracts.
 - Extend prompt/image-token handling without changing Qwen2.5 behavior.
-- Compare deterministic processor inputs, add config and vision ONNX cases,
+- Compare deterministic processor inputs, add config and vision native graph cases,
   exercise direct graph compilation where supported, and run a complete
   image-grounded model on Modalix.

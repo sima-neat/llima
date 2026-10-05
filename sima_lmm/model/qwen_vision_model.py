@@ -5,14 +5,13 @@ import numpy as np
 from afe.apis.defines import TensorDRAMLayout
 from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import BaseModel, TensorTessellateParameters, LayerConfiguration
-from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
+from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 from sima_lmm.config.vlm_config import VlmArchType
 
 @dataclass
 class QwenVisionLayerModel(BaseModel):
     """Qwen Vision model implementation (Qwen2.5-VL and Qwen3-VL).
-    
+
     Differs from StandardVisionLayerModel (CLIP/SigLIP/LFM2) in:
     - 3D Conv patch embedding (vs 2D Conv)
     - RoPE position embeddings (vs additive embeddings)
@@ -26,324 +25,15 @@ class QwenVisionLayerModel(BaseModel):
     include_embeddings: bool
     include_mm_proj: bool
 
-    def gen_onnx_files(self):
-        base_name = "vision_model"
-        self.create_onnx_builder()
-        
-        patch_feature_size = (
-            3
-            * self.cfg.vm_cfg.temporal_patch_size
-            * (self.cfg.vm_cfg.patch_size ** 2)
-        )
-        input_size = (
-            patch_feature_size if self.include_embeddings else self.cfg.vm_cfg.hidden_size
-        )
-        self._onnx_builder.create_input_node(
-            "input", (1, input_size, 1, self.cfg.vm_cfg.seq_len)
-        )
-
-        output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
-        primary_shape = (
-            (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image)
-            if self.include_mm_proj
-            else (1, self.cfg.vm_cfg.hidden_size, 1, self.cfg.vm_cfg.seq_len)
-        )
-        deepstack_shape = (
-            1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image
-        )
-        for output_idx, node in enumerate(output_nodes):
-            self._onnx_builder.create_output_node(
-                self._onnx_builder.get_node_output_name(node),
-                primary_shape if output_idx == 0 else deepstack_shape,
-            )
-
-        self._onnx_builder.create_and_save_model()
-        self._onnx_builder = None
-
-    def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        if self.cfg.model_type in (VlmArchType.VLM_QWEN3_VL, VlmArchType.VLM_QWEN3_5_VL):
-            vision_output = self._build_qwen3_vision_model(
-                self.hf_model.vision_model_param_base_name, input_nodes
-            )
-            return vision_output 
-        else: # Qwen 2.5-VL
-            vision_output = self._build_qwen2_vision_model(
-                self.hf_model.vision_model_param_base_name, input_nodes
-            )
-            return [vision_output]
 
     # ------------------------------------------------------------------------
     # Qwen 3 logic
     # ------------------------------------------------------------------------
 
-    def _build_qwen3_vision_model(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        """Build one Qwen3-VL encoder layer and its boundary operations."""
-        cos_table_node, sin_table_node = self._prepare_qwen3_rotary_tables(base_name)
-        hidden_states = input_nodes[0]
-        if self.include_embeddings:
-            pos_embed_node = self._prepare_qwen3_position_embedding(base_name)
-            hidden_states = self._onnx_builder.build_conv(
-                f"{base_name}.patch_embed.proj",
-                hidden_states,
-                is_fc=False,
-                src_bias_name=f"{base_name}.patch_embed.proj.bias",
-                weight_process_func=self._reshape_qwen_patch_embed_kernel
-            )
-            hidden_states = self._onnx_builder.build_op(
-                f"{base_name}.add_position_embedding",
-                [hidden_states, pos_embed_node],
-                "Add"
-            )
-
-        layer_base = f"{base_name}.blocks.{self.layer_idx}"
-        hidden_states = self._build_qwen3_vision_block(
-            layer_base,
-            hidden_states,
-            cos_table_node,
-            sin_table_node
-        )
-        deepstack_outputs: list[OnnxNode] = []
-        if self.layer_idx in self.cfg.vm_cfg.deepstack_visual_indexes:
-            ds_index = self.cfg.vm_cfg.deepstack_visual_indexes.index(self.layer_idx)
-            ds_base = f"{base_name}.deepstack_merger_list.{ds_index}"
-            deepstack_outputs.append(
-                self._build_qwen3_deepstack_merger(ds_base, hidden_states)
-            )
-
-        primary_output = (
-            self._build_qwen3_merger(f"{base_name}.merger", hidden_states)
-            if self.include_mm_proj
-            else hidden_states
-        )
-        return [primary_output, *deepstack_outputs]
-
-    def _build_qwen3_vision_block(
-        self,
-        base_name: str,
-        input_node: OnnxNode,
-        cos_table: OnnxNode,
-        sin_table: OnnxNode,
-    ) -> OnnxNode:
-        norm1 = self._onnx_builder.build_layer_norm(
-            f"{base_name}.norm1",
-            input_node,
-            self.cfg.vm_cfg.layer_norm_eps
-        )
-        attn_out = self._build_qwen_attention(
-            f"{base_name}.attn",
-            norm1,
-            cos_table,
-            sin_table
-        )
-        add1 = self._onnx_builder.build_op(
-            f"{base_name}.add1",
-            [input_node, attn_out],
-            "Add"
-        )
-        norm2 = self._onnx_builder.build_layer_norm(
-            f"{base_name}.norm2",
-            add1,
-            self.cfg.vm_cfg.layer_norm_eps
-        )
-        mlp_out = self._build_qwen3_mlp(f"{base_name}.mlp", norm2)
-        add2 = self._onnx_builder.build_op(
-            f"{base_name}.add2",
-            [add1, mlp_out],
-            "Add"
-        )
-        return add2
-
-    def _build_qwen_attention(
-        self,
-        base_name: str,
-        input_node: OnnxNode,
-        cos_table: OnnxNode,
-        sin_table: OnnxNode,
-        attention_mask=None,
-    ) -> OnnxNode:
-        """
-        Builds the shared Qwen vision attention block (Qwen2.5-VL and Qwen3-VL).
-        Pass attention_mask for Qwen2.5-VL windowed attention; omit for Qwen3-VL.
-        """
-        num_heads = self.cfg.vm_cfg.num_attention_heads
-        hidden_size = self.cfg.vm_cfg.hidden_size
-        head_dim = hidden_size // num_heads
-        scaling = head_dim ** -0.5
-
-        qkv_proj = self._onnx_builder.build_conv(f"{base_name}.qkv", input_node)
-        q_proj = self._onnx_builder.build_op(
-            f"{base_name}.q_slice", [qkv_proj,
-                np.array([0], dtype=np.int64),
-                np.array([hidden_size], dtype=np.int64),
-                np.array([1], dtype=np.int64)],
-            "Slice"
-        )
-        k_proj = self._onnx_builder.build_op(
-            f"{base_name}.k_slice", [qkv_proj,
-                np.array([hidden_size], dtype=np.int64),
-                np.array([2 * hidden_size], dtype=np.int64),
-                np.array([1], dtype=np.int64)],
-            "Slice"
-        )
-        v_proj = self._onnx_builder.build_op(
-            f"{base_name}.v_slice", [qkv_proj,
-                np.array([2 * hidden_size], dtype=np.int64),
-                np.array([3 * hidden_size], dtype=np.int64),
-                np.array([1], dtype=np.int64)],
-            "Slice"
-        )
-
-        q_heads = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.q_heads", q_proj, num_heads, split_axis=1, concat_axis=2
-        )
-        k_heads = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.k_heads", k_proj, num_heads, split_axis=1, concat_axis=2
-        )
-        v_heads = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.v_heads", v_proj, num_heads, split_axis=1, concat_axis=2
-        )
-
-        q_rope = self._build_rotary_emb(f"{base_name}.q_rope", q_heads, cos_table, sin_table)
-        k_rope = self._build_rotary_emb(f"{base_name}.k_rope", k_heads, cos_table, sin_table)
-
-        attn_scores = self._onnx_builder.build_op(
-            f"{base_name}.attn_scores", [q_rope, k_rope], "Einsum",
-            equation="nchw,nchq->nqhw"
-        )
-
-        scaled_scores = self._onnx_builder.build_op(
-            f"{base_name}.scaled_scores", [attn_scores, np.array(scaling, dtype=np.float32)], "Mul"
-        )
-        if attention_mask is not None:
-            scaled_scores = self._onnx_builder.build_op(
-                f"{base_name}.masked_scores", [scaled_scores, attention_mask], "Add"
-            )
-        softmax_scores = self._onnx_builder.build_op(
-            f"{base_name}.softmax", [scaled_scores], "Softmax", axis=1
-        )
-
-        context_layer = self._onnx_builder.build_op(
-            f"{base_name}.context_layer", [softmax_scores, v_heads], "Einsum",
-            equation="nchw,nqhc->nqhw"
-        )
-
-        merged = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.merged", context_layer,
-            num_splits=num_heads, split_axis=2, concat_axis=1
-        )
-
-        return self._onnx_builder.build_conv(f"{base_name}.proj", merged)
-
-    def _build_qwen3_mlp(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        fc1 = self._onnx_builder.build_conv(
-            f"{base_name}.linear_fc1",
-            input_node,
-        )
-        act = self._onnx_builder.build_activation(
-            f"{base_name}.act",
-            fc1,
-            self.cfg.vm_cfg.hidden_act
-        )
-        fc2 = self._onnx_builder.build_conv(
-            f"{base_name}.linear_fc2",
-            act,
-        )
-        return fc2
-
-    def _build_qwen3_merger(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        """
-        Builds the Qwen3-VL Patch Merger by fusing the spatial merge and first MLP layer.
-        """
-        norm_output = self._onnx_builder.build_layer_norm(
-            f"{base_name}.norm",
-            input_node,
-            self.cfg.vm_cfg.layer_norm_eps
-        )
-
-        factor = self.cfg.vm_cfg.spatial_merge_size ** 2
-        
-        fc1 = self._onnx_builder.build_conv(
-            f"{base_name}.linear_fc1",
-            norm_output,
-            is_fc=False, 
-            strides=[1, factor], 
-            weight_process_func=self._reshape_merger_kernel,
-            src_bias_name=f"{base_name}.linear_fc1.bias"
-        )
-
-        act = self._onnx_builder.build_activation(
-            f"{base_name}.act",
-            fc1,
-            self.cfg.mm_cfg.hidden_act
-        )
-        fc2 = self._onnx_builder.build_conv(
-            f"{base_name}.linear_fc2",
-            act,
-        )
-
-        return fc2
-
-    def _build_qwen3_deepstack_merger(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        """
-        Builds a Qwen3-VL deepstack merger that extracts intermediate vision features.
-        """
-        merge_factor = self.cfg.vm_cfg.spatial_merge_size * self.cfg.vm_cfg.spatial_merge_size
-        grouped_seq = self.cfg.vm_cfg.seq_len // merge_factor
-
-        transposed_to_nhwc = self._onnx_builder.build_op(
-            f"{base_name}.to_nhwc",
-            [input_node],
-            "Transpose",
-            perm=[0, 2, 3, 1]
-        )
-
-        merge_shape_np = np.array([1, 1, grouped_seq, self.cfg.vm_cfg.hidden_size * merge_factor], dtype=np.int64)
-        merge_shape_node = self._onnx_builder.create_initializer(f"{base_name}.merge_shape", merge_shape_np)
-
-        reshaped = self._onnx_builder.build_op(
-            f"{base_name}.merge_flatten",
-            [transposed_to_nhwc, merge_shape_node],
-            "Reshape"
-        )
-        transposed_to_nchw = self._onnx_builder.build_op(
-            f"{base_name}.to_nchw",
-            [reshaped],
-            "Transpose",
-            perm=[0, 3, 1, 2]
-        )
-
-        norm_output = self._onnx_builder.build_layer_norm(
-            f"{base_name}.norm",
-            transposed_to_nchw,
-            self.cfg.vm_cfg.layer_norm_eps
-        )
-        fc1 = self._onnx_builder.build_conv(f"{base_name}.linear_fc1", norm_output)
-        act = self._onnx_builder.build_activation(f"{base_name}.act", fc1, "gelu")
-        return self._onnx_builder.build_conv(f"{base_name}.linear_fc2", act)
-
-    def _prepare_qwen3_rotary_tables(self, base_name: str) -> tuple[OnnxNode, OnnxNode]:
-        cos_np, sin_np = self._calc_qwen3_rotary_tables()
-        cos_table = self._onnx_builder.create_initializer(
-            f"{base_name}.rotary.cos_table",
-            cos_np
-        )
-        sin_table = self._onnx_builder.create_initializer(
-            f"{base_name}.rotary.sin_table",
-            sin_np
-        )
-        return cos_table, sin_table
-
-    def _prepare_qwen3_position_embedding(self, base_name: str) -> OnnxNode:
-        position_np = self._calc_qwen3_position_embeddings_array(base_name)
-        return self._onnx_builder.create_initializer(
-            f"{base_name}.pos_embed.static",
-            position_np
-        )
-
     def _calc_qwen3_position_embeddings_array(self, base_name: str) -> np.ndarray:
         """
         Calculates Qwen3-VL position embeddings by interpolating pretrained weights to target image size.
-        
+
         Uses bilinear interpolation to resize the pretrained position embedding grid,
         then reorders the patches to match the spatial merge pattern used during inference.
         """
@@ -456,183 +146,6 @@ class QwenVisionLayerModel(BaseModel):
     # Qwen 2.5 logic
     # ------------------------------------------------------------------------
 
-    def _build_qwen2_vision_model(self, base_name: str, input_nodes: list[OnnxNode]) -> OnnxNode:
-        """Build one Qwen2.5-VL encoder layer and its boundary operations."""
-        encoder_input = input_nodes[0]
-        if self.include_embeddings:
-            encoder_input = self._onnx_builder.build_conv(
-                f"{base_name}.patch_embed.proj",
-                encoder_input,
-                is_fc=False,
-                weight_process_func=self._reshape_qwen_patch_embed_kernel
-            )
-        (cos_table_node, sin_table_node, 
-        global_mask_node, windowed_mask_node) = self._prepare_qwen2_static_inputs()
-
-        layer_base_name = f"{base_name}.blocks.{self.layer_idx}"
-        mask_to_use = (
-            global_mask_node
-            if self.layer_idx in self.cfg.vm_cfg.fullatt_block_indexes
-            else windowed_mask_node
-        )
-        encoder_input = self._build_qwen2_vision_block(
-            layer_base_name,
-            encoder_input,
-            mask_to_use,
-            cos_table_node,
-            sin_table_node
-        )
-
-        if self.include_mm_proj:
-            final_output = self._build_qwen2_merger(base_name, encoder_input)
-        else:
-            final_output = encoder_input
-        
-        return final_output
-
-    def _build_qwen2_merger(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        """
-        Builds the Qwen 2.5-VL Patch Merger.
-        """
-        norm_out = self._onnx_builder.build_rms_norm(
-            f"{base_name}.merger.ln_q",
-            input_node,
-            epsilon=self.cfg.vm_cfg.layer_norm_eps,
-            weight_offset=0.0
-        )
-
-        factor = self.cfg.vm_cfg.spatial_merge_size ** 2
-        mlp_fc1 = self._onnx_builder.build_conv(
-            f"{base_name}.merger.mlp.0",
-            norm_out,
-            is_fc=False, 
-            strides=[1, factor], 
-            weight_process_func=self._reshape_merger_kernel,
-            src_bias_name=f"{base_name}.merger.mlp.0.bias"
-        )
-
-        mlp_act = self._onnx_builder.build_activation(
-            f"{base_name}.act", 
-            mlp_fc1, 
-            self.cfg.mm_cfg.hidden_act 
-        )
-        mlp_fc2 = self._onnx_builder.build_conv(
-            f"{base_name}.merger.mlp.2", mlp_act
-        )
-        
-        return mlp_fc2
-
-    def _build_qwen2_vision_block(self, base_name: str, input_node: OnnxNode, 
-                                attention_mask: OnnxNode, 
-                                cos_table: OnnxNode, sin_table: OnnxNode) -> OnnxNode:
-        """
-        Builds one complete Qwen 2.5-VL Vision Transformer Block in NCHW layout.
-        """
-        
-        norm1_out = self._onnx_builder.build_rms_norm(
-            f"{base_name}.norm1",
-            input_node,
-            epsilon=self.cfg.vm_cfg.layer_norm_eps,
-            weight_offset=0.0
-        )
-
-        attn_out = self._build_qwen_attention(
-            f"{base_name}.attn",
-            norm1_out,
-            cos_table,
-            sin_table,
-            attention_mask=attention_mask,
-        )
-
-        add1 = self._onnx_builder.build_op(
-            f"{base_name}.add1", [input_node, attn_out], "Add"
-        )
-
-        norm2_out = self._onnx_builder.build_rms_norm(
-            f"{base_name}.norm2",
-            add1,
-            epsilon=self.cfg.vm_cfg.layer_norm_eps,
-            weight_offset=0.0
-        )
-
-        mlp_out = self._build_qwen2_mlp(
-            f"{base_name}.mlp",
-            norm2_out
-        )
-
-        add2 = self._onnx_builder.build_op(
-            f"{base_name}.add2", [add1, mlp_out], "Add"
-        )
-
-        return add2
-
-    def _build_qwen2_mlp(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        gate_proj = self._onnx_builder.build_conv(f"{base_name}.gate_proj", input_node)
-        act = self._onnx_builder.build_activation(
-            f"{base_name}.act", gate_proj, self.cfg.vm_cfg.hidden_act 
-        )
-        up_proj = self._onnx_builder.build_conv(f"{base_name}.up_proj", input_node)
-        mul2 = self._onnx_builder.build_op(f"{base_name}.mul2", [act, up_proj], "Mul")
-        down_proj = self._onnx_builder.build_conv(f"{base_name}.down_proj", mul2)
-        return down_proj
-
-
-    def _build_rotary_emb(self, base_name: str, input_node: OnnxNode,
-                               cos_table: OnnxNode, sin_table: OnnxNode) -> OnnxNode:
-        """
-        Applies RoPE for tensors in (1, head_dim, num_heads, seq) NCHW layout.
-        Splits/concats on axis=1 (head_dim); cos/sin tables are (1, half_dim, 1, seq).
-        """
-        split_names = [f"{base_name}.split_out_{i}" for i in range(2)]
-        split = self._onnx_builder.build_op(
-            f"{base_name}.split", [input_node], "Split", axis=1, output_names=split_names
-        )
-        real_in, imag_in = [split, 0], [split, 1]
-
-        mul_rr = self._onnx_builder.build_op(f"{base_name}.mul_rr", [real_in, cos_table], "Mul")
-        mul_ii = self._onnx_builder.build_op(f"{base_name}.mul_ii", [imag_in, sin_table], "Mul")
-        real_out = self._onnx_builder.build_op(f"{base_name}.real_out", [mul_rr, mul_ii], "Sub")
-
-        mul_ri = self._onnx_builder.build_op(f"{base_name}.mul_ri", [real_in, sin_table], "Mul")
-        mul_ir = self._onnx_builder.build_op(f"{base_name}.mul_ir", [imag_in, cos_table], "Mul")
-        imag_out = self._onnx_builder.build_op(f"{base_name}.imag_out", [mul_ri, mul_ir], "Add")
-
-        return self._onnx_builder.build_op(
-            f"{base_name}.concat", [real_out, imag_out], "Concat", axis=1
-        )
-
-    def _prepare_qwen2_static_inputs(self) -> tuple[OnnxNode, OnnxNode, OnnxNode, OnnxNode]:
-        """
-        Pre-calculates and creates initializers for RoPE tables and attention masks.
-        """
-        base_name = self.hf_model.vision_model_param_base_name
-        seq_len = self.cfg.vm_cfg.seq_len
-        cos_np, sin_np = self._calc_qwen2_vision_rope_tables()
-        
-        cos_table_4d = cos_np.reshape(1, cos_np.shape[0], 1, -1)
-        sin_table_4d = sin_np.reshape(1, cos_np.shape[0], 1, -1)
-
-        cos_table_node = self._onnx_builder.create_initializer(f"{base_name}.cos_table", cos_table_4d)
-        sin_table_node = self._onnx_builder.create_initializer(f"{base_name}.sin_table", sin_table_4d)
-
-        window_size_llm = self.cfg.vm_cfg.window_size // self.cfg.vm_cfg.spatial_merge_size // self.cfg.vm_cfg.patch_size
-        window_size_patches = (window_size_llm ** 2) * (self.cfg.vm_cfg.spatial_merge_size ** 2)
-        # Mask shape matches einsum score layout (1, seq_k, num_heads, seq_q):
-        mask_shape = (1, seq_len, 1, seq_len)
-
-        global_mask_np = np.zeros(mask_shape, dtype=np.float32)
-        global_mask_node = self._onnx_builder.create_initializer(f"{base_name}.global_mask", global_mask_np)
-
-        large_neg_val = np.finfo(np.float32).min
-        windowed_mask_np = np.zeros(mask_shape, dtype=np.float32)
-        for i in range(seq_len):
-            for j in range(seq_len):
-                if (i // window_size_patches) != (j // window_size_patches):
-                    windowed_mask_np[0, j, 0, i] = large_neg_val
-        windowed_mask_node = self._onnx_builder.create_initializer(f"{base_name}.windowed_mask", windowed_mask_np)
-
-        return cos_table_node, sin_table_node, global_mask_node, windowed_mask_node
-
     def _calc_qwen2_vision_rope_tables(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Calculates the permuted 2D RoPE tables and returns them as
@@ -647,7 +160,7 @@ class QwenVisionLayerModel(BaseModel):
         spatial_merge_size = self.cfg.vm_cfg.spatial_merge_size
 
         h_grid_2d = np.broadcast_to(np.arange(grid_h).reshape(-1, 1), (grid_h, grid_w))
-        
+
         w_grid_2d = np.broadcast_to(np.arange(grid_w).reshape(1, -1), (grid_h, grid_w))
 
         h_blocks = h_grid_2d.reshape(
@@ -666,8 +179,8 @@ class QwenVisionLayerModel(BaseModel):
         hpos_ids = np.transpose(h_blocks, (0, 2, 1, 3)).flatten()
         wpos_ids = np.transpose(w_blocks, (0, 2, 1, 3)).flatten()
 
-        inv_freq = 1.0 / (10000.0 ** (np.arange(0, rope_dim, 2, dtype=np.float32) / rope_dim)) 
-        
+        inv_freq = 1.0 / (10000.0 ** (np.arange(0, rope_dim, 2, dtype=np.float32) / rope_dim))
+
         max_grid_size = max(grid_h, grid_w)
         seq = np.arange(max_grid_size, dtype=np.float32)
         freqs_full = np.outer(inv_freq, seq)
@@ -712,16 +225,12 @@ class QwenVisionLayerModel(BaseModel):
         kernel_transposed = kernel_reshaped.transpose(0, 2, 1)
         return kernel_transposed.reshape(C_mid, C_in, 1, factor)
 
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
-        g = self._build_sima_nodes(self.hf_model.vision_model_param_base_name, quantizable)
-        save_model_graph(self, g, quantizable)
-
-    def _build_sima_nodes(self, base_name: str, quantizable: bool):
+        base_name = self.hf_model.vision_model_param_base_name
         patch_feature_size = (
             3 * self.cfg.vm_cfg.temporal_patch_size * (self.cfg.vm_cfg.patch_size ** 2)
         )
@@ -734,26 +243,26 @@ class QwenVisionLayerModel(BaseModel):
         mla_input = graph.inputs["input"]
 
         if self.cfg.model_type in (VlmArchType.VLM_QWEN3_VL, VlmArchType.VLM_QWEN3_5_VL):
-            output_nodes = self._build_sima_qwen3_vision_model(graph, base_name, mla_input, quantizable)
+            output_nodes = self._build_qwen3_vision_model(graph, base_name, mla_input, quantizable)
         else:
             output_nodes = [
-                self._build_sima_qwen2_vision_model(graph, base_name, mla_input, quantizable)
+                self._build_qwen2_vision_model(graph, base_name, mla_input, quantizable)
             ]
 
         if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
             quantized_vision_output, vision_scale = graph.quant(output_nodes[0])
             output_nodes = [quantized_vision_output, vision_scale, *output_nodes[1:]]
-        return graph.finish(output_nodes)
+        graph.save(output_nodes)
 
-    def _build_sima_qwen3_vision_model(
+    def _build_qwen3_vision_model(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> list[NodeOrHandle]:
-        cos_table, sin_table = self._prepare_sima_qwen3_rotary_tables(
+        cos_table, sin_table = self._prepare_qwen3_rotary_tables(
             graph, base_name, quantizable
         )
         hidden_states = input_node
         if self.include_embeddings:
-            pos_embed = self._prepare_sima_qwen3_position_embedding(
+            pos_embed = self._prepare_qwen3_position_embedding(
                 graph, base_name, quantizable
             )
             hidden_states = graph.conv(
@@ -766,7 +275,7 @@ class QwenVisionLayerModel(BaseModel):
             hidden_states = graph.add(hidden_states, pos_embed)
 
         layer_base = f"{base_name}.blocks.{self.layer_idx}"
-        hidden_states = self._build_sima_qwen3_vision_block(
+        hidden_states = self._build_qwen3_vision_block(
             graph, layer_base, hidden_states, cos_table, sin_table
         )
         deepstack_outputs: list[NodeOrHandle] = []
@@ -774,13 +283,13 @@ class QwenVisionLayerModel(BaseModel):
             ds_idx = self.cfg.vm_cfg.deepstack_visual_indexes.index(self.layer_idx)
             ds_base = f"{base_name}.deepstack_merger_list.{ds_idx}"
             deepstack_outputs.append(
-                self._build_sima_qwen3_deepstack_merger(
+                self._build_qwen3_deepstack_merger(
                     graph, ds_base, hidden_states
                 )
             )
 
         primary_output = (
-            self._build_sima_qwen3_merger(
+            self._build_qwen3_merger(
                 graph, f"{base_name}.merger", hidden_states
             )
             if self.include_mm_proj
@@ -788,7 +297,7 @@ class QwenVisionLayerModel(BaseModel):
         )
         return [primary_output, *deepstack_outputs]
 
-    def _build_sima_qwen2_vision_model(
+    def _build_qwen2_vision_model(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
         hidden_states = input_node
@@ -799,7 +308,7 @@ class QwenVisionLayerModel(BaseModel):
                 weight_process_func=self._reshape_qwen_patch_embed_kernel,
                 scale_process_func=self._reshape_qwen_patch_embed_scales,
             )
-        cos_table, sin_table, global_mask, windowed_mask = self._prepare_sima_qwen2_static_inputs(graph, quantizable)
+        cos_table, sin_table, global_mask, windowed_mask = self._prepare_qwen2_static_inputs(graph, quantizable)
 
         layer_base = f"{base_name}.blocks.{self.layer_idx}"
         mask = (
@@ -807,15 +316,15 @@ class QwenVisionLayerModel(BaseModel):
             if self.layer_idx in self.cfg.vm_cfg.fullatt_block_indexes
             else windowed_mask
         )
-        hidden_states = self._build_sima_qwen2_vision_block(
+        hidden_states = self._build_qwen2_vision_block(
             graph, layer_base, hidden_states, mask, cos_table, sin_table
         )
 
         if self.include_mm_proj:
-            return self._build_sima_qwen2_merger(graph, base_name, hidden_states)
+            return self._build_qwen2_merger(graph, base_name, hidden_states)
         return hidden_states
 
-    def _build_sima_qwen3_vision_block(
+    def _build_qwen3_vision_block(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -825,7 +334,7 @@ class QwenVisionLayerModel(BaseModel):
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         norm1 = graph.layer_norm(f"{base_name}.norm1", input_node, axis=-1, epsilon=epsilon)
-        attn = self._build_sima_qwen_attention(
+        attn = self._build_qwen_attention(
             graph, f"{base_name}.attn", norm1, cos_table, sin_table,
         )
         add1 = graph.add(input_node, attn)
@@ -836,7 +345,7 @@ class QwenVisionLayerModel(BaseModel):
         )
         return graph.add(add1, mlp)
 
-    def _build_sima_qwen2_vision_block(
+    def _build_qwen2_vision_block(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -847,7 +356,7 @@ class QwenVisionLayerModel(BaseModel):
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         norm1 = graph.rms_norm(f"{base_name}.norm1", input_node, epsilon=epsilon)
-        attn = self._build_sima_qwen_attention(
+        attn = self._build_qwen_attention(
             graph, f"{base_name}.attn", norm1, cos_table, sin_table,
             attention_mask=attention_mask,
         )
@@ -859,7 +368,7 @@ class QwenVisionLayerModel(BaseModel):
         )
         return graph.add(add1, mlp)
 
-    def _build_sima_qwen_attention(
+    def _build_qwen_attention(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -887,7 +396,7 @@ class QwenVisionLayerModel(BaseModel):
         )
         return graph.linear(f"{base_name}.proj", graph.merge_heads(context))
 
-    def _build_sima_qwen3_merger(
+    def _build_qwen3_merger(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
@@ -903,7 +412,7 @@ class QwenVisionLayerModel(BaseModel):
         act = graph.activation(fc1, self.cfg.mm_cfg.hidden_act)
         return graph.linear(f"{base_name}.linear_fc2", act)
 
-    def _build_sima_qwen2_merger(
+    def _build_qwen2_merger(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
@@ -919,7 +428,7 @@ class QwenVisionLayerModel(BaseModel):
         act = graph.activation(fc1, self.cfg.mm_cfg.hidden_act)
         return graph.linear(f"{base_name}.merger.mlp.2", act)
 
-    def _build_sima_qwen3_deepstack_merger(
+    def _build_qwen3_deepstack_merger(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         factor = self.cfg.vm_cfg.spatial_merge_size ** 2
@@ -938,7 +447,7 @@ class QwenVisionLayerModel(BaseModel):
         act = graph.activation(fc1, "gelu")
         return graph.linear(f"{base_name}.linear_fc2", act)
 
-    def _prepare_sima_qwen3_rotary_tables(
+    def _prepare_qwen3_rotary_tables(
         self, graph: ModelGraph, base_name: str, quantizable: bool
     ) -> tuple[NodeOrHandle, NodeOrHandle]:
         dtype = activation_dtype(quantizable)
@@ -947,14 +456,14 @@ class QwenVisionLayerModel(BaseModel):
         sin_node = graph.constant(sin_np.transpose(0, 2, 3, 1).astype(dtype))
         return cos_node, sin_node
 
-    def _prepare_sima_qwen3_position_embedding(
+    def _prepare_qwen3_position_embedding(
         self, graph: ModelGraph, base_name: str, quantizable: bool
     ) -> NodeOrHandle:
         pos_nchw = self._calc_qwen3_position_embeddings_array(base_name)
         pos_nhwc = pos_nchw.transpose(0, 2, 3, 1).astype(activation_dtype(quantizable))
         return graph.constant(pos_nhwc)
 
-    def _prepare_sima_qwen2_static_inputs(
+    def _prepare_qwen2_static_inputs(
         self, graph: ModelGraph, quantizable: bool
     ) -> tuple[NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle]:
         seq_len = self.cfg.vm_cfg.seq_len

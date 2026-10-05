@@ -7,8 +7,7 @@ from afe.ir.attributes import ClipAttrs
 from afe.ir.build_node import NodeOrHandle
 from afe.ir.defines import get_expected_tensor_value
 from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
-from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.model_graph import ModelGraph, save_model_graph, activation_dtype
+from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 
 
 @dataclass
@@ -29,94 +28,26 @@ class Gemma4VisionLayerModel(BaseModel):
     include_embeddings: bool
     include_mm_proj: bool
 
-    def gen_onnx_files(self):
-        self.create_onnx_builder()
-
-        patch_feature_size = 3 * self.cfg.vm_cfg.patch_size * self.cfg.vm_cfg.patch_size
-        input_size = (
-            patch_feature_size if self.include_embeddings else self.cfg.vm_cfg.hidden_size
-        )
-        self._onnx_builder.create_input_node(
-            "input", (1, input_size, 1, self.cfg.vm_cfg.seq_len)
-        )
-
-        output_nodes = self._build_onnx_nodes(self.hf_model.vision_model_param_base_name,
-                                               self._onnx_builder.input_nodes)
-
-        output_shape = (
-            (1, self.cfg.lm_cfg.hidden_size, 1, self.cfg.mm_cfg.mm_tokens_per_image)
-            if self.include_mm_proj
-            else (1, self.cfg.vm_cfg.hidden_size, 1, self.cfg.vm_cfg.seq_len)
-        )
-        for node in output_nodes:
-            self._onnx_builder.create_output_node(
-                self._onnx_builder.get_node_output_name(node),
-                output_shape,
-            )
-
-        self._onnx_builder.create_and_save_model()
-        self._onnx_builder = None
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
-        g = self._build_sima_nodes(self.hf_model.vision_model_param_base_name, quantizable)
-        save_model_graph(self, g, quantizable)
-
-    def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-
-        if isinstance(self.cfg.vm_cfg.image_size, list):
-            image_h, image_w = self.cfg.vm_cfg.image_size
-        else:
-            image_h = image_w = self.cfg.vm_cfg.image_size
-
-        grid_h = image_h // self.cfg.vm_cfg.patch_size
-        grid_w = image_w // self.cfg.vm_cfg.patch_size
-
-        # Precompute all constants needed for the encoder.
-        (pos_embed_node,
-         rope_cos_x_node, rope_sin_x_node,
-         rope_cos_y_node, rope_sin_y_node) = self._precompute_constants(
-            base_name, grid_h, grid_w
-        )
-
+        base_name = self.hf_model.vision_model_param_base_name
+        patch_feature_size = 3 * self.cfg.vm_cfg.patch_size * self.cfg.vm_cfg.patch_size
         if self.include_embeddings:
-            x = self._build_patch_embedder(base_name, input_nodes[0], pos_embed_node)
+            input_shape = (1, 1, self.cfg.vm_cfg.seq_len, patch_feature_size)
         else:
-            x = input_nodes[0]
+            input_shape = (1, 1, self.cfg.vm_cfg.seq_len, self.cfg.vm_cfg.hidden_size)
 
-        layer_base = f"{base_name}.encoder.layers.{self.layer_idx}"
-        x = self._build_encoder_layer(
-            layer_base, x,
-            rope_cos_x_node, rope_sin_x_node,
-            rope_cos_y_node, rope_sin_y_node
+        graph = ModelGraph(self, {"input": input_shape}, quantizable)
+        vision_output = self._build_vision_model(
+            graph, base_name, graph.inputs["input"], quantizable
         )
-
-        if self.include_mm_proj:
-            x = self._build_pooler(base_name, x, grid_h)
-            x = self._build_multimodal_embedder(base_name, x)
-
-        return [x]
-
-
-    def _precompute_constants(
-        self, base_name: str, grid_h: int, grid_w: int
-    ) -> tuple[OnnxNode, OnnxNode, OnnxNode, OnnxNode, OnnxNode]:
-        """Precompute position embeddings and 2D RoPE tables as ONNX initializers."""
-        pos_embed, cos_x, sin_x, cos_y, sin_y = self._calc_static_constants(base_name, grid_h, grid_w)
-
-        pos_embed_node = self._onnx_builder.create_initializer(
-            f"{base_name}.pos_embed_static", pos_embed
-        )
-        rope_cos_x = self._onnx_builder.create_initializer(f"{base_name}.rope_cos_x", cos_x)
-        rope_sin_x = self._onnx_builder.create_initializer(f"{base_name}.rope_sin_x", sin_x)
-        rope_cos_y = self._onnx_builder.create_initializer(f"{base_name}.rope_cos_y", cos_y)
-        rope_sin_y = self._onnx_builder.create_initializer(f"{base_name}.rope_sin_y", sin_y)
-
-        return pos_embed_node, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y
+        outputs = [vision_output]
+        if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
+            outputs = list(graph.quant(vision_output))
+        graph.save(outputs)
 
     def _calc_static_constants(
         self, base_name: str, grid_h: int, grid_w: int
@@ -142,224 +73,6 @@ class Gemma4VisionLayerModel(BaseModel):
 
         return pos_embed, cos_x, sin_x, cos_y, sin_y
 
-    def _build_patch_embedder(
-        self, base_name: str, input_node: OnnxNode, pos_embed_node: OnnxNode
-    ) -> OnnxNode:
-        """Match HF Gemma4 patch embedder literally: 2 * (x - 0.5), proj, add position."""
-        sub = self._onnx_builder.build_op(
-            f"{base_name}.patch_embedder.sub_half",
-            [input_node, 0.5],
-            "Sub",
-        )
-        scaled = self._onnx_builder.build_op(
-            f"{base_name}.patch_embedder.mul_two",
-            [sub, 2.0],
-            "Mul",
-        )
-        proj = self._onnx_builder.build_conv(
-            f"{base_name}.patch_embedder.input_proj",
-            scaled,
-            is_fc=True,
-        )
-        return self._onnx_builder.build_op(
-            f"{base_name}.patch_embedder.add_pos_embed",
-            [proj, pos_embed_node],
-            "Add"
-        )
-
-    def _build_encoder_layer(
-        self, base_name: str, input_node: OnnxNode,
-        rope_cos_x: OnnxNode, rope_sin_x: OnnxNode,
-        rope_cos_y: OnnxNode, rope_sin_y: OnnxNode,
-    ) -> OnnxNode:
-
-        x = self._onnx_builder.build_rms_norm(
-            f"{base_name}.input_layernorm", input_node, self.cfg.vm_cfg.layer_norm_eps, 0.0
-        )
-        x = self._build_attention(base_name, x, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
-        x = self._onnx_builder.build_rms_norm(
-            f"{base_name}.post_attention_layernorm", x, self.cfg.vm_cfg.layer_norm_eps, 0.0
-        )
-        x = self._onnx_builder.build_op(f"{base_name}.add1", [input_node, x], "Add")
-
-        residual = x
-        x = self._onnx_builder.build_rms_norm(
-            f"{base_name}.pre_feedforward_layernorm", x, self.cfg.vm_cfg.layer_norm_eps, 0.0
-        )
-        x = self._build_mlp(base_name, x)
-        x = self._onnx_builder.build_rms_norm(
-            f"{base_name}.post_feedforward_layernorm", x, self.cfg.vm_cfg.layer_norm_eps, 0.0
-        )
-        x = self._onnx_builder.build_op(f"{base_name}.add2", [residual, x], "Add")
-
-        return x
-
-    def _build_attention(
-        self, base_name: str, input_node: OnnxNode,
-        rope_cos_x: OnnxNode, rope_sin_x: OnnxNode,
-        rope_cos_y: OnnxNode, rope_sin_y: OnnxNode,
-    ) -> OnnxNode:
-        attn_base = f"{base_name}.self_attn"
-        head_dim = self.cfg.vm_cfg.hidden_size // self.cfg.vm_cfg.num_attention_heads
-
-        q = self._build_enc_conv(f"{attn_base}.q_proj", input_node)
-        k = self._build_enc_conv(f"{attn_base}.k_proj", input_node)
-        v = self._build_enc_conv(f"{attn_base}.v_proj", input_node)
-
-        q = self._onnx_builder.build_split_and_concat(
-            f"{attn_base}.q_split_concat", q,
-            num_splits=self.cfg.vm_cfg.num_attention_heads, split_axis=1, concat_axis=2
-        )
-        k = self._onnx_builder.build_split_and_concat(
-            f"{attn_base}.k_split_concat", k,
-            num_splits=self.cfg.vm_cfg.num_attention_heads, split_axis=1, concat_axis=2
-        )
-        v = self._onnx_builder.build_split_and_concat(
-            f"{attn_base}.v_split_concat", v,
-            num_splits=self.cfg.vm_cfg.num_attention_heads, split_axis=1, concat_axis=2
-        )
-
-        eps = self.cfg.vm_cfg.layer_norm_eps
-        q = self._onnx_builder.build_rms_norm(f"{attn_base}.q_norm", q, eps, 0.0)
-        k = self._onnx_builder.build_rms_norm(f"{attn_base}.k_norm", k, eps, 0.0)
-        v = self._onnx_builder.build_rms_norm(
-            f"{attn_base}.v_norm", v, float(self.cfg.vm_cfg.layer_norm_eps),
-            weightless=True, num_channels=head_dim,
-        )
-
-        q = self._apply_2d_rope(f"{attn_base}.q_rope", q, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
-        k = self._apply_2d_rope(f"{attn_base}.k_rope", k, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
-
-        attn_scores = self._onnx_builder.build_op(
-            f"{attn_base}.attn_scores", [q, k], "Einsum", equation="nchw,nchq->nqhw"
-        )
-        attn_probs = self._onnx_builder.build_op(
-            f"{attn_base}.softmax", [attn_scores], "Softmax", axis=1
-        )
-        context = self._onnx_builder.build_op(
-            f"{attn_base}.context", [attn_probs, v], "Einsum", equation="nchw,nqhc->nqhw"
-        )
-
-        x = self._onnx_builder.build_split_and_concat(
-            f"{attn_base}.merge_heads_split_concat", context,
-            num_splits=self.cfg.vm_cfg.num_attention_heads, split_axis=2, concat_axis=1
-        )
-        x = self._build_enc_conv(f"{attn_base}.o_proj", x)
-        return x
-
-    def _apply_2d_rope(
-        self, base_name: str, x: OnnxNode,
-        cos_x: OnnxNode, sin_x: OnnxNode,
-        cos_y: OnnxNode, sin_y: OnnxNode,
-    ) -> OnnxNode:
-        """Apply 2D RoPE via a single 4-way split and 4-way concat."""
-        split_names = [f"{base_name}.split_out_{i}" for i in range(4)]
-        split_node = self._onnx_builder.build_op(
-            f"{base_name}.split", [x], "Split", axis=1, output_names=split_names
-        )
-        x_xr, x_xi, x_yr, x_yi = [[split_node, i] for i in range(4)]
-
-        mul_rr_x = self._onnx_builder.build_op(f"{base_name}.x_rr", [x_xr, cos_x], "Mul")
-        mul_ii_x = self._onnx_builder.build_op(f"{base_name}.x_ii", [x_xi, sin_x], "Mul")
-        real_x   = self._onnx_builder.build_op(f"{base_name}.x_real", [mul_rr_x, mul_ii_x], "Sub")
-        mul_ri_x = self._onnx_builder.build_op(f"{base_name}.x_ri", [x_xr, sin_x], "Mul")
-        mul_ir_x = self._onnx_builder.build_op(f"{base_name}.x_ir", [x_xi, cos_x], "Mul")
-        imag_x   = self._onnx_builder.build_op(f"{base_name}.x_imag", [mul_ri_x, mul_ir_x], "Add")
-
-        mul_rr_y = self._onnx_builder.build_op(f"{base_name}.y_rr", [x_yr, cos_y], "Mul")
-        mul_ii_y = self._onnx_builder.build_op(f"{base_name}.y_ii", [x_yi, sin_y], "Mul")
-        real_y   = self._onnx_builder.build_op(f"{base_name}.y_real", [mul_rr_y, mul_ii_y], "Sub")
-        mul_ri_y = self._onnx_builder.build_op(f"{base_name}.y_ri", [x_yr, sin_y], "Mul")
-        mul_ir_y = self._onnx_builder.build_op(f"{base_name}.y_ir", [x_yi, cos_y], "Mul")
-        imag_y   = self._onnx_builder.build_op(f"{base_name}.y_imag", [mul_ri_y, mul_ir_y], "Add")
-
-        return self._onnx_builder.build_op(
-            f"{base_name}.concat", [real_x, imag_x, real_y, imag_y], "Concat", axis=1
-        )
-
-    def _build_mlp(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        mlp_base = f"{base_name}.mlp"
-        gate = self._build_enc_conv(f"{mlp_base}.gate_proj", input_node)
-        up = self._build_enc_conv(f"{mlp_base}.up_proj", input_node)
-        act = self._onnx_builder.build_activation(f"{mlp_base}.act", gate, self.cfg.vm_cfg.hidden_act)
-        mul = self._onnx_builder.build_op(f"{mlp_base}.mul", [act, up], "Mul")
-        return self._build_enc_conv(f"{mlp_base}.down_proj", mul)
-
-    def _build_pooler(
-        self, base_name: str, input_node: OnnxNode, grid_h: int) -> OnnxNode:
-        """Convert 1D patch sequence to 2D grid, pool, then flatten back to 1D."""
-        s = self.cfg.vm_cfg.spatial_merge_size
-
-        x = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.pooler_reshape_2d",
-            input_node,
-            num_splits=grid_h,
-            split_axis=3,
-            concat_axis=2,
-        )
-
-        x = self._onnx_builder.build_op(
-            f"{base_name}.pooler_avgpool", [x], "AveragePool",
-            kernel_shape=[s, s], strides=[s, s]
-        )
-
-        scale_node = self._onnx_builder.create_initializer(
-            f"{base_name}.pooler_scale_val", float(np.sqrt(self.cfg.vm_cfg.hidden_size))
-        )
-        x = self._onnx_builder.build_op(f"{base_name}.pooler_scale", [x, scale_node], "Mul")
-
-        x = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.pooler_reshape_1d",
-            x,
-            num_splits=grid_h // s,
-            split_axis=2,
-            concat_axis=3,
-        )
-        return x
-
-    def _build_multimodal_embedder(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        """Weightless RMSNorm + linear projection to LM hidden size."""
-        x = self._onnx_builder.build_rms_norm(
-            f"{base_name}.embed_vision_norm", input_node, float(self.cfg.vm_cfg.layer_norm_eps),
-            weightless=True, num_channels=self.cfg.vm_cfg.hidden_size,
-        )
-        x = self._onnx_builder.build_conv(
-            f"model.embed_vision.embedding_projection", x, is_fc=True
-        )
-        return x
-
-    def _build_enc_conv(self, base_name: str, input_node: OnnxNode, **kwargs) -> OnnxNode:
-        """build_conv for encoder-layer projections with optional activation clipping.
-
-        Weights live at .linear.weight. If the checkpoint contains finite
-        input_min/input_max or output_min/output_max scalars (activation-quantization
-        metadata), Clip nodes are inserted before and after the Conv respectively.
-        """
-        x = self._maybe_clip(base_name, input_node, "input")
-        x = self._onnx_builder.build_conv(
-            base_name, x, is_fc=True,
-            src_weight_name=f"{base_name}.linear.weight",
-            **kwargs
-        )
-        return self._maybe_clip(base_name, x, "output")
-
-    def _maybe_clip(self, base_name: str, input_node: OnnxNode, side: str) -> OnnxNode:
-        """Insert a Clip node if finite {side}_min / {side}_max scalars exist in the checkpoint."""
-        min_name = f"{base_name}.{side}_min"
-        max_name = f"{base_name}.{side}_max"
-        if not (self._onnx_builder.check_param_func(min_name)
-                and self._onnx_builder.check_param_func(max_name)):
-            return input_node
-        clip_min = float(self._onnx_builder.get_param_func(min_name))
-        clip_max = float(self._onnx_builder.get_param_func(max_name))
-        if not (np.isfinite(clip_min) and np.isfinite(clip_max)):
-            return input_node
-        min_node = self._onnx_builder.create_initializer(min_name, clip_min)
-        max_node = self._onnx_builder.create_initializer(max_name, clip_max)
-        return self._onnx_builder.build_op(
-            f"{base_name}.{side}_clip", [input_node, min_node, max_node], "Clip"
-        )
-
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         input_tessellate_params = TensorTessellateParameters(
             tile_shape=(0, 0, 0, 0),
@@ -373,23 +86,7 @@ class Gemma4VisionLayerModel(BaseModel):
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         return {}
 
-    def _build_sima_nodes(self, base_name: str, quantizable: bool):
-        patch_feature_size = 3 * self.cfg.vm_cfg.patch_size * self.cfg.vm_cfg.patch_size
-        if self.include_embeddings:
-            input_shape = (1, 1, self.cfg.vm_cfg.seq_len, patch_feature_size)
-        else:
-            input_shape = (1, 1, self.cfg.vm_cfg.seq_len, self.cfg.vm_cfg.hidden_size)
-
-        graph = ModelGraph(self, {"input": input_shape}, quantizable)
-        vision_output = self._build_sima_vision_model(
-            graph, base_name, graph.inputs["input"], quantizable
-        )
-        if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
-            vision_output, vision_scale = graph.quant(vision_output)
-            return graph.finish([vision_output, vision_scale])
-        return graph.finish([vision_output])
-
-    def _build_sima_vision_model(
+    def _build_vision_model(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
         if isinstance(self.cfg.vm_cfg.image_size, list):
@@ -399,26 +96,26 @@ class Gemma4VisionLayerModel(BaseModel):
 
         grid_h = image_h // self.cfg.vm_cfg.patch_size
         grid_w = image_w // self.cfg.vm_cfg.patch_size
-        pos_embed, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y = self._precompute_sima_constants(
+        pos_embed, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y = self._precompute_constants(
             graph, base_name, grid_h, grid_w, quantizable
         )
 
         if self.include_embeddings:
-            x = self._build_sima_patch_embedder(graph, base_name, input_node, pos_embed, quantizable)
+            x = self._build_patch_embedder(graph, base_name, input_node, pos_embed, quantizable)
         else:
             x = input_node
 
-        x = self._build_sima_encoder_layer(
+        x = self._build_encoder_layer(
             graph, f"{base_name}.encoder.layers.{self.layer_idx}", x,
             rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y
         )
 
         if self.include_mm_proj:
-            x = self._build_sima_pooler(graph, base_name, x, grid_h, quantizable)
-            x = self._build_sima_multimodal_embedder(graph, base_name, x)
+            x = self._build_pooler(graph, base_name, x, grid_h, quantizable)
+            x = self._build_multimodal_embedder(graph, base_name, x)
         return x
 
-    def _precompute_sima_constants(
+    def _precompute_constants(
         self, graph: ModelGraph, base_name: str, grid_h: int, grid_w: int, quantizable: bool
     ) -> tuple[NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle]:
         constants = self._calc_static_constants(base_name, grid_h, grid_w)
@@ -428,7 +125,7 @@ class Gemma4VisionLayerModel(BaseModel):
             for c in constants
         )
 
-    def _build_sima_patch_embedder(
+    def _build_patch_embedder(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle,
         pos_embed_node: NodeOrHandle, quantizable: bool
     ) -> NodeOrHandle:
@@ -442,7 +139,7 @@ class Gemma4VisionLayerModel(BaseModel):
         proj = graph.linear(f"{base_name}.patch_embedder.input_proj", scaled)
         return graph.add(proj, pos_embed_node)
 
-    def _build_sima_encoder_layer(
+    def _build_encoder_layer(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -454,17 +151,17 @@ class Gemma4VisionLayerModel(BaseModel):
     ) -> NodeOrHandle:
         eps = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         x = graph.rms_norm(f"{base_name}.input_layernorm", input_node, epsilon=eps)
-        x = self._build_sima_attention(graph, base_name, x, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
+        x = self._build_attention(graph, base_name, x, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
         x = graph.rms_norm(f"{base_name}.post_attention_layernorm", x, epsilon=eps)
         x = graph.add(input_node, x)
 
         residual = x
         x = graph.rms_norm(f"{base_name}.pre_feedforward_layernorm", x, epsilon=eps)
-        x = self._build_sima_mlp(graph, base_name, x)
+        x = self._build_mlp(graph, base_name, x)
         x = graph.rms_norm(f"{base_name}.post_feedforward_layernorm", x, epsilon=eps)
         return graph.add(residual, x)
 
-    def _build_sima_attention(
+    def _build_attention(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -481,19 +178,19 @@ class Gemma4VisionLayerModel(BaseModel):
         k_base = f"{attn_base}.k_proj"
         v_base = f"{attn_base}.v_proj"
         qkv_bounds = [
-            self._get_sima_clip_bounds(q_base, "input"),
-            self._get_sima_clip_bounds(k_base, "input"),
-            self._get_sima_clip_bounds(v_base, "input"),
+            self._get_clip_bounds(q_base, "input"),
+            self._get_clip_bounds(k_base, "input"),
+            self._get_clip_bounds(v_base, "input"),
         ]
         if qkv_bounds[0] is not None and all(bounds == qkv_bounds[0] for bounds in qkv_bounds):
             shared_input = graph.clip(input_node, qkv_bounds[0][0], qkv_bounds[0][1])
-            q = self._build_sima_enc_conv(graph, q_base, shared_input, include_input_clip=False)
-            k = self._build_sima_enc_conv(graph, k_base, shared_input, include_input_clip=False)
-            v = self._build_sima_enc_conv(graph, v_base, shared_input, include_input_clip=False)
+            q = self._build_enc_conv(graph, q_base, shared_input, include_input_clip=False)
+            k = self._build_enc_conv(graph, k_base, shared_input, include_input_clip=False)
+            v = self._build_enc_conv(graph, v_base, shared_input, include_input_clip=False)
         else:
-            q = self._build_sima_enc_conv(graph, q_base, input_node)
-            k = self._build_sima_enc_conv(graph, k_base, input_node)
-            v = self._build_sima_enc_conv(graph, v_base, input_node)
+            q = self._build_enc_conv(graph, q_base, input_node)
+            k = self._build_enc_conv(graph, k_base, input_node)
+            v = self._build_enc_conv(graph, v_base, input_node)
 
         q = graph.split_heads(q, num_heads)
         k = graph.split_heads(k, num_heads)
@@ -507,28 +204,28 @@ class Gemma4VisionLayerModel(BaseModel):
         q = graph.rope2d(q, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
         k = graph.rope2d(k, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
         context = graph.attention(q, k, v)
-        return self._build_sima_enc_conv(graph, f"{attn_base}.o_proj", graph.merge_heads(context))
+        return self._build_enc_conv(graph, f"{attn_base}.o_proj", graph.merge_heads(context))
 
-    def _build_sima_mlp(
+    def _build_mlp(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         mlp_base = f"{base_name}.mlp"
         gate_base = f"{mlp_base}.gate_proj"
         up_base = f"{mlp_base}.up_proj"
-        gate_bounds = self._get_sima_clip_bounds(gate_base, "input")
-        up_bounds = self._get_sima_clip_bounds(up_base, "input")
+        gate_bounds = self._get_clip_bounds(gate_base, "input")
+        up_bounds = self._get_clip_bounds(up_base, "input")
         if gate_bounds is not None and gate_bounds == up_bounds:
             shared_input = graph.clip(input_node, gate_bounds[0], gate_bounds[1])
-            gate = self._build_sima_enc_conv(graph, gate_base, shared_input, include_input_clip=False)
-            up = self._build_sima_enc_conv(graph, up_base, shared_input, include_input_clip=False)
+            gate = self._build_enc_conv(graph, gate_base, shared_input, include_input_clip=False)
+            up = self._build_enc_conv(graph, up_base, shared_input, include_input_clip=False)
         else:
-            gate = self._build_sima_enc_conv(graph, gate_base, input_node)
-            up = self._build_sima_enc_conv(graph, up_base, input_node)
+            gate = self._build_enc_conv(graph, gate_base, input_node)
+            up = self._build_enc_conv(graph, up_base, input_node)
         act = graph.activation(gate, self.cfg.vm_cfg.hidden_act)
         mul = graph.mul(act, up)
-        return self._build_sima_enc_conv(graph, f"{mlp_base}.down_proj", mul)
+        return self._build_enc_conv(graph, f"{mlp_base}.down_proj", mul)
 
-    def _build_sima_pooler(
+    def _build_pooler(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle,
         grid_h: int, quantizable: bool
     ) -> NodeOrHandle:
@@ -547,13 +244,13 @@ class Gemma4VisionLayerModel(BaseModel):
             x, axis=2, split_axis=1, split_block=grid_h // s, split_repeat=1
         )
 
-    def _build_sima_multimodal_embedder(
+    def _build_multimodal_embedder(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
     ) -> NodeOrHandle:
         x = graph.rms_norm(None, input_node, epsilon=self.cfg.vm_cfg.layer_norm_eps)
         return graph.linear("model.embed_vision.embedding_projection", x)
 
-    def _build_sima_enc_conv(
+    def _build_enc_conv(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -562,10 +259,10 @@ class Gemma4VisionLayerModel(BaseModel):
     ) -> NodeOrHandle:
         x = input_node
         if include_input_clip:
-            x = self._build_sima_maybe_clip(graph, base_name, x, "input")
+            x = self._build_maybe_clip(graph, base_name, x, "input")
 
         activation = None
-        out_bounds = self._get_sima_clip_bounds(base_name, "output")
+        out_bounds = self._get_clip_bounds(base_name, "output")
         if out_bounds is not None:
             ifm_type = get_expected_tensor_value(x.get_type().output)
             params = self.get_hf_param(f"{base_name}.linear.weight")
@@ -585,15 +282,15 @@ class Gemma4VisionLayerModel(BaseModel):
         )
         return x
 
-    def _build_sima_maybe_clip(
+    def _build_maybe_clip(
         self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, side: str
     ) -> NodeOrHandle:
-        bounds = self._get_sima_clip_bounds(base_name, side)
+        bounds = self._get_clip_bounds(base_name, side)
         if bounds is None:
             return input_node
         return graph.clip(input_node, bounds[0], bounds[1])
 
-    def _get_sima_clip_bounds(self, base_name: str, side: str) -> tuple[float, float] | None:
+    def _get_clip_bounds(self, base_name: str, side: str) -> tuple[float, float] | None:
         min_name = f"{base_name}.{side}_min"
         max_name = f"{base_name}.{side}_max"
         if not (self.check_hf_param(min_name) and self.check_hf_param(max_name)):
