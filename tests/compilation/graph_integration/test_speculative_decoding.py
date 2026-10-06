@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from afe.ir.defines import NodeName, get_expected_tensor_value
+from afe.ir.serializer import load_awesomenet
 from afe.ir.tensor_type import ScalarType
 
 from sima_lmm.config.layer_id import LayerID
@@ -165,10 +166,8 @@ def test_speculative_cache_graph_accepts_quantized_kv_and_scales(
     model, _, _ = _build_component(
         SpeculativeGraphCase("cache"), draft_model
     )
-    net = model._build_nodes(
-        f"{draft_model.hf_model.language_model_param_base_name}.token.{TOKEN_INDEX}",
-        quantizable=False,
-    )
+    model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    net = load_awesomenet(model.sdk_file_name.name, str(model.sima_model_sdk_path))
 
     assert get_expected_tensor_value(
         net.nodes[NodeName("cached_keys")].get_type().output
@@ -198,10 +197,8 @@ def test_speculative_embedding_graph_uses_target_rows_and_scales(
     pre_model, _, _ = _build_component(SpeculativeGraphCase("pre"), draft_model)
     post_model, _, _ = _build_component(SpeculativeGraphCase("post"), draft_model)
 
-    pre_net = pre_model._build_nodes(
-        draft_model.hf_model.language_model_param_base_name,
-        quantizable=False,
-    )
+    pre_model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    pre_net = load_awesomenet(pre_model.sdk_file_name.name, str(pre_model.sima_model_sdk_path))
     assert [str(name) for name in pre_net.input_node_names] == [
         "input", "input_scale", "hidden_states", "freq_real", "freq_imag",
     ]
@@ -212,10 +209,8 @@ def test_speculative_embedding_graph_uses_target_rows_and_scales(
         pre_net.nodes[NodeName("input_scale")].get_type().output
     ).scalar == ScalarType.bfloat16
 
-    post_net = post_model._build_nodes(
-        draft_model.hf_model.language_model_param_base_name,
-        quantizable=False,
-    )
+    post_model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    post_net = load_awesomenet(post_model.sdk_file_name.name, str(post_model.sima_model_sdk_path))
     assert [str(name) for name in post_net.input_node_names] == ["input", "self_attn"]
     assert get_expected_tensor_value(
         post_net.nodes[NodeName("input")].get_type().output

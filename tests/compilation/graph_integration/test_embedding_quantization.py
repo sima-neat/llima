@@ -11,6 +11,7 @@
 """Embedding quantization tests for LLM, VLM, and Gemma4 per-layer inputs."""
 
 import copy
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -19,10 +20,11 @@ import pytest
 from afe.ir.defines import NodeName, get_expected_tensor_value
 from afe.ir.net import AwesomeNet
 from afe.ir.operations import DynamicDequantOp
+from afe.ir.serializer import load_awesomenet
 from afe.ir.sima_ir import SiMaIR
 from afe.ir.tensor_type import ScalarType
 
-from sima_lmm.model import EvalMode, VisionLanguageModel
+from sima_lmm.model import EvalMode, FileGenMode, VisionLanguageModel
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.model.language_post_model import LanguagePostModel
@@ -186,7 +188,8 @@ def test_non_gemma4_vlm_graph_dequantizes_embedding_rows_on_mla(
     )
     assert isinstance(pre_model, LanguagePreModel)
 
-    net = pre_model._build_nodes(pre_model._layer_base_name, quantizable=False)
+    pre_model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    net = load_awesomenet(pre_model.sdk_file_name.name, str(pre_model.sima_model_sdk_path))
 
     assert _input_scalar_type(net, "input") == ScalarType.int8
     assert _input_scalar_type(net, "input_scale") == ScalarType.bfloat16
@@ -204,9 +207,8 @@ def test_non_gemma4_vlm_graph_dequantizes_embedding_rows_on_mla(
         "post", num_tokens=1, layer_idx=0
     )
     assert isinstance(post_model, LanguagePostModel)
-    post_net = post_model._build_nodes(
-        post_model._layer_base_name, quantizable=False
-    )
+    post_model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    post_net = load_awesomenet(post_model.sdk_file_name.name, str(post_model.sima_model_sdk_path))
     assert _input_names(post_net) == ["input", "input_scale", "self_attn"]
     assert _mla_input_names(post_net) == [
         "MLA_0/input", "MLA_0/input_scale", "MLA_0/self_attn"
@@ -228,10 +230,8 @@ def test_per_layer_graph_embedding_inputs(
         num_tokens=1,
     )
 
-    net = model._build_nodes(
-        language_model.hf_model.language_model_param_base_name,
-        quantizable=False,
-    )
+    model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    net = load_awesomenet(model.sdk_file_name.name, str(model.sima_model_sdk_path))
 
     assert _input_scalar_type(net, "per_layer_emb_staging") == ScalarType.int8
     assert _input_scalar_type(net, "input") == ScalarType.int8
