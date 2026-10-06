@@ -3,11 +3,10 @@ from dataclasses import dataclass
 
 from afe.apis.defines import TensorDRAMLayout
 from afe.ir.defines import get_expected_tensor_value
-from afe.ir.tensor_type import TensorType, ScalarType
 
 from sima_lmm.model.base import TensorTessellateParameters, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import activation_type, ModelGraph
+from sima_lmm.model.model_graph import ModelGraph
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
@@ -145,10 +144,9 @@ class LanguageCacheModel(LanguagePartBaseModel):
             # or they don't use an attention mask
             attn_shape = (1, 1, 1, self.token_idx + 1)
 
-        kv_dtype = ScalarType.int8 if quantize_kv_cache else activation_type(quantizable)
         input_specs = {
             "input": input_shape,
-            "cached_keys": TensorType(kv_dtype, kv_tensor_shape),
+            "cached_keys": kv_tensor_shape,
         }
         if quantize_kv_cache:
             input_specs["cached_keys_scale"] = kv_scale_shape
@@ -161,10 +159,13 @@ class LanguageCacheModel(LanguagePartBaseModel):
             or self._uses_group_future_token_mask
         ):
             input_specs["attn_mask"] = attn_shape
-        input_specs["cached_values"] = TensorType(kv_dtype, kv_tensor_shape)
+        input_specs["cached_values"] = kv_tensor_shape
         if quantize_kv_cache:
             input_specs["cached_values_scale"] = kv_scale_shape
-        graph = ModelGraph(self, input_specs, quantizable)
+        graph = ModelGraph(
+            self, input_specs, quantizable,
+            input_dtypes={"cached_keys": np.int8, "cached_values": np.int8} if quantize_kv_cache else None,
+        )
         inputs = graph.inputs
         mla_input_input = inputs["input"]
         mla_input_cached_keys = inputs["cached_keys"]
@@ -205,9 +206,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 for i in range(self.num_tokens):
                     for j in range(self.token_idx + i + 1, self.context_length):
                         mask[0, 0, i, j] = np.finfo(np.float32).min
-                mask_const = graph.constant(
-                    mask.astype(ScalarType.numpy_type(activation_type(quantizable)))
-                )
+                mask_const = graph.constant(mask)
                 bmm1 = graph.add(bmm1, mask_const)
         elif self._cache_mask_size > 1:
             assert mla_input_attn_mask is not None
@@ -222,9 +221,9 @@ class LanguageCacheModel(LanguagePartBaseModel):
         else:
             partial_bmm2 = []
             for start, end in reduction_ranges:
-                softmax_slice = graph.slice(softmax, [start], [end], [1], [3])
+                softmax_slice = graph.slice(softmax, start=start, stop=end, axis=3)
                 values_slice = graph.slice(
-                    mla_input_cached_values, [start], [end], [1], [2]
+                    mla_input_cached_values, start=start, stop=end, axis=2
                 )
                 partial_bmm2.append(
                     graph.matmul(softmax_slice, values_slice)

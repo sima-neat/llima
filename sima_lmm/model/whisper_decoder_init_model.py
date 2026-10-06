@@ -80,9 +80,9 @@ class WhisperDecoderInitModel(BaseModel):
         query, key, value = pre_outputs[:3]
         residual = pre_outputs[pre.positioned_residual_output_idx] if self.layer_idx == 0 else inputs[0]
         if final_layer:
-            query = graph.slice(query, [self.num_tokens - 1], [self.num_tokens], [1], [2])
+            query = graph.slice(query, start=self.num_tokens - 1, stop=self.num_tokens, axis=2)
             residual = graph.slice(
-                residual, [self.num_tokens - 1], [self.num_tokens], [1], [2]
+                residual, start=self.num_tokens - 1, stop=self.num_tokens, axis=2
             )
         attn = cache._build_nodes(graph, [query, key, value])[0]
         outputs = post._build_nodes(graph, [residual, attn, inputs[1]])

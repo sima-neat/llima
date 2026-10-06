@@ -1,14 +1,10 @@
 from dataclasses import dataclass
 
-from afe.ir.tensor_type import TensorType, ScalarType
-from afe.ir.build_node import NodeOrHandle
+import numpy as np
 
 from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
-from sima_lmm.model.model_graph import (
-    ModelGraph,
-    activation_dtype,
-)
+from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.config.vlm_config import VlmArchType
 
 
@@ -42,11 +38,10 @@ class LanguagePostModel(LanguagePostBaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        hidden_states: NodeOrHandle,
-        per_layer_input: NodeOrHandle,
-        quantizable: bool,
+        hidden_states: Node,
+        per_layer_input: Node,
         merged_lora: bool = False,
-    ) -> NodeOrHandle:
+    ) -> Node:
         residual = hidden_states
         gate = graph.linear(
             f"{base_name}.per_layer_input_gate", hidden_states, merged_lora=merged_lora, lora_rank=None
@@ -60,7 +55,6 @@ class LanguagePostModel(LanguagePostBaseModel):
         add = graph.add(residual, norm)
         layer_scalar = graph.constant(
             self.get_hf_param(f"{base_name}.layer_scalar")
-            .astype(activation_dtype(quantizable))
             .reshape(1)
         )
         return graph.mul(add, layer_scalar)
@@ -83,8 +77,9 @@ class LanguagePostModel(LanguagePostBaseModel):
         per_layer_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size_per_layer_input)
 
         input_specs = {"input": input_shape}
+        input_dtypes = {}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            input_specs["input"] = TensorType(ScalarType.int8, input_shape)
+            input_dtypes["input"] = np.int8
             input_specs["input_scale"] = scale_shape
         # Check if this layer needs deepstack injection.
         llm_injection_layers = (
@@ -100,7 +95,7 @@ class LanguagePostModel(LanguagePostBaseModel):
             input_specs["gate"] = self_attn_shape
         if needs_deepstack:
             input_specs["deepstack_features"] = input_shape
-        graph = ModelGraph(self, input_specs, quantizable)
+        graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
         mla_input_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             mla_input_scale = graph.inputs["input_scale"]
@@ -181,7 +176,6 @@ class LanguagePostModel(LanguagePostBaseModel):
                 base_name,
                 final_output,
                 mla_input_per_layer,
-                quantizable,
                 merged_lora,
             )
         if needs_deepstack and mla_input_deepstack is not None:

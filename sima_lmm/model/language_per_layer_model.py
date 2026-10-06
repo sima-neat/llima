@@ -2,11 +2,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from afe.ir.tensor_type import TensorType, ScalarType
-
 from sima_lmm.model.base import LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph, activation_dtype
+from sima_lmm.model.model_graph import ModelGraph
 
 
 @dataclass
@@ -45,16 +43,16 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
         input_specs = {"per_layer_emb_staging": staging_shape}
+        input_dtypes = {}
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            input_specs["per_layer_emb_staging"] = TensorType(ScalarType.int8, staging_shape)
+            input_dtypes["per_layer_emb_staging"] = np.int8
             input_specs["per_layer_emb_staging_scale"] = scale_shape
-        input_specs["input"] = (
-            TensorType(ScalarType.int8, input_shape)
-            if self.uses_quantized_input_embeddings else input_shape
-        )
+        input_specs["input"] = input_shape
+        if self.uses_quantized_input_embeddings:
+            input_dtypes["input"] = np.int8
         if self.cfg.pipeline_cfg.quantize_embeddings:
             input_specs["input_scale"] = scale_shape
-        graph = ModelGraph(self, input_specs, quantizable)
+        graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
         mla_input_staging = graph.inputs["per_layer_emb_staging"]
         if self.cfg.pipeline_cfg.quantize_embeddings:
             mla_input_staging_scale = graph.inputs["per_layer_emb_staging_scale"]
@@ -69,12 +67,7 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         proj = graph.linear(f"{lm_base}.per_layer_model_projection", projection_input, lora_rank=None)
         proj = graph.mul(
             proj,
-            graph.constant(
-                np.array(
-                    [self.cfg.lm_cfg.hidden_size**-0.5],
-                    dtype=activation_dtype(quantizable),
-                )
-            ),
+            graph.constant([self.cfg.lm_cfg.hidden_size**-0.5]),
         )
         proj = graph.split_concat(
             proj,
@@ -103,7 +96,7 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
         combined = graph.add(emb, proj_normed)
         output = graph.mul(
             combined,
-            graph.constant(np.array([2.0**-0.5], dtype=activation_dtype(quantizable))),
+            graph.constant([2.0**-0.5]),
         )
 
         graph.save([output])

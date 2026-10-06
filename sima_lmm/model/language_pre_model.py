@@ -2,17 +2,12 @@ import numpy as np
 from dataclasses import dataclass
 
 from afe.apis.defines import TensorDRAMLayout
-from afe.ir.node import AwesomeNode
-from afe.ir.tensor_type import TensorType, ScalarType
-from afe.ir.build_node import NodeOrHandle
 
 from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerConfiguration
-from sima_lmm.model.model_graph import ModelGraph, activation_dtype
+from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.config.vlm_config import VlmArchType
 
-
-_bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
 
 @dataclass
 class LanguagePreModel(LanguagePartBaseModel):
@@ -78,13 +73,14 @@ class LanguagePreModel(LanguagePartBaseModel):
             self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2,
         )
         input_specs = {"input": input_shape}
+        input_dtypes = {}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            input_specs["input"] = TensorType(ScalarType.int8, input_shape)
+            input_dtypes["input"] = np.int8
             input_specs["input_scale"] = scale_shape
         if self.is_draft:
             input_specs["hidden_states"] = input_shape
         input_specs.update(freq_real=freq_shape, freq_imag=freq_shape)
-        graph = ModelGraph(self, input_specs, quantizable)
+        graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
         inputs = graph.inputs
         mla_input_input = inputs["input"]
         mla_input_freq_real = inputs["freq_real"]
@@ -116,7 +112,6 @@ class LanguagePreModel(LanguagePartBaseModel):
             attn_input,
             mla_input_freq_real,
             mla_input_freq_imag,
-            quantizable,
             merged_lora,
         )
         gate_out = None
@@ -150,7 +145,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         graph.save(output_nodes)
 
     def _build_rotary_emb(
-        self, graph: ModelGraph, data: NodeOrHandle, freq_real: NodeOrHandle, freq_imag: NodeOrHandle
+        self, graph: ModelGraph, data: Node, freq_real: Node, freq_imag: Node
     ):
         """
         Create nodes that compute rotary embedding.
@@ -167,12 +162,11 @@ class LanguagePreModel(LanguagePartBaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        rms_norm: NodeOrHandle,
-        freq_real: NodeOrHandle,
-        freq_imag: NodeOrHandle,
-        quantizable: bool,
+        rms_norm: Node,
+        freq_real: Node,
+        freq_imag: Node,
         merged_lora: bool = False,
-    ) -> AwesomeNode:
+    ) -> Node | tuple[Node, Node]:
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "q_proj")
@@ -189,8 +183,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
             q_fused = graph.split_heads(q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads)
             head_dim = self.cfg.lm_cfg.attn_cfg.head_dim
-            gate_out = graph.slice(q_fused, [head_dim], [2 * head_dim], [1], [3])
-            q_proj = graph.slice(q_fused, [0], [head_dim], [1], [3])
+            gate_out = graph.slice(q_fused, start=head_dim, stop=2 * head_dim, axis=3)
+            q_proj = graph.slice(q_fused, start=0, stop=head_dim, axis=3)
             gate_out = graph.merge_heads(gate_out)
             reshape1 = q_proj
         elif self.cfg.lm_cfg.attn_cfg.num_attention_heads > 1:
@@ -212,7 +206,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
             rotary_emb = graph.mul(
                 rotary_emb,
-                graph.constant(np.array([self._head_dim**-0.5], dtype=activation_dtype(quantizable))),
+                graph.constant([self._head_dim**-0.5]),
             )
         if gate_out is not None:
             return rotary_emb, gate_out
@@ -222,11 +216,11 @@ class LanguagePreModel(LanguagePartBaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        rms_norm: NodeOrHandle,
-        freq_real: NodeOrHandle,
-        freq_imag: NodeOrHandle,
+        rms_norm: Node,
+        freq_real: Node,
+        freq_imag: Node,
         merged_lora: bool = False,
-    ) -> AwesomeNode:
+    ) -> Node:
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "k_proj")
@@ -254,8 +248,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         return rotary_emb
 
     def _build_attn_value(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, merged_lora: bool = False
-    ) -> AwesomeNode:
+        self, graph: ModelGraph, base_name: str, input_node: Node, merged_lora: bool = False
+    ) -> Node:
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "v_proj")

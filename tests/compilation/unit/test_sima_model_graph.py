@@ -35,8 +35,9 @@ def _run(net, inputs):
 @pytest.mark.parametrize("multiple_outputs", [False, True])
 def test_model_graph_preserves_inputs_and_selected_output_types(quantizable, multiple_outputs):
     shape = (1, 1, 2, 32)
-    specs = {"hidden": shape, "cache": TensorType(ScalarType.int8, shape)}
-    graph = ModelGraph(_source(), specs, quantizable)
+    specs = {"hidden": shape, "cache": shape}
+    graph = ModelGraph(_source(), specs, quantizable, input_dtypes={"cache": np.int8})
+    assert graph.dtype == np.dtype(activation_dtype(quantizable))
     builder, inputs = graph, graph.inputs
     outputs = [inputs["cache"], inputs["hidden"]] if multiple_outputs else [inputs["hidden"]]
     # Finishing must select the requested outputs, not the last node created.
@@ -75,10 +76,19 @@ def test_model_graph_preserves_inputs_and_selected_output_types(quantizable, mul
     assert all(node.ir.backend == Backend.EV for node in casts)
 
 
-@pytest.mark.parametrize("specs", [{"": (1, 1, 1, 32)}, {"input": (1, 1, 0, 32)}])
-def test_model_graph_rejects_invalid_inputs(specs):
-    with pytest.raises(ValueError, match="Invalid model input"):
-        ModelGraph(_source(), specs, quantizable=True)
+@pytest.mark.parametrize(
+    "specs,input_dtypes,error",
+    [
+        ({"": (1, 1, 1, 32)}, None, "Invalid model input"),
+        ({"input": (1, 1, 0, 32)}, None, "Invalid model input"),
+        ({"input": (1, 1, 1, 32)}, {"missing": np.int8}, "unknown inputs"),
+        ({"input": (1, 1, 1, 32)}, {"input": np.complex64}, "unsupported input dtype"),
+        ({"input": TensorType(ScalarType.int8, (1, 1, 1, 32))}, {"input": np.int8}, "not both"),
+    ],
+)
+def test_model_graph_rejects_invalid_inputs(specs, input_dtypes, error):
+    with pytest.raises(ValueError, match=error):
+        ModelGraph(_source(), specs, quantizable=True, input_dtypes=input_dtypes)
 
 
 @pytest.mark.parametrize("quantizable", [True, False])

@@ -92,8 +92,8 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
             hidden = [output]
         norm = graph.layer_norm("model.decoder.layer_norm", hidden[0])
         logits = graph.linear("model.decoder.embed_tokens", norm)
-        language_logits = graph.slice(logits, [start], [start + count], [1], [3])
-        graph.save([graph.argmax(language_logits), logits], transform_subnet=self._fold_sot_prefix if quantizable else None)
+        language_logits = graph.slice(logits, start=start, stop=start + count, axis=3)
+        graph.save([graph.argmax(language_logits), logits], transform_subnet=self._fold_sot_prefix if graph.quantizable else None)
 
     @staticmethod
     def _fold_sot_prefix(net: AwesomeNet):

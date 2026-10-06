@@ -26,8 +26,8 @@ class _FakeNode:
 class _RecordingModelGraph(ModelGraph):
     instances = []
 
-    def __init__(self, model, specs, quantizable):
-        super().__init__(model, specs, quantizable)
+    def __init__(self, model, specs, quantizable, **kwargs):
+        super().__init__(model, specs, quantizable, **kwargs)
         self.subnet_input_names = list(specs)
         self.dynamic_dequant_inputs = None
         self.__class__.instances.append(self)

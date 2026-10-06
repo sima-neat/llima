@@ -1,7 +1,7 @@
 """Common native graph operations with model weights and precision bound once."""
 
 import math
-from typing import TYPE_CHECKING, Callable, Sequence, TypedDict, Unpack
+from typing import Callable, Sequence, TypedDict, Unpack
 
 import numpy as np
 from afe.apis.defines import gen2_target
@@ -15,13 +15,12 @@ from afe.ir.serializer import save_awesomenet
 from afe.ir.sima_builder import SimaBuilder
 from afe.ir.tensor_type import ScalarType, TensorType
 
+from sima_lmm.model.base import BaseModel
 from sima_lmm.utils import ceil_div_row, mla_max_num_rows, mla_row_size, round_up_to_row
-
-if TYPE_CHECKING:
-    from sima_lmm.model.base import BaseModel
 
 
 _bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
+Node = NodeOrHandle
 
 
 def activation_type(quantizable: bool) -> ScalarType:
@@ -178,13 +177,20 @@ class ModelGraph(SimaBuilder):
 
     def __init__(
         self,
-        model: "BaseModel",
+        model: BaseModel,
         input_specs: dict[str, tuple[int, ...] | TensorType],
         quantizable: bool,
+        *,
+        input_dtypes: dict[str, np.dtype | type | str] | None = None,
     ):
-        """Create matching outer/subnet inputs in the selected graph precision."""
+        """Create matching outer/subnet inputs; optional NumPy dtypes override precision."""
         self.model = model
         self.quantizable = quantizable
+        self.dtype = np.dtype(activation_dtype(quantizable))
+        input_dtypes = {} if input_dtypes is None else input_dtypes
+        unknown = input_dtypes.keys() - input_specs.keys()
+        if unknown:
+            raise ValueError(f"Input dtypes supplied for unknown inputs: {sorted(unknown)}")
         types = {}
         for name, spec in input_specs.items():
             shape = spec.shape if isinstance(spec, TensorType) else spec
@@ -197,11 +203,17 @@ class ModelGraph(SimaBuilder):
                 raise ValueError(
                     f"Invalid model input {name!r}: expected a name and positive static dimensions, got {shape}"
                 )
-            types[name] = (
-                spec
-                if isinstance(spec, TensorType)
-                else TensorType(activation_type(quantizable), shape)
-            )
+            if isinstance(spec, TensorType):
+                if name in input_dtypes:
+                    raise ValueError(f"{name}: specify either TensorType or input_dtypes, not both")
+                types[name] = spec
+            else:
+                dtype = input_dtypes.get(name, self.dtype)
+                try:
+                    scalar = ScalarType.from_numpy(np.dtype(dtype))
+                except (TypeError, ValueError) as error:
+                    raise ValueError(f"{name}: unsupported input dtype {dtype!r}") from error
+                types[name] = TensorType(scalar, shape)
         super().__init__(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
         outer_inputs = [self.create_placeholder_node(name, spec) for name, spec in types.items()]
         self.begin_subnet(outer_inputs)
@@ -263,7 +275,7 @@ class ModelGraph(SimaBuilder):
         data = np.asarray(value)
         if dtype is None:
             dtype = (
-                activation_dtype(self.quantizable)
+                self.dtype
                 if data.dtype.kind == "f" or data.dtype == activation_dtype(False)
                 else data.dtype
             )
@@ -459,7 +471,7 @@ class ModelGraph(SimaBuilder):
                 last = self.create_swish_node(data)
             case "gelu":
                 # AFE's GELU node does not support bfloat16, so expand GELU via Erf.
-                dtype = activation_dtype(self.quantizable)
+                dtype = self.dtype
                 scaled = self.create_mul_node(
                     data,
                     self.create_constant_node(np.array(1 / math.sqrt(2), dtype=dtype)),
@@ -473,7 +485,7 @@ class ModelGraph(SimaBuilder):
                     mul, self.create_constant_node(np.array(0.5, dtype=dtype))
                 )
             case "gelu_tanh" | "gelu_pytorch_tanh":
-                dtype = activation_dtype(self.quantizable)
+                dtype = self.dtype
                 value_a = 2 * math.sqrt(2 / math.pi)
                 value_b = 2 * math.sqrt(2 / math.pi) * 0.044715
                 const_a = self.create_constant_node(np.array(value_a, dtype=dtype))
@@ -492,7 +504,7 @@ class ModelGraph(SimaBuilder):
 
     def softcap(self, data: NodeOrHandle, scalar: float) -> NodeOrHandle:
         """Apply scalar * tanh(data / scalar) in activation precision."""
-        dtype = activation_dtype(self.quantizable)
+        dtype = self.dtype
         mul1 = self.create_mul_node(
             data, self.create_constant_node(np.array(2.0 / scalar, dtype=dtype))
         )
@@ -550,7 +562,7 @@ class ModelGraph(SimaBuilder):
             ScalarType.bfloat16,
         ):
             heads = [
-                self.slice(data, [i * head_dim], [(i + 1) * head_dim], [1], [3])
+                self.slice(data, start=i * head_dim, stop=(i + 1) * head_dim, axis=3)
                 for i in range(num_heads)
             ]
             return self.concat([head for head in heads for _ in range(repeat)], axis=1)
@@ -605,7 +617,7 @@ class ModelGraph(SimaBuilder):
                     return (
                         node
                         if len(shape) != 4 or shape[1] == 1
-                        else self.slice(node, [i], [i + 1], [1], [1])
+                        else self.slice(node, start=i, stop=i + 1, axis=1)
                     )
 
                 return self.concat(
@@ -710,7 +722,7 @@ class ModelGraph(SimaBuilder):
                     f"rope2d tables must broadcast to {target} with the input scalar; got {freq}"
                 )
         xr, xi, yr, yi = [
-            self.slice(data, [i * quarter], [(i + 1) * quarter], [1], [3]) for i in range(4)
+            self.slice(data, start=i * quarter, stop=(i + 1) * quarter, axis=3) for i in range(4)
         ]
         real_x = self.sub(self.mul(xr, cos_x), self.mul(xi, sin_x))
         imag_x = self.add(self.mul(xr, sin_x), self.mul(xi, cos_x))

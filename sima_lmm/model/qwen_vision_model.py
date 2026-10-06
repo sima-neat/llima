@@ -3,9 +3,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from afe.apis.defines import TensorDRAMLayout
-from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import BaseModel, TensorTessellateParameters, LayerConfiguration
-from sima_lmm.model.model_graph import ModelGraph, activation_dtype
+from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.config.vlm_config import VlmArchType
 
 @dataclass
@@ -243,10 +242,10 @@ class QwenVisionLayerModel(BaseModel):
         mla_input = graph.inputs["input"]
 
         if self.cfg.model_type in (VlmArchType.VLM_QWEN3_VL, VlmArchType.VLM_QWEN3_5_VL):
-            output_nodes = self._build_qwen3_vision_model(graph, base_name, mla_input, quantizable)
+            output_nodes = self._build_qwen3_vision_model(graph, base_name, mla_input)
         else:
             output_nodes = [
-                self._build_qwen2_vision_model(graph, base_name, mla_input, quantizable)
+                self._build_qwen2_vision_model(graph, base_name, mla_input)
             ]
 
         if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
@@ -255,15 +254,15 @@ class QwenVisionLayerModel(BaseModel):
         graph.save(output_nodes)
 
     def _build_qwen3_vision_model(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
-    ) -> list[NodeOrHandle]:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> list[Node]:
         cos_table, sin_table = self._prepare_qwen3_rotary_tables(
-            graph, base_name, quantizable
+            graph, base_name
         )
         hidden_states = input_node
         if self.include_embeddings:
             pos_embed = self._prepare_qwen3_position_embedding(
-                graph, base_name, quantizable
+                graph, base_name
             )
             hidden_states = graph.conv(
                 f"{base_name}.patch_embed.proj",
@@ -278,7 +277,7 @@ class QwenVisionLayerModel(BaseModel):
         hidden_states = self._build_qwen3_vision_block(
             graph, layer_base, hidden_states, cos_table, sin_table
         )
-        deepstack_outputs: list[NodeOrHandle] = []
+        deepstack_outputs: list[Node] = []
         if self.layer_idx in self.cfg.vm_cfg.deepstack_visual_indexes:
             ds_idx = self.cfg.vm_cfg.deepstack_visual_indexes.index(self.layer_idx)
             ds_base = f"{base_name}.deepstack_merger_list.{ds_idx}"
@@ -298,8 +297,8 @@ class QwenVisionLayerModel(BaseModel):
         return [primary_output, *deepstack_outputs]
 
     def _build_qwen2_vision_model(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> Node:
         hidden_states = input_node
         if self.include_embeddings:
             hidden_states = graph.conv(
@@ -308,7 +307,7 @@ class QwenVisionLayerModel(BaseModel):
                 weight_process_func=self._reshape_qwen_patch_embed_kernel,
                 scale_process_func=self._reshape_qwen_patch_embed_scales,
             )
-        cos_table, sin_table, global_mask, windowed_mask = self._prepare_qwen2_static_inputs(graph, quantizable)
+        cos_table, sin_table, global_mask, windowed_mask = self._prepare_qwen2_static_inputs(graph)
 
         layer_base = f"{base_name}.blocks.{self.layer_idx}"
         mask = (
@@ -328,10 +327,10 @@ class QwenVisionLayerModel(BaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        input_node: NodeOrHandle,
-        cos_table: NodeOrHandle,
-        sin_table: NodeOrHandle,
-    ) -> NodeOrHandle:
+        input_node: Node,
+        cos_table: Node,
+        sin_table: Node,
+    ) -> Node:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         norm1 = graph.layer_norm(f"{base_name}.norm1", input_node, axis=-1, epsilon=epsilon)
         attn = self._build_qwen_attention(
@@ -349,11 +348,11 @@ class QwenVisionLayerModel(BaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        input_node: NodeOrHandle,
-        attention_mask: NodeOrHandle,
-        cos_table: NodeOrHandle,
-        sin_table: NodeOrHandle,
-    ) -> NodeOrHandle:
+        input_node: Node,
+        attention_mask: Node,
+        cos_table: Node,
+        sin_table: Node,
+    ) -> Node:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         norm1 = graph.rms_norm(f"{base_name}.norm1", input_node, epsilon=epsilon)
         attn = self._build_qwen_attention(
@@ -372,19 +371,19 @@ class QwenVisionLayerModel(BaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        input_node: NodeOrHandle,
-        cos_table: NodeOrHandle,
-        sin_table: NodeOrHandle,
-        attention_mask: NodeOrHandle = None,
-    ) -> NodeOrHandle:
+        input_node: Node,
+        cos_table: Node,
+        sin_table: Node,
+        attention_mask: Node = None,
+    ) -> Node:
         num_heads = self.cfg.vm_cfg.num_attention_heads
         hidden_size = self.cfg.vm_cfg.hidden_size
         head_dim = hidden_size // num_heads
 
         qkv = graph.linear(f"{base_name}.qkv", input_node)
-        q = graph.slice(qkv, [0], [hidden_size], [1], [3])
-        k = graph.slice(qkv, [hidden_size], [2 * hidden_size], [1], [3])
-        v = graph.slice(qkv, [2 * hidden_size], [3 * hidden_size], [1], [3])
+        q = graph.slice(qkv, start=0, stop=hidden_size, axis=3)
+        k = graph.slice(qkv, start=hidden_size, stop=2 * hidden_size, axis=3)
+        v = graph.slice(qkv, start=2 * hidden_size, stop=3 * hidden_size, axis=3)
 
         q_heads = graph.split_heads(q, num_heads)
         k_heads = graph.split_heads(k, num_heads)
@@ -397,8 +396,8 @@ class QwenVisionLayerModel(BaseModel):
         return graph.linear(f"{base_name}.proj", graph.merge_heads(context))
 
     def _build_qwen3_merger(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> Node:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         norm = graph.layer_norm(f"{base_name}.norm", input_node, axis=-1, epsilon=epsilon)
         factor = self.cfg.vm_cfg.spatial_merge_size ** 2
@@ -413,8 +412,8 @@ class QwenVisionLayerModel(BaseModel):
         return graph.linear(f"{base_name}.linear_fc2", act)
 
     def _build_qwen2_merger(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> Node:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         norm = graph.rms_norm(f"{base_name}.merger.ln_q", input_node, epsilon=epsilon)
         factor = self.cfg.vm_cfg.spatial_merge_size ** 2
@@ -429,8 +428,8 @@ class QwenVisionLayerModel(BaseModel):
         return graph.linear(f"{base_name}.merger.mlp.2", act)
 
     def _build_qwen3_deepstack_merger(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> Node:
         factor = self.cfg.vm_cfg.spatial_merge_size ** 2
         grouped_seq = self.cfg.vm_cfg.seq_len // factor
         hidden = self.cfg.vm_cfg.hidden_size
@@ -448,33 +447,32 @@ class QwenVisionLayerModel(BaseModel):
         return graph.linear(f"{base_name}.linear_fc2", act)
 
     def _prepare_qwen3_rotary_tables(
-        self, graph: ModelGraph, base_name: str, quantizable: bool
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
-        dtype = activation_dtype(quantizable)
+        self, graph: ModelGraph, base_name: str
+    ) -> tuple[Node, Node]:
         cos_np, sin_np = self._calc_qwen3_rotary_tables()
-        cos_node = graph.constant(cos_np.transpose(0, 2, 3, 1).astype(dtype))
-        sin_node = graph.constant(sin_np.transpose(0, 2, 3, 1).astype(dtype))
+        cos_node = graph.constant(cos_np.transpose(0, 2, 3, 1))
+        sin_node = graph.constant(sin_np.transpose(0, 2, 3, 1))
         return cos_node, sin_node
 
     def _prepare_qwen3_position_embedding(
-        self, graph: ModelGraph, base_name: str, quantizable: bool
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str
+    ) -> Node:
         pos_nchw = self._calc_qwen3_position_embeddings_array(base_name)
-        pos_nhwc = pos_nchw.transpose(0, 2, 3, 1).astype(activation_dtype(quantizable))
+        pos_nhwc = pos_nchw.transpose(0, 2, 3, 1)
         return graph.constant(pos_nhwc)
 
     def _prepare_qwen2_static_inputs(
-        self, graph: ModelGraph, quantizable: bool
-    ) -> tuple[NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle]:
+        self, graph: ModelGraph
+    ) -> tuple[Node, Node, Node, Node]:
         seq_len = self.cfg.vm_cfg.seq_len
-        dtype = activation_dtype(quantizable)
+        dtype = graph.dtype
         cos_np, sin_np = self._calc_qwen2_vision_rope_tables()
         half_dim = cos_np.shape[0]
         cos_node = graph.constant(
-            cos_np.reshape(1, half_dim, 1, seq_len).transpose(0, 2, 3, 1).astype(dtype)
+            cos_np.reshape(1, half_dim, 1, seq_len).transpose(0, 2, 3, 1)
         )
         sin_node = graph.constant(
-            sin_np.reshape(1, half_dim, 1, seq_len).transpose(0, 2, 3, 1).astype(dtype)
+            sin_np.reshape(1, half_dim, 1, seq_len).transpose(0, 2, 3, 1)
         )
 
         window_size_llm = (

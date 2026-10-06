@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
-from afe.ir.tensor_type import TensorType, ScalarType
-
+import numpy as np
 from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.model.model_graph import ModelGraph
@@ -55,11 +54,12 @@ class LanguageConvModel(LanguagePartBaseModel):
         cache_shape = (1, 1, self.cfg.lm_cfg.conv_L_cache - 1, hidden_size)
 
         input_specs = {"input": input_shape}
+        input_dtypes = {}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            input_specs["input"] = TensorType(ScalarType.int8, input_shape)
+            input_dtypes["input"] = np.int8
             input_specs["input_scale"] = scale_shape
         input_specs["conv_cache"] = cache_shape
-        graph = ModelGraph(self, input_specs, quantizable)
+        graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
         mla_input_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             mla_input_scale = graph.inputs["input_scale"]
@@ -77,18 +77,14 @@ class LanguageConvModel(LanguagePartBaseModel):
             f"{base_name}.in_proj", norm_input, lora_rank=lora_rank, merged_lora=merged_lora
         )
 
-        b = graph.slice(in_proj, [0], [hidden_size], [1], [3])
-        c = graph.slice(in_proj, [hidden_size], [2 * hidden_size], [1], [3])
-        x = graph.slice(in_proj, [2 * hidden_size], [3 * hidden_size], [1], [3])
+        b = graph.slice(in_proj, start=0, stop=hidden_size, axis=3)
+        c = graph.slice(in_proj, start=hidden_size, stop=2 * hidden_size, axis=3)
+        x = graph.slice(in_proj, start=2 * hidden_size, stop=3 * hidden_size, axis=3)
         bx = graph.mul(b, x)
 
         tail = graph.concat([mla_input_conv_cache, bx], 2)
         conv_cache_out = graph.slice(
-            tail,
-            [1],
-            [self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 1],
-            [1],
-            [2],
+            tail, start=1, stop=self.num_tokens + self.cfg.lm_cfg.conv_L_cache - 1, axis=2
         )
 
         conv_out = graph.conv(f"{base_name}.conv", tail, is_depthwise=True)

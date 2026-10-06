@@ -4,7 +4,7 @@ import time
 
 from dataclasses import asdict, dataclass
 
-from afe.ir.tensor_type import ScalarType
+from ml_dtypes import bfloat16
 from afe.ir.quantization_conv import block_quantize_weight_tensor
 
 from sima_lmm.logging import sima_log_info, sima_log_warning
@@ -22,9 +22,6 @@ from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
-
-
-bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
 
 
 def quantize_embedding_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

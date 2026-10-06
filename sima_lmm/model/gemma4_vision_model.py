@@ -4,10 +4,9 @@ import numpy as np
 
 from afe.apis.defines import TensorDRAMLayout
 from afe.ir.attributes import ClipAttrs
-from afe.ir.build_node import NodeOrHandle
 from afe.ir.defines import get_expected_tensor_value
 from sima_lmm.model.base import BaseModel, LayerConfiguration, TensorTessellateParameters
-from sima_lmm.model.model_graph import ModelGraph, activation_dtype
+from sima_lmm.model.model_graph import ModelGraph, Node
 
 
 @dataclass
@@ -42,7 +41,7 @@ class Gemma4VisionLayerModel(BaseModel):
 
         graph = ModelGraph(self, {"input": input_shape}, quantizable)
         vision_output = self._build_vision_model(
-            graph, base_name, graph.inputs["input"], quantizable
+            graph, base_name, graph.inputs["input"]
         )
         outputs = [vision_output]
         if self.include_mm_proj and self.cfg.pipeline_cfg.quantize_embeddings:
@@ -87,8 +86,8 @@ class Gemma4VisionLayerModel(BaseModel):
         return {}
 
     def _build_vision_model(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> Node:
         if isinstance(self.cfg.vm_cfg.image_size, list):
             image_h, image_w = self.cfg.vm_cfg.image_size
         else:
@@ -97,11 +96,11 @@ class Gemma4VisionLayerModel(BaseModel):
         grid_h = image_h // self.cfg.vm_cfg.patch_size
         grid_w = image_w // self.cfg.vm_cfg.patch_size
         pos_embed, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y = self._precompute_constants(
-            graph, base_name, grid_h, grid_w, quantizable
+            graph, base_name, grid_h, grid_w
         )
 
         if self.include_embeddings:
-            x = self._build_patch_embedder(graph, base_name, input_node, pos_embed, quantizable)
+            x = self._build_patch_embedder(graph, base_name, input_node, pos_embed)
         else:
             x = input_node
 
@@ -111,30 +110,28 @@ class Gemma4VisionLayerModel(BaseModel):
         )
 
         if self.include_mm_proj:
-            x = self._build_pooler(graph, base_name, x, grid_h, quantizable)
+            x = self._build_pooler(graph, base_name, x, grid_h)
             x = self._build_multimodal_embedder(graph, base_name, x)
         return x
 
     def _precompute_constants(
-        self, graph: ModelGraph, base_name: str, grid_h: int, grid_w: int, quantizable: bool
-    ) -> tuple[NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle, NodeOrHandle]:
+        self, graph: ModelGraph, base_name: str, grid_h: int, grid_w: int
+    ) -> tuple[Node, Node, Node, Node, Node]:
         constants = self._calc_static_constants(base_name, grid_h, grid_w)
-        dtype = activation_dtype(quantizable)
         return tuple(
-            graph.constant(c.transpose(0, 2, 3, 1).astype(dtype))
+            graph.constant(c.transpose(0, 2, 3, 1))
             for c in constants
         )
 
     def _build_patch_embedder(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle,
-        pos_embed_node: NodeOrHandle, quantizable: bool
-    ) -> NodeOrHandle:
-        dtype = activation_dtype(quantizable)
+        self, graph: ModelGraph, base_name: str, input_node: Node,
+        pos_embed_node: Node
+    ) -> Node:
         sub = graph.sub(
-            input_node, graph.constant(np.array([0.5], dtype=dtype))
+            input_node, graph.constant([0.5])
         )
         scaled = graph.mul(
-            sub, graph.constant(np.array([2.0], dtype=dtype))
+            sub, graph.constant([2.0])
         )
         proj = graph.linear(f"{base_name}.patch_embedder.input_proj", scaled)
         return graph.add(proj, pos_embed_node)
@@ -143,12 +140,12 @@ class Gemma4VisionLayerModel(BaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        input_node: NodeOrHandle,
-        rope_cos_x: NodeOrHandle,
-        rope_sin_x: NodeOrHandle,
-        rope_cos_y: NodeOrHandle,
-        rope_sin_y: NodeOrHandle,
-    ) -> NodeOrHandle:
+        input_node: Node,
+        rope_cos_x: Node,
+        rope_sin_x: Node,
+        rope_cos_y: Node,
+        rope_sin_y: Node,
+    ) -> Node:
         eps = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         x = graph.rms_norm(f"{base_name}.input_layernorm", input_node, epsilon=eps)
         x = self._build_attention(graph, base_name, x, rope_cos_x, rope_sin_x, rope_cos_y, rope_sin_y)
@@ -165,12 +162,12 @@ class Gemma4VisionLayerModel(BaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        input_node: NodeOrHandle,
-        rope_cos_x: NodeOrHandle,
-        rope_sin_x: NodeOrHandle,
-        rope_cos_y: NodeOrHandle,
-        rope_sin_y: NodeOrHandle,
-    ) -> NodeOrHandle:
+        input_node: Node,
+        rope_cos_x: Node,
+        rope_sin_x: Node,
+        rope_cos_y: Node,
+        rope_sin_y: Node,
+    ) -> Node:
         attn_base = f"{base_name}.self_attn"
         num_heads = self.cfg.vm_cfg.num_attention_heads
 
@@ -207,8 +204,8 @@ class Gemma4VisionLayerModel(BaseModel):
         return self._build_enc_conv(graph, f"{attn_base}.o_proj", graph.merge_heads(context))
 
     def _build_mlp(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> Node:
         mlp_base = f"{base_name}.mlp"
         gate_base = f"{mlp_base}.gate_proj"
         up_base = f"{mlp_base}.up_proj"
@@ -226,9 +223,9 @@ class Gemma4VisionLayerModel(BaseModel):
         return self._build_enc_conv(graph, f"{mlp_base}.down_proj", mul)
 
     def _build_pooler(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle,
-        grid_h: int, quantizable: bool
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node,
+        grid_h: int
+    ) -> Node:
         s = self.cfg.vm_cfg.spatial_merge_size
         x = graph.split_concat(
             input_node, axis=1, split_axis=2, split_block=grid_h, split_repeat=1
@@ -236,17 +233,15 @@ class Gemma4VisionLayerModel(BaseModel):
         x = graph.avgpool2d(x, kernel_shape=(s, s), strides=(s, s))
         x = graph.mul(
             x,
-            graph.constant(
-                np.array([float(np.sqrt(self.cfg.vm_cfg.hidden_size))], dtype=activation_dtype(quantizable))
-            ),
+            graph.constant([float(np.sqrt(self.cfg.vm_cfg.hidden_size))]),
         )
         return graph.split_concat(
             x, axis=2, split_axis=1, split_block=grid_h // s, split_repeat=1
         )
 
     def _build_multimodal_embedder(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node
+    ) -> Node:
         x = graph.rms_norm(None, input_node, epsilon=self.cfg.vm_cfg.layer_norm_eps)
         return graph.linear("model.embed_vision.embedding_projection", x)
 
@@ -254,9 +249,9 @@ class Gemma4VisionLayerModel(BaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        input_node: NodeOrHandle,
+        input_node: Node,
         include_input_clip: bool = True,
-    ) -> NodeOrHandle:
+    ) -> Node:
         x = input_node
         if include_input_clip:
             x = self._build_maybe_clip(graph, base_name, x, "input")
@@ -283,8 +278,8 @@ class Gemma4VisionLayerModel(BaseModel):
         return x
 
     def _build_maybe_clip(
-        self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, side: str
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, base_name: str, input_node: Node, side: str
+    ) -> Node:
         bounds = self._get_clip_bounds(base_name, side)
         if bounds is None:
             return input_node

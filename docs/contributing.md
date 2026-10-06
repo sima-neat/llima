@@ -153,11 +153,19 @@ separate logging argument.
 
 Shapes infer FP32 inputs for `quantizable=True` (a floating graph to quantize
 later), or BF16 for `False` (a direct graph using the source weight precision).
-Use `TensorType(ScalarType.int8, shape)` for integer caches. Input and output
+Use `input_dtypes={"cache": np.int8}` for integer inputs such as caches; names must
+match the input specifications. Existing explicit AFE tensor specifications remain
+supported for low-level callers. Input and output
 order follows the supplied specifications; shapes and output types come from
 AFE's inference. `constant()` casts floating data to the activation precision;
 use `dtype=np.int32`, for example, when integer constants require a specific
 width. Node names follow AFE's deterministic creation counter.
+
+Import `Node` from `model_graph.py` for graph-node annotations. Helpers receive
+the graph rather than a separate `quantizable` flag. `graph.constant()` selects
+floating precision automatically; use the NumPy `graph.dtype` when host-side
+array calculations need that precision. The stage flag stays at `generate_graph()`
+and graph construction.
 
 `save()` finishes the MLA subnet and creates outer-graph output tuples, preserves integer
 outputs, casts BF16 outputs to FP32 on EV, and writes the standard artifact name

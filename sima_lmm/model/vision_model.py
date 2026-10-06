@@ -6,7 +6,6 @@ import numpy as np
 
 from afe.apis.defines import TensorDRAMLayout
 from afe.ir.defines import get_expected_tensor_value
-from afe.ir.build_node import NodeOrHandle
 from sima_lmm.model.base import (
     BaseModel, EvalMode, FileGenMode, TensorTessellateParameters, GenConfiguration,
     LayerConfiguration
@@ -14,8 +13,7 @@ from sima_lmm.model.base import (
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
 from sima_lmm.model.model_graph import (
-    ModelGraph,
-    activation_dtype,
+    ModelGraph, Node,
     load_tensor_from_source,
 )
 from sima_lmm.config.vlm_config import VisionArchType, VlmArchType
@@ -207,7 +205,7 @@ class StandardVisionLayerModel(BaseModel):
 
         # Vision tower.
         vision_output = self._build_vision_tower(
-            graph, self.hf_model.vision_model_param_base_name, mla_input, quantizable
+            graph, self.hf_model.vision_model_param_base_name, mla_input
         )
 
         # MM projection.
@@ -231,10 +229,10 @@ class StandardVisionLayerModel(BaseModel):
             outputs = [vision_output, vision_scale]
         graph.save(outputs)
 
-    def _build_vision_tower(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
+    def _build_vision_tower(self, graph: ModelGraph, base_name: str, input_node: Node) -> Node:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         if self.include_embeddings:
-            embeddings = self._build_patch_embeddings(graph, f"{base_name}.embeddings", input_node, quantizable)
+            embeddings = self._build_patch_embeddings(graph, f"{base_name}.embeddings", input_node)
 
             if self.cfg.vm_cfg.arch == VisionArchType.CLIP:
                 # Note that the original source code has a typo in the layer norm node name.
@@ -266,7 +264,7 @@ class StandardVisionLayerModel(BaseModel):
         )
         return post_layer_norm
 
-    def _build_patch_embeddings(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle, quantizable: bool) -> NodeOrHandle:
+    def _build_patch_embeddings(self, graph: ModelGraph, base_name: str, input_node: Node) -> Node:
         node_name = f"{base_name}.patch_embedding"
 
         if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
@@ -295,7 +293,7 @@ class StandardVisionLayerModel(BaseModel):
                     f"{base_name}.class_embedding",
                     self.get_hf_param, self.check_hf_param,
                     reshape_str="c->nhwc"
-                ).astype(activation_dtype(quantizable))
+                )
                 class_embedding = graph.constant(class_embedding_weight)
                 embeddings = graph.concat([class_embedding, split_and_concat], axis=2)
             else:
@@ -314,14 +312,15 @@ class StandardVisionLayerModel(BaseModel):
                 target_w,
             )
 
-        # Reshape "wc->nhwc" and cast to the activation dtype (float32 in RELAY, bfloat16 in SIMA_QUANTIZED).
-        pos_weight = position_embedding_weight.astype(activation_dtype(quantizable))
-        pos_weight = pos_weight.reshape(1, 1, pos_weight.shape[0], pos_weight.shape[1])
+        # Reshape "wc->nhwc"; graph.constant selects the activation dtype.
+        pos_weight = position_embedding_weight.reshape(
+            1, 1, position_embedding_weight.shape[0], position_embedding_weight.shape[1]
+        )
         position_embedding = graph.constant(pos_weight)
         embeddings = graph.add(embeddings, position_embedding)
         return embeddings
 
-    def _build_encoder(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
+    def _build_encoder(self, graph: ModelGraph, base_name: str, input_node: Node) -> Node:
         epsilon = float(np.float32(self.cfg.vm_cfg.layer_norm_eps))
         layer_norm1 = graph.layer_norm(
             f"{base_name}.layer_norm1",
@@ -336,7 +335,7 @@ class StandardVisionLayerModel(BaseModel):
         add2 = graph.add(add1, mlp)
         return add2
 
-    def _build_encoder_attention(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
+    def _build_encoder_attention(self, graph: ModelGraph, base_name: str, input_node: Node) -> Node:
         num_heads = self.cfg.vm_cfg.num_attention_heads
         head_dim = self.cfg.vm_cfg.hidden_size // num_heads
         projection_options, output_options = graph._head_padding_options(
@@ -357,7 +356,7 @@ class StandardVisionLayerModel(BaseModel):
         context = graph.attention(query, key, value)
         return graph.linear(f"{base_name}.out_proj", graph.merge_heads(context), **output_options)
 
-    def _build_mm_projector(self, graph: ModelGraph, base_name: str, input_node: NodeOrHandle) -> NodeOrHandle:
+    def _build_mm_projector(self, graph: ModelGraph, base_name: str, input_node: Node) -> Node:
         match self.cfg.model_type:
             case VlmArchType.VLM_LFM2_VL:
                 # NHWC: (1, 1, seq_len, hidden) → (1, num_patches_h, num_patches_w, hidden)

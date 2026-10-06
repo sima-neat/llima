@@ -185,7 +185,7 @@ def test_qwen2_layer_uses_its_source_block_and_attention_mode():
     layer_input = object()
 
     assert model._build_qwen2_vision_model(
-        graph, "vision", layer_input, quantizable=False
+        graph, "vision", layer_input
     ) is layer_output
     args = model._build_qwen2_vision_block.call_args.args
     assert args[:4] == (graph, "vision.blocks.7", layer_input, global_mask)
@@ -210,7 +210,7 @@ def test_qwen3_layer_emits_its_deepstack_output_without_final_merger(
     model._build_qwen3_merger = Mock(side_effect=AssertionError("unexpected final merger"))
 
     assert model._build_qwen3_vision_model(
-        graph, "vision", object(), quantizable=False
+        graph, "vision", object()
     ) == [
         layer_output,
         deepstack_output,

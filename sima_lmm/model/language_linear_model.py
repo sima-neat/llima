@@ -2,12 +2,9 @@ import math
 import numpy as np
 from dataclasses import dataclass
 
-from afe.ir.tensor_type import TensorType, ScalarType
-from afe.ir.build_node import NodeOrHandle
-
 from sima_lmm.model.base import LayerConfiguration, LoraGenMode
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.model_graph import ModelGraph
+from sima_lmm.model.model_graph import ModelGraph, Node
 
 
 @dataclass
@@ -83,14 +80,15 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
 
         input_specs = {"input": input_shape}
+        input_dtypes = {}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            input_specs["input"] = TensorType(ScalarType.int8, input_shape)
+            input_dtypes["input"] = np.int8
             input_specs["input_scale"] = scale_shape
         input_specs["linear_conv_state"] = conv_state_shape
         if self.num_tokens > 1:
             input_specs["linear_valid_mask"] = valid_mask_shape
         input_specs["linear_delta_state"] = state_shape
-        graph = ModelGraph(self, input_specs, quantizable)
+        graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
         mla_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             mla_input_scale = graph.inputs["input_scale"]
@@ -124,10 +122,9 @@ class LanguageLinearModel(LanguagePartBaseModel):
         conv_tail = graph.concat([mla_conv_state, mixed_qkv], 2)
         linear_conv_state_out = graph.slice(
             conv_tail,
-            [1],
-            [self.num_tokens + self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim - 1],
-            [1],
-            [2],
+            start=1,
+            stop=self.num_tokens + self.cfg.lm_cfg.linear_attn_cfg.conv_kernel_dim - 1,
+            axis=2,
         )
         conv_out = graph.conv(f"{linear_base}.conv1d", conv_tail, is_depthwise=True)
         conv_out = graph.activation(conv_out, "silu")
@@ -135,21 +132,19 @@ class LanguageLinearModel(LanguagePartBaseModel):
             conv_out = graph.mul(conv_out, mla_valid_mask)
 
         q_flat = graph.slice(
-            conv_out, [0], [self.cfg.lm_cfg.linear_attn_cfg.key_dim], [1], [3]
+            conv_out, start=0, stop=self.cfg.lm_cfg.linear_attn_cfg.key_dim, axis=3
         )
         k_flat = graph.slice(
             conv_out,
-            [self.cfg.lm_cfg.linear_attn_cfg.key_dim],
-            [2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim],
-            [1],
-            [3],
+            start=self.cfg.lm_cfg.linear_attn_cfg.key_dim,
+            stop=2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim,
+            axis=3,
         )
         v_flat = graph.slice(
             conv_out,
-            [2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim],
-            [self.cfg.lm_cfg.linear_attn_cfg.conv_dim],
-            [1],
-            [3],
+            start=2 * self.cfg.lm_cfg.linear_attn_cfg.key_dim,
+            stop=self.cfg.lm_cfg.linear_attn_cfg.conv_dim,
+            axis=3,
         )
 
         query = graph.split_heads(
@@ -281,9 +276,9 @@ class LanguageLinearModel(LanguagePartBaseModel):
         self,
         graph: ModelGraph,
         linear_base: str,
-        norm_input: NodeOrHandle,
+        norm_input: Node,
         merged_lora: bool,
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+    ) -> tuple[Node, Node]:
         lora_ranks = {"a": None, "b": None}
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_ranks = {
@@ -312,13 +307,13 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
         heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
         return (
-            graph.slice(ab, [0], [heads], [1], [3]),
-            graph.slice(ab, [heads], [2 * heads], [1], [3]),
+            graph.slice(ab, start=0, stop=heads, axis=3),
+            graph.slice(ab, start=heads, stop=2 * heads, axis=3),
         )
 
     def _build_static_triangular_sums(
-        self, graph: ModelGraph, g: NodeOrHandle, upper: bool
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, g: Node, upper: bool
+    ) -> Node:
         """Build NHWC prefix/suffix sums with a static triangular matrix multiplication."""
         # The mask axes are (output_token, sum_token).
         mask_fn = np.tril if upper else np.triu
@@ -335,8 +330,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
         return graph.matmul(graph.constant(mask), g)
 
     def _build_global_interval_decay_mask(
-        self, graph: ModelGraph, g: NodeOrHandle
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, g: Node
+    ) -> Node:
         """Build NHWC pairwise decay in lower-triangular query/key orientation."""
         interval_end_mask = np.tril(np.ones((self.num_tokens, self.num_tokens), dtype=np.float32))
         interval_start_mask = np.tril(
@@ -371,8 +366,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
         return graph.mul(decay, interval_end)
 
     def _build_l2norm(
-        self, graph: ModelGraph, input_node: NodeOrHandle, scale: float
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, input_node: Node, scale: float
+    ) -> Node:
         """Normalize NHWC Q/K heads over the last dimension."""
         norm = graph.rms_norm(
             None,
@@ -386,8 +381,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
 
     def _folded_matrix_mul(
-        self, graph: ModelGraph, left_blocks: list[NodeOrHandle], right_blocks: list[NodeOrHandle]
-    ) -> list[NodeOrHandle]:
+        self, graph: ModelGraph, left_blocks: list[Node], right_blocks: list[Node]
+    ) -> list[Node]:
         """Batch independent NHWC block multiplications by folding blocks into head axis."""
         assert len(left_blocks) == len(right_blocks)
         folded_left = (
@@ -405,11 +400,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         for block_idx in range(len(left_blocks)):
             blocks.append(
                 graph.slice(
-                    folded_out,
-                    [block_idx * num_heads],
-                    [(block_idx + 1) * num_heads],
-                    [1],
-                    [1],
+                    folded_out, start=block_idx * num_heads, stop=(block_idx + 1) * num_heads, axis=1
                 )
             )
         return blocks
@@ -417,9 +408,9 @@ class LanguageLinearModel(LanguagePartBaseModel):
     def _build_direct_chunk_inverse(
         self,
         graph: ModelGraph,
-        initial_attn: NodeOrHandle,
+        initial_attn: Node,
         chunk_size: int,
-    ) -> NodeOrHandle:
+    ) -> Node:
         """Build the exact NHWC lower-triangular inverse for one folded token block."""
         if chunk_size == 4:
             eye = graph.constant(
@@ -431,11 +422,11 @@ class LanguageLinearModel(LanguagePartBaseModel):
             return graph.matmul(i_plus_a_squared, i_plus_a)
 
         half = chunk_size // 2
-        top_rows = graph.slice(initial_attn, [0], [half], [1], [2])
-        bottom_rows = graph.slice(initial_attn, [half], [chunk_size], [1], [2])
-        a00 = graph.slice(top_rows, [0], [half], [1], [3])
-        a10 = graph.slice(bottom_rows, [0], [half], [1], [3])
-        a11 = graph.slice(bottom_rows, [half], [chunk_size], [1], [3])
+        top_rows = graph.slice(initial_attn, start=0, stop=half, axis=2)
+        bottom_rows = graph.slice(initial_attn, start=half, stop=chunk_size, axis=2)
+        a00 = graph.slice(top_rows, start=0, stop=half, axis=3)
+        a10 = graph.slice(bottom_rows, start=0, stop=half, axis=3)
+        a11 = graph.slice(bottom_rows, start=half, stop=chunk_size, axis=3)
 
         inv00 = self._build_direct_chunk_inverse(graph, a00, half)
         inv11 = self._build_direct_chunk_inverse(graph, a11, half)
@@ -458,31 +449,23 @@ class LanguageLinearModel(LanguagePartBaseModel):
         return graph.concat([top, bottom], 2)
 
     def _build_block_chunk_inverse(
-        self, graph: ModelGraph, initial_attn: NodeOrHandle, block_size: int = 32
-    ) -> NodeOrHandle:
+        self, graph: ModelGraph, initial_attn: Node, block_size: int = 32
+    ) -> Node:
         """Build the NHWC grouped lower-triangular inverse from fixed-size blocks."""
         assert self.num_tokens % block_size == 0
         num_blocks = self.num_tokens // block_size
 
-        attn_blocks: dict[tuple[int, int], NodeOrHandle] = {}
+        attn_blocks: dict[tuple[int, int], Node] = {}
         for row in range(num_blocks):
             row_block = graph.slice(
-                initial_attn,
-                [row * block_size],
-                [(row + 1) * block_size],
-                [1],
-                [2],
+                initial_attn, start=row * block_size, stop=(row + 1) * block_size, axis=2
             )
             for col in range(row + 1):
                 attn_blocks[(row, col)] = graph.slice(
-                    row_block,
-                    [col * block_size],
-                    [(col + 1) * block_size],
-                    [1],
-                    [3],
+                    row_block, start=col * block_size, stop=(col + 1) * block_size, axis=3
                 )
 
-        inverse_blocks: dict[tuple[int, int], NodeOrHandle] = {}
+        inverse_blocks: dict[tuple[int, int], Node] = {}
         diag_blocks = [attn_blocks[(block_idx, block_idx)] for block_idx in range(num_blocks)]
         folded_diag = diag_blocks[0] if len(diag_blocks) == 1 else graph.concat(diag_blocks, 1)
         folded_diag_inv = self._build_direct_chunk_inverse(
@@ -493,11 +476,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         num_heads = self.cfg.lm_cfg.linear_attn_cfg.num_value_heads
         for block_idx in range(num_blocks):
             inverse_blocks[(block_idx, block_idx)] = graph.slice(
-                folded_diag_inv,
-                [block_idx * num_heads],
-                [(block_idx + 1) * num_heads],
-                [1],
-                [1],
+                folded_diag_inv, start=block_idx * num_heads, stop=(block_idx + 1) * num_heads, axis=1
             )
 
         for span in range(1, num_blocks):
@@ -512,7 +491,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 [attn_blocks[(row, mid)] for _, row, mid, _ in term_specs],
                 [inverse_blocks[(mid, col)] for _, _, mid, col in term_specs],
             )
-            grouped_terms: list[list[NodeOrHandle]] = [[] for _ in span_targets]
+            grouped_terms: list[list[Node]] = [[] for _ in span_targets]
             for (target_idx, _, _, _), term in zip(term_specs, term_products):
                 grouped_terms[target_idx].append(term)
 
@@ -550,13 +529,13 @@ class LanguageLinearModel(LanguagePartBaseModel):
     def _build_decode_delta(
         self,
         graph: ModelGraph,
-        query: NodeOrHandle,
-        key: NodeOrHandle,
-        value: NodeOrHandle,
-        beta: NodeOrHandle,
-        decay: NodeOrHandle,
-        state: NodeOrHandle,
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+        query: Node,
+        key: Node,
+        value: Node,
+        beta: Node,
+        decay: Node,
+        state: Node,
+    ) -> tuple[Node, Node]:
         """Build the NHWC single-token recurrent Gated DeltaNet update."""
         state = graph.mul(state, decay)
         kv_mem = graph.matmul(key, state)
@@ -570,15 +549,15 @@ class LanguageLinearModel(LanguagePartBaseModel):
     def _build_group_delta(
         self,
         graph: ModelGraph,
-        query: NodeOrHandle,
-        key: NodeOrHandle,
-        query_unscaled: NodeOrHandle,
-        key_unscaled: NodeOrHandle,
-        value: NodeOrHandle,
-        beta: NodeOrHandle,
-        g: NodeOrHandle,
-        state: NodeOrHandle,
-    ) -> tuple[NodeOrHandle, NodeOrHandle]:
+        query: Node,
+        key: Node,
+        query_unscaled: Node,
+        key_unscaled: Node,
+        value: Node,
+        beta: Node,
+        g: Node,
+        state: Node,
+    ) -> tuple[Node, Node]:
         """Build the grouped prefill computation in NHWC head-major layout."""
         g_cum = self._build_static_triangular_sums(graph, g, upper=True)
         strict_lower = graph.constant(
@@ -640,8 +619,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
             graph, g, upper=False
         )
         suffix_g_exp = graph.exp(suffix_g)
-        final_g_exp = graph.slice(suffix_g_exp, [0], [1], [1], [2])
-        final_decay_mask = graph.slice(suffix_g_exp, [1], [self.num_tokens], [1], [2])
+        final_g_exp = graph.slice(suffix_g_exp, start=0, stop=1, axis=2)
+        final_decay_mask = graph.slice(suffix_g_exp, start=1, stop=self.num_tokens, axis=2)
         final_decay_mask_tail = graph.constant(
             np.ones((1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, 1, 1), dtype=np.float32),
         )

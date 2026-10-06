@@ -1,10 +1,8 @@
 from dataclasses import dataclass
 import numpy as np
 
-from afe.ir.build_node import NodeOrHandle
-
 from sima_lmm.model.base import BaseModel
-from sima_lmm.model.model_graph import ModelGraph
+from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
@@ -15,9 +13,9 @@ class LanguagePartBaseModel(BaseModel):
         self,
         graph: ModelGraph,
         base_name: str,
-        input_node: NodeOrHandle,
+        input_node: Node,
         weightless: bool = False,
-    ) -> NodeOrHandle:
+    ) -> Node:
         """
         Create an RMS norm with a multiplication applied to its outputs.
         """
@@ -28,8 +26,8 @@ class LanguagePartBaseModel(BaseModel):
         )
 
     def _build_mlp(
-        self, graph, base_name: str, input_nodes: list[NodeOrHandle], merged_lora: bool = False, with_residual_add: bool =  False
-    ) -> NodeOrHandle:
+        self, graph, base_name: str, input_nodes: list[Node], merged_lora: bool = False, with_residual_add: bool =  False
+    ) -> Node:
         """Build SiMa nodes for the MLP block with optional splitting.
 
         Handles both LFM2-style weights (w1/w2/w3) and standard weights (gate_proj/up_proj/down_proj).
@@ -74,7 +72,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
     layer_idx: int
     final_softcapping: float | None
 
-    def _build_post_transformer(self, graph, input_node) -> NodeOrHandle:
+    def _build_post_transformer(self, graph, input_node) -> Node:
         """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""
         # LFM2 uses embedding_norm instead of norm for the final normalization.
         base_prefix = self.hf_model.language_model_param_base_name
