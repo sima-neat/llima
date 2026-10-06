@@ -136,7 +136,6 @@ sdk_ext_require = [
 
 
 sdk_require = [
-    get_package("SIMA_UTILS", "sima-utils", "latest"),
     get_package("AWESOME_FRONT_END", "sima-frontend", "latest"),
     *sdk_ext_require
 ]

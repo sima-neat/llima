@@ -33,6 +33,8 @@ void Chat::set_system_prompt(std::string system_prompt) {
 
 void Chat::clear_system_prompt() {
     _vlm_helper.set_system_prompt(std::nullopt);
+    if (!_messages.empty() && _messages[0]["role"] == "system")
+        _messages.erase(_messages.begin());
     clear_history();
 }
 

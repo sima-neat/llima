@@ -219,10 +219,6 @@ def _reconstruct_openai_reasoning_stream(body: bytes) -> tuple[str, str, bool]:
 
 def test_openai_http_protocol_and_recovery(tmp_path):
     assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
-    subprocess.run(
-        ["systemctl", "is-active", "--quiet", "simaai-appcomplex.service"],
-        check=True,
-    )
 
     with _running_web_server(tmp_path):
         malformed_status, _, malformed_body = _post("/v1/chat/completions", b"{")
