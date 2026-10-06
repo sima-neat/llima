@@ -560,16 +560,27 @@ def test_shared_mlp_matches_dense_reference(gated):
 def test_rms_norm_supports_weight_offset_and_inferred_weightless_channels():
     shape = (1, 1, 2, 32)
     weight = np.linspace(-0.2, 0.2, 32).astype(np.float32)
-    graph = ModelGraph(_source({"norm.weight": weight}), {"x": shape}, True)
+    source = _source({"norm.weight": weight})
+    source.cfg = SimpleNamespace(lm_cfg=SimpleNamespace(rms_norm_eps=1e-6, rms_norm_unit_offset=True))
+    graph = ModelGraph(source, {"x": shape}, True)
     weighted = graph.rms_norm("norm", graph.inputs["x"], epsilon=1e-6, weight_offset=1.0)
-    weightless = graph.rms_norm(None, graph.inputs["x"], epsilon=1e-6)
+    weightless = graph.rms_norm(None, graph.inputs["x"])
+    language_norm = graph.rms_norm("norm", graph.inputs["x"])
+    explicit_norm = graph.rms_norm("norm", graph.inputs["x"], epsilon=1e-4)
     x = np.linspace(-1, 1, np.prod(shape)).reshape(shape).astype(np.float32)
     normalized = x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + np.float32(1e-6))
-    result = graph.finish([weighted, weightless]).run(
+    result = graph.finish([weighted, weightless, language_norm, explicit_norm]).run(
         {"x": x}, node_callable=create_node_executor(False)
     )
     np.testing.assert_allclose(result[0], normalized * (weight + 1), rtol=2e-6, atol=2e-7)
     np.testing.assert_allclose(result[1], normalized, rtol=2e-6, atol=2e-7)
+    np.testing.assert_array_equal(result[2], result[0])
+    explicit = x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + np.float32(1e-4))
+    np.testing.assert_allclose(result[3], explicit * weight, rtol=2e-6, atol=2e-7)
+
+    graph = ModelGraph(_source(), {"x": shape}, True)
+    with pytest.raises(ValueError, match="requires epsilon"):
+        graph.rms_norm(None, graph.inputs["x"])
 
 
 def test_tessellation_defaults_and_explicit_cache_layout_overrides():

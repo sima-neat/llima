@@ -94,13 +94,13 @@ def test_linear_attention_single_block_inverse(num_tokens):
 def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(monkeypatch):
     monkeypatch.setattr(language_linear_model, "ModelGraph", _RecordingModelGraph)
 
-    def stop_after_input_contract(_self, _builder, _name, input_node):
+    def stop_after_input_contract(_self, _name, input_node):
         assert input_node.name in {"MLA_0/input", "dequantized_input"}
         raise _StopGraphBuild
 
     monkeypatch.setattr(
-        LanguageLinearModel,
-        "_build_rms_norm",
+        _RecordingModelGraph,
+        "rms_norm",
         stop_after_input_contract,
     )
 

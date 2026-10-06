@@ -76,11 +76,7 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             split_block=L,
             split_repeat=1,
         )
-        proj_normed = self._build_rms_norm(
-            graph,
-            f"{lm_base}.per_layer_projection_norm",
-            proj,
-        )
+        proj_normed = graph.rms_norm(f"{lm_base}.per_layer_projection_norm", proj)
 
         if self.cfg.pipeline_cfg.quantize_embeddings:
             staging = graph.dequant(mla_input_staging, mla_input_staging_scale)

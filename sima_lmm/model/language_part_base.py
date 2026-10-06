@@ -2,28 +2,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from sima_lmm.model.base import BaseModel
-from sima_lmm.model.model_graph import ModelGraph, Node
+from sima_lmm.model.model_graph import Node
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
 @dataclass
 class LanguagePartBaseModel(BaseModel):
-
-    def _build_rms_norm(
-        self,
-        graph: ModelGraph,
-        base_name: str,
-        input_node: Node,
-        weightless: bool = False,
-    ) -> Node:
-        """
-        Create an RMS norm with a multiplication applied to its outputs.
-        """
-        weight_offset = 1.0 if self.cfg.lm_cfg.rms_norm_unit_offset else 0.0
-        return graph.rms_norm(
-            None if weightless else base_name, input_node,
-            epsilon=self.cfg.lm_cfg.rms_norm_eps, weight_offset=weight_offset,
-        )
 
     def _build_mlp(
         self, graph, base_name: str, input_nodes: list[Node], merged_lora: bool = False, with_residual_add: bool =  False
@@ -82,7 +66,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
         if self.is_draft:
             final_norm_full_name = final_norm_name
-        rms_norm = self._build_rms_norm(graph, final_norm_full_name, input_node)
+        rms_norm = graph.rms_norm(final_norm_full_name, input_node)
 
         # Find the last layer's size based on the weight tensor shape.
         output_embed_name = self._get_output_embed_name()

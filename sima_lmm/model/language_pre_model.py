@@ -97,12 +97,10 @@ class LanguagePreModel(LanguagePartBaseModel):
             if self.check_hf_param(f"{base_name}.operator_norm.weight")
             else f"{base_name}.input_layernorm"
         )
-        rms_norm = self._build_rms_norm(graph, norm_name, rms_norm_in)
+        rms_norm = graph.rms_norm(norm_name, rms_norm_in)
         # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
         if self.is_draft:
-            hidden_states_norm = self._build_rms_norm(
-                graph, f"{base_name}.hidden_norm", inputs["hidden_states"]
-            )
+            hidden_states_norm = graph.rms_norm(f"{base_name}.hidden_norm", inputs["hidden_states"])
             attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
@@ -199,7 +197,7 @@ class LanguagePreModel(LanguagePartBaseModel):
                 break
 
         if q_norm_name:
-            reshape1 = self._build_rms_norm(graph, q_norm_name, reshape1)
+            reshape1 = graph.rms_norm(q_norm_name, reshape1)
 
         rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
 
@@ -242,7 +240,7 @@ class LanguagePreModel(LanguagePartBaseModel):
                 break
 
         if k_norm_name:
-            reshape1 = self._build_rms_norm(graph, k_norm_name, reshape1)
+            reshape1 = graph.rms_norm(k_norm_name, reshape1)
 
         rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
         return rotary_emb
@@ -267,12 +265,7 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         # Gemma4 applies value RMS norm per KV head before writing V to cache.
         split = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
-        split = self._build_rms_norm(
-            graph,
-            f"{base_name}.v_norm",
-            split,
-            weightless=True,
-        )
+        split = graph.rms_norm(None, split)
         return split
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :

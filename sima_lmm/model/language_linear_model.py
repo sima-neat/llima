@@ -104,7 +104,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         else:
             residual = mla_input
 
-        norm_input = self._build_rms_norm(graph, f"{base_layer}.input_layernorm", residual)
+        norm_input = graph.rms_norm(f"{base_layer}.input_layernorm", residual)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(linear_base, "in_proj_qkv")
@@ -225,7 +225,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
             f"{linear_base}.out_proj", core_attn_out, lora_rank=lora_rank, merged_lora=merged_lora
         )
         add1 = graph.add(residual, out_proj)
-        rms_norm2 = self._build_rms_norm(graph, f"{base_layer}.post_attention_layernorm", add1)
+        rms_norm2 = graph.rms_norm(f"{base_layer}.post_attention_layernorm", add1)
         mlp = self._build_mlp(
             graph,
             f"{base_layer}.mlp",

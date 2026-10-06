@@ -179,7 +179,10 @@ Common operations include `add`, `sub`, `mul`, `matmul`, `concat`, `slice`,
 `activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`,
 `clip`, `avgpool2d`, `space_to_depth`, `quant`, and `dequant`. A gated MLP uses
 `projections=("gate_proj", "up_proj", "down_proj")`; the default is
-`("fc1", "fc2")`. `rms_norm(None, input, epsilon=...)` infers weightless channels.
+`("fc1", "fc2")`. `rms_norm("model.norm", input)` uses the language configuration's
+epsilon and weight offset. An explicit `epsilon` keeps zero weight offset unless
+`weight_offset` is also supplied, for vision and GDN norms.
+`rms_norm(None, input, epsilon=...)` infers weightless channels.
 RoPE supports full, partial and proportional split-half rotation.
 `rope2d(input, cos_x, sin_x, cos_y, sin_y)` rotates channel quarters in
 `[x-real, x-imag, y-real, y-imag]` order. `split_heads(input, heads, repeat=...)`

@@ -454,9 +454,23 @@ class ModelGraph(SimaBuilder):
         return self.create_conv_node(layer_norm, weight_tensor, bias_tensor, conv_attrs, None)
 
     def rms_norm(
-        self, name: str | None, data: NodeOrHandle, *, epsilon: float, weight_offset: float = 0.0
+        self, name: str | None, data: NodeOrHandle, *,
+        epsilon: float | None = None, weight_offset: float | None = None,
     ) -> NodeOrHandle:
-        """Normalize channel RMS with source weights, or unit weights when name is None."""
+        """Normalize channel RMS with source weights, or unit weights when name is None.
+
+        Omitted epsilon selects the language configuration's epsilon and weight
+        offset. Explicit epsilon uses zero weight offset unless overridden.
+        """
+        if epsilon is None:
+            cfg = getattr(getattr(self.model, "cfg", None), "lm_cfg", None)
+            if cfg is None:
+                raise ValueError("rms_norm requires epsilon without a language configuration")
+            epsilon = cfg.rms_norm_eps
+            if weight_offset is None:
+                weight_offset = 1.0 if cfg.rms_norm_unit_offset else 0.0
+        if weight_offset is None:
+            weight_offset = 0.0
         weight = (
             np.ones(tensor_type(data).shape[-1], np.float32)
             if name is None

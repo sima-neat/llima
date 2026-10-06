@@ -27,7 +27,7 @@ class LanguageConvPostModel(LanguagePostBaseModel):
         graph = ModelGraph(self, {"input": input_shape}, quantizable)
         mla_input_input = graph.inputs["input"]
 
-        rms_norm2 = self._build_rms_norm(graph, f"{base_name}.ffn_norm", mla_input_input)
+        rms_norm2 = graph.rms_norm(f"{base_name}.ffn_norm", mla_input_input)
 
         mlp_base = (
             f"{base_name}.feed_forward"

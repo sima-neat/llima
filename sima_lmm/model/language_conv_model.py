@@ -69,7 +69,7 @@ class LanguageConvModel(LanguagePartBaseModel):
         else:
             residual = mla_input_input
 
-        norm_input = self._build_rms_norm(graph, f"{base_layer}.operator_norm", residual)
+        norm_input = graph.rms_norm(f"{base_layer}.operator_norm", residual)
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "in_proj")
@@ -102,7 +102,7 @@ class LanguageConvModel(LanguagePartBaseModel):
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
             outputs = [add1, conv_cache_out]
         else:
-            rms_norm2 = self._build_rms_norm(graph, f"{base_layer}.ffn_norm", add1)
+            rms_norm2 = graph.rms_norm(f"{base_layer}.ffn_norm", add1)
             mlp = self._build_mlp(
                 graph, f"{base_layer}.feed_forward", [rms_norm2], merged_lora
             )

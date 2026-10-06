@@ -51,7 +51,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         proj = graph.linear(
             f"{base_name}.per_layer_projection", mul, merged_lora=merged_lora, lora_rank=None
         )
-        norm = self._build_rms_norm(graph, f"{base_name}.post_per_layer_input_norm", proj)
+        norm = graph.rms_norm(f"{base_name}.post_per_layer_input_norm", proj)
         add = graph.add(residual, norm)
         layer_scalar = graph.constant(
             self.get_hf_param(f"{base_name}.layer_scalar")
@@ -132,13 +132,9 @@ class LanguagePostModel(LanguagePostBaseModel):
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
         if has_ffn_norms:
-            rms_norm1 = self._build_rms_norm(
-                graph, f"{base_name}.post_attention_layernorm", o_proj
-            )
+            rms_norm1 = graph.rms_norm(f"{base_name}.post_attention_layernorm", o_proj)
             add1 = graph.add(rms_norm_in, rms_norm1)
-            rms_norm2 = self._build_rms_norm(
-                graph, f"{base_name}.pre_feedforward_layernorm", add1
-            )
+            rms_norm2 = graph.rms_norm(f"{base_name}.pre_feedforward_layernorm", add1)
         else:
             if self.check_hf_param(f"{base_name}.ffn_norm.weight"):
                 rms_norm_name = "ffn_norm"
@@ -148,7 +144,7 @@ class LanguagePostModel(LanguagePostBaseModel):
                 rms_norm_name = "post_attention_layernorm"
 
             add1 = graph.add(rms_norm_in, o_proj)
-            rms_norm2 = self._build_rms_norm(graph, f"{base_name}.{rms_norm_name}", add1)
+            rms_norm2 = graph.rms_norm(f"{base_name}.{rms_norm_name}", add1)
 
         # LFM2 uses feed_forward.{w1,w3,w2}; fall back to mlp.{gate,up,down}.
         mlp_base = (
@@ -161,7 +157,7 @@ class LanguagePostModel(LanguagePostBaseModel):
 
         if has_ffn_norms:
             mlp = self._build_mlp(graph, mlp_base, [rms_norm2], merged_lora)
-            mlp = self._build_rms_norm(graph, f"{base_name}.post_feedforward_layernorm", mlp)
+            mlp = graph.rms_norm(f"{base_name}.post_feedforward_layernorm", mlp)
             add2 = graph.add(add1, mlp)
         else:
             add2 = self._build_mlp(
