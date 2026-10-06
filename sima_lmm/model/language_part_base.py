@@ -68,7 +68,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
     final_softcapping: float | None
     expert_idx: int = -1
 
-    def _build_post_transformer(self, graph, input_node) -> Node:
+    def _build_post_transformer(self, graph, input_node) -> list[Node]:
         """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""
         # LFM2 uses embedding_norm instead of norm for the final normalization.
         base_prefix = self.hf_model.language_model_param_base_name
