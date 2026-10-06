@@ -1,6 +1,5 @@
 import argparse
 import logging
-import os
 import sys
 import time
 import subprocess
@@ -11,9 +10,8 @@ from pathlib import Path
 from sima_lmm.devkit import model_manager
 from sima_lmm.devkit.model_manager import ModelManager
 from sima_lmm.devkit.utils import CLI, WEB, ZMQServer, connect, disconnect
-from sima_utils.logging.sima_logger import (
-    _get_logging_config as sima_get_logging_config,
-    _initialize_logger as sima_initialize_logger,
+from sima_lmm.logging import (
+    configure_runtime_logging,
     sima_log_exception,
     sima_log_info,
 )
@@ -29,17 +27,10 @@ class DemoMode(str, Enum):
 
 
 def _init_logging(mode: DemoMode, log_level: str | None) -> None:
-    config_file_path = os.path.join(os.path.dirname(__file__), "logging_config.yaml")
-    os.environ["SIMA_LOGGING_CONFIG_YAML_FILE"] = os.getenv(
-        "SIMA_LOGGING_CONFIG_YAML_FILE", config_file_path
+    configure_runtime_logging(
+        log_level=log_level,
+        console=mode == DemoMode.WEB,
     )
-    logging_config = sima_get_logging_config()
-    if mode == DemoMode.WEB:
-        logging_config["root"]["handlers"].append("console")
-    if log_level is not None:
-        logging_config["handlers"]["console"]["level"] = log_level
-        logging_config["handlers"]["file"]["level"] = log_level
-    sima_initialize_logger(logging_config)
 
 
 def _resolve_run_model_path(model: str) -> Path:

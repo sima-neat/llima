@@ -172,10 +172,9 @@ Build candidate packages and runtime-test extras:
 ./build.sh --all --clean
 ```
 
-This builds but does not run the tests. Install matching candidate LLiMa and
-Internals packages on Modalix, extract the extras archive, and run packaged
-CTest and pytest following the DevKit runtime-testing instructions in
-`tests/README.md`.
+This builds but does not run the tests. Install the matching candidate LLiMa
+packages on Modalix, extract the extras archive, and run packaged CTest and
+pytest following the DevKit runtime-testing instructions in `tests/README.md`.
 
 Run affected hardware tests when a change reaches model loading, inference,
 tokenization, multimodal preprocessing, speculative decoding, CLI/HTTP/ZMQ, or

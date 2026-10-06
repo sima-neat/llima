@@ -1,286 +1,593 @@
+#include <dlfcn.h>
 
 #include <algorithm>
-#include <any>
-#include <cstdint>
-#include <future>
-#include <memory>
-#include <stdexcept>
+#include <chrono>
+#include <cstring>
+#include <deque>
+#include <limits>
+#include <mutex>
 #include <sstream>
+#include <stdexcept>
+#include <tuple>
+#include <unordered_map>
 #include <utility>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fmt/std.h>
+#include <simaai/gst-api.h>
 #include <spdlog/spdlog.h>
 
 #include "mla_model.hpp"
 
-
 namespace simaai {
 namespace llima {
-
 namespace {
 
-struct MlaRunCompletion {
-    int32_t rc = 0;
-    std::size_t failed_index = simaaidispatcher::DispatcherBase::NoFailedQueueIndex;
-    std::string detail;
+struct QueuedRun {
+    std::size_t model_index = 0;
+    std::vector<mla_tensor> ifms;
+    std::vector<mla_tensor> ofms;
 };
 
-using MlaRunPromise = std::shared_ptr<std::promise<MlaRunCompletion>>;
+struct ImportedBuffer {
+    uint64_t generation = 0;
+    uint32_t id = 0;
+};
 
-MlaRunCompletion make_submit_error(
-    simaaidispatcher::DispatcherBase* dispatcher,
-    int32_t rc
-) {
-    MlaRunCompletion result;
-    result.rc = rc;
-    result.detail = dispatcher->lastErrorString();
-    return result;
+struct MlaRuntimeState {
+    std::mutex registry_mutex;
+    std::recursive_mutex execution_mutex;
+    mla_handle_p handle = nullptr;
+    std::map<std::filesystem::path, std::size_t> path_to_index;
+    std::vector<std::filesystem::path> paths;
+    std::vector<mla_model_p> models;
+    std::unordered_map<const MLABuffer*, ImportedBuffer> imported_buffers;
+};
+
+MlaRuntimeState& runtime_state() {
+    static MlaRuntimeState state;
+    return state;
 }
 
-MlaRunCompletion wait_for_result(
-    simaaidispatcher::DispatcherBase* dispatcher,
-    std::future<MlaRunCompletion>& future
-) {
-    MlaRunCompletion result = future.get();
-    if (result.rc != 0) {
-        result.detail = dispatcher->lastErrorString();
+thread_local std::vector<QueuedRun> queued_runs;
+thread_local std::size_t queued_run_count = 0;
+
+mla_handle_p require_handle() {
+    auto& state = runtime_state();
+    if (!state.handle) {
+        throw std::runtime_error("MLA-RT is not connected; call connect() first");
     }
-    return result;
+    return state.handle;
 }
 
-MlaRunCompletion submit_prepared_and_wait(
-    simaaidispatcher::DispatcherBase* dispatcher,
-    simaaidispatcher::JobMLA&& job
-) {
-    auto promise = std::make_shared<std::promise<MlaRunCompletion>>();
-    auto future = promise->get_future();
-
-    job.userData = promise;
-    job.cb = [](
-        const std::map<std::string, simaai_memory_t*>&,
-        int32_t rc,
-        std::any user_data
-    ) {
-        auto completion =
-            std::any_cast<MlaRunPromise>(user_data);
-        MlaRunCompletion result;
-        result.rc = rc;
-        completion->set_value(std::move(result));
-    };
-
-    const int32_t submit_rc = dispatcher->submitPrepared(simaaidispatcher::Job{std::move(job)});
-    if (submit_rc != 0) {
-        return make_submit_error(dispatcher, submit_rc);
+uint32_t imported_buffer_id(MLABuffer* buffer) {
+    auto& state = runtime_state();
+    const uint64_t generation = buffer->get_allocation_generation();
+    if (generation == 0) {
+        throw std::logic_error("cannot import an unallocated MLA buffer");
     }
-    return wait_for_result(dispatcher, future);
-}
 
-MlaRunCompletion submit_queue_and_wait(
-    simaaidispatcher::DispatcherBase* dispatcher,
-    simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest&& request
-) {
-    auto promise = std::make_shared<std::promise<MlaRunCompletion>>();
-    auto future = promise->get_future();
-
-    request.userData = promise;
-    request.cb = [](
-        int32_t rc,
-        std::size_t failed_index,
-        const simaaidispatcher::DispatcherBase::ErrorSnapshot&,
-        const simaaidispatcher::DispatcherBase::ProfileSnapshot&,
-        std::any user_data
-    ) {
-        auto completion =
-            std::any_cast<MlaRunPromise>(user_data);
-        MlaRunCompletion result;
-        result.rc = rc;
-        result.failed_index = failed_index;
-        completion->set_value(std::move(result));
-    };
-
-    const int32_t submit_rc = dispatcher->submitPreparedMlaPartitionQueue(std::move(request));
-    if (submit_rc != 0) {
-        return make_submit_error(dispatcher, submit_rc);
+    auto found = state.imported_buffers.find(buffer);
+    if (found != state.imported_buffers.end() &&
+        found->second.generation == generation) {
+        return found->second.id;
     }
-    return wait_for_result(dispatcher, future);
+    if (found != state.imported_buffers.end()) {
+        const int rc = mla_release_dmabuf(require_handle(), found->second.id);
+        if (rc != 0) {
+            throw std::runtime_error(fmt::format(
+                "MLA-RT failed to release stale DMA-BUF registration: rc={} ({})",
+                rc, std::strerror(rc < 0 ? -rc : rc)
+            ));
+        }
+        state.imported_buffers.erase(found);
+    }
+
+    uint32_t id = 0;
+    const int rc = mla_import_dmabuf(
+        require_handle(), buffer->get_dmabuf_fd(), MLA_BUF_IFM, &id, nullptr
+    );
+    if (rc != 0) {
+        throw std::runtime_error(fmt::format(
+            "MLA-RT failed to import DMA-BUF: rc={} ({})",
+            rc, std::strerror(rc < 0 ? -rc : rc)
+        ));
+    }
+    state.imported_buffers.emplace(buffer, ImportedBuffer{generation, id});
+    return id;
 }
 
+bool path_matches_family(
+    const std::filesystem::path& model_path,
+    const std::optional<std::filesystem::path>& selector
+) {
+    if (!selector) return true;
+    const auto model = std::filesystem::absolute(model_path).lexically_normal();
+    const auto family = std::filesystem::absolute(*selector).lexically_normal();
+
+    // Callers use either a directory (Whisper) or a filename stem (language
+    // and vision models). Match real path components first, then accept a
+    // sibling whose filename begins with the complete stem at a separator.
+    const auto mismatch = std::mismatch(
+        family.begin(), family.end(), model.begin(), model.end()
+    );
+    if (mismatch.first == family.end()) {
+        return true;
+    }
+    if (family.parent_path() != model.parent_path()) {
+        return false;
+    }
+
+    const std::string stem = family.filename().string();
+    const std::string candidate = model.filename().string();
+    if (candidate.size() <= stem.size() ||
+        candidate.compare(0, stem.size(), stem) != 0) {
+        return false;
+    }
+    const char boundary = candidate[stem.size()];
+    return boundary == '_' || boundary == '.';
 }
+
+void validate_override_indices(
+    const std::map<uint8_t, MLABufferSlice>* overrides,
+    std::size_t count,
+    const char* kind
+) {
+    if (!overrides) return;
+    for (const auto& [index, unused] : *overrides) {
+        (void)unused;
+        if (index >= count) {
+            throw std::out_of_range(fmt::format(
+                "{} override index {} is outside {} bindings", kind, index, count
+            ));
+        }
+    }
+}
+
+const MLABufferSlice& effective_slice(
+    const std::vector<MLABufferSlice>& defaults,
+    const std::map<uint8_t, MLABufferSlice>* overrides,
+    std::size_t index
+) {
+    if (overrides) {
+        const auto override_it = overrides->find(static_cast<uint8_t>(index));
+        if (override_it != overrides->end()) return override_it->second;
+    }
+    return defaults[index];
+}
+
+MLABuffer* effective_buffer(
+    const std::vector<MLABufferSlice>& defaults,
+    const MLABufferSlice& slice,
+    std::size_t index
+) {
+    MLABuffer* buffer = slice.get_buf_ptr();
+    if (!buffer) buffer = defaults[index].get_buf_ptr();
+    if (!buffer) {
+        throw std::invalid_argument(fmt::format(
+            "MLA binding {} has no backing buffer", index
+        ));
+    }
+    return buffer;
+}
+
+void make_bindings(
+    const std::vector<MLABufferSlice>& defaults,
+    const std::map<uint8_t, MLABufferSlice>* overrides,
+    const char* kind,
+    std::vector<mla_tensor>& bindings
+) {
+    validate_override_indices(overrides, defaults.size(), kind);
+    if (defaults.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        throw std::overflow_error(fmt::format("{} binding count exceeds MLA-RT", kind));
+    }
+    bindings.clear();
+    bindings.reserve(defaults.size());
+    for (std::size_t i = 0; i < defaults.size(); ++i) {
+        const auto& slice = effective_slice(defaults, overrides, i);
+        MLABuffer* buffer = effective_buffer(defaults, slice, i);
+        const uint64_t offset = buffer->get_buf_addr_offset(slice.get_buf_begins());
+        if (offset >= buffer->get_allocation_size()) {
+            throw std::out_of_range(fmt::format(
+                "{} binding {} starts at {} outside its {}-byte dma-buf",
+                kind, i, offset, buffer->get_allocation_size()
+            ));
+        }
+        // The fd binding describes the accessible carrier extent from this
+        // offset. The model's descriptors define which bytes are actually
+        // touched; this matters for strided KV-cache slices whose ELF section
+        // size is larger than their per-token access span.
+        const uint64_t length = buffer->get_allocation_size() - offset;
+        bindings.push_back({imported_buffer_id(buffer), 0, offset, length});
+    }
+}
+
+mla_model_p model_for(std::size_t index) {
+    auto& state = runtime_state();
+    std::lock_guard lock(state.registry_mutex);
+    if (index >= state.models.size()) {
+        throw std::out_of_range("MLA model registry index is invalid");
+    }
+    return state.models[index];
+}
+
+std::filesystem::path path_for(std::size_t index) {
+    auto& state = runtime_state();
+    std::lock_guard lock(state.registry_mutex);
+    if (index >= state.paths.size()) {
+        throw std::out_of_range("MLA model registry index is invalid");
+    }
+    return state.paths[index];
+}
+
+MLABufferSlice materialize_view(
+    MLABuffer* buffer,
+    const MLABufferSlice& slice
+) {
+    if (slice.get_buf_shapes()) {
+        auto begins = slice.get_buf_begins().value_or(
+            std::vector<uint32_t>(buffer->get_shape().size(), 0)
+        );
+        return MLABufferSlice(buffer, std::move(begins), *slice.get_buf_shapes());
+    }
+    if (slice.get_buf_begins()) {
+        return MLABufferSlice(buffer, *slice.get_buf_begins());
+    }
+    return MLABufferSlice(buffer);
+}
+
+} // namespace
 
 void connect_mla_rt(const std::vector<std::string>& args) {
-    if (MLAModelWithBuffer::_dispatcher) return;
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    std::lock_guard registry_lock(state.registry_mutex);
+    if (state.handle) return;
 
-    if (!args.empty()) {
-        spdlog::warn("MLA dispatcher mode ignores mla_rt_args: [{}]", fmt::join(args, ", "));
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(mla_get_handle_argv), &info) && info.dli_fname) {
+        spdlog::info("Loaded libMLArt.so: {}", info.dli_fname);
     }
 
-    MLAModelWithBuffer::_dispatcher =
-        simaaidispatcher::DispatcherFactory::getDispatcher(
-            simaaidispatcher::DispatcherFactory::MLASHM
+    std::vector<std::string> effective_args = args;
+    if (effective_args.empty()) {
+        effective_args = {
+            "libMLArt.so", "--connect", "kernel,ma", "-t", "-b=no", "-x", "4"
+        };
+    }
+    std::vector<char*> argv;
+    argv.reserve(effective_args.size());
+    for (auto& value : effective_args) argv.push_back(value.data());
+
+    spdlog::info("Connect MLA-RT with args: [{}]", fmt::join(effective_args, ", "));
+    try {
+        // LLiMa is a throughput workload. Keep latency-sensitive vision
+        // processes at the platform default priority above it. MLA_CTX_PRIORITY
+        // can override this request before the first connection.
+        mla_ctx_cfg cfg{};
+        cfg.fields = MLA_CTX_CFG_GROUP_PRIO;
+        cfg.group_prio = 10;
+        state.handle = mla_get_handle_cfg(
+            static_cast<int>(argv.size()), argv.data(), &cfg
         );
-    if (!MLAModelWithBuffer::_dispatcher) {
-        throw std::runtime_error("Failed to acquire MLASHM dispatcher");
+    } catch (const std::exception& error) {
+        throw std::runtime_error(fmt::format("Failed to connect MLA-RT: {}", error.what()));
     }
-    spdlog::info("Connected MLA runtime through MLASHM dispatcher");
+    if (!state.handle) throw std::runtime_error("Failed to connect MLA-RT");
+
+    mla_ctx_cfg applied_cfg{};
+    const int cfg_rc = mla_get_ctx_cfg(state.handle, &applied_cfg);
+    if (cfg_rc != 0) {
+        mla_free_handle(state.handle);
+        state.handle = nullptr;
+        throw std::runtime_error(fmt::format(
+            "MLA-RT failed to read back context priority: rc={} ({})",
+            cfg_rc, std::strerror(cfg_rc < 0 ? -cfg_rc : cfg_rc)
+        ));
+    }
+    spdlog::info("MLA-RT context group priority: {}", applied_cfg.group_prio);
 }
 
 void disconnect_mla_rt() {
-    MLAModelWithBuffer::free_all_models();
-
-    if (MLAModelWithBuffer::_dispatcher) {
-        simaaidispatcher::DispatcherFactory::releaseDispatcher(
-            simaaidispatcher::DispatcherFactory::MLASHM
-        );
-        MLAModelWithBuffer::_dispatcher = nullptr;
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    std::lock_guard registry_lock(state.registry_mutex);
+    for (auto& model : state.models) {
+        if (model) {
+            mla_free_model(model);
+            model = nullptr;
+        }
+    }
+    queued_runs.clear();
+    queued_run_count = 0;
+    for (const auto& [buffer, imported] : state.imported_buffers) {
+        (void)buffer;
+        const int rc = mla_release_dmabuf(state.handle, imported.id);
+        if (rc != 0) {
+            spdlog::error(
+                "MLA-RT failed to release DMA-BUF registration {}: rc={} ({})",
+                imported.id, rc, std::strerror(rc < 0 ? -rc : rc)
+            );
+        }
+    }
+    state.imported_buffers.clear();
+    if (state.handle) {
+        mla_free_handle(state.handle);
+        state.handle = nullptr;
     }
 }
-
-
-std::map<std::filesystem::path, uint16_t> MLAModelWithBuffer::_unique_model_path_to_idx_map;
-std::vector<std::filesystem::path> MLAModelWithBuffer::_unique_model_paths;
-std::vector<mla_model_p> MLAModelWithBuffer::_unique_model_ptrs;
-thread_local simaaidispatcher::DispatcherBase::PreparedMlaPartitionQueueRequest
-    MLAModelWithBuffer::_queue_request;
-thread_local std::vector<simaaidispatcher::PreparedMlaPlan>
-    MLAModelWithBuffer::_queued_plans;
-thread_local std::vector<mla_model_p> MLAModelWithBuffer::_queued_handles;
-thread_local std::size_t MLAModelWithBuffer::_queued_plan_count = 0;
-simaaidispatcher::DispatcherBase* MLAModelWithBuffer::_dispatcher = nullptr;
-
 
 MLAModelWithBuffer::MLAModelWithBuffer(
     std::filesystem::path model_path,
     std::vector<MLABufferSlice> ifms,
     std::vector<MLABufferSlice> ofms
 ) : _ifms(std::move(ifms)), _ofms(std::move(ofms)) {
-    if (_unique_model_path_to_idx_map.contains(model_path)) {
-        _model_idx = _unique_model_path_to_idx_map[model_path];
-    } else if (!std::filesystem::is_regular_file(model_path)) {
+    model_path = std::filesystem::absolute(model_path).lexically_normal();
+    if (!std::filesystem::is_regular_file(model_path)) {
         throw std::runtime_error(fmt::format("Model file does not exist: {}", model_path));
-    } else {
-        _model_idx = _unique_model_ptrs.size();
-        _unique_model_path_to_idx_map[model_path] = _model_idx;
-        _unique_model_paths.emplace_back(model_path);
-        _unique_model_ptrs.emplace_back(nullptr);
     }
-
-    _prepared_plan.mode = simaaidispatcher::PreparedMlaPlan::DispatchMode::MultiIoSingleBatch;
-    _prepared_plan.ifm_count = static_cast<int>(_ifms.size());
-    _prepared_plan.ofm_count = static_cast<int>(_ofms.size());
-    _prepared_plan.batch_size = 1;
-    _prepared_plan.batch_model = 1;
-    _prepared_plan.ifm_len.resize(_ifms.size());
-    _prepared_plan.ofm_len.resize(_ofms.size());
-    _prepared_plan.ifm_paddr.resize(_ifms.size());
-    _prepared_plan.ofm_paddr.resize(_ofms.size());
+    auto& state = runtime_state();
+    std::lock_guard lock(state.registry_mutex);
+    const auto [it, inserted] = state.path_to_index.emplace(model_path, state.paths.size());
+    _model_idx = it->second;
+    if (inserted) {
+        state.paths.push_back(std::move(model_path));
+        state.models.push_back(nullptr);
+    }
 }
-
 
 void MLAModelWithBuffer::load() {
-    if (_unique_model_ptrs[_model_idx]) return;
-    auto* dispatcher = _get_dispatcher();
-    const auto model_path = std::filesystem::absolute(_unique_model_paths[_model_idx]);
-    _unique_model_ptrs[_model_idx] = dispatcher->load(model_path.string());
-    if (!_unique_model_ptrs[_model_idx]) {
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    std::lock_guard registry_lock(state.registry_mutex);
+    require_handle();
+    if (state.models[_model_idx]) return;
+    state.models[_model_idx] = mla_load_model(state.handle, state.paths[_model_idx].c_str());
+    if (!state.models[_model_idx]) {
         throw std::runtime_error(fmt::format(
-            "Failed to load model through MLASHM dispatcher: {} ({})",
-            model_path,
-            dispatcher->lastErrorString()
+            "MLA-RT failed to load model: {}", state.paths[_model_idx]
         ));
     }
-    spdlog::info("Loaded model: {}", model_path);
+    spdlog::info("Loaded model: {}", state.paths[_model_idx]);
 }
-
 
 void MLAModelWithBuffer::free() {
-    if (!_unique_model_ptrs[_model_idx]) return;
-    auto* dispatcher = _get_dispatcher();
-    const int rc = dispatcher->release(_unique_model_ptrs[_model_idx]);
-    if (rc != 0) {
-        spdlog::error(
-            "Failed to release model through MLASHM dispatcher: {} ({})",
-            _unique_model_paths[_model_idx],
-            dispatcher->lastErrorString()
-        );
-    }
-    _unique_model_ptrs[_model_idx] = nullptr;
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    std::lock_guard registry_lock(state.registry_mutex);
+    if (_model_idx >= state.models.size() || !state.models[_model_idx]) return;
+    mla_free_model(state.models[_model_idx]);
+    state.models[_model_idx] = nullptr;
 }
 
-
-simaaidispatcher::DispatcherBase* MLAModelWithBuffer::_get_dispatcher() {
-    if (!_dispatcher) {
-        _dispatcher = simaaidispatcher::DispatcherFactory::getDispatcher(
-            simaaidispatcher::DispatcherFactory::MLASHM
-        );
-    }
-    if (!_dispatcher) {
-        throw std::runtime_error("MLASHM dispatcher is unavailable");
-    }
-    return _dispatcher;
-}
-
-
-void MLAModelWithBuffer::_prepare_run(
-    simaaidispatcher::PreparedMlaPlan& plan,
+void MLAModelWithBuffer::run(
     std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
     std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
-    auto patch_io = [](
-        const std::vector<MLABufferSlice>& default_slices,
-        std::map<uint8_t, MLABufferSlice>* override_map_ptr,
-        std::vector<uint64_t>& paddr,
-        std::vector<int>& len
-    ) {
-        for (uint32_t i = 0; i < default_slices.size(); ++i) {
-            const MLABufferSlice* effective_slice = &default_slices[i];
-            if (override_map_ptr) {
-                const auto override_it = override_map_ptr->find(static_cast<uint8_t>(i));
-                if (override_it != override_map_ptr->end()) {
-                    effective_slice = &override_it->second;
-                }
-            }
-            MLABuffer* base = effective_slice->get_buf_ptr()
-                ? effective_slice->get_buf_ptr()
-                : default_slices[i].get_buf_ptr();
-            paddr[i] = effective_slice->get_buf_ptr()
-                ? effective_slice->get_buf_addr()
-                : default_slices[i].get_buf_addr(effective_slice->get_buf_begins());
-            len[i] = static_cast<int>(base->get_buf_len(effective_slice->get_buf_shapes()));
-        }
-    };
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    load();
+    _debug_inouts("ifm", ifm_map_ptr);
 
-    plan.mode = simaaidispatcher::PreparedMlaPlan::DispatchMode::MultiIoSingleBatch;
-    plan.ifm_count = static_cast<int>(_ifms.size());
-    plan.ofm_count = static_cast<int>(_ofms.size());
-    plan.batch_size = 1;
-    plan.batch_model = 1;
-    plan.ifm_len.resize(_ifms.size());
-    plan.ofm_len.resize(_ofms.size());
-    plan.ifm_paddr.resize(_ifms.size());
-    plan.ofm_paddr.resize(_ofms.size());
-
-    patch_io(_ifms, ifm_map_ptr, plan.ifm_paddr, plan.ifm_len);
-    patch_io(_ofms, ofm_map_ptr, plan.ofm_paddr, plan.ofm_len);
+    std::vector<mla_tensor> ifms;
+    std::vector<mla_tensor> ofms;
+    make_bindings(_ifms, ifm_map_ptr, "IFM", ifms);
+    make_bindings(_ofms, ofm_map_ptr, "OFM", ofms);
+    mla_job_h job = nullptr;
+    int rc = mla_submit_async(
+        model_for(_model_idx),
+        static_cast<int>(ifms.size()), ifms.data(),
+        static_cast<int>(ofms.size()), ofms.data(),
+        &job
+    );
+    if (rc != 0) {
+        throw std::runtime_error(fmt::format(
+            "MLA-RT submit failed for {}: rc={} ({})",
+            path_for(_model_idx), rc, std::strerror(rc < 0 ? -rc : rc)
+        ));
+    }
+    uint64_t tile_us = 0;
+    uint64_t submit_to_reap_us = 0;
+    rc = mla_wait(job, &tile_us, &submit_to_reap_us);
+    if (rc != 0) {
+        throw std::runtime_error(fmt::format(
+            "MLA-RT wait failed for {}: rc={} ({})",
+            path_for(_model_idx), rc, std::strerror(rc < 0 ? -rc : rc)
+        ));
+    }
+    if (_profile) {
+        spdlog::info(
+            "MLA-RT run {}: tile={} us, submit-to-reap={} us",
+            path_for(_model_idx), tile_us, submit_to_reap_us
+        );
+    }
+    _debug_inouts("ofm", ofm_map_ptr);
 }
 
-
-simaaidispatcher::PreparedMlaRunRef MLAModelWithBuffer::_make_run_ref(
-    simaaidispatcher::PreparedMlaPlan& plan,
-    mla_model_p handle
+void MLAModelWithBuffer::add_to_queue(
+    std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
+    std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
-    simaaidispatcher::PreparedMlaRunRef run;
-    run.handle = handle;
-    run.ifm_paddr = plan.ifm_paddr.data();
-    run.ifm_len = plan.ifm_len.data();
-    run.ifm_count = static_cast<uint16_t>(plan.ifm_paddr.size());
-    run.ofm_paddr = plan.ofm_paddr.data();
-    run.ofm_len = plan.ofm_len.data();
-    run.ofm_count = static_cast<uint16_t>(plan.ofm_paddr.size());
-    return run;
+    if (!_enable_queue) {
+        run(ifm_map_ptr, ofm_map_ptr);
+        return;
+    }
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    load();
+    const std::size_t slot = queued_run_count;
+    if (slot == queued_runs.size()) queued_runs.emplace_back();
+    auto& queued = queued_runs[slot];
+    queued.model_index = _model_idx;
+    make_bindings(_ifms, ifm_map_ptr, "IFM", queued.ifms);
+    make_bindings(_ofms, ofm_map_ptr, "OFM", queued.ofms);
+    ++queued_run_count;
 }
 
+void MLAModelWithBuffer::run_queue() {
+    if (!_enable_queue || queued_run_count == 0) return;
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    const std::size_t run_count = queued_run_count;
+    queued_run_count = 0;
+    const auto queue_start = std::chrono::steady_clock::now();
+    uint64_t total_tile_us = 0;
+    constexpr std::size_t queue_ahead_depth = 256;
+    std::deque<std::pair<mla_job_h, std::size_t>> inflight;
+    std::size_t next = 0;
+    std::string first_error;
+
+    // Submit the complete model sequence before reaping, matching MLA-RT's
+    // legacy pipelined multi-model behavior while retaining one kernel
+    // scheduling boundary per model. The public async pool is capped at 256;
+    // longer queues advance as completed slots become available.
+    while (next < run_count || !inflight.empty()) {
+        while (first_error.empty() && next < run_count &&
+               inflight.size() < queue_ahead_depth) {
+            const auto& queued = queued_runs[next];
+            mla_model_p model = model_for(queued.model_index);
+            if (!model) {
+                first_error = fmt::format(
+                    "MLA model was released before queued execution: {}",
+                    path_for(queued.model_index)
+                );
+                break;
+            }
+            mla_job_h job = nullptr;
+            int rc = mla_submit_async(
+                model,
+                static_cast<int>(queued.ifms.size()), queued.ifms.data(),
+                static_cast<int>(queued.ofms.size()), queued.ofms.data(),
+                &job
+            );
+            if (rc != 0) {
+                first_error = fmt::format(
+                    "MLA-RT queued submit failed for {}: rc={} ({})",
+                    path_for(queued.model_index), rc,
+                    std::strerror(rc < 0 ? -rc : rc)
+                );
+                break;
+            }
+            inflight.emplace_back(job, queued.model_index);
+            ++next;
+        }
+
+        if (inflight.empty()) break;
+        const auto [job, model_index] = inflight.front();
+        inflight.pop_front();
+        uint64_t tile_us = 0;
+        const int rc = mla_wait(job, &tile_us, nullptr);
+        if (rc != 0 && first_error.empty()) {
+            first_error = fmt::format(
+                "MLA-RT queued wait failed for {}: rc={} ({})",
+                path_for(model_index), rc, std::strerror(rc < 0 ? -rc : rc)
+            );
+        }
+        total_tile_us += tile_us;
+    }
+    if (!first_error.empty()) throw std::runtime_error(first_error);
+    if (_profile) {
+        const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - queue_start
+        ).count();
+        spdlog::info(
+            "MLA-RT queue: {} jobs, total tile={} us, wall={} us",
+            run_count, total_tile_us, wall_us
+        );
+    }
+}
+
+void MLAModelWithBuffer::update_reloc(
+    const std::map<std::string, uint64_t>& reloc_addr_map
+) {
+    if (reloc_addr_map.empty()) return;
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    load();
+    mla_model_p model = model_for(_model_idx);
+    const auto lengths = mla_get_ifm_ofm_len_vector(model).reloc_len_array;
+    if (lengths.size() != reloc_addr_map.size()) {
+        throw std::invalid_argument(fmt::format(
+            "Relocation count for {} is {}, model expects {}",
+            path_for(_model_idx), reloc_addr_map.size(), lengths.size()
+        ));
+    }
+    std::vector<DADDR_LEN> relocs;
+    relocs.reserve(reloc_addr_map.size());
+    std::size_t index = 0;
+    for (const auto& [name, address] : reloc_addr_map) {
+        (void)name;
+        relocs.emplace_back(address, lengths[index++]);
+    }
+    const int rc = mla_update_model_rel(
+        model, 0, nullptr, 0, nullptr,
+        static_cast<int>(relocs.size()), relocs.data()
+    );
+    if (rc <= 0) {
+        throw std::runtime_error(fmt::format(
+            "MLA-RT relocation failed for {}: rc={}", path_for(_model_idx), rc
+        ));
+    }
+}
+
+void MLAModelWithBuffer::load_all_models(
+    std::optional<std::filesystem::path> relative_dir
+) {
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    std::lock_guard registry_lock(state.registry_mutex);
+    require_handle();
+
+    if (!_disable_parallel_load) {
+        std::map<std::filesystem::path, uint16_t> batch_paths;
+        for (const auto& [path, index] : state.path_to_index) {
+            if (!state.models[index] && path_matches_family(path, relative_dir)) {
+                if (batch_paths.size() > std::numeric_limits<uint16_t>::max()) {
+                    throw std::overflow_error("MLA model batch exceeds MLA-RT index range");
+                }
+                batch_paths.emplace(path, static_cast<uint16_t>(batch_paths.size()));
+            }
+        }
+        if (!batch_paths.empty()) {
+            std::vector<mla_model_p> batch_models(batch_paths.size(), nullptr);
+            mla_load_model_multi(state.handle, batch_paths, batch_models, std::nullopt);
+            for (const auto& [path, batch_index] : batch_paths) {
+                auto model = batch_models[batch_index];
+                if (!model) {
+                    throw std::runtime_error(fmt::format(
+                        "MLA-RT bulk load failed for model: {}", path
+                    ));
+                }
+                state.models[state.path_to_index.at(path)] = model;
+                spdlog::info("Loaded model: {}", path);
+            }
+        }
+        return;
+    }
+
+    for (const auto& [path, index] : state.path_to_index) {
+        if (state.models[index] || !path_matches_family(path, relative_dir)) continue;
+        state.models[index] = mla_load_model(state.handle, path.c_str());
+        if (!state.models[index]) {
+            throw std::runtime_error(fmt::format("MLA-RT failed to load model: {}", path));
+        }
+        spdlog::info("Loaded model: {}", path);
+    }
+}
+
+void MLAModelWithBuffer::free_all_models(
+    std::optional<std::filesystem::path> relative_dir
+) {
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    std::lock_guard registry_lock(state.registry_mutex);
+    for (std::size_t i = 0; i < state.models.size(); ++i) {
+        if (!state.models[i] || !path_matches_family(state.paths[i], relative_dir)) continue;
+        mla_free_model(state.models[i]);
+        state.models[i] = nullptr;
+    }
+}
 
 void MLAModelWithBuffer::_bind_ifm(
     uint8_t index,
@@ -290,7 +597,6 @@ void MLAModelWithBuffer::_bind_ifm(
     _ifms.at(index)._bind(buffer, begins);
 }
 
-
 void MLAModelWithBuffer::_bind_ofm(
     uint8_t index,
     MLABuffer* buffer,
@@ -299,273 +605,32 @@ void MLAModelWithBuffer::_bind_ofm(
     _ofms.at(index)._bind(buffer, begins);
 }
 
-
-void MLAModelWithBuffer::run(
-    std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
-    std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
-) {
-    load();
-
-    _debug_inouts("ifm", ifm_map_ptr);
-
-    auto* dispatcher = _get_dispatcher();
-    _prepare_run(_prepared_plan, ifm_map_ptr, ofm_map_ptr);
-    const auto run_ref = _make_run_ref(_prepared_plan, _unique_model_ptrs[_model_idx]);
-
-    simaaidispatcher::JobMLA job;
-    job.handle = run_ref.handle;
-    job.batchSize = 1;
-    job.batchModel = 1;
-    job.prepared = &_prepared_plan;
-    auto result = submit_prepared_and_wait(dispatcher, std::move(job));
-    if (result.rc != 0) {
-        throw std::runtime_error(fmt::format(
-            "MLASHM dispatcher run failed for {}: rc={} ({})",
-            _unique_model_paths[_model_idx],
-            result.rc,
-            result.detail.empty() ? dispatcher->lastErrorString() : result.detail
-        ));
-    }
-
-    _debug_inouts("ofm", ofm_map_ptr);
-}
-
-
-void MLAModelWithBuffer::add_to_queue(
-    std::map<uint8_t, MLABufferSlice>* ifm_map_ptr,
-    std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
-) {
-    if (!MLAModelWithBuffer::_enable_queue) {
-        // Run queue is disabled. Run the model immediately.
-        return run(ifm_map_ptr, ofm_map_ptr);
-    }
-
-    load();
-    const std::size_t slot = MLAModelWithBuffer::_queued_plan_count;
-    if (slot == MLAModelWithBuffer::_queued_plans.size()) {
-        MLAModelWithBuffer::_queued_plans.emplace_back();
-        MLAModelWithBuffer::_queued_handles.emplace_back(nullptr);
-    }
-    _prepare_run(MLAModelWithBuffer::_queued_plans[slot], ifm_map_ptr, ofm_map_ptr);
-    MLAModelWithBuffer::_queued_handles[slot] = _unique_model_ptrs[_model_idx];
-    ++MLAModelWithBuffer::_queued_plan_count;
-}
-
-
-void MLAModelWithBuffer::run_queue() {
-    if (!MLAModelWithBuffer::_enable_queue || MLAModelWithBuffer::_queued_plan_count == 0) return;
-
-    auto* dispatcher = _get_dispatcher();
-    try {
-        MLAModelWithBuffer::_queue_request.runs.clear();
-        MLAModelWithBuffer::_queue_request.runs.reserve(
-            MLAModelWithBuffer::_queued_plan_count
-        );
-        for (std::size_t i = 0; i < MLAModelWithBuffer::_queued_plan_count; ++i) {
-            MLAModelWithBuffer::_queue_request.runs.push_back(
-                _make_run_ref(
-                    MLAModelWithBuffer::_queued_plans[i],
-                    MLAModelWithBuffer::_queued_handles[i]
-                )
-            );
-        }
-        auto result = submit_queue_and_wait(
-            dispatcher,
-            std::move(MLAModelWithBuffer::_queue_request)
-        );
-        if (result.rc != 0) {
-            throw std::runtime_error(fmt::format(
-                "MLASHM dispatcher runQueue failed: rc={} failed_index={} ({})",
-                result.rc,
-                result.failed_index,
-                result.detail.empty() ? dispatcher->lastErrorString() : result.detail
-            ));
-        }
-    } catch (...) {
-        MLAModelWithBuffer::_queue_request = {};
-        MLAModelWithBuffer::_queued_plan_count = 0;
-        throw;
-    }
-    MLAModelWithBuffer::_queue_request = {};
-    MLAModelWithBuffer::_queued_plan_count = 0;
-}
-
-
-void MLAModelWithBuffer::update_reloc(const std::map<std::string, uint64_t>& reloc_addr_map) {
-    if (reloc_addr_map.empty()) return;
-
-    load();
-    std::vector<DADDR_LEN> reloc_addrs;
-    reloc_addrs.reserve(reloc_addr_map.size());
-    for (const auto& [_, addr]: reloc_addr_map) {
-        (void)_;
-        reloc_addrs.emplace_back(static_cast<DADDR>(addr), 0);
-    }
-
-    auto* dispatcher = _get_dispatcher();
-    const int rc = dispatcher->updateReloc(_unique_model_ptrs[_model_idx], reloc_addrs);
-    if (rc != 0) {
-        throw std::runtime_error(fmt::format(
-            "Failed to update relocations through MLASHM dispatcher: {} rc={} ({})",
-            _unique_model_paths[_model_idx],
-            rc,
-            dispatcher->lastErrorString()
-        ));
-    }
-}
-
-
-void MLAModelWithBuffer::load_all_models(
-    std::optional<std::filesystem::path> relative_dir
-) {
-    auto* dispatcher = _get_dispatcher();
-    std::vector<std::filesystem::path> file_names;
-    std::vector<uint16_t> indices;
-    for (const auto& [file_name, idx]: _unique_model_path_to_idx_map) {
-        if (relative_dir.has_value() && !file_name.string().starts_with(relative_dir.value().string())) {
-            continue;
-        }
-        if (_unique_model_ptrs[idx]) {
-            continue;
-        }
-        file_names.push_back(file_name);
-        indices.push_back(idx);
-    }
-
-    if (file_names.empty()) {
-        return;
-    }
-
-    if (!_disable_parallel_load) {
-        std::vector<std::string> paths;
-        paths.reserve(file_names.size());
-        for (const auto& file_name: file_names) {
-            paths.push_back(std::filesystem::absolute(file_name).string());
-        }
-        auto handles = dispatcher->loadMany(paths);
-        if (handles.size() != file_names.size()) {
-            throw std::runtime_error(fmt::format(
-                "Bulk MLASHM model load returned {} handles for {} models ({})",
-                handles.size(),
-                file_names.size(),
-                dispatcher->lastErrorString()
-            ));
-        }
-        for (std::size_t i = 0; i < file_names.size(); ++i) {
-            _unique_model_ptrs[indices[i]] = handles[i];
-            if (!_unique_model_ptrs[indices[i]]) {
-                throw std::runtime_error(fmt::format(
-                    "Failed to bulk load model through MLASHM dispatcher: {} ({})",
-                    file_names[i],
-                    dispatcher->lastErrorString()
-                ));
-            }
-            spdlog::info("Loaded model: {}", file_names[i]);
-        }
-        return;
-    }
-
-    for (std::size_t i = 0; i < file_names.size(); ++i) {
-        const auto model_path = std::filesystem::absolute(file_names[i]);
-        _unique_model_ptrs[indices[i]] = dispatcher->load(model_path.string());
-        if (!_unique_model_ptrs[indices[i]]) {
-            throw std::runtime_error(fmt::format(
-                "Failed to load model through MLASHM dispatcher: {} ({})",
-                model_path,
-                dispatcher->lastErrorString()
-            ));
-        }
-        spdlog::info("Loaded model: {}", model_path);
-    }
-}
-
-
-void MLAModelWithBuffer::free_all_models(
-    std::optional<std::filesystem::path> relative_dir
-) {
-    simaaidispatcher::DispatcherBase* dispatcher = nullptr;
-    const auto should_release = [&](std::size_t i) {
-        if (!MLAModelWithBuffer::_unique_model_ptrs[i]) {
-            return false;
-        }
-        return !relative_dir.has_value() ||
-               MLAModelWithBuffer::_unique_model_paths[i].string().starts_with(
-                   relative_dir.value().string());
-    };
-
-    for (std::size_t i = 0; i < MLAModelWithBuffer::_unique_model_paths.size(); ++i) {
-        if (!should_release(i)) {
-            continue;
-        }
-        if (!dispatcher) {
-            dispatcher = _get_dispatcher();
-        }
-        const int rc = dispatcher->release(MLAModelWithBuffer::_unique_model_ptrs[i]);
-        if (rc != 0) {
-            spdlog::error(
-                "Failed to release model through MLASHM dispatcher: {} ({})",
-                MLAModelWithBuffer::_unique_model_paths[i],
-                dispatcher->lastErrorString()
-            );
-        }
-        MLAModelWithBuffer::_unique_model_ptrs[i] = nullptr;
-    }
-}
-
-
 void MLAModelWithBuffer::_debug_inouts(
-    const std::string& name, std::map<uint8_t, MLABufferSlice>* fm_map_ptr
+    const std::string& name,
+    std::map<uint8_t, MLABufferSlice>* fm_map_ptr
 ) {
-    if (_print_inouts) {
-        auto& fms = (name == "ifm")? _ifms : _ofms;
-        std::ostringstream print_buffer;
-        print_buffer << _unique_model_paths[_model_idx] << std::endl;
-        for (uint32_t i = 0; i < fms.size(); ++i) {
-            print_buffer << name << i << " ";
-            if (fm_map_ptr && fm_map_ptr->contains(i)) {
-                auto& buf_slice = fm_map_ptr->at(i);
-                auto buf_ptr = (
-                    buf_slice.get_buf_ptr()? buf_slice.get_buf_ptr() : fms[i].get_buf_ptr()
-                );
-                const auto begins = buf_slice.get_buf_begins().value();
-                const auto shapes = buf_slice.get_buf_shapes().value();
-                print_buffer << MLABufferSlice(buf_ptr, begins, shapes);
-            } else {
-                print_buffer << fms[i];
-            }
-            spdlog::info("{}", print_buffer.str());
-            print_buffer.str("");
-            print_buffer.clear();
+    if (!_print_inouts && !_save_inouts) return;
+    auto& defaults = name == "ifm" ? _ifms : _ofms;
+    validate_override_indices(fm_map_ptr, defaults.size(), name.c_str());
+    for (std::size_t i = 0; i < defaults.size(); ++i) {
+        const auto& slice = effective_slice(defaults, fm_map_ptr, i);
+        MLABuffer* buffer = effective_buffer(defaults, slice, i);
+        const auto view = materialize_view(buffer, slice);
+
+        if (_print_inouts) {
+            std::ostringstream output;
+            output << path_for(_model_idx) << '\n' << name << i << ' ' << view;
+            spdlog::info("{}", output.str());
+        }
+        if (_save_inouts) {
+            const auto directory = std::filesystem::path(_save_inout_dir)
+                / path_for(_model_idx).stem() / fmt::format("{}{}", name, i);
+            std::filesystem::create_directories(directory);
+            const auto file = directory / fmt::format("{}.bin", count_regular_files(directory));
+            view.to_file(file);
         }
     }
-
-    if (_save_inouts) {
-        auto& fms = (name == "ifm")? _ifms : _ofms;
-        for (uint32_t i = 0; i < fms.size(); ++i) {
-            std::filesystem::path d = (
-                _save_inout_dir
-                / _unique_model_paths[_model_idx].stem()
-                / (name + std::to_string(i))
-            );
-            std::filesystem::create_directories(d);
-            auto num_files = count_regular_files(d);
-            std::filesystem::path fn = d / fmt::format("{}.bin", num_files);
-            if (fm_map_ptr && fm_map_ptr->contains(i)) {
-                auto& buf_slice = fm_map_ptr->at(i);
-                auto buf_ptr = (
-                    buf_slice.get_buf_ptr()? buf_slice.get_buf_ptr() : fms[i].get_buf_ptr()
-                );
-                const auto begins = buf_slice.get_buf_begins().value();
-                const auto shapes = buf_slice.get_buf_shapes().value();
-                MLABufferSlice(buf_ptr, begins, shapes).to_file(fn);
-            } else {
-                fms[i].to_file(fn);
-            }
-        }
-    }
-
 }
-
 
 }
 }

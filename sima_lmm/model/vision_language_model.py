@@ -16,7 +16,7 @@ from sima_lmm.model.base import (
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
-from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
+from sima_lmm.logging import sima_log_info, sima_log_warning
 
 
 

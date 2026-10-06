@@ -139,7 +139,7 @@ python -P -m pytest \
 ./build.sh --all --clean
 ```
 
-이 작업은 빌드를 수행하지만 테스트는 실행하지 않습니다. 호환되는 LLiMa 및 내부 패키지를 Modalix에 설치하고, 추가 아카이브를 추출한 다음, `tests/README.md`에 있는 DevKit 런타임 테스트 지침에 따라 패키지화된 CTest 및 pytest를 실행합니다.
+이 작업은 빌드만 수행하며 테스트는 실행하지 않습니다. Modalix에 일치하는 후보 LLiMa 패키지를 설치하고, 추가 아카이브를 추출한 다음, `tests/README.md`의 DevKit 런타임 테스트 지침에 따라 패키지화된 CTest와 pytest를 실행합니다.
 
 모델 로딩, 추론, 토큰화, 다중 모달 전처리, 추론 디코딩, CLI/HTTP/ZMQ 또는 리소스 수명 주기에 변경 사항이 적용될 때 관련 하드웨어 테스트를 실행합니다. 필요한 경우 대표적인 간단한 테스트를 추가합니다.
 

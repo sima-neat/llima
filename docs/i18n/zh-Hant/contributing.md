@@ -139,7 +139,7 @@ python -P -m pytest \
 ./build.sh --all --clean
 ```
 
-這會編譯程式碼，但不會執行測試。請安裝相符的 LLiMa 候選模型，以及在 Modalix 上安裝相關的內部元件套件。接著，解壓縮額外的檔案，並按照 `tests/README.md` 中 DevKit 執行階段測試的說明，執行封裝後的 CTest 和 pytest。
+這會建置程式碼，但不會執行測試。請在 Modalix 上安裝相符的候選 LLiMa 套件、解壓縮額外的封存檔，並按照 `tests/README.md` 中的 DevKit 執行階段測試說明，執行封裝的 CTest 和 pytest。
 
 當程式碼變更影響到模型載入、推論、分詞、多模態預處理、推測式解碼、CLI/HTTP/ZMQ 或資源生命週期時，請執行相關的硬體測試。必要時，新增一個具有代表性的簡短測試。
 

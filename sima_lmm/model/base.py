@@ -43,7 +43,7 @@ from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.model.onnx_builder import OnnxBuilder
 from sima_lmm.model.sima_analysis import get_tessellate_parameters
 from sima_lmm.preproc.vlm_helper import VlmHelper
-from sima_utils.logging.sima_logger import (
+from sima_lmm.logging import (
     ScopedLogLevel, sima_log_exception, sima_log_dbg, sima_log_info
 )
 
