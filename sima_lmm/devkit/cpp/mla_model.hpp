@@ -42,7 +42,7 @@ class MLAModelWithBuffer {
             std::map<uint8_t, MLABufferSlice>* ifm_map_ptr = nullptr,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr = nullptr
         );
-        void update_reloc(const std::map<std::string, uint64_t>& reloc_addr_map);
+        void update_reloc(const std::map<std::string, MLABuffer*>& reloc_buffers);
 
         static void run_queue();
         // Existing disk-loading overload.

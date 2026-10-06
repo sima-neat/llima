@@ -2787,7 +2787,7 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         uint16_t expert_idx;
         auto operator<=>(const RelocMapType&) const = default;
     };
-    using RelocMap = std::map<std::string, uint64_t>;
+    using RelocMap = std::map<std::string, MLABuffer*>;
 
     // Allocate the memory for the new content to be relocated and collect the maps of the addresses
     // to relocate the models' dma descriptors.
@@ -2847,8 +2847,9 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         // Upload the tensor.
         buf.upload(tensor.data<void>());
 
-        // Append the reloc addr map.
-        reloc_addr_maps[model_key][buffer_name] = buf.get_buf_addr();
+        // Append the reloc buffer map. The buf_id reloc path imports the
+        // adapter's DMA-BUF in update_reloc rather than taking its address.
+        reloc_addr_maps[model_key][buffer_name] = &buf;
     }
 
     // Relocation the dma descriptors
