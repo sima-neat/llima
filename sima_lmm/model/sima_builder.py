@@ -2,8 +2,6 @@ import math
 import numpy as np
 from typing import Callable, Sequence
 
-from sima_utils.common import Platform
-
 from afe.backends.backends import Backend
 import afe.ir.attributes as attributes
 from afe.ir.attributes import ConvAttrs

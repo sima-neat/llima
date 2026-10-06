@@ -63,7 +63,9 @@ def write_command(path: Path, body: str) -> None:
 
 
 def run_installer(
-    tmp_path: Path, replacement_version: str
+    tmp_path: Path,
+    removed_package: str = "",
+    extra_package: str = "",
 ) -> subprocess.CompletedProcess:
     bundle = tmp_path / "bundle"
     commands = tmp_path / "commands"
@@ -71,26 +73,20 @@ def run_installer(
     commands.mkdir()
 
     debs = [
-        build_deb(
-            bundle,
-            "neat-common",
-            "0.4.0",
-            provides=f"simaai-common (= {replacement_version})",
-            replaces="simaai-common",
-            conflicts="simaai-common",
-        )
+        build_deb(bundle, package, "0.4.0")
+        for package in ("sima-lmm-core", "sima-lmm-cli", "sima-lmm-dev")
     ]
-    for package in ("sima-lmm-core", "sima-lmm-cli", "sima-lmm-dev"):
-        debs.append(build_deb(bundle, package, "0.4.0"))
+    if extra_package:
+        debs.append(build_deb(bundle, extra_package, "0.4.0"))
     (bundle / "llima-install-manifest.txt").write_text(
         "".join(f"{deb.name}\n" for deb in debs)
     )
 
     write_command(
         commands / "apt-get",
-        """
-if [[ " $* " == *" --simulate "* ]]; then
-  echo "Remv simaai-common [2.1.3~pre4678]"
+        f"""
+if [[ " $* " == *" --simulate "* && -n {removed_package!r} ]]; then
+  echo "Remv {removed_package} [3.0.0]"
 fi
 exit 0
 """,
@@ -100,8 +96,7 @@ exit 0
         """
 package="${!#}"
 case "${package}" in
-  simaai-common) echo "2.1.3~pre4678" ;;
-  neat-common|sima-lmm-core|sima-lmm-cli|sima-lmm-dev) echo "0.4.0" ;;
+  sima-lmm-core|sima-lmm-cli|sima-lmm-dev) echo "0.4.0" ;;
   *) exit 1 ;;
 esac
 """,
@@ -116,7 +111,6 @@ exec "$@"
 """,
     )
     write_command(commands / "llima", "exit 0\n")
-
     installer = bundle / "install_llima.sh"
     installer.write_bytes((ROOT / "tools/install_llima.sh").read_bytes())
     installer.chmod(0o755)
@@ -134,19 +128,25 @@ exec "$@"
 
 
 @requires_associative_arrays
-def test_installer_allows_exact_identity_preserving_replacement(tmp_path: Path) -> None:
-    result = run_installer(tmp_path, "2.1.3~pre4678")
+def test_installer_accepts_the_three_llima_packages(tmp_path: Path) -> None:
+    result = run_installer(tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Verified platform package replacements" in result.stdout
-    assert "simaai-common=2.1.3~pre4678" in result.stdout
+    assert "Validated 3 Debian package(s)" in result.stdout
+    assert "LLiMa 0.4.0 installed successfully" in result.stdout
 
 
 @requires_associative_arrays
-def test_installer_rejects_non_exact_replacement(tmp_path: Path) -> None:
-    result = run_installer(tmp_path, "2.1.3")
+def test_installer_rejects_removing_unrelated_platform_package(tmp_path: Path) -> None:
+    result = run_installer(tmp_path, "simaai-common")
 
     assert result.returncode != 0
-    assert "without a bundled package that Provides its exact installed version" in (
-        result.stderr
-    )
+    assert "Refusing to install because APT would remove simaai-common" in result.stderr
+
+
+@requires_associative_arrays
+def test_installer_rejects_non_llima_packages(tmp_path: Path) -> None:
+    result = run_installer(tmp_path, extra_package="neat-runtime")
+
+    assert result.returncode != 0
+    assert "Install bundle contains unexpected package neat-runtime" in result.stderr
