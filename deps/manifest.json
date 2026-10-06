@@ -2,7 +2,7 @@
   "sdk": {
     "channel": "develop"
   },
-  "package-version": "0.4.0",
+  "package-version": "0.5.0",
   "platform-version": "3.0.0",
   "sysroot-version": "3.0.0~git202610040121.2e0f59b-1859"
 }

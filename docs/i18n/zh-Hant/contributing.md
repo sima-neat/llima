@@ -95,6 +95,8 @@ python scripts/gen_models--openai--whisper.py \
 在 Model Compiler 環境中執行，並明確指定模型路徑。
 `--part` 接受 `all`、`encoder`、`language_detect`、`init`、`single_pre`、`single_post`，以及 `single_cache`。新增 `--enable_log_probe` 以編譯啟用日誌探測功能的解碼器輸出；使用 `--part all --enable_log_probe` 以進行完整的日誌探測建置。
 
+Whisper 模型儲存庫中，每個編碼器層各有一個 ELF。執行階段不支援編碼器 ELF 為單一整體的舊版儲存庫；請下載分層模型，或使用目前的 LLiMa 版本重新編譯檢查點。
+
 編譯器變更通常會影響 `sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py` 和腳本；執行階段變更會影響 `sima_lmm/devkit/cpp/whisper_*`。使用封裝的 C++ ASR 執行階段測試進行驗證，該測試的相關檔案位於 `tests/README.md` 中，並使用 Modalix 上的代表性音訊進行測試。這是一個 Whisper 專用的路徑，而不是一個通用的 ASR 架構框架。
 
 ## 測試
@@ -137,7 +139,7 @@ python -P -m pytest \
 ./build.sh --all --clean
 ```
 
-這會編譯程式碼，但不會執行測試。請安裝相符的 LLiMa 候選模型，以及在 Modalix 上安裝相關的內部元件套件。接著，解壓縮額外的檔案，並按照 `tests/README.md` 中 DevKit 執行階段測試的說明，執行封裝後的 CTest 和 pytest。
+這會建置程式碼，但不會執行測試。請在 Modalix 上安裝相符的候選 LLiMa 套件、解壓縮額外的封存檔，並按照 `tests/README.md` 中的 DevKit 執行階段測試說明，執行封裝的 CTest 和 pytest。
 
 當程式碼變更影響到模型載入、推論、分詞、多模態預處理、推測式解碼、CLI/HTTP/ZMQ 或資源生命週期時，請執行相關的硬體測試。必要時，新增一個具有代表性的簡短測試。
 
