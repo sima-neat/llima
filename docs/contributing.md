@@ -175,7 +175,7 @@ outer outputs are extracted. Pass the graph itself to component helpers; inputs,
 precision and source weights remain bound to the same object.
 
 Common operations include `add`, `sub`, `mul`, `matmul`, `concat`, `slice`,
-`transpose`, `reshape`, `softmax`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`,
+`transpose`, `reshape`, `softmax`, `topk`, `sum_channels`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`,
 `activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`,
 `clip`, `avgpool2d`, `space_to_depth`, `quant`, and `dequant`. A gated MLP uses
 `projections=("gate_proj", "up_proj", "down_proj")`; the default is

@@ -67,6 +67,20 @@ class LanguagePostModel(LanguagePostBaseModel):
         base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        if self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0:
+            graph = ModelGraph(self, {
+                "norm_hidden": input_shape,
+                "router": (1, 1, self.num_tokens, self.cfg.lm_cfg.moe_cfg.num_experts),
+            }, quantizable)
+            mlp_base = f"{base_name}.mlp.experts.{self.expert_idx}"
+            if not self.check_hf_param(f"{mlp_base}.gate_proj.weight"):
+                mlp_base = f"{base_name}.mlp"
+            expert = self._build_mlp(graph, mlp_base, [graph.inputs["norm_hidden"]], merged_lora)
+            weight = graph.slice(
+                graph.inputs["router"], start=self.expert_idx, stop=self.expert_idx + 1, axis=-1
+            )
+            graph.save([graph.mul(expert, weight)])
+            return
         scale_shape = (1, 1, self.num_tokens, 1)
         self_attn_shape = (
             1,

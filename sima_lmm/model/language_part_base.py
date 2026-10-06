@@ -12,7 +12,7 @@ class LanguagePartBaseModel(BaseModel):
     def _build_mlp(
         self, graph, base_name: str, input_nodes: list[Node], merged_lora: bool = False, with_residual_add: bool =  False
     ) -> Node:
-        """Build SiMa nodes for the MLP block with optional splitting.
+        """Build the MLP using the model's projection, expert and LoRA configuration.
 
         Handles both LFM2-style weights (w1/w2/w3) and standard weights (gate_proj/up_proj/down_proj).
         """
@@ -20,13 +20,24 @@ class LanguagePartBaseModel(BaseModel):
         projections = ("w1", "w3", "w2") if self.check_hf_param(f"{base_name}.w2.weight") else (
             "gate_proj", "up_proj", "down_proj"
         )
-        ranks = {
-            name: self.cfg.lm_cfg.get_lora_rank(base_name, name) for name in projections
-        } if self.cfg.lm_cfg.lora_cfg is not None else None
+        expert_idx = getattr(self, "expert_idx", -1)
+        ranks = {}
+        if self.cfg.lm_cfg.lora_cfg is not None:
+            bundled = {
+                "gate_proj": "experts.gate_up_proj", "up_proj": "experts.gate_up_proj",
+                "down_proj": "experts.down_proj",
+            }
+            for name in projections:
+                rank = self.cfg.lm_cfg.get_lora_rank(base_name, name)
+                if rank is None and expert_idx >= 0:
+                    rank = self.cfg.lm_cfg.get_lora_rank(base_name, bundled[name])
+                ranks[name] = rank
         return graph.mlp(
             base_name, input_nodes[0], self.cfg.lm_cfg.mlp_cfg.act,
             projections=projections, residual=input_nodes[1] if with_residual_add else None,
-            lora_ranks=ranks, merged_lora=merged_lora,
+            lora_ranks=ranks, merged_lora=merged_lora, expert_idx=expert_idx,
+            de_interleave=self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS,
+            swiglu_limit=self.cfg.lm_cfg.mlp_cfg.swiglu_limit,
         )
 
     @property
@@ -55,6 +66,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
     num_tokens: int
     layer_idx: int
     final_softcapping: float | None
+    expert_idx: int = -1
 
     def _build_post_transformer(self, graph, input_node) -> Node:
         """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""

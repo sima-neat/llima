@@ -7,7 +7,7 @@ import numpy as np
 from afe.apis.defines import gen2_target
 from afe.backends.backends import Backend
 from afe.ir.attributes import ClipAttrs, ConvAttrs, ReluAttrs
-from afe.ir.build_node import NodeOrHandle, as_handle
+from afe.ir.build_node import NodeOrHandle, TopKRetType, as_handle
 from afe.ir.defines import Status, get_expected_tensor_value
 from afe.ir.net import AwesomeNet
 from afe.ir.node import AwesomeNode
@@ -54,6 +54,8 @@ class WeightOptions(TypedDict, total=False):
     kv_size: int
     relocatable: bool
     activation: ReluAttrs | ClipAttrs | None
+    expert_idx: int
+    de_interleave: bool
 
 
 def _validate_weight_options(options: dict) -> None:
@@ -132,6 +134,22 @@ class ModelGraph(SimaBuilder):
     def softmax(self, data: NodeOrHandle, axis: int = -1) -> NodeOrHandle:
         """Convert values into probabilities along axis, defaulting to the last axis."""
         return self.create_softmax_node(data, axis)
+
+    def topk(self, data: NodeOrHandle, k: int) -> tuple[NodeOrHandle, NodeOrHandle]:
+        """Return the largest k values and their INT32 indices along the last axis."""
+        return (
+            self.create_topk_node(data, k, TopKRetType.VALUES),
+            self.create_topk_node(data, k, TopKRetType.INDICES),
+        )
+
+    def sum_channels(self, data: NodeOrHandle) -> NodeOrHandle:
+        """Sum the channels of a rank-four tensor through a weightless 1x1 projection."""
+        channels = tensor_type(data).shape[-1]
+        weights = np.ones((1, channels), dtype=np.float32)
+        return self._build_conv(
+            "channel_sum", data, get_param_func=lambda _: weights,
+            check_param_func=lambda name: name.endswith(".weight"),
+        )
 
     def sigmoid(self, data: NodeOrHandle) -> NodeOrHandle:
         """Apply 1 / (1 + exp(-x)) elementwise."""
@@ -236,11 +254,15 @@ class ModelGraph(SimaBuilder):
         if not outputs:
             raise ValueError("A model graph needs at least one output")
         # Explicitly select outputs even when they are not the last nodes created.
-        self.create_tuple_node(list(outputs))
+        if len(outputs) > 1:
+            self.create_tuple_node(list(outputs))
         mla = self.finish_subnet("MLA_0")
+        if len(outputs) == 1:
+            # Keep a tensor output; the compiler can flatten singleton tuples.
+            mla.ir.output_node_name = as_handle(outputs[0]).name
         if transform_subnet is not None:
             transform_subnet(mla.ir)
-        model_outputs = self.create_tuple_get_item_nodes(mla)
+        model_outputs = [mla] if len(outputs) == 1 else self.create_tuple_get_item_nodes(mla)
         for i, output in enumerate(model_outputs):
             if tensor_type(output).scalar == ScalarType.bfloat16:
                 model_outputs[i] = self.cast(output, ScalarType.float32, backend=Backend.EV)
@@ -323,8 +345,13 @@ class ModelGraph(SimaBuilder):
             a_shape = (lora_rank, input_channels)
             b_shape = (output_channels, lora_rank)
 
-            lora_a = self._build_conv_lora(f"{name}.lora_A", data, a_shape)
-            lora_b = self._build_conv_lora(f"{name}.lora_B", lora_a, b_shape)
+            bundled_expert = (
+                kwargs.get("expert_idx", -1) >= 0
+                and not self.model.check_hf_param(f"{name}.weight")
+            )
+            lora_name = f"{name}.expert.{kwargs['expert_idx']}" if bundled_expert else name
+            lora_a = self._build_conv_lora(f"{lora_name}.lora_A", data, a_shape)
+            lora_b = self._build_conv_lora(f"{lora_name}.lora_B", lora_a, b_shape)
             proj = self.create_add_node(proj, lora_b)
         return proj
 
@@ -808,20 +835,44 @@ class ModelGraph(SimaBuilder):
         residual: NodeOrHandle | None = None,
         lora_ranks: dict[str, int | None] | None = None,
         merged_lora: bool = False,
+        expert_idx: int = -1,
+        de_interleave: bool = False,
+        swiglu_limit: float | None = None,
     ) -> NodeOrHandle:
-        """Build two-projection or gated (gate, up, down) MLPs."""
+        """Build dense or expert MLPs, optionally using GPT-OSS's clamped SwiGLU."""
         if len(projections) not in (2, 3):
             raise ValueError("MLP needs two projection names or three names in gate/up/down order")
         ranks = lora_ranks or {}
 
-        def project(proj, node):
-            return self.linear(
-                f"{name}.{proj}", node, lora_rank=ranks.get(proj), merged_lora=merged_lora
+        def project(proj, node, bounds=None):
+            rank = ranks.get(proj)
+            branch_lora = bool(rank) and not merged_lora
+            clip = None
+            if bounds is not None and not branch_lora:
+                input_type = tensor_type(node)
+                channels = self.model.cfg.lm_cfg.get_effective_intermediate_size(self.model.layer_idx)
+                clip = ClipAttrs(
+                    a_min=bounds[0], a_max=bounds[1],
+                    shape=(*input_type.shape[:-1], channels), scalar_type=input_type.scalar,
+                )
+            output = self.linear(
+                f"{name}.{proj}", node, lora_rank=rank, merged_lora=merged_lora,
+                expert_idx=expert_idx, de_interleave=de_interleave, activation=clip,
             )
+            return self.clip(output, *bounds) if bounds is not None and branch_lora else output
 
-        hidden = self.activation(project(projections[0], data), activation)
-        if len(projections) == 3:
-            hidden = self.mul(hidden, project(projections[1], data))
+        if swiglu_limit is not None:
+            if len(projections) != 3:
+                raise ValueError("Clamped SwiGLU needs gate/up/down projections")
+            # The gate has no lower clamp; AFE requires a finite BF16 bound.
+            gate = project(projections[0], data, (-float.fromhex("0x1.fep127"), swiglu_limit))
+            up = project(projections[1], data, (-swiglu_limit, swiglu_limit))
+            glu = self.mul(gate, self.sigmoid(self.mul(gate, self.constant([1.702]))))
+            hidden = self.mul(self.add(up, self.constant([1.0])), glu)
+        else:
+            hidden = self.activation(project(projections[0], data), activation)
+            if len(projections) == 3:
+                hidden = self.mul(hidden, project(projections[1], data))
         output = project(projections[-1], hidden)
         return self.add(residual, output) if residual is not None else output
 
@@ -861,9 +912,26 @@ class ModelGraph(SimaBuilder):
         q_size = kwargs.pop("q_size", None)
         kv_size = kwargs.pop("kv_size", None)
         activation = kwargs.pop("activation", None)
+        expert_idx = kwargs.pop("expert_idx", -1)
+        de_interleave = kwargs.pop("de_interleave", False)
+        bundled_expert = expert_idx >= 0 and not check_param_func(src_weight_name)
+        expert_offset = None
 
         # Some models have bundled weights with a different name for a layer.
-        if not check_param_func(src_weight_name):
+        if bundled_expert:
+            projection = src_weight_name.removesuffix(".weight").rsplit(".", 1)[-1]
+            prefix = src_weight_name.rsplit(".", 2)[0]
+            if projection in ("gate_proj", "up_proj") and de_interleave:
+                src_weight_name = f"{prefix}.experts.gate_up_proj"
+                expert_offset = 0 if projection == "gate_proj" else 1
+            elif projection == "down_proj":
+                src_weight_name = f"{prefix}.experts.down_proj"
+            else:
+                raise NotImplementedError(f"{base_name}: unsupported bundled expert projection")
+            if relocatable:
+                raise NotImplementedError("Bundled MoE experts require LORA_BRANCH, not LORA_MERGED")
+            src_bias_name = f"{src_weight_name}_bias"
+        elif not check_param_func(src_weight_name):
             src_weight_name, partition = self._find_alternate_weight(
                 src_weight_name, q_size, kv_size
             )
@@ -876,6 +944,14 @@ class ModelGraph(SimaBuilder):
         params = get_param_func(src_weight_name)
         scales, weight_tensor, *metadata = params if isinstance(params, tuple) else (None, params)
         c_block_size = metadata[0] if metadata else None
+        if bundled_expert:
+            if scales is not None:
+                raise ValueError(
+                    f"{base_name}: bundled quantized experts need separate output-major weights and scales"
+                )
+            weight_tensor = weight_tensor[expert_idx].T
+            if expert_offset is not None:
+                weight_tensor = weight_tensor[expert_offset::2]
 
         # SiMaIR expects weights in the scales shape (num_c_blocks, out_channels)
         if scales is not None:
@@ -914,6 +990,10 @@ class ModelGraph(SimaBuilder):
 
         if check_param_func(src_bias_name):
             bias_tensor = get_param_func(src_bias_name)
+            if bundled_expert:
+                bias_tensor = bias_tensor[expert_idx].astype(np.float32)
+                if expert_offset is not None:
+                    bias_tensor = bias_tensor[expert_offset::2]
             bias_tensor = bias_process_func(bias_tensor)
             if bias_tensor.dtype in (_bfloat16, np.float16):
                 bias_tensor = bias_tensor.astype(np.float32)

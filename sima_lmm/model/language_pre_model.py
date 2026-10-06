@@ -6,7 +6,7 @@ from afe.apis.defines import TensorDRAMLayout
 from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerConfiguration
 from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.config.vlm_config import VlmArchType
+from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
 @dataclass
@@ -177,6 +177,15 @@ class LanguagePreModel(LanguagePartBaseModel):
             lora_rank=lora_rank,
         )
 
+        q_norm_name = None
+        for suffix in ("q_layernorm", "q_norm"):
+            if self.check_hf_param(f"{base_name}.{suffix}.weight"):
+                q_norm_name = f"{base_name}.{suffix}"
+                break
+
+        if q_norm_name and self.cfg.lm_cfg.arch == LlmArchType.OLMOE:
+            q_proj = graph.rms_norm(q_norm_name, q_proj)
+
         gate_out = None
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
             q_fused = graph.split_heads(q_proj, self.cfg.lm_cfg.attn_cfg.num_attention_heads)
@@ -190,13 +199,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         else:
             reshape1 = q_proj
 
-        q_norm_name = None
-        for suffix in ("q_layernorm", "q_norm"):
-            if self.check_hf_param(f"{base_name}.{suffix}.weight"):
-                q_norm_name = f"{base_name}.{suffix}"
-                break
-
-        if q_norm_name:
+        if q_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(q_norm_name, reshape1)
 
         rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
@@ -231,15 +234,18 @@ class LanguagePreModel(LanguagePartBaseModel):
             lora_rank=lora_rank,
         )
 
-        reshape1 = graph.split_heads(k_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
-
         k_norm_name = None
         for suffix in ("k_layernorm", "k_norm"):
             if self.check_hf_param(f"{base_name}.{suffix}.weight"):
                 k_norm_name = f"{base_name}.{suffix}"
                 break
 
-        if k_norm_name:
+        if k_norm_name and self.cfg.lm_cfg.arch == LlmArchType.OLMOE:
+            k_proj = graph.rms_norm(k_norm_name, k_proj)
+
+        reshape1 = graph.split_heads(k_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
+
+        if k_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(k_norm_name, reshape1)
 
         rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)

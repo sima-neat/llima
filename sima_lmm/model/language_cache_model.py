@@ -159,6 +159,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
             or self._uses_group_future_token_mask
         ):
             input_specs["attn_mask"] = attn_shape
+        if self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS:
+            input_specs["sinks"] = (1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.num_attention_heads)
         input_specs["cached_values"] = kv_tensor_shape
         if quantize_kv_cache:
             input_specs["cached_values_scale"] = kv_scale_shape
@@ -212,7 +214,15 @@ class LanguageCacheModel(LanguagePartBaseModel):
             assert mla_input_attn_mask is not None
             bmm1 = graph.add(bmm1, mla_input_attn_mask)
 
-        softmax = graph.softmax(bmm1, 3)
+        if self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS:
+            sinks = graph.split_concat(
+                inputs["sinks"], axis=1, split_axis=3,
+                split_block=self.cfg.lm_cfg.attn_cfg.num_attention_heads, split_repeat=1,
+            )
+            probabilities = graph.softmax(graph.concat([bmm1, sinks], axis=3))
+            softmax = graph.slice(probabilities, start=0, stop=self.context_length, axis=3)
+        else:
+            softmax = graph.softmax(bmm1, 3)
 
         # Second multiply ((input * key) * value)
         reduction_ranges = _get_bmm2_reduction_ranges(self.context_length)
@@ -250,8 +260,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         """
         tessellate_params = {}
 
-        # Input order: [input, cached_keys, (cached_keys_scale), (attn_mask), cached_values,
-        # (cached_values_scale)]
+        # Input order: input, keys, optional key scales/mask/sinks, values, optional value scales.
 
         # cached_keys
         idx = 1
@@ -299,6 +308,10 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 dram_layout=TensorDRAMLayout.HWC
             )
             tessellate_params[idx] = attn_mask_tessellate_params
+            idx += 1
+
+        # Attention sinks precede values but do not use the strided cache layout.
+        if self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS:
             idx += 1
 
         # cached_values

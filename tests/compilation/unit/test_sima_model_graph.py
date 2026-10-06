@@ -5,7 +5,7 @@ import pytest
 from ml_dtypes import int4
 
 from afe.backends.backends import Backend
-from afe.ir.defines import Status, get_expected_tensor_value
+from afe.ir.defines import Status, TensorValue, TupleValue, get_expected_tensor_value
 from afe.ir.execute import create_node_executor, create_node_quant_executor
 from afe.ir.operations import BatchMatmulOp, ConvAddActivationOp, StridedSliceOp
 from afe.ir.serializer import load_awesomenet
@@ -45,6 +45,8 @@ def test_model_graph_preserves_inputs_and_selected_output_types(quantizable, mul
     transformed = []
     net = graph.finish(outputs, transform_subnet=transformed.append)
     mla = net.nodes["MLA_0"].ir
+    output_type = mla.nodes[mla.output_node_name].get_type().output
+    assert isinstance(output_type, TupleValue if multiple_outputs else TensorValue)
 
     assert net.status == (Status.RELAY if quantizable else Status.SIMA_QUANTIZED)
     assert list(net.input_node_names) == list(specs)
