@@ -179,11 +179,18 @@ receives:
 
 - `layer`: Dictionary with:
   - `"part"`: Logical component such as `"PRE"`, `"CACHE"`, `"POST"`,
-    `"VISION"`, `"DRAFT_FC"`, or `"PER_LAYER"`
+    `"VISION"`, `"DRAFT_FC"`, or `"PER_LAYER"`. Mixture-of-Experts models add
+    `"ROUTER"`, `"EXPERT"`, and `"WEIGHTEDSUM"`.
   - `"is_group"`: `True` for a multi-token/group variant and `False` otherwise
   - `"index"`: Index of that compiler unit. For `"PRE"` and `"POST"` this
     normally corresponds to a transformer layer. For `"CACHE"` it identifies
     a cache or token-position variant rather than a transformer layer.
+  - `"expert_idx"`: Index of the expert within the layer, for `"EXPERT"`
+    records. `-1` for every other part, including all dense models.
+
+  Read the values you need by key. New keys may be added in future releases,
+  so avoid unpacking this dictionary into a fixed argument list or asserting
+  an exact set of keys.
 
 **Return Values**
 
