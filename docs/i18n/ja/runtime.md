@@ -45,6 +45,8 @@ modalix:~$ llima run <model> [options]
 
 利用可能なすべてのオプションについては、`llima run -h` を実行してください。
 
+自動の埋め込みオフロードを無効にし、テーブルを DRAM に保持するには、`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>` を実行してください。
+
 **例**
 
 ``` console
