@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -169,6 +170,24 @@ void test_disk_does_not_pull_files() {
            "disk provider must report pulls_files() == false (parallel load allowed)");
 }
 
+void test_provider_root_alias_is_rejected() {
+    using Base = simaai::llima::BaseModel<simaai::llima::WhisperConfig>;
+    struct RootProbe : Base {
+        RootProbe(const std::filesystem::path& root, std::shared_ptr<FileProvider> files)
+            : Base(root, std::move(files)) {}
+    };
+    TempModel model;
+    const auto alias = model.root / "alias";
+    std::filesystem::create_directory_symlink(model.root, alias);
+    bool rejected = false;
+    try {
+        RootProbe probe(alias, std::make_shared<DiskFileProvider>(model.root));
+    } catch (const std::invalid_argument& e) {
+        rejected = std::string(e.what()).find("FileProvider ELF location") != std::string::npos;
+    }
+    expect(rejected, "provider root aliases must be rejected before model loading");
+}
+
 void test_whisper_preprocessor_directory_and_provider() {
     TempModel model;
     const auto custom = model.root / "custom preprocessing directory";
@@ -197,6 +216,7 @@ int main() {
         test_fetch_and_evict_are_no_ops_on_disk();
         test_open_stream_missing_file_throws();
         test_disk_does_not_pull_files();
+        test_provider_root_alias_is_rejected();
         test_whisper_preprocessor_directory_and_provider();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: unexpected exception: " << e.what() << '\n';

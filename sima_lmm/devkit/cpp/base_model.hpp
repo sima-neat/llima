@@ -77,8 +77,9 @@ class BaseModel {
 
         virtual ~BaseModel() { if (!_buf_map.empty()) _finalize(); }
         void _validate_provider_root() {
-            if (std::filesystem::weakly_canonical(_files->reserve("elf_files"))
-                != std::filesystem::weakly_canonical(_elf_dir)) {
+            // Match the lexical representation used by MLA load/free selectors.
+            if (std::filesystem::absolute(_files->reserve("elf_files")).lexically_normal()
+                != std::filesystem::absolute(_elf_dir).lexically_normal()) {
                 throw std::invalid_argument(
                     "FileProvider ELF location does not match model_path; "
                     "pass the provider's staging root as model_path"
