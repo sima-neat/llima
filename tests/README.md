@@ -103,18 +103,20 @@ This protects:
 
 - Location: `tests/compilation/source_ingestion/`
 - Marker: `compiler_source`
-- Expected cases: 15
+- Expected cases: 5
 
 This group validates:
 
 - GGUF parser detection for Q8_0 and Q4_0 inputs.
-- Dequantization for Q8_0, Q4_0, Q6_K, Q5_K, Q4_K, and Q3_K.
+- Two exhaustive dequantization cases: Q8_0 and Q4_0.
 - Numerical comparison with the BF16 GGUF reference and GGUF library.
 - Resolution of Hugging Face weight names to GGUF weights.
-- Shape agreement between Hugging Face and GGUF weights.
+- Shape agreement between Hugging Face and BF16 GGUF weights.
 
-The comparisons are exhaustive across model tensors. Reference weights are
-shared across quantization variants where possible.
+The two numerical comparisons are exhaustive across model tensors and share
+the BF16 reference weights. Weight-name and shape checks use BF16 once because
+the mapping is independent of quantization format. Fast unit tests retain
+coverage of the other GGUF quantization formats.
 
 #### Native graph generation and validation
 
@@ -165,7 +167,7 @@ are not stored in the repository or artifact cache.
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 40 standard and 6 high-memory
+- Expected cases: 31 standard and 6 high-memory
 
 This group validates:
 
@@ -173,10 +175,10 @@ This group validates:
 - Staged native FP32 graph quantization versus direct quantized generation.
 - Whisper SiMa graph numerical and output-contract comparisons against Hugging Face, including
   BF16/INT8 quantization, using deterministic synthetic weights.
-- GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
+- One Q4_0 GGUF pre-layer graph smoke case against a Hugging Face BF16 graph.
 - Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are serial and high-memory. CI runs the 40
+The speculative-decoding cases are serial and high-memory. CI runs the 31
 standard cases first and the 6 high-memory cases separately.
 
 #### Selected-model full compilation E2E
