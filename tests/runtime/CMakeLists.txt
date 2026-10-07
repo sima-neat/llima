@@ -63,6 +63,8 @@ target_link_libraries(
     PRIVATE
         sima_lmm_runtime
 )
+# Keep the parser assertions active in release/package builds.
+target_compile_options(sima_lmm_reasoning_parser_test PRIVATE -UNDEBUG)
 set_target_properties(
     sima_lmm_embedding_offload_generation_test
     sima_lmm_embedding_offload_test

@@ -65,7 +65,9 @@ std::optional<std::string> VisionLanguageModel::run_model(
             "Thinking is not supported for model type '" + _cfg.model_type + "'"
         );
     }
-    if (chat.get_enable_thinking()) {
+    // gpt_oss always emits harmony channel tokens; preserve them even with
+    // thinking off so the parser can strip to the final channel.
+    if (chat.get_enable_thinking() || reasoning_format == ReasoningFormat::GptOss) {
         for (const auto marker : reasoning_special_tokens(reasoning_format)) {
             try {
                 preserved_tokens.emplace_back(
