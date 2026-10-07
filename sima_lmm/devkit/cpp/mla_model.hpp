@@ -15,6 +15,7 @@
 namespace simaai {
 namespace llima {
 
+class FileProvider;  // forward declaration; full type in file_provider.hpp
 class LanguageModel;
 
 void connect_mla_rt(const std::vector<std::string>& args);
@@ -44,8 +45,14 @@ class MLAModelWithBuffer {
         void update_reloc(const std::map<std::string, uint64_t>& reloc_addr_map);
 
         static void run_queue();
+        // Existing disk-loading overload.
         static void load_all_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt
+        );
+        // Loads through files (nullptr = from disk).
+        static void load_all_models(
+            std::optional<std::filesystem::path> relative_dir,
+            FileProvider* files
         );
         static void free_all_models(
             std::optional<std::filesystem::path> relative_dir = std::nullopt

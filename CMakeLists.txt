@@ -418,6 +418,7 @@ endif()
 
 set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/base_model.hpp
+    sima_lmm/devkit/cpp/file_provider.hpp
     sima_lmm/devkit/cpp/chat.hpp
     sima_lmm/devkit/cpp/eagle_helpers.hpp
     sima_lmm/devkit/cpp/eigen_types.hpp

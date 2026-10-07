@@ -719,10 +719,11 @@ void LanguageModel::_define_draft_fc_models() {
         num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     for (const auto& num_tokens : num_tokens_vec) {
-        auto elf_path = _elf_dir / fmt::format(
-            "{}_n{}_draft_fc_stage1_mla.elf",
+        // Reserve ELF paths now; deferred providers fetch them at MLA load time.
+        auto elf_path = _files->reserve(fmt::format(
+            "elf_files/{}_n{}_draft_fc_stage1_mla.elf",
             _cfg.language_model_name, num_tokens
-        );
+        ));
         std::vector<MLABufferSlice> ifms{
             MLABufferSlice{&get_buffer(fmt::format("fc_n{}_input", num_tokens))}
         };
@@ -801,7 +802,7 @@ std::filesystem::path LanguageModel::_get_elf_path_pre(uint16_t num_tokens, uint
     auto elf_file_name = fmt::format(
         "{}_n{}_pre_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -818,7 +819,7 @@ std::filesystem::path LanguageModel::_get_elf_path_cache(
         cache_name,
         token_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -826,7 +827,7 @@ std::filesystem::path LanguageModel::_get_elf_path_post(uint16_t num_tokens, uin
     auto elf_file_name = fmt::format(
         "{}_n{}_post_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -834,7 +835,7 @@ std::filesystem::path LanguageModel::_get_elf_path_router(uint16_t num_tokens, u
     auto elf_file_name = fmt::format(
         "{}_n{}_router_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -846,7 +847,7 @@ std::filesystem::path LanguageModel::_get_elf_path_expert(
         "{}_n{}_post_layer{}_expert{}_stage1_mla.elf",
         _cfg.language_model_name, num_tokens, layer_idx, expert_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -857,7 +858,7 @@ std::filesystem::path LanguageModel::_get_elf_path_weightedsum(
         "{}_n{}_moe_weightedsum_layer{}_stage1_mla.elf",
         _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -865,7 +866,7 @@ std::filesystem::path LanguageModel::_get_elf_path_conv(uint16_t num_tokens, uin
     auto elf_file_name = fmt::format(
         "{}_n{}_layer{}_conv_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -873,7 +874,7 @@ std::filesystem::path LanguageModel::_get_elf_path_conv_final(uint8_t layer_idx)
     auto elf_file_name = fmt::format(
         "{}_n1_post_layer{}_conv_final_stage1_mla.elf", _cfg.language_model_name, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -881,7 +882,7 @@ std::filesystem::path LanguageModel::_get_elf_path_per_layer(uint16_t num_tokens
     auto elf_file_name = fmt::format(
         "{}_n{}_per_layer_stage1_mla.elf", _cfg.language_model_name, num_tokens
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -894,7 +895,7 @@ std::filesystem::path LanguageModel::_get_elf_path_linear(
         num_tokens,
         layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 

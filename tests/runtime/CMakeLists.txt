@@ -198,3 +198,15 @@ install(
     DESTINATION share/sima-lmm/tests/runtime
     COMPONENT extras
 )
+
+foreach(provider_test IN ITEMS file_provider file_provider_routing)
+    add_executable(sima_lmm_${provider_test}_test ${provider_test}_test.cpp)
+    target_include_directories(sima_lmm_${provider_test}_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+    target_link_libraries(sima_lmm_${provider_test}_test PRIVATE sima_lmm_runtime)
+    add_test(NAME runtime.${provider_test} COMMAND sima_lmm_${provider_test}_test)
+    set_tests_properties(runtime.${provider_test} PROPERTIES LABELS "devkit;runtime;provider" TIMEOUT 900)
+    install(TARGETS sima_lmm_${provider_test}_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+endforeach()
+set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;runtime;long" RESOURCE_LOCK mla)
+install(FILES file_provider_test.cpp file_provider_routing_test.cpp
+    DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)

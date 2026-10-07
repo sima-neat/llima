@@ -2,6 +2,7 @@
 #define _SIMA_LLIMA_WHISPER_MODEL_
 
 #include <filesystem>
+#include <istream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -34,6 +35,7 @@ namespace llima {
 class WhisperPreprocessor {
     public:
         WhisperPreprocessor(const std::filesystem::path& devkit_dir);
+        explicit WhisperPreprocessor(std::shared_ptr<FileProvider> files);
         ~WhisperPreprocessor();
 
         ArrayXXbf preprocess(const std::filesystem::path& audio_file_name);
@@ -47,6 +49,7 @@ class WhisperPreprocessor {
         static constexpr uint32_t N_FRAMES = N_SAMPLES / HOP_LENGTH;
 
     private:
+        explicit WhisperPreprocessor(std::unique_ptr<std::istream> config);
         ArrayXf _load_audio_ffmpeg(const std::filesystem::path& audio_file_name);
         ArrayXXbf _log_mel_spectrogram(ArrayXf& audio_tensor);
 
@@ -74,6 +77,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         };
 
         WhisperModel(std::filesystem::path model_path);
+        WhisperModel(std::filesystem::path model_path, std::shared_ptr<FileProvider> files);
         virtual ~WhisperModel() { _finalize(); };
 
         TranscriptionResult run_model(

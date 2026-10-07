@@ -27,10 +27,18 @@ class WEB;
 
 class VisionLanguageModel : public BaseModel<VlmConfig> {
     public:
+        // Existing disk-loading overload; preserves source compatibility.
         VisionLanguageModel(
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,
             std::optional<std::string> chat_template = std::nullopt
+        );
+        // Reads the model files through file_provider (nullptr = from disk).
+        VisionLanguageModel(
+            std::filesystem::path model_path,
+            std::optional<std::string> system_prompt,
+            std::optional<std::string> chat_template,
+            std::shared_ptr<FileProvider> file_provider
         );
         ~VisionLanguageModel() {}
 
