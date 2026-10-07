@@ -112,10 +112,10 @@ void test_gptoss_analysis_to_final() {
     append_events(parsed, parser.add("<|channel|>analysis<|message|>Need answer."));
     // The role arrives before the header it belongs to, in its own chunk.
     append_events(parsed, parser.add("assistant"));
-    append_events(parsed, parser.add("<|channel|>final<|message|>Paris.", true));
+    append_events(parsed, parser.add("<|channel|>final<|message|>Paris is the capital of France.", true));
 
     assert(parsed.reasoning == "Need answer.");
-    assert(parsed.content == "Paris.");
+    assert(parsed.content == "Paris is the capital of France.");
     assert_no_markers(parsed);
 }
 
@@ -153,10 +153,10 @@ void test_gptoss_hidden_reasoning_still_yields_final() {
     append_events(parsed, parser.add("<|channel|>commentary<|message|>aside."));
     append_events(parsed, parser.add("<|cha"));
     append_events(parsed, parser.add("nnel|>final<|mess"));
-    append_events(parsed, parser.add("age|>answer.", true));
+    append_events(parsed, parser.add("age|>The final answer must remain visible.", true));
 
     assert(parsed.reasoning.empty());
-    assert(parsed.content == "answer.");
+    assert(parsed.content == "The final answer must remain visible.");
     assert_no_markers(parsed);
 }
 

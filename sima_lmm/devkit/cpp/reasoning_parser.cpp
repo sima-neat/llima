@@ -193,10 +193,10 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
                     _pending_from_draft
                 );
             }
-            _pending.erase(0, message_pos + gptoss_message.size());
-            _pending_from_draft = from_draft;
             // A hidden channel leaves the mode alone, so its content stays hidden.
             if (gptoss_channel_is_visible(header)) _mode = Mode::Content;
+            _pending.erase(0, message_pos + gptoss_message.size());
+            _pending_from_draft = from_draft;
             continue;
         }
         if (close_pos != std::string::npos) {
