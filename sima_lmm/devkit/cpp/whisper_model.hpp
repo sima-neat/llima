@@ -2,6 +2,7 @@
 #define _SIMA_LLIMA_WHISPER_MODEL_
 
 #include <filesystem>
+#include <istream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -48,6 +49,7 @@ class WhisperPreprocessor {
         static constexpr uint32_t N_FRAMES = N_SAMPLES / HOP_LENGTH;
 
     private:
+        explicit WhisperPreprocessor(std::unique_ptr<std::istream> config);
         ArrayXf _load_audio_ffmpeg(const std::filesystem::path& audio_file_name);
         ArrayXXbf _log_mel_spectrogram(ArrayXf& audio_tensor);
 

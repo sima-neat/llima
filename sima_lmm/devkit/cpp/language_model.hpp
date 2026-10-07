@@ -47,8 +47,7 @@ using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
 class LanguageModel : public BaseModel<VlmConfig> {
     public:
-        // Reads the model files from disk (the signature from before the
-        // FileProvider seam, kept so older builds still link).
+        // Existing disk-loading overload; preserves source compatibility.
         LanguageModel(
             std::filesystem::path model_path,
             std::set<uint32_t> stop_token_ids,

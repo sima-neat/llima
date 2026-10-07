@@ -32,8 +32,7 @@ struct PreprocessedChat {
 class Chat;
 class VlmHelper {
     public:
-        // Reads from the devkit folder on disk (the signature from before the
-        // FileProvider seam, kept so older builds still link and compile).
+        // Existing devkit-directory overload; preserves source compatibility.
         VlmHelper(
             const VlmConfig& vlm_cfg,
             const std::filesystem::path& devkit_dir,

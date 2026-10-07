@@ -125,10 +125,7 @@ class BaseModel {
         T _cfg;
         std::filesystem::path _elf_dir;
         std::filesystem::path _devkit_dir;
-        // The seam between LLiMa and the files it loads. Every
-        // text-path read routes through this. The default is a DiskFileProvider
-        // rooted at model_path, so today's behaviour is byte-for-byte the same.
-        // A deferred provider can be injected via the constructor instead.
+        // Model assets use the injected provider or a model-rooted disk provider.
         std::shared_ptr<FileProvider> _files;
         std::map<std::string, MLABuffer> _buf_map;
 

@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "file_provider.hpp"
+#include "whisper_model.hpp"
 
 namespace {
 
@@ -168,6 +169,20 @@ void test_disk_does_not_pull_files() {
            "disk provider must report pulls_files() == false (parallel load allowed)");
 }
 
+void test_whisper_preprocessor_directory_and_provider() {
+    TempModel model;
+    const auto custom = model.root / "custom preprocessing directory";
+    const std::string config = R"({"mel_filters":[[0.0]]})";
+    write_file(custom / "preprocessor_config.json", config);
+    write_file(model.root / "devkit/preprocessor_config.json", config);
+    // The legacy overload reads the supplied directory, not parent/devkit.
+    simaai::llima::WhisperPreprocessor from_directory(custom);
+    simaai::llima::WhisperPreprocessor trailing_separator(custom.string() + "/");
+    simaai::llima::WhisperPreprocessor from_provider(
+        std::make_shared<DiskFileProvider>(model.root)
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -182,6 +197,7 @@ int main() {
         test_fetch_and_evict_are_no_ops_on_disk();
         test_open_stream_missing_file_throws();
         test_disk_does_not_pull_files();
+        test_whisper_preprocessor_directory_and_provider();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: unexpected exception: " << e.what() << '\n';
         return 1;

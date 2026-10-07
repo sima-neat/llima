@@ -19,11 +19,14 @@ namespace simaai {
 namespace llima {
 
 WhisperPreprocessor::WhisperPreprocessor(const std::filesystem::path& devkit_dir)
-    : WhisperPreprocessor(std::make_shared<DiskFileProvider>(devkit_dir.parent_path())) {}
+    : WhisperPreprocessor(DiskFileProvider(devkit_dir).open_stream("preprocessor_config.json")) {}
 
-WhisperPreprocessor::WhisperPreprocessor(std::shared_ptr<FileProvider> files) {
+WhisperPreprocessor::WhisperPreprocessor(std::shared_ptr<FileProvider> files)
+    : WhisperPreprocessor(files->open_stream("devkit/preprocessor_config.json")) {}
+
+WhisperPreprocessor::WhisperPreprocessor(std::unique_ptr<std::istream> config) {
     // Load mel filters.
-    auto json = nlohmann::json::parse(*files->open_stream("devkit/preprocessor_config.json"));
+    auto json = nlohmann::json::parse(*config);
     auto mel_filters_json = json["mel_filters"];
     _mel_filters.resize(mel_filters_json.size(), mel_filters_json[0].size());
     for (uint32_t i = 0; i < mel_filters_json.size(); ++i) {

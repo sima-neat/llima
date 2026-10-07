@@ -325,10 +325,7 @@ MLAModelWithBuffer::MLAModelWithBuffer(
     std::vector<MLABufferSlice> ofms
 ) : _ifms(std::move(ifms)), _ofms(std::move(ofms)) {
     model_path = std::filesystem::absolute(model_path).lexically_normal();
-    // Note: we do NOT require the file to exist here. Paths may be reserved
-    // at model-define time and only fetched over PCIe at load time (deferred
-    // pull). Presence is enforced by mla_load_model in load_all_models, which
-    // throws with a clear message if the file is missing.
+    // Deferred assets may not exist yet; load_all_models() checks them at load time.
     auto& state = runtime_state();
     std::lock_guard lock(state.registry_mutex);
     const auto [it, inserted] = state.path_to_index.emplace(model_path, state.paths.size());
@@ -546,9 +543,7 @@ void MLAModelWithBuffer::load_all_models(
     std::lock_guard registry_lock(state.registry_mutex);
     require_handle();
 
-    // A provider that pulls files (PCIe) needs the serial fetch -> load ->
-    // evict loop below: the parallel batch load would read files that were
-    // never pulled. So force serial here, even if the env var was not set.
+    // Deferred assets require serial fetch -> load -> evict, not batch loading.
     const bool must_pull = files != nullptr && files->pulls_files();
     if (!_disable_parallel_load && !must_pull) {
         std::map<std::filesystem::path, uint16_t> batch_paths;

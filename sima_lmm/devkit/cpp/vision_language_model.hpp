@@ -27,8 +27,7 @@ class WEB;
 
 class VisionLanguageModel : public BaseModel<VlmConfig> {
     public:
-        // Reads the model files from disk. Same signature as before the
-        // FileProvider seam, so code built against the older library still links.
+        // Existing disk-loading overload; preserves source compatibility.
         VisionLanguageModel(
             std::filesystem::path model_path,
             std::optional<std::string> system_prompt = std::nullopt,

@@ -645,11 +645,7 @@ void LanguageModel::_define_draft_fc_models() {
         num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     for (const auto& num_tokens : num_tokens_vec) {
-        // reserve() only builds the path. It does NOT pull the file yet.
-        // In PCIe mode the real pull happens later, at load time (so only
-        // one ELF is on disk at a time). In disk mode reserve() just points
-        // at the local file. Same call works for both. The other
-        // _get_elf_path_* helpers below use reserve() the same way.
+        // Reserve ELF paths now; deferred providers fetch them at MLA load time.
         auto elf_path = _files->reserve(fmt::format(
             "elf_files/{}_n{}_draft_fc_stage1_mla.elf",
             _cfg.language_model_name, num_tokens

@@ -16,8 +16,7 @@ namespace llima {
 
 class VisionModel : public BaseModel<VlmConfig> {
     public:
-        // Reads the model files from disk (the signature from before the
-        // FileProvider seam, kept so older builds still link).
+        // Existing disk-loading overload; preserves source compatibility.
         VisionModel(std::filesystem::path model_path);
         // Reads the model files through file_provider (nullptr = from disk).
         VisionModel(
