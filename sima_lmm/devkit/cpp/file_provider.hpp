@@ -43,9 +43,11 @@ class FileProvider {
             return std::filesystem::exists(get_path(name));
         }
 
-        // Reserve the path a file WILL occupy, WITHOUT fetching it. Define-time
+        // Reserve a file or model subdirectory path WITHOUT fetching it. Define-time
         // callers (ELF path resolution) use this so no bytes move until load
         // time. Default == get_path, so DiskFileProvider is unchanged.
+        // Providers supplied to model constructors must preserve the directory
+        // layout under model_path; reserve("elf_files") must name its ELF directory.
         virtual std::filesystem::path reserve(std::string_view name) {
             return get_path(name);
         }

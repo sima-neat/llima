@@ -6,6 +6,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -37,6 +38,7 @@ class BaseModel {
                 ? std::move(file_provider)
                 : std::make_shared<DiskFileProvider>(model_path))
         {
+            _validate_provider_root();
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("VLM") : spdlog::default_logger();
 
@@ -59,6 +61,7 @@ class BaseModel {
                 ? std::move(file_provider)
                 : std::make_shared<DiskFileProvider>(model_path))
         {
+            _validate_provider_root();
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("Whisper") : spdlog::default_logger();
 
@@ -73,6 +76,15 @@ class BaseModel {
         }
 
         virtual ~BaseModel() { if (!_buf_map.empty()) _finalize(); }
+        void _validate_provider_root() {
+            if (std::filesystem::weakly_canonical(_files->reserve("elf_files"))
+                != std::filesystem::weakly_canonical(_elf_dir)) {
+                throw std::invalid_argument(
+                    "FileProvider ELF location does not match model_path; "
+                    "pass the provider's staging root as model_path"
+                );
+            }
+        }
         void define_buffer(
             const std::string& name,
             const std::vector<size_t>& shape,
