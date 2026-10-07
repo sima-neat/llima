@@ -306,14 +306,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _define_attn_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
         // Mixture-of-Experts post block: router + experts + weighted-sum (replaces post).
         void _define_moe_post_models(
-            uint16_t num_tokens, uint8_t layer_idx, bool is_draft,
-            const std::vector<MLABufferSlice>& pre_ifms,
-            const std::vector<MLABufferSlice>& cache_ofms
+            uint16_t num_tokens, uint8_t layer_idx,
+            const std::vector<MLABufferSlice>& post_ifms,
+            const std::vector<MLABufferSlice>& post_ofms
         );
-        // Runtime for one MoE post block: router -> host top-k/softmax scatter -> experts ->
+        // Runtime for one MoE post block: router -> host weight scatter -> experts ->
         // weighted-sum. Gated on _cfg.lm_cfg.is_moe().
         void _run_moe_post(
-            const LanguageModelMapKey& model_key,
             std::map<uint8_t, MLABufferSlice>* ifm_map,
             uint16_t num_tokens, uint8_t layer_idx
         );
@@ -438,7 +437,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             MLABuffer* values = nullptr;         // n{nt}_router_values
             MLABuffer* indices = nullptr;        // n{nt}_router_indices
             MLABuffer* weights = nullptr;        // n{nt}_router_weights
-            std::vector<MLABuffer*> expert_out;  // n{nt}_expert{e}, e < num_experts
+            std::vector<MLABuffer*> expert_out;  // top_k decode slots or num_experts prefill outputs
             // Decode only: top_k OFM overrides routing each expert into its combine slot.
             std::vector<std::map<uint8_t, MLABufferSlice>> slot_ofm;
             // Host staging, sized once; never reallocated on the critical path.
@@ -450,7 +449,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<MoeHostCache> _moe_host;
         void _init_moe_host_cache();
         MoeHostCache& _get_moe_host(uint16_t moe_nt);
-        
+
         // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
 

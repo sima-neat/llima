@@ -796,7 +796,7 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
             attn_models.pre->add_to_queue(&ifm_map);
             attn_models.cache->add_to_queue();
             if (_cfg.lm_cfg.is_moe()) {
-                _run_moe_post(model_key, &ifm_map, num_tokens, layer_idx);
+                _run_moe_post(&ifm_map, num_tokens, layer_idx);
             } else {
                 attn_models.post->add_to_queue(&ifm_map);
             }
@@ -1262,7 +1262,7 @@ uint32_t LanguageModel::run_model_once(
                 );
             }
             if (_cfg.lm_cfg.is_moe()) {
-                _run_moe_post(model_key, &ifm_map, num_tokens, layer_idx);
+                _run_moe_post(&ifm_map, num_tokens, layer_idx);
             } else {
                 attn_models.post->add_to_queue(&ifm_map);
             }
@@ -2084,8 +2084,9 @@ void LanguageModel::_define_buffers() {
             );
             // Dense per-expert routing weights (host scatters the k values here).
             define_buffer(fmt::format("n{}_router_weights", num_tokens), {num_tokens, num_experts});
-            // Per-expert outputs, summed by the combine (decode fills only the first top_k).
-            for (uint16_t e = 0; e < num_experts; ++e) {
+            // Decode routes selected experts into top-k slots; prefill combines all experts.
+            const uint16_t num_outputs = num_tokens == 1 ? top_k : num_experts;
+            for (uint16_t e = 0; e < num_outputs; ++e) {
                 define_buffer(
                     fmt::format("n{}_expert{}", num_tokens, e),
                     {num_tokens, _cfg.lm_cfg.hidden_size}
@@ -2480,11 +2481,6 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
 }
 
 
-
-
-
-
-
 void LanguageModel::_init_moe_host_cache() {
     const auto& moe = _cfg.lm_cfg.moe_cfg.value();
     const uint16_t num_experts = moe.num_experts;
@@ -2505,8 +2501,9 @@ void LanguageModel::_init_moe_host_cache() {
         mh.values = &get_buffer(fmt::format("n{}_router_values", nt));
         mh.indices = &get_buffer(fmt::format("n{}_router_indices", nt));
         mh.weights = &get_buffer(fmt::format("n{}_router_weights", nt));
-        mh.expert_out.reserve(num_experts);
-        for (uint16_t e = 0; e < num_experts; ++e) {
+        const uint16_t num_outputs = nt == 1 ? top_k : num_experts;
+        mh.expert_out.reserve(num_outputs);
+        for (uint16_t e = 0; e < num_outputs; ++e) {
             mh.expert_out.emplace_back(&get_buffer(fmt::format("n{}_expert{}", nt, e)));
         }
         // Only the single-token variant takes the slot-routing path in _run_moe_post.
@@ -2545,11 +2542,9 @@ LanguageModel::MoeHostCache& LanguageModel::_get_moe_host(uint16_t moe_nt) {
 
 
 void LanguageModel::_run_moe_post(
-    const LanguageModelMapKey& model_key,
     std::map<uint8_t, MLABufferSlice>* ifm_map,
     uint16_t num_tokens, uint8_t layer_idx
 ) {
-    (void)model_key;  // router/ws use their own {num_tokens, layer_idx, 0} keys below.
     const auto& moe = _cfg.lm_cfg.moe_cfg.value();
     const uint16_t num_experts = moe.num_experts;
     const uint16_t top_k = moe.num_experts_per_tok;
@@ -2557,11 +2552,10 @@ void LanguageModel::_run_moe_post(
     // The last layer processes only the last token (n1), like the non-MoE last post.
     const uint16_t moe_nt = (is_last && !_cfg.lm_cfg.is_spec_decode()) ? 1 : num_tokens;
 
-    const LanguageModelMapKey router_key{num_tokens, layer_idx, 0};
-    const LanguageModelMapKey ws_key{num_tokens, layer_idx, 0};
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
 
     // Router -> values + indices + residual + norm(h) (TopK+softmax on MLA).
-    _router_model_map.at(router_key).add_to_queue(ifm_map);
+    _router_model_map.at(model_key).add_to_queue(ifm_map);
 
     // Flush this layer's pre+cache+router (+ prev layer's experts+ws) so indices are ready.
     MLAModelWithBuffer::run_queue();
@@ -2571,35 +2565,26 @@ void LanguageModel::_run_moe_post(
     auto& values = mh.values_scratch;
     auto& indices = mh.indices_scratch;
     auto& weights = mh.weights_scratch;
-    const size_t n_sel = static_cast<size_t>(moe_nt) * top_k;
+    auto& activated = mh.activated_scratch;
     mh.values->download(values.data());
     mh.indices->download(indices.data());
-
-    // Validate device-emitted indices before indexing host arrays / keying the expert map.
-    for (size_t i = 0; i < n_sel; ++i) {
-        if (indices[i] < 0 || indices[i] >= num_experts) {
-            throw std::runtime_error(fmt::format(
-                "MoE router emitted out-of-range expert index {} at selection {} "
-                "(layer {}, num_experts {})",
-                indices[i], i, layer_idx, num_experts
-            ));
-        }
-    }
-
     std::fill(weights.begin(), weights.end(), Eigen::bfloat16(0.0f));
-    if (moe_nt > 1) {
-        // Prefill: independent rows.
-        #pragma omp parallel for schedule(static)
-        for (uint16_t r = 0; r < moe_nt; ++r) {
-            for (uint16_t j = 0; j < top_k; ++j) {
-                const size_t sel = static_cast<size_t>(r) * top_k + j;
-                weights[static_cast<size_t>(r) * num_experts + indices[sel]] = values[sel];
-            }
-        }
-    } else {
-        // Decode: single row, top_k scalar stores.
+    std::fill(activated.begin(), activated.end(), uint8_t{0});
+
+    // Scatter each row's selections and record the experts needed by prefill.
+    for (uint16_t r = 0; r < moe_nt; ++r) {
         for (uint16_t j = 0; j < top_k; ++j) {
-            weights[indices[j]] = values[j];
+            const size_t sel = static_cast<size_t>(r) * top_k + j;
+            const int32_t expert = indices[sel];
+            if (expert < 0 || expert >= num_experts) {
+                throw std::runtime_error(fmt::format(
+                    "MoE router emitted out-of-range expert index {} at selection {} "
+                    "(layer {}, num_experts {})",
+                    expert, sel, layer_idx, num_experts
+                ));
+            }
+            weights[static_cast<size_t>(r) * num_experts + expert] = values[sel];
+            activated[expert] = 1;
         }
     }
     mh.weights->upload(weights.data());
@@ -2607,11 +2592,6 @@ void LanguageModel::_run_moe_post(
     // Experts. Prefill runs the selected experts (rest zeroed); decode runs the top-k,
     // routing each into the first combine slots.
     if (moe_nt > 1) {
-        auto& activated = mh.activated_scratch;
-        std::fill(activated.begin(), activated.end(), uint8_t{0});
-        for (size_t i = 0; i < n_sel; ++i) {
-            activated[indices[i]] = 1;
-        }
         for (uint16_t e = 0; e < num_experts; ++e) {
             if (activated[e]) {
                 _expert_model_map.at({num_tokens, layer_idx, e}).add_to_queue();
@@ -2629,7 +2609,7 @@ void LanguageModel::_run_moe_post(
     }
 
     // Weighted sum -> layer output. No flush: experts+ws ride to the next router flush.
-    _weightedsum_model_map.at(ws_key).add_to_queue();
+    _weightedsum_model_map.at(model_key).add_to_queue();
 }
 
 
