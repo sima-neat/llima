@@ -11,23 +11,31 @@ constexpr std::string_view think_open = "<think>";
 constexpr std::string_view think_close = "</think>";
 constexpr std::string_view gemma_reasoning_open = "<|channel>thought\n";
 constexpr std::string_view gemma_reasoning_close = "<channel|>";
-constexpr std::string_view gptoss_reasoning_open = "<|channel|>analysis<|message|>";
+constexpr std::string_view gptoss_start = "<|start|>";
 constexpr std::string_view gptoss_channel = "<|channel|>";
 constexpr std::string_view gptoss_message = "<|message|>";
 
-// Content of a gpt-oss channel is shown when the channel is "final", or when it is
-// a commentary message carrying a tool call. A plain commentary message is the
-// model talking to itself, so it stays hidden like analysis.
-bool gptoss_channel_is_visible(std::string_view header) {
-    if (header.find("final") != std::string_view::npos) return true;
-    if (header.find("commentary") == std::string_view::npos) return false;
-    return header.find("to=") != std::string_view::npos
-        || header.find("json") != std::string_view::npos;
+// The generation prompt already supplies "assistant"; later messages have a start marker.
+// Hold the whole header so a recipient preceding the channel is not emitted as reasoning.
+bool gptoss_header_prefix(std::string_view text) {
+    for (const auto prefix : {gptoss_start, gptoss_channel, std::string_view("assistant"),
+                              std::string_view("to=")}) {
+        if (prefix.starts_with(text) || text.starts_with(prefix)) return true;
+    }
+    return false;
 }
 
-// A channel header is preceded by "<|start|>assistant". Both control tokens decode
-// to nothing, so the role name arrives as ordinary text and would otherwise be
-// emitted as the tail of the previous message.
+bool gptoss_channel_is_visible(std::string_view header) {
+    const auto pos = header.find(gptoss_channel);
+    if (pos == std::string_view::npos) return false;
+    auto channel = header.substr(pos + gptoss_channel.size());
+    channel = channel.substr(0, channel.find_first_of(" \t\r\n"));
+    return channel == "final" || (channel == "commentary" &&
+        (header.find("to=") != std::string_view::npos ||
+         header.find("json") != std::string_view::npos));
+}
+
+// Compatibility with decoded streams that omit the message start token.
 size_t gptoss_role_suffix_size(std::string_view text) {
     constexpr std::string_view role = "assistant";
     return text.ends_with(role) ? role.size() : 0;
@@ -79,7 +87,7 @@ ReasoningStreamParser::ReasoningStreamParser(
     } else if (format == ReasoningFormat::GptOss) {
         // Harmony always emits channels; analysis = reasoning, final = answer.
         // Parse even when thinking is off so only the final channel shows.
-        _start_marker = gptoss_reasoning_open;
+        _start_marker = gptoss_channel;
         _end_marker = gptoss_channel;
         _channel_headers = true;
         _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
@@ -126,6 +134,27 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
 
         if (_mode == Mode::AwaitingStart || _mode == Mode::AwaitingHiddenStart) {
             const bool hide_reasoning = _mode == Mode::AwaitingHiddenStart;
+            if (_channel_headers && gptoss_header_prefix(_pending)) {
+                const auto message_pos = _pending.find(gptoss_message);
+                if (message_pos == std::string::npos) {
+                    if (done) {
+                        _pending.clear();
+                        _mode = Mode::Done;
+                    }
+                    break;
+                }
+                const std::string_view header(_pending.data(), message_pos);
+                _mode = gptoss_channel_is_visible(header) ? Mode::Content
+                    : hide_reasoning ? Mode::HiddenReasoning : Mode::Reasoning;
+                if (_mode == Mode::Content && header.find("to=") != std::string_view::npos) {
+                    // The tool parser needs the recipient as well as the JSON arguments.
+                    emit(events, _pending.substr(0, message_pos + gptoss_message.size()),
+                         false, _pending_from_draft);
+                }
+                _pending.erase(0, message_pos + gptoss_message.size());
+                _pending_from_draft = from_draft;
+                continue;
+            }
             if (_pending.starts_with(_start_marker)) {
                 _pending.erase(0, _start_marker.size());
                 _pending_from_draft = from_draft;
@@ -159,44 +188,19 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
             }
         }
 
-        const auto close_pos = _pending.find(_end_marker);
+        auto close_pos = _pending.find(_end_marker);
+        if (_channel_headers) close_pos = std::min(close_pos, _pending.find(gptoss_start));
         if (close_pos != std::string::npos && _channel_headers) {
-            // The header runs to the message marker; wait for the rest of it.
-            const auto header_pos = close_pos + _end_marker.size();
-            const auto message_pos = _pending.find(gptoss_message, header_pos);
-            if (message_pos == std::string::npos) {
-                if (_mode == Mode::Reasoning) {
-                    const std::string_view before(_pending.data(), close_pos);
-                    emit(
-                        events,
-                        _pending.substr(0, close_pos - gptoss_role_suffix_size(before)),
-                        true,
-                        _pending_from_draft
-                    );
-                }
-                _pending.erase(0, close_pos);
-                if (done) {
-                    _pending.clear();
-                    _mode = Mode::Done;
-                }
-                break;
-            }
-            const std::string_view header(
-                _pending.data() + header_pos, message_pos - header_pos
-            );
+            const std::string_view before(_pending.data(), close_pos);
+            const size_t body_size = close_pos -
+                (_pending.compare(close_pos, gptoss_start.size(), gptoss_start) == 0
+                    ? 0 : gptoss_role_suffix_size(before));
             if (_mode == Mode::Reasoning) {
-                const std::string_view before(_pending.data(), close_pos);
-                emit(
-                    events,
-                    _pending.substr(0, close_pos - gptoss_role_suffix_size(before)),
-                    true,
-                    _pending_from_draft
-                );
+                emit(events, _pending.substr(0, body_size), true, _pending_from_draft);
             }
-            // A hidden channel leaves the mode alone, so its content stays hidden.
-            if (gptoss_channel_is_visible(header)) _mode = Mode::Content;
-            _pending.erase(0, message_pos + gptoss_message.size());
-            _pending_from_draft = from_draft;
+            _pending.erase(0, body_size);
+            _mode = _mode == Mode::HiddenReasoning ? Mode::AwaitingHiddenStart
+                                                   : Mode::AwaitingStart;
             continue;
         }
         if (close_pos != std::string::npos) {
@@ -213,7 +217,8 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
         if (_channel_headers) {
             // The role name reaches us before the header it belongs to, so hold it
             // back until the next chunk shows whether a header follows.
-            retained = std::max(retained, gptoss_role_suffix_size(_pending));
+            retained = std::max({retained, partial_marker_size(gptoss_start),
+                                 gptoss_role_suffix_size(_pending)});
         }
         if (_mode == Mode::Reasoning) {
             emit(

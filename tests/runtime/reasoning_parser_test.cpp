@@ -138,12 +138,11 @@ void test_gptoss_tool_call_commentary_is_shown() {
     append_events(parsed, parser.add("<|channel|>analysis<|message|>pick a tool."));
     append_events(
         parsed,
-        parser.add("<|channel|>commentary to=functions.get json<|message|>{\"a\":1}", true)
+        parser.add("<|start|>assistant to=functions.get<|channel|>commentary json<|message|>{\"a\":1}", true)
     );
 
     assert(parsed.reasoning == "pick a tool.");
-    assert(parsed.content == "{\"a\":1}");
-    assert_no_markers(parsed);
+    assert(parsed.content == "<|start|>assistant to=functions.get<|channel|>commentary json<|message|>{\"a\":1}");
 }
 
 void test_gptoss_hidden_reasoning_still_yields_final() {
@@ -168,12 +167,11 @@ void test_gptoss_tool_call_commentary_without_final() {
     append_events(parsed, parser.add("<|channel|>analysis<|message|>pick a tool."));
     append_events(
         parsed,
-        parser.add("<|channel|>commentary to=functions.get json<|message|>{\"a\":1}", true)
+        parser.add("<|start|>assistant to=functions.get<|channel|>commentary json<|message|>{\"a\":1}", true)
     );
 
     assert(parsed.reasoning.empty());
-    assert(parsed.content == "{\"a\":1}");
-    assert_no_markers(parsed);
+    assert(parsed.content == "<|start|>assistant to=functions.get<|channel|>commentary json<|message|>{\"a\":1}");
 }
 
 void test_disabled_and_unsupported_pass_through() {
