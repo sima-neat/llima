@@ -1,9 +1,17 @@
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from sima_lmm.host.remote_destination import (
+    RemoteSession,
+    local_size_kb,
+    parse_remote_destination,
+    report_free_space,
+)
 
 
 def _abort(message):
@@ -77,7 +85,7 @@ def _validate_sima_files(src_sima_dir: Path) -> None:
         raise RuntimeError(f"mpk directory cannot be found in {src_sima_dir}")
 
 
-def _deploy_sima_files(src_sima_dir: Path, dst_dir: Path) -> None:
+def _deploy_sima_files(src_sima_dir: Path, dst_dir: Path | str, rsh: str | None = None) -> None:
     """Deploy one direct sima_files directory to a runtime model directory."""
     src_devkit_dir = src_sima_dir / "devkit"
     src_mpk_dir = src_sima_dir / "mpk"
@@ -116,17 +124,46 @@ def _deploy_sima_files(src_sima_dir: Path, dst_dir: Path) -> None:
         src_dirs.append(src_npy_dir)
 
     # Use rsync to copy the data to the destination.
-    cmd = ["rsync", "-aP", "--mkpath", *src_dirs, dst_dir]
+    rsh_args = ["-e", rsh] if rsh else []
+    cmd = ["rsync", "-aP", "--mkpath", *rsh_args, *src_dirs, dst_dir]
     subprocess.check_call(cmd)
 
 
-def deploy(src_dir: Path, dst_dir: Path) -> None:
+def _deployment_size_kb(sources: list[tuple[str | None, Path]]) -> int:
+    """Upper-bound estimate of the deployed size, taken before ELF extraction."""
+    paths = []
+    for _, src_sima_dir in sources:
+        paths += [src_sima_dir / "devkit", src_sima_dir / "mpk", src_sima_dir / "npy_files"]
+    return local_size_kb(paths)
+
+
+def deploy(
+    src_dir: Path, dst_dir: Path | str, rsh: str | None = None, preflight: bool = True
+) -> None:
     sources = _resolve_deploy_sources(src_dir)
     for _, src_sima_dir in sources:
         _validate_sima_files(src_sima_dir)
-    for model_name, src_sima_dir in sources:
-        model_dst = dst_dir if model_name is None else dst_dir / model_name
-        _deploy_sima_files(src_sima_dir, model_dst)
+
+    remote = parse_remote_destination(str(dst_dir))
+
+    def model_destination(model_name: str | None) -> Path | str:
+        if remote is None:
+            return Path(dst_dir) if model_name is None else Path(dst_dir) / model_name
+        return str(remote) if model_name is None else remote.join(model_name)
+
+    if remote is None or not preflight:
+        for model_name, src_sima_dir in sources:
+            _deploy_sima_files(src_sima_dir, model_destination(model_name), rsh)
+        return
+
+    # Check the remote destination once, before the slow ELF extraction, and
+    # reuse the same SSH connection for every transfer.
+    with RemoteSession(remote.host, rsh) as session:
+        print(f"Checking {remote} ...", flush=True)
+        free_kb = session.preflight(remote.path)
+        report_free_space(str(remote), free_kb, _deployment_size_kb(sources))
+        for model_name, src_sima_dir in sources:
+            _deploy_sima_files(src_sima_dir, model_destination(model_name), session.rsync_rsh)
 
 
 def main():
@@ -136,12 +173,22 @@ def main():
         help="Path to the source directory with compiled mpk tar.gz files and devkit files"
     )
     parser.add_argument(
-        "dst_dir", type=Path, help="Path to the destination directory to be copied to"
+        "dst_dir",
+        help="Destination directory, either a local path or a remote [user@]host:/path"
+    )
+    parser.add_argument(
+        "--rsh", default=os.environ.get("RSYNC_RSH"),
+        help="Remote shell command for a remote destination, used for both the pre-flight "
+             "check and rsync (default: $RSYNC_RSH, otherwise ssh with a shared connection)"
+    )
+    parser.add_argument(
+        "--no-preflight", action="store_true",
+        help="Skip the remote destination check that runs before ELF extraction"
     )
     args = parser.parse_args()
 
     try:
-        deploy(args.src_dir, args.dst_dir)
+        deploy(args.src_dir, args.dst_dir, rsh=args.rsh, preflight=not args.no_preflight)
     except RuntimeError as error:
         _abort(str(error))
 

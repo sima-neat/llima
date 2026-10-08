@@ -13,13 +13,14 @@ sima-user@docker-image-id:/home/docker$ llima-deploy <source_directory> <destina
 Where:
 
 - `source_directory` - Path to the compiled model directory (contains `sima_files/` with `devkit/`, `mpk/`, and optionally `npy_files/` subdirectories)
-- `destination_directory` - Target directory on the Modalix device (or local path for rsync deployment)
+- `destination_directory` - Target directory on the Modalix device as `[user@]host:/path`, or a local path
 
-When you run this command, the deployment tool performs three key steps:
+When you run this command, the deployment tool performs these steps:
 
 1.  **Validates** that the source directory contains required files (`sima_files/devkit/` and `sima_files/mpk/`)
-2.  **Extracts** ELF files from MPK archives (`*.tar.gz`)
-3.  **Syncs** the following to the destination using `rsync`:
+2.  **Checks** a remote destination before any local work (see [Remote destination check](#remote-destination-check))
+3.  **Extracts** ELF files from MPK archives (`*.tar.gz`)
+4.  **Syncs** the following to the destination using `rsync`:
     - `devkit/` - Runtime orchestration files
     - `elf_files/` - Extracted binary files
     - `npy_files/` - LoRA adapter weights (automatically included if present)
@@ -71,6 +72,42 @@ Then run the model using the `llima` CLI. See [LLiMa CLI](runtime.md) for detail
 modalix:~$ llima run <model_name>
 ```
 
+## Remote destination check
+
+For a remote destination, `llima-deploy` connects to the device before it
+extracts ELF files. It creates the destination directory, checks that it is
+writable, and reports the free space:
+
+``` console
+sima-user@docker-image-id:/home/docker$ llima-deploy Llama-3.2-3B-Instruct_out sima@192.168.1.20:/media/nvme/llima/llama3_2
+Checking sima@192.168.1.20:/media/nvme/llima/llama3_2 ...
+sima@192.168.1.20's password:
+Destination sima@192.168.1.20:/media/nvme/llima/llama3_2 OK (402.3 GB free).
+```
+
+Any password or host-key prompt appears at this point, and `rsync` reuses the
+same SSH connection, so the rest of the deployment runs unattended. If the
+device cannot be reached or the destination is not writable, the command stops
+before extracting anything. If the free space looks smaller than the model, it
+prints a warning and continues.
+
+To avoid password prompts entirely, install an SSH key on the device once:
+
+``` console
+sima-user@docker-image-id:/home/docker$ ssh-copy-id sima@192.168.1.20
+```
+
+Options:
+
+- `--rsh "<command>"` - Remote shell command for both the check and `rsync`,
+  for example `--rsh "ssh -p 2222 -i ~/.ssh/modalix"`. It defaults to the
+  `RSYNC_RSH` environment variable. A custom remote shell is used as given,
+  without connection sharing.
+- `--no-preflight` - Skip the check and contact the device only during `rsync`.
+
+`llima-deploy-lora` runs the same check and also verifies that the destination
+model directory already contains `elf_files/`.
+
 ## Speculative decoding models
 
 When `llima-compile` is given `--draft_model_path`, its output contains target and
@@ -100,6 +137,15 @@ llima run spec-decoding-output
 ```
 
 ## Troubleshooting
+
+**Error: "Cannot reach ..."**
+
+Check the device IP address, the network connection, and your SSH credentials.
+
+**Error: "Destination ... is not writable"**
+
+Check that the storage is mounted (for example `/media/nvme`) and that the SSH
+user can write to the destination.
 
 **Error: "devkit directory cannot be found"**
 
