@@ -269,11 +269,14 @@ class LocalHuggingFaceModel:
         assert set(layer_names.keys()).issubset(DEFAULT_LAYER_NAMES.keys()), (
             f'Ensure that the suffix/prefix mapping uses the following keys: {DEFAULT_LAYER_NAMES}'
         )
-        assert directory.exists(), f'{directory} does not exist!'
-        assert directory.is_dir(), f'{directory} is not a directory!'
+        if not directory.exists():
+            raise FileNotFoundError(f"Model directory not found: {directory}")
+        if not directory.is_dir():
+            raise NotADirectoryError(f"Expected a Hugging Face model directory: {directory}")
         # Load model config
         config_file = find_file(directory=directory, filename="config.json", resolve=False)
-        assert config_file
+        if config_file is None or not config_file.is_file():
+            raise FileNotFoundError(f"Model config.json not found in {directory}")
         hf_config = AutoConfig.from_pretrained(config_file.parent)
         config = hf_config.to_dict()
 
@@ -284,7 +287,7 @@ class LocalHuggingFaceModel:
         # Load and verify HF Index File
         # Some small models do not have an index file, so we need to build one here.
         weight_file = find_file(directory=directory, filename=HF_SINGLE_MODEL_FILENAME)
-        if weight_file:
+        if weight_file is not None and weight_file.is_file():
             # Handles the case where only a single .safetensors file is found.
             # This means there is no .index.json, so the weight-map needs to be build manually.
             # Weight-map structure {'model_param_name': 'safetensors_file_name'}
@@ -297,7 +300,11 @@ class LocalHuggingFaceModel:
             index_file = find_file(
                 directory=directory, filename=HF_WEIGHT_INDEX_FILENAME
             )
-            assert index_file
+            if index_file is None or not index_file.is_file():
+                raise FileNotFoundError(
+                    f"Model weights not found in {directory}: expected "
+                    f"{HF_SINGLE_MODEL_FILENAME} or {HF_WEIGHT_INDEX_FILENAME}"
+                )
             with index_file.open('r') as fp:
                 index_data = json.load(fp=fp)
             # Check Weights
@@ -306,9 +313,14 @@ class LocalHuggingFaceModel:
                 filename: find_file(directory=directory, filename=filename)
                 for filename in safetensors_filenames
             }
-        assert all(isinstance(w, Path) and w.exists() for w in weight_files.values()), (
-            f'Could not find all weight files: {weight_files}'
+        missing_weights = sorted(
+            name for name, path in weight_files.items() if path is None or not path.is_file()
         )
+        if missing_weights:
+            raise FileNotFoundError(
+                f"Missing weight files in {directory}: {', '.join(missing_weights)}. "
+                "Download all checkpoint shards."
+            )
         # Parse llm-compressor quantization config if present
         compressed_tensors_config = CompressedTensorsConfig.from_hf_config(config)
         if compressed_tensors_config:

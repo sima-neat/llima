@@ -3,11 +3,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from afe.ir.execute import create_node_executor
+
 from sima_lmm.config.vlm_config import LanguageModelConfig, LoraConfig
 from sima_lmm.model import language_linear_model
+from sima_lmm.model.model_graph import ModelGraph
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
-
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
@@ -21,21 +23,16 @@ class _FakeNode:
         self.name = name
 
 
-class _FakeSimaBuilder:
+class _RecordingModelGraph(ModelGraph):
     instances = []
 
-    def __init__(self, *_args, **_kwargs):
-        self.subnet_input_names = []
+    def __init__(self, model, specs, quantizable, **kwargs):
+        super().__init__(model, specs, quantizable, **kwargs)
+        self.subnet_input_names = list(specs)
         self.dynamic_dequant_inputs = None
         self.__class__.instances.append(self)
 
-    def create_placeholder_node(self, name, _tensor_type):
-        return _FakeNode(name)
-
-    def begin_subnet(self, inputs):
-        self.subnet_input_names = [node.name for node in inputs]
-
-    def create_dynamic_dequant_node(self, input_node, scale_node):
+    def dequant(self, input_node, scale_node):
         self.dynamic_dequant_inputs = (input_node.name, scale_node.name)
         return _FakeNode("dequantized_input")
 
@@ -43,6 +40,7 @@ class _FakeSimaBuilder:
 def _linear_model(*, quantize_embeddings: bool, layer_idx: int = 0) -> LanguageLinearModel:
     model = object.__new__(LanguageLinearModel)
     model.num_tokens = 1
+    model.hf_model = SimpleNamespace(language_model_param_base_name="model")
     model.layer_idx = layer_idx
     model.cfg = SimpleNamespace(
         pipeline_cfg=SimpleNamespace(quantize_embeddings=quantize_embeddings),
@@ -76,38 +74,55 @@ def test_linear_attention_selects_supported_delta_block_sizes():
             model.__post_init__()
 
 
-def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(monkeypatch):
-    monkeypatch.setattr(language_linear_model, "SimaBuilder", _FakeSimaBuilder)
+@pytest.mark.parametrize("num_tokens", [4, 8, 16, 32])
+def test_linear_attention_single_block_inverse(num_tokens):
+    model = _linear_model(quantize_embeddings=False)
+    model.num_tokens = num_tokens
+    model.model_name = "single_block_inverse"
+    shape = (1, 1, num_tokens, num_tokens)
+    graph = ModelGraph(model, {"attn": shape}, quantizable=True)
+    inverse = model._build_block_chunk_inverse(graph, graph.inputs["attn"], block_size=num_tokens)
+    rng = np.random.default_rng(19)
+    attn = np.tril(rng.uniform(-0.1, 0.1, shape).astype(np.float32), k=-1)
+    expected = np.linalg.inv(np.eye(num_tokens, dtype=np.float32) - attn)
+    actual = graph.finish([inverse]).run({"attn": attn}, node_callable=create_node_executor(False))
+    if isinstance(actual, (list, tuple)):
+        actual = actual[0]
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-7)
 
-    def stop_after_input_contract(_self, _builder, _name, input_node):
-        assert input_node.name in {"input", "dequantized_input"}
+
+def test_linear_attention_adds_embedding_scale_only_for_quantized_layer_zero(monkeypatch):
+    monkeypatch.setattr(language_linear_model, "ModelGraph", _RecordingModelGraph)
+
+    def stop_after_input_contract(_self, _name, input_node):
+        assert input_node.name in {"MLA_0/input", "dequantized_input"}
         raise _StopGraphBuild
 
     monkeypatch.setattr(
-        LanguageLinearModel,
-        "_build_sima_rms_norm",
+        _RecordingModelGraph,
+        "rms_norm",
         stop_after_input_contract,
     )
 
-    _FakeSimaBuilder.instances.clear()
+    _RecordingModelGraph.instances.clear()
     with pytest.raises(_StopGraphBuild):
-        _linear_model(quantize_embeddings=True)._build_sima_nodes("model.layers.0", False)
-    quantized_builder = _FakeSimaBuilder.instances[-1]
+        _linear_model(quantize_embeddings=True).generate_graph({}, quantizable=False)
+    quantized_builder = _RecordingModelGraph.instances[-1]
     assert quantized_builder.subnet_input_names == [
         "input",
         "input_scale",
         "linear_conv_state",
         "linear_delta_state",
     ]
-    assert quantized_builder.dynamic_dequant_inputs == ("input", "input_scale")
+    assert quantized_builder.dynamic_dequant_inputs == ("MLA_0/input", "MLA_0/input_scale")
     assert _linear_model(quantize_embeddings=True).get_mla_input_tessellate_params() == {}
     assert _linear_model(quantize_embeddings=True).get_mla_output_tessellate_params() == {}
 
     with pytest.raises(_StopGraphBuild):
-        _linear_model(quantize_embeddings=True, layer_idx=1)._build_sima_nodes(
-            "model.layers.1", False
+        _linear_model(quantize_embeddings=True, layer_idx=1).generate_graph(
+            {}, quantizable=False
         )
-    bf16_builder = _FakeSimaBuilder.instances[-1]
+    bf16_builder = _RecordingModelGraph.instances[-1]
     assert bf16_builder.subnet_input_names == [
         "input",
         "linear_conv_state",
@@ -140,23 +155,22 @@ def test_linear_attention_lora_targets_disable_ab_projection_fusion(monkeypatch)
     model.check_hf_param = lambda _name: False
     calls = []
 
-    def build_projection(
-        _builder, _get_param, _check_param, base_name, _input, **kwargs
-    ):
+    def build_projection(_graph, base_name, _input, **kwargs):
         calls.append((base_name, kwargs))
         return _FakeNode(base_name)
 
-    monkeypatch.setattr(
-        language_linear_model, "build_conv_from_dense_with_lora", build_projection
-    )
+    monkeypatch.setattr(ModelGraph, "linear", build_projection)
     monkeypatch.setattr(
         LanguageLinearModel,
         "_get_ab_projection_params",
         lambda *_args: pytest.fail("targeted A/B projections must not be fused"),
     )
 
-    a, b = model._build_sima_ab_projections(
-        object(), "model.layers.0.linear_attn", object(), merged_lora=True
+    a, b = model._build_ab_projections(
+        ModelGraph(model, {"input": (1, 1, 1, 16)}, False),
+        "model.layers.0.linear_attn",
+        object(),
+        merged_lora=True,
     )
 
     assert (a.name, b.name) == (

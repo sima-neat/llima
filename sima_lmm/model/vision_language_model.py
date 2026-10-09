@@ -1,47 +1,16 @@
-import copy
 import logging
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import (
-    ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
-)
+from sima_lmm.config.vlm_config import ModelFormat, SPECULATIVE_BUDGET, VlmConfig, model_file_type
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.base import (
-    BaseModel, EvalMode, FileGenMode, FileGenPrecision, LoraGenMode, GenConfiguration
-)
+from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
-from sima_lmm.logging import sima_log_info, sima_log_warning
-
-
-
-class _TrivialContextManager:
-    """
-    Context manager that does nothing.
-    """
-    def __enter__(self):
-        pass
-    def __exit__(self, exc_type, exc_value, traceback):
-        pass
-
-
-class _LoadParamsContextManager:
-    """
-    Load model parameters on entry, unload on exit.
-    """
-    def __init__(self, model):
-        self._model = model
-
-    def __enter__(self):
-        self._model.load_all_params()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self._model.unload_all_params()
+from sima_lmm.logging import sima_log_info
 
 
 @dataclass
@@ -51,7 +20,7 @@ class VisionLanguageModel(BaseModel):
 
     def __post_init__(self):
         self.language_model = LanguageModel(
-            self.cfg, self.language_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+            self.cfg, self.language_model_name, sima_path=self.sima_path,
             hf_model=self.hf_model, vlm_helper=self.vlm_helper,
         )
 
@@ -59,7 +28,6 @@ class VisionLanguageModel(BaseModel):
     def from_hf_cache(
         model_name: str,
         hf_cache_path: Path | str,
-        onnx_path: Path | str,
         sima_path: Path | str,
         max_num_tokens: int,
         system_prompt: str | None = None,
@@ -76,10 +44,8 @@ class VisionLanguageModel(BaseModel):
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
         Args:
-            model_name: Model name. This is used as a file name prefix for the generated onnx
-                and model sdk files.
+            model_name: File name prefix for the generated SiMa artifacts.
             hf_cache_path: Path to the cached Hugging Face model.
-            onnx_path: Path to the generated ONNX files.
             sima_path: Path to the generated SiMa files.
             max_num_tokens: Maximum number of tokens, including both input and output tokens.
             system_prompt: System prompt.
@@ -140,7 +106,6 @@ class VisionLanguageModel(BaseModel):
             cfg=vlm_cfg,
             hf_model=hf_model,
             model_name=model_name,
-            onnx_path=Path(onnx_path),
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
@@ -188,28 +153,21 @@ class VisionLanguageModel(BaseModel):
         elif not (self.sima_devkit_path / "vlm_config.json").is_file():
             self.gen_devkit_files(precision=precision, resume=False)
 
-        if gen_mode == FileGenMode.SOURCE_TO_ONNX:
-            num_processes = 1
-            gen_context = _LoadParamsContextManager(self.hf_model)
-        else:
-            gen_context = _TrivialContextManager()
-
-        with gen_context:
-            if self.cfg.vm_cfg is not None and self.cfg.is_supported_multimodal:
-                # This model includes a vision model
-                vision_model = VisionModel(
-                    self.cfg, self.vision_model_name, onnx_path=self.onnx_path,
-                    sima_path=self.sima_path, hf_model=self.hf_model
-                )
-                vision_model.gen_files(
-                    gen_mode, gen_config=gen_config, log_level=log_level,
-                    num_processes=num_processes, resume=resume
-                )
-
-            self.language_model.gen_files(
+        if self.cfg.vm_cfg is not None and self.cfg.is_supported_multimodal:
+            # This model includes a vision model
+            vision_model = VisionModel(
+                self.cfg, self.vision_model_name,
+                sima_path=self.sima_path, hf_model=self.hf_model
+            )
+            vision_model.gen_files(
                 gen_mode, gen_config=gen_config, log_level=log_level,
                 num_processes=num_processes, resume=resume
             )
+
+        self.language_model.gen_files(
+            gen_mode, gen_config=gen_config, log_level=log_level,
+            num_processes=num_processes, resume=resume
+        )
         sima_log_info("%s files generation completed.", gen_mode)
 
     def evaluate(self, eval_mode: EvalMode, chat: Chat) -> str | np.ndarray:
@@ -278,7 +236,7 @@ class VisionLanguageModel(BaseModel):
                 )
 
             vision_model = VisionModel(
-                self.cfg, self.vision_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path
+                self.cfg, self.vision_model_name, sima_path=self.sima_path
             )
             vision_outputs = vision_model.run_model(eval_mode, [image_tensor])
             vision_proj = vision_outputs[0]

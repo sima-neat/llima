@@ -94,8 +94,8 @@ output_directory/
 | `--input_width` | 픽셀 단위의 입력 이미지 너비입니다. `--input_height`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Qwen3.5, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
 | `--system_prompt` | CLI 모드와 모델 초기화를 위해 저장할 시스템 프롬프트입니다. |
 | `--system_prompt_file` | 시스템 프롬프트를 포함하는 텍스트 파일의 경로입니다. |
-| `--chat_template` | 컴파일된 모델에 저장할 채팅 템플릿 문자열입니다. 시스템 프롬프트 및 채팅 템플릿 파일 옵션과 상호 배타적입니다. |
-| `--chat_template_file` | 채팅 템플릿이 포함된 파일의 경로입니다. 시스템 프롬프트 옵션과 `--chat_template`는 상호 배타적입니다. |
+| `--chat_template` | 컴파일된 모델에 저장할 채팅 템플릿 문자열입니다. `--chat_template_file`과 상호 배타적입니다. |
+| `--chat_template_file` | 채팅 템플릿이 포함된 파일의 경로입니다. `--chat_template`과 상호 배타적입니다. |
 
 :::note
 대부분의 모델은 최대 8192개의 토큰까지의 컨텍스트 길이를 지원합니다. 8K 컨텍스트 길이를 사용하려면 `--max_num_tokens 8192`를 사용하세요.

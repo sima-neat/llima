@@ -4,16 +4,14 @@ import time
 
 from dataclasses import asdict, dataclass
 
-from afe.ir.tensor_type import ScalarType
+from ml_dtypes import bfloat16
 from afe.ir.quantization_conv import block_quantize_weight_tensor
 
 from sima_lmm.logging import sima_log_info, sima_log_warning
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.base import (
-    BaseModel, EvalMode, FileGenMode, FileGenPrecision, LoraGenMode, GenConfiguration
-)
+from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_moe_router_model import LanguageMoeRouterModel
@@ -25,11 +23,7 @@ from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
-from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
-
-
-bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
+from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
 def quantize_embedding_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -433,16 +427,8 @@ class LanguageModel(BaseModel):
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 
                 if self.cfg.lm_cfg.moe_cfg is not None:
-                    router_ifms = [pre_ifms[0]]
-                    if (
-                        eval_mode == EvalMode.SDK
-                        and self.cfg.pipeline_cfg.quantize_embeddings
-                        and layer_idx == 0
-                    ):
-                        router_ifms.append(pre_ifms[1])
-                    router_ifms.append(cache_ofms[0])
                     post_ofms = self._run_moe_post(
-                        eval_mode, num_tokens, layer_idx, router_ifms
+                        eval_mode, num_tokens, layer_idx, pre_ifms, cache_ofms[0]
                     )
                 else:
                     post_ifms = [pre_ifms[0]]
@@ -476,37 +462,26 @@ class LanguageModel(BaseModel):
         # Return the generated tokens.
         return np.array([new_tokens])
 
-    def _run_moe_post(self, eval_mode, num_tokens, layer_idx, router_ifms):
-        """MoE post block: router (TopK+softmax on-graph) -> experts -> weighted-sum.
-
-        router_ifms is [hidden, self_attn], or [hidden, input_scale, self_attn] when
-        Model SDK evaluation feeds layer zero quantized embedding rows.
-        """
+    def _run_moe_post(self, eval_mode, num_tokens, layer_idx, hidden, self_attn):
+        """MoE post block: router (TopK+softmax on-graph) -> experts -> weighted-sum."""
         moe = self.cfg.lm_cfg.moe_cfg
         num_experts = moe.num_experts
 
         router_model = self._get_part_model("router", num_tokens, layer_idx=layer_idx)
+        router_inputs = [hidden[0]]
+        if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
+            router_inputs.append(hidden[1])
         values, indices, residual, norm_hidden = router_model.run_model(
-            eval_mode, router_ifms
+            eval_mode, router_inputs + [self_attn]
         )
-        # The two paths lay the router outputs out differently: ONNX is NCHW
-        # (1, top_k, 1, num_tokens), Model SDK is (1, 1, num_tokens, top_k).
-        is_onnx = eval_mode == EvalMode.ONNX
-        if is_onnx:
-            vals = values[0, :, 0, :].T                    # (num_tokens, top_k)
-            idxs = indices[0, :, 0, :].T.astype(np.int64)  # (num_tokens, top_k)
-        else:
-            vals = values[0, 0]                    # (num_tokens, top_k)
-            idxs = indices[0, 0].astype(np.int64)  # (num_tokens, top_k)
+        vals = values[0, 0]                    # (num_tokens, top_k)
+        idxs = indices[0, 0].astype(np.int64)  # (num_tokens, top_k)
 
         # Scatter the k routing weights into a dense (num_tokens, num_experts) tensor.
         router_weights = np.zeros((num_tokens, num_experts), dtype=np.float32)
         for t in range(num_tokens):
             router_weights[t, idxs[t]] = vals[t]
-        if is_onnx:
-            rw = router_weights.T[None, :, None, :]  # (1, num_experts, 1, num_tokens)
-        else:
-            rw = router_weights[None, None]          # (1, 1, num_tokens, num_experts)
+        rw = router_weights[None, None]  # NHWC: (1, 1, num_tokens, num_experts)
 
         # Only run experts at least one token selected; the rest have weight 0.
         activated = set(int(e) for e in idxs.flatten())
@@ -520,11 +495,9 @@ class LanguageModel(BaseModel):
         expert_outs = []
         if num_tokens > 1:
             # Group combine consumes all num_experts slots; skipped ones are zeros.
-            zero_shape = (
-                (1, self.cfg.lm_cfg.hidden_size, 1, num_tokens) if is_onnx
-                else (1, 1, num_tokens, self.cfg.lm_cfg.hidden_size)
+            zero = np.zeros(
+                (1, 1, num_tokens, self.cfg.lm_cfg.hidden_size), dtype=np.float32
             )
-            zero = np.zeros(zero_shape, dtype=np.float32)
             for e in range(num_experts):
                 expert_outs.append(run_expert(e) if e in activated else zero)
         else:
@@ -616,7 +589,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_pre_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguagePreModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                 )
             case "post":
@@ -626,7 +599,7 @@ class LanguageModel(BaseModel):
                     model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguagePostModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
                     expert_idx=expert_idx,
@@ -635,14 +608,14 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_router_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguageMoeRouterModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                 )
             case "moe_weightedsum":
                 model_name = f"{self.model_name}_n{num_tokens}_moe_weightedsum_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguageMoeWeightedSumModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
                 )
@@ -650,7 +623,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_cache_token{token_idx}"
                 assert token_idx is not None
                 return LanguageCacheModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping
                 )
@@ -658,7 +631,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_sliding_cache_token{token_idx}"
                 assert token_idx is not None
                 return LanguageCacheModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
                     layer_type="sliding_attention"
@@ -667,7 +640,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_conv"
                 assert layer_idx is not None
                 return LanguageConvModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
                 )
@@ -675,26 +648,26 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_linear"
                 assert layer_idx is not None
                 return LanguageLinearModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx
                 )
             case "conv_post_final":
                 model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}_conv_final"
                 assert layer_idx is not None
                 return LanguageConvPostModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
                 )
             case "draft_fc":
                 model_name = f"{self.model_name}_n{num_tokens}_draft_fc"
                 return LanguageDraftFCModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens
                 )
             case "per_layer":
                 model_name = f"{self.model_name}_n{num_tokens}_per_layer"
                 return LanguagePerLayerModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens,
                 )

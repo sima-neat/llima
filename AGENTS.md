@@ -63,7 +63,7 @@ update or required integration fix, and document submodule revisions.
 - Pure logic: hermetic tests without network or model downloads.
 - Model-backed compiler changes: configure required cached inputs; unintended
   skips fail validation.
-- ONNX/numerical regression: generate comparison artifacts during the run.
+- Native graph/numerical regression: generate comparison artifacts during the run.
 - MLA/runtime behavior: run affected packaged tests on Modalix.
 - Packaging: build every affected Debian or wheel profile.
 - Skills: run the isolated `sima-cli playbooks install ./skills` validation

@@ -1,298 +1,44 @@
 from dataclasses import dataclass
 import numpy as np
 
-from afe.backends.backends import Backend
-from afe.ir.build_node import NodeHandle, NodeOrHandle
-
-from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.model.base import BaseModel
-from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import SimaBuilder, build_conv, build_logit_softcapping
+from sima_lmm.model.model_graph import Node
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
 
 
 @dataclass
 class LanguagePartBaseModel(BaseModel):
-    def _build_rms_norm(self, base_name: str, input_node: OnnxNode) -> OnnxNode:
-        weight_offset = 1.0 if self.cfg.lm_cfg.rms_norm_unit_offset else 0.0
-        return self._onnx_builder.build_rms_norm(
-            base_name, input_node, self.cfg.lm_cfg.rms_norm_eps, weight_offset
-        )
 
-    def _build_sima_rms_norm(
-        self,
-        builder: SimaBuilder,
-        base_name: str,
-        input_node: NodeOrHandle,
-        weightless: bool = False,
-        num_channels: int | None = None,
-    ) -> NodeOrHandle:
-        """
-        Create an RMS norm with a multiplication applied to its outputs.
-        """
-        if weightless:
-            assert num_channels is not None
-            weight_tensor = np.ones(num_channels, dtype=np.float32)
-        else:
-            weight_offset = 1.0 if self.cfg.lm_cfg.rms_norm_unit_offset else 0.0
-            weight_tensor = self.get_hf_param(f"{base_name}.weight") + weight_offset
-
-        # Reduce the precision of epsilon so that it is exactly representable in float32
-        epsilon = float(np.float32(self.cfg.lm_cfg.rms_norm_eps))
-        return builder.create_rms_norm_node(input_node, epsilon, weight_tensor)
-
-    def _build_onnx_mlp(
-        self, base_name: str, input_nodes: list[OnnxNode], with_residual_add: bool = False
-    ) -> OnnxNode:
-        """Build ONNX nodes for the MLP block with optional splitting.
-
-        Handles both LFM2-style weights (w1/w2/w3) and standard weights (gate_proj/up_proj/down_proj).
-       """
-        # Make sure that there is residual add input if needed.
-        assert len(input_nodes) == (2 if with_residual_add else 1)
-
-        expert_idx = getattr(self, "expert_idx", -1)
-        swiglu_limit = self.cfg.lm_cfg.mlp_cfg.swiglu_limit
-        if swiglu_limit is not None:
-            # Clamped gated SwiGLU. de_interleave (gpt_oss only) splits the fused
-            # interleaved gate_up into two projection convs at load time.
-            de_interleave = self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
-            lora_ranks = {}
-            if self.cfg.lm_cfg.lora_cfg is not None:
-                bundled = {
-                    "gate_proj": "experts.gate_up_proj",
-                    "up_proj": "experts.gate_up_proj",
-                    "down_proj": "experts.down_proj",
-                }
-                for name in ("gate_proj", "up_proj", "down_proj"):
-                    rank = self.cfg.lm_cfg.get_lora_rank(base_name, name)
-                    if rank is None and expert_idx >= 0:
-                        rank = self.cfg.lm_cfg.get_lora_rank(base_name, bundled[name])
-                    lora_ranks[name] = rank
-            gate = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.gate_proj", input_nodes[0], lora_ranks.get("gate_proj"),
-                expert_idx=expert_idx, de_interleave=de_interleave,
-            )
-            up = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.up_proj", input_nodes[0], lora_ranks.get("up_proj"),
-                expert_idx=expert_idx, de_interleave=de_interleave,
-            )
-            act = self._onnx_builder.build_swiglu(f"{base_name}.act", gate, up, swiglu_limit)
-            down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-                f"{base_name}.down_proj", act, lora_ranks.get("down_proj"),
-                expert_idx=expert_idx,
-            )
-            if with_residual_add:
-                down_proj = self._onnx_builder.build_op(
-                    f"{base_name}.add2", [input_nodes[1], down_proj], "Add"
-                )
-            return down_proj
-
-        # Determine weight naming convention based on what exists in the model.
-        if self.check_hf_param(f"{base_name}.w2.weight"):
-            gate_name, up_name, down_name = "w1", "w3", "w2"
-        else:
-            gate_name, up_name, down_name = "gate_proj", "up_proj", "down_proj"
-
-        # The MLP is built unsplit; the n2a compiler auto-splits infeasible conv-bounded regions.
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, gate_name)
-        gate_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.{gate_name}", input_nodes[0], lora_rank
-        )
-
-        act = self._onnx_builder.build_activation(
-            f"{base_name}.act", gate_proj, self.cfg.lm_cfg.mlp_cfg.act
-        )
-
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, up_name)
-        up_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.{up_name}", input_nodes[0], lora_rank
-        )
-
-        mul2 = self._onnx_builder.build_op(f"{base_name}.mul2", [act, up_proj], "Mul")
-
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
-
-        down_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.{down_name}", mul2, lora_rank
-        )
-
-        if with_residual_add:
-            # Sums the MLP output with the residual stream.
-            down_proj = self._onnx_builder.build_op(
-                f"{base_name}.add2", [input_nodes[1], down_proj], "Add"
-            )
-
-        return down_proj
-
-    def _build_sima_mlp(
-        self, builder, base_name: str, input_nodes: list[NodeOrHandle], quantizable: bool,
-        merged_lora: bool = False, with_residual_add: bool =  False
-    ) -> NodeOrHandle:
-        """Build SiMa nodes for the MLP block with optional splitting.
+    def _build_mlp(
+        self, graph, base_name: str, input_nodes: list[Node], merged_lora: bool = False, with_residual_add: bool =  False
+    ) -> Node:
+        """Build the MLP using the model's projection, expert and LoRA configuration.
 
         Handles both LFM2-style weights (w1/w2/w3) and standard weights (gate_proj/up_proj/down_proj).
         """
-        from sima_lmm.model.sima_builder import build_conv_from_dense_with_lora, build_activation
-
-        # Make sure that there is residual add input if needed.
         assert len(input_nodes) == (2 if with_residual_add else 1)
-
-        swiglu_limit = self.cfg.lm_cfg.mlp_cfg.swiglu_limit
-        if swiglu_limit is not None:
-            return self._build_sima_swiglu_mlp(
-                builder, base_name, input_nodes, swiglu_limit, merged_lora, with_residual_add
-            )
-
-        # Determine weight naming convention based on what exists in the model.
-        if self.check_hf_param(f"{base_name}.w2.weight"):
-            gate_name, up_name, down_name = "w1", "w3", "w2"
-        else:
-            gate_name, up_name, down_name = "gate_proj", "up_proj", "down_proj"
-
-        # The MLP is built unsplit; the n2a compiler auto-splits infeasible conv-bounded regions.
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, gate_name)
-        gate_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{gate_name}",
-            input_nodes[0], lora_rank, merged_lora=merged_lora
+        projections = ("w1", "w3", "w2") if self.check_hf_param(f"{base_name}.w2.weight") else (
+            "gate_proj", "up_proj", "down_proj"
         )
-
-        act = build_activation(builder, gate_proj, self.cfg.lm_cfg.mlp_cfg.act, quantizable)
-
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, up_name)
-        up_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{up_name}",
-            input_nodes[0], lora_rank, merged_lora=merged_lora
-        )
-
-        mul2 = builder.create_mul_node(act, up_proj)
-
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, down_name)
-        down_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.{down_name}", mul2,
-            lora_rank, merged_lora=merged_lora
-        )
-
-        if with_residual_add:
-            # Sums the MLP output with the residual stream.
-            down_proj = builder.create_add_node(input_nodes[1], down_proj)
-
-        return down_proj
-
-    def _build_sima_swiglu_mlp(
-        self, builder, base_name: str, input_nodes: list[NodeOrHandle], swiglu_limit: float,
-        merged_lora: bool = False, with_residual_add: bool = False
-    ) -> NodeOrHandle:
-        """Build SiMa nodes for a clamped gated SwiGLU MLP block (gpt_oss).
-
-        Mirrors the swiglu branch of _build_onnx_mlp, including its lack of part
-        splitting.
-        """
-        from afe.ir.defines import get_expected_tensor_value
-        from sima_lmm.model.sima_builder import (
-            build_conv_from_dense_with_lora, build_swiglu, swiglu_clip
-        )
-
         expert_idx = getattr(self, "expert_idx", -1)
-        # de_interleave (gpt_oss only) splits the fused interleaved gate_up into two
-        # projection convs at load time.
-        de_interleave = self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS
-
-        # Fold the SwiGLU clamps into the projections, as the ONNX path does, rather
-        # than emitting standalone Clip nodes.
-        ifm = input_nodes[0]
-        ifm_type = get_expected_tensor_value(
-            ifm.type if isinstance(ifm, NodeHandle) else ifm.get_type().output
-        )
-        gate_clip, up_clip = swiglu_clip(
-            ifm_type,
-            self.cfg.lm_cfg.get_effective_intermediate_size(self.layer_idx),
-            swiglu_limit,
-        )
-        if merged_lora and expert_idx >= 0 and not self.check_hf_param(
-            f"{base_name}.gate_proj.weight"
-        ):
-            raise NotImplementedError(
-                "LORA_MERGED is not supported for bundled MoE experts: the merged "
-                "weight would relocate under the batched gate_up_proj name that every "
-                "expert shares. Use LORA_BRANCH."
-            )
-        lora_ranks = {}
+        ranks = {}
         if self.cfg.lm_cfg.lora_cfg is not None:
             bundled = {
-                "gate_proj": "experts.gate_up_proj",
-                "up_proj": "experts.gate_up_proj",
+                "gate_proj": "experts.gate_up_proj", "up_proj": "experts.gate_up_proj",
                 "down_proj": "experts.down_proj",
             }
-            for name in ("gate_proj", "up_proj", "down_proj"):
+            for name in projections:
                 rank = self.cfg.lm_cfg.get_lora_rank(base_name, name)
                 if rank is None and expert_idx >= 0:
                     rank = self.cfg.lm_cfg.get_lora_rank(base_name, bundled[name])
-                lora_ranks[name] = rank
-        # A branch-mode adapter is added after the convolution, so the clamp cannot be
-        # folded into it: the ONNX path clips the combined projection, not the base one.
-        gate_rank = lora_ranks.get("gate_proj")
-        branch_gate = bool(gate_rank) and not merged_lora
-        gate = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.gate_proj",
-            ifm, gate_rank, merged_lora=merged_lora,
-            expert_idx=expert_idx, de_interleave=de_interleave,
-            activation=None if branch_gate else gate_clip,
+                ranks[name] = rank
+        return graph.mlp(
+            base_name, input_nodes[0], self.cfg.lm_cfg.mlp_cfg.act,
+            projections=projections, residual=input_nodes[1] if with_residual_add else None,
+            lora_ranks=ranks, merged_lora=merged_lora, expert_idx=expert_idx,
+            de_interleave=self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS,
+            swiglu_limit=self.cfg.lm_cfg.mlp_cfg.swiglu_limit,
         )
-        if branch_gate:
-            gate = builder.create_clip_node(gate, gate_clip.a_min, gate_clip.a_max)
-        up_rank = lora_ranks.get("up_proj")
-        branch_up = bool(up_rank) and not merged_lora
-        up = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.up_proj",
-            ifm, up_rank, merged_lora=merged_lora,
-            expert_idx=expert_idx, de_interleave=de_interleave,
-            activation=None if branch_up else up_clip,
-        )
-        if branch_up:
-            up = builder.create_clip_node(up, up_clip.a_min, up_clip.a_max)
-        act = build_swiglu(builder, gate, up)
-        down_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, f"{base_name}.down_proj",
-            act, lora_ranks.get("down_proj"), merged_lora=merged_lora, expert_idx=expert_idx,
-        )
-        if with_residual_add:
-            # Sums the MLP output with the residual stream.
-            down_proj = builder.create_add_node(input_nodes[1], down_proj)
-        return down_proj
-
-    def _cast_bf16_outputs_to_fp32(self, builder: SimaBuilder, mla_node: NodeOrHandle):
-        """Cast bfloat16 outputs to float32. Do not cast int outputs."""
-        from afe.ir.defines import TensorValue, TupleValue, get_expected_tensor_value
-        from afe.ir.tensor_type import ScalarType
-
-        match mla_node.get_type().output:
-            case TensorValue(value=t):
-                if t.scalar == ScalarType.bfloat16:
-                    _ = builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
-            case TupleValue():
-                tuple_items = []
-                for node in builder.create_tuple_get_item_nodes(mla_node):
-                    if (get_expected_tensor_value(node.get_type().output).scalar
-                            == ScalarType.bfloat16):
-                        tuple_items.append(
-                            builder.create_cast_node(node, ScalarType.float32, backend=Backend.EV)
-                        )
-                    else:
-                        tuple_items.append(node)
-                builder.create_tuple_node(tuple_items)
 
     @property
     def is_draft(self) -> bool:
@@ -316,47 +62,14 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             in one model.
         layer_idx: Transformer layer index.
         final_softcapping: Final logit soft capping for gemma 2.
-        expert_idx: MoE expert this post model builds; -1 for a non-expert post model.
     """
     num_tokens: int
     layer_idx: int
     final_softcapping: float | None
     expert_idx: int = -1
 
-    def _create_final_layer_output_nodes(self, output_nodes: list[OnnxNode]):
-        """Create output nodes for the final transformer layer."""
-        if not self.is_draft and self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
-            output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
-            self._onnx_builder.create_output_node(output_name, (1, 1, 1, self.num_tokens), np.int64)
-        else:
-            # Find the last layer's size based on the weight tensor shape.
-            output_vocab_size = self.get_hf_param(self._get_output_embed_name()).shape[0]
-            assert 1 < output_vocab_size <= (
-                self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
-                else self.cfg.lm_cfg.token_cfg.vocab_size
-            )
-
-            for i in range(self.cfg.lm_cfg.lm_head_num_splits):
-                split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
-                split_size = min(
-                    output_vocab_size - split_begin,
-                    self.cfg.lm_cfg.lm_head_split_dim
-                )
-                output_name = self._onnx_builder.get_node_output_name(output_nodes[i])
-                self._onnx_builder.create_output_node(
-                    output_name, (1, split_size, 1, self.num_tokens)
-                )
-            if self.is_draft:
-                # EAGLE3 draft model also returns hidden_states as the last output
-                hidden_states_name = self._onnx_builder.get_node_output_name(output_nodes[-1])
-                self._onnx_builder.create_output_node(
-                    hidden_states_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-                )
-
-    def _build_onnx_post_transformer(self, base_name: str, input_node: OnnxNode) -> list[OnnxNode]:
-        """
-        Build ONNX nodes for the post-transformer projection (final norm + lm_head).
-        """
+    def _build_post_transformer(self, graph, input_node) -> list[Node]:
+        """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""
         # LFM2 uses embedding_norm instead of norm for the final normalization.
         base_prefix = self.hf_model.language_model_param_base_name
         final_norm_name = (
@@ -365,75 +78,23 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
         if self.is_draft:
             final_norm_full_name = final_norm_name
-        rms_norm2 = self._build_rms_norm(final_norm_full_name, input_node)
+        rms_norm = graph.rms_norm(final_norm_full_name, input_node)
 
         # Find the last layer's size based on the weight tensor shape.
         output_embed_name = self._get_output_embed_name()
-        output_vocab_size = self.get_hf_param(output_embed_name).shape[0]
-        assert 1 < output_vocab_size <= (
-            self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
-            else self.cfg.lm_cfg.token_cfg.vocab_size
-        )
-
-        lm_heads = list()
-        kwargs = dict()
-        kwargs["src_weight_name"] = output_embed_name
-        for i in range(self.cfg.lm_cfg.lm_head_num_splits):
-            split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
-            split_end = min(
-                split_begin + self.cfg.lm_cfg.lm_head_split_dim,
-                output_vocab_size
-            )
-            def param_process_func(x: np.ndarray) -> np.ndarray:
-                return x[split_begin:split_end]
-            kwargs["weight_process_func"] = param_process_func
-            kwargs["bias_process_func"] = param_process_func
-            lm_head = self._onnx_builder.build_conv(f"lm_head.{i}", rms_norm2, **kwargs)
-            if self.final_softcapping is not None:
-                assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and (
-                    self.cfg.model_type in (VlmArchType.LLM_GEMMA2, VlmArchType.VLM_GEMMA4)
-                )
-                lm_head = self._onnx_builder.build_logit_softcapping(
-                    f"{base_name}.final_softcap.{i}", lm_head, self.cfg.lm_cfg.final_logit_softcapping
-                )
-            lm_heads.append(lm_head)
-
-        if self.is_draft:
-            lm_heads.append(input_node)
-            return lm_heads
-        if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
-            argmax = self._onnx_builder.build_op(
-                "argmax", lm_heads, "ArgMax", axis=1, keepdims=1
-            )
-            return [argmax]
-        else:
-            return lm_heads
-
-    def _build_post_transformer(self, builder, input_node, quantizable) -> NodeOrHandle:
-        """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""
-        from afe.ir.tensor_type import ScalarType
-
-        # LFM2 uses embedding_norm instead of norm for the final normalization.
-        base_prefix = self.hf_model.language_model_param_base_name
-        final_norm_name = "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
-        final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_draft:
-            final_norm_full_name = final_norm_name
-        rms_norm = self._build_sima_rms_norm(builder,
-            final_norm_full_name, input_node
-        )
-
-        # Find the last layer's size based on the weight tensor shape.
-        output_embed_name = self._get_output_embed_name()
-        output_embed_param = self.get_hf_param(output_embed_name)
+        output_embed_param = graph.parameter(output_embed_name)
         output_embed_weight = (
-            output_embed_param[1] if isinstance(output_embed_param, tuple)
-            else output_embed_param
+            output_embed_param[1] if isinstance(output_embed_param, tuple) else output_embed_param
         )
         output_vocab_size = output_embed_weight.shape[0]
-        assert 1 < output_vocab_size <= (
-            self.cfg.lm_cfg.draft_vocab_size if self.cfg.lm_cfg.draft_vocab_size > 0
-            else self.cfg.lm_cfg.token_cfg.vocab_size
+        assert (
+            1
+            < output_vocab_size
+            <= (
+                self.cfg.lm_cfg.draft_vocab_size
+                if self.cfg.lm_cfg.draft_vocab_size > 0
+                else self.cfg.lm_cfg.token_cfg.vocab_size
+            )
         )
 
         lm_heads = []
@@ -441,32 +102,28 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         kwargs["src_weight_name"] = output_embed_name
         for i in range(self.cfg.lm_cfg.lm_head_num_splits):
             split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
-            split_end = min(
-                split_begin + self.cfg.lm_cfg.lm_head_split_dim,
-                output_vocab_size
-            )
+            split_end = min(split_begin + self.cfg.lm_cfg.lm_head_split_dim, output_vocab_size)
+
             def param_process_func(x: np.ndarray) -> np.ndarray:
                 return x[split_begin:split_end]
+
             kwargs["weight_process_func"] = param_process_func
             kwargs["scale_process_func"] = param_process_func
             kwargs["bias_process_func"] = param_process_func
-            lm_head = build_conv(builder, self.get_hf_param, self.check_hf_param,
-                                 f"lm_head.{i}", rms_norm, **kwargs)
+            lm_head = graph.linear(f"lm_head.{i}", rms_norm, **kwargs)
             if self.final_softcapping is not None:
                 assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and (
                     self.cfg.lm_cfg.model_type == "gemma2"
                     or self.cfg.model_type == VlmArchType.VLM_GEMMA4
                 )
-                lm_head = build_logit_softcapping(
-                    builder, lm_head, self.cfg.lm_cfg.final_logit_softcapping, quantizable
-                )
+                lm_head = graph.softcap(lm_head, self.cfg.lm_cfg.final_logit_softcapping)
             lm_heads.append(lm_head)
 
         if self.is_draft:
             lm_heads.append(input_node)
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
-            argmax = builder.create_argmax_node(lm_heads[0], ScalarType.int32)
+            argmax = graph.argmax(lm_heads[0])
             return [argmax]
         else:
             return lm_heads

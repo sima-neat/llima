@@ -1,8 +1,18 @@
 import gc
+import inspect
 from pathlib import Path
 
 from sima_lmm.model import VisionLanguageModel
 from tests.compilation.helpers.paths import require_readable_path
+
+
+def _from_hf_cache(**kwargs) -> VisionLanguageModel:
+    """Load native graphs with either the candidate or the published baseline API."""
+    factory = VisionLanguageModel.from_hf_cache
+    if "onnx_path" in inspect.signature(factory).parameters:
+        # Older develop wheels require this path even when generating native graphs.
+        kwargs["onnx_path"] = kwargs["sima_path"].parent / "unused"
+    return factory(**kwargs)
 
 
 def load_hf_model(
@@ -17,10 +27,9 @@ def load_hf_model(
         model_inputs_path / model_folder,
         f"source model {model_folder}",
     )
-    return VisionLanguageModel.from_hf_cache(
+    return _from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=output_path / "onnx",
         sima_path=output_path / "sima",
         max_num_tokens=max_num_tokens,
         system_prompt=None,
@@ -49,10 +58,9 @@ def load_speculative_draft_model(
         f"speculative draft model {draft_model_folder}",
     )
 
-    target_model = VisionLanguageModel.from_hf_cache(
+    target_model = _from_hf_cache(
         hf_cache_path=target_path,
         model_name=target_path.name,
-        onnx_path=output_path / "target" / "onnx",
         sima_path=output_path / "target" / "sima",
         max_num_tokens=max_num_tokens,
         system_prompt=None,
@@ -61,10 +69,9 @@ def load_speculative_draft_model(
     )
     target_model.configure_speculative_decoding(is_draft=False)
 
-    draft_model = VisionLanguageModel.from_hf_cache(
+    draft_model = _from_hf_cache(
         hf_cache_path=draft_path,
         model_name=draft_path.name,
-        onnx_path=output_path / "draft" / "onnx",
         sima_path=output_path / "draft" / "sima",
         target_model=target_model,
         max_num_tokens=max_num_tokens,

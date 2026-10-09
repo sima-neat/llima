@@ -30,7 +30,6 @@ def gen_files(
     model = WhisperModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=output_path / "onnx_files",
         sima_path=output_path / "sima_files",
         use_future_token_mask=True,
         enable_filter_sharing=True,

@@ -1,27 +1,16 @@
-"""The gpt-oss SwiGLU clamp must follow a branch-mode LoRA add.
-
-The ONNX path clips the combined projection, so the SDK path must not fold the
-clamp into the convolution when an adapter branch is appended after it.
-"""
+"""GPT-OSS's SwiGLU clamp must follow a branch-mode LoRA add."""
 from types import SimpleNamespace
 
-import afe.ir.defines as afe_defines
 import pytest
 
-import sima_lmm.model.sima_builder as sima_builder
-from sima_lmm.config.vlm_config import LlmArchType
-from sima_lmm.model.language_part_base import LanguagePartBaseModel
+import sima_lmm.model.model_graph as model_graph
+from sima_lmm.model.model_graph import ModelGraph
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
 RANK = 8
 LIMIT = 7.0
-GATE_CLIP = "gate_clip"
-UP_CLIP = "up_clip"
-
-# Base projection and adapter contribution per projection, chosen so the base
-# lands outside the clamp and base + delta lands inside it.
 BASE = {"gate_proj": 10.0, "up_proj": -10.0, "down_proj": 0.0}
 DELTA = {"gate_proj": -5.0, "up_proj": 4.0, "down_proj": 0.0}
 
@@ -30,112 +19,82 @@ def _clip(value, a_min, a_max):
     return min(max(value, a_min), a_max)
 
 
-class _Builder:
-    """Records and applies the clip nodes the MLP builder appends."""
+class _Graph:
+    """Evaluate scalar projections while recording fused and separate clamps."""
 
     def __init__(self):
+        self.convs = []
         self.clips = []
+        self.projected = {}
+        self.model = SimpleNamespace(
+            cfg=SimpleNamespace(lm_cfg=SimpleNamespace(get_effective_intermediate_size=lambda _: 8)),
+            layer_idx=0,
+        )
 
-    def create_clip_node(self, data, a_min, a_max):
+    def linear(self, name, data, lora_rank=None, merged_lora=False, **kwargs):
+        proj = name.rsplit(".", 1)[-1]
+        value = BASE[proj]
+        activation = kwargs.get("activation")
+        if activation is not None:
+            value = _clip(value, activation.a_min, activation.a_max)
+        if lora_rank and not merged_lora:
+            value += DELTA[proj]
+        self.convs.append(SimpleNamespace(activation=activation))
+        self.projected[proj] = value
+        return value
+
+    def clip(self, data, a_min, a_max):
         self.clips.append((data, a_min, a_max))
         return _clip(data, a_min, a_max)
 
-    def create_add_node(self, a, b):
-        return a + b
+    def constant(self, value):
+        return value[0]
+
+    def sigmoid(self, data):
+        self.gate = data / 1.702
+        return 0.5
+
+    def add(self, lhs, rhs):
+        self.up = lhs
+        return lhs + rhs
+
+    def mul(self, lhs, rhs):
+        return lhs * rhs
 
 
 def _build(monkeypatch, lora_rank, merged_lora):
-    """Build one SwiGLU MLP through the real code path, with arithmetic stubs.
-
-    Returns (conv calls, clip calls, gate value, up value).
-    """
-    convs = []
-    gated = {}
-
-    def fake_build_conv(builder, get_param, check_param, base_name, ifm, rank=None,
-                        merged_lora=False, **kwargs):
-        proj_name = base_name.rsplit(".", 1)[-1]
-        value = BASE[proj_name]
-        activation = kwargs.get("activation")
-        # A fused activation clamps the convolution itself...
-        if activation is not None:
-            value = _clip(value, activation.a_min, activation.a_max)
-        # ...and the adapter branch is added afterwards.
-        if rank and not merged_lora:
-            value += DELTA[proj_name]
-        convs.append(SimpleNamespace(name=base_name, rank=rank, activation=activation))
-        return value
-
-    def fake_swiglu_clip(ifm_type, out_channels, swiglu_limit):
-        return (
-            SimpleNamespace(a_min=-1e30, a_max=swiglu_limit, tag=GATE_CLIP),
-            SimpleNamespace(a_min=-swiglu_limit, a_max=swiglu_limit, tag=UP_CLIP),
-        )
-
-    def fake_build_swiglu(builder, gate, up):
-        # Receives the gate/up values after any separate clip node.
-        gated["gate"], gated["up"] = gate, up
-        return 0.0
-
-    monkeypatch.setattr(sima_builder, "build_conv_from_dense_with_lora", fake_build_conv)
-    monkeypatch.setattr(sima_builder, "swiglu_clip", fake_swiglu_clip)
-    monkeypatch.setattr(sima_builder, "build_swiglu", fake_build_swiglu)
-    monkeypatch.setattr(
-        afe_defines, "get_expected_tensor_value",
-        lambda _node: SimpleNamespace(shape=(1, 1, 1, 8)),
+    monkeypatch.setattr(model_graph, "tensor_type", lambda _: SimpleNamespace(shape=(1, 1, 1, 8), scalar=model_graph.ScalarType.float32))
+    graph = _Graph()
+    ModelGraph.mlp(
+        graph, "model.layers.0.mlp.experts.1", 0.0, "silu",
+        projections=("gate_proj", "up_proj", "down_proj"),
+        lora_ranks={name: lora_rank for name in BASE},
+        merged_lora=merged_lora, expert_idx=1, swiglu_limit=LIMIT,
     )
-
-    lm_cfg = SimpleNamespace(
-        lora_cfg=SimpleNamespace(r=RANK) if lora_rank else None,
-        arch=LlmArchType.GPT_OSS,
-        mlp_cfg=SimpleNamespace(swiglu_limit=LIMIT),
-        get_effective_intermediate_size=lambda _idx: 8,
-        get_lora_rank=lambda _base, _module: lora_rank,
-    )
-    model = SimpleNamespace(
-        cfg=SimpleNamespace(lm_cfg=lm_cfg),
-        layer_idx=0,
-        expert_idx=1,
-        get_hf_param=lambda _name: None,
-        # True keeps the split-expert path, so LORA_MERGED is not rejected.
-        check_hf_param=lambda _name: True,
-    )
-    builder = _Builder()
-    ifm = SimpleNamespace(get_type=lambda: SimpleNamespace(output=None))
-
-    LanguagePartBaseModel._build_sima_swiglu_mlp(
-        model, builder, "model.layers.0.mlp.experts.1", [ifm], LIMIT, merged_lora, False
-    )
-    return convs, builder.clips, gated["gate"], gated["up"]
+    return graph
 
 
 def test_branch_lora_clamps_after_the_adapter_add(monkeypatch):
-    convs, clips, gate, up = _build(monkeypatch, lora_rank=RANK, merged_lora=False)
-
-    # The ONNX ordering is clip(base + delta).
-    assert gate == _clip(BASE["gate_proj"] + DELTA["gate_proj"], -1e30, LIMIT)
-    assert up == _clip(BASE["up_proj"] + DELTA["up_proj"], -LIMIT, LIMIT)
-
-    assert convs[0].activation is None
-    assert convs[1].activation is None
-    assert len(clips) == 2
-    assert clips[0][2] == LIMIT
-    assert clips[1][1] == -LIMIT
+    graph = _build(monkeypatch, lora_rank=RANK, merged_lora=False)
+    assert graph.gate == _clip(BASE["gate_proj"] + DELTA["gate_proj"], -1e30, LIMIT)
+    assert graph.up == _clip(BASE["up_proj"] + DELTA["up_proj"], -LIMIT, LIMIT)
+    assert graph.convs[0].activation is None
+    assert graph.convs[1].activation is None
+    assert len(graph.clips) == 2
+    assert graph.clips[0][2] == LIMIT
+    assert graph.clips[1][1] == -LIMIT
 
 
 def test_clamp_stays_fused_without_an_adapter(monkeypatch):
-    convs, clips, gate, _ = _build(monkeypatch, lora_rank=None, merged_lora=False)
-
-    assert convs[0].activation.tag == GATE_CLIP
-    assert convs[1].activation.tag == UP_CLIP
-    assert not clips
-    assert gate == _clip(BASE["gate_proj"], -1e30, LIMIT)
+    graph = _build(monkeypatch, lora_rank=None, merged_lora=False)
+    assert graph.convs[0].activation.a_max == LIMIT
+    assert graph.convs[1].activation.a_min == -LIMIT
+    assert not graph.clips
+    assert graph.gate == LIMIT
 
 
 def test_clamp_stays_fused_for_merged_lora(monkeypatch):
-    # A merged adapter is already inside the weights, so nothing is added after.
-    convs, clips, _, _ = _build(monkeypatch, lora_rank=RANK, merged_lora=True)
-
-    assert convs[0].activation.tag == GATE_CLIP
-    assert convs[1].activation.tag == UP_CLIP
-    assert not clips
+    graph = _build(monkeypatch, lora_rank=RANK, merged_lora=True)
+    assert graph.convs[0].activation.a_max == LIMIT
+    assert graph.convs[1].activation.a_min == -LIMIT
+    assert not graph.clips

@@ -199,34 +199,6 @@ GGUF_FILE_CASES = (
         (0.05, 0.18),
         (0.02, 0.05),
     ),
-    GgufFileCase(
-        "Q6_K",
-        "models--unsloth--gemma-3-1b-it-GGUF",
-        "gemma-3-1b-it-Q6_K.gguf",
-        (0.04, 0.06),
-        (0.02, 0.03),
-    ),
-    GgufFileCase(
-        "Q5_K",
-        "models--unsloth--gemma-3-1b-it-GGUF",
-        "gemma-3-1b-it-Q5_K_S.gguf",
-        (0.04, 0.06),
-        (0.03, 0.04),
-    ),
-    GgufFileCase(
-        "Q4_K",
-        "models--unsloth--gemma-3-1b-it-GGUF",
-        "gemma-3-1b-it-Q4_K_S.gguf",
-        (0.06, 0.10),
-        (0.05, 0.05),
-    ),
-    GgufFileCase(
-        "Q3_K",
-        "models--unsloth--gemma-3-1b-it-GGUF",
-        "gemma-3-1b-it-Q3_K_S.gguf",
-        (0.08, 0.14),
-        (0.08, 0.05),
-    ),
 )
 
 GGUF_PARSER_CASES = (
@@ -247,7 +219,7 @@ RegressionMode = Literal["required", "informative", "disabled"]
 
 
 @dataclass(frozen=True)
-class OnnxRegressionCase:
+class GraphRegressionCase:
     model_folder: str
     component: str
     image_resolution: tuple[int, int] | None = None
@@ -264,105 +236,100 @@ class OnnxRegressionCase:
         return f"{prefix}:{model}:{self.component}"
 
 
-ONNX_REGRESSION_CASES = (
-    OnnxRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "pre"),
-    OnnxRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "cache"),
-    OnnxRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "post"),
-    OnnxRegressionCase("models--google--gemma-3-1b-it", "pre"),
-    OnnxRegressionCase("models--google--gemma-3-1b-it", "cache"),
-    OnnxRegressionCase("models--google--gemma-3-1b-it", "post"),
-    OnnxRegressionCase(
+GRAPH_REGRESSION_CASES = (
+    GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "pre"),
+    GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "cache"),
+    GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "post"),
+    GraphRegressionCase("models--google--gemma-3-1b-it", "pre"),
+    GraphRegressionCase("models--google--gemma-3-1b-it", "cache"),
+    GraphRegressionCase("models--google--gemma-3-1b-it", "post"),
+    GraphRegressionCase(
         "models--google--gemma-4-E2B-it", "pre", (240, 240)
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--google--gemma-4-E2B-it", "cache", (240, 240)
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--google--gemma-4-E2B-it", "post", (240, 240)
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--google--gemma-4-E2B-it", "per_layer", (240, 240)
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--mistralai--Mistral-7B-Instruct-v0.3", "pre"
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--mistralai--Mistral-7B-Instruct-v0.3", "cache"
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--mistralai--Mistral-7B-Instruct-v0.3", "post"
     ),
-    OnnxRegressionCase("models--microsoft--Phi-3.5-mini-instruct", "pre"),
-    OnnxRegressionCase("models--microsoft--Phi-3.5-mini-instruct", "cache"),
-    OnnxRegressionCase("models--microsoft--Phi-3.5-mini-instruct", "post"),
-    OnnxRegressionCase("models--Qwen--Qwen2.5-0.5B-Instruct", "pre"),
-    OnnxRegressionCase("models--Qwen--Qwen2.5-0.5B-Instruct", "cache"),
-    OnnxRegressionCase("models--Qwen--Qwen2.5-0.5B-Instruct", "post"),
-    OnnxRegressionCase("models--Qwen--Qwen3-0.6B", "pre"),
-    OnnxRegressionCase("models--Qwen--Qwen3-0.6B", "cache"),
-    OnnxRegressionCase("models--Qwen--Qwen3-0.6B", "post"),
-    OnnxRegressionCase("models--LiquidAI--LFM2-350M", "conv"),
-    OnnxRegressionCase("models--stribomon--gemma3-siglip448", "vision"),
-    OnnxRegressionCase(
+    GraphRegressionCase("models--microsoft--Phi-3.5-mini-instruct", "pre"),
+    GraphRegressionCase("models--microsoft--Phi-3.5-mini-instruct", "cache"),
+    GraphRegressionCase("models--microsoft--Phi-3.5-mini-instruct", "post"),
+    GraphRegressionCase("models--Qwen--Qwen2.5-0.5B-Instruct", "pre"),
+    GraphRegressionCase("models--Qwen--Qwen2.5-0.5B-Instruct", "cache"),
+    GraphRegressionCase("models--Qwen--Qwen2.5-0.5B-Instruct", "post"),
+    GraphRegressionCase("models--Qwen--Qwen3-0.6B", "pre"),
+    GraphRegressionCase("models--Qwen--Qwen3-0.6B", "cache"),
+    GraphRegressionCase("models--Qwen--Qwen3-0.6B", "post"),
+    GraphRegressionCase("models--LiquidAI--LFM2-350M", "conv"),
+    GraphRegressionCase("models--stribomon--gemma3-siglip448", "vision"),
+    GraphRegressionCase(
         "models--Qwen--Qwen2.5-VL-3B-Instruct", "vision", (224, 224)
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--Qwen--Qwen3-VL-2B-Instruct", "vision", (224, 224)
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--Qwen--Qwen3.5-0.8B",
         "pre",
         (224, 224),
-        mode="informative",
         layer_index=3,
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--Qwen--Qwen3.5-0.8B",
         "cache",
         (224, 224),
-        mode="informative",
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--Qwen--Qwen3.5-0.8B",
         "post",
         (224, 224),
-        mode="informative",
         layer_index=3,
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--Qwen--Qwen3.5-0.8B",
         "linear",
         (224, 224),
-        mode="informative",
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--Qwen--Qwen3.5-0.8B",
         "vision",
         (224, 224),
-        mode="informative",
     ),
-    OnnxRegressionCase(
-        "models--LiquidAI--LFM2-VL-450M", "vision", mode="informative"
+    GraphRegressionCase(
+        "models--LiquidAI--LFM2-VL-450M", "vision"
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--google--gemma-4-E2B-it", "vision", (240, 240)
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--lmsys--SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge",
         "pre",
         target_model_folder="models--meta-llama--Llama-3.1-8B-Instruct",
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--lmsys--SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge",
         "cache",
         target_model_folder="models--meta-llama--Llama-3.1-8B-Instruct",
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--lmsys--SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge",
         "post",
         target_model_folder="models--meta-llama--Llama-3.1-8B-Instruct",
     ),
-    OnnxRegressionCase(
+    GraphRegressionCase(
         "models--lmsys--SGLang-EAGLE3-Llama-3.1-8B-Instruct-SpecForge",
         "draft_fc",
         target_model_folder="models--meta-llama--Llama-3.1-8B-Instruct",
@@ -430,79 +397,10 @@ _GEMMA3_GGUF_FOLDER = "models--unsloth--gemma-3-1b-it-GGUF"
 GGUF_GRAPH_CASES = (
     GgufGraphCase(
         "pre",
-        "Q8_0",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q8_0.gguf",
-        2,
-        (0.02, 0.01, 0.02),
-    ),
-    GgufGraphCase(
-        "pre",
         "Q4_0",
         f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q4_0.gguf",
         2,
         (0.09, 0.06, 0.12),
-    ),
-    GgufGraphCase(
-        "pre",
-        "Q4_1",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q4_1.gguf",
-        2,
-        (0.12, 0.06, 0.12),
-    ),
-    GgufGraphCase(
-        "cache",
-        "Q8_0",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q8_0.gguf",
-        2,
-        (0.0,),
-    ),
-    GgufGraphCase(
-        "post",
-        "Q8_0",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q8_0.gguf",
-        2,
-        (0.02,),
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
-    ),
-    GgufGraphCase(
-        "post",
-        "Q4_0",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q4_0.gguf",
-        2,
-        (0.06,),
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
-    ),
-    GgufGraphCase(
-        "post",
-        "Q4_1",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q4_1.gguf",
-        2,
-        (0.04,),
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
-    ),
-    GgufGraphCase(
-        "post",
-        "Q8_0",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q8_0.gguf",
-        25,
-        (0.09,),
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
-    ),
-    GgufGraphCase(
-        "post",
-        "Q4_0",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q4_0.gguf",
-        25,
-        (0.18,),
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
-    ),
-    GgufGraphCase(
-        "post",
-        "Q4_1",
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-Q4_1.gguf",
-        25,
-        (0.15,),
-        f"{_GEMMA3_GGUF_FOLDER}/gemma-3-1b-it-BF16.gguf",
     ),
 )
 

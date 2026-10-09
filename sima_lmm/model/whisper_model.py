@@ -35,7 +35,6 @@ class WhisperModel(BaseModel):
     def from_hf_cache(
         model_name: str,
         hf_cache_path: Path | str,
-        onnx_path: Path | str,
         sima_path: Path | str,
         use_future_token_mask: bool,
         enable_filter_sharing: bool = False,
@@ -44,10 +43,8 @@ class WhisperModel(BaseModel):
         """Creates a WhisperModel object from cached Hugging Face model.
 
         Args:
-            model_name: Model name. This is used as a file name prefix for the generated onnx
-                and model sdk files.
+            model_name: File name prefix for the generated SiMa artifacts.
             hf_cache_path: Path to the cached Hugging Face model.
-            onnx_path: Path to the generated ONNX files.
             sima_path: Path to the generated SiMa files.
         Returns:
             A WhisperModel object for file generation or evaluation.
@@ -60,7 +57,6 @@ class WhisperModel(BaseModel):
             cfg=whisper_cfg,
             hf_model=hf_model,
             model_name=model_name,
-            onnx_path=Path(onnx_path),
             sima_path=Path(sima_path),
             use_future_token_mask=use_future_token_mask,
             use_filter_sharing=enable_filter_sharing,
@@ -91,8 +87,8 @@ class WhisperModel(BaseModel):
         """
         if gen_mode == FileGenMode.ALL:
             gen_modes = [
-                FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_ONNX, FileGenMode.ONNX_TO_QUANT,
-                FileGenMode.MODEL_SDK_COMPILE
+                FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
+                FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE,
             ]
             for gen_mode in gen_modes:
                 self.gen_files(
@@ -180,7 +176,7 @@ class WhisperModel(BaseModel):
         single_post_precision = precision.get("single_post", single_precision)
         single_cache_precision = precision.get("single_cache", single_precision)
 
-        if gen_mode == FileGenMode.ONNX_TO_QUANT:
+        if gen_mode == FileGenMode.FP_TO_QUANT:
             with ScopedLogLevel(log_level):
                 sima_log_info("Quantization precision:")
                 sima_log_info("  Encoder      = %s", encoder_precision)
@@ -221,14 +217,8 @@ class WhisperModel(BaseModel):
                 (self._get_part_model("cache", token_idx=token_idx), single_cache_precision)
             )
 
-        if gen_mode == FileGenMode.SOURCE_TO_ONNX:
-            num_processes = 1
-            self.hf_model.load_all_params()
-
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
 
-        if gen_mode == FileGenMode.SOURCE_TO_ONNX:
-            self.hf_model.unload_all_params()
         sima_log_info("%s files generation completed.", gen_mode)
 
     def evaluate(
@@ -554,19 +544,19 @@ class WhisperModel(BaseModel):
                     else f"{self.model_name}_encoder_layer{layer_idx}"
                 )
                 return WhisperEncoderModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, layer_idx=layer_idx
                 )
             case "language_detect":
                 model_name = f"{self.model_name}_decoder_language_detect"
                 return WhisperDecoderLanguageDetectModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, use_filter_sharing=self.use_filter_sharing
                 )
             case "init":
                 model_name = f"{self.model_name}_decoder_init_layer{layer_idx}"
                 return WhisperDecoderInitModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, layer_idx=layer_idx,
                     enable_log_probe=(
                         self.cfg.log_probe_enabled and layer_idx == self.cfg.decoder_layers - 1
@@ -576,14 +566,14 @@ class WhisperModel(BaseModel):
             case "pre":
                 model_name = f"{self.model_name}_decoder_n1_pre_layer{layer_idx}"
                 return WhisperDecoderPreModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=1, layer_idx=layer_idx,
                     use_filter_sharing=self.use_filter_sharing
                 )
             case "post":
                 model_name = f"{self.model_name}_decoder_n1_post_layer{layer_idx}"
                 return WhisperDecoderPostModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=1, layer_idx=layer_idx,
                     skip_encoder_kv_proj=True, output_encoder_kv_cache=False,
                     enable_log_probe=(
@@ -594,7 +584,7 @@ class WhisperModel(BaseModel):
             case "cache":
                 model_name = f"{self.model_name}_decoder_n1_cache_token{token_idx}"
                 return WhisperDecoderCacheModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=1, token_idx=token_idx,
                     use_future_token_mask=self.use_future_token_mask,
                     use_filter_sharing=self.use_filter_sharing

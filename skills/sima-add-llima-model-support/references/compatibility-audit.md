@@ -45,6 +45,12 @@ Use the exact model repository implementation as the oracle when upstream
 Transformers has no native implementation. Treat secondary implementations as
 corroboration, not a substitute for the pinned target.
 
+Compare tensors in equivalent layouts. ModelGraph preserves LLM hidden-state
+and attention axis order, adding a singleton axis to hidden states for 4D;
+vision image tensors use NHWC instead of Transformers' usual NCHW. Follow
+`llm-architecture.md` and `vlm-architecture.md` for the exact shape mappings
+before attributing a layout difference to graph semantics.
+
 Inspect the supported compiler environment rather than assuming repository
 metadata declares every transitive dependency. This reproduces the native
 mapping check and the repository's current
@@ -101,9 +107,8 @@ Before writing a transform, inspect:
 
 - `LocalHuggingFaceModel.param_exists`, `load_np_param`, and
   `language_model_param_base_name` in `sima_lmm/hf/hf_transformer.py`;
-- `find_alternate_weight` in `sima_lmm/model/onnx_builder.py`;
-- its ONNX and direct Model SDK call sites in `onnx_builder.py` and
-  `sima_builder.py`;
+- `ModelGraph._find_alternate_weight` and its `_build_conv` call site in
+  `sima_lmm/model/model_graph.py`;
 - conditional name selection in the nearest language or vision graph; and
 - existing configuration aliases in `sima_lmm/config/vlm_config.py`.
 

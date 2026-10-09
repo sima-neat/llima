@@ -32,7 +32,6 @@ After compiling your model with `llima-compile`, you'll have a directory structu
 
 ``` text
 Llama-3.2-3B-Instruct_out/
-├── onnx_files/
 └── sima_files/
     ├── devkit/
     └── mpk/

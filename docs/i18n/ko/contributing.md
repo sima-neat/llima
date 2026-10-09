@@ -129,7 +129,7 @@ python -P -m pytest \
 `--model-inputs-path` 및 `LLIMA_HF_MODELS_PATH`는 준비된 Hugging Face/GGUF 입력 루트를 선택합니다. CI는 `tools/hf-safetensors/` 아래의 매니페스트를 사용합니다.
 테스트 생략을 허용하는 대신 필요한 입력을 구성합니다.
 
-테스트 매트릭스, 예상 값, 기본 정책은 `tests/README.md`에, CI 호출은 `.github/workflows/model-compiler-tests.yml`에 있습니다. 실행 중에 ONNX 및 숫자 비교 아티팩트를 생성하고, 이진 기본값을 커밋하는 대신 생성합니다.
+테스트 매트릭스, 예상 값, 기본 정책은 `tests/README.md`에, CI 호출은 `.github/workflows/model-compiler-tests.yml`에 있습니다. 실행 중에 Model SDK 및 숫자 비교 아티팩트를 생성하고, 이진 기본값을 커밋하는 대신 생성합니다.
 
 ### 런타임 유효성 검사
 
