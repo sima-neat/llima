@@ -35,7 +35,7 @@ corresponding resolver output is false.
 
 The compiler workflow validates the exact LLiMa compiler wheel produced for
 the candidate commit. It covers configuration, model ingestion, generated
-ONNX, quantization, and a bounded full compilation pipeline.
+native SDK graphs, quantization, and a bounded full compilation pipeline.
 
 Model inputs are downloaded from the internal Vulcan cache. After preparation,
 Hugging Face and Transformers run in offline mode so test groups cannot
@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 134
+- Expected cases: 322
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -103,37 +103,50 @@ This protects:
 
 - Location: `tests/compilation/source_ingestion/`
 - Marker: `compiler_source`
-- Expected cases: 15
+- Expected cases: 5
 
 This group validates:
 
 - GGUF parser detection for Q8_0 and Q4_0 inputs.
-- Dequantization for Q8_0, Q4_0, Q6_K, Q5_K, Q4_K, and Q3_K.
+- Two exhaustive dequantization cases: Q8_0 and Q4_0.
 - Numerical comparison with the BF16 GGUF reference and GGUF library.
 - Resolution of Hugging Face weight names to GGUF weights.
-- Shape agreement between Hugging Face and GGUF weights.
+- Shape agreement between Hugging Face and BF16 GGUF weights.
 
-The comparisons are exhaustive across model tensors. Reference weights are
-shared across quantization variants where possible.
+The two numerical comparisons are exhaustive across model tensors and share
+the BF16 reference weights. Weight-name and shape checks use BF16 once because
+the mapping is independent of quantization format. Fast unit tests retain
+coverage of the other GGUF quantization formats.
 
-#### ONNX generation and validation
+#### Native graph generation and validation
 
-- Location: `tests/compilation/onnx_regression/`
-- Marker: `compiler_onnx_regression`
+- Location: `tests/compilation/graph_regression/`
+- Marker: `compiler_graph_regression`
 - Expected cases: 37
+
+All current cases are required.
 
 Every case:
 
-1. Generates candidate ONNX.
-2. Runs `onnx.checker`.
+1. Generates a floating-point native SDK graph (`.fp32.sima`) through the model component.
+2. Loads the graph and validates its input/output types and fixed shapes.
 3. Creates deterministic inputs.
-4. Executes the graph with ONNX Runtime.
-5. Validates output count, dtype, rank, and fixed dimensions.
+4. Executes the graph with AFE's reference executor.
+5. Validates output count, dtype, shape and finite values.
+
+Vision cases cover layer 0, including patch and position embeddings, plus one
+intermediate layer selected deterministically from the case ID. The same
+layers are generated for both revisions and executed independently.
 
 Feature branches, except `release*`, also generate the same components with
 the latest published `develop` compiler wheel. `develop`, `main`, `release*`,
 and tag builds validate the candidate only because those refs do not have a
 separate baseline artifact.
+
+Baseline generation uses develop's existing native SDK path; it does not
+require the new `ModelGraph` wrapper. The test model factory supplies the
+legacy constructor path only when the published baseline API requires it;
+no ONNX graph is generated or executed.
 
 Each case declares one regression mode in `tests/compilation/cases.py`:
 
@@ -147,23 +160,25 @@ Use `informative` for new model support that is not yet available from the
 published `develop` compiler. Change it to `required` once baseline support is
 available.
 
-Generated ONNX and NumPy payloads are deleted after the workflow. They are not
-stored in the repository or artifact cache.
+Generated SDK graphs and NumPy payloads are deleted after the workflow. They
+are not stored in the repository or artifact cache.
 
 #### Generated-graph and quantization integration
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 22 standard and 6 high-memory
+- Expected cases: 31 standard and 6 high-memory
 
 This group validates:
 
 - Embedding quantization and dequantization wiring.
-- Staged source-to-ONNX-to-quant generation versus direct generation.
-- GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
+- Staged native FP32 graph quantization versus direct quantized generation.
+- Whisper SiMa graph numerical and output-contract comparisons against Hugging Face, including
+  BF16/INT8 quantization, using deterministic synthetic weights.
+- One Q4_0 GGUF pre-layer graph smoke case against a Hugging Face BF16 graph.
 - Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are serial and high-memory. CI runs the 22
+The speculative-decoding cases are serial and high-memory. CI runs the 31
 standard cases first and the 6 high-memory cases separately.
 
 #### Selected-model full compilation E2E
@@ -243,18 +258,18 @@ python -P -m pytest \
   -vv -ra
 ```
 
-ONNX regression additionally requires separately generated candidate and
-baseline roots and manifests. The authoritative invocation is maintained in
+Native graph regression additionally requires separately generated candidate
+and baseline roots and manifests. The authoritative invocation is maintained in
 `.github/workflows/model-compiler-tests.yml`.
 
 ### Compiler reference-artifact policy
 
 - Checked-in JSON configuration contracts are allowed.
-- Reference ONNX and NumPy output files are not checked in or stored
+- Reference SDK graphs and NumPy output files are not checked in or stored
   externally.
 - Numerical regression compares candidate and baseline artifacts generated
   during the same workflow run.
-- Generated ONNX, quantization, and compilation payloads are temporary.
+- Generated graphs, quantization, and compilation payloads are temporary.
 
 ## DevKit runtime CI
 
@@ -491,8 +506,8 @@ When adding runtime coverage:
 - Required dependencies and fixtures fail loudly when missing.
 - Runtime tests do not skip because a DevKit, service, or model is absent.
 - Compiler case counts are audited and unexpected skips fail the workflow.
-- New compiler support may use informative ONNX comparison until it exists in
-  the published `develop` baseline.
+- New compiler support may use informative native graph comparison until it
+  exists in the published `develop` baseline.
 
 ### Provenance
 

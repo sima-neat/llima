@@ -1,20 +1,11 @@
-import numpy as np
 from dataclasses import dataclass
 
-from afe.apis.defines import gen2_target, TensorDRAMLayout
-from afe.ir.serializer import save_awesomenet
-from afe.ir.defines import Status, TensorValue, TupleValue, get_expected_tensor_value
-from afe.ir.tensor_type import TensorType, ScalarType
-from afe.ir.build_node import NodeHandle, NodeOrHandle
+import numpy as np
 
-from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerConfiguration
+from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
-from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora,
-    build_activation, activation_type, activation_dtype
-)
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
+from sima_lmm.model.model_graph import ModelGraph, Node
+from sima_lmm.config.vlm_config import VlmArchType
 
 
 @dataclass
@@ -42,7 +33,7 @@ class LanguagePostModel(LanguagePostBaseModel):
 
     @property
     def uses_quantized_input_embeddings(self) -> bool:
-        # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
+        # Draft post consumes floating hidden states, not a quantized embedding row.
         return super().uses_quantized_input_embeddings and not self.is_draft
 
     @property
@@ -50,329 +41,93 @@ class LanguagePostModel(LanguagePostBaseModel):
         base = self.hf_model.language_model_param_base_name
         return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
 
-    @property
-    def _input_hidden_size(self) -> int:
-        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
-            return 2 * self.cfg.lm_cfg.assistant_backbone_hidden_size
-        return self.cfg.lm_cfg.hidden_size
-
-    def _build_onnx_pre_projection_if_needed(self, input_node: OnnxNode) -> OnnxNode:
-        if not (self.is_gemma4_mtp_draft and self.layer_idx == 0):
-            return input_node
-        return self._onnx_builder.build_conv(
-            "pre_projection", input_node, src_weight_name="pre_projection.weight"
-        )
-
-    def _build_sima_pre_projection_if_needed(
-        self, builder: SimaBuilder, input_node: NodeOrHandle
-    ) -> NodeOrHandle:
-        if not (self.is_gemma4_mtp_draft and self.layer_idx == 0):
-            return input_node
-        return build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, "pre_projection",
-            input_node, None, src_weight_name="pre_projection.weight"
-        )
-
-    def gen_onnx_files(self):
-        base_name = self._layer_base_name
-        self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "input", (1, self._input_hidden_size, 1, self.num_tokens)
-        )
-        self._onnx_builder.create_input_node(
-            "self_attn", (1, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type), 1, self.num_tokens)
-        )
-        if self.uses_per_layer_inputs:
-            self._onnx_builder.create_input_node(
-                "per_layer_input",
-                (1, self.cfg.lm_cfg.hidden_size_per_layer_input, 1, self.num_tokens),
-            )
-
-        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            self._onnx_builder.create_input_node(
-                "gate", (1, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type), 1, self.num_tokens)
-            )
-
-        llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
-        if self.cfg.vm_cfg and self.layer_idx in llm_injection_layers and self.num_tokens > 1:
-            self._onnx_builder.create_input_node(
-                "deepstack_features", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-            )
-        output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
-        output_name = self._onnx_builder.get_node_output_name(output_nodes[0])
-        if self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1:
-            self._onnx_builder.create_output_node(
-                output_name, (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-            )
-        else:
-            self._create_final_layer_output_nodes(output_nodes)
-
-        self._onnx_builder.create_and_save_model()
-
-        # Set to None to deallocate the memory.
-        self._onnx_builder = None
-
-
-    def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        # LFM2 uses self_attn.out_proj instead of o_proj.
-        attn_out_name = ("out_proj" if self.check_hf_param(f"{base_name}.self_attn.out_proj.weight") else "o_proj")
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, attn_out_name)
-
-        residual_input = self._build_onnx_pre_projection_if_needed(input_nodes[0])
-        input_idx = 2
-        per_layer_input = None
-        if self.uses_per_layer_inputs:
-            per_layer_input = input_nodes[input_idx]
-            input_idx += 1
-
-        attn_in = input_nodes[1]
-        if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            gate = input_nodes[input_idx]
-            sig = self._onnx_builder.build_op(
-                f"{base_name}.self_attn.gate_sigmoid", [gate], "Sigmoid"
-            )
-            attn_in = self._onnx_builder.build_op(
-                f"{base_name}.self_attn.gate_mul", [input_nodes[1], sig], "Mul"
-            )
-
-        o_proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.self_attn.{attn_out_name}", attn_in, lora_rank
-        )
-
-        has_ffn_norms = self.has_ffn_layernorms(base_name)
-        if has_ffn_norms:
-            rms_norm1 = self._build_rms_norm(f"{base_name}.post_attention_layernorm", o_proj)
-            add1 = self._onnx_builder.build_op(
-                f"{base_name}.add1", [residual_input, rms_norm1], "Add"
-            )
-            rms_norm2 = self._build_rms_norm(f"{base_name}.pre_feedforward_layernorm", add1)
-        else:
-            norm_name = "ffn_norm" if self.check_hf_param(f"{base_name}.ffn_norm.weight") else "post_attention_layernorm"
-            add1 = self._onnx_builder.build_op(
-                f"{base_name}.add1", [residual_input, o_proj], "Add"
-            )
-            rms_norm2 = self._build_rms_norm(f"{base_name}.{norm_name}", add1)
-
-        # LFM2 uses feed_forward.{w1,w3,w2}; fall back to mlp.{gate,up,down}.
-        mlp_base = (
-            f"{base_name}.feed_forward"
-            if all(
-                self.check_hf_param(f"{base_name}.feed_forward.{w}.weight")
-                for w in ("w1", "w2", "w3")
-            )
-            else f"{base_name}.mlp"
-        )
-
-        if has_ffn_norms:
-            mlp = self._build_onnx_mlp(mlp_base, [rms_norm2])
-            rms_norm = self._build_rms_norm(f"{base_name}.post_feedforward_layernorm", mlp)
-            add2 = self._onnx_builder.build_op(f"{base_name}.add2", [add1, rms_norm], "Add")
-        else:
-            add2 = self._build_onnx_mlp(
-                mlp_base, [rms_norm2, add1], with_residual_add=True
-            )
-
-        final_output = add2
-        if self.uses_per_layer_inputs:
-            final_output = self._build_onnx_per_layer_input_branch(
-                base_name, final_output, per_layer_input
-            )
-        final_output = self._build_onnx_layer_scalar_if_needed(base_name, final_output)
-        llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
-        if self.layer_idx in llm_injection_layers and self.num_tokens > 1:
-            deepstack_features_input = input_nodes[-1]
-            final_output = self._onnx_builder.build_op(
-                f"{base_name}.deepstack_add",
-                [final_output, deepstack_features_input],
-                "Add"
-            )
-        if self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1:
-            return [final_output]
-
-        # Include the operations after the last transformer layer into last post cache model.
-        return self._build_onnx_post_transformer(base_name, final_output)
-
-    def _build_onnx_per_layer_input_branch(
-        self, base_name: str, hidden_states: OnnxNode, per_layer_input: OnnxNode
-    ) -> OnnxNode:
-        residual = hidden_states
-        gate = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.per_layer_input_gate", hidden_states, None
-        )
-        act = self._onnx_builder.build_activation(
-            f"{base_name}.per_layer_input_act", gate, self.cfg.lm_cfg.mlp_cfg.act
-        )
-        mul = self._onnx_builder.build_op(
-            f"{base_name}.per_layer_input_mul", [act, per_layer_input], "Mul"
-        )
-        proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{base_name}.per_layer_projection", mul, None
-        )
-        norm = self._build_rms_norm(f"{base_name}.post_per_layer_input_norm", proj)
-        add = self._onnx_builder.build_op(
-            f"{base_name}.per_layer_input_add", [residual, norm], "Add"
-        )
-        return add
-
-    def _build_sima_per_layer_input_branch(
+    def _build_per_layer_input_branch(
         self,
-        builder: SimaBuilder,
+        graph: ModelGraph,
         base_name: str,
-        hidden_states: NodeOrHandle,
-        per_layer_input: NodeOrHandle,
-        quantizable: bool,
+        hidden_states: Node,
+        per_layer_input: Node,
         merged_lora: bool = False,
-    ) -> NodeOrHandle:
+    ) -> Node:
         residual = hidden_states
-        gate = build_conv_from_dense_with_lora(
-            builder,
-            self.get_hf_param,
-            self.check_hf_param,
-            f"{base_name}.per_layer_input_gate",
-            hidden_states,
-            None,
-            merged_lora=merged_lora,
+        gate = graph.linear(
+            f"{base_name}.per_layer_input_gate", hidden_states, merged_lora=merged_lora, lora_rank=None
         )
-        act = build_activation(builder, gate, self.cfg.lm_cfg.mlp_cfg.act, quantizable)
-        mul = builder.create_mul_node(act, per_layer_input)
-        proj = build_conv_from_dense_with_lora(
-            builder,
-            self.get_hf_param,
-            self.check_hf_param,
-            f"{base_name}.per_layer_projection",
-            mul,
-            None,
-            merged_lora=merged_lora,
+        act = graph.activation(gate, self.cfg.lm_cfg.mlp_cfg.act)
+        mul = graph.mul(act, per_layer_input)
+        proj = graph.linear(
+            f"{base_name}.per_layer_projection", mul, merged_lora=merged_lora, lora_rank=None
         )
-        norm = self._build_sima_rms_norm(builder, f"{base_name}.post_per_layer_input_norm", proj)
-        add = builder.create_add_node(residual, norm)
-        return add
+        norm = graph.rms_norm(f"{base_name}.post_per_layer_input_norm", proj)
+        return graph.add(residual, norm)
 
-    def _build_onnx_layer_scalar_if_needed(
-        self, base_name: str, hidden_states: OnnxNode
-    ) -> OnnxNode:
-        if self.cfg.model_type != VlmArchType.VLM_GEMMA4 or not self.check_hf_param(f"{base_name}.layer_scalar"):
-            return hidden_states
-        layer_scalar = self._onnx_builder.create_initializer(
-            f"{base_name}.layer_scalar",
-            self.get_hf_param(f"{base_name}.layer_scalar")
-            .astype(np.float32)
-            .reshape(1, 1, 1, 1),
-        )
-        return self._onnx_builder.build_op(
-            f"{base_name}.layer_scalar_mul", [hidden_states, layer_scalar], "Mul"
-        )
-
-    def _build_sima_layer_scalar_if_needed(
-        self, builder: SimaBuilder, base_name: str, hidden_states: NodeOrHandle,
-        quantizable: bool,
-    ) -> NodeOrHandle:
-        if self.cfg.model_type != VlmArchType.VLM_GEMMA4 or not self.check_hf_param(f"{base_name}.layer_scalar"):
-            return hidden_states
-        layer_scalar = builder.create_constant_node(
-            self.get_hf_param(f"{base_name}.layer_scalar")
-            .astype(activation_dtype(quantizable))
-            .reshape(1)
-        )
-        return builder.create_mul_node(hidden_states, layer_scalar)
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
         base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
-        g = self._build_sima_nodes(base_name, quantizable, merged_lora)
-        save_awesomenet(g, self.model_name + (".fp32" if quantizable else ""), str(self.sima_model_sdk_path))
-
-    def has_ffn_layernorms(self, base_name):
-        pre_ln = f"{base_name}.pre_feedforward_layernorm.weight"
-        post_ln = f"{base_name}.post_feedforward_layernorm.weight"
-        return self.check_hf_param(pre_ln) and self.check_hf_param(post_ln)
-
-    def _build_sima_nodes(self, base_name: str, quantizable: bool, merged_lora: bool = False):
         input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
+        if self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0:
+            graph = ModelGraph(self, {
+                "norm_hidden": input_shape,
+                "router": (1, 1, self.num_tokens, self.cfg.lm_cfg.moe_cfg.num_experts),
+            }, quantizable)
+            mlp_base = f"{base_name}.mlp.experts.{self.expert_idx}"
+            if not self.check_hf_param(f"{mlp_base}.gate_proj.weight"):
+                mlp_base = f"{base_name}.mlp"
+            expert = self._build_mlp(graph, mlp_base, [graph.inputs["norm_hidden"]], merged_lora)
+            weight = graph.slice(
+                graph.inputs["router"], start=self.expert_idx, stop=self.expert_idx + 1, axis=-1
+            )
+            graph.save([graph.mul(expert, weight)])
+            return
         scale_shape = (1, 1, self.num_tokens, 1)
         self_attn_shape = (
-            1, 1, self.num_tokens, self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type),
+            1,
+            1,
+            self.num_tokens,
+            self.cfg.lm_cfg.attn_cfg.get_q_size(self.layer_type),
         )
         per_layer_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size_per_layer_input)
 
+        input_specs = {"input": input_shape}
+        input_dtypes = {}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            input_dtype = ScalarType.int8
-        else:
-            input_dtype = activation_type(quantizable)
-
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-
-        # Check if this layer needs deepstack injection
-        llm_injection_layers = range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", []))) if self.cfg.vm_cfg else []
+            input_dtypes["input"] = np.int8
+            input_specs["input_scale"] = scale_shape
+        # Check if this layer needs deepstack injection.
+        llm_injection_layers = (
+            range(len(getattr(self.cfg.vm_cfg, "deepstack_visual_indexes", [])))
+            if self.cfg.vm_cfg
+            else []
+        )
         needs_deepstack = self.layer_idx in llm_injection_layers and self.num_tokens > 1
-
-        model_input_input = builder.create_placeholder_node(
-            "input", TensorType(input_dtype, input_shape)
-        )
-        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            model_input_scale = builder.create_placeholder_node(
-                "input_scale", TensorType(activation_type(quantizable), scale_shape)
-            )
-        model_input_self_attn = builder.create_placeholder_node(
-            "self_attn", TensorType(activation_type(quantizable), self_attn_shape)
-        )
-        subnet_inputs = [model_input_input]
-        if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            subnet_inputs.append(model_input_scale)
-        subnet_inputs.append(model_input_self_attn)
-        model_input_per_layer = None
+        input_specs["self_attn"] = self_attn_shape
         if self.uses_per_layer_inputs:
-            model_input_per_layer = builder.create_placeholder_node(
-                "per_layer_input", TensorType(activation_type(quantizable), per_layer_shape)
-            )
-            subnet_inputs.append(model_input_per_layer)
-        model_input_gate = None
+            input_specs["per_layer_input"] = per_layer_shape
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            model_input_gate = builder.create_placeholder_node(
-                "gate", TensorType(activation_type(quantizable), self_attn_shape)
-            )
-            subnet_inputs.append(model_input_gate)
+            input_specs["gate"] = self_attn_shape
         if needs_deepstack:
-            model_input_deepstack = builder.create_placeholder_node(
-                "deepstack_features", TensorType(activation_type(quantizable), input_shape)
-            )
-            subnet_inputs.append(model_input_deepstack)
-        # MLA subgraph inputs are the same as the model inputs, except the node names are different
-        builder.begin_subnet(subnet_inputs)
-        mla_input_input = builder.create_placeholder_node(
-            "MLA_0/input", TensorType(input_dtype, input_shape)
-        )
+            input_specs["deepstack_features"] = input_shape
+        graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
+        mla_input_input = graph.inputs["input"]
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            mla_input_scale = builder.create_placeholder_node(
-                "MLA_0/input_scale", TensorType(activation_type(quantizable), scale_shape)
-            )
-        mla_input_self_attn = builder.create_placeholder_node(
-            "MLA_0/self_attn", TensorType(activation_type(quantizable), self_attn_shape)
-        )
+            mla_input_scale = graph.inputs["input_scale"]
+        mla_input_self_attn = graph.inputs["self_attn"]
         mla_input_per_layer = None
         if self.uses_per_layer_inputs:
-            mla_input_per_layer = builder.create_placeholder_node(
-                "MLA_0/per_layer_input",
-                TensorType(activation_type(quantizable), per_layer_shape),
-            )
+            mla_input_per_layer = graph.inputs["per_layer_input"]
         mla_input_gate = None
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
-            mla_input_gate = builder.create_placeholder_node(
-                "MLA_0/gate", TensorType(activation_type(quantizable), self_attn_shape)
-            )
+            mla_input_gate = graph.inputs["gate"]
         mla_input_deepstack = None
         if needs_deepstack:
-            mla_input_deepstack = builder.create_placeholder_node(
-                "MLA_0/deepstack_features", TensorType(activation_type(quantizable), input_shape)
-            )
-        attn_out_name = ("out_proj" if self.check_hf_param(f"{base_name}.self_attn.out_proj.weight") else "o_proj")
+            mla_input_deepstack = graph.inputs["deepstack_features"]
+        attn_out_name = (
+            "out_proj" if self.check_hf_param(f"{base_name}.self_attn.out_proj.weight") else "o_proj"
+        )
         attn_out_full_name = f"{base_name}.self_attn.{attn_out_name}"
 
         lora_rank = None
@@ -381,27 +136,24 @@ class LanguagePostModel(LanguagePostBaseModel):
 
         attn_in = mla_input_self_attn
         if mla_input_gate is not None:
-            sig = builder.create_sigmoid_node(mla_input_gate)
-            attn_in = builder.create_mul_node(mla_input_self_attn, sig)
-        o_proj = build_conv_from_dense_with_lora(
-            builder, self.get_hf_param, self.check_hf_param, attn_out_full_name,
-            attn_in, lora_rank, merged_lora=merged_lora
-        )
+            sig = graph.sigmoid(mla_input_gate)
+            attn_in = graph.mul(mla_input_self_attn, sig)
+        o_proj = graph.linear(attn_out_full_name, attn_in, merged_lora=merged_lora, lora_rank=lora_rank)
 
         # Dequantize the selected embedding rows before the residual path consumes them.
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
-            rms_norm_in = builder.create_dynamic_dequant_node(
-                mla_input_input, mla_input_scale
-            )
+            rms_norm_in = graph.dequant(mla_input_input, mla_input_scale)
         else:
             rms_norm_in = mla_input_input
-        rms_norm_in = self._build_sima_pre_projection_if_needed(builder, rms_norm_in)
+
+        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
+            rms_norm_in = graph.linear("pre_projection", rms_norm_in)
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
         if has_ffn_norms:
-            rms_norm1 = self._build_sima_rms_norm(builder, f"{base_name}.post_attention_layernorm", o_proj)
-            add1 = builder.create_add_node(rms_norm_in, rms_norm1)
-            rms_norm2 = self._build_sima_rms_norm(builder, f"{base_name}.pre_feedforward_layernorm", add1)
+            rms_norm1 = graph.rms_norm(f"{base_name}.post_attention_layernorm", o_proj)
+            add1 = graph.add(rms_norm_in, rms_norm1)
+            rms_norm2 = graph.rms_norm(f"{base_name}.pre_feedforward_layernorm", add1)
         else:
             if self.check_hf_param(f"{base_name}.ffn_norm.weight"):
                 rms_norm_name = "ffn_norm"
@@ -410,69 +162,54 @@ class LanguagePostModel(LanguagePostBaseModel):
             else:
                 rms_norm_name = "post_attention_layernorm"
 
-            add1 = builder.create_add_node(rms_norm_in, o_proj)
-            rms_norm2 = self._build_sima_rms_norm(builder, f"{base_name}.{rms_norm_name}", add1)
+            add1 = graph.add(rms_norm_in, o_proj)
+            rms_norm2 = graph.rms_norm(f"{base_name}.{rms_norm_name}", add1)
 
         # LFM2 uses feed_forward.{w1,w3,w2}; fall back to mlp.{gate,up,down}.
         mlp_base = (
             f"{base_name}.feed_forward"
             if all(
-                self.check_hf_param(f"{base_name}.feed_forward.{w}.weight")
-                for w in ("w1", "w2", "w3")
+                self.check_hf_param(f"{base_name}.feed_forward.{w}.weight") for w in ("w1", "w2", "w3")
             )
             else f"{base_name}.mlp"
         )
 
         if has_ffn_norms:
-            mlp = self._build_sima_mlp(builder, mlp_base, [rms_norm2], quantizable, merged_lora)
-            mlp = self._build_sima_rms_norm(builder, f"{base_name}.post_feedforward_layernorm", mlp)
-            add2 = builder.create_add_node(add1, mlp)
+            mlp = self._build_mlp(graph, mlp_base, [rms_norm2], merged_lora)
+            mlp = graph.rms_norm(f"{base_name}.post_feedforward_layernorm", mlp)
+            add2 = graph.add(add1, mlp)
         else:
-            add2 = self._build_sima_mlp(
-                builder, mlp_base, [rms_norm2, add1], quantizable, merged_lora,
-                with_residual_add=True
+            add2 = self._build_mlp(
+                graph, mlp_base, [rms_norm2, add1], merged_lora, with_residual_add=True
             )
 
         # Add deepstack features if needed
         final_output = add2
         if self.uses_per_layer_inputs:
-            final_output = self._build_sima_per_layer_input_branch(
-                builder,
+            final_output = self._build_per_layer_input_branch(
+                graph,
                 base_name,
                 final_output,
                 mla_input_per_layer,
-                quantizable,
                 merged_lora,
             )
-        final_output = self._build_sima_layer_scalar_if_needed(
-            builder, base_name, final_output, quantizable
-        )
+        if (
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.check_hf_param(f"{base_name}.layer_scalar")
+        ):
+            layer_scalar = graph.constant(graph.parameter(f"{base_name}.layer_scalar").reshape(1))
+            final_output = graph.mul(final_output, layer_scalar)
         if needs_deepstack and mla_input_deepstack is not None:
-            final_output = builder.create_add_node(final_output, mla_input_deepstack)
+            final_output = graph.add(final_output, mla_input_deepstack)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
-            outputs = self._build_post_transformer(builder, final_output, quantizable)
-            if len(outputs) > 1:
-                _ = builder.create_tuple_node(outputs)
+            outputs = self._build_post_transformer(graph, final_output)
+        else:
+            outputs = [final_output]
 
-        mla_node = builder.finish_subnet("MLA_0")
+        graph.save(outputs)
 
-        self._cast_bf16_outputs_to_fp32(builder, mla_node)
-
-        net = builder.finish(self.model_name)
-        return net
-
-    def get_mla_input_tessellate_params(self) ->  dict[int, TensorTessellateParameters]:
-        """
-        Get the custom tessellate params for model's inputs on the MLA.
-        """
-        # Use default tessellate params.
-        return {}
-
-
-    def get_mla_output_tessellate_params(self) ->  dict[int, TensorTessellateParameters]:
-        """
-        Get the custom tessellate params for model's output on the MLA.
-        """
-        # Use default tessellate params.
-        return {}
+    def has_ffn_layernorms(self, base_name):
+        pre_ln = f"{base_name}.pre_feedforward_layernorm.weight"
+        post_ln = f"{base_name}.post_feedforward_layernorm.weight"
+        return self.check_hf_param(pre_ln) and self.check_hf_param(post_ln)

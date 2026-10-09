@@ -105,10 +105,15 @@ struct RopeScalingConfig {
     std::string rope_type;
     std::optional<std::vector<size_t>> mrope_section;
     bool mrope_interleaved = false;
+    // YaRN parameters (rope_type == "yarn"). Defaults match the HF fallbacks.
+    double beta_fast = 32.0;
+    double beta_slow = 1.0;
+    bool truncate = true;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     RopeScalingConfig, factor, low_freq_factor, high_freq_factor, original_max_position_embeddings,
-    attention_factor, long_factor, short_factor, rope_type, mrope_section, mrope_interleaved
+    attention_factor, long_factor, short_factor, rope_type, mrope_section, mrope_interleaved,
+    beta_fast, beta_slow, truncate
 )
 
 
@@ -192,6 +197,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     SpeculativeDecodingConfig, method, is_draft, speculative_budget
 )
 
+struct MixtureOfExpertsConfig {
+    uint16_t num_experts;
+    uint16_t num_experts_per_tok;
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    MixtureOfExpertsConfig, num_experts, num_experts_per_tok
+)
+
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
 
 struct LanguageModelConfig {
@@ -217,6 +230,15 @@ struct LanguageModelConfig {
     uint32_t assistant_num_centroids = 0;
     uint32_t assistant_centroid_intermediate_top_k = 0;
     std::optional<SpeculativeDecodingConfig> speculative_decoding_cfg = std::nullopt;
+    std::string arch = "";
+    std::optional<MixtureOfExpertsConfig> moe_cfg = std::nullopt;
+
+    // Mixture-of-Experts: the post block is replaced by router + experts + weighted-sum.
+    bool is_moe() const { return moe_cfg.has_value(); }
+    // gpt_oss feeds a per-head "sink" logit into the attention softmax as an extra
+    // per-layer input to the (shared) cache model.
+    bool uses_attention_sinks() const { return arch == "gpt_oss"; }
+
     bool is_kv_shared_layer(uint8_t layer_idx) const {
         uint8_t first_shared_layer = num_hidden_layers - num_kv_shared_layers;
         return num_kv_shared_layers > 0 && layer_idx >= first_shared_layer;
@@ -296,7 +318,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     draft_vocab_size, assistant_model_type, assistant_backbone_hidden_size,
     assistant_use_ordered_embeddings, assistant_masked_lm_head_enabled,
     assistant_num_centroids,
-    assistant_centroid_intermediate_top_k, speculative_decoding_cfg
+    assistant_centroid_intermediate_top_k, speculative_decoding_cfg, arch, moe_cfg
 )
 
 

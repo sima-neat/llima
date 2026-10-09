@@ -129,7 +129,7 @@ python -P -m pytest \
 
 設定所需的輸入，而不是接受跳過測試。
 
-測試矩陣、預期的計數和基準策略位於 `tests/README.md`；CI 執行位於 `.github/workflows/model-compiler-tests.yml`。在執行期間生成 ONNX 和數值比較成品，而不是提交二進位基準。
+測試矩陣、預期的計數和基準策略位於 `tests/README.md`；CI 執行位於 `.github/workflows/model-compiler-tests.yml`。在執行期間生成 Model SDK 和數值比較成品，而不是提交二進位基準。
 
 ### 執行階段驗證
 

@@ -50,6 +50,8 @@ JsonPrefixMatch match_json_prefix(
     return JsonPrefixMatch::Complete;
 }
 
+constexpr std::string_view gptoss_message = "<|message|>";
+constexpr std::string_view gptoss_call = "<|call|>";
 constexpr std::string_view lfm_open = "<|tool_call_start|>";
 constexpr std::string_view lfm_close = "<|tool_call_end|>";
 constexpr std::string_view gemma_open = "<|tool_call>";
@@ -614,6 +616,31 @@ nlohmann::json parse_qwen35_tool_calls(
     return result.empty() ? nullptr : result;
 }
 
+// Harmony carries the recipient in the header and only arguments in the body.
+nlohmann::json parse_gptoss_tool_call(
+    std::string_view text,
+    int& id_counter,
+    const std::vector<std::string>* allowed_tool_names
+) {
+    const auto message_pos = text.find(gptoss_message);
+    if (message_pos == std::string_view::npos) {
+        return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names, false);
+    }
+    const auto header = text.substr(0, message_pos);
+    const auto recipient_pos = header.find("to=");
+    if (recipient_pos == std::string_view::npos) return nullptr;
+    auto name = header.substr(recipient_pos + 3);
+    name = name.substr(0, name.find_first_of(" \t\r\n<"));
+    if (name.starts_with("functions.")) name.remove_prefix(std::string_view("functions.").size());
+    auto arguments = trim_view(text.substr(message_pos + gptoss_message.size()));
+    if (arguments.ends_with(gptoss_call)) arguments.remove_suffix(gptoss_call.size());
+    const auto parsed = nlohmann::ordered_json::parse(std::string(arguments));
+    const auto entry = build_tool_call_entry(
+        {{"name", std::string(name)}, {"arguments", parsed}}, id_counter, allowed_tool_names
+    );
+    return entry.is_null() ? nlohmann::json(nullptr) : nlohmann::json::array({entry});
+}
+
 nlohmann::json try_parse_tool_calls_impl(
     ToolCallFormat format,
     std::string_view text,
@@ -640,6 +667,11 @@ nlohmann::json try_parse_tool_calls_impl(
                 return parse_qwen35_tool_calls(text, id_counter, allowed_tool_names);
             case ToolCallFormat::Llama:
                 return parse_plain_json_tool_calls(text, id_counter, allowed_tool_names, true);
+            case ToolCallFormat::GptOss:
+                if (!text.starts_with('[')) {
+                    return parse_gptoss_tool_call(text, id_counter, allowed_tool_names);
+                }
+                [[fallthrough]];
             case ToolCallFormat::GenericJson:
                 if (text.starts_with('[')) {
                     return parse_json_array_tool_calls(
@@ -681,6 +713,9 @@ ToolCallFormat tool_call_format_for_model(std::string_view model_type) {
     if (model_type == "vlm-qwen3_5") {
         return ToolCallFormat::Qwen35;
     }
+    if (model_type == "llm-gpt_oss") {
+        return ToolCallFormat::GptOss;
+    }
     if (model_type == "llm-llama") {
         return ToolCallFormat::Llama;
     }
@@ -695,6 +730,8 @@ std::vector<std::string> tool_call_special_tokens(ToolCallFormat format) {
             return {std::string(gemma_open), std::string(gemma_close), R"(<|"|>)"};
         case ToolCallFormat::Mistral:
             return {std::string(mistral_prefix)};
+        case ToolCallFormat::GptOss:
+            return {"<|start|>", "<|channel|>", "<|message|>"};
         default:
             return {};
     }
@@ -876,6 +913,13 @@ ToolCallStreamParser::Mode ToolCallStreamParser::decide(bool done) const {
             return done ? Mode::ToolCall : Mode::Undecided;
         case ToolCallFormat::Llama:
             return stripped.front() == '{' ? Mode::ToolCall : Mode::Content;
+        case ToolCallFormat::GptOss:
+            for (const auto prefix : {std::string_view("<|"), std::string_view("to="),
+                                      std::string_view("assistant")}) {
+                if (prefix.starts_with(stripped)) return done ? Mode::Content : Mode::Undecided;
+                if (stripped.starts_with(prefix)) return Mode::ToolCall;
+            }
+            [[fallthrough]];
         case ToolCallFormat::GenericJson:
             return stripped.front() == '{' || stripped.front() == '[' ? Mode::ToolCall
                                                                        : Mode::Content;

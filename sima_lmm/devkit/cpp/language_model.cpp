@@ -7,6 +7,7 @@
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <utility>
 #include <string_view>
 
 #include <Eigen/Dense>
@@ -64,6 +65,19 @@ LogLikelihoodResult score_logits(
 
 namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
+
+// Load a whole .bin file into one buffer and check its size. The old
+// load_file() checked "file size == buffer size". load_stream() alone only
+// catches a file that is too SHORT, so we also check that no bytes are left
+// over (a file that is too LONG, e.g. from another model).
+void load_whole_file(MLABuffer& buffer, std::istream& stream, const std::string& name) {
+    buffer.load_stream(stream);
+    if (stream.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error(fmt::format(
+            "Invalid size for {}: file is larger than buffer {}", name, buffer.get_name()
+        ));
+    }
+}
 }
 
 LanguageModel::LanguageModel(
@@ -72,7 +86,19 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer
-) : BaseModel(model_path),
+) : LanguageModel(
+        std::move(model_path), std::move(stop_token_ids), image_token_id, pad_token_id,
+        text_streamer, nullptr
+    ) {}
+
+LanguageModel::LanguageModel(
+    std::filesystem::path model_path,
+    std::set<uint32_t> stop_token_ids,
+    std::optional<uint32_t> image_token_id,
+    std::optional<uint32_t> pad_token_id,
+    TextStreamer& text_streamer,
+    std::shared_ptr<FileProvider> file_provider
+) : BaseModel(model_path, std::move(file_provider)),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id),
@@ -802,7 +828,11 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
             );
             attn_models.pre->add_to_queue(&ifm_map);
             attn_models.cache->add_to_queue();
-            attn_models.post->add_to_queue(&ifm_map);
+            if (_cfg.lm_cfg.is_moe()) {
+                _run_moe_post(&ifm_map, num_tokens, layer_idx);
+            } else {
+                attn_models.post->add_to_queue(&ifm_map);
+            }
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
             if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
@@ -1264,7 +1294,11 @@ uint32_t LanguageModel::run_model_once(
                     )
                 );
             }
-            attn_models.post->add_to_queue(&ifm_map);
+            if (_cfg.lm_cfg.is_moe()) {
+                _run_moe_post(&ifm_map, num_tokens, layer_idx);
+            } else {
+                attn_models.post->add_to_queue(&ifm_map);
+            }
 
             // Spec-decoding capture: download n128_buffer1 (this layer's hidden
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
@@ -1509,32 +1543,48 @@ void LanguageModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
+    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name, _files.get());
+
+    // Resolve the MoE host round-trip handles once (buffers allocated above).
+    if (_cfg.lm_cfg.is_moe()) {
+        _init_moe_host_cache();
+    }
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
     const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
     if (!draft_model) {
         if (!_embedding_offload) {
-            auto embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
-            if (std::filesystem::exists(embeddings_file_name)) {
-                get_buffer("embeddings").load_file(embeddings_file_name);
+            const auto embeddings_bin = "devkit/" + _cfg.language_model_name + "_embeddings.bin";
+            // The .bin file is optional. Use exists() to check softly: if it
+            // is there, exists() pulls it and we use it; if it is missing we
+            // fall back to the required .npy below with get_path(), which
+            // pulls it and fails loudly if it is not there either. Both go
+            // through _files, so PCIe and disk take the same path. Do NOT use
+            // get_path() for the optional check — it throws when the file is
+            // missing.
+            if (_files->exists(embeddings_bin)) {
+                load_whole_file(get_buffer("embeddings"), *_files->open_stream(embeddings_bin),
+                                embeddings_bin);
             } else {
                 // Compatibility with packages generated before raw embedding files were introduced.
-                embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.npy");
-                auto embeddings_tensor = cnpy::npy_load(embeddings_file_name);
+                const auto embeddings_npy = "devkit/" + _cfg.language_model_name + "_embeddings.npy";
+                auto embeddings_tensor = cnpy::npy_load(_files->get_path(embeddings_npy));
+                // cnpy has read the whole file into memory, so the disk copy
+                // is no longer needed (over PCIe this frees recv_root space).
+                _files->release(embeddings_npy);
                 get_buffer("embeddings").upload(embeddings_tensor.data<void>());
             }
         }
         if (_cfg.pipeline_cfg.quantize_embeddings) {
-            const auto scale_file_name = (
-                _devkit_dir / (_cfg.language_model_name + "_embedding_scales.bin")
-            );
-            get_buffer("embedding_scales").load_file(scale_file_name);
+            const auto scale_file =
+                "devkit/" + _cfg.language_model_name + "_embedding_scales.bin";
+            load_whole_file(get_buffer("embedding_scales"), *_files->open_stream(scale_file),
+                            scale_file);
         }
     } else if (is_eagle3_draft) {
-        // Load d2t mapping (int64 in npy, narrows to int32; values fit easily).
-        auto d2t_file_name = _devkit_dir / "d2t.npy";
-        auto d2t_tensor = cnpy::npy_load(d2t_file_name);
+        // Load d2t mapping (int64 in npy, narrows to int32 — values fit easily).
+        auto d2t_tensor = cnpy::npy_load(_files->get_path("devkit/d2t.npy"));
+        _files->release("devkit/d2t.npy");   // already in memory
         const int64_t* src = d2t_tensor.data<int64_t>();
         const size_t n = d2t_tensor.num_vals;
         _d2t.resize(n);
@@ -1543,8 +1593,9 @@ void LanguageModel::_initialize() {
         }
         _logger->info("Loaded d2t mapping with {} entries", _d2t.size());
     } else if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
-        const auto ordering_file_name = _devkit_dir / "gemma4_token_ordering.npy";
+        const auto ordering_file_name = _files->get_path("devkit/gemma4_token_ordering.npy");
         const auto ordering_tensor = cnpy::npy_load(ordering_file_name);
+        _files->release("devkit/gemma4_token_ordering.npy");
         const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
         if (
             ordering_tensor.word_size != sizeof(int64_t)
@@ -1596,6 +1647,53 @@ void LanguageModel::_initialize() {
         );
     }
 
+    // Upload attention sinks (gpt_oss): broadcast each layer's per-head vector across its
+    // buffer rows. Raw bf16, shape (num_layers, num_heads).
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        const auto sinks_asset = "devkit/" + _cfg.language_model_name + "_sinks.bin";
+        const auto sinks_file_name = _files->get_path(sinks_asset);
+        std::ifstream sinks_file(sinks_file_name, std::ios::binary);
+        if (!sinks_file) {
+            throw std::runtime_error(
+                fmt::format("Missing attention sinks file: {}", sinks_file_name.string())
+            );
+        }
+        const uint16_t num_heads = _cfg.lm_cfg.attn_cfg.num_attention_heads;
+        std::vector<uint16_t> sinks(  // raw bf16, 2 bytes/elem
+            static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers) * num_heads
+        );
+        // A stale or truncated file would leave entries zeroed, and a zero sink is not neutral:
+        // it is a logit in the softmax, so it silently reweights attention. Require an exact match.
+        const auto expected_bytes = static_cast<std::uintmax_t>(sinks.size() * sizeof(uint16_t));
+        const auto actual_bytes = std::filesystem::file_size(sinks_file_name);
+        if (actual_bytes != expected_bytes) {
+            throw std::runtime_error(fmt::format(
+                "Attention sinks file {} has {} bytes, expected {} for {} layers x {} heads. "
+                "The file is stale or truncated; recompile the model.",
+                sinks_file_name.string(), actual_bytes, expected_bytes,
+                static_cast<unsigned>(_cfg.lm_cfg.num_hidden_layers), num_heads
+            ));
+        }
+        sinks_file.read(
+            reinterpret_cast<char*>(sinks.data()),
+            static_cast<std::streamsize>(expected_bytes)
+        );
+        sinks_file.close();
+        _files->release(sinks_asset);
+        for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
+            auto& buf = get_buffer(fmt::format("sinks_l{}", layer));
+            const size_t rows = buf.get_shape()[0];
+            std::vector<uint16_t> host(rows * num_heads);
+            for (size_t r = 0; r < rows; ++r) {
+                std::copy_n(
+                    sinks.data() + static_cast<size_t>(layer) * num_heads, num_heads,
+                    host.begin() + r * num_heads
+                );
+            }
+            buf.upload(host.data());
+        }
+    }
+
     // Upload freq real and imag.
     auto rope_table = calc_freq_real_imag(
         _cfg.pipeline_cfg.max_num_tokens,
@@ -1611,9 +1709,14 @@ void LanguageModel::_initialize() {
     // the (mutated) device buffer.
     _global_freq_host = rope_table;
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        // A distinct local base freq (Gemma3) means an unscaled local rope; when it
+        // matches rope_theta the sliding layers share the global scaling (gpt-oss YaRN).
+        const std::string local_rope_type =
+            _cfg.lm_cfg.rope_cfg.rope_local_base_freq != _cfg.lm_cfg.rope_cfg.rope_theta
+            ? "default" : _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type;
         rope_table = calc_freq_real_imag(
             _cfg.pipeline_cfg.max_num_tokens,
-            "default",
+            local_rope_type,
             _cfg.lm_cfg.rope_cfg.rope_local_base_freq,
             _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention"),
             _cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention"),
@@ -1977,6 +2080,21 @@ void LanguageModel::_define_buffers() {
         }
     }
 
+    // gpt_oss attention sinks: per-head logit for the (shared) cache model, one buffer per
+    // layer broadcast across tokens; the cache model slices num_tokens rows.
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        uint16_t max_sink_tokens = _cfg.lm_cfg.get_single_num_tokens();
+        if (_use_group_token_models) {
+            max_sink_tokens = std::max(max_sink_tokens, _cfg.pipeline_cfg.input_token_group_size);
+        }
+        for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
+            define_buffer(
+                fmt::format("sinks_l{}", i),
+                {max_sink_tokens, _cfg.lm_cfg.attn_cfg.num_attention_heads}
+            );
+        }
+    }
+
     // Deepstack features for qwen3.
     if (_cfg.vm_cfg.has_value()) {
         for (size_t i = 0; i < _cfg.vm_cfg.value().deepstack_visual_indexes.size(); ++i) {
@@ -2083,6 +2201,34 @@ void LanguageModel::_define_buffers() {
                 fmt::format("n{}_target_hidden_states", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
             );
+        }
+
+        // Mixture-of-Experts working buffers (router outputs + per-expert outputs).
+        if (_cfg.lm_cfg.is_moe()) {
+            const uint16_t num_experts = _cfg.lm_cfg.moe_cfg.value().num_experts;
+            const uint16_t top_k = _cfg.lm_cfg.moe_cfg.value().num_experts_per_tok;
+            // Router outputs: top-k weights + selected indices (int32 from the MLA), residual
+            // h, and norm(h) (computed once by the router; every expert consumes it).
+            define_buffer(fmt::format("n{}_router_values", num_tokens), {num_tokens, top_k});
+            define_buffer(
+                fmt::format("n{}_router_indices", num_tokens), {num_tokens, top_k}, "int32"
+            );
+            define_buffer(
+                fmt::format("n{}_residual", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+            define_buffer(
+                fmt::format("n{}_norm_hidden", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+            // Dense per-expert routing weights (host scatters the k values here).
+            define_buffer(fmt::format("n{}_router_weights", num_tokens), {num_tokens, num_experts});
+            // Decode routes selected experts into top-k slots; prefill combines all experts.
+            const uint16_t num_outputs = num_tokens == 1 ? top_k : num_experts;
+            for (uint16_t e = 0; e < num_outputs; ++e) {
+                define_buffer(
+                    fmt::format("n{}_expert{}", num_tokens, e),
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                );
+            }
         }
 
         // Qwen3.5: transient gate buffer, written by Pre and consumed by Post within the same layer.
@@ -2346,7 +2492,10 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
     );
     auto& pre_model = _pre_model_map.at(pre_post_key);
     auto& cache_model = _cache_model_map.at(cache_key);
-    auto& post_model = _post_model_map.at(pre_post_key);
+    // MoE has no post model; bind these inputs to the router (it consumes the raw hidden).
+    auto& post_model = _cfg.lm_cfg.is_moe()
+        ? _router_model_map.at(pre_post_key)
+        : _post_model_map.at(pre_post_key);
 
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const auto& binding_buffers = _attention_binding_buffers.at(layer_idx);
@@ -2460,6 +2609,11 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
             );
         }
     }
+    // gpt_oss sinks: cache model is layer-shared, so bind this layer's sinks before cached_values.
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        auto& sinks_buf = get_buffer(fmt::format("sinks_l{}", layer_idx));
+        cache_model._bind_ifm(cache_ifm_idx++, &sinks_buf, {0, 0});
+    }
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
             cache_ifm_idx++, binding_buffers.value, {0, cache_token_idx_begin, 0}
@@ -2499,9 +2653,136 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
 }
 
 
+void LanguageModel::_init_moe_host_cache() {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+
+    // Same num_tokens set the MoE buffers were defined for, and the set of moe_nt values
+    // _run_moe_post can ask for.
+    std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
+    if (_use_group_token_models) {
+        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+    }
+
+    _moe_host.clear();
+    _moe_host.reserve(num_tokens_vec.size());
+    for (const auto& nt: num_tokens_vec) {
+        MoeHostCache mh;
+        mh.num_tokens = nt;
+        mh.values = &get_buffer(fmt::format("n{}_router_values", nt));
+        mh.indices = &get_buffer(fmt::format("n{}_router_indices", nt));
+        mh.weights = &get_buffer(fmt::format("n{}_router_weights", nt));
+        const uint16_t num_outputs = nt == 1 ? top_k : num_experts;
+        mh.expert_out.reserve(num_outputs);
+        for (uint16_t e = 0; e < num_outputs; ++e) {
+            mh.expert_out.emplace_back(&get_buffer(fmt::format("n{}_expert{}", nt, e)));
+        }
+        // Only the single-token variant takes the slot-routing path in _run_moe_post.
+        if (nt == 1) {
+            mh.slot_ofm.resize(top_k);
+            for (uint16_t slot = 0; slot < top_k; ++slot) {
+                mh.slot_ofm[slot].emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(0),
+                    std::forward_as_tuple(
+                        mh.expert_out[slot],
+                        std::vector<uint32_t>{0, 0},
+                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+                    )
+                );
+            }
+        }
+        mh.values_scratch.resize(static_cast<size_t>(nt) * top_k);
+        mh.indices_scratch.resize(static_cast<size_t>(nt) * top_k);
+        mh.weights_scratch.resize(static_cast<size_t>(nt) * num_experts);
+        mh.activated_scratch.resize(num_experts);
+        _moe_host.emplace_back(std::move(mh));
+    }
+}
 
 
+LanguageModel::MoeHostCache& LanguageModel::_get_moe_host(uint16_t moe_nt) {
+    // At most two entries (single-token and group), so a scan beats any container.
+    for (auto& mh: _moe_host) {
+        if (mh.num_tokens == moe_nt) return mh;
+    }
+    throw std::runtime_error(
+        fmt::format("No MoE host cache defined for num_tokens = {}", moe_nt)
+    );
+}
 
+
+void LanguageModel::_run_moe_post(
+    std::map<uint8_t, MLABufferSlice>* ifm_map,
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+    const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
+    // The last layer processes only the last token (n1), like the non-MoE last post.
+    const uint16_t moe_nt = (is_last && !_cfg.lm_cfg.is_spec_decode()) ? 1 : num_tokens;
+
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+
+    // Router -> values + indices + residual + norm(h) (TopK+softmax on MLA).
+    _router_model_map.at(model_key).add_to_queue(ifm_map);
+
+    // Flush this layer's pre+cache+router (+ prev layer's experts+ws) so indices are ready.
+    MLAModelWithBuffer::run_queue();
+
+    // Host: scatter the k weights into dense router_weights (indices are int32 from the MLA).
+    MoeHostCache& mh = _get_moe_host(moe_nt);
+    auto& values = mh.values_scratch;
+    auto& indices = mh.indices_scratch;
+    auto& weights = mh.weights_scratch;
+    auto& activated = mh.activated_scratch;
+    mh.values->download(values.data());
+    mh.indices->download(indices.data());
+    std::fill(weights.begin(), weights.end(), Eigen::bfloat16(0.0f));
+    std::fill(activated.begin(), activated.end(), uint8_t{0});
+
+    // Scatter each row's selections and record the experts needed by prefill.
+    for (uint16_t r = 0; r < moe_nt; ++r) {
+        for (uint16_t j = 0; j < top_k; ++j) {
+            const size_t sel = static_cast<size_t>(r) * top_k + j;
+            const int32_t expert = indices[sel];
+            if (expert < 0 || expert >= num_experts) {
+                throw std::runtime_error(fmt::format(
+                    "MoE router emitted out-of-range expert index {} at selection {} "
+                    "(layer {}, num_experts {})",
+                    expert, sel, layer_idx, num_experts
+                ));
+            }
+            weights[static_cast<size_t>(r) * num_experts + expert] = values[sel];
+            activated[expert] = 1;
+        }
+    }
+    mh.weights->upload(weights.data());
+
+    // Experts. Prefill runs the selected experts (rest zeroed); decode runs the top-k,
+    // routing each into the first combine slots.
+    if (moe_nt > 1) {
+        for (uint16_t e = 0; e < num_experts; ++e) {
+            if (activated[e]) {
+                _expert_model_map.at({num_tokens, layer_idx, e}).add_to_queue();
+            } else {
+                mh.expert_out[e]->clear();
+            }
+        }
+    } else {
+        for (uint16_t slot = 0; slot < top_k; ++slot) {
+            const uint16_t e = static_cast<uint16_t>(indices[slot]);  // moe_nt==1 row 0
+            // Route this expert's output into combine slot `slot` (prebuilt override).
+            _expert_model_map.at({num_tokens, layer_idx, e})
+                .add_to_queue(nullptr, &mh.slot_ofm[slot]);
+        }
+    }
+
+    // Weighted sum -> layer output. No flush: experts+ws ride to the next router flush.
+    _weightedsum_model_map.at(model_key).add_to_queue();
+}
 
 
 void LanguageModel::compact_kv_after_accept(
@@ -2621,15 +2902,24 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         _logger->info("No relocation is needed");
         return;
     }
+    // The file list below comes from a directory listing on local disk. A
+    // deferred provider has no listing, so the folder is not
+    // there: say so, instead of "Relocation directory does not exist".
+    if (_files->pulls_files()) {
+        throw std::runtime_error(
+            "LoRA requires a local model directory; the asset provider cannot list npy_files"
+        );
+    }
 
     // Key to access the reloc addr maps.
     struct RelocMapType {
         std::string model_type;
         uint16_t num_tokens;
         uint8_t layer_idx;
+        uint16_t expert_idx;
         auto operator<=>(const RelocMapType&) const = default;
     };
-    using RelocMap = std::map<std::string, uint64_t>;
+    using RelocMap = std::map<std::string, MLABuffer*>;
 
     // Allocate the memory for the new content to be relocated and collect the maps of the addresses
     // to relocate the models' dma descriptors.
@@ -2649,14 +2939,19 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
             continue;
 
         // Extract the num_tokens and layer_idx from the file name.
-        std::regex pattern(R"(_n(\d+)_(pre|post)_layer(\d+)_)");
+        std::regex pattern(R"(_n(\d+)_(pre|post|router)_layer(\d+)(?:_expert(\d+))?_)");
         std::smatch match;
         RelocMapType model_key;
         if (std::regex_search(file_name_str, match, pattern)) {
             uint16_t num_tokens = std::stoi(match[1].str());
             std::string model_type = match[2].str();
             uint8_t layer_idx = std::stoi(match[3].str());
-            model_key = {model_type, num_tokens, layer_idx};
+            uint16_t expert_idx = 0;
+            if (match[4].matched) {
+                model_type = "expert";
+                expert_idx = std::stoi(match[4].str());
+            }
+            model_key = {model_type, num_tokens, layer_idx, expert_idx};
         } else {
             auto msg = fmt::format("Invalid file name for relocation: {}", file_name);
             throw std::runtime_error(msg);
@@ -2666,8 +2961,12 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         if (!_use_group_token_models && model_key.num_tokens > 1)
             continue;
 
-        // Upload the tensor to the buffer.
-        auto tensor = cnpy::npy_load(file_name);
+        // Upload the tensor to the buffer. The directory listing above stays on
+        // disk (the seam has no listing API yet), but the file read routes
+        // through the provider by its model-root-relative name.
+        auto tensor = cnpy::npy_load(
+            _files->get_path("npy_files/" + reloc_name + "/" + file_name.filename().string())
+        );
         auto buffer_name = file_name.stem();
 
         // If the buffer does not exist, define and allocate it first.
@@ -2680,20 +2979,27 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         // Upload the tensor.
         buf.upload(tensor.data<void>());
 
-        // Append the reloc addr map.
-        reloc_addr_maps[model_key][buffer_name] = buf.get_buf_addr();
+        // Append the reloc buffer map. The buf_id reloc path imports the
+        // adapter's DMA-BUF in update_reloc rather than taking its address.
+        reloc_addr_maps[model_key][buffer_name] = &buf;
     }
 
     // Relocation the dma descriptors
     for (const auto& [reloc_map_type, reloc_addr_map]: reloc_addr_maps) {
         // For each pre/post model, we only need to relocate the unique model once.
-        LanguageModelMapKey model_key{reloc_map_type.num_tokens, reloc_map_type.layer_idx, 0};
+        LanguageModelMapKey model_key{
+            reloc_map_type.num_tokens, reloc_map_type.layer_idx, reloc_map_type.expert_idx
+        };
 
         MLAModelWithBuffer* model_ptr;
         if (reloc_map_type.model_type == "pre") {
             model_ptr = &_pre_model_map.at(model_key);
         } else if (reloc_map_type.model_type == "post") {
             model_ptr = &_post_model_map.at(model_key);
+        } else if (reloc_map_type.model_type == "router") {
+            model_ptr = &_router_model_map.at(model_key);
+        } else if (reloc_map_type.model_type == "expert") {
+            model_ptr = &_expert_model_map.at(model_key);
         } else {
             auto msg = fmt::format(
                 "Relocate data for {} is not supported", reloc_map_type.model_type
@@ -2932,9 +3238,8 @@ std::vector<uint32_t> LanguageModel::_get_per_layer_token_ids(
 
 
 void LanguageModel::_load_per_layer_embeddings() {
-    const auto file_name = (
-        _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin")
-    );
+    const auto file_rel = "devkit/" + _cfg.language_model_name + "_per_layer_embeddings.bin";
+    const auto file_name = _files->get_path(file_rel);
     const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
     const size_t out_dim = static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers)
                          * _cfg.lm_cfg.hidden_size_per_layer_input;
@@ -2951,8 +3256,8 @@ void LanguageModel::_load_per_layer_embeddings() {
     }
 
     // Resident mode streams complete tables; offload mode has no table shards.
-    std::ifstream stream;
-    if (!_embedding_offload) stream.open(file_name, std::ios::binary);
+    std::unique_ptr<std::istream> stream;
+    if (!_embedding_offload) stream = _files->open_stream(file_rel);
     for (auto* shard : _per_layer_embedding_shards) {
         if (shard->get_buf_len() != shard->get_shape()[0] * token_row_size) {
             throw std::runtime_error(fmt::format(
@@ -2960,15 +3265,14 @@ void LanguageModel::_load_per_layer_embeddings() {
                 shard->get_name()
             ));
         }
-        shard->load_stream(stream);
+        shard->load_stream(*stream);
     }
 
     if (_cfg.pipeline_cfg.quantize_embeddings) {
-        const auto scale_file_name = (
-            _devkit_dir
-            / (_cfg.language_model_name + "_per_layer_embedding_scales.bin")
-        );
-        get_buffer("per_layer_embedding_scales").load_file(scale_file_name);
+        const auto scale_file =
+            "devkit/" + _cfg.language_model_name + "_per_layer_embedding_scales.bin";
+        load_whole_file(get_buffer("per_layer_embedding_scales"), *_files->open_stream(scale_file),
+                        scale_file);
     }
 }
 

@@ -126,6 +126,144 @@ Compiler changes normally touch `sima_lmm/config/whisper_config.py`,
 test documented in `tests/README.md` and representative audio on Modalix. This
 is a Whisper-specific path, not a general ASR architecture framework.
 
+### Native graph components
+
+Use `ModelGraph` from `sima_lmm/model/model_graph.py`. It binds the component's
+source weights, precision and output path once. Graph-node construction lives
+in the class; independent array-layout and naming utilities remain module
+functions. Model components use the graph methods. A component's implementation can then focus on its topology:
+
+```python
+from sima_lmm.model.model_graph import ModelGraph
+
+def generate_graph(self, layer_cfg, quantizable):
+    graph = ModelGraph(self, {"hidden": (1, 1, self.num_tokens, self.cfg.d_model)}, quantizable)
+    hidden = graph.layer_norm("model.norm", graph.inputs["hidden"])
+    output = graph.mlp("model.mlp", hidden, "gelu", residual=graph.inputs["hidden"])
+    graph.save([output])
+```
+
+Define a standalone component's inputs, top-level topology and `graph.save()`
+inside `generate_graph()`. Keep `_build_nodes(graph, inputs)` for shared graph
+construction, such as Whisper's pre/cache/post parts used by its combined
+decoder graphs.
+
+Logging is scoped by `BaseModel.gen_files()`; graph construction does not need a
+separate logging argument.
+
+Shapes infer FP32 inputs for `quantizable=True` (a floating graph to quantize
+later), or BF16 for `False` (a direct graph using the source weight precision).
+Use `input_dtypes={"cache": np.int8}` for integer inputs such as caches; names must
+match the input specifications. Existing explicit AFE tensor specifications remain
+supported for low-level callers. Input and output
+order follows the supplied specifications; shapes and output types come from
+AFE's inference. `constant()` casts floating data to the activation precision;
+use `dtype=np.int32`, for example, when integer constants require a specific
+width. Node names follow AFE's deterministic creation counter.
+
+Import `Node` from `model_graph.py` for graph-node annotations. Helpers receive
+the graph rather than a separate `quantizable` flag. `graph.constant()` selects
+floating precision automatically; use the NumPy `graph.dtype` when host-side
+array calculations need that precision. The stage flag stays at `generate_graph()`
+and graph construction.
+
+`save()` finishes the MLA subnet and creates outer-graph output tuples, preserves integer
+outputs, casts BF16 outputs to FP32 on EV, and writes the standard artifact name
+(`.fp32` for a floating graph). Use `finish()` instead to obtain the completed
+network. Both accept `transform_subnet` for model-specific rewrites before the
+outer outputs are extracted. Pass the graph itself to component helpers; inputs,
+precision and source weights remain bound to the same object.
+
+Common operations include `add`, `sub`, `mul`, `matmul`, `concat`, `slice`,
+`transpose`, `reshape`, `softmax`, `topk`, `sum_channels`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`,
+`activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`,
+`clip`, `avgpool2d`, `space_to_depth`, `quant`, and `dequant`. A gated MLP uses
+`projections=("gate_proj", "up_proj", "down_proj")`; the default is
+`("fc1", "fc2")`. `rms_norm("model.norm", input)` uses the language configuration's
+epsilon and weight offset. An explicit `epsilon` keeps zero weight offset unless
+`weight_offset` is also supplied, for vision and GDN norms.
+`rms_norm(None, input, epsilon=...)` infers weightless channels.
+RoPE supports full, partial and proportional split-half rotation.
+`rope2d(input, cos_x, sin_x, cos_y, sin_y)` rotates channel quarters in
+`[x-real, x-imag, y-real, y-imag]` order. `split_heads(input, heads, repeat=...)`
+repeats each head for grouped-query patterns. `split_concat()` exposes AFE's
+regrouping operation for spatial/token layouts that need more than a reshape.
+`space_to_depth(input, blocksize)` merges complete spatial blocks into channels.
+`quant(input)` returns `(int8_values, scale)`; `dequant(int8_values, scale)`
+restores the graph's activation precision. `argmax(input)` returns INT32 channel indices.
+`slice(input, begin, end, stride, axis)` automatically uses selector convolutions
+for unaligned, contiguous, single-axis channel slices of rank-four FP32/BF16 tensors; other
+slices retain AFE's native behavior.
+
+`linear("model.proj", input)` resolves `model.proj.weight` and its optional bias,
+converts OI source weights to SiMa's layout, and retains packed weight values,
+scales, nonaligned group sizes and relocation metadata. `conv()` infers OIW or
+OIHW source layouts; an explicit transform can convert other source layouts,
+such as Qwen's five-dimensional patch weights. `WeightOptions` documents source-name, layout,
+weight/scale/bias transform and relocation overrides. When slicing grouped
+weights, supply the corresponding `scale_process_func`; groups must retain the
+checkpoint's actual size. LoRA rank and merged-adapter behavior are explicit
+arguments to `linear()` and `mlp()`.
+
+Build attention from projections and head layout operations. Fold query scaling
+into `linear()` to retain the existing projection rounding:
+
+```python
+queries = graph.split_heads(graph.linear("attn.q_proj", hidden, scale=head_dim ** -0.5), heads)
+keys = graph.split_heads(graph.linear("attn.k_proj", hidden), heads)
+values = graph.split_heads(graph.linear("attn.v_proj", hidden), heads)
+context = graph.attention(queries, keys, values)
+output = graph.linear("attn.out_proj", graph.merge_heads(context))
+```
+
+`split_heads()` handles unaligned head channels through selector convolutions.
+Standard vision attention pads projection weights for unaligned heads to avoid these
+convolutions; grouped output weights retain their original layout.
+`attention()` uses query/key lengths to select separate head branches for large
+attention tensors, including cross-attention. It accepts an additive `mask` and
+assumes queries are already scaled unless `score_scale` is supplied. That scale is applied after
+Q×K and before the mask, preserving models such as Qwen vision's BF16 order.
+Masks must be rank-four, vectors or scalars and broadcast to `[N,H,T_query,T_key]`;
+unsupported shapes raise `ValueError`.
+
+`graph.matmul(lhs, rhs)` creates an MLA batch matmul. Both transpose flags default
+to `False`; use `transpose_a=True` for Kᵀ×V or `transpose_b=True` for Q×Kᵀ.
+Inputs must be rank-four FP32/BF16 tensors with matching batches and contraction
+dimensions. Divisible head counts use implicit repetition for grouped-query
+attention; invalid shapes or types raise `ValueError`.
+
+`graph.softmax(x)` defaults to the last axis; an explicit `axis` is supported.
+Use `graph.slice(x, start=0, stop=128, axis=-1)` for a contiguous single-axis slice,
+or the existing `begin`/`end`/`stride`/`axis` lists for multi-axis slicing. The
+single-axis form defaults to start zero, requires an explicit axis and in-range
+nonempty bounds, and retains unaligned-channel handling. Do not mix the two forms.
+
+`ModelGraph` extends AFE's `SimaBuilder`, so native operations are available
+on the same object as the common helpers:
+
+```python
+projected = graph.linear("model.proj", graph.inputs["hidden"])
+output = graph.add(projected, graph.inputs["hidden"])
+graph.save([output])
+```
+
+Concise primitive operations are direct aliases of AFE methods, retaining their
+signatures, type inference and deterministic naming. For uncommon operations,
+inherited `create_*` methods remain available on the same graph. Graphs requiring
+a custom multi-subnet lifecycle can still use AFE's `SimaBuilder` directly with
+the low-level operation helpers.
+
+Tessellation is inferred centrally in `sima_analysis.get_tessellate_parameters()`:
+HWC16 layout, automatic tile sizes and deterministic persistent buffer names.
+Ordinary components inherit empty overrides from `BaseModel`. Exceptional
+layouts, such as strided KV caches, override the existing
+`get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` methods;
+keys are tensor indices (negative indices count from the end).
+
+Whisper components, all native language graph parts and the standard vision tower
+show this API in use; their attention, MLP and rotary helpers share the same
+implementations.
+
 ## Testing
 
 Choose tests by failure surface. A build does not replace behavioral
@@ -161,8 +299,9 @@ Configure required inputs instead of accepting fixture skips.
 
 The test matrix, expected counts, and baseline policy live in
 `tests/README.md`; CI invocation lives in
-`.github/workflows/model-compiler-tests.yml`. Generate ONNX and numerical
-comparison artifacts during the run rather than committing binary baselines.
+`.github/workflows/model-compiler-tests.yml`. Generate native SDK graphs and
+numerical comparison artifacts during the run rather than committing binary
+baselines.
 
 ### Runtime validation
 

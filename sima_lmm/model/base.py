@@ -2,45 +2,33 @@ import json
 import logging
 import multiprocessing
 import numpy as np
-import onnx
-import onnxruntime as ort
 import os
 import shutil
-import sys
 from typing import NotRequired, TypedDict
 
 from abc import ABC
-from concurrent.futures import ProcessPoolExecutor, as_completed, wait
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
-import dataclasses
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from ml_dtypes import bfloat16
 from pathlib import Path
 
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import GenerationConfig
 
 from afe.apis.defines import (
-    QuantizationParams, TensorDRAMLayout, TensorTessellateParameters,
-    bfloat16_scheme, default_quantization, gen2_target, quantization_scheme,
-    SkipCalibration
+    QuantizationParams, TensorTessellateParameters, bfloat16_scheme, default_quantization,
+    quantization_scheme, SkipCalibration
 )
 from afe.backends.backends import Backend
 from afe.apis.error_handling_variables import enable_verbose_error_messages
-from afe.apis.loaded_net import load_model, onnx_source
 from afe.apis.model import Model as SDKModel
-from afe.core.configs import (
-    QuantizationConfigs, OptimizationConfigs,
-    create_quantization_configs, api_calibration_configs
-)
-from afe.ir.operations import PlaceholderOp
-from afe.ir.tensor_type import ScalarType
+import afe.apis.loaded_net
 import afe.ir.serializer
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import BaseConfig, VlmConfig, VlmArchType
+from sima_lmm.config.vlm_config import BaseConfig, VlmConfig, VlmArchType, LlmArchType
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.gguf.gguf_conversion import GgufModel
-from sima_lmm.model.onnx_builder import OnnxBuilder
 from sima_lmm.model.sima_analysis import get_tessellate_parameters
 from sima_lmm.preproc.vlm_helper import VlmHelper
 from sima_lmm.logging import (
@@ -79,20 +67,14 @@ class FileGenMode(Enum):
     """
     File generation mode.
     """
-    # Use this mode to generate ONNX files.
-    SOURCE_TO_ONNX = auto()
-
-    # Use this mode to generate floating-point Model SDK files without using ONNX.
+    # Use this mode to generate floating-point Model SDK files.
     SOURCE_TO_FP = auto()
 
     # Use this mode to quantize Model SDK files.
     FP_TO_QUANT = auto()
 
-    # Use this mode to generate quantized Model SDK files without using ONNX.
-    SOURCE_TO_QUANT = auto()
-
     # Use this mode to generate quantized Model SDK files.
-    ONNX_TO_QUANT = auto()
+    SOURCE_TO_QUANT = auto()
 
     # Use this mode to generate MPK tar.gz file.  Input is quantized Model SDK files ("QUANT").
     MODEL_SDK_COMPILE = auto()
@@ -179,9 +161,6 @@ class EvalMode(str, Enum):
     # Evaluate using HuggingFace model and processor.
     HF = "hf"
 
-    # Evaluate using generated onnx files.
-    ONNX = "onnx"
-
     # Evaluate using quantized Model SDK files.
     SDK = "sdk"
 
@@ -194,22 +173,17 @@ class BaseModel(ABC):
     Attributes:
         cfg: Configuration of the model.
         model_name: Name of the model. This will be used to determine the generated files' names.
-        onnx_path: Path to store the ONNX files.
         sima_path: Path to store the SiMa-specific files.
         hf_model: LocalHuggingFaceModel or GgufModel object
-            for obtaining the parameters to generate ONNX files.
-        onnx_file_name: File name of the generated ONNX file.
+            for obtaining source parameters.
         weight_prefix: The prefix of weight tensor names in the source model.
     """
     cfg: BaseConfig
     model_name: str
-    onnx_path: Path = field(default="onnx_files", kw_only=True)
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
     use_filter_sharing: bool = field(default=False, kw_only=True)
-
-    _onnx_builder: OnnxBuilder | None = field(init=False)
 
     def gen_files(
         self, gen_mode: FileGenMode, *,
@@ -241,21 +215,15 @@ class BaseModel(ABC):
         enable_verbose_error_messages()
         with ScopedLogLevel(log_level):
             match gen_mode:
-                case FileGenMode.SOURCE_TO_ONNX:
-                    self.onnx_path.mkdir(parents=True, exist_ok=True)
-                    self.gen_onnx_files()
                 case FileGenMode.SOURCE_TO_FP:
                     self.sima_model_sdk_path.mkdir(parents=True, exist_ok=True)
-                    self.gen_model_sdk_files_directly(layer_cfg, log_level=log_level, quantizable=True)
+                    self.generate_graph(layer_cfg, quantizable=True)
                 case FileGenMode.FP_TO_QUANT:
                     self.sima_path.mkdir(parents=True, exist_ok=True)
                     self.quantize_model_sdk(layer_cfg, log_level=log_level)
                 case FileGenMode.SOURCE_TO_QUANT:
                     self.sima_model_sdk_path.mkdir(parents=True, exist_ok=True)
-                    self.gen_model_sdk_files_directly(layer_cfg, log_level=log_level, quantizable=False)
-                case FileGenMode.ONNX_TO_QUANT:
-                    self.sima_path.mkdir(parents=True, exist_ok=True)
-                    self.gen_model_sdk_files(layer_cfg, log_level=log_level)
+                    self.generate_graph(layer_cfg, quantizable=False)
                 case FileGenMode.MODEL_SDK_COMPILE:
                     self.sima_path.mkdir(parents=True, exist_ok=True)
                     self.gen_mpk_files(log_level=log_level)
@@ -274,8 +242,6 @@ class BaseModel(ABC):
             for idx, ifm in enumerate(ifms):
                 sima_log_dbg(f"{self.model_name} ifm{idx} {ifm.shape} {ifm}")
         match eval_mode:
-            case EvalMode.ONNX:
-                ofms = self._run_onnx_model(ifms)
             case EvalMode.SDK:
                 ofms = self._run_model_sdk_model(ifms)
             case _:
@@ -292,10 +258,6 @@ class BaseModel(ABC):
     @property
     def language_model_name(self) -> str:
         return f"{self.model_name}_language"
-
-    @property
-    def onnx_file_name(self) -> Path:
-        return self.onnx_path / f"{self.model_name}.onnx"
 
     @property
     def sima_model_sdk_path(self) -> Path:
@@ -329,39 +291,31 @@ class BaseModel(ABC):
 
     def get_gen_file_name(self, gen_mode: FileGenMode) -> Path:
         match gen_mode:
-            case FileGenMode.SOURCE_TO_ONNX:
-                return self.onnx_file_name
             case FileGenMode.SOURCE_TO_FP:
                 return self.sdk_fp_file_name
-            case FileGenMode.FP_TO_QUANT | FileGenMode.ONNX_TO_QUANT | FileGenMode.SOURCE_TO_QUANT:
+            case FileGenMode.FP_TO_QUANT | FileGenMode.SOURCE_TO_QUANT:
                 return self.sdk_file_name
             case FileGenMode.MODEL_SDK_COMPILE:
                 return self.mpk_file_name
             case _:
                 raise RuntimeError(f"Files generation for gen_mode={gen_mode} is not implemented")
 
-    def gen_onnx_files(self):
-        """Generates ONNX files."""
-        raise RuntimeError("gen_onnx_files method is not implemented")
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int, quantizable: bool
+        quantizable: bool
     ):
         """
-        Generates quantized Model SDK files from the data in the config file,
-        without using ONNX as an intermediate step.
+        Builds and saves this component graph from source weights and configuration.
 
         Args:
             layer_cfg: The configuration of precision and lora mode to be used for Model SDK
                 graph generation and quantization.
-            log_level: Logging level.
             quantizable: Whether to create files for input to the quantizer.
                 If True, the input model must have floating-point data.
                 If False, the input model may have floating-point or quantized data.
         """
-        raise NotImplementedError("gen_model_sdk_files_directly method is not implemented")
+        raise NotImplementedError("generate_graph method is not implemented")
 
     def quantize_model_sdk(self, layer_cfg: LayerConfiguration, log_level: int):
         """Quantizes a floating-point Model SDK file, producing a quantized Model SDK file.
@@ -389,68 +343,23 @@ class BaseModel(ABC):
             net, self.model_name, str(self.sima_model_sdk_path)
         )
 
-    def gen_model_sdk_files(
-        self, layer_cfg: LayerConfiguration, log_level: int
-    ):
-        """Generates quantized Model SDK files.
-
-        Args:
-            layer_cfg: The configuration including precision used for quantization.
-            log_level: Logging level.
-        """
-        # Get the input shapes and dtypes from the onnx file directly.
-        # Use string instead of Path for onnx.load since it does not handle the external data file
-        # names correctly with Path.
-        onnx_model = onnx.load(str(self.onnx_file_name), load_external_data=False)
-        shape_dict = dict()
-        np_dtype_dict = dict()
-        sima_dtype_dict = dict()
-        for node in onnx_model.graph.input:
-            name = node.name
-            shape = tuple(x.dim_value for x in node.type.tensor_type.shape.dim)
-            onnx_dtype = node.type.tensor_type.elem_type
-            if onnx.__version__ > "1.13":
-                np_dtype = onnx.helper.tensor_dtype_to_np_dtype(onnx_dtype)
-            else:
-                np_dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[onnx_dtype]
-            sima_dtype = ScalarType.from_numpy(np_dtype)
-            shape_dict[name] = shape
-            np_dtype_dict[name] = np_dtype
-            sima_dtype_dict[name] = sima_dtype
-        del onnx_model
-
-        params = onnx_source(
-            model_path=str(self.onnx_file_name), shape_dict=shape_dict, dtype_dict=sima_dtype_dict
-        )
-        loaded_net = load_model(params, target=gen2_target, log_level=log_level)
-        input_dataset = [
-            {
-                name: np.zeros((shape[0], shape[2], shape[3], shape[1]), dtype=np_dtype)
-                for (name, shape), (_, np_dtype) in zip(shape_dict.items(), np_dtype_dict.items())
-            }
-        ]
-        model = loaded_net.quantize(
-            calibration_data=input_dataset,
-            quantization_config=_quantization_params(layer_cfg["precision"]),
-            model_name=self.model_name, log_level=log_level, automatic_layout_conversion=True
-        )
-        model.save(self.model_name, self.sima_model_sdk_path, include_unquantized_net=False)
-
     def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """
         Get tessellate parameters to use for this model's inputs on the MLA.
-        This function is only meaningful for models that consist of one
-        network and can compile to one elf file.
+        Empty overrides infer standard HWC16 layouts and automatic tile sizes.
+        Override tensor indices for exceptional layouts such as strided caches.
+        This function applies to components with one MLA subnet.
         """
-        raise RuntimeError("get_mla_input_tessellate_params is not implemented")
+        return {}
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
         """
         Get tessellate parameters to use for this model's output on the MLA.
-        This function is only meaningful for models that consist of one
-        network and can compile to one elf file.
+        Empty overrides infer standard HWC16 layouts and automatic tile sizes.
+        Override tensor indices for exceptional layouts such as strided caches.
+        This function applies to components with one MLA subnet.
         """
-        raise RuntimeError("get_mla_output_tessellate_params is not implemented")
+        return {}
 
     @property
     def enable_filter_sharing(self) -> bool:
@@ -536,6 +445,20 @@ class BaseModel(ABC):
             del embeddings
             del embeddings_scale
 
+        # gpt_oss attention sinks, stacked (num_layers, num_attention_heads) for the devkit.
+        if self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS:
+            sinks_file_name = self.sima_devkit_path / f"{self.language_model_name}_sinks.bin"
+            if not (resume and sinks_file_name.is_file()):
+                base_name = self.hf_model.language_model_param_base_name
+                sinks = np.stack([
+                    np.asarray(
+                        self.get_hf_param(f"{base_name}.layers.{i}.self_attn.sinks"),
+                        dtype=np.float32,
+                    )
+                    for i in range(self.cfg.lm_cfg.num_hidden_layers)
+                ])
+                sinks.astype(bfloat16).tofile(sinks_file_name)
+
         if write_cfg:
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name
@@ -597,8 +520,7 @@ class BaseModel(ABC):
             for src_file_name in src_file_names:
                 # Ignore the files not from HF and safetensor files.
                 if (
-                    src_file_name.is_relative_to(self.onnx_path)
-                    or src_file_name.is_relative_to(self.sima_path)
+                    src_file_name.is_relative_to(self.sima_path)
                     or "safetensors" in src_file_name.name
                 ):
                     continue
@@ -613,7 +535,12 @@ class BaseModel(ABC):
                 precision_list = list()
                 for layer_id, layer_p in precision.items():
                     precision_list.append(
-                        {"part": layer_id.part, "idx": layer_id.part_idx, "precision": layer_p}
+                        {
+                            "part": layer_id.part,
+                            "idx": layer_id.part_idx,
+                            "expert_idx": layer_id.expert_idx,
+                            "precision": layer_p,
+                        }
                     )
                 with open(precision_file_name, "w") as f:
                     json.dump(precision_list, f, indent=4)
@@ -709,28 +636,12 @@ class BaseModel(ABC):
             The parameter tensor in numpy array. For GGUF model or llm-compressor
             quantized weights return scales and quantized weight, followed by an
             explicit group size when the source uses grouped quantization.
-            
+
         """
         assert isinstance(self.hf_model, (LocalHuggingFaceModel, GgufModel)), \
             f"Unsupported model type: {type(self.hf_model)}"
 
         return self.hf_model.load_np_param(name)
-
-    def create_onnx_builder(self):
-        """Creates onnx builder."""
-        self._onnx_builder = OnnxBuilder(
-            self.onnx_file_name, get_param_func=self.get_hf_param,
-            check_param_func=self.check_hf_param
-        )
-
-    def _run_onnx_model(self, ifms: list[np.ndarray]) -> list[np.ndarray]:
-        onnx_model = onnx.load(str(self.onnx_file_name), load_external_data=False)
-        ifm_dict = {}
-        for node, ifm in zip(onnx_model.graph.input, ifms):
-            ifm_dict[node.name] = ifm.transpose(0, 3, 1, 2)
-        sess = ort.InferenceSession(str(self.onnx_file_name))
-        ofms = sess.run([], ifm_dict)
-        return [x.transpose(0, 2, 3, 1) for x in ofms]
 
     def _run_model_sdk_model(self, ifms: list[np.ndarray]) -> list[np.ndarray]:
         model = SDKModel.load(
@@ -771,64 +682,63 @@ class BaseModel(ABC):
         log_level: int,
         resume: bool
     ):
+        stage = {
+            FileGenMode.SOURCE_TO_FP: "graph",
+            FileGenMode.FP_TO_QUANT: "quantize",
+            FileGenMode.SOURCE_TO_QUANT: "quantized graph",
+            FileGenMode.MODEL_SDK_COMPILE: "compile",
+        }.get(gen_mode, "generate")
+        total = len(model_list)
+        if total:
+            print(f"[{stage}] Processing {total} components", flush=True)
         if num_processes != 1 and len(model_list) > 1:
             os.environ["SIMA_MLA_SIM_PARALLEL"] = "1"
-            def _stop_processes(futures, msg = None):
-                if msg is not None:
-                    print(msg, file=sys.stderr, flush=True)
-                    sima_log_exception(msg)
-                for f in futures:
-                    if not f.done():
-                        f.cancel()
-
-                # Wait for all the submitted jobs to be completed.
-                wait(results.keys())
-
-                # Re-raise the exception.
-                raise
-
-            results = dict()
-            msg = None
-            try:
-                with ProcessPoolExecutor(
-                    max_workers=num_processes, mp_context=multiprocessing.get_context("spawn")
-                ) as executor:
+            with ProcessPoolExecutor(
+                max_workers=num_processes, mp_context=multiprocessing.get_context("spawn")
+            ) as executor:
+                results = {}
+                generated_file_name = None
+                try:
                     for model, layer_cfg in model_list:
+                        generated_file_name = model.get_gen_file_name(gen_mode)
                         future = executor.submit(
                             model.gen_files, gen_mode, layer_cfg=layer_cfg,
                             log_level=logging.NOTSET, resume=resume
                         )
-                        results[future] = model.get_gen_file_name(gen_mode)
+                        results[future] = (model.model_name, generated_file_name)
+                    # Include every spawned worker in the manager's exit watch set.
+                    executor._executor_manager_thread_wakeup.wakeup()
                     with ScopedLogLevel(log_level):
-                        for future in as_completed(results.keys()):
-                            generated_file_name = results[future]
-                            try:
-                                created = future.result()
-                                if created:
-                                    sima_log_info("Created %s.", generated_file_name)
-                                else:
-                                    sima_log_info("Skipped %s.", generated_file_name)
-                            except KeyboardInterrupt:
-                                msg = "Ctrl-C received. Stop generating files."
-                                _stop_processes(results.keys(), msg)
-                            except BrokenProcessPool:
-                                msg = (
-                                    "Process worker died. Error occured when creating"
-                                    f" {generated_file_name}."
-                                )
-                                _stop_processes(results.keys(), msg)
-                            except Exception:
-                                msg = f"Error occured when creating {generated_file_name}."
-                                _stop_processes(results.keys(), msg)
-            except KeyboardInterrupt:
-                msg = "Ctrl-C received. Stop generating files."
-                _stop_processes(results.keys(), msg)
-            except Exception:
-                msg = f"Unexpected error occured."
-                _stop_processes(results.keys(), msg)
+                        for completed, future in enumerate(as_completed(results), start=1):
+                            model_name, generated_file_name = results[future]
+                            created = future.result()
+                            if created:
+                                sima_log_info("Created %s.", generated_file_name)
+                            else:
+                                sima_log_info("Skipped %s.", generated_file_name)
+                            action = "Completed" if created else "Skipped"
+                            print(f"[{stage} {completed}/{total}] {action} {model_name}", flush=True)
+                except BaseException as exc:
+                    # Python 3.11/3.12 have no public executor worker-termination API.
+                    # Stop active work before the context manager waits for shutdown.
+                    processes = list((executor._processes or {}).values())
+                    for process in processes:
+                        if process.is_alive():
+                            process.kill()
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    for process in processes:
+                        process.close()
+                    if isinstance(exc, KeyboardInterrupt):
+                        msg = "Ctrl-C received. Stop generating files."
+                    elif isinstance(exc, BrokenProcessPool):
+                        msg = f"Process worker died while creating {generated_file_name}."
+                    else:
+                        msg = f"Error occurred while creating {generated_file_name}."
+                    sima_log_exception(msg)
+                    raise
         else:
             with ScopedLogLevel(log_level):
-                for model, layer_cfg in model_list:
+                for completed, (model, layer_cfg) in enumerate(model_list, start=1):
                     try:
                         created = model.gen_files(
                             gen_mode, layer_cfg=layer_cfg, log_level=log_level, resume=resume
@@ -837,6 +747,8 @@ class BaseModel(ABC):
                             sima_log_info("Created %s.", model.get_gen_file_name(gen_mode))
                         else:
                             sima_log_info("Skipped %s.", model.get_gen_file_name(gen_mode))
+                        action = "Completed" if created else "Skipped"
+                        print(f"[{stage} {completed}/{total}] {action} {model.model_name}", flush=True)
                     except Exception:
                         msg = f"Error occured when creating {model.get_gen_file_name(gen_mode)}."
                         sima_log_exception(msg)

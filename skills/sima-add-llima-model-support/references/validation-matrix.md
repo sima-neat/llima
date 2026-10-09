@@ -9,7 +9,7 @@ in `docs/contributing.md` and `tests/README.md`.
 | LLM configuration | Hermetic parsing and invalid-input tests | Reject a hybrid layer schedule whose length differs from `num_hidden_layers` |
 | LLM numerical behavior | Deterministic prefill/cache/post comparisons | Compare LFM2-style convolution and attention units against upstream outputs |
 | VLM preprocessing | Exact processor input comparison | Compare Qwen3-VL patch tensors for one fixed image and resolution |
-| VLM numerical behavior | Vision/projector ONNX comparison | Compare the final projected image embeddings before language insertion |
+| VLM numerical behavior | Vision/projector native graph comparison | Compare the final projected image embeddings before language insertion |
 | Hugging Face layout | Synthetic transform plus source-ingestion case | Split a marked fused QKV tensor and assert every output slice |
 | GGUF layout | Config parity, permutation, and quantization cases | Compare Mistral HF/GGUF config and Q/K tensors |
 | Tokenizer/prompt contract | Exact rendered prompt and token IDs | Render ordinary and tool-enabled messages through the source Jinja implementation and Minja |
@@ -27,7 +27,7 @@ in `docs/contributing.md` and `tests/README.md`.
      when needed).
 3. Extend `tools/hf-safetensors/selection-policy.json` only for required files
    not already selected; avoid broad cache patterns.
-4. Set ONNX regression mode:
+4. Set native graph regression mode:
    - `required` when the published `develop` compiler supports the baseline;
    - `informative` for candidate-only support, promoted after publication;
    - `disabled` only with a documented reason; it runs neither revision.
@@ -45,7 +45,7 @@ For a new Qwen3-VL-style VLM, report:
 - source model ID and revision;
 - VLM and source-layout routes selected;
 - manifest/policy/count changes and temporary `informative` mode;
-- config, processor, ONNX, graph, output-asset, and Modalix results;
+- config, processor, native graph, output-asset, and Modalix results;
 - compilation options and artifact location;
 - GGUF not supported because it was not implemented or validated; and
 - supported-model documentation updated only for Hugging Face input.

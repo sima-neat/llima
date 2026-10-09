@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
-from sima_lmm.model.base import BaseModel, TensorTessellateParameters
-from sima_lmm.model.onnx_builder import OnnxNode
+from sima_lmm.model.model_graph import ModelGraph
+from sima_lmm.model.base import BaseModel, LayerConfiguration
 
 
 @dataclass
@@ -28,88 +28,28 @@ class WhisperDecoderPreModel(BaseModel):
     def enable_filter_sharing(self) -> bool:
         return self.use_filter_sharing
 
-    def gen_onnx_files(self):
-        base_name = f"model.decoder.layers.{self.layer_idx}"
-        self.create_onnx_builder()
-        self._onnx_builder.create_input_node("input", (1, self.cfg.d_model, 1, self.num_tokens))
+    def generate_graph(
+        self, layer_cfg: LayerConfiguration, quantizable: bool
+    ):
+        shape = (1, 1, self.num_tokens, self.cfg.d_model)
+        shapes = {"input": shape}
         if self.layer_idx == 0:
-            self._onnx_builder.create_input_node(
-                "embed_positions", (1, self.cfg.d_model, 1, self.num_tokens)
-            )
-        output_nodes = self._build_onnx_nodes(base_name, self._onnx_builder.input_nodes)
+            shapes["embed_positions"] = shape
 
-        # q_proj
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[0]),
-            (1, self.cfg.decoder_head_dim, self.cfg.decoder_attention_heads, self.num_tokens)
-        )
-        # self_k_cache
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[1]),
-            (1, self.cfg.d_model, 1, self.num_tokens)
-        )
-        # self_v_cache
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_nodes[2]),
-            (1, self.cfg.d_model, 1, self.num_tokens)
-        )
+        graph = ModelGraph(self, shapes, quantizable)
+        outputs = self._build_nodes(graph, list(graph.inputs.values()))
+        graph.save(outputs)
+
+    def _build_nodes(self, graph, inputs):
+        name = f"model.decoder.layers.{self.layer_idx}"
+        residual = graph.add(*inputs) if self.layer_idx == 0 else inputs[0]
+        norm = graph.layer_norm(f"{name}.self_attn_layer_norm", residual)
+        query, key, value = [
+            graph.linear(f"{name}.self_attn.{proj}_proj", norm) for proj in ("q", "k", "v")
+        ]
+        query = graph.mul(query, graph.constant(self.cfg.decoder_head_dim**-0.5))
+        query = graph.split_heads(query, self.cfg.decoder_attention_heads)
+        outputs = [query, key, value]
         if self.layer_idx == 0:
-            # Layer 0 adds the learned position embedding before entering the decoder. Preserve
-            # that complete hidden state for the residual path in the separately compiled post
-            # model.
-            self._onnx_builder.create_output_node(
-                self._onnx_builder.get_node_output_name(
-                    output_nodes[self.positioned_residual_output_idx]
-                ),
-                (1, self.cfg.d_model, 1, self.num_tokens)
-            )
-
-        self._onnx_builder.create_and_save_model()
-
-        # Set to None to deallocate the memory.
-        self._onnx_builder = None
-
-    def _build_onnx_nodes(self, base_name: str, input_nodes: list[OnnxNode]) -> list[OnnxNode]:
-        residual = input_nodes[0]
-        if self.layer_idx == 0:
-            assert len(input_nodes) == 2
-            residual = self._onnx_builder.build_op(
-                f"{base_name}.add_embed", input_nodes, "Add"
-            )
-            layer_norm = self._onnx_builder.build_layer_norm(
-                f"{base_name}.self_attn_layer_norm", residual
-            )
-        else:
-            assert len(input_nodes) == 1
-            layer_norm = self._onnx_builder.build_layer_norm(
-                f"{base_name}.self_attn_layer_norm", input_nodes[0]
-            )
-        
-        q_proj = self._onnx_builder.build_conv(f"{base_name}.self_attn.q_proj", layer_norm)
-        k_proj = self._onnx_builder.build_conv(f"{base_name}.self_attn.k_proj", layer_norm)
-        v_proj = self._onnx_builder.build_conv(f"{base_name}.self_attn.v_proj", layer_norm)
-
-        scaled_q_proj = self._onnx_builder.build_op(
-            f"{base_name}.self_attn.scaled_q_proj", [q_proj, self.cfg.decoder_head_dim ** -0.5],
-            "Mul"
-        )
-        reshaped_q_proj = self._onnx_builder.build_split_and_concat(
-            f"{base_name}.self_attn.scaled_q_proj.reshape", scaled_q_proj,
-            self.cfg.decoder_attention_heads, split_axis=1, concat_axis=2
-        )
-        output_nodes = [reshaped_q_proj, k_proj, v_proj]
-        if self.layer_idx == 0:
-            output_nodes.append(residual)
-        return output_nodes
-
-    def get_mla_input_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}
-
-    def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
-        """
-        Get the DRAM layouts to use for this model's inputs on the MLA.
-        """
-        return {}
+            outputs.append(residual)
+        return outputs
