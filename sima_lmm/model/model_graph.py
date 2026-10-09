@@ -418,7 +418,8 @@ class ModelGraph(SimaBuilder):
     ) -> NodeOrHandle:
         """Convolve OIW/OIHW weights, or a source layout with an explicit transform."""
         _validate_weight_options(kwargs)
-        source = self.parameter(kwargs.get("src_weight_name", name + ".weight"))
+        src_weight_name = kwargs.get("src_weight_name", name + ".weight")
+        source = self.parameter(src_weight_name)
         weight = source[1] if isinstance(source, tuple) else source
         if not is_depthwise:
             if weight.ndim not in (3, 4) and not (
@@ -426,9 +427,16 @@ class ModelGraph(SimaBuilder):
             ):
                 raise ValueError(f"{name}: convolution needs OIW/OIHW weights; got {weight.shape}")
             kwargs.setdefault("reshape_str", "oiw->oihw" if weight.ndim == 3 else None)
+
+        def get_param(param_name):
+            if param_name == src_weight_name:
+                return source
+            return self.model.get_hf_param(param_name)
+
         return self._build_conv(
             name,
             data,
+            get_param_func=get_param,
             is_fc=False,
             stride=stride,
             padding=padding,
