@@ -47,12 +47,22 @@ using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
 class LanguageModel : public BaseModel<VlmConfig> {
     public:
+        // Existing disk-loading overload; preserves source compatibility.
         LanguageModel(
             std::filesystem::path model_path,
             std::set<uint32_t> stop_token_ids,
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer
+        );
+        // Reads the model files through file_provider (nullptr = from disk).
+        LanguageModel(
+            std::filesystem::path model_path,
+            std::set<uint32_t> stop_token_ids,
+            std::optional<uint32_t> image_token_id,
+            std::optional<uint32_t> pad_token_id,
+            TextStreamer& text_streamer,
+            std::shared_ptr<FileProvider> file_provider
         );
         virtual ~LanguageModel() override { _finalize(); }
 

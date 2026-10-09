@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <fstream>
+#include <iterator>
+#include <memory>
 #include <string_view>
+#include <utility>
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -26,9 +29,48 @@ uint32_t find_and_replace_all(
 }
 
 
+namespace {
+// The legacy VlmHelper constructor gets the devkit folder itself, while the
+// provider API names files from the model root ("devkit/tokenizer.json").
+// Drop that prefix and read from the given folder, whatever it is called.
+class DevkitDirProvider final : public FileProvider {
+    public:
+        explicit DevkitDirProvider(std::filesystem::path devkit_dir)
+            : _disk(std::move(devkit_dir)) {}
+        std::filesystem::path get_path(std::string_view name) override {
+            return _disk.get_path(_strip(name));
+        }
+        std::unique_ptr<std::istream> open_stream(std::string_view name) override {
+            return _disk.open_stream(_strip(name));
+        }
+    private:
+        static std::string_view _strip(std::string_view name) {
+            constexpr std::string_view prefix = "devkit/";
+            return name.substr(0, prefix.size()) == prefix ? name.substr(prefix.size()) : name;
+        }
+        DiskFileProvider _disk;
+};
+}  // namespace
+
+
+// The provider only lives for the delegated constructor: VlmHelper reads all
+// its files while it is built and keeps no reference to the provider.
 VlmHelper::VlmHelper(
     const VlmConfig& vlm_cfg,
     const std::filesystem::path& devkit_dir,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    bool enable_thinking,
+    std::string reasoning_effort
+) : VlmHelper(
+        vlm_cfg, *std::make_unique<DevkitDirProvider>(devkit_dir), std::move(system_prompt),
+        std::move(chat_template), enable_thinking, std::move(reasoning_effort)
+    ) {}
+
+
+VlmHelper::VlmHelper(
+    const VlmConfig& vlm_cfg,
+    FileProvider& files,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
     bool enable_thinking,
@@ -49,29 +91,36 @@ VlmHelper::VlmHelper(
     }
 
     if (_vlm_cfg.gguf_file_name.empty()) {
-        _tokenizer_ptr = Tokenizer::from_hf_json(devkit_dir / "tokenizer.json");
+        _tokenizer_ptr = Tokenizer::from_hf_json(*files.open_stream("devkit/tokenizer.json"));
         // Huggingface format.
         auto tokenizer_config_json = nlohmann::json::parse(
-            std::ifstream(devkit_dir / "tokenizer_config.json")
+            *files.open_stream("devkit/tokenizer_config.json")
         );
-        _init_chat_template(devkit_dir, tokenizer_config_json, chat_template);
-        _init_stop_token_ids(devkit_dir, &tokenizer_config_json);
+        _init_chat_template(files, tokenizer_config_json, chat_template);
+        _init_stop_token_ids(files, &tokenizer_config_json);
         if (_vlm_cfg.is_multimodal()) {
             _init_image_token_id(tokenizer_config_json);
             _init_pad_token_id(tokenizer_config_json);
-            _init_image_processor(devkit_dir);
+            _init_image_processor(files);
         }
     } else {
         // GGUf format.
         assert(!_vlm_cfg.is_multimodal());
-        _tokenizer_ptr = Tokenizer::from_gguf(devkit_dir / _vlm_cfg.gguf_file_name);
+        const std::string gguf_name = "devkit/" + _vlm_cfg.gguf_file_name;
+        _tokenizer_ptr = Tokenizer::from_gguf(files.get_path(gguf_name));
+        // The tokenizer loads only the vocabulary (vocab_only: no tensors, no
+        // mmap) and keeps no hold on the file. For a model compiled from GGUF
+        // this file is the whole source model (GBs), so let a pulling provider
+        // (PCIe) delete it now instead of keeping it for the whole run. The
+        // disk provider keeps it (release() does nothing there).
+        files.release(gguf_name);
         auto chat_template_str = _tokenizer_ptr->get_chat_template();
         _bos_token = _tokenizer_ptr->get_bos_token();
         auto eos_token = _tokenizer_ptr->get_eos_token();
         _chat_template_ptr = std::make_unique<minja::chat_template>(
             chat_template_str, _bos_token, eos_token
         );
-        _init_stop_token_ids(devkit_dir);
+        _init_stop_token_ids(files);
     }
 }
 
@@ -227,13 +276,14 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
 
 
 void VlmHelper::_init_chat_template(
-    const std::filesystem::path& devkit_dir,
+    FileProvider& files,
     const nlohmann::json& tokenizer_config_json,
     std::optional<std::string> override_chat_template
 ) {
-    // Determine the chat template.
-    auto chat_template_jinja_file_name = devkit_dir / "chat_template.jinja";
-    auto chat_template_json_file_name = devkit_dir / "chat_template.json";
+    // Determine the chat template. The devkit/chat_template.{jinja,json} files
+    // are OPTIONAL (most models carry the template in tokenizer_config.json),
+    // so probe with exists() — get_path() would treat their absence as a fatal
+    // error. exists() also avoids pulling them over PCIe unless they are used.
     std::string chat_template_str;
     if (override_chat_template.has_value()) {
         // Use custom chat template if specified by user.
@@ -241,16 +291,16 @@ void VlmHelper::_init_chat_template(
     } else if (_vlm_cfg.pipeline_cfg.chat_template.has_value()) {
         // Use custom chat template if specified by user.
         chat_template_str = _vlm_cfg.pipeline_cfg.chat_template.value();
-    } else if (std::filesystem::is_regular_file(chat_template_jinja_file_name)) {
+    } else if (files.exists("devkit/chat_template.jinja")) {
         // Try the chat_template.jinja.
-        auto size = std::filesystem::file_size(chat_template_jinja_file_name);
-        std::ifstream file(chat_template_jinja_file_name, std::ios::binary);
-        chat_template_str.assign(size, '\0');
-        file.read(chat_template_str.data(), size);
-    } else if (std::filesystem::is_regular_file(chat_template_json_file_name)) {
+        auto stream = files.open_stream("devkit/chat_template.jinja");
+        chat_template_str.assign(
+            std::istreambuf_iterator<char>(*stream), std::istreambuf_iterator<char>()
+        );
+    } else if (files.exists("devkit/chat_template.json")) {
         // Try the chat_template.json.
         auto chat_template_json = nlohmann::json::parse(
-            std::ifstream(chat_template_json_file_name)
+            *files.open_stream("devkit/chat_template.json")
         );
         chat_template_str = chat_template_json.at("chat_template");
     } else if (
@@ -297,7 +347,7 @@ void VlmHelper::_init_chat_template(
 
 
 void VlmHelper::_init_stop_token_ids(
-    const std::filesystem::path& devkit_dir,
+    FileProvider& files,
     const nlohmann::json* tokenizer_config_json
 ) {
     // Draft models use the target's tokenization scheme; stop tokens come from
@@ -307,9 +357,11 @@ void VlmHelper::_init_stop_token_ids(
         return;
     }
 
-    auto generation_config_file_name = devkit_dir / "generation_config.json";
-    if (std::filesystem::is_regular_file(generation_config_file_name)) {
-        auto json = nlohmann::json::parse(std::ifstream(generation_config_file_name));
+    // generation_config.json is OPTIONAL — fall back to tokenizer_config when
+    // absent, so probe with exists() rather than get_path() (which throws on a
+    // missing file) and skip the pull entirely when it is not present.
+    if (files.exists("devkit/generation_config.json")) {
+        auto json = nlohmann::json::parse(*files.open_stream("devkit/generation_config.json"));
         auto eos_token_id = json.at("eos_token_id");
         if (eos_token_id.is_number_integer() || eos_token_id.is_number_unsigned()) {
             _stop_token_ids.emplace(eos_token_id.get<uint32_t>());
@@ -364,10 +416,14 @@ void VlmHelper::_init_pad_token_id(const nlohmann::json& tokenizer_config_json) 
 
 
 
-void VlmHelper::_init_image_processor(const std::filesystem::path& devkit_dir) {
-    auto p1 = devkit_dir / "preprocessor_config.json";
-    auto p2 = devkit_dir / "processor_config.json";
-    auto json_root = nlohmann::json::parse(std::ifstream(std::filesystem::exists(p1) ? p1 : p2));
+void VlmHelper::_init_image_processor(FileProvider& files) {
+    // preprocessor_config.json is OPTIONAL — models without it use
+    // processor_config.json instead. Probe with exists() (get_path() would
+    // throw on the missing file) so the choice does not pull the wrong file.
+    const bool use_preprocessor = files.exists("devkit/preprocessor_config.json");
+    auto json_root = nlohmann::json::parse(*files.open_stream(
+        use_preprocessor ? "devkit/preprocessor_config.json" : "devkit/processor_config.json"
+    ));
     const auto& json = json_root.contains("image_processor") ? json_root["image_processor"] : json_root;
 
     bool do_pad_to_square;
