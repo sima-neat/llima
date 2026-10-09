@@ -43,6 +43,8 @@ Combine routes only for independently proven differences. Then read
   parallel model-specific implementation.
 - Keep format-specific normalization out of shared model computation.
 - Use ModelGraph for native generation and validate staged and direct quantization.
+  Apply the Transformers layout mapping in `references/llm-architecture.md`
+  and `references/vlm-architecture.md` when porting or comparing graphs.
 - Reject missing or ambiguous config/tensor layouts.
 - Add hermetic tests for pure logic and model-backed coverage for each affected
   compiler surface.

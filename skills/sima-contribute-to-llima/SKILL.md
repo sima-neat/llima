@@ -28,6 +28,8 @@ description: Make safe changes in the sima-neat/llima repository across GenAI co
 - Treat installed APIs, CLI contracts, serialized configuration, package
   metadata, and artifact layouts as compatibility surfaces.
 - Use `deps/manifest.json` for dependency versions.
+- For Transformer reference comparisons, follow the ModelGraph layout mapping
+  in `CONTRIBUTING.md`: 4D hidden states/attention and NHWC vision images.
 - Reject unsupported input explicitly; do not silently change model, revision,
   precision, format, or execution path.
 - Distinguish declared dependency constraints from the versions actually

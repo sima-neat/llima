@@ -63,6 +63,14 @@ packages. `llima-compile` covers LLMs and VLMs; existing Whisper maintenance
 uses the separate
 [Whisper/ASR path](docs/contributing.md#whisper-and-asr-development).
 
+Use the matching pinned Transformers implementation as the architecture and
+numerical reference, or pinned model repository code when Transformers lacks
+support. ModelGraph keeps LLM hidden states in the same logical
+order, adding a singleton axis: `[B, T, C]` becomes `[B, 1, T, C]`. Attention
+Q/K/V retain `[B, heads, T, D]`. Vision image tensors use NHWC
+`[B, height, width, C]` instead of Transformers' usual NCHW
+`[B, C, height, width]`. Align these layouts before numerical comparisons.
+
 ## Validate
 
 Run the smallest tier that proves the change.

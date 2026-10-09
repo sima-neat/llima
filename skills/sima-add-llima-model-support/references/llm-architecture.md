@@ -28,6 +28,21 @@ ingestion/source-layout handling.
 8. Adapt the C++ runtime only for a new execution contract. Drive selection,
    dimensions, and behavior from generated configuration.
 
+## Reference Tensor Layouts
+
+ModelGraph preserves Transformers' logical LLM axis order, using 4D tensors:
+
+| Tensor | Transformers | ModelGraph |
+| --- | --- | --- |
+| Hidden states | `[B, T, C]` | `[B, 1, T, C]` |
+| Attention Q/K/V | `[B, heads, T, D]` | `[B, heads, T, D]` |
+
+`B` is batch size, `T` sequence length, `C` hidden width, and `D` head width.
+Current LLiMa components normally use `B=1`. The extra hidden-state axis is
+a singleton; preserve token and feature order. Add or remove that axis when
+comparing against the reference, without transposing it into a channel-first
+layout. Attention already uses the same head/sequence ordering.
+
 ## Define the Contract
 
 Compare the upstream config, implementation, and tensor index with the closest

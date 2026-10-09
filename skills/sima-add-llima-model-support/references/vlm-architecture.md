@@ -3,6 +3,16 @@
 Separate vision-transformer, projector, preprocessing, and prompt-integration
 differences before editing.
 
+Use the matching pinned Transformers implementation as the architecture and
+numerical reference, or the pinned model repository implementation when
+Transformers lacks support. ModelGraph uses NHWC `[B, height, width, C]` for
+image tensors, while Transformers typically uses NCHW `[B, C, height, width]`.
+Transpose image inputs at the reference boundary. Already patchified inputs
+follow the component's token contract. Encoder hidden states use
+`[B, 1, T, C]` instead of `[B, T, C]`, and
+attention Q/K/V retain `[B, heads, T, D]`, as described in
+`llm-architecture.md`.
+
 ## Procedure
 
 1. Define image sizes, patch/merge factors, channel layout, normalization, and
