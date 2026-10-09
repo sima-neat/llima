@@ -498,32 +498,37 @@ void MLAModelWithBuffer::run_queue() {
 }
 
 void MLAModelWithBuffer::update_reloc(
-    const std::map<std::string, uint64_t>& reloc_addr_map
+    const std::map<std::string, MLABuffer*>& reloc_buffers
 ) {
-    if (reloc_addr_map.empty()) return;
+    if (reloc_buffers.empty()) return;
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
     load();
     mla_model_p model = model_for(_model_idx);
     const auto lengths = mla_get_ifm_ofm_len_vector(model).reloc_len_array;
-    if (lengths.size() != reloc_addr_map.size()) {
+    if (lengths.size() != reloc_buffers.size()) {
         throw std::invalid_argument(fmt::format(
             "Relocation count for {} is {}, model expects {}",
-            path_for(_model_idx), reloc_addr_map.size(), lengths.size()
+            path_for(_model_idx), reloc_buffers.size(), lengths.size()
         ));
     }
-    std::vector<DADDR_LEN> relocs;
-    relocs.reserve(reloc_addr_map.size());
-    std::size_t index = 0;
-    for (const auto& [name, address] : reloc_addr_map) {
+    // Bind adapters by internal_buf_id, not physical address. A reusable-CMA
+    // memory profile refuses the raw-phys attach path outright (the DMS pool is
+    // System RAM), so import each adapter's DMA-BUF and pass its buf_id, exactly
+    // as the IFM/OFM run path does in make_bindings(). Reloc ports are ordered
+    // by adapter buffer name, which matches the model's reloc section order.
+    std::vector<mla_tensor> relocs;
+    relocs.reserve(reloc_buffers.size());
+    for (const auto& [name, buffer] : reloc_buffers) {
         (void)name;
-        relocs.emplace_back(address, lengths[index++]);
+        const uint64_t offset = buffer->get_buf_addr_offset();
+        const uint64_t length = buffer->get_allocation_size() - offset;
+        relocs.push_back({imported_buffer_id(buffer), 0, offset, length});
     }
-    const int rc = mla_update_model_rel(
-        model, 0, nullptr, 0, nullptr,
-        static_cast<int>(relocs.size()), relocs.data()
+    const int rc = mla_update_model_reloc(
+        model, static_cast<int>(relocs.size()), relocs.data()
     );
-    if (rc <= 0) {
+    if (rc != 0) {
         throw std::runtime_error(fmt::format(
             "MLA-RT relocation failed for {}: rc={}", path_for(_model_idx), rc
         ));
