@@ -30,7 +30,8 @@ enum class DecodeCallbackType : uint32_t {
     TTFT = 1,
     TPS = 2,
     CACHE_FULL = 3,
-    STOP = 4
+    STOP = 4,
+    CACHED_PROMPT_TOKENS = 5
 };
 
 
@@ -44,8 +45,7 @@ struct DecodeCallbackData {
 
 class TextStreamer {
     public:
-        // Callback for timing/status information (ttft, tps, FULL, END)
-        // Parameters: metric_type ("ttft", "tps", "FULL", "END"), metric_value (duration or rate)
+        // Callback for timing, cache, and status information.
         using InfoCallback = std::function<void(const std::string&, double)>;
         
         // Callback for finalized text chunks.

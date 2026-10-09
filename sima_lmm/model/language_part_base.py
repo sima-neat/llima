@@ -3,7 +3,7 @@ import numpy as np
 
 from sima_lmm.model.base import BaseModel
 from sima_lmm.model.model_graph import Node
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
+from sima_lmm.config.vlm_config import LlmArchType, SpeculativeDecodingMethod, VlmArchType
 
 
 @dataclass
@@ -46,6 +46,30 @@ class LanguagePartBaseModel(BaseModel):
         return cfg is not None and cfg.is_draft
 
     @property
+    def is_eagle3_draft(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return self.is_draft and cfg.method == SpeculativeDecodingMethod.EAGLE3
+
+    @property
+    def is_gemma4_mtp_draft(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return self.is_draft and cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+
+    @property
+    def is_gemma4_mtp_target(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return (
+            cfg is not None and not cfg.is_draft
+            and cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+        )
+
+    @property
+    def _input_hidden_size(self) -> int:
+        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
+            return 2 * self.cfg.lm_cfg.assistant_backbone_hidden_size
+        return self.cfg.lm_cfg.hidden_size
+
+    @property
     def uses_quantized_input_embeddings(self) -> bool:
         return self.cfg.pipeline_cfg.quantize_embeddings
 
@@ -69,14 +93,14 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
     expert_idx: int = -1
 
     def _build_post_transformer(self, graph, input_node) -> list[Node]:
-        """Build SiMa nodes for the post-transformer projection (final norm + lm_head)."""
+        """Build final normalization, logits and speculative state outputs."""
         # LFM2 uses embedding_norm instead of norm for the final normalization.
         base_prefix = self.hf_model.language_model_param_base_name
         final_norm_name = (
             "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
         )
         final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_draft:
+        if self.is_eagle3_draft:
             final_norm_full_name = final_norm_name
         rms_norm = graph.rms_norm(final_norm_full_name, input_node)
 
@@ -119,8 +143,16 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 lm_head = graph.softcap(lm_head, self.cfg.lm_cfg.final_logit_softcapping)
             lm_heads.append(lm_head)
 
-        if self.is_draft:
+        if self.is_eagle3_draft:
             lm_heads.append(input_node)
+            return lm_heads
+        if self.is_gemma4_mtp_draft:
+            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                lm_heads.append(graph.linear("masked_embedding.centroids", rms_norm))
+            lm_heads.append(graph.linear("post_projection", rms_norm))
+            return lm_heads
+        if self.is_gemma4_mtp_target:
+            lm_heads.append(rms_norm)
             return lm_heads
         if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
             argmax = graph.argmax(lm_heads[0])

@@ -1,0 +1,170 @@
+#include "gemma4_mtp_helpers.hpp"
+
+#include <algorithm>
+#include <limits>
+#include <numeric>
+#include <stdexcept>
+#include <vector>
+
+namespace simaai {
+namespace llima {
+namespace gemma4_mtp_helpers {
+
+uint16_t draft_query_position(size_t input_length, size_t max_num_tokens) {
+    if (input_length == 0) {
+        throw std::runtime_error("Gemma4 MTP draft requires at least one input token");
+    }
+    const size_t position_id = input_length - 1;
+    if (
+        position_id >= max_num_tokens
+        || position_id > std::numeric_limits<uint16_t>::max()
+    ) {
+        throw std::runtime_error("Gemma4 MTP draft position exceeds cache capacity");
+    }
+    return static_cast<uint16_t>(position_id);
+}
+
+uint16_t draft_visible_shared_kv_len(
+    size_t input_length,
+    size_t available_shared_kv_len,
+    size_t max_num_tokens
+) {
+    if (input_length == 0 || available_shared_kv_len == 0) {
+        throw std::runtime_error(
+            "Gemma4 MTP draft requires at least one target KV row"
+        );
+    }
+    if (
+        input_length > max_num_tokens
+        || available_shared_kv_len > max_num_tokens
+        || max_num_tokens > std::numeric_limits<uint16_t>::max()
+    ) {
+        throw std::runtime_error("Gemma4 MTP shared KV length exceeds cache capacity");
+    }
+    // The target may have computed speculative rows beyond the accepted prefix.
+    // Transformers exposes those rows only through the current input length. A
+    // partial rejection therefore makes the visible KV length one greater than
+    // the assistant query position, while initial/full-acceptance rounds remain
+    // bounded by the number of rows the target actually produced.
+    return static_cast<uint16_t>(std::min(input_length, available_shared_kv_len));
+}
+
+std::vector<Eigen::bfloat16> build_causal_mask(
+    uint16_t num_tokens,
+    uint16_t first_visible_token_count,
+    uint16_t valid_tokens,
+    uint16_t cache_token_idx_begin,
+    uint16_t context_length
+) {
+    if (valid_tokens == 0 || valid_tokens > num_tokens
+        || first_visible_token_count <= cache_token_idx_begin
+        || static_cast<size_t>(first_visible_token_count) + valid_tokens - 1
+            > static_cast<size_t>(cache_token_idx_begin) + context_length) {
+        throw std::runtime_error("Invalid Gemma4 MTP causal-mask range");
+    }
+    const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
+    std::vector<Eigen::bfloat16> mask(
+        static_cast<size_t>(num_tokens) * context_length, neg_inf
+    );
+    const size_t first_visible_columns = first_visible_token_count - cache_token_idx_begin;
+    for (uint16_t row = 0; row < valid_tokens; ++row) {
+        std::fill_n(
+            mask.begin() + static_cast<size_t>(row) * context_length,
+            first_visible_columns + row,
+            Eigen::bfloat16{0.0f}
+        );
+    }
+    return mask;
+}
+
+std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(
+    std::span<const uint32_t> draft_token_ids,
+    std::span<const uint32_t> target_next_token_ids
+) {
+    if (
+        target_next_token_ids.empty()
+        || target_next_token_ids.size() > draft_token_ids.size() + 1
+    ) {
+        throw std::runtime_error(
+            "Invalid Gemma4 MTP verification result"
+        );
+    }
+
+    std::vector<std::pair<uint32_t, bool>> emitted_tokens;
+    emitted_tokens.reserve(draft_token_ids.size() + 1);
+    for (size_t depth = 0; depth < target_next_token_ids.size(); ++depth) {
+        if (depth == draft_token_ids.size()) {
+            emitted_tokens.emplace_back(target_next_token_ids[depth], false);
+            return emitted_tokens;
+        }
+        if (draft_token_ids[depth] != target_next_token_ids[depth]) {
+            emitted_tokens.emplace_back(target_next_token_ids[depth], false);
+            return emitted_tokens;
+        }
+        emitted_tokens.emplace_back(draft_token_ids[depth], true);
+    }
+
+    throw std::runtime_error(
+        "Gemma4 MTP verification ended without a mismatch or bonus token"
+    );
+}
+
+std::vector<uint32_t> select_candidate_tokens(
+    std::span<const Eigen::bfloat16> centroid_logits,
+    std::span<const uint32_t> token_ordering,
+    uint32_t top_k_centroids
+) {
+    if (
+        centroid_logits.empty() || token_ordering.empty()
+        || token_ordering.size() % centroid_logits.size() != 0
+    ) {
+        throw std::runtime_error(
+            "Gemma4 masked lm_head vocabulary must divide evenly across centroids"
+        );
+    }
+    if (top_k_centroids == 0 || top_k_centroids > centroid_logits.size()) {
+        throw std::runtime_error("Invalid Gemma4 masked lm_head centroid top-k");
+    }
+
+    std::vector<uint32_t> centroid_indices(centroid_logits.size());
+    std::iota(centroid_indices.begin(), centroid_indices.end(), 0);
+    std::partial_sort(
+        centroid_indices.begin(),
+        centroid_indices.begin() + top_k_centroids,
+        centroid_indices.end(),
+        [&](uint32_t left, uint32_t right) {
+            const float left_value = static_cast<float>(centroid_logits[left]);
+            const float right_value = static_cast<float>(centroid_logits[right]);
+            return left_value != right_value
+                ? left_value > right_value
+                : left < right;
+        }
+    );
+
+    const size_t tokens_per_centroid = (
+        token_ordering.size() / centroid_logits.size()
+    );
+    std::vector<uint32_t> candidate_tokens;
+    candidate_tokens.reserve(
+        static_cast<size_t>(top_k_centroids) * tokens_per_centroid
+    );
+    for (uint32_t rank = 0; rank < top_k_centroids; ++rank) {
+        const size_t ordering_begin = (
+            static_cast<size_t>(centroid_indices[rank]) * tokens_per_centroid
+        );
+        for (size_t offset = 0; offset < tokens_per_centroid; ++offset) {
+            const uint32_t token = token_ordering[ordering_begin + offset];
+            if (token >= token_ordering.size()) {
+                throw std::runtime_error(
+                    "Gemma4 token_ordering contains an out-of-range token ID"
+                );
+            }
+            candidate_tokens.emplace_back(token);
+        }
+    }
+    return candidate_tokens;
+}
+
+} // namespace gemma4_mtp_helpers
+} // namespace llima
+} // namespace simaai

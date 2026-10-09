@@ -32,7 +32,11 @@ class LanguagePreModel(LanguagePartBaseModel):
     @property
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
-        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+        return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
+
+    @property
+    def uses_quantized_input_embeddings(self) -> bool:
+        return super().uses_quantized_input_embeddings and not self.is_gemma4_mtp_draft
 
     @property
     def layer_type(self) -> str:
@@ -64,7 +68,7 @@ class LanguagePreModel(LanguagePartBaseModel):
     ):
         base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
-        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
         freq_shape = (
             1,
@@ -77,7 +81,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             input_dtypes["input"] = np.int8
             input_specs["input_scale"] = scale_shape
-        if self.is_draft:
+        if self.is_eagle3_draft:
             input_specs["hidden_states"] = input_shape
         input_specs.update(freq_real=freq_shape, freq_imag=freq_shape)
         graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
@@ -92,6 +96,9 @@ class LanguagePreModel(LanguagePartBaseModel):
         else:
             rms_norm_in = mla_input_input
 
+        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
+            rms_norm_in = graph.linear("pre_projection", rms_norm_in)
+
         norm_name = (
             f"{base_name}.operator_norm"
             if self.check_hf_param(f"{base_name}.operator_norm.weight")
@@ -99,7 +106,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         )
         rms_norm = graph.rms_norm(norm_name, rms_norm_in)
         # EAGLE3 draft model additionally normalizes the hidden_states and concatenates.
-        if self.is_draft:
+        if self.is_eagle3_draft:
             hidden_states_norm = graph.rms_norm(f"{base_name}.hidden_norm", inputs["hidden_states"])
             attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
         else:

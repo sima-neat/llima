@@ -25,14 +25,21 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.pipeline_cfg.enable_filter_sharing
 
     @property
+    def uses_per_layer_inputs(self) -> bool:
+        return (
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.cfg.lm_cfg.hidden_size_per_layer_input > 0
+        )
+
+    @property
     def uses_quantized_input_embeddings(self) -> bool:
-        # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
+        # Draft post consumes floating hidden states, not a quantized embedding row.
         return super().uses_quantized_input_embeddings and not self.is_draft
 
     @property
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
-        return base if self.is_draft else f"{base}.layers.{self.layer_idx}"
+        return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
 
     def _build_per_layer_input_branch(
         self,
@@ -52,12 +59,7 @@ class LanguagePostModel(LanguagePostBaseModel):
             f"{base_name}.per_layer_projection", mul, merged_lora=merged_lora, lora_rank=None
         )
         norm = graph.rms_norm(f"{base_name}.post_per_layer_input_norm", proj)
-        add = graph.add(residual, norm)
-        layer_scalar = graph.constant(
-            self.get_hf_param(f"{base_name}.layer_scalar")
-            .reshape(1)
-        )
-        return graph.mul(add, layer_scalar)
+        return graph.add(residual, norm)
 
     def generate_graph(
         self,
@@ -66,7 +68,7 @@ class LanguagePostModel(LanguagePostBaseModel):
     ):
         base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
-        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
         if self.cfg.lm_cfg.moe_cfg is not None and self.expert_idx >= 0:
             graph = ModelGraph(self, {
                 "norm_hidden": input_shape,
@@ -103,7 +105,7 @@ class LanguagePostModel(LanguagePostBaseModel):
         )
         needs_deepstack = self.layer_idx in llm_injection_layers and self.num_tokens > 1
         input_specs["self_attn"] = self_attn_shape
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             input_specs["per_layer_input"] = per_layer_shape
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
             input_specs["gate"] = self_attn_shape
@@ -115,7 +117,7 @@ class LanguagePostModel(LanguagePostBaseModel):
             mla_input_scale = graph.inputs["input_scale"]
         mla_input_self_attn = graph.inputs["self_attn"]
         mla_input_per_layer = None
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             mla_input_per_layer = graph.inputs["per_layer_input"]
         mla_input_gate = None
         if self.cfg.lm_cfg.attn_cfg.attn_output_gate:
@@ -143,6 +145,9 @@ class LanguagePostModel(LanguagePostBaseModel):
             rms_norm_in = graph.dequant(mla_input_input, mla_input_scale)
         else:
             rms_norm_in = mla_input_input
+
+        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
+            rms_norm_in = graph.linear("pre_projection", rms_norm_in)
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
         if has_ffn_norms:
@@ -180,7 +185,7 @@ class LanguagePostModel(LanguagePostBaseModel):
 
         # Add deepstack features if needed
         final_output = add2
-        if self.cfg.model_type == VlmArchType.VLM_GEMMA4:
+        if self.uses_per_layer_inputs:
             final_output = self._build_per_layer_input_branch(
                 graph,
                 base_name,
@@ -188,6 +193,12 @@ class LanguagePostModel(LanguagePostBaseModel):
                 mla_input_per_layer,
                 merged_lora,
             )
+        if (
+            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.check_hf_param(f"{base_name}.layer_scalar")
+        ):
+            layer_scalar = graph.constant(graph.parameter(f"{base_name}.layer_scalar").reshape(1))
+            final_output = graph.mul(final_output, layer_scalar)
         if needs_deepstack and mla_input_deepstack is not None:
             final_output = graph.add(final_output, mla_input_deepstack)
 
