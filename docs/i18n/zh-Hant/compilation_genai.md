@@ -95,8 +95,8 @@ output_directory/
 | `--input_width` | 輸入圖片的寬度，單位為像素。必須與 `--input_height` 一起提供。對於 Qwen 2 VL、Qwen 3 VL、Qwen3.5 和 Gemma 4 而言，這是必需的；對於覆寫 SigLIP2 模型已設定的大小而言，則是可選的。 |
 | `--system_prompt` | 系統提示，用於儲存以供 CLI 模式使用，以及用於模型預熱。 |
 | `--system_prompt_file` | 指向包含系統提示的文字檔案的路徑。 |
-| `--chat_template` | 聊天範本字串，用於儲存在編譯後的模型中。與「系統提示」和「聊天範本檔案」選項為互斥關係。 |
-| `--chat_template_file` | 檔案路徑，指向包含對話範本的檔案。與「系統提示」選項互斥，且與 `--chat_template` 互斥。 |
+| `--chat_template` | 聊天範本字串，用於儲存在編譯後的模型中。與 `--chat_template_file` 互斥。 |
+| `--chat_template_file` | 檔案路徑，指向包含對話範本的檔案。與 `--chat_template` 互斥。 |
 
 :::note
 大多數模型支援最多 8192 個 token 的上下文長度。請使用 `--max_num_tokens 8192` 以啟用 8K 的上下文長度。
