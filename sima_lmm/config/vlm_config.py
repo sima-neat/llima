@@ -1275,17 +1275,6 @@ class VlmConfig(BaseConfig):
                 "for linear-attention models"
             )
 
-        if (
-            self.lm_cfg.attn_cfg.swa_enable
-            and self.pipeline_cfg.input_token_group_offsets
-            and self.pipeline_cfg.input_token_group_size
-            >= self.lm_cfg.attn_cfg.sliding_window
-        ):
-            raise ValueError(
-                "language_group_size must be smaller than sliding_window "
-                "for models with sliding attention"
-            )
-
     def get_layer_ids(self) -> list[LayerID]:
         """
         Get IDs of all layers that comprise the model.
@@ -1376,21 +1365,21 @@ class VlmConfig(BaseConfig):
                         and sliding_window <= pipeline_cfg.max_num_tokens
                     )
                     if not sliding_cache_mask_differs:
-                        group_cache_indices = group_shared_sliding_cache_model_indices(
-                            pipeline_cfg, sliding_window
-                        )
                         single_cache_indices = single_shared_sliding_cache_model_indices(
                             pipeline_cfg, sliding_window
                         )
                 layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
                 layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
-                if separate_sliding_cache:
+                if has_sliding_attn:
                     layers.extend(
                         LayerID("group_sliding_cache", n)
                         for n in group_sliding_cache_model_indices(
                             pipeline_cfg, lm_cfg.attn_cfg.sliding_window
                         )
+                        if separate_sliding_cache
+                        or n + pipeline_cfg.input_token_group_size > lm_cfg.attn_cfg.sliding_window
                     )
+                if separate_sliding_cache:
                     layers.extend(
                         LayerID("single_sliding_cache", n)
                         for n in single_sliding_cache_model_indices(
@@ -1398,16 +1387,6 @@ class VlmConfig(BaseConfig):
                         )
                     )
                 elif terminal_sliding_cache:
-                    layers.append(LayerID(
-                        "group_sliding_cache",
-                        _cache_model_index(
-                            pipeline_cfg,
-                            "sliding_attention",
-                            sliding_window,
-                            pipeline_cfg.input_token_group_size,
-                            is_group=True,
-                        ),
-                    ))
                     layers.append(LayerID(
                         "single_sliding_cache",
                         _cache_model_index(
@@ -1633,34 +1612,11 @@ def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
 
 
 def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
-    """
-    Get the indices of all group sliding-window cache models.
-
-    For sliding attention the effective cache_model_token_idx saturates at
-    sliding_window - group_size once the window is fully filled.  Any group offset
-    beyond that point maps to the same compiled model, so we only keep offsets
-    strictly below the transition and add the transition itself.
-
-    Returns:
-        Indices of group sliding cache models in ascending order.
-    """
-    transition = sliding_window - cfg.input_token_group_size
-    indices = [
-        n for n in _group_cache_model_indices(cfg, "sliding_attention")
-        if n < transition
-    ]
-    if transition > 0:
-        indices.append(transition)
-    return indices
-
-
-def group_shared_sliding_cache_model_indices(
-    cfg: PipelineConfig, sliding_window: int
-) -> list[int]:
-    """Get cache indices needed by sliding attention sharing the full cache."""
-    return sorted(set(group_cache_model_indices(cfg)) | set(
-        group_sliding_cache_model_indices(cfg, sliding_window)
-    ))
+    """Return first-query indices relative to the union of a group's windows."""
+    return sorted({
+        min(offset, sliding_window - 1)
+        for offset in cfg.input_token_group_offsets or []
+    })
 
 
 def _single_cache_model_indices(cfg: PipelineConfig, layer_type: str) -> list[int]:

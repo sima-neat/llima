@@ -329,6 +329,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMapKey _get_cache_model_key(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
         ) const;
+        uint16_t _get_cache_token_idx_begin(
+            uint16_t num_tokens, uint16_t token_idx, const std::string& layer_type
+        ) const;
         BoundAttentionModels _bind_attn_models(
             uint16_t num_tokens,
             uint16_t token_idx,
