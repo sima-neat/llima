@@ -409,8 +409,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
 
     std::optional<std::vector<uint32_t>> output_token_ids{};
 
-    // If the input is already greater than the cache size, no need to run the model.
-    if (input_token_ids.size() > _max_num_tokens) {
+    // No output token fits when the input fills or exceeds the cache.
+    if (input_token_ids.size() >= _max_num_tokens) {
         _notify_cache_full();
         output_token_ids = std::vector<uint32_t>();
     } else {
@@ -579,10 +579,12 @@ void LanguageModel::run_model_decode(
         token_id = next_token_id;
 
         auto duration = timer_tps.stop(true);
-        _notify_new_token(next_token_id, duration);
-        if (_stop_token_ids.contains(token_id)) {
-            _notify_stop();
-            return;
+        if (token_idx + 1 < _max_num_tokens) {
+            _notify_new_token(next_token_id, duration);
+            if (_stop_token_ids.contains(token_id)) {
+                _notify_stop();
+                return;
+            }
         }
         if (!_is_running.load(std::memory_order_relaxed)) {
             _notify_interrupt();
