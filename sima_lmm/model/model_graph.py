@@ -223,6 +223,8 @@ class ModelGraph(SimaBuilder):
                 raise ValueError(
                     f"Invalid model input {name!r}: expected a name and positive static dimensions, got {shape}"
                 )
+            if name in ("self", "use_jax"):
+                raise ValueError(f"Input name {name!r} is reserved by ModelGraph.run(); choose another name")
             if isinstance(spec, TensorType):
                 if name in input_dtypes:
                     raise ValueError(f"{name}: specify either TensorType or input_dtypes, not both")
