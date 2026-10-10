@@ -435,7 +435,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         // Prefill.
         auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
         const auto output_token_id_begin = input_token_ids.size();
-        if (_stop_token_ids.contains(token_id)) {
+        if (input_token_ids.size() == _max_num_tokens) {
+            _notify_cache_full();
+            output_token_ids = std::vector<uint32_t>();
+        } else if (_stop_token_ids.contains(token_id)) {
             _notify_stop();
             output_token_ids = std::vector<uint32_t>{token_id};
         } else if (!_is_running.load(std::memory_order_relaxed)) {
@@ -562,7 +565,8 @@ uint32_t LanguageModel::run_model_prefill(
     }
     _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
     auto duration = timer_ttft.value().stop();
-    _notify_first_token(next_token_id, duration);
+    if (num_input_tokens < _max_num_tokens)
+        _notify_first_token(next_token_id, duration);
     _cached_first_generated_token = next_token_id;
     return next_token_id;
 }
@@ -579,10 +583,12 @@ void LanguageModel::run_model_decode(
         token_id = next_token_id;
 
         auto duration = timer_tps.stop(true);
-        _notify_new_token(next_token_id, duration);
-        if (_stop_token_ids.contains(token_id)) {
-            _notify_stop();
-            return;
+        if (token_idx + 1 < _max_num_tokens) {
+            _notify_new_token(next_token_id, duration);
+            if (_stop_token_ids.contains(token_id)) {
+                _notify_stop();
+                return;
+            }
         }
         if (!_is_running.load(std::memory_order_relaxed)) {
             _notify_interrupt();
