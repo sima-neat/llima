@@ -35,10 +35,6 @@ class LanguageConvModel(LanguagePartBaseModel):
             not self.cfg.lm_cfg.conv_bias
         ), "LanguageConvModel requires conv_bias=False due to missing padding mask logic."
 
-    @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
     def generate_graph(
         self,
         layer_cfg: LayerConfiguration,

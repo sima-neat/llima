@@ -105,7 +105,6 @@ output_directory/
 |----|----|
 | `--language_group_size` | プリフィル中に並列でトークンを処理する際のバッチサイズ。より大きな値（例：256）を使用すると、大規模な入力プロンプトに対するTTFT（トークン生成までの時間）を改善できますが、小規模な入力プロンプトに対するTTFTを低下させる可能性があります。デフォルト値：128。 |
 | `--future_token_mask_size` | トークン位置を跨いでコンパイル済みのモデルを再利用するためのマスクサイズ。値を大きくすると、コンパイルされたバイナリファイルの数が減りますが、1秒あたりのトークン数（TPS）が低下する可能性があります。デフォルト値：128。 |
-| `--enable_filter_sharing` | グループモデルと単一モデル間でフィルターの共有を有効にすることで、DRAMの使用量を削減できます。ただし、その代償として、TTFT（最初のトークンが生成されるまでの時間）が増加し、TPS（1秒あたりのトークン数）が低下します。これは、両方のモデルタイプが同じ精度を使用する場合にのみ有効であり、LoRA を使用してコンパイルする場合には必須です。 |
 | `--no-quantize_embeddings` | サポートされているLLMおよびVLMでは、デフォルトで有効になっている埋め込みテーブルの量子化を無効にします。 |
 | `--no-quantize_kv_cache` | デフォルトで有効になっている KV キャッシュの量子化を無効にします。 |
 | `--return_logits` | 最終層の出力におけるロジットを返します（モデル評価器に必要なもの）。 |
@@ -260,7 +259,7 @@ def get_layer_configuration(model_properties, layer):
 LoRA (低ランク適応) を使用すると、ベースモデルを微調整し、アダプターを動的に適用または削除できます。これにより、ベースモデルを再コンパイルすることなく、ランタイムで変更できます。ベースモデルは、並列 LoRA ブランチ（ゼロで初期化）を使用してコンパイルされ、アダプターの重みは個別に `.npy` ファイルとしてコンパイルされ、必要に応じてロードされます。
 
 :::note
-LoRA を使用してコンパイルする場合は、フィルター共有を有効にする必要があります。`--enable_filter_sharing` を使用して有効にしてください。より高い精度を実現するために、LoRA ブランチは、INT4 が指定されていても、常に INT8 でコンパイルされます。
+より高い精度を実現するために、LoRA ブランチは、INT4 が指定されていても、常に INT8 でコンパイルされます。
 :::
 
 1.  **ベースモデルとLoRAアダプターをダウンロードしてください**:
@@ -286,7 +285,6 @@ LoRA を使用してコンパイルする場合は、フィルター共有を有
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -299,7 +297,6 @@ LoRA を使用してコンパイルする場合は、フィルター共有を有
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \
