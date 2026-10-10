@@ -1,5 +1,9 @@
 # LLiMa Model Validation
 
+Use the sections for the requested stage. Compile-only and partial-debug tasks
+do not require deployment or a Modalix smoke test; report that those stages were
+not exercised. A runtime-validation request continues through the device checks.
+
 ## Quantized Input
 
 For a published pre-quantized checkpoint, record its model repository and
@@ -26,8 +30,8 @@ as failure.
 
 For speculative decoding, validate that the output parent contains one target
 tree and one draft tree, each with its own `sima_files/` directory. Keep the two
-trees separate and deploy their parent in one command. See
-[Model Deployment](../../../docs/deployment.md#speculative-decoding-models).
+trees separate and deploy their parent in one command. See the matching
+checkout's `docs/deployment.md` for supported speculative-decoding models.
 
 ## Deploy
 
@@ -46,6 +50,9 @@ LoRA arrays. Confirm expected runtime config and ELFs at the destination.
 ```bash
 llima run <model-path-or-name> --mode cli
 ```
+
+For a supported speculative target/draft pair, pass the deployed parent
+directory so the runtime loads both roles.
 
 Verify all components load, a short prompt produces tokens, a second turn works
 when history matters, and `quit` exits cleanly. This is functional validation,
@@ -76,5 +83,5 @@ Capture:
 - LLM/VLM scenario and result; and
 - redacted failures or unavailable Modalix validation.
 
-After the smoke test, use `neat-application-builder` for application
-integration.
+Application integration is a separate task; use `neat-application-builder`
+when that workflow is requested and available.

@@ -1,10 +1,14 @@
 # LLiMa Model Inputs
 
-## Required Selection Order
+## Source Selection
 
-Always check the
+Honor an explicitly selected source, fidelity requirement, or format. When
+choosing a source without such a requirement, check the
 [SiMa.ai Pre-Quantized Models collection](https://huggingface.co/collections/simaai/pre-quantized-models)
-first. It is an index of model-specific repositories, not a shared
+first. A supplied compatible pre-quantized checkpoint or an explicit FP/BF16/GGUF
+compilation request needs no collection lookup. A supplied FP/BF16 custom
+fine-tune to pre-quantize still needs the exact matching repository's recipe.
+The collection is an index of model-specific repositories, not a shared
 quantization workflow.
 
 1. Prefer an exact matching pre-quantized checkpoint directly by default.
@@ -48,7 +52,8 @@ dequantize differently.
 
 ## Check Support First
 
-Read `docs/index.md` and `docs/compilation_genai.md` for supported
+Use relevant sections of the matching checkout's `docs/index.md` and
+`docs/compilation_genai.md` for supported
 architectures/sizes, formats, required assets, vision shapes, quantization, and
 flags. Reject unsupported input rather than choosing a similarly named model.
 GGUF is not the VLM path.
@@ -88,8 +93,9 @@ accuracy, size, compilation time, TTFT, and TPS.
 For speculative decoding, pass the supported draft model with
 `--draft_model_path`. Compilation produces separate target and draft artifact
 trees under one output parent. Keep those trees separate and pass their parent
-to `llima-deploy`; see
-[Model Deployment](../../../docs/deployment.md#speculative-decoding-models).
+to `llima-deploy`. The matching checkout's `docs/deployment.md` describes
+supported speculative-decoding models; do not assume every draft method is
+supported by the installed release.
 
 A normal deployable output contains:
 

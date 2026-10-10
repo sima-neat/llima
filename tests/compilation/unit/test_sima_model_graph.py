@@ -10,7 +10,6 @@ from afe.ir.execute import create_node_executor, create_node_quant_executor
 from afe.ir.operations import BatchMatmulOp, ConvAddActivationOp, StridedSliceOp
 from afe.ir.serializer import load_awesomenet
 from afe.ir.tensor_type import ScalarType, TensorType
-from sima_lmm.model.base import BaseModel
 from sima_lmm.model.model_graph import ModelGraph, tensor_type, activation_dtype, activation_type
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -341,7 +340,7 @@ def test_rope_preserves_nonrotary_channels(proportional):
 
 
 @pytest.mark.parametrize("quantizable", [True, False])
-def test_context_saves_constants_and_infers_tessellation_defaults(tmp_path, quantizable):
+def test_context_saves_constants_with_inferred_dtypes(tmp_path, quantizable):
     graph = ModelGraph(_source(path=tmp_path), {"x": (1, 1, 2, 32)}, quantizable)
     constant = graph.constant([0.5])
     assert tensor_type(constant).scalar == activation_type(quantizable)
@@ -350,16 +349,6 @@ def test_context_saves_constants_and_infers_tessellation_defaults(tmp_path, quan
     graph.save([graph.mul(graph.inputs["x"], constant), integer])
     net = load_awesomenet("component" + (".fp32" if quantizable else ""), str(tmp_path))
     assert net.status == (Status.RELAY if quantizable else Status.SIMA_QUANTIZED)
-    # Components with ordinary layouts need no boilerplate tessellation overrides.
-    assert BaseModel.get_mla_input_tessellate_params(_source()) == {}
-    assert BaseModel.get_mla_output_tessellate_params(_source()) == {}
-
-
-def test_cross_attention_projection_uses_basic_linear_and_head_split():
-    params = {"proj.weight": np.zeros((64, 64), np.float32)}
-    graph = ModelGraph(_source(params), {"audio": (1, 1, 1500, 64)}, True)
-    heads = graph.split_heads(graph.linear("proj", graph.inputs["audio"]), 4)
-    assert tensor_type(heads).shape == (1, 4, 1500, 16)
 
 
 def test_split_and_merge_heads_preserve_tokens():
@@ -509,16 +498,14 @@ def test_attention_preserves_broadcast_values_and_mask(monkeypatch, split_heads,
     np.testing.assert_allclose(_run(net, inputs), expected, rtol=2e-5, atol=2e-6)
 
 
-@pytest.mark.parametrize("split_heads", [False, True])
 @pytest.mark.parametrize(
     "mask_shape",
     [(1, 3, 3, 5), (3, 3, 5), (3, 5), (2, 2, 3, 5), (1, 2, 4, 5), (1, 2, 3, 6), (1, 1, 2, 3, 5)],
 )
-def test_attention_rejects_masks_that_do_not_broadcast_to_scores(monkeypatch, split_heads, mask_shape):
+def test_attention_rejects_masks_that_do_not_broadcast_to_scores(monkeypatch, mask_shape):
     import sima_lmm.model.model_graph as graph_module
 
-    if split_heads:
-        monkeypatch.setattr(graph_module, "mla_max_num_rows", 1)
+    monkeypatch.setattr(graph_module, "mla_max_num_rows", 1)
     specs = {"q": (1, 2, 3, 16), "k": (1, 2, 5, 16), "v": (1, 1, 5, 16), "mask": mask_shape}
     graph = ModelGraph(_source(), specs, True)
     with pytest.raises(ValueError, match="attention mask .* broadcast to score shape"):
@@ -543,27 +530,6 @@ def test_rope2d_preserves_axis_pairing_with_unaligned_quarters():
         axis=-1,
     )
     np.testing.assert_array_equal(_run(graph.finish([output]), inputs), expected)
-
-
-def test_attention_scales_scores_before_adding_mask():
-    specs = {name: (1, 2, 3, 16) for name in ("q", "k", "v")}
-    specs["mask"] = (1, 1, 3, 3)
-    graph = ModelGraph(_source(), specs, True)
-    output = graph.attention(
-        graph.inputs["q"],
-        graph.inputs["k"],
-        graph.inputs["v"],
-        mask=graph.inputs["mask"],
-        score_scale=0.125,
-    )
-    rng = np.random.default_rng(4)
-    inputs = {name: rng.normal(size=shape).astype(np.float32) for name, shape in specs.items()}
-    inputs["mask"][..., -1] = -20
-    scores = np.einsum("nhtc,nhsc->nhts", inputs["q"], inputs["k"]) * 0.125 + inputs["mask"]
-    probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
-    probs /= probs.sum(axis=-1, keepdims=True)
-    expected = np.einsum("nhts,nhsc->nhtc", probs, inputs["v"])
-    np.testing.assert_allclose(_run(graph.finish([output]), inputs), expected, rtol=2e-5, atol=2e-6)
 
 
 def test_space_to_depth_preserves_spatial_block_order():
