@@ -169,8 +169,6 @@ LLM inference consists of two distinct phases, and the compiler generates optimi
 
 Because these phases have different performance characteristics, you can apply different quantization strategies to each using the `is_group` flag in the configuration function.
 
-Filter sharing is enabled by default, including LoRA and speculative draft models. It applies when group and single models use the same precision; mixed-precision models keep separate filters.
-
 **Input Parameters**
 
 The `get_layer_configuration` function is called for each compiler unit and
@@ -298,7 +296,7 @@ runtime.
 LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter to be dynamically applied or removed at runtime without recompiling the base model. The base model is compiled with parallel LoRA branches (initialized to zero), and the adapter weights are compiled separately into `.npy` files that are loaded on demand.
 
 :::note
-Filter sharing is enabled by default when compiling with LoRA. LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
+LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
 :::
 
 1.  **Download the base model and LoRA adapter**:
