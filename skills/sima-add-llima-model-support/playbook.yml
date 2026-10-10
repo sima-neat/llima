@@ -1,6 +1,6 @@
 id: sima-add-llima-model-support
 name: Assess or Add LLiMa Model Support
-version: 0.2.0
+version: 0.2.1
 agents: [codex, claude]
 description: Assess LLM/VLM checkpoint compatibility with LLiMa or implement missing architecture, source-layout, tokenizer, or prompt support.
 compatibility:
