@@ -2386,6 +2386,11 @@ void LanguageModel::_define_buffers() {
         _local_freq_real = &get_buffer("local_freq_real");
         _local_freq_imag = &get_buffer("local_freq_imag");
     }
+    // Gemma4 assistants bind the target's KV buffers at each draft step.
+    // All assistant layers share KV, so there are no private buffers to cache.
+    if (_cfg.lm_cfg.is_gemma4_mtp_draft()) {
+        return;
+    }
     _attention_binding_buffers.resize(_cfg.lm_cfg.num_hidden_layers);
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
