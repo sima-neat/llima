@@ -106,7 +106,6 @@ output_directory/
 |----|----|
 | `--language_group_size` | 在預填階段，用於平行處理分詞的批次大小。較大的值（例如，256）可以改善大型輸入提示的首次產生詞元所需時間（TTFT），但可能會使小型輸入提示的 TTFT 變差。預設值：128。 |
 | `--future_token_mask_size` | 用於跨分詞位置重複使用已編譯模型的遮罩大小。較大的值會減少已編譯的二進位檔案數量，但可能會降低每秒詞元數（TPS）。預設值：128。 |
-| `--enable_filter_sharing` | 啟用群組模型和單一模型之間的篩選器共享功能，以減少 DRAM 使用量，但會增加 TTFT（首次產生詞元所需時間）並降低 TPS（每秒詞元數）。此功能僅在兩種模型類型都使用相同的精確度時才有效，並且在使用 LoRA 進行編譯時是必需的。 |
 | `--no-quantize_embeddings` | 停用嵌入表格量化功能。預設情況下，此功能會針對支援的 LLM 和 VLM 啟用。 |
 | `--no-quantize_kv_cache` | 停用 KV 快取量化功能，因為預設情況下已啟用此功能。 |
 | `--return_logits` | 傳回最後一層輸出的 logits 值（模型評估器需要此值）。 |
@@ -139,6 +138,8 @@ LLM 推論包含兩個不同的階段，編譯器會為每個階段產生最佳�
 - **解碼（單詞元模型）**：以自迴歸方式逐一產生輸出詞元。這個階段決定了每秒產生的詞元數（TPS），並針對低延遲生成進行優化。
 
 由於這些階段具有不同的效能特性，因此您可以透過在設定函式中使用 `is_group` 旗標，為每個階段套用不同的量化策略。
+
+篩選器共享預設啟用，包括 LoRA 和推測解碼的草稿模型。當群組與單一詞元模型使用相同精確度時才會套用；混合精確度模型會保留各自的篩選器。
 
 **輸入參數**
 
@@ -263,7 +264,7 @@ def get_layer_configuration(model_properties, layer):
 LoRA（低階適應）允許對基礎模型進行微調，並且可以在執行階段動態地應用或移除適配器，而無需重新編譯基礎模型。基礎模型使用並行的 LoRA 分支進行編譯（初始化為零），並且適配器權重會單獨編譯到 `.npy` 檔案中，這些檔案會在需要時載入。
 
 :::note
-在搭配 LoRA 進行編譯時，需要啟用篩選器共享功能。請透過 `--enable_filter_sharing` 來啟用。即使指定了 INT4，LoRA 分支總是會以 INT8 進行編譯，以提高準確度。
+搭配 LoRA 編譯時，篩選器共享預設啟用。即使指定了 INT4，LoRA 分支總是會以 INT8 進行編譯，以提高準確度。
 :::
 
 1.  **下載基礎模型和 LoRA 轉接器**：
@@ -289,7 +290,6 @@ LoRA（低階適應）允許對基礎模型進行微調，並且可以在執行�
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -302,7 +302,6 @@ LoRA（低階適應）允許對基礎模型進行微調，並且可以在執行�
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \

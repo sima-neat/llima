@@ -969,7 +969,7 @@ class PipelineConfig(BaseConfig):
     future_token_mask_size: int = 1
     long_context_future_token_mask_size: int | None = None
     return_logits: bool = False
-    enable_filter_sharing: bool = False
+    enable_filter_sharing: bool = True
     quantize_embeddings: bool = False
     quantize_kv_cache: bool = False
 

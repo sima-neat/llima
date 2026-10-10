@@ -58,6 +58,10 @@ python -m pip install -e '.[sdk_ext,tests]'
 llima-compile --help
 ```
 
+LLM/VLM compilation enables filter sharing by default, including LoRA and
+speculative draft models. Group and single models with different precisions
+keep separate filters.
+
 Do not create another environment that shadows the installed compiler
 packages. `llima-compile` covers LLMs and VLMs; existing Whisper maintenance
 uses the separate

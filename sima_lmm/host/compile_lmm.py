@@ -49,7 +49,7 @@ def gen_files(
     num_processes: int, resume: bool, model_path: Path, lora_path: Path | None,
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
-    language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
+    language_group_size: int, future_token_mask_size: int,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None
@@ -67,7 +67,6 @@ def gen_files(
         override_language_group_size=language_group_size,
         override_language_future_token_mask_size=future_token_mask_size,
         return_logits=return_logits,
-        enable_filter_sharing=enable_filter_sharing,
         quantize_embeddings=quantize_embeddings,
         quantize_kv_cache=quantize_kv_cache,
         image_resolution=image_resolution
@@ -91,7 +90,6 @@ def gen_files(
             override_language_group_size=language_group_size,
             override_language_future_token_mask_size=future_token_mask_size,
             return_logits=return_logits,
-            enable_filter_sharing=enable_filter_sharing,
             quantize_embeddings=quantize_embeddings,
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
@@ -240,14 +238,6 @@ def main():
         help=(
             "Return logits at the last layer output. Automatically enabled when compiling "
             "for speculative decoding."
-        )
-    )
-    group.add_argument(
-        "--enable_filter_sharing", action=argparse.BooleanOptionalAction, default=False,
-        help=(
-            "Enables filter sharing between group and single models to reduce the overall DRAM"
-            " usage at a cost of higher TTFT and lower TPS. This is only effective when both group"
-            " and single models are compiled with the same precision."
         )
     )
     group.add_argument(
@@ -419,7 +409,7 @@ def main():
             num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
             mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
             args.language_group_size, args.future_token_mask_size,
-            args.enable_filter_sharing, args.quantize_embeddings,
+            args.quantize_embeddings,
             args.quantize_kv_cache, return_logits, log_level, image_resolution,
             args.draft_model_path, draft_output_path
         )

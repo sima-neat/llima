@@ -11,22 +11,21 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 @pytest.mark.parametrize(
     ("options", "expected"),
     [
-        ([], (False, True, True, False)),
+        ([], (True, True, False)),
         (
             ["--source_to_fp", "--no-quantize_embeddings", "--no-quantize_kv_cache"],
-            (False, False, False, False),
+            (False, False, False),
         ),
         (
             ["--draft_model_path", "draft"],
-            (False, True, True, True),
+            (True, True, True),
         ),
         (
             [
-                "--enable_filter_sharing",
                 "--no-quantize_embeddings",
                 "--no-quantize_kv_cache",
             ],
-            (True, False, False, False),
+            (False, False, False),
         ),
     ],
 )
@@ -34,7 +33,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
     options: list[str],
-    expected: tuple[bool, bool, bool, bool],
+    expected: tuple[bool, bool, bool],
 ):
     (tmp_path / "model").mkdir()
     (tmp_path / "draft").mkdir()
@@ -58,7 +57,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     compile_lmm.main()
 
     args = calls[0]
-    assert (args[12], args[13], args[14], args[15]) == expected
+    assert (args[12], args[13], args[14]) == expected
 
 
 @pytest.mark.parametrize("jobs", ["0", "-1"])
