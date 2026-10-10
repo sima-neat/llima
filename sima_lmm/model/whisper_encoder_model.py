@@ -6,6 +6,8 @@ from sima_lmm.model.base import BaseModel, LayerConfiguration
 
 @dataclass
 class WhisperEncoderModel(BaseModel):
+    enable_filter_sharing = False
+
     layer_idx: int | None = None
 
     def generate_graph(

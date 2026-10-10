@@ -23,6 +23,8 @@ class Gemma4VisionLayerModel(BaseModel):
     - Pixel scaling 2*(x - 0.5) absorbed into input_proj weights at graph-creation time
     """
 
+    enable_filter_sharing = False
+
     layer_idx: int
     include_embeddings: bool
     include_mm_proj: bool

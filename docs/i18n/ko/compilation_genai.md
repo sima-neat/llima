@@ -105,7 +105,6 @@ output_directory/
 |----|----|
 | `--language_group_size` | 사전 학습 단계에서 병렬 토큰 처리를 위한 배치 크기입니다. 더 큰 값(예: 256)을 사용하면 큰 입력 프롬프트에 대해 TTFT(Time To First Token)를 개선할 수 있지만, 작은 입력 프롬프트에 대해서는 TTFT를 저하시킬 수 있습니다. 기본값: 128. |
 | `--future_token_mask_size` | 토큰 위치 간에 컴파일된 모델을 재사용하기 위한 마스크 크기입니다. 값이 클수록 컴파일된 바이너리 파일의 수가 줄어들지만, 초당 토큰 수(TPS)가 감소할 수 있습니다. 기본값: 128. |
-| `--enable_filter_sharing` | 그룹 모델과 단일 모델 간에 필터 공유를 활성화하여 DRAM 사용량을 줄이되, TTFT(첫 번째 토큰 생성까지의 시간)는 증가하고 TPS(초당 토큰 수)는 감소합니다. 이는 두 모델 유형 모두 동일한 정밀도를 사용할 때만 효과가 있으며, LoRA를 사용하여 컴파일할 때 필수적으로 적용해야 합니다. |
 | `--no-quantize_embeddings` | 기본적으로 지원되는 LLM 및 VLM에 대해 활성화되어 있는 임베딩 테이블 양자화를 비활성화합니다. |
 | `--no-quantize_kv_cache` | 기본적으로 활성화되어 있는 KV 캐시 양자화를 비활성화합니다. |
 | `--return_logits` | 마지막 레이어의 출력에서 로짓 값을 반환합니다(모델 평가에 필요). |
@@ -261,7 +260,7 @@ def get_layer_configuration(model_properties, layer):
 LoRA (저랭크 적응)를 사용하면 기본 모델을 미세 조정하고 어댑터를 동적으로 적용하거나 런타임에 기본 모델을 다시 컴파일하지 않고 제거할 수 있습니다. 기본 모델은 병렬 LoRA 분기와 함께 컴파일됩니다(0으로 초기화됨). 어댑터 가중치는 별도로 `.npy` 파일로 컴파일되어 필요에 따라 로드됩니다.
 
 :::note
-LoRA를 사용하여 컴파일할 때는 필터 공유가 필요합니다. `--enable_filter_sharing`를 사용하여 활성화하세요. 더 나은 정확도를 위해 INT4가 지정되었더라도 LoRA 브랜치는 항상 INT8으로 컴파일됩니다.
+더 나은 정확도를 위해 INT4가 지정되었더라도 LoRA 브랜치는 항상 INT8으로 컴파일됩니다.
 :::
 
 1.  **기본 모델과 LoRA 어댑터를 다운로드하세요**:
@@ -287,7 +286,6 @@ LoRA를 사용하여 컴파일할 때는 필터 공유가 필요합니다. `--en
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -300,7 +298,6 @@ LoRA를 사용하여 컴파일할 때는 필터 공유가 필요합니다. `--en
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \

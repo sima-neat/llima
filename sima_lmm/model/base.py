@@ -4,7 +4,7 @@ import multiprocessing
 import numpy as np
 import os
 import shutil
-from typing import NotRequired, TypedDict
+from typing import ClassVar, NotRequired, TypedDict
 
 from abc import ABC
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -156,7 +156,7 @@ class BaseModel(ABC):
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
-    use_filter_sharing: bool = field(default=False, kw_only=True)
+    enable_filter_sharing: ClassVar[bool] = True
 
     def gen_files(
         self, gen_mode: FileGenMode, *,
@@ -333,10 +333,6 @@ class BaseModel(ABC):
         This function applies to components with one MLA subnet.
         """
         return {}
-
-    @property
-    def enable_filter_sharing(self) -> bool:
-        return False
 
     def gen_mpk_files(self, log_level: int) -> SDKModel:
         """Generates MPK files.
