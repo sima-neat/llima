@@ -5,8 +5,10 @@
 Honor an explicitly selected source, fidelity requirement, or format. When
 choosing a source without such a requirement, check the
 [SiMa.ai Pre-Quantized Models collection](https://huggingface.co/collections/simaai/pre-quantized-models)
-first. A user-supplied compatible checkpoint needs no collection lookup. The
-collection is an index of model-specific repositories, not a shared
+first. A supplied compatible pre-quantized checkpoint or an explicit FP/BF16/GGUF
+compilation request needs no collection lookup. A supplied FP/BF16 custom
+fine-tune to pre-quantize still needs the exact matching repository's recipe.
+The collection is an index of model-specific repositories, not a shared
 quantization workflow.
 
 1. Prefer an exact matching pre-quantized checkpoint directly by default.

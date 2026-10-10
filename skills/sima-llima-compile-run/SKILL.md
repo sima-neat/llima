@@ -1,6 +1,6 @@
 ---
 name: sima-llima-compile-run
-description: Compile supported LLMs/VLMs with LLiMa and deploy or validate them on Modalix. Excludes repository maintenance and ordinary ONNX models.
+description: Quantize supported LLM/VLM fine-tunes, compile with LLiMa, or deploy and validate on Modalix. Excludes repository maintenance and ordinary ONNX models.
 ---
 
 # Compile and Test LLiMa Models
@@ -43,7 +43,8 @@ out of reports and unauthorized destinations.
 
 ## Completion
 
-Complete the requested stage: compilation ends with verified artifacts;
+Complete the requested stage: quantization ends with a validated checkpoint;
+compilation ends with verified artifacts;
 selective debugging ends with the requested units and an explicit partial-build
 label. Deployment/runtime requests continue through `llima-deploy` and a
 `llima run` smoke test, including an image-grounded prompt for VLMs. Preserve

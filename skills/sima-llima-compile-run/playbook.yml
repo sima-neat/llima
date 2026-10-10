@@ -2,7 +2,7 @@ id: sima-llima-compile-run
 name: Compile and Test LLiMa Models
 version: 0.2.0
 agents: [codex, claude]
-description: Compile supported LLMs/VLMs with LLiMa and deploy or validate them on Modalix. Excludes repository maintenance and ordinary ONNX models.
+description: Quantize supported LLM/VLM fine-tunes, compile with LLiMa, or deploy and validate on Modalix. Excludes repository maintenance and ordinary ONNX models.
 compatibility:
   env_types: [host, sdk]
   env_subtypes: [linux, palette]
