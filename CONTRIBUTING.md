@@ -25,10 +25,6 @@ The first provides repository-wide contribution guidance. The second provides
 additional compatibility and implementation guidance when work reaches LLM or
 VLM model support.
 
-Installation includes each skill's supporting references, not this guide or
-`docs/contributing.md`. Those documents belong to the repository checkout;
-read their relevant sections when the task needs setup or validation guidance.
-
 In the Neat SDK, build runtime packages and tests with:
 
 ```bash
