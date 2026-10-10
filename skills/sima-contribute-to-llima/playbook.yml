@@ -1,8 +1,8 @@
 id: sima-contribute-to-llima
 name: Contribute to LLiMa
-version: 0.1.0
+version: 0.2.0
 agents: [codex, claude]
-description: Repository guidance for safe, tested changes to LLiMa compilation, runtime, packaging, CI, tests, documentation, and skills.
+description: Modify or review the LLiMa repository. For new LLM/VLM checkpoint compatibility or architecture support, use sima-add-llima-model-support.
 compatibility:
   env_types: [host, sdk]
   env_subtypes: [linux, palette]
