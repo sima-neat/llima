@@ -1,6 +1,6 @@
 {
   "ja": {
-    "docs/compilation_genai.md": "93e67172a67617b313ac1dc1b459c721e2d68fc1c0d1a09345e6e5e4d131ea70",
+    "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
     "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
     "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
@@ -9,7 +9,7 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "ko": {
-    "docs/compilation_genai.md": "93e67172a67617b313ac1dc1b459c721e2d68fc1c0d1a09345e6e5e4d131ea70",
+    "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
     "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
     "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
@@ -18,7 +18,7 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "uk": {
-    "docs/compilation_genai.md": "93e67172a67617b313ac1dc1b459c721e2d68fc1c0d1a09345e6e5e4d131ea70",
+    "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
     "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
     "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
@@ -27,7 +27,7 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "zh-Hant": {
-    "docs/compilation_genai.md": "93e67172a67617b313ac1dc1b459c721e2d68fc1c0d1a09345e6e5e4d131ea70",
+    "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
     "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
     "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",

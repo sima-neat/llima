@@ -33,6 +33,12 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_dflash_context": (False, "DFLASH_CONTEXT"),
     "group_per_layer": (True, "PER_LAYER"),
     "single_per_layer": (False, "PER_LAYER"),
+    "group_router": (True, "ROUTER"),
+    "single_router": (False, "ROUTER"),
+    "group_expert": (True, "EXPERT"),
+    "single_expert": (False, "EXPERT"),
+    "group_weightedsum": (True, "WEIGHTEDSUM"),
+    "single_weightedsum": (False, "WEIGHTEDSUM"),
 }
 
 
@@ -48,9 +54,17 @@ def _import_file(module_name: str, path: str | Path) -> types.ModuleType:
     """
     Import a Python file as a module with name module_name.
     """
+    path = Path(path)
+    if not path.is_file():
+        _abort(f"Configuration file not found or not a regular file: {path}")
     spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    if spec is None or spec.loader is None:
+        _abort(f"Cannot load configuration file {path}: expected a Python .py file")
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        _abort(f"Cannot load configuration file {path}: {exc}")
     return module
 
 
@@ -60,7 +74,7 @@ def _encode_layer_id(l: LayerID) -> dict[str, Any]:
     """
     is_group, part = _ENCODE_LAYER_PART[l.part]
     index = l.part_idx
-    return {"is_group": is_group, "part": part, "index": index}
+    return {"is_group": is_group, "part": part, "index": index, "expert_idx": l.expert_idx}
 
 
 def _decode_layer_configuration(c: dict) -> LayerConfiguration | None:
@@ -116,7 +130,7 @@ def _decode_layer_configuration(c: dict) -> LayerConfiguration | None:
 
 
 def _fetch_configuration(
-    configuration_path: str, num_hidden_layers: int, layer_ids: list[LayerID],
+    configuration_path: str | Path, num_hidden_layers: int, layer_ids: list[LayerID],
     is_draft_model: bool = False,
 ) -> GenConfiguration:
     """
@@ -125,6 +139,12 @@ def _fetch_configuration(
     layers to be compiled.
     """
     config_module = _import_file("private__configuration_file", configuration_path)
+    configure_layer = getattr(config_module, "get_layer_configuration", None)
+    if not callable(configure_layer):
+        _abort(
+            f"Configuration file {configuration_path} must define "
+            "get_layer_configuration(model_properties, layer) as a function"
+        )
 
     model_properties = {
         "num_hidden_layers": num_hidden_layers,
@@ -135,14 +155,13 @@ def _fetch_configuration(
     for layer_id in layer_ids:
         encoded_layer_id = _encode_layer_id(layer_id)
         try:
-            encoded_layer_configuration = config_module.get_layer_configuration(
+            encoded_layer_configuration = configure_layer(
                 model_properties, encoded_layer_id
             )
         except Exception as e:
             _abort(
                 "The following error occurred while getting layer configuration\n"
-                "from " + configuration_path + ":\n" +
-                str(e)
+                f"from {configuration_path}:\n{e}"
             )
         layer_configuration = _decode_layer_configuration(encoded_layer_configuration)
         if layer_configuration is not None:

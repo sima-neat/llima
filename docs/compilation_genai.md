@@ -119,8 +119,8 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--input_width` | Input image width in pixels. Must be provided with `--input_height`. Required for Qwen 2 VL, Qwen 3 VL, Qwen3.5, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
 | `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
 | `--system_prompt_file` | Path to a text file containing the system prompt. |
-| `--chat_template` | Chat template string to store in the compiled model. Mutually exclusive with the system-prompt and chat-template file options. |
-| `--chat_template_file` | Path to a file containing the chat template. Mutually exclusive with the system-prompt options and `--chat_template`. |
+| `--chat_template` | Chat template string to store in the compiled model. Mutually exclusive with `--chat_template_file`. |
+| `--chat_template_file` | Path to a file containing the chat template. Mutually exclusive with `--chat_template`. |
 
 :::note
 Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 8192` to enable an 8K context length.
@@ -181,11 +181,18 @@ receives:
 
 - `layer`: Dictionary with:
   - `"part"`: Logical component such as `"PRE"`, `"CACHE"`, `"POST"`,
-    `"VISION"`, `"DRAFT_FC"`, or `"PER_LAYER"`
+    `"VISION"`, `"DRAFT_FC"`, or `"PER_LAYER"`. Mixture-of-Experts models add
+    `"ROUTER"`, `"EXPERT"`, and `"WEIGHTEDSUM"`.
   - `"is_group"`: `True` for a multi-token/group variant and `False` otherwise
   - `"index"`: Index of that compiler unit. For `"PRE"` and `"POST"` this
     normally corresponds to a transformer layer. For `"CACHE"` it identifies
     a cache or token-position variant rather than a transformer layer.
+  - `"expert_idx"`: Index of the expert within the layer, for `"EXPERT"`
+    records. `-1` for every other part, including all dense models.
+
+  Read the values you need by key. New keys may be added in future releases,
+  so avoid unpacking this dictionary into a fixed argument list or asserting
+  an exact set of keys.
 
 **Return Values**
 

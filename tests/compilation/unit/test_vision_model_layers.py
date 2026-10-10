@@ -1,14 +1,24 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
+from ml_dtypes import int4
+
+from afe.ir.defines import get_expected_tensor_value
+from afe.ir.execute import create_node_executor, create_node_quant_executor
+from afe.ir.operations import ConvAddActivationOp
+from afe.ir.serializer import load_awesomenet
+from afe.ir.tensor_type import ScalarType
 
 from sima_lmm.config.vlm_config import VlmConfig
-from sima_lmm.model import EvalMode
+from sima_lmm.model import EvalMode, FileGenMode
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
 from sima_lmm.model.vision_model import StandardVisionLayerModel, VisionModel
+from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -21,6 +31,67 @@ REFERENCE_CONFIGS_PATH = (
 def _load_reference_config(filename: str) -> VlmConfig:
     config = json.loads((REFERENCE_CONFIGS_PATH / filename).read_text())
     return VlmConfig.load(config)
+
+
+@pytest.mark.parametrize("head_dim", [24, 32])
+@pytest.mark.parametrize("precision", ["float32", "int8", "int4"])
+def test_standard_vision_head_padding_preserves_attention_and_grouped_weights(head_dim, precision):
+    heads, channels = 2, 2 * head_dim
+    rng = np.random.default_rng(12)
+    params, dequantized = {}, {}
+    for projection in ("q_proj", "k_proj", "v_proj", "out_proj"):
+        weight = rng.integers(-7, 8, (channels, channels))
+        bias = rng.normal(0, 0.02, channels).astype(np.float32)
+        if precision == "float32":
+            source = weight.astype(np.float32) * 0.005
+            dequantized[projection] = source
+        else:
+            scales = np.full((channels, 2 if precision == "int4" else 1), 0.005, np.float32)
+            weight = weight.astype(int4 if precision == "int4" else np.int8)
+            source = (scales, weight, 32) if precision == "int4" else (scales, weight)
+            dequantized[projection] = weight.astype(np.float32) * 0.005
+        params[f"attn.{projection}.weight"] = source
+        params[f"attn.{projection}.bias"] = bias
+    cfg = SimpleNamespace(vm_cfg=SimpleNamespace(num_attention_heads=heads, hidden_size=channels))
+    model = StandardVisionLayerModel(
+        cfg, "head_padding", layer_idx=0, include_embeddings=False, include_mm_proj=False
+    )
+    model.get_hf_param, model.check_hf_param = params.__getitem__, params.__contains__
+    shape = (1, 1, 3, channels)
+    quantizable = precision == "float32"
+    graph = ModelGraph(model, {"x": shape}, quantizable)
+    output = model._build_encoder_attention(graph, "attn", graph.inputs["x"])
+    net = graph.finish([output])
+    convolutions = [
+        node for node in net.nodes["MLA_0"].ir.nodes.values()
+        if isinstance(node.ir.operation, ConvAddActivationOp)
+    ]
+    padded = head_dim == 24 and precision != "int4"
+    assert len(convolutions) == (10 if head_dim == 24 and not padded else 4)
+    if precision == "int4":
+        assert all(node.ir.quant_attrs.c_block_size == 32 for node in convolutions[:1])
+        np.testing.assert_array_equal(
+            convolutions[0].ir.quant_attrs.weight_quant_data.reshape(channels, channels),
+            params["attn.q_proj.weight"][1].T,
+        )
+    x = rng.normal(0, 0.2, shape).astype(activation_dtype(quantizable))
+    projections = []
+    for name in ("q_proj", "k_proj", "v_proj"):
+        values = x.astype(np.float32) @ dequantized[name].T + params[f"attn.{name}.bias"]
+        if name == "q_proj":
+            values *= head_dim ** -0.5
+        projections.append(values.reshape(1, 3, heads, head_dim).transpose(0, 2, 1, 3))
+    query, key, value = projections
+    scores = query @ key.swapaxes(-1, -2)
+    probabilities = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    context = (probabilities @ value).transpose(0, 2, 1, 3).reshape(shape)
+    expected = context @ dequantized["out_proj"].T + params["attn.out_proj.bias"]
+    execute = create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
+    actual = net.run({"x": x}, node_callable=execute)
+    actual = actual[0] if isinstance(actual, (tuple, list)) else actual
+    np.testing.assert_allclose(actual, expected, rtol=3e-6 if quantizable else 0.03,
+                               atol=2e-7 if quantizable else 0.002)
 
 
 @pytest.mark.parametrize(
@@ -101,8 +172,8 @@ def test_vision_evaluation_chains_layers_and_preserves_deepstack_order():
 def test_qwen2_layer_uses_its_source_block_and_attention_mode():
     config = _load_reference_config("qwen2.5_vl_vlm_config.json")
     model = VisionModel(config, "test_vision")._get_part_model(7)
-    model._onnx_builder = Mock()
-    model._onnx_builder.build_conv = Mock(side_effect=AssertionError("unexpected embedding"))
+    graph = Mock(spec=ModelGraph)
+    graph.conv.side_effect = AssertionError("unexpected embedding")
     global_mask = object()
     windowed_mask = object()
     model._prepare_qwen2_static_inputs = Mock(
@@ -113,18 +184,21 @@ def test_qwen2_layer_uses_its_source_block_and_attention_mode():
     model._build_qwen2_merger = Mock(side_effect=AssertionError("unexpected merger"))
     layer_input = object()
 
-    assert model._build_qwen2_vision_model("vision", [layer_input]) is layer_output
+    assert model._build_qwen2_vision_model(
+        graph, "vision", layer_input
+    ) is layer_output
     args = model._build_qwen2_vision_block.call_args.args
-    assert args[0] == "vision.blocks.7"
-    assert args[1] is layer_input
-    assert args[2] is global_mask
+    assert args[:4] == (graph, "vision.blocks.7", layer_input, global_mask)
 
 
-def test_qwen3_layer_emits_its_deepstack_output_without_final_merger():
+@pytest.mark.parametrize(("layer_idx", "deepstack_idx"), [(5, 0), (11, 1)])
+def test_qwen3_layer_emits_its_deepstack_output_without_final_merger(
+    layer_idx: int, deepstack_idx: int
+):
     config = _load_reference_config("qwen3_vl_vlm_config.json")
-    model = VisionModel(config, "test_vision")._get_part_model(5)
-    model._onnx_builder = Mock()
-    model._onnx_builder.build_conv = Mock(side_effect=AssertionError("unexpected embedding"))
+    model = VisionModel(config, "test_vision")._get_part_model(layer_idx)
+    graph = Mock(spec=ModelGraph)
+    graph.conv.side_effect = AssertionError("unexpected embedding")
     model._prepare_qwen3_rotary_tables = Mock(return_value=(object(), object()))
     model._prepare_qwen3_position_embedding = Mock(
         side_effect=AssertionError("unexpected position embedding")
@@ -135,66 +209,55 @@ def test_qwen3_layer_emits_its_deepstack_output_without_final_merger():
     model._build_qwen3_deepstack_merger = Mock(return_value=deepstack_output)
     model._build_qwen3_merger = Mock(side_effect=AssertionError("unexpected final merger"))
 
-    assert model._build_qwen3_vision_model("vision", [object()]) == [
+    assert model._build_qwen3_vision_model(
+        graph, "vision", object()
+    ) == [
         layer_output,
         deepstack_output,
     ]
-    assert model._build_qwen3_vision_block.call_args.args[0] == "vision.blocks.5"
-    assert model._build_qwen3_deepstack_merger.call_args.args[0] == (
-        "vision.deepstack_merger_list.0"
-    )
-
-
-def test_qwen3_direct_layer_emits_its_deepstack_output():
-    config = _load_reference_config("qwen3_vl_vlm_config.json")
-    model = VisionModel(config, "test_vision")._get_part_model(11)
-    builder = Mock()
-    model._prepare_sima_qwen3_rotary_tables = Mock(return_value=(object(), object()))
-    model._prepare_sima_qwen3_position_embedding = Mock(
-        side_effect=AssertionError("unexpected position embedding")
-    )
-    layer_output = object()
-    deepstack_output = object()
-    model._build_sima_qwen3_vision_block = Mock(return_value=layer_output)
-    model._build_sima_qwen3_deepstack_merger = Mock(return_value=deepstack_output)
-    model._build_sima_qwen3_merger = Mock(
-        side_effect=AssertionError("unexpected final merger")
-    )
-
-    assert model._build_sima_qwen3_vision_model(
-        builder, "vision", object(), quantizable=False
-    ) == [layer_output, deepstack_output]
-    assert model._build_sima_qwen3_vision_block.call_args.args[1] == "vision.blocks.11"
-    assert model._build_sima_qwen3_deepstack_merger.call_args.args[1] == (
-        "vision.deepstack_merger_list.1"
+    assert model._build_qwen3_vision_block.call_args.args[1] == f"vision.blocks.{layer_idx}"
+    assert model._build_qwen3_deepstack_merger.call_args.args[1] == (
+        f"vision.deepstack_merger_list.{deepstack_idx}"
     )
 
 
 @pytest.mark.parametrize(
-    ("config_name", "layer_idx"),
+    ("config_name", "constants_method", "block_method", "num_constants"),
     [
-        ("gemma4_e2b_it_vlm_config.json", 1),
-        ("qwen2.5_vl_vlm_config.json", 1),
-        ("qwen3_vl_vlm_config.json", 1),
+        (
+            "gemma4_e2b_it_vlm_config.json", "_precompute_constants",
+            "_build_encoder_layer", 5,
+        ),
+        (
+            "qwen2.5_vl_vlm_config.json", "_prepare_qwen2_static_inputs",
+            "_build_qwen2_vision_block", 4,
+        ),
+        (
+            "qwen3_vl_vlm_config.json", "_prepare_qwen3_rotary_tables",
+            "_build_qwen3_vision_block", 2,
+        ),
     ],
 )
-def test_nonfirst_onnx_layer_uses_hidden_state_shapes(
-    config_name: str, layer_idx: int
+def test_nonfirst_native_layer_uses_hidden_state_shapes(
+    config_name: str, constants_method: str, block_method: str, num_constants: int,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     config = _load_reference_config(config_name)
-    model = VisionModel(config, "test_vision")._get_part_model(layer_idx)
+    model = VisionModel(config, "test_vision", sima_path=tmp_path)._get_part_model(1)
     model.hf_model = Mock(vision_model_param_base_name="vision")
-    builder = Mock()
-    builder.input_nodes = [object()]
-    builder.get_node_output_name.return_value = "output"
-    model.create_onnx_builder = Mock(side_effect=lambda: setattr(model, "_onnx_builder", builder))
-    model._build_onnx_nodes = Mock(return_value=[object()])
+    monkeypatch.setattr(model, constants_method, Mock(return_value=(None,) * num_constants))
+    monkeypatch.setattr(model, block_method, lambda graph, name, hidden, *args: hidden)
 
-    model.gen_onnx_files()
-
-    builder.create_input_node.assert_called_once_with(
-        "input", (1, config.vm_cfg.hidden_size, 1, config.vm_cfg.seq_len)
-    )
-    builder.create_output_node.assert_called_once_with(
-        "output", (1, config.vm_cfg.hidden_size, 1, config.vm_cfg.seq_len)
-    )
+    model.gen_files(FileGenMode.SOURCE_TO_FP)
+    net = load_awesomenet(model.sdk_fp_file_name.name, str(model.sima_model_sdk_path))
+    shape = (1, 1, config.vm_cfg.seq_len, config.vm_cfg.hidden_size)
+    assert net.input_node_names == ["input"]
+    for name in ("input", net.output_node_name):
+        spec = get_expected_tensor_value(net.nodes[name].get_type().output)
+        assert tuple(spec.shape) == shape
+        assert spec.scalar == ScalarType.float32
+    hidden = np.random.default_rng(0).normal(0, 0.1, shape).astype(np.float32)
+    outputs = net.run({"input": hidden}, node_callable=create_node_executor(False))
+    assert len(outputs) == 1
+    assert outputs[0].dtype == hidden.dtype
+    np.testing.assert_array_equal(outputs[0], hidden)

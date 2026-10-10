@@ -1,7 +1,8 @@
-"""Generate the ONNX regression matrix for one installed LLiMa revision."""
+"""Generate the native graph regression matrix for one installed LLiMa revision."""
 
 import argparse
 import gc
+import hashlib
 import importlib.metadata
 import json
 import logging
@@ -11,7 +12,6 @@ from pathlib import Path
 
 import sima_lmm
 
-from sima_lmm.config.layer_id import LayerID
 from sima_lmm.model import FileGenMode, FileGenPrecision, VisionLanguageModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
@@ -20,7 +20,7 @@ from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.vision_model import VisionModel
-from tests.compilation.cases import ONNX_REGRESSION_CASES, OnnxRegressionCase
+from tests.compilation.cases import GRAPH_REGRESSION_CASES, GraphRegressionCase
 from tests.compilation.helpers.model_factory import (
     load_hf_model,
     load_speculative_draft_model,
@@ -33,14 +33,13 @@ NUM_TOKENS = 1
 
 
 def _standard_models(
-    case: OnnxRegressionCase, vlm_model: VisionLanguageModel
+    case: GraphRegressionCase, vlm_model: VisionLanguageModel
 ) -> tuple[list[object], FileGenPrecision]:
     cfg = vlm_model.cfg
     if case.component == "pre":
         model = LanguagePreModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_pre_layer{case.layer_index}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -50,7 +49,6 @@ def _standard_models(
         model = LanguageCacheModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_cache_token{LAYER_IDX}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -61,7 +59,6 @@ def _standard_models(
         model = LanguagePostModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_post_layer{case.layer_index}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -74,7 +71,6 @@ def _standard_models(
         model = LanguageLinearModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_layer{case.layer_index}_linear",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -84,7 +80,6 @@ def _standard_models(
         model = LanguagePerLayerModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_per_layer",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -93,7 +88,6 @@ def _standard_models(
         model = LanguageConvModel(
             cfg,
             f"{vlm_model.model_name}_language_n{NUM_TOKENS}_layer{LAYER_IDX}_conv",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -104,105 +98,99 @@ def _standard_models(
         vision_model = VisionModel(
             cfg,
             vlm_model.vision_model_name,
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
         )
-        if getattr(vision_model, "is_single_vision_model", False):
-            models = [vision_model._get_part_model(case.layer_index)]
-        else:
-            models = [
-                vision_model._get_part_model(layer_idx)
-                for layer_idx in range(vision_model.cfg.num_vision_layers)
-            ]
+        num_layers = vision_model.cfg.num_vision_layers
+        if num_layers < 3:
+            raise ValueError(f"{case.id}: vision regression needs at least three layers")
+        digest = hashlib.sha256(case.id.encode("utf-8")).digest()
+        seed = int.from_bytes(digest[:8], "big")
+        middle_layer = 1 + seed % (num_layers - 2)
+        models = [vision_model._get_part_model(index) for index in (0, middle_layer)]
         return models, FileGenPrecision.BF16
     else:
-        raise ValueError(f"Unsupported standard ONNX component: {case.component}")
+        raise ValueError(f"Unsupported standard native graph component: {case.component}")
 
     return [model], FileGenPrecision.BF16
 
 
 def _speculative_model(
-    case: OnnxRegressionCase, draft_model: VisionLanguageModel
-) -> tuple[object, dict]:
+    case: GraphRegressionCase, draft_model: VisionLanguageModel
+) -> tuple[object, FileGenPrecision]:
     cfg = draft_model.cfg
     num_tokens = cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
     if case.component == "pre":
         model = LanguagePreModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_pre_layer{LAYER_IDX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,
             layer_idx=LAYER_IDX,
         )
-        layer_id = LayerID("single_pre", LAYER_IDX)
     elif case.component == "cache":
         model = LanguageCacheModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_cache_token{TOKEN_IDX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,
             token_idx=TOKEN_IDX,
             logit_softcapping=cfg.lm_cfg.attn_logit_softcapping,
         )
-        layer_id = LayerID("single_cache", TOKEN_IDX)
     elif case.component == "post":
         model = LanguagePostModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_post_layer{LAYER_IDX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,
             layer_idx=LAYER_IDX,
             final_softcapping=cfg.lm_cfg.final_logit_softcapping,
         )
-        layer_id = LayerID("single_post", LAYER_IDX)
     elif case.component == "draft_fc":
         model = LanguageDraftFCModel(
             cfg,
             f"{draft_model.model_name}_language_n{num_tokens}_draft_fc",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=num_tokens,
         )
-        layer_id = LayerID("single_draft_fc", 0)
     else:
-        raise ValueError(f"Unsupported speculative ONNX component: {case.component}")
+        raise ValueError(f"Unsupported speculative native graph component: {case.component}")
 
-    return model, {"precision": {layer_id: FileGenPrecision.BF16}}
+    return model, FileGenPrecision.BF16
 
 
 def _record_models(
     manifest: dict,
-    case: OnnxRegressionCase,
+    case: GraphRegressionCase,
     models: list[object],
     output_dir: Path,
 ) -> None:
-    onnx_paths = [Path(model.onnx_file_name).resolve() for model in models]
-    missing_paths = [path for path in onnx_paths if not path.is_file()]
+    graph_paths = [Path(model.sdk_fp_file_name).resolve() for model in models]
+    missing_paths = [path for path in graph_paths if not path.is_file()]
     if missing_paths:
         raise FileNotFoundError(
-            f"ONNX was not generated for {case.id}: {missing_paths}"
+            f"native graph was not generated for {case.id}: {missing_paths}"
         )
     manifest["cases"][case.id] = {
         "component": case.component,
         "mode": case.mode,
         "status": "available",
-        "onnx_paths": [
-            str(path.relative_to(output_dir.resolve())) for path in onnx_paths
+        "graph_paths": [
+            str(path.relative_to(output_dir.resolve())) for path in graph_paths
         ],
     }
+    if case.component == "vision":
+        manifest["cases"][case.id]["layer_indices"] = [model.layer_idx for model in models]
+    print(f"Generated {case.id}: {len(graph_paths)} native graphs", flush=True)
 
 
 def _record_unavailable(
     manifest: dict,
-    cases: list[OnnxRegressionCase],
+    cases: list[GraphRegressionCase],
     error: Exception,
 ) -> None:
     reason = f"{type(error).__name__}: {error}"
@@ -214,19 +202,19 @@ def _record_unavailable(
             "reason": reason,
         }
         print(
-            f"Informative baseline ONNX unavailable for {case.id}: {reason}",
+            f"Informative baseline native graph unavailable for {case.id}: {reason}",
             flush=True,
         )
 
 
 def _generate_standard_cases(
-    cases: list[OnnxRegressionCase],
+    cases: list[GraphRegressionCase],
     model_inputs_path: Path,
     output_dir: Path,
     manifest: dict,
     allow_informative_unavailable: bool,
 ) -> None:
-    grouped: dict[tuple, list[OnnxRegressionCase]] = defaultdict(list)
+    grouped: dict[tuple, list[GraphRegressionCase]] = defaultdict(list)
     for case in cases:
         grouped[(case.model_folder, case.image_resolution)].append(case)
 
@@ -254,7 +242,7 @@ def _generate_standard_cases(
                 models, precision = _standard_models(case, vlm_model)
                 for model in models:
                     model.gen_files(
-                        FileGenMode.SOURCE_TO_ONNX,
+                        FileGenMode.SOURCE_TO_FP,
                         layer_cfg={"precision": precision},
                         log_level=logging.WARNING,
                         resume=False,
@@ -272,13 +260,13 @@ def _generate_standard_cases(
 
 
 def _generate_speculative_cases(
-    cases: list[OnnxRegressionCase],
+    cases: list[GraphRegressionCase],
     model_inputs_path: Path,
     output_dir: Path,
     manifest: dict,
     allow_informative_unavailable: bool,
 ) -> None:
-    grouped: dict[tuple[str, str], list[OnnxRegressionCase]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[GraphRegressionCase]] = defaultdict(list)
     for case in cases:
         assert case.target_model_folder is not None
         grouped[(case.target_model_folder, case.model_folder)].append(case)
@@ -304,11 +292,10 @@ def _generate_speculative_cases(
 
         for case in group_cases:
             try:
-                model, gen_config = _speculative_model(case, draft_model)
-                draft_model.gen_files(
-                    FileGenMode.SOURCE_TO_ONNX,
-                    gen_config=gen_config,
-                    num_processes=1,
+                model, precision = _speculative_model(case, draft_model)
+                model.gen_files(
+                    FileGenMode.SOURCE_TO_FP,
+                    layer_cfg={"precision": precision},
                     log_level=logging.WARNING,
                     resume=False,
                 )
@@ -346,7 +333,7 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=False)
     enabled_cases = [
-        case for case in ONNX_REGRESSION_CASES if case.mode != "disabled"
+        case for case in GRAPH_REGRESSION_CASES if case.mode != "disabled"
     ]
     manifest = {
         "revision": args.revision,
@@ -356,7 +343,7 @@ def main() -> None:
         "cases": {},
     }
     print(
-        f"Generating ONNX for revision {manifest['revision']} with "
+        f"Generating native graph for revision {manifest['revision']} with "
         f"sima-lmm {manifest['package_version']} from {manifest['package_path']}",
         flush=True,
     )
@@ -384,7 +371,7 @@ def main() -> None:
 
     expected_ids = {case.id for case in enabled_cases}
     if set(manifest["cases"]) != expected_ids:
-        raise RuntimeError("Generated ONNX manifest does not match enabled case matrix")
+        raise RuntimeError("Generated native graph manifest does not match enabled case matrix")
     args.manifest_output.write_text(
         json.dumps(manifest, indent=2) + os.linesep,
         encoding="utf-8",

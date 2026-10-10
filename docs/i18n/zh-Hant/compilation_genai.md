@@ -95,8 +95,8 @@ output_directory/
 | `--input_width` | 輸入圖片的寬度，單位為像素。必須與 `--input_height` 一起提供。對於 Qwen 2 VL、Qwen 3 VL、Qwen3.5 和 Gemma 4 而言，這是必需的；對於覆寫 SigLIP2 模型已設定的大小而言，則是可選的。 |
 | `--system_prompt` | 系統提示，用於儲存以供 CLI 模式使用，以及用於模型預熱。 |
 | `--system_prompt_file` | 指向包含系統提示的文字檔案的路徑。 |
-| `--chat_template` | 聊天範本字串，用於儲存在編譯後的模型中。與「系統提示」和「聊天範本檔案」選項為互斥關係。 |
-| `--chat_template_file` | 檔案路徑，指向包含對話範本的檔案。與「系統提示」選項互斥，且與 `--chat_template` 互斥。 |
+| `--chat_template` | 聊天範本字串，用於儲存在編譯後的模型中。與 `--chat_template_file` 互斥。 |
+| `--chat_template_file` | 檔案路徑，指向包含對話範本的檔案。與 `--chat_template` 互斥。 |
 
 :::note
 大多數模型支援最多 8192 個 token 的上下文長度。請使用 `--max_num_tokens 8192` 以啟用 8K 的上下文長度。
@@ -148,11 +148,17 @@ LLM 推論包含兩個不同的階段，編譯器會為每個階段產生最佳�
 
 - `layer`：包含以下詞彙的字典：
   - `"part"`：邏輯元件，例如 `"PRE"`、`"CACHE"`、`"POST"`。
-    `"VISION"`、`"DRAFT_FC"` 或 `"PER_LAYER"`。
+    `"VISION"`、`"DRAFT_FC"` 或 `"PER_LAYER"`。Mixture-of-Experts 模型會新增
+    `"ROUTER"`、`"EXPERT"` 和 `"WEIGHTEDSUM"`。
   - `"is_group"`：對於多個詞彙/群組的變體，其值為`True`，否則為`False`。
   - `"index"`：該編譯單元的索引。對於 `"PRE"` 和 `"POST"`，
     通常對應於一個轉換器層。對於 `"CACHE"`，它會識別
 一個快取或權杖位置變體，而不是一個轉換器層。
+  - `"expert_idx"`：在 `"EXPERT"` 記錄中，表示該層內專家的索引。
+    其他所有元件（包括所有密集模型）皆為 `-1`。
+
+  請透過鍵讀取所需的值。未來版本可能新增鍵，因此請勿將此字典解包為
+  固定的引數清單，也不要斷言鍵的集合必須完全一致。
 
 **傳回值**
 

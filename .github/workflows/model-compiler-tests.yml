@@ -213,7 +213,7 @@ jobs:
           set -euo pipefail
           test_stage="${RUNNER_TEMP}/llima-compiler-tests"
           junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
-          expected_test_count=137
+          expected_test_count=324
 
           rm -rf "${test_stage}"
           mkdir -p "${test_stage}"
@@ -311,7 +311,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-source-junit.xml"
-          expected_test_count=15
+          expected_test_count=5
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -339,34 +339,34 @@ jobs:
             echo "- Stored NumPy reference fixtures: none"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Run ONNX generation and validation
+      - name: Run native graph generation and validation
         if: ${{ github.event_name == 'push' }}
         shell: bash
         run: |
           set -euo pipefail
-          junit_report="${RUNNER_TEMP}/compiler-onnx-regression-junit.xml"
+          junit_report="${RUNNER_TEMP}/compiler-graph-regression-junit.xml"
           expected_test_count=37
           base_wheel_dir="${RUNNER_TEMP}/llima-base-wheel"
           base_package_root="${RUNNER_TEMP}/llima-base-package"
           base_resolution="${RUNNER_TEMP}/llima-base-resolution.json"
           candidate_package_root="${RUNNER_TEMP}/llima-candidate-package"
-          base_onnx_root="${RUNNER_TEMP}/llima-base-onnx"
-          base_onnx_manifest="${RUNNER_TEMP}/llima-base-onnx-manifest.json"
-          candidate_onnx_root="${RUNNER_TEMP}/llima-candidate-onnx"
-          candidate_onnx_manifest="${RUNNER_TEMP}/llima-candidate-onnx-manifest.json"
+          base_graph_root="${RUNNER_TEMP}/llima-base-graph"
+          base_graph_manifest="${RUNNER_TEMP}/llima-base-graph-manifest.json"
+          candidate_graph_root="${RUNNER_TEMP}/llima-candidate-graph"
+          candidate_graph_manifest="${RUNNER_TEMP}/llima-candidate-graph-manifest.json"
 
-          cleanup_onnx() {
+          cleanup_graphs() {
             rm -rf \
               "${base_wheel_dir}" \
               "${base_package_root}" \
               "${candidate_package_root}" \
-              "${base_onnx_root}" \
-              "${candidate_onnx_root}"
-            rm -f "${base_onnx_manifest}" "${candidate_onnx_manifest}" \
+              "${base_graph_root}" \
+              "${candidate_graph_root}"
+            rm -f "${base_graph_manifest}" "${candidate_graph_manifest}" \
               "${base_resolution}" "${base_resolution}.txt"
           }
-          trap cleanup_onnx EXIT
-          cleanup_onnx
+          trap cleanup_graphs EXIT
+          cleanup_graphs
 
           validation_mode="candidate-only"
           base_ref=""
@@ -389,13 +389,13 @@ jobs:
             --target "${candidate_package_root}" \
             "${LLIMA_COMPILER_WHEEL}"
 
-          generator="${LLIMA_TEST_STAGE}/tests/compilation/onnx_regression/generate.py"
+          generator="${LLIMA_TEST_STAGE}/tests/compilation/graph_regression/generate.py"
 
           PYTHONPATH="${candidate_package_root}:${LLIMA_TEST_STAGE}" \
             python -P "${generator}" \
               --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
-              --output-dir "${candidate_onnx_root}" \
-              --manifest-output "${candidate_onnx_manifest}" \
+              --output-dir "${candidate_graph_root}" \
+              --manifest-output "${candidate_graph_manifest}" \
               --expected-package-root "${candidate_package_root}" \
               --revision "${GITHUB_SHA}"
 
@@ -457,8 +457,8 @@ jobs:
             PYTHONPATH="${base_package_root}:${LLIMA_TEST_STAGE}" \
               python -P "${generator}" \
                 --model-inputs-path "${LLIMA_HF_MODELS_PATH}" \
-                --output-dir "${base_onnx_root}" \
-                --manifest-output "${base_onnx_manifest}" \
+                --output-dir "${base_graph_root}" \
+                --manifest-output "${base_graph_manifest}" \
                 --expected-package-root "${base_package_root}" \
                 --revision "${base_revision}" \
                 --allow-informative-unavailable
@@ -466,21 +466,21 @@ jobs:
 
           pytest_args=(
             -c pytest.ini
-            tests/compilation/onnx_regression
-            -m compiler_onnx_regression
+            tests/compilation/graph_regression
+            -m compiler_graph_regression
             --strict-markers
             -vv
             -ra
             --durations=20
-            --onnx-validation-mode "${validation_mode}"
-            --candidate-onnx-root "${candidate_onnx_root}"
-            --candidate-onnx-manifest "${candidate_onnx_manifest}"
+            --graph-validation-mode "${validation_mode}"
+            --candidate-graph-root "${candidate_graph_root}"
+            --candidate-graph-manifest "${candidate_graph_manifest}"
             --junitxml="${junit_report}"
           )
           if [[ "${validation_mode}" == "compare" ]]; then
             pytest_args+=(
-              --base-onnx-root "${base_onnx_root}"
-              --base-onnx-manifest "${base_onnx_manifest}"
+              --base-graph-root "${base_graph_root}"
+              --base-graph-manifest "${base_graph_manifest}"
             )
           fi
 
@@ -492,15 +492,15 @@ jobs:
           python "${VULCAN_WORKSPACE}/tools/ci/audit_pytest_report.py" \
             --report "${junit_report}" \
             --expected "${expected_test_count}" \
-            --label "ONNX generation and validation"
+            --label "native graph generation and validation"
 
           {
-            echo "### ONNX generation and validation"
+            echo "### native graph generation and validation"
             echo
             echo "- Validation mode: ${validation_mode}"
             echo "- Candidate SHA: ${GITHUB_SHA}"
             echo "- Required/informative cases executed: ${expected_test_count}"
-            echo "- Stored ONNX references: none"
+            echo "- Stored native graph references: none"
             if [[ "${validation_mode}" == "compare" ]]; then
               echo "- Baseline ref: ${base_ref}"
               echo "- Baseline artifact: ${package_spec}"
@@ -515,7 +515,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-graph-integration-junit.xml"
-          expected_test_count=22
+          expected_test_count=31
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -559,7 +559,7 @@ jobs:
           {
             echo "### Generated-graph and quantization integration"
             echo
-            echo "- Standard/embedding/GGUF cases: 22"
+            echo "- Standard/embedding/Whisper/GGUF cases: 31"
             echo "- Serial speculative-decoding cases: 6"
             echo "- Unexpected skips: 0"
           } >> "${GITHUB_STEP_SUMMARY}"

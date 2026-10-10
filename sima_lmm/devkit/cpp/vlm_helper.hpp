@@ -13,6 +13,7 @@
 #include <minja/chat-template.hpp>
 
 #include "chat.hpp"
+#include "file_provider.hpp"
 #include "image_processor.hpp"
 #include "tokenizer.hpp"
 #include "vlm_config.hpp"
@@ -31,12 +32,23 @@ struct PreprocessedChat {
 class Chat;
 class VlmHelper {
     public:
+        // Existing devkit-directory overload; preserves source compatibility.
         VlmHelper(
             const VlmConfig& vlm_cfg,
             const std::filesystem::path& devkit_dir,
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template,
-            bool enable_thinking = false
+            bool enable_thinking = false,
+            std::string reasoning_effort = "low"
+        );
+        // Reads "devkit/..." names through files, relative to the model root.
+        VlmHelper(
+            const VlmConfig& vlm_cfg,
+            FileProvider& files,
+            std::optional<std::string> system_prompt,
+            std::optional<std::string> chat_template,
+            bool enable_thinking = false,
+            std::string reasoning_effort = "low"
         );
         ~VlmHelper() {};
 
@@ -44,6 +56,10 @@ class VlmHelper {
         std::optional<std::string> get_system_prompt() const { return _system_prompt; }
         void set_enable_thinking(bool enable_thinking) { _enable_thinking = enable_thinking; }
         bool get_enable_thinking() const { return _enable_thinking; }
+        void set_reasoning_effort(std::string reasoning_effort) {
+            _reasoning_effort = std::move(reasoning_effort);
+        }
+        const std::string& get_reasoning_effort() const { return _reasoning_effort; }
         PreprocessedChat preprocess(const Chat& chat);
 
         bool is_multimodal() const { return _vlm_cfg.is_multimodal(); }
@@ -55,17 +71,17 @@ class VlmHelper {
 
     private:
         void _init_chat_template(
-            const std::filesystem::path& devkit_dir,
+            FileProvider& files,
             const nlohmann::json& tokenizer_config_json,
             std::optional<std::string> override_chat_template
         );
         void _init_stop_token_ids(
-            const std::filesystem::path& devkit_dir,
+            FileProvider& files,
             const nlohmann::json* tokenizer_config_json = nullptr
         );
         void _init_image_token_id(const nlohmann::json& tokenizer_config_json);
         void _init_pad_token_id(const nlohmann::json& tokenizer_config_json);
-        void _init_image_processor(const std::filesystem::path& devkit_dir);
+        void _init_image_processor(FileProvider& files);
 
         const VlmConfig& _vlm_cfg;
         std::unique_ptr<Tokenizer> _tokenizer_ptr;
@@ -73,6 +89,7 @@ class VlmHelper {
         std::unique_ptr<ImageProcessor> _image_processor_ptr;
         std::optional<std::string> _system_prompt;
         bool _enable_thinking;
+        std::string _reasoning_effort;
         std::string _bos_token;
         std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;

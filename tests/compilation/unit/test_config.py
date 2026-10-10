@@ -115,7 +115,6 @@ def test_embedding_quantization_is_supported_for_non_gemma4_vlm(monkeypatch, tmp
     model = VisionLanguageModel.from_hf_cache(
         model_name="qwen3-vl",
         hf_cache_path=tmp_path / "model",
-        onnx_path=tmp_path / "onnx",
         sima_path=tmp_path / "sima",
         max_num_tokens=1024,
         quantize_embeddings=True,
@@ -267,7 +266,6 @@ def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_p
     model = LanguageModel(
         config,
         "draft",
-        onnx_path=tmp_path / "onnx",
         sima_path=tmp_path / "sima",
         hf_model=SimpleNamespace(),
     )
@@ -303,7 +301,6 @@ def test_dflash_final_post_uses_paired_target_head(tmp_path):
     model = LanguageModel(
         config,
         "draft",
-        onnx_path=tmp_path / "onnx",
         sima_path=tmp_path / "sima",
         hf_model=SimpleNamespace(),
         dflash_target_hf_model=target_weights,
@@ -355,7 +352,6 @@ def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(
     target = LanguageModel(
         target_cfg,
         "target",
-        onnx_path=tmp_path / "target_onnx",
         sima_path=tmp_path / "target_sima",
         hf_model=SimpleNamespace(language_model_param_base_name="model"),
     )
@@ -382,7 +378,6 @@ def test_dflash_routes_linear_and_sliding_cache_graphs_at_block_width(
     draft = LanguageModel(
         draft_cfg,
         "draft",
-        onnx_path=tmp_path / "draft_onnx",
         sima_path=tmp_path / "draft_sima",
         hf_model=SimpleNamespace(),
     )

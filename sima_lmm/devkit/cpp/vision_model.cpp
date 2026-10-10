@@ -1,5 +1,5 @@
 
-#include <fstream>
+#include <utility>
 
 #include "vision_model.hpp"
 
@@ -7,9 +7,13 @@
 namespace simaai {
 namespace llima {
 
+VisionModel::VisionModel(std::filesystem::path model_path)
+    : VisionModel(std::move(model_path), nullptr) {}
+
 VisionModel::VisionModel(
-    std::filesystem::path model_path
-) : BaseModel(model_path),
+    std::filesystem::path model_path,
+    std::shared_ptr<FileProvider> file_provider
+) : BaseModel(model_path, std::move(file_provider)),
     _vm_cfg(_cfg.vm_cfg.value()),
     _mm_cfg(_cfg.mm_cfg.value())
 {
@@ -72,7 +76,7 @@ void VisionModel::_initialize() {
     BaseModel::_initialize();
     _define_models();
     for (const auto& model_name: _cfg.vision_model_name) {
-        MLAModelWithBuffer::load_all_models(_elf_dir / model_name);
+        MLAModelWithBuffer::load_all_models(_elf_dir / model_name, _files.get());
     }
     _logger->info("Vision model initialize completed");
 }
@@ -188,12 +192,12 @@ void VisionModel::_validate_model_names() const {
         throw std::runtime_error("vision_model_name must contain at least one model");
     }
 
-    const auto config_path = _devkit_dir / "vlm_config.json";
-    const auto config_json = nlohmann::json::parse(std::ifstream(config_path));
+    const char* config_name = "devkit/vlm_config.json";
+    const auto config_json = nlohmann::json::parse(*_files->open_stream(config_name));
     if (!config_json.contains("vm_cfg")
         || !config_json["vm_cfg"].contains("num_hidden_layers")) {
         throw std::runtime_error(fmt::format(
-            "Cannot find vm_cfg.num_hidden_layers in {}", config_path.string()
+            "Cannot find vm_cfg.num_hidden_layers in {}", config_name
         ));
     }
     size_t expected_layers = config_json["vm_cfg"]["num_hidden_layers"].get<size_t>();

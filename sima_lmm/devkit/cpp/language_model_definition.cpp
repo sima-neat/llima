@@ -33,7 +33,8 @@ void LanguageModel::_define_attn_models_iter(
     );
     const bool define_pre = !_pre_model_map.contains(pre_post_key);
     const bool define_cache = !_cache_model_map.contains(cache_key);
-    const bool define_post = !_post_model_map.contains(pre_post_key);
+    const auto& post_model_map = _cfg.lm_cfg.is_moe() ? _router_model_map : _post_model_map;
+    const bool define_post = !post_model_map.contains(pre_post_key);
     if (!define_pre && !define_cache && !define_post) {
         return;
     }
@@ -279,6 +280,16 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
     }
+    // gpt_oss attention sinks slot, right before cached_values (rebound per layer at runtime).
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        cache_ifms.emplace_back(
+            MLABufferSlice{
+                &get_buffer(fmt::format("sinks_l{}", layer_idx)),
+                {0, 0},
+                {num_tokens, _cfg.lm_cfg.attn_cfg.num_attention_heads}
+            }
+        );
+    }
     cache_ifms.emplace_back(
         MLABufferSlice{
             &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
@@ -310,6 +321,10 @@ void LanguageModel::_define_attn_models_iter(
             cache_ifms,
             cache_ofms
         );
+    }
+
+    if (!define_post) {
+        return;
     }
 
     // Draft post consumes the BF16 FC-fused hidden state. Target post consumes the same
@@ -448,9 +463,68 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
     }
-    if (define_post) {
+    if (_cfg.lm_cfg.is_moe()) {
+        _define_moe_post_models(num_tokens, layer_idx, post_ifms, post_ofms);
+    } else {
         _define_model("post", pre_post_key, post_elf_path, post_ifms, post_ofms);
     }
+}
+
+
+void LanguageModel::_define_moe_post_models(
+    uint16_t num_tokens, uint8_t layer_idx,
+    const std::vector<MLABufferSlice>& post_ifms,
+    const std::vector<MLABufferSlice>& post_ofms
+) {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+    const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
+
+    // Last layer runs single-token (n1 ELFs/buffers), like the dense post.
+    const uint16_t moe_nt = (is_last && !_cfg.lm_cfg.is_spec_decode()) ? 1 : num_tokens;
+
+    // The router consumes the same residual, embedding scales and attention as dense post.
+    std::vector<MLABufferSlice> router_ofms{
+        MLABufferSlice{&get_buffer(fmt::format("n{}_router_values", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_router_indices", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_residual", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_norm_hidden", moe_nt))},
+    };
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+    _define_model(
+        "router", model_key, _get_elf_path_router(moe_nt, layer_idx), post_ifms, router_ofms
+    );
+
+    // Experts consume norm(h), scaled by their routing-weight column (runtime runs the top-k).
+    for (uint16_t e = 0; e < num_experts; ++e) {
+        std::vector<MLABufferSlice> expert_ifms{
+            MLABufferSlice{&get_buffer(fmt::format("n{}_norm_hidden", moe_nt))},
+            MLABufferSlice{&get_buffer(fmt::format("n{}_router_weights", moe_nt))},
+        };
+        // Decode always overrides OFM 0 with the selected combine slot when queuing.
+        const uint16_t output_slot = moe_nt == 1 ? 0 : e;
+        std::vector<MLABufferSlice> expert_ofms{
+            MLABufferSlice{&get_buffer(fmt::format("n{}_expert{}", moe_nt, output_slot))},
+        };
+        LanguageModelMapKey expert_key{num_tokens, layer_idx, e};
+        _define_model(
+            "expert", expert_key, _get_elf_path_expert(moe_nt, layer_idx, e),
+            expert_ifms, expert_ofms
+        );
+    }
+
+    // Weighted sum of the routing-weighted expert outputs + residual (decode sums the top-k).
+    const uint16_t n_combine = (moe_nt == 1) ? top_k : num_experts;
+    std::vector<MLABufferSlice> ws_ifms;
+    for (uint16_t e = 0; e < n_combine; ++e) {
+        ws_ifms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_expert{}", moe_nt, e))});
+    }
+    ws_ifms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_residual", moe_nt))});
+
+    _define_model(
+        "weightedsum", model_key, _get_elf_path_weightedsum(moe_nt, layer_idx), ws_ifms, post_ofms
+    );
 }
 
 
@@ -712,10 +786,11 @@ void LanguageModel::_define_draft_fc_models() {
         num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     for (const auto& num_tokens : num_tokens_vec) {
-        auto elf_path = _elf_dir / fmt::format(
-            "{}_n{}_draft_fc_stage1_mla.elf",
+        // Reserve ELF paths now; deferred providers fetch them at MLA load time.
+        auto elf_path = _files->reserve(fmt::format(
+            "elf_files/{}_n{}_draft_fc_stage1_mla.elf",
             _cfg.language_model_name, num_tokens
-        );
+        ));
         std::vector<MLABufferSlice> ifms;
         if (_cfg.lm_cfg.is_dflash()) {
             for (size_t index = 0;
@@ -746,10 +821,10 @@ void LanguageModel::_define_dflash_models() {
             return;
         }
         const auto& linear_cfg = _linear_attn_cfg();
-        const auto elf_path = _elf_dir / fmt::format(
-            "{}_n{}_dflash_state_resolver_stage1_mla.elf",
+        const auto elf_path = _files->reserve(fmt::format(
+            "elf_files/{}_n{}_dflash_state_resolver_stage1_mla.elf",
             _cfg.language_model_name, single_num_tokens
-        );
+        ));
         for (uint8_t layer_idx = 0;
              layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
             if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
@@ -839,10 +914,10 @@ void LanguageModel::_define_dflash_models() {
             _dflash_context_model_map.emplace(
                 key_id,
                 MLAModelWithBuffer(
-                    _elf_dir / fmt::format(
-                        "{}_n{}_dflash_context_layer{}_stage1_mla.elf",
+                    _files->reserve(fmt::format(
+                        "elf_files/{}_n{}_dflash_context_layer{}_stage1_mla.elf",
                         _cfg.language_model_name, num_tokens, layer_idx
-                    ),
+                    )),
                     {
                         MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))},
                         MLABufferSlice{
@@ -913,6 +988,12 @@ LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) {
         return _conv_final_model_map;
     } else if (model_type == "per_layer") {
         return _per_layer_model_map;
+    } else if (model_type == "router") {
+        return _router_model_map;
+    } else if (model_type == "expert") {
+        return _expert_model_map;
+    } else if (model_type == "weightedsum") {
+        return _weightedsum_model_map;
     } else if (model_type == "linear") {
         return _linear_model_map;
     } else {
@@ -925,7 +1006,7 @@ std::filesystem::path LanguageModel::_get_elf_path_pre(uint16_t num_tokens, uint
     auto elf_file_name = fmt::format(
         "{}_n{}_pre_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -942,7 +1023,7 @@ std::filesystem::path LanguageModel::_get_elf_path_cache(
         cache_name,
         token_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -950,7 +1031,38 @@ std::filesystem::path LanguageModel::_get_elf_path_post(uint16_t num_tokens, uin
     auto elf_file_name = fmt::format(
         "{}_n{}_post_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_router(uint16_t num_tokens, uint8_t layer_idx) {
+    auto elf_file_name = fmt::format(
+        "{}_n{}_router_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
+    );
+    return _files->reserve("elf_files/" + elf_file_name);
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_expert(
+    uint16_t num_tokens, uint8_t layer_idx, uint16_t expert_idx
+) {
+    // Experts keep the factory post_layer..expert.. naming.
+    auto elf_file_name = fmt::format(
+        "{}_n{}_post_layer{}_expert{}_stage1_mla.elf",
+        _cfg.language_model_name, num_tokens, layer_idx, expert_idx
+    );
+    return _files->reserve("elf_files/" + elf_file_name);
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_weightedsum(
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    auto elf_file_name = fmt::format(
+        "{}_n{}_moe_weightedsum_layer{}_stage1_mla.elf",
+        _cfg.language_model_name, num_tokens, layer_idx
+    );
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -958,7 +1070,7 @@ std::filesystem::path LanguageModel::_get_elf_path_conv(uint16_t num_tokens, uin
     auto elf_file_name = fmt::format(
         "{}_n{}_layer{}_conv_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -966,7 +1078,7 @@ std::filesystem::path LanguageModel::_get_elf_path_conv_final(uint8_t layer_idx)
     auto elf_file_name = fmt::format(
         "{}_n1_post_layer{}_conv_final_stage1_mla.elf", _cfg.language_model_name, layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -974,7 +1086,7 @@ std::filesystem::path LanguageModel::_get_elf_path_per_layer(uint16_t num_tokens
     auto elf_file_name = fmt::format(
         "{}_n{}_per_layer_stage1_mla.elf", _cfg.language_model_name, num_tokens
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 
@@ -987,7 +1099,7 @@ std::filesystem::path LanguageModel::_get_elf_path_linear(
         num_tokens,
         layer_idx
     );
-    return _elf_dir / elf_file_name;
+    return _files->reserve("elf_files/" + elf_file_name);
 }
 
 

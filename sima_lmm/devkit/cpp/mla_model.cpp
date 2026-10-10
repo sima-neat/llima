@@ -18,6 +18,7 @@
 #include <simaai/gst-api.h>
 #include <spdlog/spdlog.h>
 
+#include "file_provider.hpp"
 #include "mla_model.hpp"
 
 namespace simaai {
@@ -324,9 +325,7 @@ MLAModelWithBuffer::MLAModelWithBuffer(
     std::vector<MLABufferSlice> ofms
 ) : _ifms(std::move(ifms)), _ofms(std::move(ofms)) {
     model_path = std::filesystem::absolute(model_path).lexically_normal();
-    if (!std::filesystem::is_regular_file(model_path)) {
-        throw std::runtime_error(fmt::format("Model file does not exist: {}", model_path));
-    }
+    // Deferred assets may not exist yet; load_all_models() checks them at load time.
     auto& state = runtime_state();
     std::lock_guard lock(state.registry_mutex);
     const auto [it, inserted] = state.path_to_index.emplace(model_path, state.paths.size());
@@ -499,47 +498,59 @@ void MLAModelWithBuffer::run_queue() {
 }
 
 void MLAModelWithBuffer::update_reloc(
-    const std::map<std::string, uint64_t>& reloc_addr_map
+    const std::map<std::string, MLABuffer*>& reloc_buffers
 ) {
-    if (reloc_addr_map.empty()) return;
+    if (reloc_buffers.empty()) return;
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
     load();
     mla_model_p model = model_for(_model_idx);
     const auto lengths = mla_get_ifm_ofm_len_vector(model).reloc_len_array;
-    if (lengths.size() != reloc_addr_map.size()) {
+    if (lengths.size() != reloc_buffers.size()) {
         throw std::invalid_argument(fmt::format(
             "Relocation count for {} is {}, model expects {}",
-            path_for(_model_idx), reloc_addr_map.size(), lengths.size()
+            path_for(_model_idx), reloc_buffers.size(), lengths.size()
         ));
     }
-    std::vector<DADDR_LEN> relocs;
-    relocs.reserve(reloc_addr_map.size());
-    std::size_t index = 0;
-    for (const auto& [name, address] : reloc_addr_map) {
+    // Bind adapters by internal_buf_id, not physical address. A reusable-CMA
+    // memory profile refuses the raw-phys attach path outright (the DMS pool is
+    // System RAM), so import each adapter's DMA-BUF and pass its buf_id, exactly
+    // as the IFM/OFM run path does in make_bindings(). Reloc ports are ordered
+    // by adapter buffer name, which matches the model's reloc section order.
+    std::vector<mla_tensor> relocs;
+    relocs.reserve(reloc_buffers.size());
+    for (const auto& [name, buffer] : reloc_buffers) {
         (void)name;
-        relocs.emplace_back(address, lengths[index++]);
+        const uint64_t offset = buffer->get_buf_addr_offset();
+        const uint64_t length = buffer->get_allocation_size() - offset;
+        relocs.push_back({imported_buffer_id(buffer), 0, offset, length});
     }
-    const int rc = mla_update_model_rel(
-        model, 0, nullptr, 0, nullptr,
-        static_cast<int>(relocs.size()), relocs.data()
+    const int rc = mla_update_model_reloc(
+        model, static_cast<int>(relocs.size()), relocs.data()
     );
-    if (rc <= 0) {
+    if (rc != 0) {
         throw std::runtime_error(fmt::format(
             "MLA-RT relocation failed for {}: rc={}", path_for(_model_idx), rc
         ));
     }
 }
 
+void MLAModelWithBuffer::load_all_models(std::optional<std::filesystem::path> relative_dir) {
+    load_all_models(std::move(relative_dir), nullptr);
+}
+
 void MLAModelWithBuffer::load_all_models(
-    std::optional<std::filesystem::path> relative_dir
+    std::optional<std::filesystem::path> relative_dir,
+    FileProvider* files
 ) {
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
     std::lock_guard registry_lock(state.registry_mutex);
     require_handle();
 
-    if (!_disable_parallel_load) {
+    // Deferred assets require serial fetch -> load -> evict, not batch loading.
+    const bool must_pull = files != nullptr && files->pulls_files();
+    if (!_disable_parallel_load && !must_pull) {
         std::map<std::filesystem::path, uint16_t> batch_paths;
         for (const auto& [path, index] : state.path_to_index) {
             if (!state.models[index] && path_matches_family(path, relative_dir)) {
@@ -568,10 +579,13 @@ void MLAModelWithBuffer::load_all_models(
 
     for (const auto& [path, index] : state.path_to_index) {
         if (state.models[index] || !path_matches_family(path, relative_dir)) continue;
+        if (files) files->fetch(path);           // pull over PCIe (no-op on disk)
         state.models[index] = mla_load_model(state.handle, path.c_str());
         if (!state.models[index]) {
+            // Leave the fetched file in place for debugging on failure.
             throw std::runtime_error(fmt::format("MLA-RT failed to load model: {}", path));
         }
+        if (files) files->evict(path);           // delete disk copy (no-op on disk)
         spdlog::info("Loaded model: {}", path);
     }
 }

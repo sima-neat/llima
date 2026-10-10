@@ -6,6 +6,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -15,6 +16,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "file_provider.hpp"
 #include "mla_buffer.hpp"
 #include "mla_model.hpp"
 #include "vlm_config.hpp"
@@ -27,15 +29,22 @@ namespace llima {
 template <typename T>
 class BaseModel {
     protected:
-        BaseModel(std::filesystem::path model_path) requires std::is_same_v<T, VlmConfig>
-          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
+        BaseModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<FileProvider> file_provider = nullptr
+        ) requires std::is_same_v<T, VlmConfig>
+          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit"),
+            _files(file_provider
+                ? std::move(file_provider)
+                : std::make_shared<DiskFileProvider>(model_path))
         {
+            _validate_provider_root();
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("VLM") : spdlog::default_logger();
 
-            std::filesystem::path config_file_name = _devkit_dir / "vlm_config.json";
+            const char* config_file_name = "devkit/vlm_config.json";
             try {
-                _cfg = nlohmann::json::parse(std::ifstream(config_file_name)).get<VlmConfig>();
+                _cfg = nlohmann::json::parse(*_files->open_stream(config_file_name)).get<VlmConfig>();
             } catch (const std::exception& e) {
                 std::cerr << "Failed to load vlm config: " << config_file_name << ", "
                     << e.what() << std::endl;
@@ -43,15 +52,22 @@ class BaseModel {
             }
         }
 
-        BaseModel(std::filesystem::path model_path) requires std::is_same_v<T, WhisperConfig>
-          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit")
+        BaseModel(
+            std::filesystem::path model_path,
+            std::shared_ptr<FileProvider> file_provider = nullptr
+        ) requires std::is_same_v<T, WhisperConfig>
+          : _elf_dir(model_path / "elf_files"), _devkit_dir(model_path / "devkit"),
+            _files(file_provider
+                ? std::move(file_provider)
+                : std::make_shared<DiskFileProvider>(model_path))
         {
+            _validate_provider_root();
             auto llima_logger = spdlog::get("llima");
             _logger = llima_logger? llima_logger->clone("Whisper") : spdlog::default_logger();
 
-            std::filesystem::path config_file_name = _devkit_dir / "whisper_config.json";
+            const char* config_file_name = "devkit/whisper_config.json";
             try {
-                _cfg = nlohmann::json::parse(std::ifstream(config_file_name)).get<WhisperConfig>();
+                _cfg = nlohmann::json::parse(*_files->open_stream(config_file_name)).get<WhisperConfig>();
             } catch (const std::exception& e) {
                 std::cerr << "Failed to load whisper config: " << config_file_name << ", "
                     << e.what() << std::endl;
@@ -60,6 +76,16 @@ class BaseModel {
         }
 
         virtual ~BaseModel() { if (!_buf_map.empty()) _finalize(); }
+        void _validate_provider_root() {
+            // Match the lexical representation used by MLA load/free selectors.
+            if (std::filesystem::absolute(_files->reserve("elf_files")).lexically_normal()
+                != std::filesystem::absolute(_elf_dir).lexically_normal()) {
+                throw std::invalid_argument(
+                    "FileProvider ELF location does not match model_path; "
+                    "pass the provider's staging root as model_path"
+                );
+            }
+        }
         void define_buffer(
             const std::string& name,
             const std::vector<size_t>& shape,
@@ -100,6 +126,8 @@ class BaseModel {
         T _cfg;
         std::filesystem::path _elf_dir;
         std::filesystem::path _devkit_dir;
+        // Model assets use the injected provider or a model-rooted disk provider.
+        std::shared_ptr<FileProvider> _files;
         std::map<std::string, MLABuffer> _buf_map;
 
         // Logging.

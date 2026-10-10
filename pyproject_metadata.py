@@ -104,9 +104,6 @@ sdk_ext_require = [
     "numpy==1.23.5; python_version>='3.10' and python_version<'3.12'",
     # Same as other SDK packages.
     "numpy==1.26.4; python_version>='3.12'",
-    "onnx==1.17.0",  # Required for graph surgery
-    "onnxruntime==1.21.1",
-    "onnxsim-prebuilt",  # Required for graph surgery
     "safetensors",  # Required for HF LLM models
     "torch==2.8.0",  # Required to load GGUF file to transformers.
     "av",  # Required for audio preprocessing

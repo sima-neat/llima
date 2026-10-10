@@ -114,5 +114,5 @@ A speculative output contains the same structure for both roles:
     └── npy_files/  # optional LoRA material
 ```
 
-Keep `onnx_files/` and compiler intermediates on the host. Deploy with
+Keep compiler intermediates on the host. Deploy with
 `llima-deploy`; do not copy the entire compiler workspace as a runtime model.
