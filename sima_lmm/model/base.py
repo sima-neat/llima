@@ -4,7 +4,7 @@ import multiprocessing
 import numpy as np
 import os
 import shutil
-from typing import NotRequired, TypedDict
+from typing import ClassVar, NotRequired, TypedDict
 
 from abc import ABC
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -156,6 +156,7 @@ class BaseModel(ABC):
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
+    enable_filter_sharing: ClassVar[bool] = True
 
     def gen_files(
         self, gen_mode: FileGenMode, *,
@@ -364,7 +365,7 @@ class BaseModel(ABC):
             self.sima_mpk_path, compress=True, log_level=log_level, preserve=False,
             tessellate_parameters=tessellate_parameters,
             retained_temporary_directory_name=retained_temporary_directory_name,
-            enable_filter_sharing=True,
+            enable_filter_sharing=self.enable_filter_sharing,
             layout_search_effort_level=layout_search_effort_level, deployable=False
         )
         return model
