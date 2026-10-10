@@ -942,10 +942,8 @@ void LanguageModel::_upload_group_future_token_masks(
         "group_future_token_mask", "full_attention", 0
     );
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
-        const uint16_t cache_token_idx_begin = std::max(
-            0,
-            token_idx + num_tokens
-                - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+        const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+            num_tokens, token_idx, "sliding_attention"
         );
         upload_group_mask(
             "group_sliding_future_token_mask", "sliding_attention", cache_token_idx_begin
@@ -2283,17 +2281,29 @@ void LanguageModel::_define_buffers() {
 
 
 
+uint16_t LanguageModel::_get_cache_token_idx_begin(
+    uint16_t num_tokens, uint16_t token_idx, const std::string& layer_type
+) const {
+    if (layer_type != "sliding_attention") {
+        return 0;
+    }
+    // Group prefill retains the first row's complete window. Speculative
+    // single-model batches keep their existing separate decoding contract.
+    const uint16_t window_rows = num_tokens == _cfg.lm_cfg.get_single_num_tokens()
+        ? num_tokens : 1;
+    return std::max(
+        0, token_idx + window_rows - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+    );
+}
+
+
 LanguageModelMapKey LanguageModel::_get_cache_model_key(
     uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
 ) const {
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    uint16_t cache_token_idx_begin = 0;
-    if (layer_type == "sliding_attention") {
-        cache_token_idx_begin = std::max(
-            0,
-            token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-        );
-    }
+    const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+        num_tokens, token_idx, layer_type
+    );
 
     const uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
@@ -2317,7 +2327,10 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     );
     const bool use_sliding_cache = (
         separate_sliding_cache
-        || (sliding_cache_mask_differs && eff_num_cached_tokens >= sliding_window)
+        || (layer_type == "sliding_attention" && !is_single_model
+            && token_idx + num_tokens > sliding_window)
+        || (is_single_model && sliding_cache_mask_differs
+            && eff_num_cached_tokens >= sliding_window)
     );
     const std::string cache_layer_type = (
         use_sliding_cache ? "sliding_attention" : "full_attention"
@@ -2378,13 +2391,9 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     const bool is_single_model = num_tokens == single_num_tokens;
 
-    uint16_t cache_token_idx_begin = 0;
-    if (layer_type == "sliding_attention") {
-        cache_token_idx_begin = std::max(
-            0,
-            token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-        );
-    }
+    const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+        num_tokens, token_idx, layer_type
+    );
 
     const bool is_draft = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;

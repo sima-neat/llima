@@ -42,18 +42,10 @@ void LanguageModel::_define_attn_models_iter(
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
     const auto& kv_layer_type = _cfg.lm_cfg.layer_types[kv_source_layer];
-    std::string freq_prefix;
-    uint16_t cache_token_idx_begin;
-    if (layer_type == "sliding_attention") {
-        freq_prefix = "local";
-        cache_token_idx_begin = std::max(
-            0,
-            token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-        );
-    } else {
-        freq_prefix = "global";
-        cache_token_idx_begin = 0;
-    }
+    const std::string freq_prefix = layer_type == "sliding_attention" ? "local" : "global";
+    const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+        num_tokens, token_idx, layer_type
+    );
 
     // Pre model.
     std::vector<uint32_t> pre_kv_cache_shape;
@@ -819,6 +811,15 @@ std::filesystem::path LanguageModel::_get_elf_path_cache(
         cache_name,
         token_idx
     );
+    if (use_sliding_cache && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
+        && token_idx + num_tokens > _cfg.lm_cfg.attn_cfg.sliding_window.value()
+        && !_files->exists("elf_files/" + elf_file_name)) {
+        throw std::runtime_error(fmt::format(
+            "Incompatible compiled sliding-attention model. Recompile the grouped "
+            "sliding-cache stages and redeploy. Missing: {}.",
+            elf_file_name
+        ));
+    }
     return _files->reserve("elf_files/" + elf_file_name);
 }
 
