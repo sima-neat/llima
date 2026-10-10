@@ -156,7 +156,6 @@ class BaseModel(ABC):
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
-    use_filter_sharing: bool = field(default=False, kw_only=True)
 
     def gen_files(
         self, gen_mode: FileGenMode, *,
@@ -334,10 +333,6 @@ class BaseModel(ABC):
         """
         return {}
 
-    @property
-    def enable_filter_sharing(self) -> bool:
-        return False
-
     def gen_mpk_files(self, log_level: int) -> SDKModel:
         """Generates MPK files.
 
@@ -369,7 +364,7 @@ class BaseModel(ABC):
             self.sima_mpk_path, compress=True, log_level=log_level, preserve=False,
             tessellate_parameters=tessellate_parameters,
             retained_temporary_directory_name=retained_temporary_directory_name,
-            enable_filter_sharing=self.enable_filter_sharing,
+            enable_filter_sharing=True,
             layout_search_effort_level=layout_search_effort_level, deployable=False
         )
         return model

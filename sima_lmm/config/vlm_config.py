@@ -957,7 +957,6 @@ class PipelineConfig(BaseConfig):
         future_token_mask_size: The normal cache-model mask bucket size.
         long_context_future_token_mask_size: Optional full-attention override for long contexts.
         return_logits: Return logits at the last layer.
-        enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
         quantize_kv_cache: Enables KV cache quantization to reduce memory consumption.
     """
@@ -969,7 +968,6 @@ class PipelineConfig(BaseConfig):
     future_token_mask_size: int = 1
     long_context_future_token_mask_size: int | None = None
     return_logits: bool = False
-    enable_filter_sharing: bool = True
     quantize_embeddings: bool = False
     quantize_kv_cache: bool = False
 
@@ -1028,9 +1026,6 @@ class PipelineConfig(BaseConfig):
     def set_return_logits(self, return_logits: bool):
         self.return_logits = return_logits
 
-    def set_enable_filter_sharing(self, enable_filter_sharing: bool):
-        self.enable_filter_sharing = enable_filter_sharing
-
     def set_quantize_embeddings(self, quantize_embeddings: bool):
         self.quantize_embeddings = quantize_embeddings
 
@@ -1065,6 +1060,7 @@ class VlmConfig(BaseConfig):
         if vlm_cfg.get("mm_cfg") is not None:
             vlm_cfg["mm_cfg"] = MMConnectionConfig(**vlm_cfg["mm_cfg"])
         vlm_cfg["lm_cfg"] = LanguageModelConfig.load(vlm_cfg["lm_cfg"])
+        vlm_cfg["pipeline_cfg"].pop("enable_filter_sharing", None)
         vlm_cfg["pipeline_cfg"] = PipelineConfig(**vlm_cfg["pipeline_cfg"])
         vlm_cfg["model_type"] = VlmArchType(vlm_cfg["model_type"])
         vc = VlmConfig(**vlm_cfg)

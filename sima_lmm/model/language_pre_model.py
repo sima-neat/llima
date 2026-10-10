@@ -26,10 +26,6 @@ class LanguagePreModel(LanguagePartBaseModel):
         assert 0 <= self.layer_idx < self.cfg.lm_cfg.num_hidden_layers
 
     @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
-    @property
     def _layer_base_name(self) -> str:
         base = self.hf_model.language_model_param_base_name
         return base if self.is_draft else f"{base}.layers.{self.layer_idx}"

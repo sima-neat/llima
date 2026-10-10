@@ -21,10 +21,6 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.lm_cfg.layer_types[self.layer_idx]
 
     @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
-    @property
     def uses_quantized_input_embeddings(self) -> bool:
         # EAGLE3 draft post consumes the BF16 FC-fused hidden state, not an embedding row.
         return super().uses_quantized_input_embeddings and not self.is_draft

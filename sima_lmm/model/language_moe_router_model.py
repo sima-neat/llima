@@ -21,10 +21,6 @@ class LanguageMoeRouterModel(LanguagePartBaseModel):
         assert self.cfg.lm_cfg.moe_cfg is not None
 
     @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
-    @property
     def layer_type(self) -> str:
         return self.cfg.lm_cfg.layer_types[self.layer_idx]
 

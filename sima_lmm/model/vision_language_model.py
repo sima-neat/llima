@@ -35,7 +35,6 @@ class VisionLanguageModel(BaseModel):
         override_language_group_size: int | None = None,
         override_language_future_token_mask_size: int = 1,
         return_logits: bool = False,
-        enable_filter_sharing: bool = True,
         quantize_embeddings: bool = False,
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
@@ -50,8 +49,6 @@ class VisionLanguageModel(BaseModel):
             max_num_tokens: Maximum number of tokens, including both input and output tokens.
             system_prompt: System prompt.
             return_logits: Return logits at the last layer output instead of argmax token IDs.
-            enable_filter_sharing: True if sharing filters between group and single models is
-                enabled. Enabled by default.
             quantize_embeddings: True if embedding table is quantized.
             quantize_kv_cache: True if KV cache is quantized.
             target_model: Target VisionLanguageModel when constructing a draft model.
@@ -77,7 +74,6 @@ class VisionLanguageModel(BaseModel):
             override_language_future_token_mask_size
         )
 
-        vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)
 
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
