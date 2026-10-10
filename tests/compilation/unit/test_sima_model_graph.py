@@ -31,6 +31,97 @@ def _run(net, inputs):
 
 
 @pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize("use_jax", [False, True])
+def test_run_reuses_graph_with_named_inputs_and_ordered_outputs(monkeypatch, quantizable, use_jax):
+    shape = (1, 1, 2, 32)
+    graph = ModelGraph(_source(), {"hidden": shape, "mask": shape, "cache": shape}, quantizable,
+                       input_dtypes={"cache": np.int8})
+    total = graph.add(graph.inputs["hidden"], graph.inputs["mask"])
+    graph.finish([graph.inputs["cache"], total, graph.argmax(total)])
+    selected = []
+
+    def executor(**kwargs):
+        selected.append(kwargs)
+        return create_node_quant_executor(**kwargs)
+
+    monkeypatch.setattr("sima_lmm.model.model_graph.create_node_quant_executor", executor)
+    hidden = np.arange(64).reshape(shape).astype(activation_dtype(quantizable))
+    mask = np.ones(shape, dtype=hidden.dtype)
+    cache = np.full(shape, 7, dtype=np.int8)
+    # Keyword order differs from declaration order; new values reuse the same graph.
+    for offset in (0, 2):
+        values = hidden + np.array(offset, dtype=hidden.dtype)
+        result = graph.run(cache=cache, mask=mask, hidden=values, use_jax=use_jax)
+        assert isinstance(result, list)
+        assert len(result) == 3
+        np.testing.assert_array_equal(result[0], cache)
+        np.testing.assert_array_equal(result[1], (values + mask).astype(np.float32))
+        np.testing.assert_array_equal(result[2], np.full((1, 1, 2, 1), 31, dtype=np.int32))
+    assert selected == [{"fast_mode": True, "use_jax": use_jax}] * 2
+
+
+@pytest.mark.parametrize("weight_dtype,group_size", [(np.int8, 32), (int4, 16)])
+@pytest.mark.parametrize("use_jax", [False, True])
+def test_run_executes_prequantized_projections(weight_dtype, group_size, use_jax):
+    shape = (1, 1, 2, 32)
+    weights = np.full((16, 32), 2, dtype=weight_dtype)
+    scales = np.full((16, 32 // group_size), 0.5, dtype=np.float32)
+    graph = ModelGraph(_source({"proj.weight": (scales, weights, group_size)}), {"x": shape}, False)
+    graph.finish([graph.linear("proj", graph.inputs["x"])])
+    x = np.full(shape, 0.25, dtype=activation_dtype(False))
+    np.testing.assert_array_equal(graph.run(x=x, use_jax=use_jax)[0], np.full((1, 1, 2, 16), 8.0))
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize("finish_first", [True, False])
+def test_run_and_save_share_finalization(tmp_path, quantizable, finish_first):
+    shape = (1, 1, 2, 32)
+    graph = ModelGraph(_source(path=tmp_path), {"x": shape}, quantizable)
+    output = graph.mul(graph.inputs["x"], graph.constant([2.0]))
+    x = np.ones(shape, dtype=activation_dtype(quantizable))
+    if finish_first:
+        graph.finish([output])
+        graph.run(x=x)
+        graph.save()
+    else:
+        graph.save([output])
+    np.testing.assert_array_equal(graph.run(x=x)[0], x.astype(np.float32) * 2)
+    net = load_awesomenet("component" + (".fp32" if quantizable else ""), str(tmp_path))
+    actual = net.run({"x": x}, node_callable=create_node_quant_executor(fast_mode=True))
+    np.testing.assert_array_equal(actual[0], x.astype(np.float32) * 2)
+    with pytest.raises(RuntimeError, match="already finished"):
+        graph.finish([output])
+    with pytest.raises(ValueError, match="without outputs"):
+        graph.save([output])
+
+
+@pytest.mark.parametrize(
+    "inputs,error,message",
+    [
+        ({}, ValueError, "missing.*x"),
+        ({"x": np.ones((1, 1, 1, 32), np.float32), "extra": np.zeros(1)}, ValueError, "unexpected.*extra"),
+        ({"x": np.ones((1, 1, 2, 32), np.float32)}, ValueError, "x: expected shape"),
+        ({"x": np.ones((1, 1, 1, 32), np.float64)}, TypeError, "x: expected dtype float32"),
+        ({"x": [1]}, TypeError, "x: expected a NumPy array"),
+        ({"x": np.ones((1, 1, 1, 32), np.float32), "use_jax": "yes"}, TypeError, "use_jax must be a bool"),
+    ],
+)
+def test_run_rejects_invalid_inputs(inputs, error, message):
+    graph = ModelGraph(_source(), {"x": (1, 1, 1, 32)}, True)
+    graph.finish([graph.inputs["x"]])
+    with pytest.raises(error, match=message):
+        graph.run(**inputs)
+
+
+def test_execution_requires_explicit_finalization():
+    graph = ModelGraph(_source(), {"x": (1, 1, 1, 32)}, True)
+    with pytest.raises(RuntimeError, match="before run"):
+        graph.run(x=np.ones((1, 1, 1, 32), np.float32))
+    with pytest.raises(ValueError, match="Supply outputs"):
+        graph.save()
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
 @pytest.mark.parametrize("multiple_outputs", [False, True])
 def test_model_graph_preserves_inputs_and_selected_output_types(quantizable, multiple_outputs):
     shape = (1, 1, 2, 32)

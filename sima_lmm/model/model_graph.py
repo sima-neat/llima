@@ -9,6 +9,7 @@ from afe.backends.backends import Backend
 from afe.ir.attributes import ClipAttrs, ConvAttrs, ReluAttrs
 from afe.ir.build_node import NodeOrHandle, TopKRetType, as_handle
 from afe.ir.defines import Status, get_expected_tensor_value
+from afe.ir.execute import create_node_quant_executor
 from afe.ir.net import AwesomeNet
 from afe.ir.node import AwesomeNode
 from afe.ir.serializer import save_awesomenet
@@ -205,6 +206,7 @@ class ModelGraph(SimaBuilder):
         self.model = model
         self.quantizable = quantizable
         self.dtype = np.dtype(activation_dtype(quantizable))
+        self._finished_net: AwesomeNet | None = None
         input_dtypes = {} if input_dtypes is None else input_dtypes
         unknown = input_dtypes.keys() - input_specs.keys()
         if unknown:
@@ -221,6 +223,8 @@ class ModelGraph(SimaBuilder):
                 raise ValueError(
                     f"Invalid model input {name!r}: expected a name and positive static dimensions, got {shape}"
                 )
+            if name in ("self", "use_jax"):
+                raise ValueError(f"Input name {name!r} is reserved by ModelGraph.run(); choose another name")
             if isinstance(spec, TensorType):
                 if name in input_dtypes:
                     raise ValueError(f"{name}: specify either TensorType or input_dtypes, not both")
@@ -251,6 +255,8 @@ class ModelGraph(SimaBuilder):
         BF16 outputs are cast to FP32 on EV. The optional transform runs before
         outer outputs are extracted.
         """
+        if self._finished_net is not None:
+            raise RuntimeError("Graph is already finished; use run() or save() on the finished graph")
         if not outputs:
             raise ValueError("A model graph needs at least one output")
         # Explicitly select outputs even when they are not the last nodes created.
@@ -268,18 +274,54 @@ class ModelGraph(SimaBuilder):
                 model_outputs[i] = self.cast(output, ScalarType.float32, backend=Backend.EV)
         if len(model_outputs) > 1:
             self.create_tuple_node(model_outputs)
-        return super().finish(self.model.model_name)
+        self._finished_net = super().finish(self.model.model_name)
+        return self._finished_net
+
+    def run(self, *, use_jax: bool = False, **inputs: np.ndarray) -> list[np.ndarray]:
+        """Execute the finished graph with named NumPy inputs, without casting.
+
+        NumPy execution uses AFE fast mode. JAX selects its reference implementation,
+        where fast mode has no effect. JAX operations use its configured backend.
+        Outputs follow the order supplied to finish().
+        """
+        if self._finished_net is None:
+            raise RuntimeError("Call finish(outputs) or save(outputs) before run()")
+        if not isinstance(use_jax, bool):
+            raise TypeError("use_jax must be a bool")
+        missing = self.inputs.keys() - inputs.keys()
+        unexpected = inputs.keys() - self.inputs.keys()
+        if missing or unexpected:
+            raise ValueError(
+                f"Graph input mismatch: missing {sorted(missing)}, unexpected {sorted(unexpected)}"
+            )
+        for name, value in inputs.items():
+            if not isinstance(value, np.ndarray):
+                raise TypeError(f"{name}: expected a NumPy array, got {type(value).__name__}")
+            expected = get_expected_tensor_value(self._finished_net.nodes[name].get_type().output)
+            if value.shape != expected.shape:
+                raise ValueError(f"{name}: expected shape {expected.shape}, got {value.shape}")
+            dtype = np.dtype(expected.scalar.numpy_type())
+            if value.dtype != dtype:
+                raise TypeError(f"{name}: expected dtype {dtype}, got {value.dtype}")
+        return self._finished_net.run(
+            inputs, node_callable=create_node_quant_executor(fast_mode=True, use_jax=use_jax)
+        )
 
     def save(
         self,
-        outputs: Sequence[NodeOrHandle],
+        outputs: Sequence[NodeOrHandle] | None = None,
         *,
         transform_subnet: Callable[[AwesomeNet], None] | None = None,
     ) -> None:
-        """Finish and save under the model's configured path and precision suffix."""
-        net = self.finish(outputs, transform_subnet=transform_subnet)
+        """Save the graph, supplying outputs only when it has not been finished yet."""
+        if self._finished_net is None:
+            if outputs is None:
+                raise ValueError("Supply outputs to save(), or call finish(outputs) first")
+            self.finish(outputs, transform_subnet=transform_subnet)
+        elif outputs is not None or transform_subnet is not None:
+            raise ValueError("Graph is already finished; call save() without outputs or transform_subnet")
         save_awesomenet(
-            net,
+            self._finished_net,
             self.model.model_name + (".fp32" if self.quantizable else ""),
             str(self.model.sima_model_sdk_path),
         )
