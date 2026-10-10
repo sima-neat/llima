@@ -1,65 +1,51 @@
 ---
 name: sima-contribute-to-llima
-description: Make safe changes in the sima-neat/llima repository across GenAI compilation, Hugging Face or GGUF ingestion, generated graphs, quantization, the Modalix C++ runtime, CLI/HTTP/ZMQ interfaces, packaging, CI, tests, documentation, and skills. Use for implementation, diagnosis, refactoring, testing, review fixes, and contributor documentation. Do not use for compiling a customer's model or building a Neat application.
+description: Modify or review the LLiMa repository. For new LLM/VLM checkpoint compatibility or architecture support, use sima-add-llima-model-support.
 ---
 
 # Contribute to LLiMa
 
-## Orient
+Work in a LLiMa checkout and follow its `AGENTS.md`. Skill installation includes
+the references below, not the repository's contributor guide. Repository paths
+such as `docs/contributing.md` are relative to that checkout.
 
-1. Read `AGENTS.md` and `docs/contributing.md`.
-2. Read `references/repository-map.md`, then classify the change.
-3. Diagnose one boundary at a time. Answer the scoped question first, then
-   separate independent downstream blockers instead of treating one failure as
-   proof that the whole workflow is unsupported.
-4. For runtime implementation, installed headers, bindings, CLI/HTTP/ZMQ,
-   lifecycle, or runtime packages, read `references/runtime-changes.md`.
-5. For external model or checkpoint compatibility, also use
-   `sima-add-llima-model-support` and read its compatibility audit before
-   classifying new implementation work.
-6. Search for nearby implementations, fallback resolvers, tests, CLI
-   definitions, and docs. When shared compiler code may affect both, trace the
-   native generation and quantization paths before adding a new helper.
-   Preserve unrelated work and vendored code.
+## Route the Work
 
-## Implement
+Load guidance for the affected surface, rather than all repository documents:
 
-- Make the smallest change that preserves compiler/runtime/package boundaries.
-- Treat installed APIs, CLI contracts, serialized configuration, package
-  metadata, and artifact layouts as compatibility surfaces.
-- Use `deps/manifest.json` for dependency versions.
-- For Transformer reference comparisons, follow the ModelGraph layout mapping
-  in `CONTRIBUTING.md`: 4D hidden states/attention and NHWC vision images.
-- Reject unsupported input explicitly; do not silently change model, revision,
-  precision, format, or execution path.
-- Distinguish declared dependency constraints from the versions actually
-  installed in the supported build environment.
-- Add focused tests and update the closest official guide with user-visible
-  behavior.
+| Task | Guidance |
+| --- | --- |
+| Locate code or package ownership | [Repository map](references/repository-map.md) |
+| Build or compare compiler graphs | ModelGraph and tensor layouts in `CONTRIBUTING.md` and `docs/contributing.md` |
+| Change runtime, installed APIs, bindings, or runtime packages | [Runtime contracts](references/runtime-changes.md) |
+| Select tests or build commands | Relevant sections of `tests/README.md` and `docs/contributing.md` |
+| Change dependencies or entry points | `deps/manifest.json` or `pyproject.toml`; verify the actual installed versions too |
 
-Apply the artifact, model-input, secret, vendor, and coding rules from
-`AGENTS.md`; do not duplicate them in task-specific changes.
+Use the model-support skill when the question is new LLM/VLM compatibility.
+Compiling an already supported model belongs to `sima-llima-compile-run`.
+Existing Whisper maintenance belongs here; the repository map identifies its
+separate compiler and runtime paths.
 
-## Validate
+## Constraints and Validation
 
-Use exact commands from `docs/contributing.md` and `tests/README.md`:
+Preserve the compiler/runtime/package boundaries and existing API, CLI,
+configuration, and artifact contracts. Reuse existing resolvers and graph
+helpers; reject unsupported input instead of silently changing the source,
+revision, precision, or execution path. Repository artifact, credential, and
+vendor rules remain authoritative.
 
-- hermetic tests for pure logic;
-- configured model-backed tests without unintended skips;
-- affected Debian/wheel builds for packaging;
-- packaged Modalix tests for MLA/runtime behavior; and
-- the isolated `sima-cli playbooks install ./skills` check from
-  `docs/contributing.md` for skills.
+Prefer existing test coverage; add or extend tests only for uncovered behavior
+or meaningful regression risk, not tests that merely mirror the implementation.
+Select validation for the changed surface: hermetic tests for pure logic,
+affected model-backed cases for graphs, package builds for packaging, and
+packaged Modalix checks for hardware-dependent runtime behavior. Skills need
+structural checks and the isolated install command in `docs/contributing.md`.
+Do not download models or run hardware/package suites for unrelated changes.
+Unintended skips and unavailable checks are not passes.
 
-Run targeted checks before broader tiers. Report unavailable model, compiler,
-or hardware checks as limitations, not passes.
+## Completion
 
-## Finish
-
-Report changed surfaces, compatibility/docs impact, tests run, skipped checks,
-and residual risk.
-
-## References
-
-- `references/repository-map.md`
-- `references/runtime-changes.md`
+A review or diagnosis ends with evidence-backed findings. An implementation
+includes the requested changes, affected validation, and user-visible docs.
+Report compatibility impact, validation results, unavailable checks, and
+remaining limitations; distinguish independent downstream blockers.

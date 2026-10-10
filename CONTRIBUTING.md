@@ -25,6 +25,10 @@ The first provides repository-wide contribution guidance. The second provides
 additional compatibility and implementation guidance when work reaches LLM or
 VLM model support.
 
+Installation includes each skill's supporting references, not this guide or
+`docs/contributing.md`. Those documents belong to the repository checkout;
+read their relevant sections when the task needs setup or validation guidance.
+
 In the Neat SDK, build runtime packages and tests with:
 
 ```bash
@@ -125,8 +129,9 @@ model compilation.
   breaks and migration steps.
 - Keep downloaded weights, customer data, secrets, and generated binary model
   artifacts out of Git. Use immutable model revisions and approved caches.
-- Follow local style, keep changes focused, and add tests and user
-  documentation with behavior changes.
+- Follow local style and keep changes focused. Reuse existing test coverage;
+  add or extend tests for uncovered behavior or meaningful regression risk.
+  Update user documentation when user-visible behavior changes.
 - Fail with actionable context instead of silently changing model, revision,
   precision, format, or execution path.
 - Keep shared state safe and teardown bounded.

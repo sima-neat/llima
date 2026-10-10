@@ -4,7 +4,9 @@
 
 Use the
 [SiMa.ai Pre-Quantized Models collection](https://huggingface.co/collections/simaai/pre-quantized-models)
-as the mandatory first lookup. The collection indexes independent,
+as the first lookup when selecting the default source or a recipe for a custom
+fine-tune. Honor an explicitly selected source; compiling a supplied compatible
+checkpoint needs no collection lookup. The collection indexes independent,
 model-specific repositories. It does not provide one generic quantization
 script.
 
