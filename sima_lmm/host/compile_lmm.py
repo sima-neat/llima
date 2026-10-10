@@ -241,6 +241,10 @@ def main():
         )
     )
     group.add_argument(
+        "--enable_filter_sharing", "--no-enable_filter_sharing",
+        action="store_true", help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=True,
         help=(
             "Quantizes embedding tables for LLMs and VLMs to reduce memory "
@@ -313,6 +317,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.enable_filter_sharing:
+        print(
+            "Warning: filter-sharing flags are deprecated and ignored. "
+            "Filter sharing is enabled automatically for decoder components.",
+            file=sys.stderr,
+        )
 
     if args.jobs is not None and args.jobs <= 0:
         parser.error("--jobs must be a positive integer")
