@@ -100,6 +100,75 @@ Whisper モデルリポジトリには、エンコーダーのレイヤーごと
 
 コンパイラの変更は通常、`sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py`、およびスクリプトに影響します。ランタイムの変更は、`sima_lmm/devkit/cpp/whisper_*` に影響します。`tests/README.md` に記載されているパッケージ化された C++ ASR ランタイムテストと、Modalix の代表的なオーディオを使用して検証します。これは、一般的な ASR アーキテクチャフレームワークではなく、Whisper に固有のパスです。
 
+### ネイティブグラフコンポーネント
+
+`sima_lmm/model/model_graph.py` の `ModelGraph` を使用します。コンポーネントのソース重み、精度、出力パスを一度設定します。グラフノードの構築はクラス内で行い、独立した配列レイアウトや命名のユーティリティはモジュール関数として残します。モデルコンポーネントはグラフのメソッドを使用するため、実装ではトポロジーに集中できます：
+
+```python
+from sima_lmm.model.model_graph import ModelGraph
+
+def generate_graph(self, layer_cfg, quantizable):
+    graph = ModelGraph(self, {"hidden": (1, 1, self.num_tokens, self.cfg.d_model)}, quantizable)
+    hidden = graph.layer_norm("model.norm", graph.inputs["hidden"])
+    output = graph.mlp("model.mlp", hidden, "gelu", residual=graph.inputs["hidden"])
+    graph.save([output])
+```
+
+独立したコンポーネントの入力、トップレベルのトポロジー、`graph.save()` は `generate_graph()` 内で定義します。Whisper の統合デコーダーグラフで使用する pre/cache/post 部分など、共有するグラフ構築には `_build_nodes(graph, inputs)` を残します。
+
+ログの範囲は `BaseModel.gen_files()` で設定されるため、グラフ構築に別のログ引数は不要です。
+
+形状から推論される入力型は、`quantizable=True` の場合は FP32（後で量子化する浮動小数点グラフ）、`False` の場合は BF16（ソース重みの精度を使用する直接グラフ）です。キャッシュなどの整数入力には `input_dtypes={"cache": np.int8}` を使用し、名前を入力仕様に一致させます。低レベルの呼び出しでは、既存の明示的な AFE テンソル仕様も使用できます。入力と出力の順序は指定した仕様に従い、形状と出力型は AFE が推論します。`constant()` は浮動小数点データをアクティベーションの精度に変換します。特定のビット幅の整数定数が必要な場合は、例えば `dtype=np.int32` を指定します。ノード名は AFE の決定的な作成カウンターに従います。
+
+グラフノードの型注釈には `model_graph.py` から `Node` をインポートします。ヘルパーには、別の `quantizable` フラグではなくグラフを渡します。`graph.constant()` は浮動小数点の精度を自動選択します。ホスト側の配列計算で同じ精度が必要な場合は、NumPy の `graph.dtype` を使用します。段階を示すフラグは `generate_graph()` とグラフの構築時にだけ使用します。
+
+`save()` は MLA サブネットを終了し、外側のグラフの出力タプルを作成します。整数出力を保持し、EV 上で BF16 出力を FP32 に変換し、標準のアーティファクト名で保存します（浮動小数点グラフには `.fp32`）。完成したネットワークを取得するには `finish()` を使用します。どちらも `transform_subnet` を受け取り、外側の出力を取り出す前にモデル固有の書き換えを行えます。コンポーネントのヘルパーにはグラフ自体を渡し、入力、精度、ソース重みを同じオブジェクトに保持します。
+
+名前付きの NumPy 入力で、完成したグラフを実行します：
+
+```python
+graph.finish([output])
+outputs = graph.run(hidden=x)
+outputs_jax = graph.run(hidden=x, use_jax=True)
+graph.save()
+```
+
+入力の名前、形状、データ型は宣言した入力に一致する必要があり、暗黙的な型変換は行いません。出力は `finish()` に渡した順序に従います。NumPy 実行は AFE の fast mode を使用し、MLA の参照演算と結果が異なる場合があります。`use_jax=True` は JAX の参照実行を選択し、fast mode は効果を持ちません。JAX の演算は設定されたバックエンドを使用し、対応する JAX 環境では GPU を使用できます。この API は量子化、コンパイル、Modalix 上での実行を行いません。一度だけ終了処理を行い、その後は `run()` と `save()` を繰り返し使用します。`save(outputs)` で終了と保存を一度に行うこともできます。
+
+一般的な操作には `add`, `sub`, `mul`, `matmul`, `concat`, `slice`, `transpose`, `reshape`, `softmax`, `topk`, `sum_channels`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`, `activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`, `clip`, `avgpool2d`, `space_to_depth`, `quant`, `dequant` があります。ゲート付き MLP には `projections=("gate_proj", "up_proj", "down_proj")` を使用し、既定値は `("fc1", "fc2")` です。`rms_norm("model.norm", input)` は言語モデル設定の epsilon と重みオフセットを使用します。vision や GDN の正規化で `epsilon` を明示すると、`weight_offset` も指定しない限り重みオフセットはゼロです。`rms_norm(None, input, epsilon=...)` は重みのないチャネルを推論します。RoPE は全体、部分、比率指定の split-half 回転をサポートします。`rope2d(input, cos_x, sin_x, cos_y, sin_y)` はチャネルの各四分の一を `[x-real, x-imag, y-real, y-imag]` の順で回転します。`split_heads(input, heads, repeat=...)` は grouped-query パターン向けに各ヘッドを繰り返します。`split_concat()` は、reshape だけでは表せない空間やトークンのレイアウトに AFE の再グループ化操作を提供します。`space_to_depth(input, blocksize)` は完全な空間ブロックをチャネルに統合します。`quant(input)` は `(int8_values, scale)` を返し、`dequant(int8_values, scale)` はグラフのアクティベーション精度を復元します。`argmax(input)` は INT32 のチャネルインデックスを返します。`slice(input, begin, end, stride, axis)` は、ランク 4 の FP32/BF16 テンソルに対する非整列の連続した単一軸チャネルスライスで、セレクター畳み込みを自動使用します。その他のスライスは AFE のネイティブ動作を維持します。
+
+`linear("model.proj", input)` は `model.proj.weight` と任意のバイアスを解決し、OI のソース重みを SiMa のレイアウトに変換します。パックされた重み、スケール、整列していないグループサイズ、リロケーションのメタデータを保持します。`conv()` は OIW または OIHW のソースレイアウトを推論します。明示的な変換で、Qwen の 5 次元パッチ重みなど他のレイアウトも変換できます。`WeightOptions` はソース名、レイアウト、重み・スケール・バイアスの変換、リロケーションの上書き設定を説明します。グループ化された重みをスライスする場合は、対応する `scale_process_func` を指定し、チェックポイントの実際のグループサイズを保持します。LoRA のランクと統合アダプターの動作は、`linear()` と `mlp()` の明示的な引数です。
+
+射影とヘッドのレイアウト操作で attention を構築します。既存の射影の丸めを保つため、クエリのスケーリングを `linear()` に組み込みます：
+
+```python
+queries = graph.split_heads(graph.linear("attn.q_proj", hidden, scale=head_dim ** -0.5), heads)
+keys = graph.split_heads(graph.linear("attn.k_proj", hidden), heads)
+values = graph.split_heads(graph.linear("attn.v_proj", hidden), heads)
+context = graph.attention(queries, keys, values)
+output = graph.linear("attn.out_proj", graph.merge_heads(context))
+```
+
+`split_heads()` は整列していないヘッドのチャネルをセレクター畳み込みで処理します。標準の vision attention は、これらの畳み込みを避けるため非整列ヘッドの射影重みをパディングします。グループ化された出力重みは元のレイアウトを保持します。`attention()` はクエリとキーの長さから、cross-attention を含む大きな attention テンソルでヘッド別の分岐を選択します。加算用の `mask` を受け取り、`score_scale` を指定しない限りクエリはスケーリング済みとみなします。このスケールは Q×K の後、マスクの前に適用し、Qwen vision などの BF16 演算順序を保持します。マスクはランク 4、ベクトル、スカラーのいずれかで、`[N,H,T_query,T_key]` にブロードキャストできる必要があります。未対応の形状では `ValueError` が発生します。
+
+`graph.matmul(lhs, rhs)` は MLA のバッチ行列積を作成します。転置フラグの既定値はどちらも `False` です。Kᵀ×V には `transpose_a=True`、Q×Kᵀ には `transpose_b=True` を使用します。入力はランク 4 の FP32/BF16 テンソルで、バッチと縮約次元が一致する必要があります。ヘッド数が割り切れる場合、grouped-query attention では暗黙的な繰り返しを使用します。不正な形状や型では `ValueError` が発生します。
+
+`graph.softmax(x)` の既定の軸は最後の軸です。`axis` の明示的な指定も可能です。連続した単一軸のスライスには `graph.slice(x, start=0, stop=128, axis=-1)` を使用し、複数軸には既存の `begin`/`end`/`stride`/`axis` リストを使用します。単一軸形式の開始位置は既定でゼロです。軸の明示と、範囲内の空でない境界が必要で、非整列チャネルの処理も維持します。二つの形式を混在させないでください。
+
+`ModelGraph` は AFE の `SimaBuilder` を拡張するため、共通ヘルパーとネイティブ操作を同じオブジェクトで使用できます：
+
+```python
+projected = graph.linear("model.proj", graph.inputs["hidden"])
+output = graph.add(projected, graph.inputs["hidden"])
+graph.save([output])
+```
+
+簡潔なプリミティブ操作は AFE メソッドの直接の別名であり、シグネチャ、型推論、決定的な命名を保持します。一般的でない操作には、継承された `create_*` メソッドを同じグラフで使用できます。独自の複数サブネットのライフサイクルが必要なグラフでは、AFE の `SimaBuilder` と低レベルの操作ヘルパーを直接使用できます。
+
+テセレーションは `sima_analysis.get_tessellate_parameters()` で一元的に推論します。HWC16 レイアウト、自動タイルサイズ、決定的な永続バッファ名を使用します。通常のコンポーネントは `BaseModel` から空の上書き設定を継承します。ストライド付き KV キャッシュなどの特殊なレイアウトでは、既存の `get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` メソッドを上書きします。キーはテンソルのインデックスで、負のインデックスは末尾から数えます。
+
+Whisper コンポーネント、すべてのネイティブ言語グラフ部分、標準の vision tower でこの API を使用しています。attention、MLP、回転のヘルパーは同じ実装を共有します。
+
 ## テスト
 
 エラーが発生した箇所に基づいてテストを選択します。ビルドは、動作検証の代わりにはなりません。また、スキップされた必須テストケースは、合格とはみなされません。
@@ -129,7 +198,7 @@ python -P -m pytest \
 `--model-inputs-path`と`LLIMA_HF_MODELS_PATH`は、準備されたHugging FaceのGGUF入力ルートを選択します。CIは、`tools/hf-safetensors/`の下にあるマニフェストを使用します。
 フィクスチャのスキップを受け入れる代わりに、必要な入力を設定します。
 
-テストマトリックス、期待されるカウント、およびベースラインポリシーは、`tests/README.md`にあります。CIの呼び出しは、`.github/workflows/model-compiler-tests.yml`にあります。実行中にModel SDKと数値比較アーティファクトを生成し、バイナリベースラインをコミットするのではなく、それらを使用します。
+テストマトリックス、期待される件数、およびベースラインポリシーは、`tests/README.md` に記載されています。CI の呼び出しは `.github/workflows/model-compiler-tests.yml` にあります。バイナリのベースラインをコミットする代わりに、実行中にネイティブ SDK グラフと数値比較アーティファクトを生成してください。
 
 ### ランタイムでの検証
 

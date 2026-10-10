@@ -1,8 +1,8 @@
 {
   "ja": {
     "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
-    "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
-    "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
+    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
@@ -10,8 +10,8 @@
   },
   "ko": {
     "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
-    "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
-    "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
+    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
@@ -19,8 +19,8 @@
   },
   "uk": {
     "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
-    "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
-    "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
+    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
@@ -28,8 +28,8 @@
   },
   "zh-Hant": {
     "docs/compilation_genai.md": "74a2ad7541457fa51d7a4821e5abb45a6558e817fa3cdfea196476bb0c444f98",
-    "docs/contributing.md": "da78aff7b059c75e3067d918c342094cd95d65a390e0d6ce67112c1b7f9d0324",
-    "docs/deployment.md": "45e597f9ce7ba9c2d824687e1aca12a5acc9d30a280720b37eb3a58c10c0cb79",
+    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
