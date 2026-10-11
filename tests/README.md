@@ -365,7 +365,9 @@ The manual Gemma4 MTP prefix-cache test takes an individual deployed target and
 assistant directory. It checks exact generated-token parity for cold/warm
 requests, prefill group boundaries, partial prefixes, continuation through the
 committed KV boundary, cancellation recovery, and long-context reuse (4,097
-tokens for an 8K model). It also
+tokens for an 8K model). Public token-ID requests are checked against direct
+MTP output, including token limits, stop-token overrides, timing dispatch, and
+restoring chat streaming after an error. It also
 asserts the actual prefill dispatch positions from runtime logs, rather than
 relying only on reported cache hits, and prints TTFT for comparison:
 
