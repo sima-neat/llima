@@ -746,6 +746,16 @@ class LanguageModelConfig(BaseConfig):
             else self.token_cfg.vocab_size
         )
 
+    @property
+    def single_model_num_tokens(self) -> int:
+        """Compiled decode width, distinct from recurrent MTP proposal count."""
+        spec_cfg = self.speculative_decoding_cfg
+        if spec_cfg is None:
+            return 1
+        if spec_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP and spec_cfg.is_draft:
+            return 1
+        return spec_cfg.speculative_budget
+
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
         cfg["token_cfg"] = TokenEmbedConfig(**cfg["token_cfg"])
@@ -1357,10 +1367,10 @@ class VlmConfig(BaseConfig):
             and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
         )
         verification_width = (
-            lm_cfg.speculative_decoding_cfg.speculative_budget
+            lm_cfg.single_model_num_tokens
             if lm_cfg.speculative_decoding_cfg is not None
             and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
-            and not is_speculative_draft else 1
+            else 1
         )
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:

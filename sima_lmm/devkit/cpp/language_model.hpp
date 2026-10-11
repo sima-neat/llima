@@ -456,20 +456,24 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t sliding_window = 0
         );
         uint8_t _find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const;
-        void _bind_gemma4_mtp_shared_kv_cache(
-            LanguageModel& target_lm,
+        std::vector<uint8_t> _prepare_gemma4_mtp_shared_kv_layers(
+            const LanguageModel& target_lm
+        ) const;
+        void _bind_kv_cache_inputs(
+            LanguageModel& kv_owner,
+            uint8_t source_layer,
             std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
             uint8_t cache_ifm_idx,
             uint16_t cache_token_idx_begin,
             uint16_t aligned_eff_num_cached_tokens,
-            bool has_future_token_mask,
-            std::string_view layer_type
+            bool has_future_token_mask
         );
         Gemma4MtpTargetBatchResult _run_gemma4_mtp_target_batch(
             uint16_t token_idx, std::span<const uint32_t> token_ids
         );
         Gemma4MtpDraftStepResult _run_gemma4_mtp_draft_step(
             LanguageModel& target_lm,
+            std::span<const uint8_t> shared_kv_layers,
             uint32_t token_id,
             const std::vector<Eigen::bfloat16>& hidden_state,
             uint16_t query_position_id,

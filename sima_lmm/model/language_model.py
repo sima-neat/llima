@@ -27,7 +27,6 @@ from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
     LlmArchType,
     PipelineConfig,
-    SpeculativeDecodingMethod,
     VlmArchType,
 )
 
@@ -585,17 +584,7 @@ class LanguageModel(BaseModel):
 
     @property
     def _single_model_num_tokens(self) -> int:
-        if self.cfg.lm_cfg.speculative_decoding_cfg is None:
-            return 1
-        if (
-            self.cfg.lm_cfg.speculative_decoding_cfg.method
-            == SpeculativeDecodingMethod.GEMMA4_MTP
-            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
-        ):
-            # Gemma4 MTP proposes `speculative_budget` tokens recurrently. Each
-            # assistant invocation consumes one token/hidden-state pair.
-            return 1
-        return self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
+        return self.cfg.lm_cfg.single_model_num_tokens
 
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,

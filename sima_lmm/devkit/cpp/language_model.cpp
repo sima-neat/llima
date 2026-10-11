@@ -1124,8 +1124,8 @@ uint32_t LanguageModel::run_model_once(
                 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
             );
 
-            // Non-spec uses n1 for the final row. Target speculative prefill
-            // reuses n16 and binds a contiguous window containing the final row.
+            // Non-spec uses n1 for the final row. Target speculative prefill reuses
+            // the compiled verification width with a contiguous window containing that row.
             if (num_tokens > 1 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
                 && !_cfg.lm_cfg.is_spec_decode()) {
                 const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;

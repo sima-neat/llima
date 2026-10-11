@@ -41,11 +41,8 @@ uint16_t draft_visible_shared_kv_len(
     ) {
         throw std::runtime_error("Gemma4 MTP shared KV length exceeds cache capacity");
     }
-    // The target may have computed speculative rows beyond the accepted prefix.
-    // Transformers exposes those rows only through the current input length. A
-    // partial rejection therefore makes the visible KV length one greater than
-    // the assistant query position, while initial/full-acceptance rounds remain
-    // bounded by the number of rows the target actually produced.
+    // After rejection, speculative KV remains visible up to the current input length.
+    // Cap visibility at the rows actually produced by the target.
     return static_cast<uint16_t>(std::min(input_length, available_shared_kv_len));
 }
 

@@ -1,8 +1,6 @@
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstddef>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -26,27 +24,6 @@ uint16_t checked_u16(size_t value, std::string_view name) {
         throw std::runtime_error(fmt::format("{} exceeds uint16_t range", name));
     }
     return static_cast<uint16_t>(value);
-}
-
-uint16_t gemma4_mtp_runtime_draft_tokens(uint16_t compiled_budget) {
-    const char* value = std::getenv("SIMA_LLIMA_GEMMA4_MTP_DRAFT_TOKENS");
-    if (value == nullptr) {
-        return compiled_budget;
-    }
-
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long parsed = std::strtoul(value, &end, 10);
-    if (
-        errno != 0 || end == value || *end != '\0'
-        || parsed == 0 || parsed > compiled_budget
-    ) {
-        throw std::runtime_error(fmt::format(
-            "SIMA_LLIMA_GEMMA4_MTP_DRAFT_TOKENS must be between 1 and {}",
-            compiled_budget
-        ));
-    }
-    return static_cast<uint16_t>(parsed);
 }
 
 } // namespace
@@ -375,15 +352,9 @@ uint8_t LanguageModel::_find_gemma4_mtp_target_kv_layer(std::string_view layer_t
     ));
 }
 
-void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
-    LanguageModel& target_lm,
-    std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
-    uint8_t cache_ifm_idx,
-    uint16_t cache_token_idx_begin,
-    uint16_t aligned_eff_num_cached_tokens,
-    bool has_future_token_mask,
-    std::string_view layer_type
-) {
+std::vector<uint8_t> LanguageModel::_prepare_gemma4_mtp_shared_kv_layers(
+    const LanguageModel& target_lm
+) const {
     if (_cfg.pipeline_cfg.use_strided_kv_cache != target_lm._cfg.pipeline_cfg.use_strided_kv_cache) {
         throw std::runtime_error("Gemma4 MTP target/draft strided-KV settings must match");
     }
@@ -394,39 +365,64 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
         throw std::runtime_error("Gemma4 MTP target/draft max_num_tokens must match");
     }
 
-    const std::string layer_type_str(layer_type);
-    const uint8_t source_layer = target_lm._find_gemma4_mtp_target_kv_layer(layer_type);
-    const uint32_t source_head_dim = target_lm._cfg.lm_cfg.attn_cfg.get_head_dim(layer_type_str);
-    const uint32_t consumer_head_dim = _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type_str);
     const uint32_t source_kv_heads = target_lm._cfg.lm_cfg.attn_cfg.num_key_value_heads;
     const uint32_t consumer_kv_heads = _cfg.lm_cfg.attn_cfg.num_key_value_heads;
-    if (source_head_dim != consumer_head_dim || source_kv_heads != consumer_kv_heads) {
-        throw std::runtime_error(fmt::format(
-            "Gemma4 MTP shared KV shape mismatch for {}: target {}x{}, draft {}x{}",
-            layer_type_str, source_kv_heads, source_head_dim,
-            consumer_kv_heads, consumer_head_dim
-        ));
+    if (_cfg.lm_cfg.layer_types.size() != _cfg.lm_cfg.num_hidden_layers) {
+        throw std::runtime_error("Gemma4 MTP assistant layer_types must match num_hidden_layers");
     }
+    std::vector<uint8_t> source_layers;
+    source_layers.reserve(_cfg.lm_cfg.num_hidden_layers);
+    for (const auto& layer_type : _cfg.lm_cfg.layer_types) {
+        if (layer_type != "full_attention" && layer_type != "sliding_attention") {
+            throw std::runtime_error("Gemma4 MTP draft supports attention-only assistant layers");
+        }
+        const uint8_t source_layer = target_lm._find_gemma4_mtp_target_kv_layer(layer_type);
+        const uint32_t source_head_dim = target_lm._cfg.lm_cfg.attn_cfg.get_head_dim(layer_type);
+        const uint32_t consumer_head_dim = _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type);
+        if (source_head_dim != consumer_head_dim || source_kv_heads != consumer_kv_heads) {
+            throw std::runtime_error(fmt::format(
+                "Gemma4 MTP shared KV shape mismatch for {}: target {}x{}, draft {}x{}",
+                layer_type, source_kv_heads, source_head_dim,
+                consumer_kv_heads, consumer_head_dim
+            ));
+        }
+        source_layers.push_back(source_layer);
+    }
+    return source_layers;
+}
 
+void LanguageModel::_bind_kv_cache_inputs(
+    LanguageModel& kv_owner,
+    uint8_t source_layer,
+    std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
+    uint8_t cache_ifm_idx,
+    uint16_t cache_token_idx_begin,
+    uint16_t aligned_eff_num_cached_tokens,
+    bool has_future_token_mask
+) {
+    const auto& buffers = kv_owner._attention_binding_buffers.at(source_layer);
+    const auto& attn_cfg = kv_owner._cfg.lm_cfg.attn_cfg;
+    const uint32_t kv_heads = attn_cfg.num_key_value_heads;
+    const uint32_t head_dim = attn_cfg.get_head_dim(kv_owner._cfg.lm_cfg.layer_types[source_layer]);
     std::vector<uint32_t> kv_begin;
     std::vector<uint32_t> kv_shape;
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         kv_begin = {0, cache_token_idx_begin, 0};
         kv_shape = {
-            consumer_kv_heads,
+            kv_heads,
             _cfg.pipeline_cfg.max_num_tokens,
-            consumer_head_dim
+            head_dim
         };
     } else {
         kv_begin = {cache_token_idx_begin, 0};
-        kv_shape = {aligned_eff_num_cached_tokens, consumer_kv_heads * consumer_head_dim};
+        kv_shape = {aligned_eff_num_cached_tokens, kv_heads * head_dim};
     }
 
     cache_ifm_map.emplace(
         std::piecewise_construct,
         std::forward_as_tuple(cache_ifm_idx++),
         std::forward_as_tuple(
-            &target_lm.get_buffer(fmt::format("cache_key_l{}", source_layer)),
+            buffers.key,
             kv_begin,
             kv_shape
         )
@@ -436,9 +432,9 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
             std::piecewise_construct,
             std::forward_as_tuple(cache_ifm_idx++),
             std::forward_as_tuple(
-                &target_lm.get_buffer(fmt::format("cache_key_scale_l{}", source_layer)),
+                buffers.key_scale,
                 std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                std::vector<uint32_t>{consumer_kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                std::vector<uint32_t>{kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             )
         );
     }
@@ -449,7 +445,7 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
         std::piecewise_construct,
         std::forward_as_tuple(cache_ifm_idx),
         std::forward_as_tuple(
-            &target_lm.get_buffer(fmt::format("cache_val_l{}", source_layer)),
+            buffers.value,
             kv_begin,
             kv_shape
         )
@@ -459,9 +455,9 @@ void LanguageModel::_bind_gemma4_mtp_shared_kv_cache(
             std::piecewise_construct,
             std::forward_as_tuple(cache_ifm_idx + 1),
             std::forward_as_tuple(
-                &target_lm.get_buffer(fmt::format("cache_val_scale_l{}", source_layer)),
+                buffers.value_scale,
                 std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                std::vector<uint32_t>{consumer_kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                std::vector<uint32_t>{kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
             )
         );
     }
@@ -599,46 +595,15 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
         );
 
         std::map<uint8_t, MLABufferSlice> cache_ifm_map;
-        uint8_t cache_ifm_idx = 1;
-        std::vector<uint32_t> kv_begin;
-        std::vector<uint32_t> kv_shape;
-        if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-            kv_begin = {0, cache_token_idx_begin, 0};
-            kv_shape = {
-                _cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                _cfg.pipeline_cfg.max_num_tokens,
-                _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
-            };
-        } else {
-            kv_begin = {cache_token_idx_begin, 0};
-            kv_shape = {
-                aligned_eff_num_cached_tokens,
-                _cfg.lm_cfg.attn_cfg.get_kv_size(layer_type)
-            };
-        }
-        const uint8_t kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
-        cache_ifm_map.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(cache_ifm_idx++),
-            std::forward_as_tuple(
-                &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)), kv_begin, kv_shape
-            )
+        _bind_kv_cache_inputs(
+            *this,
+            _cfg.lm_cfg.get_kv_source_layer(layer_idx),
+            cache_ifm_map,
+            /*cache_ifm_idx=*/1,
+            cache_token_idx_begin,
+            aligned_eff_num_cached_tokens,
+            use_future_token_mask
         );
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            cache_ifm_map.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(cache_ifm_idx++),
-                std::forward_as_tuple(
-                    &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
-                    std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                    std::vector<uint32_t>{
-                        _cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                        _cfg.pipeline_cfg.max_num_tokens,
-                        1
-                    }
-                )
-            );
-        }
         if (use_future_token_mask) {
             auto& mask_buffer = get_buffer(is_sliding
                 ? "gemma4_mtp_sliding_future_token_mask" : "future_token_mask");
@@ -650,33 +615,14 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
                 );
                 mask_uploaded[is_sliding] = true;
             }
+            const uint8_t mask_ifm_idx = 2 + static_cast<uint8_t>(
+                _cfg.pipeline_cfg.quantize_kv_cache
+            );
             cache_ifm_map.emplace(
-                cache_ifm_idx++,
+                mask_ifm_idx,
                 MLABufferSlice{
                     &mask_buffer, {0, 0}, {num_tokens, aligned_eff_num_cached_tokens}
                 }
-            );
-        }
-        cache_ifm_map.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(cache_ifm_idx++),
-            std::forward_as_tuple(
-                &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)), kv_begin, kv_shape
-            )
-        );
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            cache_ifm_map.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(cache_ifm_idx),
-                std::forward_as_tuple(
-                    &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
-                    std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                    std::vector<uint32_t>{
-                        _cfg.lm_cfg.attn_cfg.num_key_value_heads,
-                        _cfg.pipeline_cfg.max_num_tokens,
-                        1
-                    }
-                )
             );
         }
 
@@ -713,6 +659,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
 
 LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_step(
     LanguageModel& target_lm,
+    std::span<const uint8_t> shared_kv_layers,
     uint32_t token_id,
     const std::vector<Eigen::bfloat16>& hidden_state,
     uint16_t query_position_id,
@@ -757,11 +704,6 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-        if (layer_type != "full_attention" && layer_type != "sliding_attention") {
-            throw std::runtime_error(
-                "Gemma4 MTP draft supports attention-only assistant layers"
-            );
-        }
 
         const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
         const LanguageModelMapKey cache_key = _get_cache_model_key(
@@ -797,14 +739,14 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
         );
 
         std::map<uint8_t, MLABufferSlice> cache_ifm_map;
-        _bind_gemma4_mtp_shared_kv_cache(
+        _bind_kv_cache_inputs(
             target_lm,
+            shared_kv_layers[layer_idx],
             cache_ifm_map,
             /*cache_ifm_idx=*/1,
             cache_token_idx_begin,
             aligned_eff_num_cached_tokens,
-            use_future_token_mask,
-            layer_type
+            use_future_token_mask
         );
         if (use_future_token_mask) {
             auto& mask_buffer = get_buffer(is_sliding
@@ -888,6 +830,20 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         throw std::runtime_error("Gemma4 MTP generation requires at least one input token");
     }
 
+    const uint16_t draft_budget = draft_lm._cfg.lm_cfg.speculative_decoding_cfg
+        .value().speculative_budget;
+    const uint16_t verification_width = _cfg.lm_cfg.get_single_num_tokens();
+    if (draft_budget == 0 || verification_width != draft_budget + 1) {
+        throw std::runtime_error(fmt::format(
+            "Gemma4 MTP target width n{} must equal draft budget {} plus one",
+            verification_width, draft_budget
+        ));
+    }
+    if (draft_lm._cfg.lm_cfg.get_single_num_tokens() != 1) {
+        throw std::runtime_error("Gemma4 MTP assistant must use pointwise n1 execution");
+    }
+    const auto shared_kv_layers = draft_lm._prepare_gemma4_mtp_shared_kv_layers(*this);
+
     _is_running = true;
     draft_lm._is_running = true;
     if (performance_result != nullptr) {
@@ -921,7 +877,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         } else {
             // Decode stages arbitrary positions over the start of the RoPE
             // tables. Restore those rows before prefilling another request.
-            const auto verification_width = _cfg.lm_cfg.get_single_num_tokens();
             _upload_gemma4_mtp_freq_rows(verification_width, 0, verification_width);
             const auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
             // Even a complete prefix match needs a fresh next-token result because
@@ -970,30 +925,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             }
         }
 
-        const uint16_t draft_budget = draft_lm._cfg.lm_cfg.speculative_decoding_cfg
-            .value().speculative_budget;
-        const uint16_t verification_width = _cfg.lm_cfg.get_single_num_tokens();
-        if (draft_budget == 0 || verification_width != draft_budget + 1) {
-            throw std::runtime_error(fmt::format(
-                "Gemma4 MTP target width n{} must equal draft budget {} plus one",
-                verification_width, draft_budget
-            ));
-        }
-        if (draft_lm._cfg.lm_cfg.get_single_num_tokens() != 1) {
-            throw std::runtime_error(
-                "Gemma4 MTP assistant must use pointwise n1 execution"
-            );
-        }
-        const uint16_t runtime_draft_tokens = gemma4_mtp_runtime_draft_tokens(
-            draft_budget
-        );
-        if (runtime_draft_tokens != draft_budget) {
-            _logger->info(
-                "Gemma4 MTP runtime draft tokens: {} (compiled budget {})",
-                runtime_draft_tokens, draft_budget
-            );
-        }
-
         auto commit_processed_prefix = [&](size_t processed_tokens) {
             const auto processed_end = input_ids.begin()
                 + static_cast<std::ptrdiff_t>(processed_tokens);
@@ -1020,7 +951,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             // Reserve one output slot for the target mismatch or bonus token.
             // With one slot remaining, verify the anchor without drafting.
             const uint16_t round_draft_tokens = static_cast<uint16_t>(std::min<size_t>(
-                runtime_draft_tokens, remaining_output_tokens - 1
+                draft_budget, remaining_output_tokens - 1
             ));
 
             const bool verification_fits = (
@@ -1058,6 +989,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 while (draft_token_ids.size() < round_draft_tokens) {
                     auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
                         *this,
+                        shared_kv_layers,
                         draft_input_token,
                         draft_hidden,
                         query_position_id,
