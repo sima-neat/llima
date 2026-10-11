@@ -2422,12 +2422,9 @@ uint16_t LanguageModel::_get_cache_token_idx_begin(
     if (layer_type != "sliding_attention") {
         return 0;
     }
-    // Group prefill retains the first row's complete window. Speculative
-    // single-model batches keep their existing separate decoding contract.
-    const uint16_t window_rows = num_tokens == _cfg.lm_cfg.get_single_num_tokens()
-        ? num_tokens : 1;
+    // Retain the first query's full window for prefill and verification.
     return std::max(
-        0, token_idx + window_rows - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+        0, token_idx + 1 - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
     );
 }
 
@@ -2462,7 +2459,8 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     );
     const bool use_sliding_cache = (
         separate_sliding_cache
-        || (layer_type == "sliding_attention" && !is_single_model
+        || (layer_type == "sliding_attention"
+            && (!is_single_model || _cfg.lm_cfg.is_gemma4_mtp_target())
             && token_idx + num_tokens > sliding_window)
         || (is_single_model && sliding_cache_mask_differs
             && eff_num_cached_tokens >= sliding_window)
@@ -2492,6 +2490,11 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
         aligned_eff_token_idx = aligned_eff_num_cached_tokens - num_tokens;
     } else {
         aligned_eff_token_idx = eff_token_idx;
+    }
+    if (use_sliding_cache && is_single_model && _cfg.lm_cfg.is_gemma4_mtp_target()) {
+        aligned_eff_token_idx = std::min<uint16_t>(
+            aligned_eff_token_idx, sliding_window + num_tokens - 2
+        );
     }
 
     // The second key field is a cache executable kind, not a transformer layer.

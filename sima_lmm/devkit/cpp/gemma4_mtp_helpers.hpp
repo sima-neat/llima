@@ -28,7 +28,8 @@ std::vector<Eigen::bfloat16> build_causal_mask(
     uint16_t first_visible_token_count,
     uint16_t valid_tokens,
     uint16_t cache_token_idx_begin,
-    uint16_t context_length
+    uint16_t context_length,
+    uint16_t sliding_window = 0
 );
 
 std::vector<std::pair<uint32_t, bool>> resolve_draft_tokens(

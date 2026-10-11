@@ -349,11 +349,11 @@ void LanguageModel::_upload_gemma4_mtp_freq_rows(
 void LanguageModel::_upload_gemma4_mtp_causal_mask(
     MLABuffer& buffer,
     uint16_t num_tokens, uint16_t first_visible_token_count, uint16_t valid_tokens,
-    uint16_t cache_token_idx_begin, uint16_t context_length
+    uint16_t cache_token_idx_begin, uint16_t context_length, uint16_t sliding_window
 ) {
     const auto mask = gemma4_mtp_helpers::build_causal_mask(
         num_tokens, first_visible_token_count, valid_tokens,
-        cache_token_idx_begin, context_length
+        cache_token_idx_begin, context_length, sliding_window
     );
     // MLA reads packed rows at the cache ELF's compiled context width.
     // upload() would insert padding for the allocation's full-context shape.
@@ -579,13 +579,9 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             }
         }
 
-        const uint16_t cache_token_idx_begin = is_sliding
-            ? static_cast<uint16_t>(std::max(
-                0,
-                static_cast<int>(token_idx) + num_tokens
-                    - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-            ))
-            : 0;
+        const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+            num_tokens, token_idx, layer_type
+        );
         const uint16_t eff_num_cached_tokens = static_cast<uint16_t>(
             token_idx + num_tokens - cache_token_idx_begin
         );
@@ -649,7 +645,8 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             if (!mask_uploaded[is_sliding]) {
                 _upload_gemma4_mtp_causal_mask(
                     mask_buffer, num_tokens, static_cast<uint16_t>(token_idx + 1),
-                    num_tokens, cache_token_idx_begin, aligned_eff_num_cached_tokens
+                    valid_tokens, cache_token_idx_begin, aligned_eff_num_cached_tokens,
+                    is_sliding ? _cfg.lm_cfg.attn_cfg.sliding_window.value() : 0
                 );
                 mask_uploaded[is_sliding] = true;
             }
@@ -780,13 +777,9 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
         pre_model._bind_ifm(1, &freq_real, {0, 0});
         pre_model._bind_ifm(2, &freq_imag, {0, 0});
 
-        const uint16_t cache_token_idx_begin = is_sliding
-            ? static_cast<uint16_t>(std::max(
-                0,
-                static_cast<int>(cache_model_token_idx) + num_tokens
-                    - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-            ))
-            : 0;
+        const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+            num_tokens, cache_model_token_idx, layer_type
+        );
         const uint16_t eff_num_cached_tokens = static_cast<uint16_t>(
             cache_model_token_idx + num_tokens - cache_token_idx_begin
         );
@@ -819,7 +812,8 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
             if (!mask_uploaded[is_sliding]) {
                 _upload_gemma4_mtp_causal_mask(
                     mask_buffer, num_tokens, shared_kv_len, 1,
-                    cache_token_idx_begin, aligned_eff_num_cached_tokens
+                    cache_token_idx_begin, aligned_eff_num_cached_tokens,
+                    is_sliding ? _cfg.lm_cfg.attn_cfg.sliding_window.value() : 0
                 );
                 mask_uploaded[is_sliding] = true;
             }

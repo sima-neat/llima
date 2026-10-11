@@ -54,7 +54,8 @@ std::vector<Eigen::bfloat16> build_causal_mask(
     uint16_t first_visible_token_count,
     uint16_t valid_tokens,
     uint16_t cache_token_idx_begin,
-    uint16_t context_length
+    uint16_t context_length,
+    uint16_t sliding_window
 ) {
     if (valid_tokens == 0 || valid_tokens > num_tokens
         || first_visible_token_count <= cache_token_idx_begin
@@ -68,9 +69,12 @@ std::vector<Eigen::bfloat16> build_causal_mask(
     );
     const size_t first_visible_columns = first_visible_token_count - cache_token_idx_begin;
     for (uint16_t row = 0; row < valid_tokens; ++row) {
+        const size_t end = first_visible_columns + row;
+        const size_t begin = sliding_window > 0 && end > sliding_window
+            ? end - sliding_window : 0;
         std::fill_n(
-            mask.begin() + static_cast<size_t>(row) * context_length,
-            first_visible_columns + row,
+            mask.begin() + static_cast<size_t>(row) * context_length + begin,
+            end - begin,
             Eigen::bfloat16{0.0f}
         );
     }

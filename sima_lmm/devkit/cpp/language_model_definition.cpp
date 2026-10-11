@@ -853,11 +853,12 @@ std::filesystem::path LanguageModel::_get_elf_path_cache(
         cache_name,
         token_idx
     );
-    if (use_sliding_cache && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
+    if (use_sliding_cache
+        && (num_tokens != _cfg.lm_cfg.get_single_num_tokens() || _cfg.lm_cfg.is_gemma4_mtp_target())
         && token_idx + num_tokens > _cfg.lm_cfg.attn_cfg.sliding_window.value()
         && !_files->exists("elf_files/" + elf_file_name)) {
         throw std::runtime_error(fmt::format(
-            "Incompatible compiled sliding-attention model. Recompile the grouped "
+            "Incompatible compiled sliding-attention model. Recompile the affected "
             "sliding-cache stages and redeploy. Missing: {}.",
             elf_file_name
         ));

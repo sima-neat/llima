@@ -212,6 +212,7 @@ def test_gemma4_mtp_target_compiles_batched_decode_models_only():
     config.config_pipeline(None, None, 2048, 128, 128)
 
     assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 7
+    assert _layer_indices(config, "single_sliding_cache") == [127, 255, 383, 511, 517]
     assert not any(layer.part.startswith("point_") for layer in config.get_layer_ids())
     assert _layer_indices(config, "single_per_layer") == [0]
     for layer_id in config.get_layer_ids():

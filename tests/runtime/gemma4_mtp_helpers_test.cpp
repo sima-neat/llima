@@ -33,12 +33,13 @@ void expect_runtime_error(Callable&& callable, const std::string& message) {
 
 void expect_mask_row(
     const std::vector<Eigen::bfloat16>& mask, size_t columns,
-    size_t row, size_t visible_columns
+    size_t row, size_t visible_columns, size_t first_visible_column = 0
 ) {
     for (size_t column = 0; column < columns; ++column) {
         const float value = static_cast<float>(mask[row * columns + column]);
         expect(
-            column < visible_columns ? value == 0.0f : std::isinf(value) && value < 0.0f,
+            column >= first_visible_column && column < visible_columns
+                ? value == 0.0f : std::isinf(value) && value < 0.0f,
             "mask visibility must match the causal prefix at the compiled row stride"
         );
     }
@@ -63,13 +64,14 @@ void test_causal_mask_spans_a_context_bucket_boundary() {
 }
 
 void test_causal_mask_uses_relative_sliding_columns() {
-    const auto mask = build_causal_mask(7, 1201, 7, 183, 1024);
-    expect_mask_row(mask, 1024, 0, 1018);
-    expect_mask_row(mask, 1024, 6, 1024);
+    const auto mask = build_causal_mask(7, 1201, 7, 689, 518, 512);
+    for (size_t row = 0; row < 7; ++row) {
+        expect_mask_row(mask, 518, row, 512 + row, row);
+    }
 
     // The pointwise assistant can expose a complete shared-KV window.
-    const auto draft_mask = build_causal_mask(1, 1201, 1, 177, 1024);
-    expect_mask_row(draft_mask, 1024, 0, 1024);
+    const auto draft_mask = build_causal_mask(1, 1201, 1, 689, 512, 512);
+    expect_mask_row(draft_mask, 512, 0, 512);
 }
 
 void test_causal_mask_keeps_padding_masked_and_rejects_invalid_ranges() {

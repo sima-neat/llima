@@ -1356,6 +1356,12 @@ class VlmConfig(BaseConfig):
             is_speculative_draft
             and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
         )
+        verification_width = (
+            lm_cfg.speculative_decoding_cfg.speculative_budget
+            if lm_cfg.speculative_decoding_cfg is not None
+            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+            and not is_speculative_draft else 1
+        )
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
                 raise ValueError(
@@ -1429,7 +1435,7 @@ class VlmConfig(BaseConfig):
                         for is_group in (False, True)
                     )
                     terminal_sliding_cache = (
-                        sliding_cache_mask_differs
+                        (sliding_cache_mask_differs or verification_width > 1)
                         and sliding_window <= pipeline_cfg.max_num_tokens
                     )
                     if not sliding_cache_mask_differs:
@@ -1452,12 +1458,14 @@ class VlmConfig(BaseConfig):
                     layers.extend(
                         LayerID("single_sliding_cache", n)
                         for n in single_sliding_cache_model_indices(
-                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window, verification_width
                         )
                     )
                 elif terminal_sliding_cache:
                     layers.append(LayerID(
                         "single_sliding_cache",
+                        min(sliding_window + verification_width - 1, pipeline_cfg.max_num_tokens) - 1
+                        if verification_width > 1 else
                         _cache_model_index(
                             pipeline_cfg,
                             "sliding_attention",
@@ -1716,7 +1724,9 @@ def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     return _single_cache_model_indices(cfg, "full_attention")
 
 
-def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
+def single_sliding_cache_model_indices(
+    cfg: PipelineConfig, sliding_window: int, num_tokens: int = 1
+) -> list[int]:
     """
     Get the indices of all single-token sliding-window cache models.
 
@@ -1728,10 +1738,14 @@ def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int)
     Returns:
         Indices of single sliding cache models in ascending order.
     """
-    return [
+    indices = [
         n for n in _single_cache_model_indices(cfg, "sliding_attention")
         if n < sliding_window
     ]
+    if num_tokens > 1:
+        # Verification retains the union of all query-row windows.
+        indices.append(min(sliding_window + num_tokens - 1, cfg.max_num_tokens) - 1)
+    return sorted(set(indices))
 
 
 def single_shared_sliding_cache_model_indices(
