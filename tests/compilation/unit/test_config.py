@@ -233,7 +233,7 @@ def test_legacy_pipeline_config_uses_stored_mask_for_all_attention_types():
 
 @pytest.mark.parametrize(
     ("sliding_window", "expected_transition"),
-    [(512, 384), (1024, 896)],
+    [(512, 511), (1024, 1023)],
 )
 def test_gemma3_automatic_sliding_cache_transition(
     sliding_window: int, expected_transition: int
@@ -242,8 +242,8 @@ def test_gemma3_automatic_sliding_cache_transition(
     config.lm_cfg.attn_cfg.sliding_window = sliding_window
     config.config_pipeline(None, None, 2048, 128, 128)
 
-    assert expected_transition in _layer_indices(config, "group_cache")
-    assert _layer_indices(config, "group_sliding_cache") == []
+    assert expected_transition not in _layer_indices(config, "group_cache")
+    assert _layer_indices(config, "group_sliding_cache") == [expected_transition]
 
 
 def test_shared_sliding_cache_includes_full_and_sliding_mask_buckets():
@@ -260,9 +260,9 @@ def test_shared_sliding_cache_transition_does_not_add_execution_offset():
     config.lm_cfg.attn_cfg.sliding_window = 1000
     config.config_pipeline(None, None, 2048, 128, 128)
 
-    transition = 872
-    assert transition not in config.pipeline_cfg.input_token_group_offsets
-    assert transition in _layer_indices(config, "group_cache")
+    assert config.pipeline_cfg.input_token_group_offsets == list(range(0, 2048, 128))
+    assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
+    assert _layer_indices(config, "group_sliding_cache") == [896, 999]
 
 
 def test_gemma4_keeps_separate_sliding_cache_models():
@@ -271,7 +271,7 @@ def test_gemma4_keeps_separate_sliding_cache_models():
 
     assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
     assert _layer_indices(config, "single_cache") == list(range(127, 2048, 128))
-    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384]
+    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384, 511]
     assert _layer_indices(config, "single_sliding_cache") == [127, 255, 383, 511]
 
 
@@ -281,8 +281,20 @@ def test_non_default_mask_only_buckets_single_cache_models_through_2k():
 
     assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
     assert _layer_indices(config, "single_cache") == list(range(255, 2048, 256))
-    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384]
+    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384, 511]
     assert _layer_indices(config, "single_sliding_cache") == [255, 511]
+
+
+@pytest.mark.parametrize(
+    ("window", "group", "expected"),
+    [(128, 112, [112, 127]), (4096, 128, []), (512, 128, [511])],
+)
+def test_group_sliding_cache_only_adds_executed_crossing_windows(window, group, expected):
+    config = _load_reference_config("gemma3_vlm_config.json")
+    config.lm_cfg.attn_cfg.sliding_window = window
+    config.config_pipeline(None, None, 4096, group, 128)
+
+    assert _layer_indices(config, "group_sliding_cache") == expected
 
 
 @pytest.mark.parametrize("max_num_tokens", [128, 512, 2049, 2500])
@@ -339,8 +351,10 @@ def test_group_configuration_is_automatic_and_serializable():
     assert restored.pipeline_cfg.input_token_group_offsets == list(range(0, 1024, 128))
 
 
-def test_sliding_attention_rejects_group_at_least_as_large_as_window():
+@pytest.mark.parametrize("group", [512, 1024])
+def test_sliding_attention_supports_groups_at_least_as_large_as_window(group):
     config = _load_reference_config("gemma3_vlm_config.json")
+    config.lm_cfg.attn_cfg.sliding_window = 512
+    config.config_pipeline(None, None, 2048, group, 128)
 
-    with pytest.raises(ValueError, match="smaller than sliding_window"):
-        config.config_pipeline(None, None, 2048, 1024, 128)
+    assert _layer_indices(config, "group_sliding_cache") == ([511] if group == 512 else [0, 511])

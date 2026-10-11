@@ -206,6 +206,9 @@ class LanguageCacheModel(LanguagePartBaseModel):
                 # Attention mask is a static constant.
                 mask = np.zeros((1, 1, self.num_tokens, self.context_length), dtype=np.float32)
                 for i in range(self.num_tokens):
+                    if self.layer_type == "sliding_attention":
+                        begin = max(0, self.token_idx + i + 1 - self.cfg.lm_cfg.attn_cfg.sliding_window)
+                        mask[0, 0, i, :begin] = np.finfo(np.float32).min
                     for j in range(self.token_idx + i + 1, self.context_length):
                         mask[0, 0, i, j] = np.finfo(np.float32).min
                 mask_const = graph.constant(mask)
