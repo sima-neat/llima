@@ -435,14 +435,14 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         // Prefill.
         auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
         const auto output_token_id_begin = input_token_ids.size();
-        if (input_token_ids.size() == _max_num_tokens) {
+        if (!_is_running.load(std::memory_order_relaxed)) {
+            // Do nothing.
+        } else if (input_token_ids.size() == _max_num_tokens) {
             _notify_cache_full();
             output_token_ids = std::vector<uint32_t>();
         } else if (_stop_token_ids.contains(token_id)) {
             _notify_stop();
             output_token_ids = std::vector<uint32_t>{token_id};
-        } else if (!_is_running.load(std::memory_order_relaxed)) {
-            // Do nothing.
         } else {
             // Decode.
             run_model_decode(input_token_ids.size(), token_id);
