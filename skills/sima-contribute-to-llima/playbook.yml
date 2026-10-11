@@ -1,6 +1,6 @@
 id: sima-contribute-to-llima
 name: Contribute to LLiMa
-version: 0.2.0
+version: 0.2.1
 agents: [codex, claude]
 description: Modify or review the LLiMa repository. For new LLM/VLM checkpoint compatibility or architecture support, use sima-add-llima-model-support.
 compatibility:

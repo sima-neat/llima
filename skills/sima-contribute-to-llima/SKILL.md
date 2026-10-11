@@ -16,7 +16,7 @@ Load guidance for the affected surface, rather than all repository documents:
 | Task | Guidance |
 | --- | --- |
 | Locate code or package ownership | [Repository map](references/repository-map.md) |
-| Build or compare compiler graphs | ModelGraph and tensor layouts in `CONTRIBUTING.md` and `docs/contributing.md` |
+| Build or compare compiler graphs | ModelGraph, `graph.run()` reference execution, and tensor layouts in `CONTRIBUTING.md` and `docs/contributing.md` |
 | Change runtime, installed APIs, bindings, or runtime packages | [Runtime contracts](references/runtime-changes.md) |
 | Select tests or build commands | Relevant sections of `tests/README.md` and `docs/contributing.md` |
 | Change dependencies or entry points | `deps/manifest.json` or `pyproject.toml`; verify the actual installed versions too |

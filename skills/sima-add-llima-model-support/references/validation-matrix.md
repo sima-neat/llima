@@ -19,6 +19,23 @@ or device tests; it must not claim complete model support from partial evidence.
 | Compiler integration | Required units generated without unintended skips | Generate all selected group/single or vision units |
 | Modalix runtime | Representative task succeeds and exits cleanly | Run two LLM turns or one image-grounded VLM prompt |
 
+## Native Graph Reference Checks
+
+Use `ModelGraph.run()` for host numerical comparisons without configuring AFE
+executors manually:
+
+```python
+graph.finish([output])
+outputs = graph.run(hidden=x)
+```
+
+Input names, shapes, and dtypes must match the graph's declared inputs; pass
+NumPy arrays without implicit casts. Outputs are a list in `finish()` order.
+The default NumPy path uses fast arithmetic; `use_jax=True` selects JAX reference
+execution on its configured backend. Neither establishes MLA bit accuracy or
+replaces compiler/simulator and Modalix validation. A finished graph can be
+saved with `graph.save()`.
+
 ## Model-Support CI Checklist
 
 1. Reuse or extend affected cases in `tests/compilation/cases.py`; add new cases

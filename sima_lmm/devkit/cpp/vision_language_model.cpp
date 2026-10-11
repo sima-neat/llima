@@ -273,7 +273,8 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     }
     auto next_token_id = _language_model_ptr->get_cached_first_generated_token();
 
-    if (prefill_result->empty()) {
+    if (prefill_result->empty() && !override_stop_token_ids.value_or(
+            _language_model_ptr->get_stop_token_ids()).contains(next_token_id)) {
         // Override the max_num_tokens and stop_token_ids.
         auto original_max_num_tokens = _language_model_ptr->set_max_num_tokens(
             override_max_num_tokens
