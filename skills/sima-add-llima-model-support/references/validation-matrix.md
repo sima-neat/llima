@@ -1,7 +1,9 @@
 # Model-Support Validation Matrix
 
-Select every row affected by the chosen route. Run the exact commands documented
-in `docs/contributing.md` and `tests/README.md`.
+For implementation, select every row affected by the chosen route. Use the
+relevant commands in the checkout's `docs/contributing.md` and `tests/README.md`.
+An assessment can report a boundary as unverified without running compilation
+or device tests; it must not claim complete model support from partial evidence.
 
 | Surface | Minimum evidence | Example |
 | --- | --- | --- |
@@ -17,9 +19,27 @@ in `docs/contributing.md` and `tests/README.md`.
 | Compiler integration | Required units generated without unintended skips | Generate all selected group/single or vision units |
 | Modalix runtime | Representative task succeeds and exits cleanly | Run two LLM turns or one image-grounded VLM prompt |
 
+## Native Graph Reference Checks
+
+Use `ModelGraph.run()` for host numerical comparisons without configuring AFE
+executors manually:
+
+```python
+graph.finish([output])
+outputs = graph.run(hidden=x)
+```
+
+Input names, shapes, and dtypes must match the graph's declared inputs; pass
+NumPy arrays without implicit casts. Outputs are a list in `finish()` order.
+The default NumPy path uses fast arithmetic; `use_jax=True` selects JAX reference
+execution on its configured backend. Neither establishes MLA bit accuracy or
+replaces compiler/simulator and Modalix validation. A finished graph can be
+saved with `graph.save()`.
+
 ## Model-Support CI Checklist
 
-1. Add the smallest affected cases to `tests/compilation/cases.py`.
+1. Reuse or extend affected cases in `tests/compilation/cases.py`; add new cases
+   only for model contracts not already covered.
 2. Pin inputs by immutable revision in the matching cache manifest:
    - weighted HF: `tools/hf-safetensors/manifest.txt`;
    - metadata-only HF: `tools/hf-safetensors/config-manifest.txt`;

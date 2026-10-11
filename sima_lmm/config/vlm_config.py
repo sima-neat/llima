@@ -1018,7 +1018,6 @@ class PipelineConfig(BaseConfig):
         future_token_mask_size: The normal cache-model mask bucket size.
         long_context_future_token_mask_size: Optional full-attention override for long contexts.
         return_logits: Return logits at the last layer.
-        enable_filter_sharing: Enables filter sharing between group and single models.
         quantize_embeddings: Enables embedding quantization to reduce memory consumption.
         quantize_kv_cache: Enables KV cache quantization to reduce memory consumption.
     """
@@ -1030,7 +1029,6 @@ class PipelineConfig(BaseConfig):
     future_token_mask_size: int = 1
     long_context_future_token_mask_size: int | None = None
     return_logits: bool = False
-    enable_filter_sharing: bool = False
     quantize_embeddings: bool = False
     quantize_kv_cache: bool = False
 
@@ -1089,9 +1087,6 @@ class PipelineConfig(BaseConfig):
     def set_return_logits(self, return_logits: bool):
         self.return_logits = return_logits
 
-    def set_enable_filter_sharing(self, enable_filter_sharing: bool):
-        self.enable_filter_sharing = enable_filter_sharing
-
     def set_quantize_embeddings(self, quantize_embeddings: bool):
         self.quantize_embeddings = quantize_embeddings
 
@@ -1126,6 +1121,7 @@ class VlmConfig(BaseConfig):
         if vlm_cfg.get("mm_cfg") is not None:
             vlm_cfg["mm_cfg"] = MMConnectionConfig(**vlm_cfg["mm_cfg"])
         vlm_cfg["lm_cfg"] = LanguageModelConfig.load(vlm_cfg["lm_cfg"])
+        vlm_cfg["pipeline_cfg"].pop("enable_filter_sharing", None)
         vlm_cfg["pipeline_cfg"] = PipelineConfig(**vlm_cfg["pipeline_cfg"])
         vlm_cfg["model_type"] = VlmArchType(vlm_cfg["model_type"])
         vc = VlmConfig(**vlm_cfg)
@@ -1343,17 +1339,6 @@ class VlmConfig(BaseConfig):
                 "for linear-attention models"
             )
 
-        if (
-            self.lm_cfg.attn_cfg.swa_enable
-            and self.pipeline_cfg.input_token_group_offsets
-            and self.pipeline_cfg.input_token_group_size
-            >= self.lm_cfg.attn_cfg.sliding_window
-        ):
-            raise ValueError(
-                "language_group_size must be smaller than sliding_window "
-                "for models with sliding attention"
-            )
-
     def get_layer_ids(self) -> list[LayerID]:
         """
         Get IDs of all layers that comprise the model.
@@ -1448,23 +1433,22 @@ class VlmConfig(BaseConfig):
                         and sliding_window <= pipeline_cfg.max_num_tokens
                     )
                     if not sliding_cache_mask_differs:
-                        group_cache_indices = group_shared_sliding_cache_model_indices(
-                            pipeline_cfg, sliding_window
-                        )
                         single_cache_indices = single_shared_sliding_cache_model_indices(
                             pipeline_cfg, sliding_window
                         )
                 if not is_gemma4_mtp_draft:
                     layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
                 layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
-                if separate_sliding_cache:
-                    if not is_gemma4_mtp_draft:
-                        layers.extend(
-                            LayerID("group_sliding_cache", n)
-                            for n in group_sliding_cache_model_indices(
-                                pipeline_cfg, lm_cfg.attn_cfg.sliding_window
-                            )
+                if has_sliding_attn and not is_gemma4_mtp_draft:
+                    layers.extend(
+                        LayerID("group_sliding_cache", n)
+                        for n in group_sliding_cache_model_indices(
+                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
                         )
+                        if separate_sliding_cache
+                        or n + pipeline_cfg.input_token_group_size > lm_cfg.attn_cfg.sliding_window
+                    )
+                if separate_sliding_cache:
                     layers.extend(
                         LayerID("single_sliding_cache", n)
                         for n in single_sliding_cache_model_indices(
@@ -1472,17 +1456,6 @@ class VlmConfig(BaseConfig):
                         )
                     )
                 elif terminal_sliding_cache:
-                    if not is_gemma4_mtp_draft:
-                        layers.append(LayerID(
-                            "group_sliding_cache",
-                            _cache_model_index(
-                                pipeline_cfg,
-                                "sliding_attention",
-                                sliding_window,
-                                pipeline_cfg.input_token_group_size,
-                                is_group=True,
-                            ),
-                        ))
                     layers.append(LayerID(
                         "single_sliding_cache",
                         _cache_model_index(
@@ -1712,34 +1685,11 @@ def group_cache_model_indices(cfg: PipelineConfig) -> list[int]:
 
 
 def group_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
-    """
-    Get the indices of all group sliding-window cache models.
-
-    For sliding attention the effective cache_model_token_idx saturates at
-    sliding_window - group_size once the window is fully filled.  Any group offset
-    beyond that point maps to the same compiled model, so we only keep offsets
-    strictly below the transition and add the transition itself.
-
-    Returns:
-        Indices of group sliding cache models in ascending order.
-    """
-    transition = sliding_window - cfg.input_token_group_size
-    indices = [
-        n for n in _group_cache_model_indices(cfg, "sliding_attention")
-        if n < transition
-    ]
-    if transition > 0:
-        indices.append(transition)
-    return indices
-
-
-def group_shared_sliding_cache_model_indices(
-    cfg: PipelineConfig, sliding_window: int
-) -> list[int]:
-    """Get cache indices needed by sliding attention sharing the full cache."""
-    return sorted(set(group_cache_model_indices(cfg)) | set(
-        group_sliding_cache_model_indices(cfg, sliding_window)
-    ))
+    """Return first-query indices relative to the union of a group's windows."""
+    return sorted({
+        min(offset, sliding_window - 1)
+        for offset in cfg.input_token_group_offsets or []
+    })
 
 
 def _single_cache_model_indices(cfg: PipelineConfig, layer_type: str) -> list[int]:

@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 322
+- Expected cases: 366
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -312,7 +312,7 @@ LLiMa-specific reasoning fixtures:
 
 - `Qwen2.5-0.5B-Instruct-Autoround-a16w4`
 - `LFM2.5-VL-450M-Autoround-a16w4`
-- `florianvoss/whisper-small-a16w8-layered-encoder`
+- `simaai/whisper-small-a16w8`
 - `Qwen3-0.6B-Autoround-a16w4`
 - `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`
 

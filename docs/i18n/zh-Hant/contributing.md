@@ -99,6 +99,75 @@ Whisper 模型儲存庫中，每個編碼器層各有一個 ELF。執行階段�
 
 編譯器變更通常會影響 `sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py` 和腳本；執行階段變更會影響 `sima_lmm/devkit/cpp/whisper_*`。使用封裝的 C++ ASR 執行階段測試進行驗證，該測試的相關檔案位於 `tests/README.md` 中，並使用 Modalix 上的代表性音訊進行測試。這是一個 Whisper 專用的路徑，而不是一個通用的 ASR 架構框架。
 
+### 原生圖元件
+
+使用 `sima_lmm/model/model_graph.py` 中的 `ModelGraph`，一次綁定元件的來源權重、精度與輸出路徑。圖節點的建構放在類別內，獨立的陣列布局與命名工具則保留為模組函式。模型元件使用圖的方法，讓元件實作專注於拓撲：
+
+```python
+from sima_lmm.model.model_graph import ModelGraph
+
+def generate_graph(self, layer_cfg, quantizable):
+    graph = ModelGraph(self, {"hidden": (1, 1, self.num_tokens, self.cfg.d_model)}, quantizable)
+    hidden = graph.layer_norm("model.norm", graph.inputs["hidden"])
+    output = graph.mlp("model.mlp", hidden, "gelu", residual=graph.inputs["hidden"])
+    graph.save([output])
+```
+
+在 `generate_graph()` 中定義獨立元件的輸入、頂層拓撲與 `graph.save()`。對於共用的圖建構，例如 Whisper 整合解碼器圖使用的 pre/cache/post 部分，保留 `_build_nodes(graph, inputs)`。
+
+日誌範圍由 `BaseModel.gen_files()` 設定，圖建構不需要額外的日誌引數。
+
+形狀會推論輸入型別：`quantizable=True` 使用 FP32（稍後量化的浮點圖），`False` 使用 BF16（依來源權重精度直接建構的圖）。快取等整數輸入使用 `input_dtypes={"cache": np.int8}`，名稱必須符合輸入規格。低階呼叫仍可使用現有的明確 AFE 張量規格。輸入與輸出順序遵循指定規格，形狀與輸出型別由 AFE 推論。`constant()` 將浮點資料轉為啟用值的精度；若整數常數需要特定位元寬度，例如使用 `dtype=np.int32`。節點名稱遵循 AFE 可確定的建立計數器。
+
+圖節點的型別註記從 `model_graph.py` 匯入 `Node`。輔助函式接收圖，而非額外的 `quantizable` 旗標。`graph.constant()` 自動選擇浮點精度；主機端陣列計算需要該精度時，使用 NumPy 的 `graph.dtype`。階段旗標只保留在 `generate_graph()` 與圖建構處。
+
+`save()` 完成 MLA 子網路並建立外層圖的輸出 tuple，保留整數輸出，在 EV 上將 BF16 輸出轉為 FP32，並使用標準成品名稱寫入檔案（浮點圖使用 `.fp32`）。若要取得完成的網路，使用 `finish()`。兩者都接受 `transform_subnet`，可在擷取外層輸出前進行模型專屬改寫。將圖本身傳給元件輔助函式，輸入、精度與來源權重仍綁定於同一物件。
+
+以具名的 NumPy 輸入執行已完成的圖：
+
+```python
+graph.finish([output])
+outputs = graph.run(hidden=x)
+outputs_jax = graph.run(hidden=x, use_jax=True)
+graph.save()
+```
+
+輸入名稱、形狀與資料型別必須符合宣告的輸入，不會套用隱含型別轉換。輸出遵循傳給 `finish()` 的順序。NumPy 執行使用 AFE fast mode，結果可能與 MLA 參考運算不同。`use_jax=True` 選擇 JAX 參考執行，此時 fast mode 沒有作用。JAX 運算使用所設定的後端，並可在相容的 JAX 安裝環境中使用 GPU。此 API 不會量化、編譯或在 Modalix 上執行。只完成圖一次，之後重複使用 `run()` 與 `save()`；仍可用 `save(outputs)` 一次完成並儲存圖。
+
+常用操作包含 `add`, `sub`, `mul`, `matmul`, `concat`, `slice`, `transpose`, `reshape`, `softmax`, `topk`, `sum_channels`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`, `activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`, `clip`, `avgpool2d`, `space_to_depth`, `quant`, `dequant`。閘控 MLP 使用 `projections=("gate_proj", "up_proj", "down_proj")`，預設為 `("fc1", "fc2")`。`rms_norm("model.norm", input)` 使用語言模型設定的 epsilon 與權重偏移。vision 和 GDN 的正規化若明確指定 `epsilon`，除非也提供 `weight_offset`，否則權重偏移維持零。`rms_norm(None, input, epsilon=...)` 推論無權重的通道。RoPE 支援完整、部分與按比例的 split-half 旋轉。`rope2d(input, cos_x, sin_x, cos_y, sin_y)` 依 `[x-real, x-imag, y-real, y-imag]` 順序旋轉四等分的通道。`split_heads(input, heads, repeat=...)` 為 grouped-query 模式重複各個 head。`split_concat()` 提供 AFE 的重新分組操作，處理僅靠 reshape 無法表達的空間／權杖布局。`space_to_depth(input, blocksize)` 將完整的空間區塊合併至通道。`quant(input)` 回傳 `(int8_values, scale)`；`dequant(int8_values, scale)` 還原圖的啟用值精度。`argmax(input)` 回傳 INT32 通道索引。`slice(input, begin, end, stride, axis)` 對四維 FP32/BF16 張量中未對齊、連續的單軸通道切片，自動使用選擇器卷積；其他切片維持 AFE 的原生行為。
+
+`linear("model.proj", input)` 解析 `model.proj.weight` 與可選的偏置，將 OI 來源權重轉為 SiMa 布局，並保留封裝的權重值、縮放係數、未對齊的群組大小與重定位中繼資料。`conv()` 推論 OIW 或 OIHW 來源布局；明確的轉換也能處理其他布局，例如 Qwen 的五維 patch 權重。`WeightOptions` 說明來源名稱、布局、權重／縮放係數／偏置轉換與重定位覆寫選項。切片群組權重時，提供對應的 `scale_process_func`；群組必須保留檢查點的實際大小。LoRA 秩與合併 adapter 行為是 `linear()` 和 `mlp()` 的明確引數。
+
+以投影與 head 布局操作建構 attention。將 query 縮放併入 `linear()`，以保留現有投影的捨入行為：
+
+```python
+queries = graph.split_heads(graph.linear("attn.q_proj", hidden, scale=head_dim ** -0.5), heads)
+keys = graph.split_heads(graph.linear("attn.k_proj", hidden), heads)
+values = graph.split_heads(graph.linear("attn.v_proj", hidden), heads)
+context = graph.attention(queries, keys, values)
+output = graph.linear("attn.out_proj", graph.merge_heads(context))
+```
+
+`split_heads()` 透過選擇器卷積處理未對齊的 head 通道。標準 vision attention 會填補未對齊 head 的投影權重，以避免這些卷積；群組輸出權重保留原始布局。`attention()` 依 query/key 長度，為包含 cross-attention 的大型 attention 張量選擇各 head 的獨立分支。它接受加法 `mask`，且除非提供 `score_scale`，否則假設 query 已縮放。該縮放在 Q×K 之後、遮罩之前套用，保留 Qwen vision 等模型的 BF16 運算順序。遮罩必須是四維張量、向量或純量，且可廣播至 `[N,H,T_query,T_key]`；不支援的形狀會引發 `ValueError`。
+
+`graph.matmul(lhs, rhs)` 建立 MLA 批次矩陣乘法。兩個轉置旗標都預設為 `False`；Kᵀ×V 使用 `transpose_a=True`，Q×Kᵀ 使用 `transpose_b=True`。輸入必須是四維 FP32/BF16 張量，且批次與縮約維度相符。head 數可整除時，grouped-query attention 使用隱含重複；無效的形狀或型別會引發 `ValueError`。
+
+`graph.softmax(x)` 預設使用最後一個軸，也支援明確的 `axis`。連續單軸切片使用 `graph.slice(x, start=0, stop=128, axis=-1)`；多軸切片使用現有的 `begin`/`end`/`stride`/`axis` 列表。單軸形式的起點預設為零，必須明確指定軸與範圍內的非空邊界，並保留未對齊通道的處理。請勿混用兩種形式。
+
+`ModelGraph` 擴充 AFE 的 `SimaBuilder`，因此可在同一物件使用原生操作與共用輔助函式：
+
+```python
+projected = graph.linear("model.proj", graph.inputs["hidden"])
+output = graph.add(projected, graph.inputs["hidden"])
+graph.save([output])
+```
+
+簡潔的基礎操作是 AFE 方法的直接別名，保留其簽章、型別推論與可確定的命名。較少使用的操作仍可透過同一個圖繼承的 `create_*` 方法取得。需要自訂多子網路生命週期的圖，仍可直接使用 AFE 的 `SimaBuilder` 與低階操作輔助函式。
+
+細分布局集中由 `sima_analysis.get_tessellate_parameters()` 推論：HWC16 布局、自動 tile 大小與可確定的持久緩衝區名稱。一般元件從 `BaseModel` 繼承空的覆寫設定。具步幅的 KV 快取等特殊布局，覆寫現有的 `get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` 方法；鍵是張量索引，負索引從尾端計算。
+
+Whisper 元件、所有原生語言圖部分與標準 vision tower 都使用此 API；其 attention、MLP 與旋轉輔助函式共用相同實作。
+
 ## 測試
 
 依據失效面選擇測試。建置作業並不能取代行為驗證，而且跳過的必要測試案例不視為通過。
@@ -129,7 +198,7 @@ python -P -m pytest \
 
 設定所需的輸入，而不是接受跳過測試。
 
-測試矩陣、預期的計數和基準策略位於 `tests/README.md`；CI 執行位於 `.github/workflows/model-compiler-tests.yml`。在執行期間生成 Model SDK 和數值比較成品，而不是提交二進位基準。
+測試矩陣、預期數量與基準政策位於 `tests/README.md`；CI 呼叫位於 `.github/workflows/model-compiler-tests.yml`。請在執行期間產生原生 SDK 圖與數值比較成品，而非提交二進位基準檔。
 
 ### 執行階段驗證
 

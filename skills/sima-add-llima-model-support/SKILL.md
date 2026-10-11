@@ -1,72 +1,52 @@
 ---
 name: sima-add-llima-model-support
-description: Assess or add LLM or VLM model support in sima-neat/llima. Use to determine whether an unassessed Hugging Face or GGUF checkpoint is compatible, or when support may require a new language architecture, vision encoder, multimodal projector, tensor layout, tokenizer, or prompt contract. Do not use for ASR architecture work, checkpoints already confirmed compatible, or ordinary ONNX compilation.
+description: Assess LLM/VLM checkpoint compatibility with LLiMa or implement missing architecture, source-layout, tokenizer, or prompt support.
 ---
 
 # Assess or Add LLiMa Model Support
 
-Assess the affected compatibility boundaries first. Normalize upstream
-differences at ingestion/configuration boundaries before adding
-architecture-specific compiler or runtime branches.
+Assess only the compatibility boundaries relevant to the request, using the
+exact model/revision and source artifacts. For source changes, work in a LLiMa
+checkout under its `AGENTS.md`; repository docs are not installed with this
+skill. Already confirmed compatible models use `sima-llima-compile-run` when
+compilation or deployment is requested. Ordinary repository maintenance uses
+`sima-contribute-to-llima`.
 
-## Classify
+## Choose the Relevant Reference
 
-1. Read `AGENTS.md` and `docs/contributing.md`.
-2. Record the model ID/revision and only the source artifacts relevant to the
-   question: format, modality, config, tensor index, tokenizer, template, or
-   processor files.
-3. Read `references/compatibility-audit.md`. Record evidence for affected
-   boundaries, mark the others not applicable, and inspect existing
-   compatibility hooks before proposing new machinery.
-4. Compare with the closest case in `tests/compilation/cases.py`.
-5. If architecture, layout, tokenizer, and prompt contracts already match, use
-   `sima-llima-compile-run`; do not add checkpoint-specific branches. Example:
-   a new size or fine-tune of an existing Llama architecture needs compilation,
-   not source changes.
-6. Otherwise choose the smallest route:
+| Question | Reference |
+| --- | --- |
+| Does this checkpoint fit existing support? Which boundary fails? | Relevant sections of the [compatibility audit](references/compatibility-audit.md) |
+| Does language computation or persistent state differ? | [LLM architecture](references/llm-architecture.md) |
+| Does vision, the projector, or image preprocessing differ? | [VLM architecture](references/vlm-architecture.md) |
+| Do HF/GGUF names, config, or tensor storage differ? | [Source layouts](references/source-layouts.md) |
+| Do tokenizer, templates, tools, or runtime assets differ? | [Tokenizer and prompt contract](references/tokenizer-prompt-contract.md) |
+| Which implementation checks and CI inputs are affected? | [Validation matrix](references/validation-matrix.md) |
 
-| Route | Reference | Example |
-| --- | --- | --- |
-| New LLM architecture | `references/llm-architecture.md` | LFM2-style hybrid attention/convolution layers |
-| New VLM encoder/projector | `references/vlm-architecture.md` | Qwen3-VL vision/projector differences from Qwen2.5-VL |
-| New HF/GGUF layout | `references/source-layouts.md` | Fused HF QKV or Mistral GGUF normalization |
-| Tokenizer/prompt compatibility | `references/tokenizer-prompt-contract.md` | Tool-aware template requiring a standards-compatible Minja fix |
+Combine routes only for independent differences established by evidence. A
+narrow loader or tokenizer assessment does not require an architecture audit,
+model compilation, or Modalix access.
 
-Combine routes only for independently proven differences. Then read
-`references/validation-matrix.md`.
+## Essential Contracts
 
-## Implement
+Normalize differences at ingestion/configuration boundaries and extend existing
+resolvers before adding model-specific graph or runtime branches. Use ModelGraph
+for native graphs and preserve staged/direct quantization where applicable.
+Align reference tensor layouts as documented in the relevant architecture
+reference. Reject ambiguous configuration or tensor layouts.
 
-- Express the upstream contract with the smallest reusable config, ingestion,
-  graph, preprocessing, or runtime change.
-- Extend existing name, tensor, graph, and packaging resolvers before adding a
-  parallel model-specific implementation.
-- Keep format-specific normalization out of shared model computation.
-- Use ModelGraph for native generation and validate staged and direct quantization.
-  Apply the Transformers layout mapping in `references/llm-architecture.md`
-  and `references/vlm-architecture.md` when porting or comparing graphs.
-- Reject missing or ambiguous config/tensor layouts.
-- Add hermetic tests for pure logic and model-backed coverage for each affected
-  compiler surface.
-- Add immutable CI inputs only to the appropriate
-  `tools/hf-safetensors/*.txt` manifest.
-- Update `docs/index.md` only after support and validation are clear.
+Preserve checkpoint, revision, format, precision, and image shape. Validate HF
+and GGUF independently. Never equate host loading or CPU/reference execution
+with complete runtime support; label mirror/derivative evidence as provisional.
+Keep credentials, private data, weights, and generated binaries out of Git and
+reports. New ASR architectures need a separate design; existing Whisper
+maintenance uses the contributor skill.
 
-## Boundaries
+## Completion
 
-- Existing Whisper maintenance uses `sima-contribute-to-llima`,
-  `scripts/gen_models--openai--whisper.py`, and
-  `sima_lmm/devkit/cpp/whisper_*`. New ASR architectures require a separate
-  compiler/runtime design.
-- Validate Hugging Face and GGUF independently.
-- Never substitute another checkpoint, revision, precision, image shape, or
-  source format.
-- Follow repository artifact/security policy; do not commit models or
-  generated compiler/runtime binaries.
-
-## Finish
-
-Report the route and analogue, model/revision, changed surfaces, source formats,
-affected-boundary results, tests and Modalix evidence, unavailable checks,
-limitations, and docs/cache changes. Label evidence from mirrors or derivative
-checkpoints as provisional rather than attributing it to the pinned target.
+For assessment, report supported and failing boundaries with evidence, unknowns,
+and the smallest required change; do not implement or compile unless requested.
+For implementation, include affected tests and required-unit/asset generation
+using the validation matrix. Pin CI inputs in the relevant cache manifests and
+update `docs/index.md` only for established support. Continue through compilation
+or Modalix validation when requested, reporting unavailable checks explicitly.

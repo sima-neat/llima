@@ -1,6 +1,7 @@
 # Agent Guidance
 
-Read [Contributor Guide](docs/contributing.md) before changing LLiMa.
+Use the relevant sections of the [Contributor Guide](docs/contributing.md) for
+setup, graph development, validation commands, and contribution policy.
 
 ## Before Editing
 
@@ -59,6 +60,11 @@ update or required integration fix, and document submodule revisions.
   reproductions; do not ask users to paste credentials or proprietary assets.
 
 ## Validation
+
+Reuse existing coverage first. Add or extend tests only when changed behavior
+or a meaningful regression risk is not already covered. Do not add tests solely
+for formatting, renames, log messages, or to mirror the implementation. Choose
+validation by behavioral risk, not the number of changed lines.
 
 - Pure logic: hermetic tests without network or model downloads.
 - Model-backed compiler changes: configure required cached inputs; unintended

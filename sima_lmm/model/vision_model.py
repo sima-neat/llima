@@ -72,6 +72,8 @@ def _resize_siglip2_position_embeddings(
 class VisionModel(BaseModel):
     """Vision model implementation."""
 
+    enable_filter_sharing = False
+
     def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
         layer_ifms = ifms
         deepstack_outputs: dict[int, np.ndarray] = {}
@@ -176,6 +178,8 @@ class StandardVisionLayerModel(BaseModel):
 
     Handles Standard architectures: CLIP, SigLIP, LFM2 (non-Qwen).
     """
+
+    enable_filter_sharing = False
 
     layer_idx: int
     include_embeddings: bool

@@ -125,8 +125,9 @@ model compilation.
   breaks and migration steps.
 - Keep downloaded weights, customer data, secrets, and generated binary model
   artifacts out of Git. Use immutable model revisions and approved caches.
-- Follow local style, keep changes focused, and add tests and user
-  documentation with behavior changes.
+- Follow local style and keep changes focused. Reuse existing test coverage;
+  add or extend tests for uncovered behavior or meaningful regression risk.
+  Update user documentation when user-visible behavior changes.
 - Fail with actionable context instead of silently changing model, revision,
   precision, format, or execution path.
 - Keep shared state safe and teardown bounded.

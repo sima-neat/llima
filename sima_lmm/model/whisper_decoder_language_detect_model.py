@@ -33,10 +33,6 @@ class WhisperDecoderLanguageDetectModel(BaseModel):
     NUM_TOKENS = 1
     TOKEN_IDX = 0
 
-    @property
-    def enable_filter_sharing(self) -> bool:
-        return self.use_filter_sharing
-
     def generate_graph(
         self, layer_cfg: LayerConfiguration, quantizable: bool
     ):

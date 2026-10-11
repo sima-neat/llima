@@ -174,6 +174,24 @@ network. Both accept `transform_subnet` for model-specific rewrites before the
 outer outputs are extracted. Pass the graph itself to component helpers; inputs,
 precision and source weights remain bound to the same object.
 
+Run a finished graph with named NumPy inputs:
+
+```python
+graph.finish([output])
+outputs = graph.run(hidden=x)
+outputs_jax = graph.run(hidden=x, use_jax=True)
+graph.save()
+```
+
+Input names, shapes and dtypes must match the declared inputs; no implicit casts
+are applied. Outputs follow the order supplied to `finish()`. NumPy execution
+uses AFE fast mode, which may differ from MLA reference arithmetic. `use_jax=True`
+selects JAX reference execution, where fast mode has no effect. JAX operations
+use its configured backend and can use a GPU with a compatible JAX installation.
+This API does not
+quantize, compile or run on Modalix. Finish once, then reuse `run()` and `save()`;
+`save(outputs)` remains available to finish and save a graph in one step.
+
 Common operations include `add`, `sub`, `mul`, `matmul`, `concat`, `slice`,
 `transpose`, `reshape`, `softmax`, `topk`, `sum_channels`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`,
 `activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`,

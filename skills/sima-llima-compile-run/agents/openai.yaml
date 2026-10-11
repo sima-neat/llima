@@ -1,4 +1,4 @@
 interface:
   display_name: "Compile and Test LLiMa Models"
-  short_description: "Prefer pre-quantized models, compile, and test"
-  default_prompt: "Use $sima-llima-compile-run to prefer an exact pre-quantized LLM or VLM by default, honor explicit source or fidelity requirements, compile it, and validate it on Modalix."
+  short_description: "Quantize fine-tunes, compile models, validate on Modalix"
+  default_prompt: "Use $sima-llima-compile-run for this supported LLM or VLM and complete the requested fine-tune quantization, compilation, deployment, or Modalix validation."

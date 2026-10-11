@@ -20,6 +20,8 @@ class QwenVisionLayerModel(BaseModel):
     - Multiple outputs for Qwen3-VL deepstack mergers
     """
 
+    enable_filter_sharing = False
+
     layer_idx: int
     include_embeddings: bool
     include_mm_proj: bool

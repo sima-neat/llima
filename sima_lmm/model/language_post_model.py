@@ -21,10 +21,6 @@ class LanguagePostModel(LanguagePostBaseModel):
         return self.cfg.lm_cfg.layer_types[self.layer_idx]
 
     @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
-    @property
     def uses_per_layer_inputs(self) -> bool:
         return (
             self.cfg.model_type == VlmArchType.VLM_GEMMA4

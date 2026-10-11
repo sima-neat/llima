@@ -40,10 +40,6 @@ class LanguageLinearModel(LanguagePartBaseModel):
         )
 
     @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
-    @property
     def split_mlp(self) -> bool:
         return self.cfg.pipeline_cfg.split_mlp
 
