@@ -39,7 +39,7 @@ def test_deploy_dispatches_both_speculative_children(tmp_path: Path, monkeypatch
     monkeypatch.setattr(
         deploy_lmm,
         "_deploy_sima_files",
-        lambda src, dst: calls.append((src, dst)),
+        lambda src, dst, rsh=None: calls.append((src, dst)),
     )
 
     deploy_lmm.deploy(source, destination)
@@ -60,7 +60,7 @@ def test_deploy_preserves_normal_destination(tmp_path: Path, monkeypatch) -> Non
     monkeypatch.setattr(
         deploy_lmm,
         "_deploy_sima_files",
-        lambda src, dst: calls.append((src, dst)),
+        lambda src, dst, rsh=None: calls.append((src, dst)),
     )
 
     deploy_lmm.deploy(source, destination)
@@ -77,7 +77,7 @@ def test_deploy_validates_both_models_before_deploying(tmp_path: Path, monkeypat
     monkeypatch.setattr(
         deploy_lmm,
         "_deploy_sima_files",
-        lambda src, dst: calls.append((src, dst)),
+        lambda src, dst, rsh=None: calls.append((src, dst)),
     )
 
     with pytest.raises(RuntimeError, match="mpk directory cannot be found"):
