@@ -1088,6 +1088,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         _is_running = false;
         draft_lm._is_running = false;
         set_max_num_tokens(original_max_num_tokens);
+        _text_streamer.push(DecodeCallbackType::STOP, 0, 0);
+        _text_streamer.wait_streaming();
         throw;
     }
 

@@ -1327,9 +1327,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     const size_t input_len = input_ids.size();
     const int num_cached_tokens = 0;
 
-    const uint16_t max_length = override_max_num_tokens.has_value()
-        ? override_max_num_tokens.value()
-        : _cfg.pipeline_cfg.max_num_tokens;
+    const uint16_t max_length = std::min(
+        override_max_num_tokens.value_or(_cfg.pipeline_cfg.max_num_tokens),
+        _cfg.pipeline_cfg.max_num_tokens
+    );
     const size_t spec_budget =
         _cfg.lm_cfg.speculative_decoding_cfg.value().speculative_budget;
 
