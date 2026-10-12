@@ -201,11 +201,7 @@ void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
                                                       &mask) {
   const auto &layer_type = _cfg.lm_cfg.layer_types.at(layer_idx);
   const uint16_t cache_begin =
-      layer_type == "sliding_attention"
-          ? std::max(0, token_idx + num_tokens -
-                            static_cast<int>(
-                                _cfg.lm_cfg.attn_cfg.sliding_window.value()))
-          : 0;
+      _get_cache_token_idx_begin(num_tokens, token_idx, layer_type);
   const auto cache_key = _get_cache_model_key(num_tokens, token_idx, layer_idx);
   const uint16_t aligned_context = std::get<2>(cache_key) + 1;
   const Eigen::bfloat16 neg_inf{-std::numeric_limits<float>::infinity()};
@@ -265,6 +261,10 @@ LanguageModel::run_model_speculative_decoding(
   if (target.method != draft.method) {
     throw std::invalid_argument(
         "Target and draft speculative methods do not match");
+  }
+  if (target.is_gemma4_mtp()) {
+    return run_model_gemma4_mtp(draft_lm, input_token_ids,
+                              override_max_num_tokens, timer_ttft, performance_result);
   }
   if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.hidden_size ||
       _cfg.lm_cfg.token_cfg.vocab_size !=

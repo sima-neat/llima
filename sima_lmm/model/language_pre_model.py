@@ -26,15 +26,15 @@ class LanguagePreModel(LanguagePartBaseModel):
         assert 0 <= self.layer_idx < self.cfg.lm_cfg.num_hidden_layers
 
     @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
-    @property
     def _layer_base_name(self) -> str:
         if self.is_dflash_draft:
             return f"layers.{self.layer_idx}"
         base = self.hf_model.language_model_param_base_name
         return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
+
+    @property
+    def uses_quantized_input_embeddings(self) -> bool:
+        return super().uses_quantized_input_embeddings and not self.is_gemma4_mtp_draft
 
     @property
     def layer_type(self) -> str:
@@ -66,7 +66,7 @@ class LanguagePreModel(LanguagePartBaseModel):
     ):
         base_name = self._layer_base_name
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
-        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
+        input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
         freq_shape = (
             1,
@@ -93,6 +93,9 @@ class LanguagePreModel(LanguagePartBaseModel):
             rms_norm_in = graph.dequant(mla_input_input, inputs["input_scale"])
         else:
             rms_norm_in = mla_input_input
+
+        if self.is_gemma4_mtp_draft and self.layer_idx == 0:
+            rms_norm_in = graph.linear("pre_projection", rms_norm_in)
 
         norm_name = (
             f"{base_name}.operator_norm"

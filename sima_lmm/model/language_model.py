@@ -27,7 +27,12 @@ from sima_lmm.model.language_dflash_state_resolver_model import (
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
+from sima_lmm.config.layer_id import LayerID
+from sima_lmm.config.vlm_config import (
+    LlmArchType,
+    PipelineConfig,
+    VlmArchType,
+)
 
 
 def quantize_embedding_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -135,9 +140,8 @@ class LanguageModel(BaseModel):
                     )
                 case "single_sliding_cache":
                     part_model = self._get_part_model(
-                        "sliding_cache",
-                        single_model_num_tokens if self._is_dflash else 1,
-                        token_idx=layer_id.part_idx,
+                        "sliding_cache", single_model_num_tokens,
+                        token_idx=layer_id.part_idx
                     )
                 case "group_conv":
                     part_model = self._get_part_model(
@@ -179,7 +183,9 @@ class LanguageModel(BaseModel):
                 case "group_per_layer":
                     part_model = self._get_part_model("per_layer", num_tokens)
                 case "single_per_layer":
-                    part_model = self._get_part_model("per_layer", 1)
+                    part_model = self._get_part_model(
+                        "per_layer", single_model_num_tokens
+                    )
                 case "group_router":
                     part_model = self._get_part_model(
                         "router", num_tokens, layer_idx=layer_id.part_idx
@@ -622,14 +628,7 @@ class LanguageModel(BaseModel):
 
     @property
     def _single_model_num_tokens(self) -> int:
-        if self.cfg.lm_cfg.speculative_decoding_cfg is None:
-            return 1
-        return self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
-
-    @property
-    def _is_dflash(self) -> bool:
-        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
-        return cfg is not None and cfg.method == "dflash"
+        return self.cfg.lm_cfg.single_model_num_tokens
 
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,

@@ -32,7 +32,6 @@ def gen_files(
         model_name=model_path.name,
         sima_path=output_path / "sima_files",
         use_future_token_mask=True,
-        enable_filter_sharing=True,
         enable_log_probe=enable_log_probe,
     )
 

@@ -186,15 +186,25 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 struct SpeculativeDecodingConfig {
+    std::string method = "eagle3";
     bool is_draft = false;
     uint16_t speculative_budget = 16;
-    std::string method = "eagle3";
+    uint32_t backbone_hidden_size = 0;
+    bool use_ordered_embeddings = false;
+    uint32_t num_centroids = 0;
+    uint32_t centroid_intermediate_top_k = 0;
+
     std::vector<uint8_t> target_layer_ids = {};
     int32_t mask_token_id = -1;
+
+    bool is_dflash() const { return method == "dflash"; }
+    bool is_eagle3() const { return method == "eagle3"; }
+    bool is_gemma4_mtp() const { return method == "gemma4_mtp"; }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    SpeculativeDecodingConfig, is_draft, speculative_budget, method,
-    target_layer_ids, mask_token_id
+    SpeculativeDecodingConfig, method, is_draft, speculative_budget,
+    backbone_hidden_size, use_ordered_embeddings, num_centroids,
+    centroid_intermediate_top_k, target_layer_ids, mask_token_id
 )
 
 struct MixtureOfExpertsConfig {
@@ -251,8 +261,9 @@ struct LanguageModelConfig {
     }
 
     uint16_t get_single_num_tokens() const {
-        if (speculative_decoding_cfg.has_value()) {
-            return speculative_decoding_cfg.value().speculative_budget;
+        const auto& spec = speculative_decoding_cfg;
+        if (spec && !(spec->is_gemma4_mtp() && spec->is_draft)) {
+            return spec->speculative_budget;
         }
         return 1;
     }
@@ -262,14 +273,29 @@ struct LanguageModelConfig {
     }
 
     bool is_dflash() const {
-        return speculative_decoding_cfg.has_value()
-            && speculative_decoding_cfg.value().method == "dflash";
+        return is_spec_decode() && speculative_decoding_cfg->is_dflash();
+    }
+
+    bool is_speculative_draft() const {
+        return is_spec_decode() && speculative_decoding_cfg.value().is_draft;
+    }
+
+    bool is_eagle3_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_eagle3();
+    }
+
+    bool is_gemma4_mtp_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_gemma4_mtp();
+    }
+
+    bool is_gemma4_mtp_target() const {
+        return is_spec_decode() && speculative_decoding_cfg->is_gemma4_mtp()
+            && !speculative_decoding_cfg->is_draft;
     }
 
     uint32_t get_lm_head_output_size() const {
-        if (speculative_decoding_cfg.has_value()
-            && speculative_decoding_cfg.value().is_draft){
-            return is_dflash() ? token_cfg.vocab_size : draft_vocab_size;
+        if (is_speculative_draft() && !is_dflash() && draft_vocab_size > 0) {
+            return draft_vocab_size;
         }
         return token_cfg.vocab_size;
     }
@@ -308,14 +334,13 @@ struct PipelineConfig {
     std::optional<uint16_t> long_context_future_token_mask_size = std::nullopt;
     bool return_logits;
     bool use_strided_kv_cache = true;
-    bool enable_filter_sharing;
     bool quantize_embeddings = false;
     bool quantize_kv_cache = false;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     PipelineConfig, system_prompt, chat_template, max_num_tokens, input_token_group_size,
     input_token_group_offsets, future_token_mask_size, long_context_future_token_mask_size,
-    return_logits, use_strided_kv_cache, enable_filter_sharing, quantize_embeddings,
+    return_logits, use_strided_kv_cache, quantize_embeddings,
     quantize_kv_cache
 )
 

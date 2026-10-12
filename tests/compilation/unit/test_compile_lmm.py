@@ -3,30 +3,53 @@ import sys
 import pytest
 
 from sima_lmm.host import compile_lmm
+from sima_lmm.model.vision_language_model import _detect_speculative_method
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
 
 @pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            {"model_type": "gemma4_assistant", "architectures": ["Gemma4AssistantForCausalLM"]},
+            "gemma4_mtp",
+        ),
+        (
+            {"model_type": "llama", "architectures": ["LlamaForCausalLMEagle3"]},
+            "eagle3",
+        ),
+    ],
+)
+def test_detect_speculative_method(config: dict, expected: str):
+    assert _detect_speculative_method(config) == expected
+
+
+def test_detect_speculative_method_rejects_unknown_draft():
+    config = {"model_type": "llama", "architectures": ["LlamaForCausalLM"]}
+    with pytest.raises(ValueError, match="Expected a Gemma4 MTP, EAGLE3, or DFlash draft model"):
+        _detect_speculative_method(config)
+
+
+@pytest.mark.parametrize(
     ("options", "expected"),
     [
-        ([], (False, True, True, False)),
+        ([], (True, True, False)),
         (
             ["--source_to_fp", "--no-quantize_embeddings", "--no-quantize_kv_cache"],
-            (False, False, False, False),
+            (False, False, False),
         ),
         (
             ["--draft_model_path", "draft"],
-            (False, True, True, True),
+            (True, True, True),
         ),
         (
             [
-                "--enable_filter_sharing",
                 "--no-quantize_embeddings",
                 "--no-quantize_kv_cache",
             ],
-            (True, False, False, False),
+            (False, False, False),
         ),
     ],
 )
@@ -34,7 +57,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
     options: list[str],
-    expected: tuple[bool, bool, bool, bool],
+    expected: tuple[bool, bool, bool],
 ):
     (tmp_path / "model").mkdir()
     (tmp_path / "draft").mkdir()
@@ -58,7 +81,7 @@ def test_memory_optimization_cli_defaults_and_overrides(
     compile_lmm.main()
 
     args = calls[0]
-    assert (args[12], args[13], args[14], args[15]) == expected
+    assert (args[12], args[13], args[14]) == expected
 
 
 @pytest.mark.parametrize("jobs", ["0", "-1"])

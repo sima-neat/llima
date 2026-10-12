@@ -130,11 +130,10 @@ Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 819
 |----|----|
 | `--language_group_size` | Batch size for parallel token processing during prefill. Larger values (e.g., 256) can improve TTFT for large input prompts, but can decrease TTFT for smaller input prompts. Default: 128. |
 | `--future_token_mask_size` | Mask size for reusing compiled models across token positions. Larger values reduce number of compiled binary files, but may reduce TPS. Default: 128. |
-| `--enable_filter_sharing` | Enable filter sharing between group and single models to reduce DRAM usage at a cost of higher TTFT and lower TPS. This is only effective when both model types use the same precision and is required when compiling with LoRA. |
 | `--no-quantize_embeddings` | Disable embedding-table quantization, which is enabled by default for supported LLMs and VLMs. |
 | `--no-quantize_kv_cache` | Disable KV-cache quantization, which is enabled by default. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
-| `--draft_model_path` | Path to an EAGLE3 draft model for speculative decoding. |
+| `--draft_model_path` | Path to a compatible EAGLE3 or Gemma4 MTP draft model for speculative decoding. |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
 | `--compile_lora`, `--no-compile_lora` | Enable or disable adapter-weight compilation when LoRA paths are supplied. Enabled by default. |
@@ -299,7 +298,7 @@ runtime.
 LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter to be dynamically applied or removed at runtime without recompiling the base model. The base model is compiled with parallel LoRA branches (initialized to zero), and the adapter weights are compiled separately into `.npy` files that are loaded on demand.
 
 :::note
-Filter sharing is required when compiling with LoRA. Enable it with `--enable_filter_sharing`. LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
+LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
 :::
 
 1.  **Download the base model and LoRA adapter**:
@@ -325,7 +324,6 @@ Filter sharing is required when compiling with LoRA. Enable it with `--enable_fi
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -338,7 +336,6 @@ Filter sharing is required when compiling with LoRA. Enable it with `--enable_fi
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \

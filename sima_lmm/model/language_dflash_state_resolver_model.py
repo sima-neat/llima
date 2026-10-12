@@ -16,10 +16,6 @@ class LanguageDFlashStateResolverModel(BaseModel):
         assert self.cfg.lm_cfg.linear_attn_cfg is not None
         assert self.block_size in (4, 8, 16)
 
-    @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
     def generate_graph(self, layer_cfg: LayerConfiguration, quantizable: bool):
         linear_cfg = self.cfg.lm_cfg.linear_attn_cfg
         heads = linear_cfg.num_value_heads

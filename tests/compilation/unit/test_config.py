@@ -9,6 +9,8 @@ import pytest
 from sima_lmm.config.vlm_config import (
     ModelFormat,
     PipelineConfig,
+    SPECULATIVE_BUDGET,
+    SpeculativeDecodingMethod,
     VlmArchType,
     VlmConfig,
     group_cache_model_indices,
@@ -17,10 +19,9 @@ from sima_lmm.config.vlm_config import (
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.model import FileGenPrecision
 from sima_lmm.config.whisper_config import WhisperConfig
-from sima_lmm.model import VisionLanguageModel
-from sima_lmm.model import vision_language_model
+from sima_lmm.host.configuration_helper import _encode_layer_id, read_configuration_file
+from sima_lmm.model import VisionLanguageModel, vision_language_model
 from sima_lmm.model.language_model import LanguageModel
-from sima_lmm.host.configuration_helper import read_configuration_file
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -200,6 +201,58 @@ def test_speculative_decoding_rejects_sliding_attention():
         config.lm_cfg.set_speculative_decoding_config({})
 
 
+def test_gemma4_mtp_target_compiles_batched_decode_models_only():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": SpeculativeDecodingMethod.GEMMA4_MTP,
+            "is_draft": False,
+            "speculative_budget": SPECULATIVE_BUDGET["gemma4_mtp_target"],
+        }
+    )
+    config.config_pipeline(None, None, 2048, 128, 128)
+
+    assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 7
+    assert _layer_indices(config, "single_sliding_cache") == [127, 255, 383, 511, 517]
+    assert not any(layer.part.startswith("point_") for layer in config.get_layer_ids())
+    assert _layer_indices(config, "single_per_layer") == [0]
+    for layer_id in config.get_layer_ids():
+        _encode_layer_id(layer_id)
+
+
+def test_gemma4_mtp_draft_uses_pointwise_execution_width():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_speculative_decoding_config(
+        {
+            "method": SpeculativeDecodingMethod.GEMMA4_MTP,
+            "is_draft": True,
+            "speculative_budget": SPECULATIVE_BUDGET["gemma4_mtp_draft"],
+        }
+    )
+    model = object.__new__(LanguageModel)
+    model.cfg = config
+
+    assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 6
+    assert model._single_model_num_tokens == 1
+
+
+def test_gemma4_ordered_embedding_metadata():
+    config = _load_reference_config("gemma4_e2b_it_vlm_config.json")
+    config.lm_cfg.set_gemma4_assistant_config(
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": config.lm_cfg.hidden_size,
+            "use_ordered_embeddings": True,
+            "num_centroids": 2048,
+            "centroid_intermediate_top_k": 32,
+        }
+    )
+
+    assert config.lm_cfg.speculative_decoding_cfg.use_ordered_embeddings
+    assert config.lm_cfg.speculative_decoding_cfg.num_centroids == 2048
+    assert config.lm_cfg.speculative_decoding_cfg.centroid_intermediate_top_k == 32
+
+
 def test_speculative_decoding_rejects_linear_attention():
     config = _load_reference_config("qwen3.5_vlm_config.json")
 
@@ -262,6 +315,9 @@ def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_p
     assert _layer_indices(config, "group_cache") == []
     assert _layer_indices(config, "group_sliding_cache") == []
     assert _layer_indices(config, "single_cache") == list(range(127, 2048, 128))
+
+    assert _layer_indices(config, "group_draft_fc") == [0]
+    assert _layer_indices(config, "single_draft_fc") == [0]
 
     model = LanguageModel(
         config,
@@ -426,7 +482,7 @@ def test_legacy_pipeline_config_uses_stored_mask_for_all_attention_types():
 
 @pytest.mark.parametrize(
     ("sliding_window", "expected_transition"),
-    [(512, 384), (1024, 896)],
+    [(512, 511), (1024, 1023)],
 )
 def test_gemma3_automatic_sliding_cache_transition(
     sliding_window: int, expected_transition: int
@@ -435,8 +491,8 @@ def test_gemma3_automatic_sliding_cache_transition(
     config.lm_cfg.attn_cfg.sliding_window = sliding_window
     config.config_pipeline(None, None, 2048, 128, 128)
 
-    assert expected_transition in _layer_indices(config, "group_cache")
-    assert _layer_indices(config, "group_sliding_cache") == []
+    assert expected_transition not in _layer_indices(config, "group_cache")
+    assert _layer_indices(config, "group_sliding_cache") == [expected_transition]
 
 
 def test_shared_sliding_cache_includes_full_and_sliding_mask_buckets():
@@ -453,9 +509,9 @@ def test_shared_sliding_cache_transition_does_not_add_execution_offset():
     config.lm_cfg.attn_cfg.sliding_window = 1000
     config.config_pipeline(None, None, 2048, 128, 128)
 
-    transition = 872
-    assert transition not in config.pipeline_cfg.input_token_group_offsets
-    assert transition in _layer_indices(config, "group_cache")
+    assert config.pipeline_cfg.input_token_group_offsets == list(range(0, 2048, 128))
+    assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
+    assert _layer_indices(config, "group_sliding_cache") == [896, 999]
 
 
 def test_gemma4_keeps_separate_sliding_cache_models():
@@ -464,7 +520,7 @@ def test_gemma4_keeps_separate_sliding_cache_models():
 
     assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
     assert _layer_indices(config, "single_cache") == list(range(127, 2048, 128))
-    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384]
+    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384, 511]
     assert _layer_indices(config, "single_sliding_cache") == [127, 255, 383, 511]
 
 
@@ -474,8 +530,20 @@ def test_non_default_mask_only_buckets_single_cache_models_through_2k():
 
     assert _layer_indices(config, "group_cache") == list(range(0, 2048, 128))
     assert _layer_indices(config, "single_cache") == list(range(255, 2048, 256))
-    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384]
+    assert _layer_indices(config, "group_sliding_cache") == [0, 128, 256, 384, 511]
     assert _layer_indices(config, "single_sliding_cache") == [255, 511]
+
+
+@pytest.mark.parametrize(
+    ("window", "group", "expected"),
+    [(128, 112, [112, 127]), (4096, 128, []), (512, 128, [511])],
+)
+def test_group_sliding_cache_only_adds_executed_crossing_windows(window, group, expected):
+    config = _load_reference_config("gemma3_vlm_config.json")
+    config.lm_cfg.attn_cfg.sliding_window = window
+    config.config_pipeline(None, None, 4096, group, 128)
+
+    assert _layer_indices(config, "group_sliding_cache") == expected
 
 
 @pytest.mark.parametrize("max_num_tokens", [128, 512, 2049, 2500])
@@ -532,8 +600,10 @@ def test_group_configuration_is_automatic_and_serializable():
     assert restored.pipeline_cfg.input_token_group_offsets == list(range(0, 1024, 128))
 
 
-def test_sliding_attention_rejects_group_at_least_as_large_as_window():
+@pytest.mark.parametrize("group", [512, 1024])
+def test_sliding_attention_supports_groups_at_least_as_large_as_window(group):
     config = _load_reference_config("gemma3_vlm_config.json")
+    config.lm_cfg.attn_cfg.sliding_window = 512
+    config.config_pipeline(None, None, 2048, group, 128)
 
-    with pytest.raises(ValueError, match="smaller than sliding_window"):
-        config.config_pipeline(None, None, 2048, 1024, 128)
+    assert _layer_indices(config, "group_sliding_cache") == ([511] if group == 512 else [0, 511])

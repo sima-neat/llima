@@ -130,29 +130,38 @@ std::optional<std::string> VisionLanguageModel::run_model(
     if (max_new_tokens.has_value())
         max_num_tokens = preprocessed_data.input_token_ids.size() + max_new_tokens.value();
 
-    std::optional<std::vector<uint32_t>> output_token_ids;
-    if (_draft_vlm_ptr != nullptr) {
-        output_token_ids = _language_model_ptr->run_model_speculative_decoding(
-            *_draft_vlm_ptr->_language_model_ptr,
-            preprocessed_data.input_token_ids,
-            max_num_tokens,
-            timer_ttft,
-            nullptr,
-            preprocessed_data.stable_prefix_token_count
-        );
-    } else {
-        output_token_ids = _language_model_ptr->run_model(
-            preprocessed_data.input_token_ids,
-            timer_ttft,
-            max_num_tokens,
-            std::nullopt,
-            preprocessed_data.stable_prefix_token_count
-        );
-    }
+    auto output_token_ids = _run_language_model(
+        preprocessed_data.input_token_ids, max_num_tokens, timer_ttft,
+        nullptr, preprocessed_data.stable_prefix_token_count
+    );
 
     if (output_token_ids.has_value())
         return _vlm_helper.get_tokenizer()->decode(output_token_ids.value(), true);
     return std::nullopt;
+}
+
+
+std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_language_model(
+    std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> max_num_tokens,
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result,
+    uint16_t stable_prefix_token_count
+) {
+    if (_draft_vlm_ptr == nullptr) {
+        return _language_model_ptr->run_model(
+            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count
+        );
+    }
+    if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
+        throw std::runtime_error(
+            "Draft VLM is configured but target model lacks speculative decoding config"
+        );
+    }
+    return _language_model_ptr->run_model_speculative_decoding(
+        *_draft_vlm_ptr->_language_model_ptr, input_token_ids,
+        max_num_tokens, timer_ttft, performance_result, stable_prefix_token_count
+    );
 }
 
 
@@ -166,12 +175,18 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
     _text_streamer.set_tool_call_enabled(false);
     _text_streamer.disable();
 
-    _language_model_ptr->create_input_buffers(input_token_ids);
-    auto output_token_ids = _language_model_ptr->run_model(
-        input_token_ids, std::nullopt, override_max_num_tokens, override_stop_token_ids
-    );
-    _text_streamer.enable();
-    return output_token_ids.value_or(std::vector<uint32_t>());
+    auto original_stop_token_ids = _language_model_ptr->set_stop_token_ids(override_stop_token_ids);
+    try {
+        _language_model_ptr->create_input_buffers(input_token_ids);
+        auto output_token_ids = _run_language_model(input_token_ids, override_max_num_tokens);
+        _language_model_ptr->set_stop_token_ids(original_stop_token_ids);
+        _text_streamer.enable();
+        return output_token_ids.value_or(std::vector<uint32_t>());
+    } catch (...) {
+        _language_model_ptr->set_stop_token_ids(original_stop_token_ids);
+        _text_streamer.enable();
+        throw;
+    }
 }
 
 
@@ -233,12 +248,8 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
             override_stop_token_ids
         );
         try {
-            auto output_token_ids = _language_model_ptr->run_model_speculative_decoding(
-                *_draft_vlm_ptr->_language_model_ptr,
-                input_token_ids,
-                override_max_num_tokens,
-                std::nullopt,
-                &result
+            auto output_token_ids = _run_language_model(
+                input_token_ids, override_max_num_tokens, std::nullopt, &result
             );
             if (!output_token_ids.has_value()) {
                 throw std::runtime_error(
@@ -275,7 +286,8 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     }
     auto next_token_id = _language_model_ptr->get_cached_first_generated_token();
 
-    if (prefill_result->empty()) {
+    if (prefill_result->empty() && !override_stop_token_ids.value_or(
+            _language_model_ptr->get_stop_token_ids()).contains(next_token_id)) {
         // Override the max_num_tokens and stop_token_ids.
         auto original_max_num_tokens = _language_model_ptr->set_max_num_tokens(
             override_max_num_tokens

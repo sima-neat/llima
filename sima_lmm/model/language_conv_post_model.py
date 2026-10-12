@@ -14,10 +14,6 @@ class LanguageConvPostModel(LanguagePostBaseModel):
     def __post_init__(self):
         assert self.num_tokens == 1, "LanguageConvPostModel only supports num_tokens=1"
 
-    @property
-    def enable_filter_sharing(self) -> bool:
-        return self.cfg.pipeline_cfg.enable_filter_sharing
-
     def generate_graph(
         self, layer_cfg: LayerConfiguration, quantizable: bool
     ):
