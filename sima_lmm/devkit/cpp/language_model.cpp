@@ -1113,16 +1113,8 @@ uint32_t LanguageModel::run_model_once(
         MLABuffer* dflash_capture_buffer = nullptr;
         std::map<uint8_t, MLABufferSlice> ofm_map;
         if (direct_dflash_capture && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1) {
-            const auto& capture_layers =
-                _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids;
-            const auto capture = std::find(
-                capture_layers.begin(), capture_layers.end(), layer_idx
-            );
-            if (capture != capture_layers.end()) {
-                const auto capture_idx = std::distance(capture_layers.begin(), capture);
-                dflash_capture_buffer = &get_buffer(fmt::format(
-                    "dflash_target_hidden_n{}_{}", num_tokens, capture_idx
-                ));
+            dflash_capture_buffer = _get_dflash_hidden_buffer(num_tokens, layer_idx);
+            if (dflash_capture_buffer != nullptr) {
                 ofm_map.emplace(
                     0,
                     MLABufferSlice{
@@ -2209,11 +2201,7 @@ void LanguageModel::_define_buffers() {
         _use_group_token_models
         && _cfg.pipeline_cfg.input_token_group_size != single_num_tokens
     ) {
-        const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
-        if (std::find(num_tokens_vec.begin(), num_tokens_vec.end(), num_tokens)
-            == num_tokens_vec.end()) {
-            num_tokens_vec.emplace_back(num_tokens);
-        }
+        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     const uint16_t max_future_token_mask_size = _get_max_future_token_mask_size();
     if (max_future_token_mask_size > 1) {
@@ -3505,6 +3493,100 @@ void LanguageModel::_compute_and_upload_per_layer_inputs_prefill(
     _upload_per_layer_embedding_rows(token_ids, num_tokens);
 }
 
+
+std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
+    uint16_t num_tokens, uint16_t valid_tokens,
+    std::span<const uint32_t> expected_draft_tokens
+) {
+    if (
+        valid_tokens == 0 || valid_tokens > num_tokens
+        || expected_draft_tokens.size() + 1 != valid_tokens
+    ) {
+        throw std::runtime_error(fmt::format(
+            "Requested {} lm_head rows from n{} output", valid_tokens, num_tokens
+        ));
+    }
+
+    const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
+    const uint16_t num_splits = _cfg.lm_cfg.lm_head_num_splits;
+    if (num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
+        auto& buf = get_buffer(fmt::format("n{}_buffer4", num_tokens));
+        buf.invalidate_cache();
+        const auto* output = static_cast<const uint32_t*>(buf.get_virtual_addr());
+        std::vector<uint32_t> token_ids;
+        token_ids.reserve(valid_tokens);
+        for (uint16_t row = 0; row < valid_tokens; ++row) {
+            token_ids.emplace_back(output[row]);
+            if (
+                row < expected_draft_tokens.size()
+                && output[row] != expected_draft_tokens[row]
+            ) {
+                break;
+            }
+        }
+        return token_ids;
+    }
+
+    struct LogitView {
+        MLABuffer* buffer;
+        const uint8_t* data;
+        size_t row_bytes;
+        uint32_t vocab_begin;
+        uint32_t width;
+    };
+    std::vector<LogitView> views;
+    views.reserve(num_splits);
+    const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
+    for (uint16_t split_idx = 0; split_idx < num_splits; ++split_idx) {
+        const uint32_t split_begin = static_cast<uint32_t>(split_idx) * split_dim;
+        const uint32_t split_size = (num_splits == 1)
+            ? output_size
+            : std::min<uint32_t>(split_dim, output_size - split_begin);
+        const std::string buf_name = (num_splits == 1)
+            ? fmt::format("n{}_buffer4", num_tokens)
+            : fmt::format("n{}_lm_split{}", num_tokens, split_idx);
+        auto& buf = get_buffer(buf_name);
+        if (buf.get_dtype() != "bfloat16" || buf.get_shape().size() != 2
+            || buf.get_shape().front() != num_tokens || buf.get_shape().back() != split_size) {
+            throw std::runtime_error("Invalid lm_head logit buffer");
+        }
+        views.emplace_back(LogitView{
+            &buf,
+            static_cast<const uint8_t*>(buf.get_virtual_addr()),
+            buf.get_buf_len(std::vector<uint32_t>{1, split_size}),
+            split_begin,
+            split_size
+        });
+    }
+
+    std::vector<uint32_t> best_indices;
+    best_indices.reserve(valid_tokens);
+    for (uint16_t row = 0; row < valid_tokens; ++row) {
+        uint32_t best_index = 0;
+        float best_value = -std::numeric_limits<float>::infinity();
+        for (const auto& view : views) {
+            const size_t row_offset = static_cast<size_t>(row) * view.row_bytes;
+            view.buffer->invalidate_cache(row_offset, view.row_bytes);
+            const auto* row_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+                view.data + row_offset
+            );
+            const auto [value, offset] = argmax_bf16(row_ptr, view.width);
+            const uint32_t index = view.vocab_begin + offset;
+            if (value > best_value || (value == best_value && index < best_index)) {
+                best_value = value;
+                best_index = index;
+            }
+        }
+        best_indices.emplace_back(best_index);
+        if (
+            row < expected_draft_tokens.size()
+            && best_index != expected_draft_tokens[row]
+        ) {
+            break;
+        }
+    }
+    return best_indices;
+}
 
 uint32_t LanguageModel::_calc_next_token_id(MLABuffer* buf_ptr) {
     const auto* values = reinterpret_cast<const Eigen::bfloat16*>(

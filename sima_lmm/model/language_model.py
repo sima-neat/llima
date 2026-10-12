@@ -103,7 +103,7 @@ class LanguageModel(BaseModel):
         # Create a list of all models to compile
         model_list = list()
         num_tokens = self.cfg.pipeline_cfg.input_token_group_size
-        single_model_num_tokens = self._single_model_num_tokens
+        single_model_num_tokens = self.cfg.lm_cfg.single_model_num_tokens
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
 
@@ -625,10 +625,6 @@ class LanguageModel(BaseModel):
         )
         assert embeddings is not None
         return embeddings, scale
-
-    @property
-    def _single_model_num_tokens(self) -> int:
-        return self.cfg.lm_cfg.single_model_num_tokens
 
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,

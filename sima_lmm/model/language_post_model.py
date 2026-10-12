@@ -46,22 +46,6 @@ class LanguagePostModel(LanguagePostBaseModel):
         base = self.hf_model.language_model_param_base_name
         return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
 
-    def _dflash_target_output_embed_name(self) -> str:
-        if self.dflash_target_hf_model is None:
-            raise RuntimeError("DFlash draft is missing its paired target weight source")
-        candidates = (
-            "lm_head.weight",
-            "language_model.lm_head.weight",
-            "language_model.model.embed_tokens.weight",
-            "model.language_model.embed_tokens.weight",
-            "model.embed_tokens.weight",
-            "model.lm_head.weight",
-        )
-        for name in candidates:
-            if self.dflash_target_hf_model.param_exists(name):
-                return name
-        raise RuntimeError("Cannot determine the DFlash target output embedding tensor")
-
     def _get_dflash_target_param(self, name: str, *, dequantize: bool = False):
         if self.dflash_target_hf_model is None:
             raise RuntimeError("DFlash draft is missing its paired target weight source")
@@ -246,45 +230,7 @@ class LanguagePostModel(LanguagePostBaseModel):
             final_output = graph.add(final_output, mla_input_deepstack)
 
         if self.layer_idx == self.cfg.lm_cfg.num_hidden_layers - 1:
-            if self.is_dflash_draft:
-                normalized = graph.rms_norm("norm", final_output)
-                proposals = graph.slice(normalized, start=1, stop=self.num_tokens, axis=2)
-                output_embed_name = self._dflash_target_output_embed_name()
-                output_param = self._get_dflash_target_param(output_embed_name)
-                output_weight = (
-                    output_param[1] if isinstance(output_param, tuple) else output_param
-                )
-
-                def get_output_param(name: str):
-                    return self._get_dflash_target_param(
-                        name, dequantize=graph.quantizable
-                    )
-
-                outputs = []
-                for index in range(self.cfg.lm_cfg.lm_head_num_splits):
-                    begin = index * self.cfg.lm_cfg.lm_head_split_dim
-                    end = min(
-                        begin + self.cfg.lm_cfg.lm_head_split_dim,
-                        output_weight.shape[0],
-                    )
-
-                    def slice_rows(value, start=begin, stop=end):
-                        return value[start:stop]
-
-                    outputs.append(graph._build_conv(
-                        f"dflash_lm_head.{index}",
-                        proposals,
-                        get_param_func=get_output_param,
-                        check_param_func=self._check_dflash_target_param,
-                        src_weight_name=output_embed_name,
-                        weight_process_func=slice_rows,
-                        scale_process_func=slice_rows,
-                        bias_process_func=slice_rows,
-                    ))
-            else:
-                outputs = self._build_post_transformer(
-                    graph, final_output
-                )
+            outputs = self._build_post_transformer(graph, final_output)
         else:
             outputs = [final_output]
 

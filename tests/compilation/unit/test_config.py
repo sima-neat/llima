@@ -233,7 +233,7 @@ def test_gemma4_mtp_draft_uses_pointwise_execution_width():
     model.cfg = config
 
     assert config.lm_cfg.speculative_decoding_cfg.speculative_budget == 6
-    assert model._single_model_num_tokens == 1
+    assert model.cfg.lm_cfg.single_model_num_tokens == 1
 
 
 def test_gemma4_ordered_embedding_metadata():
@@ -363,7 +363,7 @@ def test_dflash_final_post_uses_paired_target_head(tmp_path):
     )
 
     post = model._get_part_model("post", 8, layer_idx=5)
-    assert post._dflash_target_output_embed_name() == "lm_head.weight"
+    assert post._get_output_embed_name(post._check_dflash_target_param) == "lm_head.weight"
     np.testing.assert_array_equal(
         post._get_dflash_target_param("lm_head.weight", dequantize=True),
         np.array([[1, 2, 2, 3]], dtype=np.float32),

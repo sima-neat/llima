@@ -53,6 +53,3 @@ class LanguageDFlashStateResolverModel(BaseModel):
                 ),
             )
         }
-
-    def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters]:
-        return {}

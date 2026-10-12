@@ -301,11 +301,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t token_idx, uint16_t valid_tokens
         );
         struct DFlashScratch;
+        MLABuffer* _get_dflash_hidden_buffer(uint16_t num_tokens, uint8_t layer_idx);
         void _bind_dflash_linear_conv_state(uint16_t prefix_tokens);
         void _resolve_dflash_linear_state(uint16_t prefix_tokens);
         void _commit_dflash_linear_state(uint16_t prefix_tokens);
         void _save_dflash_state_checkpoint(
-            uint16_t token_count, uint16_t prefix_tokens, bool is_prefill
+            uint16_t token_count, uint16_t prefix_tokens
         );
         void _upload_dflash_attention_mask(
             uint16_t num_tokens, uint16_t token_idx,

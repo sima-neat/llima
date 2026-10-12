@@ -49,6 +49,13 @@ struct LanguageModel::DFlashScratch {
   std::vector<Eigen::bfloat16> linear_valid_mask;
 };
 
+MLABuffer* LanguageModel::_get_dflash_hidden_buffer(uint16_t num_tokens, uint8_t layer_idx) {
+  const auto& layers = _cfg.lm_cfg.speculative_decoding_cfg->target_layer_ids;
+  const auto layer = std::find(layers.begin(), layers.end(), layer_idx);
+  return layer == layers.end() ? nullptr : &get_buffer(fmt::format(
+      "dflash_target_hidden_n{}_{}", num_tokens, std::distance(layers.begin(), layer)));
+}
+
 void LanguageModel::_bind_dflash_linear_conv_state(uint16_t prefix_tokens) {
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
   if (prefix_tokens > block_size) {
@@ -144,8 +151,7 @@ void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
 }
 
 void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
-                                                   uint16_t prefix_tokens,
-                                                   bool is_prefill) {
+                                                   uint16_t prefix_tokens) {
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
   if (prefix_tokens == 0 || prefix_tokens > block_size) {
     throw std::invalid_argument("Invalid DFlash checkpoint prefix length");
@@ -155,7 +161,7 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
   }
 
   const auto checkpoint_slot =
-      _select_state_checkpoint_slot(token_count, is_prefill);
+      _select_state_checkpoint_slot(token_count, false);
   if (!checkpoint_slot.has_value()) {
     return;
   }
@@ -404,18 +410,16 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
           : nullptr;
   _stage_embedding_rows(target_lm, input_ids, input, input_scale);
 
-  std::optional<std::pair<std::string_view, bool>> active_mask;
+  std::optional<std::string_view> active_mask_type;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const bool bidirectional = layer_type == "full_attention";
-    const auto required_mask = std::pair{std::string_view(layer_type),
-                                         bidirectional};
-    if (!active_mask.has_value() || *active_mask != required_mask) {
+    if (!active_mask_type.has_value() || *active_mask_type != layer_type) {
       MLAModelWithBuffer::run_queue();
       _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx,
                                     bidirectional, scratch.attention_mask);
-      active_mask = required_mask;
+      active_mask_type = layer_type;
     }
     const auto attn_models =
         _bind_attn_models(num_tokens, token_idx, layer_idx, input_scale);
@@ -510,8 +514,6 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
     get_buffer("linear_valid_mask").upload(valid.data());
   }
 
-  const auto &capture_layers =
-      _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids;
   MLABuffer *layer_input = nullptr;
   std::optional<std::string_view> active_mask_type;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
@@ -527,14 +529,9 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
                                        {0, 0},
                                        {num_tokens, _cfg.lm_cfg.hidden_size}});
     }
-    const auto capture =
-        std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
-    MLABuffer *capture_buffer = nullptr;
+    MLABuffer *capture_buffer = _get_dflash_hidden_buffer(num_tokens, layer_idx);
     std::map<uint8_t, MLABufferSlice> outputs;
-    if (capture != capture_layers.end()) {
-      const auto capture_idx = std::distance(capture_layers.begin(), capture);
-      capture_buffer = &get_buffer(fmt::format(
-          "dflash_target_hidden_n{}_{}", num_tokens, capture_idx));
+    if (capture_buffer != nullptr) {
       outputs.emplace(0, MLABufferSlice{capture_buffer,
                                         {0, 0},
                                         {num_tokens, _cfg.lm_cfg.hidden_size}});
@@ -569,54 +566,8 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
   }
   MLAModelWithBuffer::run_queue();
 
-  const uint32_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
-  auto &views = scratch.logit_views;
-  views.clear();
-  auto add_view = [&](MLABuffer &buffer, uint32_t begin, uint32_t width) {
-    if (buffer.get_dtype() != "bfloat16" || buffer.get_shape().size() != 2 ||
-        buffer.get_shape().front() != num_tokens ||
-        buffer.get_shape().back() != width) {
-      throw std::runtime_error("Invalid DFlash target logit buffer");
-    }
-    views.push_back(DFlashLogitView{
-        &buffer, static_cast<const uint8_t *>(buffer.get_virtual_addr()),
-        buffer.get_buf_len(std::vector<uint32_t>{1, width}), begin, width});
-  };
-  if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-    add_view(get_buffer(fmt::format("n{}_buffer4", num_tokens)), 0,
-             vocab_size);
-  } else {
-    for (uint32_t split = 0, begin = 0; begin < vocab_size;
-         begin += _cfg.lm_cfg.lm_head_split_dim, ++split) {
-      const uint32_t width =
-          std::min(_cfg.lm_cfg.lm_head_split_dim, vocab_size - begin);
-      add_view(get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split)),
-               begin, width);
-    }
-  }
-
-  for (uint16_t row = 0; row < num_tokens; ++row) {
-    float best = -std::numeric_limits<float>::infinity();
-    uint32_t target_token = 0;
-    for (const auto &view : views) {
-      const size_t row_offset = static_cast<size_t>(row) * view.row_stride;
-      view.buffer->invalidate_cache(row_offset, view.row_stride);
-      const auto *logits = reinterpret_cast<const Eigen::bfloat16 *>(
-          view.data + row_offset);
-      const auto [split_best, split_index] =
-          argmax_bf16(logits, view.width);
-      const uint32_t token = view.vocab_begin + split_index;
-      if (split_best > best
-          || (split_best == best && token < target_token)) {
-        best = split_best;
-        target_token = token;
-      }
-    }
-    if (row == num_tokens - 1 || target_token != input_ids[row + 1]) {
-      return {row, target_token};
-    }
-  }
-  throw std::runtime_error("DFlash verification did not produce a bonus token");
+  const auto token_ids = _argmax_lm_head_rows(num_tokens, num_tokens, input_ids.subspan(1));
+  return {static_cast<uint16_t>(token_ids.size() - 1), token_ids.back()};
 }
 
 std::optional<std::vector<uint32_t>>
@@ -642,6 +593,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     draft_lm._is_running = false;
     if (failed) {
       try {
+        _text_streamer.push(DecodeCallbackType::STOP, 0, 0);
         _text_streamer.wait_streaming();
       } catch (...) {
       }
@@ -759,7 +711,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     const auto &proposals =
         draft_lm._run_dflash_draft(*this, anchor, verify_start, scratch);
     auto &verify_input = scratch.verify_input;
-    std::fill(verify_input.begin(), verify_input.end(), anchor);
+    verify_input.front() = anchor;
     std::copy(proposals.begin(), proposals.end(), verify_input.begin() + 1);
     const auto [accepted, bonus_token] =
         _run_dflash_target_verify(verify_input, verify_start, scratch);
@@ -783,8 +735,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
       if (boundary != _checkpoint_boundaries.begin()) {
         --boundary;
         if (*boundary > verify_start) {
-          _save_dflash_state_checkpoint(*boundary, *boundary - verify_start,
-                                        false);
+          _save_dflash_state_checkpoint(*boundary, *boundary - verify_start);
         }
       }
     }
@@ -803,9 +754,10 @@ LanguageModel::_run_model_dflash_speculative_decoding(
         ++performance_result->generated_tokens;
       }
     }
-    _cached_token_ids.insert(_cached_token_ids.end(), verify_input.begin(),
-                             verify_input.begin() + committed_rows);
-    draft_lm._cached_token_ids = _cached_token_ids;
+    for (auto* model : {this, &draft_lm}) {
+      model->_cached_token_ids.insert(model->_cached_token_ids.end(), verify_input.begin(),
+                                      verify_input.begin() + committed_rows);
+    }
     _cached_first_generated_token = emitted[produced - 1];
     draft_lm._cached_first_generated_token = _cached_first_generated_token;
     if (performance_result != nullptr) {
