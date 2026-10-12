@@ -108,7 +108,7 @@ output_directory/
 | `--no-quantize_embeddings` | 기본적으로 지원되는 LLM 및 VLM에 대해 활성화되어 있는 임베딩 테이블 양자화를 비활성화합니다. |
 | `--no-quantize_kv_cache` | 기본적으로 활성화되어 있는 KV 캐시 양자화를 비활성화합니다. |
 | `--return_logits` | 마지막 레이어의 출력에서 로짓 값을 반환합니다(모델 평가에 필요). |
-| `--draft_model_path` | 추론 디코딩을 위한 EAGLE3 초안 모델의 경로입니다. |
+| `--draft_model_path` | 추측 디코딩을 위한 호환 가능한 EAGLE3 또는 Gemma4 MTP 초안 모델의 경로입니다. |
 | `--lora_name` | 기본 모델과 함께 컴파일되는 LoRA 어댑터의 이름입니다. |
 | `--lora_path` | 기본 모델과 함께 컴파일할 때 사용할 LoRA 어댑터 디렉터리의 경로입니다. |
 | `--compile_lora`, `--no-compile_lora` | LoRA 경로가 제공될 때 어댑터 가중치 컴파일을 활성화하거나 비활성화합니다. 기본적으로 활성화되어 있습니다. |
