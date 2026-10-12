@@ -31,11 +31,6 @@ struct QueuedRun {
     std::vector<mla_tensor> ofms;
 };
 
-struct ImportedBuffer {
-    uint64_t generation = 0;
-    uint32_t id = 0;
-};
-
 struct MlaRuntimeState {
     std::mutex registry_mutex;
     std::recursive_mutex execution_mutex;
@@ -43,7 +38,8 @@ struct MlaRuntimeState {
     std::map<std::filesystem::path, std::size_t> path_to_index;
     std::vector<std::filesystem::path> paths;
     std::vector<mla_model_p> models;
-    std::unordered_map<const MLABuffer*, ImportedBuffer> imported_buffers;
+    // Allocation identity follows storage when MLABuffer::swap_storage is used.
+    std::unordered_map<uint64_t, uint32_t> imported_buffers;
 };
 
 MlaRuntimeState& runtime_state() {
@@ -69,21 +65,8 @@ uint32_t imported_buffer_id(MLABuffer* buffer) {
         throw std::logic_error("cannot import an unallocated MLA buffer");
     }
 
-    auto found = state.imported_buffers.find(buffer);
-    if (found != state.imported_buffers.end() &&
-        found->second.generation == generation) {
-        return found->second.id;
-    }
-    if (found != state.imported_buffers.end()) {
-        const int rc = mla_release_dmabuf(require_handle(), found->second.id);
-        if (rc != 0) {
-            throw std::runtime_error(fmt::format(
-                "MLA-RT failed to release stale DMA-BUF registration: rc={} ({})",
-                rc, std::strerror(rc < 0 ? -rc : rc)
-            ));
-        }
-        state.imported_buffers.erase(found);
-    }
+    const auto found = state.imported_buffers.find(generation);
+    if (found != state.imported_buffers.end()) return found->second;
 
     uint32_t id = 0;
     const int rc = mla_import_dmabuf(
@@ -95,7 +78,7 @@ uint32_t imported_buffer_id(MLABuffer* buffer) {
             rc, std::strerror(rc < 0 ? -rc : rc)
         ));
     }
-    state.imported_buffers.emplace(buffer, ImportedBuffer{generation, id});
+    state.imported_buffers.emplace(generation, id);
     return id;
 }
 
@@ -240,6 +223,25 @@ MLABufferSlice materialize_view(
 
 } // namespace
 
+void release_mla_buffer_import(const MLABuffer* buffer) noexcept {
+    auto& state = runtime_state();
+    std::lock_guard execution_lock(state.execution_mutex);
+    std::lock_guard registry_lock(state.registry_mutex);
+    const auto found = state.imported_buffers.find(buffer->get_allocation_generation());
+    if (found == state.imported_buffers.end()) return;
+
+    const int rc = mla_release_dmabuf(state.handle, found->second);
+    if (rc != 0) {
+        // Retain the id so disconnect can retry release.
+        spdlog::error(
+            "MLA-RT failed to release DMA-BUF registration {} during buffer teardown: rc={} ({})",
+            found->second, rc, std::strerror(rc < 0 ? -rc : rc)
+        );
+        return;
+    }
+    state.imported_buffers.erase(found);
+}
+
 void connect_mla_rt(const std::vector<std::string>& args) {
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
@@ -302,13 +304,13 @@ void disconnect_mla_rt() {
     }
     queued_runs.clear();
     queued_run_count = 0;
-    for (const auto& [buffer, imported] : state.imported_buffers) {
-        (void)buffer;
-        const int rc = mla_release_dmabuf(state.handle, imported.id);
+    for (const auto& [generation, id] : state.imported_buffers) {
+        (void)generation;
+        const int rc = mla_release_dmabuf(state.handle, id);
         if (rc != 0) {
             spdlog::error(
                 "MLA-RT failed to release DMA-BUF registration {}: rc={} ({})",
-                imported.id, rc, std::strerror(rc < 0 ? -rc : rc)
+                id, rc, std::strerror(rc < 0 ? -rc : rc)
             );
         }
     }

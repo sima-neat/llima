@@ -13,6 +13,9 @@
 namespace simaai {
 namespace llima {
 
+// Private hook into the MLA-RT import registry in mla_model.cpp.
+void release_mla_buffer_import(const MLABuffer* buffer) noexcept;
+
 namespace {
 std::atomic<uint64_t> next_allocation_generation{1};
 
@@ -211,6 +214,7 @@ void MLABuffer::allocate() {
 
 void MLABuffer::free() {
     if (_simaai_dmabuf_ptr == nullptr) return;
+    release_mla_buffer_import(this);
     simaai_dmabuf_free(_simaai_dmabuf_ptr);
     _simaai_dmabuf_ptr = nullptr;
     _allocation_generation = 0;
