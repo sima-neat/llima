@@ -446,7 +446,10 @@ void LanguageModel::_define_attn_models_iter(
             }
         }
 
-        if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+        if (
+            _cfg.lm_cfg.speculative_decoding_cfg
+            && _cfg.lm_cfg.speculative_decoding_cfg->use_ordered_embeddings
+        ) {
             post_ofms.emplace_back(
                 MLABufferSlice{
                     &get_buffer(fmt::format(

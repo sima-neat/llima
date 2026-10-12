@@ -1308,7 +1308,8 @@ uint32_t LanguageModel::run_model_once(
             // states) for layers 2, N/2, N-3 so the orchestrator can feed them
             // into FC fusion.
             if (
-                _cfg.lm_cfg.is_eagle3_spec_decode()
+                _cfg.lm_cfg.is_spec_decode()
+                && _cfg.lm_cfg.speculative_decoding_cfg->is_eagle3()
                 && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
             ) {
                 const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
@@ -1596,7 +1597,10 @@ void LanguageModel::_initialize() {
             _d2t[i] = static_cast<int32_t>(src[i]);
         }
         _logger->info("Loaded d2t mapping with {} entries", _d2t.size());
-    } else if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+    } else if (
+        _cfg.lm_cfg.speculative_decoding_cfg
+        && _cfg.lm_cfg.speculative_decoding_cfg->use_ordered_embeddings
+    ) {
         const auto ordering_file_name = _files->get_path("devkit/gemma4_token_ordering.npy");
         const auto ordering_tensor = cnpy::npy_load(ordering_file_name);
         _files->release("devkit/gemma4_token_ordering.npy");
@@ -1612,11 +1616,11 @@ void LanguageModel::_initialize() {
             ));
         }
         if (
-            _cfg.lm_cfg.assistant_num_centroids == 0
-            || vocab_size % _cfg.lm_cfg.assistant_num_centroids != 0
-            || _cfg.lm_cfg.assistant_centroid_intermediate_top_k == 0
-            || _cfg.lm_cfg.assistant_centroid_intermediate_top_k
-                > _cfg.lm_cfg.assistant_num_centroids
+            _cfg.lm_cfg.speculative_decoding_cfg->num_centroids == 0
+            || vocab_size % _cfg.lm_cfg.speculative_decoding_cfg->num_centroids != 0
+            || _cfg.lm_cfg.speculative_decoding_cfg->centroid_intermediate_top_k == 0
+            || _cfg.lm_cfg.speculative_decoding_cfg->centroid_intermediate_top_k
+                > _cfg.lm_cfg.speculative_decoding_cfg->num_centroids
         ) {
             throw std::runtime_error("Invalid Gemma4 MTP ordered-embedding configuration");
         }
@@ -1640,14 +1644,6 @@ void LanguageModel::_initialize() {
         _logger->info(
             "Loaded Gemma4 MTP token ordering with {} entries",
             _gemma4_token_ordering.size()
-        );
-    } else if (
-        _cfg.lm_cfg.is_gemma4_mtp_draft()
-        && _cfg.lm_cfg.assistant_use_ordered_embeddings
-    ) {
-        _logger->warn(
-            "Gemma4 MTP ordered embeddings are disabled for this legacy artifact; "
-            "recompile the model to enable masked LM-head selection"
         );
     }
 
@@ -2135,7 +2131,11 @@ void LanguageModel::_define_buffers() {
             );
         }
     }
-    if (_cfg.lm_cfg.is_gemma4_mtp_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+    if (
+        _cfg.lm_cfg.is_spec_decode()
+        && _cfg.lm_cfg.speculative_decoding_cfg->is_gemma4_mtp()
+        && _cfg.lm_cfg.attn_cfg.swa_enable
+    ) {
         // Full and sliding attention can use different compiled mask strides.
         // They need separate storage because the entire transformer is queued.
         define_buffer(
@@ -2264,16 +2264,16 @@ void LanguageModel::_define_buffers() {
         } else if (is_gemma4_mtp_draft) {
             define_buffer(
                 fmt::format("gemma4_mtp_input_n{}", num_tokens),
-                {num_tokens, 2 * _cfg.lm_cfg.assistant_backbone_hidden_size}
+                {num_tokens, 2 * _cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size}
             );
             define_buffer(
                 fmt::format("n{}_buffer5", num_tokens),
-                {num_tokens, _cfg.lm_cfg.assistant_backbone_hidden_size}
+                {num_tokens, _cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size}
             );
-            if (_cfg.lm_cfg.uses_gemma4_masked_lm_head()) {
+            if (_cfg.lm_cfg.speculative_decoding_cfg->use_ordered_embeddings) {
                 define_buffer(
                     fmt::format("n{}_gemma4_mtp_centroid_logits", num_tokens),
-                    {num_tokens, _cfg.lm_cfg.assistant_num_centroids}
+                    {num_tokens, _cfg.lm_cfg.speculative_decoding_cfg->num_centroids}
                 );
             }
         }

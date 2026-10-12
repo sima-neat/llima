@@ -361,6 +361,15 @@ The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on
 the DevKit.
 
+Gemma4 MTP draft parameters in `vlm_config.json` live under
+`lm_cfg.speculative_decoding_cfg`, using the HF names `backbone_hidden_size`,
+`use_ordered_embeddings`, `num_centroids`, and `centroid_intermediate_top_k`.
+Other speculative models serialize these fields with defaults; normal models
+have a null speculative-decoding configuration. The former
+flat `assistant_*` keys are unsupported: migrate the model JSONs when updating
+the runtime; reuse the compiled model binaries. Rebuild C++ consumers against
+the matching development package because the configuration layout changes.
+
 The manual Gemma4 MTP prefix-cache test takes an individual deployed target and
 assistant directory. It checks exact generated-token parity for cold/warm
 requests, prefill group boundaries, partial prefixes, continuation through the

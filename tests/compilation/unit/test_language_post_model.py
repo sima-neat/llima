@@ -24,10 +24,10 @@ def _model(cls, tmp_path, tokens, *, draft=True, masked=False):
     )
     lm = SimpleNamespace(
         num_hidden_layers=1, hidden_size=32, layer_types=["full_attention"],
-        hidden_size_per_layer_input=0, assistant_backbone_hidden_size=64,
-        assistant_masked_lm_head_enabled=masked, assistant_num_centroids=16,
+        hidden_size_per_layer_input=0,
         speculative_decoding_cfg=SimpleNamespace(
             is_draft=draft, method=SpeculativeDecodingMethod.GEMMA4_MTP,
+            backbone_hidden_size=64, use_ordered_embeddings=masked, num_centroids=16,
         ),
         arch=LlmArchType.GEMMA, moe_cfg=None, lora_cfg=None, attn_cfg=attn,
         rms_norm_eps=1e-5, rms_norm_unit_offset=False,

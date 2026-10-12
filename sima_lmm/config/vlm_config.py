@@ -654,10 +654,18 @@ class SpeculativeDecodingConfig(BaseConfig):
         speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
             EAGLE3 uses 16 for target and 5 for draft by default. Gemma4 MTP uses
             7 target verification rows and a recurrent 6-token assistant budget.
+        backbone_hidden_size: Target hidden width consumed by Gemma4 MTP draft projections.
+        use_ordered_embeddings: Compile and run the centroid-masked Gemma4 MTP draft head.
+        num_centroids: Number of centroids in that head.
+        centroid_intermediate_top_k: Number of active centroids during draft selection.
     """
     method: str = SpeculativeDecodingMethod.EAGLE3
     is_draft: bool = False
     speculative_budget: int = 16
+    backbone_hidden_size: int = 0
+    use_ordered_embeddings: bool = False
+    num_centroids: int = 0
+    centroid_intermediate_top_k: int = 0
 
 
 @dataclass
@@ -693,16 +701,6 @@ class LanguageModelConfig(BaseConfig):
         lora_cfg: The configuration of LoRA for the base model.
         draft_vocab_size: Output dimension of the draft model's lm_head over a
             reduced token subset. Not an input embedding size. 0 for non-draft.
-        assistant_model_type: Outer HuggingFace model type for assistant/drafter models.
-        assistant_backbone_hidden_size: Hidden size of the target/backbone consumed by
-            Gemma4 MTP assistant projections.
-        assistant_use_ordered_embeddings: Whether the assistant uses the centroid-based
-            ordered/masked embedding head.
-        assistant_masked_lm_head_enabled: Whether compiler outputs include the centroid
-            logits and token-ordering artifact required to reproduce the masked head.
-            Kept separate from source metadata so older compiled artifacts remain loadable.
-        assistant_num_centroids: Number of ordered-embedding centroids for Gemma4 MTP.
-        assistant_centroid_intermediate_top_k: Active centroids for Gemma4 MTP.
         speculative_decoding_cfg: Speculative-decoding settings; None unless this
             model is part of a speculative-decoding pair.
     """
@@ -728,12 +726,6 @@ class LanguageModelConfig(BaseConfig):
     lm_head_num_splits: int = 1
     lm_head_split_dim: int = 0
     draft_vocab_size: int = 0
-    assistant_model_type: str = ""
-    assistant_backbone_hidden_size: int = 0
-    assistant_use_ordered_embeddings: bool = False
-    assistant_masked_lm_head_enabled: bool = False
-    assistant_num_centroids: int = 0
-    assistant_centroid_intermediate_top_k: int = 0
     conv_L_cache: int = 3
     conv_bias: bool = False
     lora_cfg: LoraConfig | None  = None
@@ -779,34 +771,34 @@ class LanguageModelConfig(BaseConfig):
         return lmc
 
     def set_gemma4_assistant_config(self, cfg: dict):
-        """Preserve Gemma4 assistant metadata from the outer HF config."""
-        self.assistant_model_type = cfg.get("model_type", "")
-        self.assistant_backbone_hidden_size = cfg.get("backbone_hidden_size", 0)
-        self.assistant_use_ordered_embeddings = cfg.get("use_ordered_embeddings", False)
-        self.assistant_masked_lm_head_enabled = self.assistant_use_ordered_embeddings
-        self.assistant_num_centroids = cfg.get("num_centroids", 2048)
-        self.assistant_centroid_intermediate_top_k = cfg.get("centroid_intermediate_top_k", 32)
-        if self.assistant_use_ordered_embeddings:
-            if self.assistant_num_centroids <= 0:
+        """Read Gemma4 MTP draft parameters from the outer HF config."""
+        spec = SpeculativeDecodingConfig(
+            method=SpeculativeDecodingMethod.GEMMA4_MTP,
+            is_draft=True,
+            speculative_budget=SPECULATIVE_BUDGET["gemma4_mtp_draft"],
+            backbone_hidden_size=cfg.get("backbone_hidden_size", 0),
+            use_ordered_embeddings=cfg.get("use_ordered_embeddings", False),
+            num_centroids=cfg.get("num_centroids", 2048),
+            centroid_intermediate_top_k=cfg.get("centroid_intermediate_top_k", 32),
+        )
+        if spec.use_ordered_embeddings:
+            if spec.num_centroids <= 0:
                 raise ValueError("Gemma4 ordered embeddings require num_centroids > 0")
-            if self.token_cfg.vocab_size % self.assistant_num_centroids != 0:
+            if self.token_cfg.vocab_size % spec.num_centroids != 0:
                 raise ValueError(
                     "Gemma4 ordered-embedding vocabulary size must be divisible by "
                     f"num_centroids: vocab_size={self.token_cfg.vocab_size}, "
-                    f"num_centroids={self.assistant_num_centroids}"
+                    f"num_centroids={spec.num_centroids}"
                 )
             if not (
-                0 < self.assistant_centroid_intermediate_top_k <= self.assistant_num_centroids
+                0 < spec.centroid_intermediate_top_k <= spec.num_centroids
             ):
                 raise ValueError(
                     "Gemma4 ordered embeddings require centroid_intermediate_top_k in "
-                    f"[1, {self.assistant_num_centroids}], got "
-                    f"{self.assistant_centroid_intermediate_top_k}"
+                    f"[1, {spec.num_centroids}], got "
+                    f"{spec.centroid_intermediate_top_k}"
                 )
-
-    @property
-    def is_gemma4_assistant(self) -> bool:
-        return self.assistant_model_type == "gemma4_assistant"
+        self.speculative_decoding_cfg = spec
 
     def set_config(self, text_cfg: dict, dtype: "LlmDataType", lm_arch: "LlmArchType", model_format: "ModelFormat"):
         text_cfg = _normalize_attention_config(text_cfg)
@@ -921,7 +913,14 @@ class LanguageModelConfig(BaseConfig):
                     raise ValueError(
                         "EAGLE3 speculative decoding does not support sliding-window attention"
                     )
-            self.speculative_decoding_cfg = SpeculativeDecodingConfig()
+            previous = self.speculative_decoding_cfg
+            if not (
+                method == SpeculativeDecodingMethod.GEMMA4_MTP
+                and cfg.get("is_draft", False)
+                and previous is not None
+                and previous.method == method and previous.is_draft
+            ):
+                self.speculative_decoding_cfg = SpeculativeDecodingConfig()
             self.speculative_decoding_cfg.set_config(cfg)
 
     def is_lora_target_module(self, base_name: str, module_name: str) -> bool:

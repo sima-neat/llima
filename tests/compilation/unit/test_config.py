@@ -247,9 +247,9 @@ def test_gemma4_ordered_embedding_metadata_and_token_ordering():
         }
     )
 
-    assert config.lm_cfg.assistant_masked_lm_head_enabled
-    assert config.lm_cfg.assistant_num_centroids == 2048
-    assert config.lm_cfg.assistant_centroid_intermediate_top_k == 32
+    assert config.lm_cfg.speculative_decoding_cfg.use_ordered_embeddings
+    assert config.lm_cfg.speculative_decoding_cfg.num_centroids == 2048
+    assert config.lm_cfg.speculative_decoding_cfg.centroid_intermediate_top_k == 32
 
     ordering = np.arange(config.lm_cfg.token_cfg.vocab_size, dtype=np.int32)
     validated = validate_gemma4_token_ordering(ordering, ordering.size)

@@ -36,7 +36,7 @@ uint32_t LanguageModel::_argmax_gemma4_mtp_masked_row(
         throw std::runtime_error("Gemma4 token_ordering is not loaded");
     }
 
-    const uint32_t num_centroids = _cfg.lm_cfg.assistant_num_centroids;
+    const uint32_t num_centroids = _cfg.lm_cfg.speculative_decoding_cfg->num_centroids;
     auto& centroid_buf = get_buffer(
         fmt::format("n{}_gemma4_mtp_centroid_logits", num_tokens)
     );
@@ -51,7 +51,7 @@ uint32_t LanguageModel::_argmax_gemma4_mtp_masked_row(
     const auto candidate_tokens = gemma4_mtp_helpers::select_candidate_tokens(
         std::span<const Eigen::bfloat16>(centroid_logits, num_centroids),
         _gemma4_token_ordering,
-        _cfg.lm_cfg.assistant_centroid_intermediate_top_k
+        _cfg.lm_cfg.speculative_decoding_cfg->centroid_intermediate_top_k
     );
 
     uint32_t best_token = std::numeric_limits<uint32_t>::max();
@@ -665,7 +665,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     uint16_t query_position_id,
     uint16_t shared_kv_len
 ) {
-    const uint32_t backbone_hidden_size = _cfg.lm_cfg.assistant_backbone_hidden_size;
+    const uint32_t backbone_hidden_size = _cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size;
     if (hidden_state.size() != backbone_hidden_size) {
         throw std::runtime_error(fmt::format(
             "Gemma4 MTP hidden state size {} does not match backbone hidden size {}",
@@ -799,7 +799,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     hidden_buf.download(projected.data());
     projected.resize(backbone_hidden_size);
 
-    const uint32_t next_token = _cfg.lm_cfg.uses_gemma4_masked_lm_head()
+    const uint32_t next_token = _cfg.lm_cfg.speculative_decoding_cfg->use_ordered_embeddings
         ? _argmax_gemma4_mtp_masked_row(num_tokens, 0)
         : _argmax_lm_head_rows(num_tokens, 1, {}).front();
     return Gemma4MtpDraftStepResult{next_token, std::move(projected)};
@@ -815,15 +815,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     if (!_cfg.lm_cfg.is_gemma4_mtp_target()) {
         throw std::runtime_error("gemma4_mtp speculative decoding must run on the target model");
     }
-    if (!draft_lm._cfg.lm_cfg.is_gemma4_assistant()) {
-        throw std::runtime_error(
-            "gemma4_mtp speculative decoding requires a gemma4_assistant draft model"
-        );
-    }
     if (!draft_lm._cfg.lm_cfg.is_gemma4_mtp_draft()) {
         throw std::runtime_error("gemma4_mtp draft model is missing draft speculative config");
     }
-    if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.assistant_backbone_hidden_size) {
+    if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size) {
         throw std::runtime_error("Gemma4 MTP target hidden size must match assistant backbone size");
     }
     if (input_token_ids.empty()) {

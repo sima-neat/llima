@@ -66,7 +66,7 @@ class LanguagePartBaseModel(BaseModel):
     @property
     def _input_hidden_size(self) -> int:
         if self.is_gemma4_mtp_draft and self.layer_idx == 0:
-            return 2 * self.cfg.lm_cfg.assistant_backbone_hidden_size
+            return 2 * self.cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size
         return self.cfg.lm_cfg.hidden_size
 
     @property
@@ -147,7 +147,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             lm_heads.append(input_node)
             return lm_heads
         if self.is_gemma4_mtp_draft:
-            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+            if self.cfg.lm_cfg.speculative_decoding_cfg.use_ordered_embeddings:
                 lm_heads.append(graph.linear("masked_embedding.centroids", rms_norm))
             lm_heads.append(graph.linear("post_projection", rms_norm))
             return lm_heads

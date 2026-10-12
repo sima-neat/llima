@@ -89,17 +89,17 @@ class VisionLanguageModel(BaseModel):
             if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:
                 if target_model.cfg.model_type != VlmArchType.VLM_GEMMA4:
                     raise ValueError("gemma4_mtp speculative decoding requires a Gemma4 target model")
-                if not vlm_cfg.lm_cfg.is_gemma4_assistant:
+                if model_config.get("model_type") != "gemma4_assistant":
                     raise ValueError(
                         "gemma4_mtp speculative decoding requires a gemma4_assistant draft model"
                     )
-                if vlm_cfg.lm_cfg.assistant_backbone_hidden_size != target_model.cfg.lm_cfg.hidden_size:
+                if vlm_cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size != target_model.cfg.lm_cfg.hidden_size:
                     raise ValueError(
                         "Gemma4 MTP assistant backbone hidden size does not match target hidden size: "
-                        f"assistant={vlm_cfg.lm_cfg.assistant_backbone_hidden_size}, "
+                        f"assistant={vlm_cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size}, "
                         f"target={target_model.cfg.lm_cfg.hidden_size}"
                     )
-                if vlm_cfg.lm_cfg.assistant_masked_lm_head_enabled:
+                if vlm_cfg.lm_cfg.speculative_decoding_cfg.use_ordered_embeddings:
                     required_tensors = (
                         "masked_embedding.centroids.weight",
                         "masked_embedding.token_ordering",

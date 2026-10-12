@@ -550,7 +550,8 @@ class BaseModel(ABC):
                     tensor = self.hf_model.load_np_param(tensor_name)
                     np.save(out_path, tensor)
 
-            if self.cfg.lm_cfg.assistant_masked_lm_head_enabled:
+            spec_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+            if spec_cfg is not None and spec_cfg.use_ordered_embeddings:
                 ordering_path = self.sima_devkit_path / GEMMA4_TOKEN_ORDERING_FILE
                 if not (resume and ordering_path.is_file()):
                     tensor_name = "masked_embedding.token_ordering"
