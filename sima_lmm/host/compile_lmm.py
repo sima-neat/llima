@@ -8,15 +8,13 @@ except ImportError:
     )
     sys.exit(-1)
 import argparse
-import json
 import logging
 from pathlib import Path
 import psutil
 from time import monotonic
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import SpeculativeDecodingMethod
-from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel, find_file
+from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.host.configuration_helper import (
     _abort, default_configuration, read_configuration_file
 )
@@ -45,32 +43,6 @@ def _print_precisions(precision: dict[LayerID, FileGenPrecision], for_quantize: 
     action_text = "quantized" if for_quantize else "compiled"
     message = f"Layers that will be {action_text}:\n" + "".join(messages)
     print(message, flush=True)
-
-
-def _detect_speculative_method(draft_model_path: Path) -> str:
-    """Detect the speculative decoding implementation for a draft model."""
-    config_file = find_file(draft_model_path, "config.json", resolve=False)
-    if config_file is None:
-        raise ValueError(
-            f"Cannot detect speculative method: no config.json found in {draft_model_path}"
-        )
-
-    with config_file.open("r") as fp:
-        draft_cfg = json.load(fp)
-    if draft_cfg.get("model_type") == "gemma4_assistant":
-        return SpeculativeDecodingMethod.GEMMA4_MTP
-
-    architectures = draft_cfg.get("architectures", [])
-    if isinstance(architectures, str):
-        architectures = [architectures]
-    if any("eagle3" in architecture.lower() for architecture in architectures):
-        return SpeculativeDecodingMethod.EAGLE3
-
-    raise ValueError(
-        "Unsupported speculative draft configuration: "
-        f"model_type={draft_cfg.get('model_type')!r}, architectures={architectures!r}. "
-        "Expected a Gemma4 MTP or EAGLE3 draft model."
-    )
 
 
 def gen_files(
@@ -107,10 +79,6 @@ def gen_files(
 
     # Check if draft model is provided
     if draft_model_path is not None:
-        speculative_method = _detect_speculative_method(draft_model_path)
-        base_model.configure_speculative_decoding(
-            is_draft=False, method=speculative_method
-        )
         draft_model = VisionLanguageModel.from_hf_cache(
             hf_cache_path=draft_model_path,
             model_name=draft_model_path.name,
@@ -125,7 +93,9 @@ def gen_files(
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
             target_model=base_model,
-            speculative_method=speculative_method
+        )
+        base_model.configure_speculative_decoding(
+            is_draft=False, method=draft_model.cfg.lm_cfg.speculative_decoding_cfg.method
         )
         models.append(draft_model)
 

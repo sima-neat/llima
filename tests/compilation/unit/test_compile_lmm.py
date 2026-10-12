@@ -1,9 +1,9 @@
-import json
 import sys
 
 import pytest
 
 from sima_lmm.host import compile_lmm
+from sima_lmm.model.vision_language_model import _detect_speculative_method
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -22,18 +22,14 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
         ),
     ],
 )
-def test_detect_speculative_method(tmp_path, config: dict, expected: str):
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-
-    assert compile_lmm._detect_speculative_method(tmp_path) == expected
+def test_detect_speculative_method(config: dict, expected: str):
+    assert _detect_speculative_method(config) == expected
 
 
-def test_detect_speculative_method_rejects_unknown_draft(tmp_path):
+def test_detect_speculative_method_rejects_unknown_draft():
     config = {"model_type": "llama", "architectures": ["LlamaForCausalLM"]}
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-
     with pytest.raises(ValueError, match="Expected a Gemma4 MTP or EAGLE3 draft model"):
-        compile_lmm._detect_speculative_method(tmp_path)
+        _detect_speculative_method(config)
 
 
 @pytest.mark.parametrize(

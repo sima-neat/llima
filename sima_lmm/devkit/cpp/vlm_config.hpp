@@ -257,11 +257,9 @@ struct LanguageModelConfig {
     }
 
     uint16_t get_single_num_tokens() const {
-        if (speculative_decoding_cfg.has_value()) {
-            if (is_gemma4_mtp_draft()) {
-                return 1;
-            }
-            return speculative_decoding_cfg.value().speculative_budget;
+        const auto& spec = speculative_decoding_cfg;
+        if (spec && !(spec->is_gemma4_mtp() && spec->is_draft)) {
+            return spec->speculative_budget;
         }
         return 1;
     }
