@@ -541,7 +541,7 @@ uint32_t LanguageModel::run_model_prefill(
                 token_idx += 1;
             }
             if (!_is_running.load(std::memory_order_relaxed)) {
-                _notify_interrupt();
+                if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                 _cached_token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx
                 );
@@ -562,7 +562,7 @@ uint32_t LanguageModel::run_model_prefill(
             }
             next_token_id = run_model_once(1, token_idx, num_input_tokens, 0);
             if (!_is_running.load(std::memory_order_relaxed)) {
-                _notify_interrupt();
+                if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                 _cached_token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx + 1
                 );
