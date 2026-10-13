@@ -88,6 +88,10 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `quit` | Quit. |
 | `help` | Print available commands. |
 
+Gemma 4 Unified uses a default ceiling of 384 image tokens. Images are
+downscaled only when needed and resized to dimensions divisible by 48, without
+enlarging smaller images. An axis shorter than 48 pixels is padded to one patch.
+
 ## Audio in Web Mode
 
 Start `llima run <model> --mode web` to serve `/v1/chat/completions` on port

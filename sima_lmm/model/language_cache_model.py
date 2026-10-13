@@ -50,7 +50,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
     @property
     def dynamic_mask(self) -> bool:
-        return self.cfg.lm_cfg.vision_bidirectional_attention and self.num_tokens > 1
+        return (self.cfg.lm_cfg.vision_bidirectional_attention
+                and self.layer_type == "sliding_attention" and self.num_tokens > 1)
 
     @property
     def _is_speculative_decoding(self) -> bool:
@@ -84,8 +85,6 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
     @property
     def context_length(self) -> int:
-        if self.dynamic_mask:
-            return self.cfg.get_prefill_cache_capacity(self.layer_type)
         if self._is_speculative_decoding:
             return self.token_idx + 1
         return self.token_idx + self.num_tokens

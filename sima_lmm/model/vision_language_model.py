@@ -100,8 +100,6 @@ class VisionLanguageModel(BaseModel):
         if vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
             processor_config = Path(hf_cache_path) / "processor_config.json"
             processor_cfg = json.loads(processor_config.read_text())
-            vlm_cfg.vm_cfg.max_soft_tokens = processor_cfg["image_processor"]["max_soft_tokens"]
-            vlm_cfg.mm_cfg.mm_tokens_per_image = vlm_cfg.vm_cfg.max_soft_tokens
             if vlm_cfg.audio_cfg is not None:
                 feature = processor_cfg["feature_extractor"]
                 vlm_cfg.audio_cfg.max_tokens = processor_cfg["audio_seq_length"]

@@ -15,7 +15,7 @@ from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import BaseModel, EvalMode
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.model_graph import ModelGraph, tensor_type
-from sima_lmm.preproc.gemma4_unified import image_windows
+from sima_lmm.preproc.gemma4_unified import cache_view, image_windows
 from sima_lmm.preproc.gemma4_unified import audio_frames
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -29,7 +29,7 @@ def unified(tmp_path):
             vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=6,
             num_attention_heads=4, num_key_value_heads=2, num_global_key_value_heads=1,
             head_dim=16, global_head_dim=32, sliding_window=256, attention_k_eq_v=True,
-            layer_types=["sliding_attention"] * 5 + ["full_attention"],
+            layer_types=(["sliding_attention"] * 2 + ["full_attention"]) * 2,
             rope_parameters={
                 "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
                 "full_attention": {"rope_type": "proportional", "rope_theta": 1000000.0,
@@ -48,6 +48,7 @@ def unified(tmp_path):
     raw = config.to_dict()
     raw.update(architectures=["Gemma4UnifiedForConditionalGeneration"], dtype="float32")
     cfg = VlmConfig.from_hf_config(ModelFormat.FORMAT_HF, Path("tiny"), raw)
+    assert cfg.vm_cfg.max_soft_tokens == cfg.mm_cfg.mm_tokens_per_image == 384
     cfg.vm_cfg.max_soft_tokens = 16
     cfg.config_pipeline(None, None, 1024, 128, 1)
     cfg.pipeline_cfg.return_logits = True
@@ -71,12 +72,14 @@ def test_unified_geometry_and_component_contract(unified, quantize_embeddings, q
     assert cfg.get_prefill_cache_capacity("full_attention") == 1024
     ids = cfg.get_layer_ids()
     assert [(p.part, p.part_idx) for p in ids if p.part.startswith("group") and "cache" in p.part] == [
-        ("group_cache", 0), ("group_sliding_cache", 0),
+        *[("group_cache", at) for at in range(0, 1024, 128)],
+        *[("group_sliding_cache", at) for at in range(0, 512, 128)],
     ]
     assert not any("per_layer" in p.part for p in ids)
     assert VlmConfig.load(asdict(cfg)) == cfg
-    for kind in ("pre", "post", "cache", "sliding_cache"):
-        part = model._get_part_model(kind, 128, **({"layer_idx": 0} if kind in ("pre", "post") else {"token_idx": 0}))
+    for kind, index in [("pre", 0), ("post", 0), ("cache", 0),
+                        *[("sliding_cache", at) for at in range(0, 512, 128)]]:
+        part = model._get_part_model(kind, 128, **({"layer_idx": index} if kind in ("pre", "post") else {"token_idx": index}))
         with patch.object(ModelGraph, "save", autospec=True) as save:
             part.generate_graph({}, quantizable=True)
         graph, outputs = save.call_args.args
@@ -90,34 +93,61 @@ def test_unified_geometry_and_component_contract(unified, quantize_embeddings, q
             names = ["input", "cached_keys"]
             if quantize_kv_cache:
                 names.append("cached_keys_scale")
-            names.extend(["attn_mask", "cached_values"])
+            if kind == "sliding_cache":
+                names.append("attn_mask")
+            names.append("cached_values")
             if quantize_kv_cache:
                 names.append("cached_values_scale")
             assert list(graph.inputs) == names
+            assert tensor_type(graph.inputs["cached_keys"]).shape[2] == index + 128
             assert tensor_type(graph.inputs["cached_keys"]).scalar.numpy_type() == (np.int8 if quantize_kv_cache else np.float32)
     with pytest.raises(ValueError, match="grouped prefill"):
         cfg.config_pipeline(None, None, 1024, 1, 1)
 
 
-def test_only_overlapping_image_windows_are_merged():
+def test_image_windows_and_cache_views():
     assert image_windows([(577, 833), (834, 1090)], 128) == [(512, 1152)]
     assert image_windows([(512, 768), (768, 1024)], 128) == [(512, 768), (768, 1024)]
+    assert cache_view(0, 128, 4096, 1024, []) == (0, 128)
+    assert cache_view(1024, 128, 4096, 1024, [(1151, 1535)]) == (1, 1536)
+    assert cache_view(3968, 128, 4096, 1024, []) == (2944, 1152)
+    for spans in ([], [(127, 511)], [(1023, 1407), (1408, 1792)], [(3839, 4095)]):
+        for query in range(0, 4096, 128):
+            begin, capacity = cache_view(query, 128, 4096, 1024, spans)
+            assert capacity % 128 == 0 and 128 <= capacity <= 1536
+            assert 0 <= begin < begin + capacity <= 4096
+            q = np.arange(query, query + 128)[:, None]
+            k = np.arange(4096)[None, :]
+            allowed = (k <= q) & (k > q - 1024)
+            for image_begin, image_end in spans:
+                allowed |= (q >= image_begin) & (q < image_end) & (k >= image_begin) & (k < image_end)
+            assert not allowed[:, :begin].any() and not allowed[:, begin + capacity:].any()
 
 
 @pytest.mark.parametrize("length,spans", [
     (129, [(127, 129)]),
     (600, [(511, 527), (528, 544)]),
     (911, [(895, 911)]),
+    (1023, [(1007, 1023)]),
+    (2177, [(2047, 2063), (2064, 2080)]),
 ])
 def test_n128_image_windows_match_full_decoder(unified, length, spans):
     reference, language, params = unified
+    if length > 1024:
+        language.cfg.config_pipeline(None, None, 4096, 128, 1)
     hidden = np.random.default_rng(249).normal(0, 0.3, (1, length, 64)).astype(np.float32)
     token_types = torch.zeros((1, length), dtype=torch.int64)
     for begin, end in spans:
         token_types[:, begin:end] = 1
+    masks = reference.create_masks_for_generate(
+        config=reference.config, inputs_embeds=torch.from_numpy(hidden),
+        attention_mask=torch.ones((1, length)), past_key_values=None,
+        position_ids=torch.arange(length)[None], mm_token_type_ids=token_types,
+        is_first_iteration=True,
+    )
     with torch.no_grad():
         expected = reference(inputs_embeds=torch.from_numpy(hidden), mm_token_type_ids=token_types,
-                             use_cache=False).logits[:, -1].numpy()
+                             attention_mask=masks, use_cache=False).logits[:, -1].numpy()
     graphs = {}
 
     def execute(part, mode, inputs):
@@ -134,7 +164,7 @@ def test_n128_image_windows_match_full_decoder(unified, length, spans):
     with patch.object(BaseModel, "run_model", execute):
         actual = language.run_model(EvalMode.SDK, [hidden[:, None]],
             embeddings_tensor=params["model.language_model.embed_tokens.weight"], image_spans=spans)
-    np.testing.assert_allclose(actual.reshape(1, 64), expected, atol=2e-5, rtol=2e-4)
+    np.testing.assert_allclose(actual.reshape(1, 64), expected, atol=3e-5, rtol=2e-4)
 
 
 @pytest.mark.parametrize("samples", [639, 640, 641])

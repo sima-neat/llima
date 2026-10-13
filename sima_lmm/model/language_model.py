@@ -475,7 +475,7 @@ class LanguageModel(BaseModel):
 
     def _run_unified_model(self, eval_mode, ifms, vocabulary, vocabulary_scales, image_spans):
         """Host mirror of normal chunk prefill and layer-major image windows."""
-        from sima_lmm.preproc.gemma4_unified import attention_mask, image_windows
+        from sima_lmm.preproc.gemma4_unified import attention_mask, cache_view, image_windows
         if vocabulary is None:
             vocabulary, vocabulary_scales = self.get_embeddings_tensor()
         quantize_embeddings = self.cfg.pipeline_cfg.quantize_embeddings
@@ -548,19 +548,19 @@ class LanguageModel(BaseModel):
                         continue
                     sliding = kind == "sliding_attention"
                     key_begin = max(0, at + 1 - self.cfg.lm_cfg.attn_cfg.sliding_window) if sliding else 0
-                    if rows > 1:
-                        capacity = self.cfg.get_prefill_cache_capacity(kind)
-                        key_begin = min(key_begin, context - capacity)
-                        cache_index = 0
+                    if rows > 1 and sliding:
+                        key_begin, capacity = cache_view(at, rows, context,
+                            self.cfg.lm_cfg.attn_cfg.sliding_window, image_spans)
+                        cache_index = capacity - rows
                     else:
-                        mask_size = self.cfg.pipeline_cfg.get_cache_mask_size(kind, at + 1 - key_begin, is_group=False)
-                        capacity = min(round_up_to(at + 1 - key_begin, mask_size), context - key_begin)
-                        cache_index = capacity - 1
+                        mask_size = self.cfg.pipeline_cfg.get_cache_mask_size(kind, at + rows - key_begin, is_group=rows > 1)
+                        capacity = min(round_up_to(at + rows - key_begin, mask_size), context - key_begin)
+                        cache_index = capacity - rows
                     cache = self._get_part_model("sliding_cache" if sliding else "cache", rows, token_idx=cache_index)
                     inputs = [q, keys[layer][..., key_begin:key_begin + capacity, :]]
                     if quantize_kv:
                         inputs.append(key_scales[layer][..., key_begin:key_begin + capacity, :])
-                    if rows > 1 or cache._cache_mask_size > 1:
+                    if cache.dynamic_mask or cache._uses_group_future_token_mask or (rows == 1 and cache._cache_mask_size > 1):
                         inputs.append(attention_mask(at, rows, key_begin, capacity,
                             min(end, prompt) if begin < prompt else end, image_spans,
                             self.cfg.lm_cfg.attn_cfg.sliding_window if sliding else 0))

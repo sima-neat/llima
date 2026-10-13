@@ -28,9 +28,12 @@ void LanguageModel::_define_attn_models_iter(
     uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
 ) {
     const LanguageModelMapKey pre_post_key{num_tokens, layer_idx, 0};
-    const LanguageModelMapKey cache_key = _get_cache_model_key(
-        num_tokens, token_idx, layer_idx
-    );
+    // Group sliding definitions enumerate bucket capacities, independent of a request's images.
+    const bool unified_sliding = _cfg.vision_bidirectional_attention() && num_tokens > 1
+        && _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention";
+    const LanguageModelMapKey cache_key = unified_sliding
+        ? LanguageModelMapKey{num_tokens, 1, token_idx}
+        : _get_cache_model_key(num_tokens, token_idx, layer_idx);
     const bool define_pre = !_pre_model_map.contains(pre_post_key);
     const bool define_cache = !_cache_model_map.contains(cache_key);
     const auto& post_model_map = _cfg.lm_cfg.is_moe() ? _router_model_map : _post_model_map;
@@ -43,9 +46,8 @@ void LanguageModel::_define_attn_models_iter(
     const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
     const auto& kv_layer_type = _cfg.lm_cfg.layer_types[kv_source_layer];
     const std::string freq_prefix = layer_type == "sliding_attention" ? "local" : "global";
-    const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
-        num_tokens, token_idx, layer_type
-    );
+    const uint16_t cache_token_idx_begin = unified_sliding ? 0
+        : _get_cache_token_idx_begin(num_tokens, token_idx, layer_type);
 
     // Pre model.
     std::vector<uint32_t> pre_kv_cache_shape;
@@ -189,8 +191,7 @@ void LanguageModel::_define_attn_models_iter(
         && cache_mask_size > num_tokens
     );
     const uint16_t aligned_eff_token_idx = std::get<2>(cache_key);
-    const uint16_t aligned_eff_num_cached_tokens = _cfg.vision_bidirectional_attention() && num_tokens > 1
-        ? _cfg.get_prefill_cache_capacity(layer_type) : use_single_future_token_mask
+    const uint16_t aligned_eff_num_cached_tokens = use_single_future_token_mask
         ? aligned_eff_token_idx + 1
         : aligned_eff_token_idx + num_tokens;
     std::vector<uint32_t> cache_kv_cache_shape;
@@ -240,7 +241,7 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
 
-    if (use_group_future_token_mask || (_cfg.vision_bidirectional_attention() && num_tokens > 1)) {
+    if (use_group_future_token_mask || unified_sliding) {
         cache_ifms.emplace_back(
             MLABufferSlice{
                 &get_buffer(
@@ -719,6 +720,11 @@ void LanguageModel::_define_models() {
         } else {
             for (const auto& token_idx: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
+                    if (_cfg.vision_bidirectional_attention()
+                        && _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
+                        && token_idx >= _cfg.get_prefill_cache_capacity("sliding_attention")) {
+                        continue;
+                    }
                     if (
                         _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
                         || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"

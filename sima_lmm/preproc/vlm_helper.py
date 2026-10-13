@@ -153,6 +153,16 @@ class VlmHelper:
                 images = load_images(images)
             else:
                 images = None
+            image_kwargs = {}
+            if self.vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED and images:
+                from sima_lmm.preproc.gemma4_unified import resize_image
+                vm = self.vlm_cfg.vm_cfg
+                images = [resize_image(image, vm) for image in images]
+                side = vm.patch_size * vm.spatial_merge_size
+                largest = max((image.width // side) * (image.height // side) for image in images)
+                # HF requires a preset for tensor padding; LLiMa keeps only valid rows.
+                padding_budget = next(n for n in (70, 140, 280, 560, 1120) if n >= largest)
+                image_kwargs = {"images_kwargs": {"do_resize": False, "max_soft_tokens": padding_budget}}
             if self.input_res is not None and images is not None:
                 if isinstance(self.input_res, list):
                     target_h, target_w = self.input_res
@@ -177,7 +187,7 @@ class VlmHelper:
                 audio_kwargs = {"audio": [frames.reshape(-1) for frames in audio_inputs],
                                 "sampling_rate": self.vlm_cfg.audio_cfg.sampling_rate}
             processed_dict = self.hf_processor(
-                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens, **audio_kwargs
+                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens, **audio_kwargs, **image_kwargs
             )
             processed_images = processed_dict.get("pixel_values")
             image_grid_thw = processed_dict.get("image_grid_thw")

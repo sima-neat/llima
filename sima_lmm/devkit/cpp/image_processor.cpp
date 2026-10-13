@@ -203,17 +203,20 @@ std::vector<Eigen::bfloat16> ImageProcessor::_preprocess_unified(const cv::Mat& 
     if (image.empty()) throw std::invalid_argument("Cannot preprocess an empty image");
     const auto& vm = _vlm_cfg.vm_cfg.value();
     const uint32_t side = vm.spatial_patch_size * vm.spatial_merge_size;
-    const double factor = std::sqrt(static_cast<double>(vm.max_soft_tokens) * side * side / image.total());
-    int height = std::floor(image.rows * factor / side) * side;
-    int width = std::floor(image.cols * factor / side) * side;
-    if (height == 0) {
-        height = side;
-        width = std::min<uint32_t>(static_cast<int>(static_cast<double>(image.cols) / image.rows) * side, vm.max_soft_tokens * side);
-    } else if (width == 0) {
-        width = side;
-        height = std::min<uint32_t>(static_cast<int>(static_cast<double>(image.rows) / image.cols) * side, vm.max_soft_tokens * side);
+    if (side == 0 || vm.max_soft_tokens == 0) {
+        throw std::invalid_argument("Unified images require a positive patch size and token budget");
     }
-    const auto resized = resize_unified_image(image, height, width);
+    cv::Mat source = image;
+    if (image.rows < side || image.cols < side) {
+        cv::copyMakeBorder(image, source, 0, std::max(0, static_cast<int>(side) - image.rows),
+            0, std::max(0, static_cast<int>(side) - image.cols), cv::BORDER_CONSTANT, cv::Scalar::all(0));
+    }
+    const double factor = std::min(1.0, std::sqrt(static_cast<double>(vm.max_soft_tokens) * side * side / source.total()));
+    int height = std::max<int>(side, std::floor(source.rows * factor / side) * side);
+    int width = std::max<int>(side, std::floor(source.cols * factor / side) * side);
+    if (height == side) width = std::min<uint32_t>(width, vm.max_soft_tokens * side);
+    if (width == side) height = std::min<uint32_t>(height, vm.max_soft_tokens * side);
+    const auto resized = resize_unified_image(source, height, width);
     _image_positions.clear();
     std::vector<Eigen::bfloat16> patches;
     patches.reserve(static_cast<size_t>(height) * width * 3);

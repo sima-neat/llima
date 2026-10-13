@@ -19,6 +19,7 @@
 
 #include "eagle_helpers.hpp"
 #include "language_model.hpp"
+#include "gemma4_unified_helpers.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -2213,9 +2214,9 @@ void LanguageModel::_define_buffers() {
     const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
     if (
         _use_group_token_models
-        && (_cfg.vision_bidirectional_attention() || _get_cache_mask_size(
+        && _get_cache_mask_size(
             "full_attention", _cfg.pipeline_cfg.max_num_tokens, true
-        ) > group_size)
+        ) > group_size
     ) {
         define_buffer(
             "group_future_token_mask",
@@ -2491,9 +2492,8 @@ uint16_t LanguageModel::_get_cache_token_idx_begin(
         return 0;
     }
     if (_cfg.vision_bidirectional_attention() && num_tokens > 1) {
-        return std::min<uint16_t>(
-            std::max(0, static_cast<int>(token_idx) + 1 - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())),
-            _cfg.pipeline_cfg.max_num_tokens - _cfg.get_prefill_cache_capacity(layer_type));
+        return gemma4_cache_view(token_idx, num_tokens, _cfg.pipeline_cfg.max_num_tokens,
+            _cfg.lm_cfg.attn_cfg.sliding_window.value(), _image_spans).first;
     }
     // Retain the first query's full window for prefill and verification.
     return std::max(
@@ -2506,8 +2506,10 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
 ) const {
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    if (_cfg.vision_bidirectional_attention() && num_tokens > 1) {
-        return {num_tokens, static_cast<uint8_t>(layer_type == "sliding_attention"), 0};
+    if (_cfg.vision_bidirectional_attention() && num_tokens > 1 && layer_type == "sliding_attention") {
+        const uint16_t capacity = gemma4_cache_view(token_idx, num_tokens,
+            _cfg.pipeline_cfg.max_num_tokens, _cfg.lm_cfg.attn_cfg.sliding_window.value(), _image_spans).second;
+        return {num_tokens, 1, capacity - num_tokens};
     }
     const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
         num_tokens, token_idx, layer_type
@@ -2704,9 +2706,8 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
             {0, cache_token_idx_begin, 0}
         );
     }
-    if (_cfg.vision_bidirectional_attention() && num_tokens > 1) {
-        cache_model._bind_ifm(cache_ifm_idx++, &get_buffer(
-            use_sliding_cache ? "group_sliding_future_token_mask" : "group_future_token_mask"), {0});
+    if (_cfg.vision_bidirectional_attention() && num_tokens > 1 && use_sliding_cache) {
+        cache_model._bind_ifm(cache_ifm_idx++, &get_buffer("group_sliding_future_token_mask"), {0});
     } else if (use_group_future_token_mask) {
         // Group-mask buffer, begin, and shape are fixed by the compact key.
         ++cache_ifm_idx;

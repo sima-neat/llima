@@ -292,7 +292,7 @@ class VisionModelConfig(BaseConfig):
             self.spatial_merge_size = vision_cfg["pooling_kernel_size"]
             self.hidden_size = vision_cfg["mm_embed_dim"]
             self.num_hidden_layers = 1
-            self.max_soft_tokens = vision_cfg.get("max_soft_tokens", 280)
+            self.max_soft_tokens = vision_cfg.get("max_soft_tokens", 384)
             self.num_position_embeddings = vision_cfg["mm_posemb_size"]
             self.image_size = self.patch_size * self.spatial_merge_size
         if "rope_parameters" in vision_cfg:
@@ -1392,7 +1392,7 @@ class VlmConfig(BaseConfig):
         ]
 
     def get_prefill_cache_capacity(self, layer_type: str) -> int:
-        """Static KV view covering the causal window and future same-image keys."""
+        """Maximum grouped KV capacity covering the causal window and same-image keys."""
         context = self.pipeline_cfg.max_num_tokens
         if layer_type != "sliding_attention":
             return context
@@ -1513,8 +1513,6 @@ class VlmConfig(BaseConfig):
             # Cache models are shared across layers; include only for kinds that exist
             if has_attn:
                 group_cache_indices = group_cache_model_indices(pipeline_cfg)
-                if lm_cfg.vision_bidirectional_attention:
-                    group_cache_indices = [0]
                 single_cache_indices = single_cache_model_indices(pipeline_cfg)
                 has_sliding_attn = "sliding_attention" in layer_types
                 separate_sliding_cache = (
@@ -1548,9 +1546,10 @@ class VlmConfig(BaseConfig):
                 if has_sliding_attn and not is_gemma4_mtp_draft:
                     layers.extend(
                         LayerID("group_sliding_cache", n)
-                        for n in ([0] if lm_cfg.vision_bidirectional_attention else
+                        for n in (range(0, self.get_prefill_cache_capacity("sliding_attention"), pipeline_cfg.input_token_group_size)
+                                  if lm_cfg.vision_bidirectional_attention else
                                   group_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
-                        if separate_sliding_cache
+                        if lm_cfg.vision_bidirectional_attention or separate_sliding_cache
                         or n + pipeline_cfg.input_token_group_size > lm_cfg.attn_cfg.sliding_window
                     )
                 if separate_sliding_cache:
