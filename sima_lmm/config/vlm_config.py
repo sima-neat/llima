@@ -199,7 +199,15 @@ MLA_CONSTRAINTS: dict = {
 SPECULATIVE_BUDGET: dict = {
     "draft": 5,
     "target": 16,
+    "gemma4_mtp_draft": 6,
+    "gemma4_mtp_target": 7,
 }
+
+
+class SpeculativeDecodingMethod(str, ExtensibleEnum):
+    """Speculative decoding implementation to use for target/draft pairs."""
+    EAGLE3 = "eagle3"
+    GEMMA4_MTP = "gemma4_mtp"
 
 
 class BaseConfig(object):
@@ -641,12 +649,23 @@ class SpeculativeDecodingConfig(BaseConfig):
     """Configuration of a model in a speculative decoding setup.
 
     Attributes:
+        method: Speculative decoding implementation.
         is_draft: True if the model is a draft model in a speculative decoding setup.
         speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
-            16 for target, 5 for draft model.
+            EAGLE3 uses 16 for target and 5 for draft by default. Gemma4 MTP uses
+            7 target verification rows and a recurrent 6-token assistant budget.
+        backbone_hidden_size: Target hidden width consumed by Gemma4 MTP draft projections.
+        use_ordered_embeddings: Compile and run the centroid-masked Gemma4 MTP draft head.
+        num_centroids: Number of centroids in that head.
+        centroid_intermediate_top_k: Number of active centroids during draft selection.
     """
+    method: str = SpeculativeDecodingMethod.EAGLE3
     is_draft: bool = False
     speculative_budget: int = 16
+    backbone_hidden_size: int = 0
+    use_ordered_embeddings: bool = False
+    num_centroids: int = 0
+    centroid_intermediate_top_k: int = 0
 
 
 @dataclass
@@ -719,6 +738,16 @@ class LanguageModelConfig(BaseConfig):
             else self.token_cfg.vocab_size
         )
 
+    @property
+    def single_model_num_tokens(self) -> int:
+        """Compiled decode width, distinct from recurrent MTP proposal count."""
+        spec_cfg = self.speculative_decoding_cfg
+        if spec_cfg is None:
+            return 1
+        if spec_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP and spec_cfg.is_draft:
+            return 1
+        return spec_cfg.speculative_budget
+
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
         cfg["token_cfg"] = TokenEmbedConfig(**cfg["token_cfg"])
@@ -740,6 +769,36 @@ class LanguageModelConfig(BaseConfig):
         lmc = LanguageModelConfig(**cfg)
         lmc._calc_lm_head_splits()
         return lmc
+
+    def set_gemma4_assistant_config(self, cfg: dict):
+        """Read Gemma4 MTP draft parameters from the outer HF config."""
+        spec = SpeculativeDecodingConfig(
+            method=SpeculativeDecodingMethod.GEMMA4_MTP,
+            is_draft=True,
+            speculative_budget=SPECULATIVE_BUDGET["gemma4_mtp_draft"],
+            backbone_hidden_size=cfg.get("backbone_hidden_size", 0),
+            use_ordered_embeddings=cfg.get("use_ordered_embeddings", False),
+            num_centroids=cfg.get("num_centroids", 2048),
+            centroid_intermediate_top_k=cfg.get("centroid_intermediate_top_k", 32),
+        )
+        if spec.use_ordered_embeddings:
+            if spec.num_centroids <= 0:
+                raise ValueError("Gemma4 ordered embeddings require num_centroids > 0")
+            if self.token_cfg.vocab_size % spec.num_centroids != 0:
+                raise ValueError(
+                    "Gemma4 ordered-embedding vocabulary size must be divisible by "
+                    f"num_centroids: vocab_size={self.token_cfg.vocab_size}, "
+                    f"num_centroids={spec.num_centroids}"
+                )
+            if not (
+                0 < spec.centroid_intermediate_top_k <= spec.num_centroids
+            ):
+                raise ValueError(
+                    "Gemma4 ordered embeddings require centroid_intermediate_top_k in "
+                    f"[1, {spec.num_centroids}], got "
+                    f"{spec.centroid_intermediate_top_k}"
+                )
+        self.speculative_decoding_cfg = spec
 
     def set_config(self, text_cfg: dict, dtype: "LlmDataType", lm_arch: "LlmArchType", model_format: "ModelFormat"):
         text_cfg = _normalize_attention_config(text_cfg)
@@ -842,15 +901,26 @@ class LanguageModelConfig(BaseConfig):
         if cfg is None:
             self.speculative_decoding_cfg = None
         else:
-            if self.linear_attn_cfg is not None:
-                raise ValueError(
-                    "EAGLE3 speculative decoding does not support linear-attention layers"
-                )
-            if self.attn_cfg.swa_enable:
-                raise ValueError(
-                    "EAGLE3 speculative decoding does not support sliding-window attention"
-                )
-            self.speculative_decoding_cfg = SpeculativeDecodingConfig()
+            method = cfg.get("method", SpeculativeDecodingMethod.EAGLE3)
+            if method not in SpeculativeDecodingMethod.values():
+                raise ValueError(f"Unsupported speculative decoding method: {method}")
+            if method == SpeculativeDecodingMethod.EAGLE3:
+                if self.linear_attn_cfg is not None:
+                    raise ValueError(
+                        "EAGLE3 speculative decoding does not support linear-attention layers"
+                    )
+                if self.attn_cfg.swa_enable:
+                    raise ValueError(
+                        "EAGLE3 speculative decoding does not support sliding-window attention"
+                    )
+            previous = self.speculative_decoding_cfg
+            if not (
+                method == SpeculativeDecodingMethod.GEMMA4_MTP
+                and cfg.get("is_draft", False)
+                and previous is not None
+                and previous.method == method and previous.is_draft
+            ):
+                self.speculative_decoding_cfg = SpeculativeDecodingConfig()
             self.speculative_decoding_cfg.set_config(cfg)
 
     def is_lora_target_module(self, base_name: str, module_name: str) -> bool:
@@ -1102,7 +1172,8 @@ class VlmConfig(BaseConfig):
         """
         source_model_name = model_path.name
         is_vlm = _is_vlm_model(model_cfg)
-        text_config = model_cfg["text_config"] if is_vlm else model_cfg
+        is_gemma4_assistant = model_cfg.get("model_type") == "gemma4_assistant"
+        text_config = model_cfg["text_config"] if (is_vlm or is_gemma4_assistant) else model_cfg
         vision_config = model_cfg["vision_config"] if is_vlm else None
 
         # Check model type
@@ -1137,6 +1208,8 @@ class VlmConfig(BaseConfig):
             data_type, model_type, vm_arch, lm_arch, text_config, vision_config,
             model_cfg, model_format=model_format
         )
+        if is_gemma4_assistant:
+            vlm_cfg.lm_cfg.set_gemma4_assistant_config(model_cfg)
         vlm_cfg.model_name = source_model_name
 
         if is_vlm:
@@ -1288,7 +1361,16 @@ class VlmConfig(BaseConfig):
             lm_cfg.speculative_decoding_cfg is not None
             and lm_cfg.speculative_decoding_cfg.is_draft
         )
-
+        is_gemma4_mtp_draft = (
+            is_speculative_draft
+            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+        )
+        verification_width = (
+            lm_cfg.single_model_num_tokens
+            if lm_cfg.speculative_decoding_cfg is not None
+            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+            else 1
+        )
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
                 raise ValueError(
@@ -1328,9 +1410,10 @@ class VlmConfig(BaseConfig):
                         )
                         layers.append(LayerID("single_weightedsum", i))
                     else:
-                        layers.append(LayerID("group_pre", i))
-                        if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
-                            layers.append(LayerID("group_post", i))
+                        if not is_gemma4_mtp_draft:
+                            layers.append(LayerID("group_pre", i))
+                            if i < lm_cfg.num_hidden_layers - 1 or is_speculative_draft:
+                                layers.append(LayerID("group_post", i))
                         layers.append(LayerID("single_pre", i))
                         layers.append(LayerID("single_post", i))
                 elif t == "linear_attention":
@@ -1361,16 +1444,17 @@ class VlmConfig(BaseConfig):
                         for is_group in (False, True)
                     )
                     terminal_sliding_cache = (
-                        sliding_cache_mask_differs
+                        (sliding_cache_mask_differs or verification_width > 1)
                         and sliding_window <= pipeline_cfg.max_num_tokens
                     )
                     if not sliding_cache_mask_differs:
                         single_cache_indices = single_shared_sliding_cache_model_indices(
                             pipeline_cfg, sliding_window
                         )
-                layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
+                if not is_gemma4_mtp_draft:
+                    layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
                 layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
-                if has_sliding_attn:
+                if has_sliding_attn and not is_gemma4_mtp_draft:
                     layers.extend(
                         LayerID("group_sliding_cache", n)
                         for n in group_sliding_cache_model_indices(
@@ -1383,12 +1467,14 @@ class VlmConfig(BaseConfig):
                     layers.extend(
                         LayerID("single_sliding_cache", n)
                         for n in single_sliding_cache_model_indices(
-                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
+                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window, verification_width
                         )
                     )
                 elif terminal_sliding_cache:
                     layers.append(LayerID(
                         "single_sliding_cache",
+                        min(sliding_window + verification_width - 1, pipeline_cfg.max_num_tokens) - 1
+                        if verification_width > 1 else
                         _cache_model_index(
                             pipeline_cfg,
                             "sliding_attention",
@@ -1401,16 +1487,17 @@ class VlmConfig(BaseConfig):
                 layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
         else:
             # Fallback: attention-only if no layer_types
-            layers.extend(LayerID("group_pre", n) for n in range(lm_cfg.num_hidden_layers))
-            num_group_post_layers = (
-                lm_cfg.num_hidden_layers
-                if is_speculative_draft
-                else lm_cfg.num_hidden_layers - 1
-            )
-            layers.extend(
-                LayerID("group_post", n) for n in range(num_group_post_layers)
-            )
-            layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
+            if not is_gemma4_mtp_draft:
+                layers.extend(LayerID("group_pre", n) for n in range(lm_cfg.num_hidden_layers))
+                num_group_post_layers = (
+                    lm_cfg.num_hidden_layers
+                    if is_speculative_draft
+                    else lm_cfg.num_hidden_layers - 1
+                )
+                layers.extend(
+                    LayerID("group_post", n) for n in range(num_group_post_layers)
+                )
+                layers.extend(LayerID("group_cache", n) for n in group_cache_model_indices(pipeline_cfg))
             layers.extend(LayerID("single_pre", n) for n in range(lm_cfg.num_hidden_layers))
             layers.extend(LayerID("single_post", n) for n in range(lm_cfg.num_hidden_layers))
             layers.extend(LayerID("single_cache", n) for n in single_cache_model_indices(pipeline_cfg))
@@ -1419,7 +1506,10 @@ class VlmConfig(BaseConfig):
                 LayerID("vision", n)
                 for n in range(self.num_vision_layers)
             )
-        if is_speculative_draft:
+        if (
+            is_speculative_draft
+            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.EAGLE3
+        ):
             layers.append(LayerID("group_draft_fc", 0))
             layers.append(LayerID("single_draft_fc", 0))
 
@@ -1643,7 +1733,9 @@ def single_cache_model_indices(cfg: PipelineConfig) -> list[int]:
     return _single_cache_model_indices(cfg, "full_attention")
 
 
-def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int) -> list[int]:
+def single_sliding_cache_model_indices(
+    cfg: PipelineConfig, sliding_window: int, num_tokens: int = 1
+) -> list[int]:
     """
     Get the indices of all single-token sliding-window cache models.
 
@@ -1655,10 +1747,14 @@ def single_sliding_cache_model_indices(cfg: PipelineConfig, sliding_window: int)
     Returns:
         Indices of single sliding cache models in ascending order.
     """
-    return [
+    indices = [
         n for n in _single_cache_model_indices(cfg, "sliding_attention")
         if n < sliding_window
     ]
+    if num_tokens > 1:
+        # Verification retains the union of all query-row windows.
+        indices.append(min(sliding_window + num_tokens - 1, cfg.max_num_tokens) - 1)
+    return sorted(set(indices))
 
 
 def single_shared_sliding_cache_model_indices(

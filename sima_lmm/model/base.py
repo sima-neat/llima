@@ -35,6 +35,8 @@ from sima_lmm.logging import (
     ScopedLogLevel, sima_log_exception, sima_log_dbg, sima_log_info
 )
 
+GEMMA4_TOKEN_ORDERING_FILE = "gemma4_token_ordering.npy"
+
 
 class FileGenMode(Enum):
     """
@@ -447,13 +449,17 @@ class BaseModel(ABC):
             self.sima_devkit_path
             / f"{self.language_model_name}_per_layer_embedding_scales.bin"
         )
-        write_per_layer_embedding_scales = (
+        uses_per_layer_inputs = (
             self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            and self.cfg.lm_cfg.hidden_size_per_layer_input > 0
+        )
+        write_per_layer_embedding_scales = (
+            uses_per_layer_inputs
             and self.cfg.pipeline_cfg.quantize_embeddings
             and not (resume and per_layer_embeddings_scale_file_name.is_file())
         )
         write_per_layer_embeddings = (
-            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            uses_per_layer_inputs
             and (
                 not (resume and per_layer_embeddings_file_name.is_file())
                 or write_per_layer_embedding_scales
@@ -518,6 +524,20 @@ class BaseModel(ABC):
                 if tensor_name in self.hf_model.weight_map:
                     tensor = self.hf_model.load_np_param(tensor_name)
                     np.save(out_path, tensor)
+
+            spec_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+            if spec_cfg is not None and spec_cfg.use_ordered_embeddings:
+                ordering_path = self.sima_devkit_path / GEMMA4_TOKEN_ORDERING_FILE
+                if not (resume and ordering_path.is_file()):
+                    tensor_name = "masked_embedding.token_ordering"
+                    if not self.hf_model.param_exists(tensor_name):
+                        raise ValueError(
+                            f"Gemma4 ordered embeddings require {tensor_name}"
+                        )
+                    ordering = self.hf_model.load_np_param(tensor_name).reshape(-1).astype(
+                        np.int64, copy=False
+                    )
+                    np.save(ordering_path, ordering)
         else:
             assert isinstance(self.hf_model, GgufModel)
             # Copy the GGUF file to construct the VlmHelper.

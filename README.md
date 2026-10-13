@@ -123,10 +123,9 @@ latency-sensitive vision processes. Set `MLA_CTX_PRIORITY` before startup to
 override this value; lower numbers have higher priority, and negative values
 require `CAP_SYS_NICE`.
 
-For EAGLE3 speculative decoding, pass the parent compiled-model directory that
-contains both the target and draft model subdirectories. `llima run` reads each
-subdirectory's `sima_files/devkit/vlm_config.json` and automatically selects the
-target and draft.
+For EAGLE3 or Gemma4 MTP speculative decoding, pass the parent compiled-model
+directory containing the target and draft model subdirectories. `llima run`
+reads their serialized configurations and automatically loads the pair.
 
 Model resolution order:
 
@@ -162,7 +161,7 @@ Inside `llima run --mode cli`:
 - `help`: print available commands.
 
 Set `SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT=1` to highlight tokens accepted from the
-draft model when running EAGLE3 speculative decoding in CLI mode.
+draft model when running speculative decoding in CLI mode.
 
 ## Model Compiler Python Package
 

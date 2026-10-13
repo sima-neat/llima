@@ -79,7 +79,6 @@ def gen_files(
 
     # Check if draft model is provided
     if draft_model_path is not None:
-        base_model.configure_speculative_decoding(is_draft=False)
         draft_model = VisionLanguageModel.from_hf_cache(
             hf_cache_path=draft_model_path,
             model_name=draft_model_path.name,
@@ -93,7 +92,10 @@ def gen_files(
             quantize_embeddings=quantize_embeddings,
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
-            target_model=base_model
+            target_model=base_model,
+        )
+        base_model.configure_speculative_decoding(
+            is_draft=False, method=draft_model.cfg.lm_cfg.speculative_decoding_cfg.method
         )
         models.append(draft_model)
 
@@ -287,9 +289,8 @@ def main():
     )
     group.add_argument(
         "--draft_model_path", type=Path,
-        help="Path of the EAGLE3 draft model for the base (target) model."
+        help="Path of the speculative draft/assistant model for the base (target) model."
     )
-
     group = parser.add_argument_group("Options to compile LoRA")
     group.add_argument(
         "--lora_name", type=str, dest="lora_names", action="append",

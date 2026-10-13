@@ -186,11 +186,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 struct SpeculativeDecodingConfig {
+    std::string method = "eagle3";
     bool is_draft = false;
     uint16_t speculative_budget = 16;
+    uint32_t backbone_hidden_size = 0;
+    bool use_ordered_embeddings = false;
+    uint32_t num_centroids = 0;
+    uint32_t centroid_intermediate_top_k = 0;
+
+    bool is_eagle3() const { return method == "eagle3"; }
+    bool is_gemma4_mtp() const { return method == "gemma4_mtp"; }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    SpeculativeDecodingConfig, is_draft, speculative_budget
+    SpeculativeDecodingConfig, method, is_draft, speculative_budget,
+    backbone_hidden_size, use_ordered_embeddings, num_centroids,
+    centroid_intermediate_top_k
 )
 
 struct MixtureOfExpertsConfig {
@@ -247,8 +257,9 @@ struct LanguageModelConfig {
     }
 
     uint16_t get_single_num_tokens() const {
-        if (speculative_decoding_cfg.has_value()) {
-            return speculative_decoding_cfg.value().speculative_budget;
+        const auto& spec = speculative_decoding_cfg;
+        if (spec && !(spec->is_gemma4_mtp() && spec->is_draft)) {
+            return spec->speculative_budget;
         }
         return 1;
     }
@@ -257,9 +268,25 @@ struct LanguageModelConfig {
         return speculative_decoding_cfg.has_value();
     }
 
+    bool is_speculative_draft() const {
+        return is_spec_decode() && speculative_decoding_cfg.value().is_draft;
+    }
+
+    bool is_eagle3_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_eagle3();
+    }
+
+    bool is_gemma4_mtp_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_gemma4_mtp();
+    }
+
+    bool is_gemma4_mtp_target() const {
+        return is_spec_decode() && speculative_decoding_cfg->is_gemma4_mtp()
+            && !speculative_decoding_cfg->is_draft;
+    }
+
     uint32_t get_lm_head_output_size() const {
-        if (speculative_decoding_cfg.has_value()
-            && speculative_decoding_cfg.value().is_draft){
+        if (is_speculative_draft() && draft_vocab_size > 0) {
             return draft_vocab_size;
         }
         return token_cfg.vocab_size;

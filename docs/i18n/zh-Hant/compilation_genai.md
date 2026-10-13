@@ -109,7 +109,7 @@ output_directory/
 | `--no-quantize_embeddings` | 停用嵌入表格量化功能。預設情況下，此功能會針對支援的 LLM 和 VLM 啟用。 |
 | `--no-quantize_kv_cache` | 停用 KV 快取量化功能，因為預設情況下已啟用此功能。 |
 | `--return_logits` | 傳回最後一層輸出的 logits 值（模型評估器需要此值）。 |
-| `--draft_model_path` | 用於推測性解碼的 EAGLE3 草稿模型的路徑。 |
+| `--draft_model_path` | 用於推測性解碼的相容 EAGLE3 或 Gemma4 MTP 草稿模型路徑。 |
 | `--lora_name` | 與基礎模型一同編譯的 LoRA 配接器的名稱。 |
 | `--lora_path` | 用於與基礎模型一起編譯的 LoRA 轉接器目錄的路徑。 |
 | `--compile_lora`, `--no-compile_lora` | 當提供 LoRA 路徑時，啟用或停用配接器權重編譯。預設為啟用。 |

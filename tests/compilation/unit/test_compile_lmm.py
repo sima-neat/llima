@@ -3,9 +3,33 @@ import sys
 import pytest
 
 from sima_lmm.host import compile_lmm
+from sima_lmm.model.vision_language_model import _detect_speculative_method
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            {"model_type": "gemma4_assistant", "architectures": ["Gemma4AssistantForCausalLM"]},
+            "gemma4_mtp",
+        ),
+        (
+            {"model_type": "llama", "architectures": ["LlamaForCausalLMEagle3"]},
+            "eagle3",
+        ),
+    ],
+)
+def test_detect_speculative_method(config: dict, expected: str):
+    assert _detect_speculative_method(config) == expected
+
+
+def test_detect_speculative_method_rejects_unknown_draft():
+    config = {"model_type": "llama", "architectures": ["LlamaForCausalLM"]}
+    with pytest.raises(ValueError, match="Expected a Gemma4 MTP or EAGLE3 draft model"):
+        _detect_speculative_method(config)
 
 
 @pytest.mark.parametrize(

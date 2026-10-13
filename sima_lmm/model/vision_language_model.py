@@ -3,7 +3,11 @@ import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from sima_lmm.config.vlm_config import ModelFormat, SPECULATIVE_BUDGET, VlmConfig, model_file_type
+from sima_lmm.config.layer_id import LayerID
+from sima_lmm.config.vlm_config import (
+    ModelFormat, SPECULATIVE_BUDGET, SpeculativeDecodingMethod, VisionArchType,
+    VlmArchType, VlmConfig, model_file_type,
+)
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
@@ -11,6 +15,24 @@ from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
 from sima_lmm.logging import sima_log_info
+
+
+def _detect_speculative_method(model_config: dict) -> str:
+    """Detect a draft model's speculative method from its loaded configuration."""
+    if model_config.get("model_type") == "gemma4_assistant":
+        return SpeculativeDecodingMethod.GEMMA4_MTP
+
+    architectures = model_config.get("architectures", [])
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if any("eagle3" in architecture.lower() for architecture in architectures):
+        return SpeculativeDecodingMethod.EAGLE3
+
+    raise ValueError(
+        "Unsupported speculative draft configuration: "
+        f"model_type={model_config.get('model_type')!r}, architectures={architectures!r}. "
+        "Expected a Gemma4 MTP or EAGLE3 draft model."
+    )
 
 
 @dataclass
@@ -39,6 +61,7 @@ class VisionLanguageModel(BaseModel):
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
+        speculative_method: str | None = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -53,6 +76,8 @@ class VisionLanguageModel(BaseModel):
             quantize_kv_cache: True if KV cache is quantized.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
+            speculative_method: Speculative decoding implementation for target/draft pairs.
+                None detects the method from the loaded draft configuration.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -64,6 +89,9 @@ class VisionLanguageModel(BaseModel):
             assert model_format == ModelFormat.FORMAT_GGUF
             hf_model = GgufModel(hf_cache_path)
             model_config = hf_model.model_config
+
+        if target_model is not None and speculative_method is None:
+            speculative_method = _detect_speculative_method(model_config)
 
         vlm_cfg = VlmConfig.from_hf_config(
             model_format, hf_cache_path, model_config, image_resolution=image_resolution
@@ -80,6 +108,33 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
         if target_model is not None:
+            if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:
+                if target_model.cfg.model_type != VlmArchType.VLM_GEMMA4:
+                    raise ValueError("gemma4_mtp speculative decoding requires a Gemma4 target model")
+                if model_config.get("model_type") != "gemma4_assistant":
+                    raise ValueError(
+                        "gemma4_mtp speculative decoding requires a gemma4_assistant draft model"
+                    )
+                if vlm_cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size != target_model.cfg.lm_cfg.hidden_size:
+                    raise ValueError(
+                        "Gemma4 MTP assistant backbone hidden size does not match target hidden size: "
+                        f"assistant={vlm_cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size}, "
+                        f"target={target_model.cfg.lm_cfg.hidden_size}"
+                    )
+                if vlm_cfg.lm_cfg.speculative_decoding_cfg.use_ordered_embeddings:
+                    required_tensors = (
+                        "masked_embedding.centroids.weight",
+                        "masked_embedding.token_ordering",
+                    )
+                    missing_tensors = [
+                        name for name in required_tensors if not hf_model.param_exists(name)
+                    ]
+                    if missing_tensors:
+                        raise ValueError(
+                            "Gemma4 ordered embeddings require checkpoint tensors: "
+                            + ", ".join(missing_tensors)
+                        )
+
             # Some draft models use target model's tokenization scheme.
             tokenizer_files = ("tokenizer_config.json", "tokenizer.json", "tokenizer.model")
             has_tokenizer = any(
@@ -91,8 +146,16 @@ class VisionLanguageModel(BaseModel):
                 vlm_helper = target_model.vlm_helper
 
             # Set speculative decoding configs for the draft model
+            if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:
+                speculative_budget = SPECULATIVE_BUDGET["gemma4_mtp_draft"]
+            else:
+                speculative_budget = SPECULATIVE_BUDGET["draft"]
             vlm_cfg.lm_cfg.set_speculative_decoding_config(
-                dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
+                dict(
+                    method=speculative_method,
+                    is_draft=True,
+                    speculative_budget=speculative_budget,
+                )
             )
 
         else:
@@ -111,10 +174,18 @@ class VisionLanguageModel(BaseModel):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
         self.cfg.lm_cfg.set_lora_adapter(lora_config)
 
-    def configure_speculative_decoding(self, is_draft: bool = False):
-        speculative_budget = SPECULATIVE_BUDGET["draft"] if is_draft else SPECULATIVE_BUDGET["target"]
+    def configure_speculative_decoding(
+        self,
+        is_draft: bool = False,
+        method: str = SpeculativeDecodingMethod.EAGLE3,
+    ):
+        if method == SpeculativeDecodingMethod.GEMMA4_MTP:
+            budget_key = "gemma4_mtp_draft" if is_draft else "gemma4_mtp_target"
+        else:
+            budget_key = "draft" if is_draft else "target"
+        speculative_budget = SPECULATIVE_BUDGET[budget_key]
         self.cfg.lm_cfg.set_speculative_decoding_config(
-            dict(is_draft=is_draft, speculative_budget=speculative_budget)
+            dict(method=method, is_draft=is_draft, speculative_budget=speculative_budget)
         )
 
     def gen_files(
