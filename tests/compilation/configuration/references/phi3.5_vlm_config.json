@@ -3,6 +3,7 @@
     "model_type": "llm-phi3",
     "vm_cfg": null,
     "mm_cfg": null,
+    "audio_cfg": null,
     "lm_cfg": {
         "model_type": "phi3",
         "data_type": "bfloat16",
@@ -131,6 +132,7 @@
             "num_key_value_heads": 32,
             "head_dim": 96,
             "sliding_head_dim": null,
+            "sliding_num_key_value_heads": null,
             "swa_enable": false,
             "sliding_window": 262144,
             "attention_bias": false,
@@ -187,6 +189,7 @@
         "hidden_size_per_layer_input": 0,
         "num_kv_shared_layers": 0,
         "use_double_wide_mlp": false,
+        "attention_k_eq_v": false,
         "attn_logit_softcapping": null,
         "final_logit_softcapping": null,
         "lm_head_num_splits": 1,

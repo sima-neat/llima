@@ -189,7 +189,7 @@ void LanguageModel::_define_attn_models_iter(
         && cache_mask_size > num_tokens
     );
     const uint16_t aligned_eff_token_idx = std::get<2>(cache_key);
-    const uint16_t aligned_eff_num_cached_tokens = _cfg.lm_cfg.vision_bidirectional_attention && num_tokens > 1
+    const uint16_t aligned_eff_num_cached_tokens = _cfg.vision_bidirectional_attention() && num_tokens > 1
         ? _cfg.get_prefill_cache_capacity(layer_type) : use_single_future_token_mask
         ? aligned_eff_token_idx + 1
         : aligned_eff_token_idx + num_tokens;
@@ -240,7 +240,7 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
 
-    if (use_group_future_token_mask || (_cfg.lm_cfg.vision_bidirectional_attention && num_tokens > 1)) {
+    if (use_group_future_token_mask || (_cfg.vision_bidirectional_attention() && num_tokens > 1)) {
         cache_ifms.emplace_back(
             MLABufferSlice{
                 &get_buffer(

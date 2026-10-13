@@ -764,7 +764,6 @@ class LanguageModelConfig(BaseConfig):
     num_kv_shared_layers: int = 0
     use_double_wide_mlp: bool = False
     attention_k_eq_v: bool = False
-    vision_bidirectional_attention: bool = False
     attn_logit_softcapping: float | None = None
     final_logit_softcapping: float | None = None
     lm_head_num_splits: int = 1
@@ -783,6 +782,13 @@ class LanguageModelConfig(BaseConfig):
         )
 
     @property
+    def vision_bidirectional_attention(self) -> bool:
+        """Unified targets need image-window prefill; speculative drafts do not."""
+        return self.model_type == "gemma4_unified_text" and not (
+            self.speculative_decoding_cfg is not None and self.speculative_decoding_cfg.is_draft
+        )
+
+    @property
     def single_model_num_tokens(self) -> int:
         """Compiled decode width, distinct from recurrent MTP proposal count."""
         spec_cfg = self.speculative_decoding_cfg
@@ -794,6 +800,7 @@ class LanguageModelConfig(BaseConfig):
 
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
+        cfg.pop("vision_bidirectional_attention", None)  # Ignore the former serialized flag.
         cfg["token_cfg"] = TokenEmbedConfig(**cfg["token_cfg"])
         if cfg["rope_cfg"].get("rope_scaling") is not None:
             cfg["rope_cfg"]["rope_scaling"] = RopeScalingConfig(**cfg["rope_cfg"]["rope_scaling"])
@@ -847,7 +854,6 @@ class LanguageModelConfig(BaseConfig):
     def set_config(self, text_cfg: dict, dtype: "LlmDataType", lm_arch: "LlmArchType", model_format: "ModelFormat"):
         text_cfg = _normalize_attention_config(text_cfg)
         self.model_type = text_cfg["model_type"]
-        self.vision_bidirectional_attention = self.model_type == "gemma4_unified_text"
         self.data_type = dtype
         self.arch = lm_arch
 

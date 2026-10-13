@@ -226,7 +226,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
 
 struct LanguageModelConfig {
-    bool vision_bidirectional_attention = false;
     TokenEmbedConfig token_cfg;
     RoPEConfig rope_cfg;
     AttentionBlockConfig attn_cfg;
@@ -309,7 +308,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     LanguageModelConfig, token_cfg, rope_cfg, attn_cfg, num_hidden_layers, hidden_size,
     lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache,
     hidden_size_per_layer_input, num_kv_shared_layers,
-    rms_norm_eps, rms_norm_unit_offset, vision_bidirectional_attention,
+    rms_norm_eps, rms_norm_unit_offset,
     linear_attn_cfg,
     draft_vocab_size, speculative_decoding_cfg, arch, moe_cfg
 )
@@ -405,6 +404,9 @@ struct VlmConfig {
     std::string gguf_file_name = "";
 
     bool is_multimodal() const { return vm_cfg.has_value(); }
+    bool vision_bidirectional_attention() const {
+        return model_type == "vlm-gemma4_unified" && !lm_cfg.is_speculative_draft();
+    }
     bool support_audio() const { return audio_cfg.has_value() && !audio_model_name.empty(); }
     uint16_t get_prefill_cache_capacity(const std::string& layer_type) const {
         if (layer_type != "sliding_attention") return pipeline_cfg.max_num_tokens;

@@ -19,7 +19,8 @@
         "num_position_embeddings": 0,
         "fullatt_block_indexes": [],
         "deepstack_visual_indexes": [],
-        "rope_theta": 10000.0
+        "rope_theta": 10000.0,
+        "max_soft_tokens": 0
     },
     "mm_cfg": {
         "num_layers": 2,
@@ -29,6 +30,7 @@
         "downsample_factor": 2,
         "projector_use_layernorm": true
     },
+    "audio_cfg": null,
     "lm_cfg": {
         "model_type": "lfm2",
         "data_type": "bfloat16",
@@ -59,6 +61,7 @@
             "num_key_value_heads": 8,
             "head_dim": 64,
             "sliding_head_dim": null,
+            "sliding_num_key_value_heads": null,
             "swa_enable": false,
             "sliding_window": 0,
             "attention_bias": false,
@@ -99,6 +102,7 @@
         "hidden_size_per_layer_input": 0,
         "num_kv_shared_layers": 0,
         "use_double_wide_mlp": false,
+        "attention_k_eq_v": false,
         "attn_logit_softcapping": null,
         "final_logit_softcapping": null,
         "lm_head_num_splits": 1,
