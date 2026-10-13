@@ -87,9 +87,6 @@ def test_dflash_verification_omits_redundant_valid_mask():
     )
     assert not model._uses_linear_valid_mask
 
-    model.cfg.pipeline_cfg.input_token_group_size = 16
-    assert model._uses_linear_valid_mask
-
 
 def test_linear_attention_selects_supported_delta_block_sizes():
     for num_tokens, block_size in ((1, 1), (4, 4), (8, 8), (16, 16), (32, 32), (128, 32)):

@@ -333,16 +333,6 @@ def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_p
     assert model._get_part_model("dflash_context", 128, layer_idx=0).num_tokens == 128
 
 
-def test_dflash_draft_deduplicates_equal_group_and_block_widths():
-    config = _dflash_draft_config()
-    config.config_pipeline(None, None, 2048, 8, 8)
-
-    assert _layer_indices(config, "group_dflash_context") == []
-    assert _layer_indices(config, "single_dflash_context") == list(range(6))
-    assert _layer_indices(config, "group_draft_fc") == []
-    assert _layer_indices(config, "single_draft_fc") == [0]
-
-
 def test_dflash_final_post_uses_paired_target_head(tmp_path):
     config = _dflash_draft_config()
     quantized_head = (

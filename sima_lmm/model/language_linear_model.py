@@ -54,10 +54,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
 
     @property
     def _uses_linear_valid_mask(self) -> bool:
-        return self.num_tokens > 1 and not (
-            self._emit_dflash_resolver_inputs
-            and self.num_tokens != self.cfg.pipeline_cfg.input_token_group_size
-        )
+        return self.num_tokens > 1 and not self._emit_dflash_resolver_inputs
 
     @property
     def split_mlp(self) -> bool:

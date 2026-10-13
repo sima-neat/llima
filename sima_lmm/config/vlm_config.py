@@ -1404,11 +1404,7 @@ class VlmConfig(BaseConfig):
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
                     if is_dflash_draft:
-                        if (
-                            pipeline_cfg.input_token_group_size
-                            != lm_cfg.speculative_decoding_cfg.speculative_budget
-                        ):
-                            layers.append(LayerID("group_dflash_context", i))
+                        layers.append(LayerID("group_dflash_context", i))
                         layers.append(LayerID("single_dflash_context", i))
                         layers.append(LayerID("single_pre", i))
                         layers.append(LayerID("single_post", i))
@@ -1532,11 +1528,7 @@ class VlmConfig(BaseConfig):
                 for n in range(self.num_vision_layers)
             )
         if is_speculative_draft and not is_gemma4_mtp_draft:
-            if (
-                not is_dflash_draft
-                or pipeline_cfg.input_token_group_size != lm_cfg.single_model_num_tokens
-            ):
-                layers.append(LayerID("group_draft_fc", 0))
+            layers.append(LayerID("group_draft_fc", 0))
             layers.append(LayerID("single_draft_fc", 0))
 
         if (

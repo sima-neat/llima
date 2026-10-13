@@ -421,20 +421,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         _notify_cache_full();
         output_token_ids = std::vector<uint32_t>();
     } else {
-        if (!_cached_states.empty()) {
-            _capture_state_checkpoints = true;
-            _rolling_checkpoint_slot = 0;
-            _writable_checkpoint_slots = 0;
-            auto system_boundary = std::upper_bound(
-                _checkpoint_boundaries.begin(),
-                _checkpoint_boundaries.end(),
-                std::min<size_t>(stable_prefix_token_count, input_token_ids.size())
-            );
-            _system_checkpoint_position = system_boundary == _checkpoint_boundaries.begin()
-                ? 0 : *std::prev(system_boundary);
-            if (_system_checkpoint_position && _state_checkpoint_positions[0] != _system_checkpoint_position)
-                _state_checkpoint_positions[0] = 0;
-        }
+        _init_state_checkpoint_capture(input_token_ids.size(), stable_prefix_token_count);
 
         // Create input embeds from input token ids and image embeds.
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
@@ -478,6 +465,80 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     }
 }
 
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result) {
+    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
+                                          timer_ttft, performance_result, 0);
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count) {
+    if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value() ||
+        !draft_lm._cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
+        throw std::invalid_argument("Both models must contain speculative-decoding configuration");
+    }
+    const auto& target = _cfg.lm_cfg.speculative_decoding_cfg.value();
+    const auto& draft = draft_lm._cfg.lm_cfg.speculative_decoding_cfg.value();
+    if (target.is_draft || !draft.is_draft) {
+        throw std::invalid_argument("Speculative decoding requires a target paired with a draft");
+    }
+    if (target.method != draft.method) {
+        throw std::invalid_argument("Target and draft speculative methods do not match");
+    }
+    if (target.is_gemma4_mtp()) {
+        return run_model_gemma4_mtp(draft_lm, input_token_ids, override_max_num_tokens, timer_ttft,
+                                    performance_result);
+    }
+    if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.hidden_size ||
+        _cfg.lm_cfg.token_cfg.vocab_size != draft_lm._cfg.lm_cfg.token_cfg.vocab_size) {
+        throw std::invalid_argument("Target and draft hidden or vocabulary sizes do not match");
+    }
+    if (target.method == "dflash") {
+        if (target.speculative_budget != draft.speculative_budget ||
+            target.target_layer_ids != draft.target_layer_ids) {
+            throw std::invalid_argument(
+                "DFlash target and draft block configuration does not match");
+        }
+        if (_cfg.pipeline_cfg.input_token_group_size !=
+            draft_lm._cfg.pipeline_cfg.input_token_group_size) {
+            throw std::invalid_argument(
+                "DFlash target and draft language group sizes do not match");
+        }
+        if (_cfg.pipeline_cfg.input_token_group_size <= target.speculative_budget) {
+            throw std::invalid_argument("DFlash language group size must exceed the block size");
+        }
+        if (draft_lm._cfg.pipeline_cfg.max_num_tokens < _cfg.pipeline_cfg.max_num_tokens) {
+            throw std::invalid_argument("DFlash draft cache is smaller than the target cache");
+        }
+        if (_cfg.pipeline_cfg.quantize_embeddings !=
+            draft_lm._cfg.pipeline_cfg.quantize_embeddings) {
+            throw std::invalid_argument(
+                "DFlash target and draft embedding quantization modes do not match");
+        }
+        if (_cfg.pipeline_cfg.future_token_mask_size <= 1 ||
+            draft_lm._cfg.pipeline_cfg.future_token_mask_size <= 1) {
+            throw std::invalid_argument(
+                "DFlash models require a multi-token future-mask configuration");
+        }
+        if (target.mask_token_id != draft.mask_token_id || draft.mask_token_id < 0 ||
+            static_cast<uint32_t>(draft.mask_token_id) >= _cfg.lm_cfg.token_cfg.vocab_size) {
+            throw std::invalid_argument("DFlash target and draft mask token IDs do not match");
+        }
+        return _run_model_dflash_speculative_decoding(
+            draft_lm, input_token_ids, override_max_num_tokens, timer_ttft, performance_result,
+            stable_prefix_token_count);
+    }
+    if (target.method == "eagle3") {
+        return _run_model_eagle3_speculative_decoding(
+            draft_lm, input_token_ids, override_max_num_tokens, timer_ttft, performance_result);
+    }
+    throw std::invalid_argument("Unsupported speculative-decoding method: " + target.method);
+}
 
 uint32_t LanguageModel::run_model_prefill(
     std::span<const uint32_t> input_token_ids,
@@ -1082,7 +1143,6 @@ uint32_t LanguageModel::run_model_once(
         _cfg.lm_cfg.is_dflash()
         && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
         && num_tokens == _cfg.pipeline_cfg.input_token_group_size
-        && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
     );
     MLABuffer* dflash_layer_input = nullptr;
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
@@ -1816,6 +1876,25 @@ void LanguageModel::_initialize() {
 
     _logger->info("Language model initialize completed");
 }
+
+void LanguageModel::_init_state_checkpoint_capture(
+    size_t input_token_count, uint16_t stable_prefix_token_count
+) {
+    if (_cached_states.empty())
+        return;
+    _capture_state_checkpoints = true;
+    _rolling_checkpoint_slot = 0;
+    _writable_checkpoint_slots = 0;
+    const auto system_boundary = std::upper_bound(
+        _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(),
+        std::min<size_t>(stable_prefix_token_count, input_token_count)
+    );
+    _system_checkpoint_position = system_boundary == _checkpoint_boundaries.begin()
+        ? 0 : *std::prev(system_boundary);
+    if (_system_checkpoint_position && _state_checkpoint_positions[0] != _system_checkpoint_position)
+        _state_checkpoint_positions[0] = 0;
+}
+
 
 // Restore the latest checkpoint, or clear state when checkpoints are unavailable.
 uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens) {

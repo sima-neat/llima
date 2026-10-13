@@ -412,22 +412,7 @@ void LanguageModel::_define_attn_models_iter(
             : (_cfg.lm_cfg.is_spec_decode() ? num_tokens : 1);
         post_elf_path = _get_elf_path_post(post_num_tokens, layer_idx);
 
-        if (is_draft && _cfg.lm_cfg.is_dflash()) {
-            if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-                post_ofms.emplace_back(MLABufferSlice{
-                    &get_buffer(fmt::format("n{}_buffer4", num_tokens))
-                });
-            } else {
-                uint32_t split = 0;
-                for (uint32_t begin = 0;
-                     begin < _cfg.lm_cfg.token_cfg.vocab_size;
-                     begin += _cfg.lm_cfg.lm_head_split_dim, ++split) {
-                    post_ofms.emplace_back(MLABufferSlice{
-                        &get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split))
-                    });
-                }
-            }
-        } else if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+        if (_cfg.lm_cfg.lm_head_num_splits == 1) {
             const std::string buf_name = _cfg.lm_cfg.is_spec_decode()
                 ? fmt::format("n{}_buffer4", post_num_tokens)
                 : std::string("n1_buffer4");
@@ -649,8 +634,7 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
     );
     const bool uses_linear_valid_mask = (
         num_tokens > 1
-        && (!is_dflash_target_verify
-            || num_tokens == _cfg.pipeline_cfg.input_token_group_size)
+        && !is_dflash_target_verify
     );
 
     std::vector<MLABufferSlice> linear_ifms;

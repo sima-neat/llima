@@ -451,6 +451,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }
+        void _init_state_checkpoint_capture(
+            size_t input_token_count, uint16_t stable_prefix_token_count
+        );
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
         void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
