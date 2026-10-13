@@ -20,6 +20,7 @@ from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.vision_model import VisionModel
+from sima_lmm.config.vlm_config import VlmArchType
 from tests.compilation.cases import GRAPH_REGRESSION_CASES, GraphRegressionCase
 from tests.compilation.helpers.model_factory import (
     load_hf_model,
@@ -102,6 +103,8 @@ def _standard_models(
             hf_model=vlm_model.hf_model,
         )
         num_layers = vision_model.cfg.num_vision_layers
+        if num_layers == 1 and cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+            return [vision_model._get_part_model(0)], FileGenPrecision.BF16
         if num_layers < 3:
             raise ValueError(f"{case.id}: vision regression needs at least three layers")
         digest = hashlib.sha256(case.id.encode("utf-8")).digest()
@@ -109,6 +112,11 @@ def _standard_models(
         middle_layer = 1 + seed % (num_layers - 2)
         models = [vision_model._get_part_model(index) for index in (0, middle_layer)]
         return models, FileGenPrecision.BF16
+    elif case.component == "audio":
+        from sima_lmm.model.gemma4_unified_model import Gemma4UnifiedAudioModel
+        model = Gemma4UnifiedAudioModel(
+            cfg, f"{vlm_model.model_name}_audio", sima_path=vlm_model.sima_path, hf_model=vlm_model.hf_model
+        )
     else:
         raise ValueError(f"Unsupported standard native graph component: {case.component}")
 

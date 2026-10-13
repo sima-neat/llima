@@ -52,6 +52,24 @@ hf download simaai/<model-repository> \
 llima-compile <prequantized-model-directory> -o <output-directory>
 ```
 
+### Gemma 4 12B Unified
+
+Compile the text, image and audio model with grouped prefill and BF16 embeddings/KV:
+
+``` console
+llima-compile /path/to/Gemma-4-12B-it-GPTQ-Safetensors \
+    -o CompiledModels/Gemma-4-12B-it \
+    --max_num_tokens 4096 --language_group_size 128 \
+    --no-quantize_embeddings --no-quantize_kv_cache -j 16
+```
+
+Omit `--input_height` and `--input_width`: image preprocessing preserves aspect
+ratio within the checkpoint's `max_soft_tokens` budget. Runtime prefill stages
+only the chunks needed to span an image, preserving bidirectional image
+attention. Audio uses a separate waveform projection and ordinary causal
+prefill. MTP is not supported for this variant yet; Modalix execution still
+requires validation.
+
 ### Describe the model. An agent with LLiMa skills compiles it.
 
 SiMa.ai LLiMa supports agentic model compilation out of the box through skills

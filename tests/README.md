@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 366
+- Expected cases: 374
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -85,7 +85,7 @@ offline mode, and reject network connections.
 
 - Location: `tests/compilation/configuration/`
 - Marker: `compiler_config`
-- Expected cases: 26
+- Expected cases: 27
 
 Generates `VlmConfig` objects from cached Hugging Face and GGUF sources and
 compares them with the checked-in JSON contracts under
@@ -122,9 +122,9 @@ coverage of the other GGUF quantization formats.
 
 - Location: `tests/compilation/graph_regression/`
 - Marker: `compiler_graph_regression`
-- Expected cases: 37
+- Expected cases: 42
 
-All current cases are required.
+Gemma 4 Unified cases are informative until support is in the published develop compiler; all other cases are required.
 
 Every case:
 

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
 
@@ -44,6 +45,9 @@ ImageProcessor::ImageProcessor(
 
 
 std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const std::filesystem::path image_path) {
+    if (_vlm_cfg.model_type == "vlm-gemma4_unified" && image_path.extension() == ".bin") {
+        throw std::invalid_argument("Gemma 4 Unified requires RGB images to derive patch positions; raw .bin inputs are unsupported");
+    }
     if (image_path.extension() == ".bin") {
         // Image is already preprocessed. Implicit assumption from the .bin extension.
         auto file_size = std::filesystem::file_size(image_path);
@@ -87,6 +91,7 @@ std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const cv::Mat& rgb_image
 
 
 std::vector<Eigen::bfloat16> ImageProcessor::_preprocess(cv::Mat image) {
+    if (_vlm_cfg.model_type == "vlm-gemma4_unified") return _preprocess_unified(image);
     if (_do_pad_to_square)
         image = _pad_to_square(image);
 
@@ -142,6 +147,87 @@ std::vector<Eigen::bfloat16> ImageProcessor::_preprocess(cv::Mat image) {
         ofs.close();
     }
     return cast_image;
+}
+
+// Match Torchvision's antialiased uint8 bicubic path, including rounding between
+// horizontal and vertical passes. OpenCV's cubic kernel uses a different filter.
+static cv::Mat resize_unified_image(const cv::Mat& image, int height, int width) {
+    auto resize_axis = [](const cv::Mat& src, int output_size, bool horizontal) {
+        const int input_size = horizontal ? src.cols : src.rows;
+        if (input_size == output_size) return src.clone();
+        const double scale = static_cast<double>(input_size) / output_size;
+        const double filter_scale = std::max(scale, 1.0);
+        std::vector<int> begins(output_size);
+        std::vector<std::vector<double>> weights(output_size);
+        double max_weight = 0;
+        for (int i = 0; i < output_size; ++i) {
+            const double center = (i + 0.5) * scale;
+            const int first = std::max(0, static_cast<int>(center - 2 * filter_scale + 0.5));
+            const int end = std::min(input_size, static_cast<int>(center + 2 * filter_scale + 0.5));
+            begins[i] = first;
+            double sum = 0;
+            for (int j = first; j < end; ++j) {
+                const double x = std::abs((j + 0.5 - center) / filter_scale);
+                const double weight = x < 1 ? (1.5 * x - 2.5) * x * x + 1
+                    : x < 2 ? ((-0.5 * x + 2.5) * x - 4) * x + 2 : 0;
+                weights[i].push_back(weight);
+                sum += weight;
+            }
+            for (auto& weight : weights[i]) {
+                weight /= sum;
+                max_weight = std::max(max_weight, weight);
+            }
+        }
+        int precision = 0;
+        while (precision < 22 && static_cast<int>(0.5 + max_weight * (1 << (precision + 1))) < 32768) ++precision;
+        cv::Mat dst(horizontal ? src.rows : output_size, horizontal ? output_size : src.cols, CV_8UC3);
+        for (int y = 0; y < dst.rows; ++y) for (int x = 0; x < dst.cols; ++x) {
+            const int i = horizontal ? x : y;
+            for (int channel = 0; channel < 3; ++channel) {
+                int64_t total = int64_t{1} << (precision - 1);
+                for (size_t j = 0; j < weights[i].size(); ++j) {
+                    const double weight = weights[i][j];
+                    const int coefficient = static_cast<int>(weight * (1 << precision) + (weight < 0 ? -0.5 : 0.5));
+                    const auto pixel = src.at<cv::Vec3b>(horizontal ? y : begins[i] + j, horizontal ? begins[i] + j : x);
+                    total += coefficient * pixel[channel];
+                }
+                dst.at<cv::Vec3b>(y, x)[channel] = std::clamp<int64_t>(total >> precision, 0, 255);
+            }
+        }
+        return dst;
+    };
+    return resize_axis(resize_axis(image, width, true), height, false);
+}
+
+std::vector<Eigen::bfloat16> ImageProcessor::_preprocess_unified(const cv::Mat& image) {
+    if (image.empty()) throw std::invalid_argument("Cannot preprocess an empty image");
+    const auto& vm = _vlm_cfg.vm_cfg.value();
+    const uint32_t side = vm.spatial_patch_size * vm.spatial_merge_size;
+    const double factor = std::sqrt(static_cast<double>(vm.max_soft_tokens) * side * side / image.total());
+    int height = std::floor(image.rows * factor / side) * side;
+    int width = std::floor(image.cols * factor / side) * side;
+    if (height == 0) {
+        height = side;
+        width = std::min<uint32_t>(static_cast<int>(static_cast<double>(image.cols) / image.rows) * side, vm.max_soft_tokens * side);
+    } else if (width == 0) {
+        width = side;
+        height = std::min<uint32_t>(static_cast<int>(static_cast<double>(image.rows) / image.cols) * side, vm.max_soft_tokens * side);
+    }
+    const auto resized = resize_unified_image(image, height, width);
+    _image_positions.clear();
+    std::vector<Eigen::bfloat16> patches;
+    patches.reserve(static_cast<size_t>(height) * width * 3);
+    for (int row = 0; row < height; row += side) for (int col = 0; col < width; col += side) {
+        _image_positions.push_back(col / side);
+        _image_positions.push_back(row / side);
+        for (uint32_t y = 0; y < side; ++y) for (uint32_t x = 0; x < side; ++x) {
+            const auto pixel = resized.at<cv::Vec3b>(row + y, col + x);
+            for (int channel = 0; channel < 3; ++channel) {
+                patches.emplace_back(static_cast<float>(pixel[channel]) * static_cast<float>(_rescale_factor));
+            }
+        }
+    }
+    return patches;
 }
 
 

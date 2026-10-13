@@ -47,7 +47,7 @@ ReasoningFormat reasoning_format_for_model(std::string_view model_type) {
     if (model_type.starts_with("llm-qwen3") || model_type.starts_with("vlm-qwen3")) {
         return ReasoningFormat::Qwen;
     }
-    if (model_type == "vlm-gemma4") {
+    if (model_type == "vlm-gemma4" || model_type == "vlm-gemma4_unified") {
         return ReasoningFormat::Gemma4;
     }
     if (model_type == "llm-lfm2") {

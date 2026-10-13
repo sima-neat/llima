@@ -433,6 +433,8 @@ class BaseModel(ABC):
         if write_cfg:
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name
+            if self.cfg.audio_cfg is not None:
+                cfg_dict["audio_model_name"] = f"{self.model_name}_audio"
             if self.cfg.vm_cfg is not None:
                 cfg_dict["vision_model_name"] = self.cfg.get_vision_model_names(
                     self.vision_model_name
@@ -484,6 +486,12 @@ class BaseModel(ABC):
 
         if isinstance(self.hf_model, LocalHuggingFaceModel):
             # Copy the HF files.
+            if self.cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+                from sima_lmm.model.gemma4_unified_model import Gemma4UnifiedImageModel
+                image_model = Gemma4UnifiedImageModel(self.cfg, self.vision_model_name, hf_model=self.hf_model)
+                self.hf_model.load_np_param(image_model.position_weight_name).astype(bfloat16).tofile(
+                    self.sima_devkit_path / "vision_positions.bin"
+                )
             src_file_names = list(self.hf_model.hf_cache.rglob("*.json"))
             src_file_names.extend(self.hf_model.hf_cache.rglob("*.txt"))
             src_file_names.extend(self.hf_model.hf_cache.rglob("*.jinja"))

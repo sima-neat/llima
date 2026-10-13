@@ -12,9 +12,10 @@ namespace llima {
 
 const std::string CLI::_COMMANDS = R"(
 add image <fn>     : add an image.
+add audio <fn>     : attach audio to an audio-capable model.
 set system <prompt>: set system prompt.
-clear system       : clear system prompt, chat history and images.
-clear history      : clear prompts, responses and images; keep system prompt.
+clear system       : clear system prompt, chat history and attachments.
+clear history      : clear prompts, responses and attachments; keep system prompt.
 print history      : print chat history.
 set audio <fn>     : set the audio file to be transcribed as query.
 set language <lang>: set transcription language; omit <lang> or use auto to detect it.
@@ -158,6 +159,16 @@ void CLI::run() {
                 std::cout << "Image file not found: " << image_file_name << std::endl;
             } else {
                 chat.add_image(image_file_name);
+            }
+            continue;
+        } else if (command.starts_with("add audio ")) {
+            const std::filesystem::path path = command.substr(std::string("add audio ").length());
+            if (!_vision_language_model_ptr->support_audio()) {
+                std::cout << "Inference with audio is not supported." << std::endl;
+            } else if (!std::filesystem::is_regular_file(path)) {
+                std::cout << "Audio file not found: " << path << std::endl;
+            } else {
+                chat.add_audio(path);
             }
             continue;
         } else if (command == "clear image") {

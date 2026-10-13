@@ -558,6 +558,7 @@ class LocalHuggingFaceModel:
         top_p: bool = None,
         max_new_tokens: int = 20,
         num_return_sequences: int = 1,
+        audio_inputs: list[np.ndarray] | None = None,
     ) -> dict:
         """
         execute_hf Execute an LLM using the transformers library.
@@ -658,9 +659,13 @@ class LocalHuggingFaceModel:
                     add_special_tokens = False
                 else:
                     add_special_tokens = True
+                audio_kwargs = {}
+                if audio_inputs:
+                    audio_kwargs = {"audio": [frames.reshape(-1) for frames in audio_inputs],
+                                    "sampling_rate": 16000}
                 processed_dict = processor(
                     text=formatted_prompt, images=images, return_tensors="pt",
-                    add_special_tokens=add_special_tokens
+                    add_special_tokens=add_special_tokens, **audio_kwargs
                 )
             else:
                 assert not images
@@ -671,8 +676,11 @@ class LocalHuggingFaceModel:
             input_ids = processed_dict["input_ids"]
             pixel_values = processed_dict.get("pixel_values")
 
+            model_inputs = {"input_ids": input_ids, "pixel_values": pixel_values}
+            if self.config.get("model_type") == "gemma4_unified":
+                model_inputs = {key: value.to(device) for key, value in processed_dict.items()}
             output = model.generate(
-                input_ids=input_ids, pixel_values=pixel_values,
+                **model_inputs,
                 do_sample=do_sample,
                 top_p=top_p,
                 max_new_tokens=max_new_tokens,

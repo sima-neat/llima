@@ -28,7 +28,7 @@ VisionLanguageModel::VisionLanguageModel(
     _text_streamer(_vlm_helper.get_tokenizer(), std::nullopt, std::nullopt)
 {
     _tool_call_format = tool_call_format_for_model(_cfg.model_type);
-    if (_cfg.support_image()) {
+    if (_cfg.support_image() || _cfg.support_audio()) {
         // VisionModel loads its stage1 ELFs and vlm_config.json through the
         // same FileProvider as the language path, so over PCIe they are pulled
         // (fetch -> load -> evict), one ELF on disk at a time.
@@ -119,9 +119,21 @@ std::optional<std::string> VisionLanguageModel::run_model(
     // input embeddings for the language models.
     ChronoTimer timer_image_encode(true);
     for (size_t i = 0; i < vision_ofm_maps.size(); ++i) {
-        _vision_model_ptr->run_model(preprocessed_data.image_tensors[i], &vision_ofm_maps[i]);
+        if (_cfg.model_type == "vlm-gemma4_unified") {
+            _vision_model_ptr->run_unified_model(preprocessed_data.image_tensors.at(i),
+                preprocessed_data.image_positions.at(i), &vision_ofm_maps[i]);
+        } else {
+            _vision_model_ptr->run_model(preprocessed_data.image_tensors.at(i), &vision_ofm_maps[i]);
+        }
     }
     _logger->info("Image encode time: {:.2f}s", timer_image_encode.stop());
+    auto audio_maps = _language_model_ptr->create_audio_input_maps(preprocessed_data.input_token_ids);
+    if (audio_maps.size() != preprocessed_data.audio_tensors.size()) {
+        throw std::invalid_argument("Audio placeholder/count mismatch");
+    }
+    for (size_t i = 0; i < audio_maps.size(); ++i) {
+        _vision_model_ptr->run_unified_audio(preprocessed_data.audio_tensors[i], &audio_maps[i]);
+    }
 
     // Decode the text and image embeddings. When a draft VLM is configured
     // (set_draft_vlm), dispatch to speculative decoding; otherwise run the

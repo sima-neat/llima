@@ -27,6 +27,8 @@ struct PreprocessedChat {
     std::vector<uint32_t> input_token_ids;
     uint16_t stable_prefix_token_count;
     std::vector<std::vector<Eigen::bfloat16>> image_tensors;
+    std::vector<std::vector<uint16_t>> image_positions;
+    std::vector<std::vector<Eigen::bfloat16>> audio_tensors;
 };
 
 class Chat;
@@ -64,6 +66,7 @@ class VlmHelper {
 
         bool is_multimodal() const { return _vlm_cfg.is_multimodal(); }
         bool support_image() const { return _vlm_cfg.support_image(); }
+        bool support_audio() const { return _vlm_cfg.support_audio(); }
         Tokenizer* get_tokenizer() { return _tokenizer_ptr.get(); }
         std::set<uint32_t> get_stop_token_ids() const { return _stop_token_ids; }
         std::optional<uint32_t> get_image_token_id() const { return _image_token_id; }

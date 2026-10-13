@@ -46,10 +46,11 @@ class Chat {
         const std::string& get_reasoning_effort() const { return _reasoning_effort; }
 
         void add_image(std::filesystem::path image_path);
+        void add_audio(std::filesystem::path audio_path);
         void clear_images();
         const std::vector<std::filesystem::path>& get_images() const { return _images; }
 
-        void clear_history() { clear_messages(); clear_images(); }
+        void clear_history() { clear_messages(); clear_images(); _media.clear(); }
         void print_history() const { std::cout << _messages << std::endl << std::flush; }
 
     protected:
@@ -57,6 +58,8 @@ class Chat {
         nlohmann::ordered_json _messages;
         nlohmann::ordered_json _tools;
         std::vector<std::filesystem::path> _images;
+        std::vector<nlohmann::ordered_json> _media;
+        size_t _media_used = 0;
         bool _enable_thinking = false;
         std::string _reasoning_effort = "low";
 };

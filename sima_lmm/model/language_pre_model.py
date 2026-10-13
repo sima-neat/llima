@@ -130,9 +130,12 @@ class LanguagePreModel(LanguagePartBaseModel):
                 mla_input_freq_imag,
                 merged_lora,
             )
-            mla_v_out = self._build_attn_value(
-                graph, f"{base_name}.self_attn", attn_input, merged_lora
-            )
+            if isinstance(mla_k_out, tuple):
+                mla_k_out, mla_v_out = mla_k_out
+            else:
+                mla_v_out = self._build_attn_value(
+                    graph, f"{base_name}.self_attn", attn_input, merged_lora
+                )
 
             if self.cfg.pipeline_cfg.quantize_kv_cache:
                 k_quant, k_scale = graph.quant(mla_k_out)
@@ -207,7 +210,7 @@ class LanguagePreModel(LanguagePartBaseModel):
 
         rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
 
-        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
+        if self.cfg.model_type not in (VlmArchType.VLM_GEMMA4, VlmArchType.VLM_GEMMA4_UNIFIED):
             rotary_emb = graph.mul(
                 rotary_emb,
                 graph.constant([self._head_dim**-0.5]),
@@ -224,7 +227,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         freq_real: Node,
         freq_imag: Node,
         merged_lora: bool = False,
-    ) -> Node:
+    ) -> Node | tuple[Node, Node]:
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "k_proj")
@@ -246,13 +249,16 @@ class LanguagePreModel(LanguagePartBaseModel):
         if k_norm_name and self.cfg.lm_cfg.arch == LlmArchType.OLMOE:
             k_proj = graph.rms_norm(k_norm_name, k_proj)
 
-        reshape1 = graph.split_heads(k_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
+        reshape1 = graph.split_heads(k_proj, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type))
+        shared_value = None
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED and self.cfg.lm_cfg.attention_k_eq_v and self.layer_type == "full_attention":
+            shared_value = graph.rms_norm(None, reshape1)
 
         if k_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(k_norm_name, reshape1)
 
         rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
-        return rotary_emb
+        return (rotary_emb, shared_value) if shared_value is not None else rotary_emb
 
     def _build_attn_value(
         self, graph: ModelGraph, base_name: str, input_node: Node, merged_lora: bool = False
@@ -268,12 +274,12 @@ class LanguagePreModel(LanguagePartBaseModel):
             kv_size=self._kv_size,
             lora_rank=lora_rank,
         )
-        if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
+        if self.cfg.model_type not in (VlmArchType.VLM_GEMMA4, VlmArchType.VLM_GEMMA4_UNIFIED):
             # Strided cache stores KV heads explicitly instead of flattened into kv_size.
-            return graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
+            return graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type))
 
         # Gemma4 applies value RMS norm per KV head before writing V to cache.
-        split = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.num_key_value_heads)
+        split = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type))
         split = graph.rms_norm(None, split)
         return split
 
@@ -284,7 +290,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
             1,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type),
             self.cfg.pipeline_cfg.max_num_tokens,
             self._head_dim
         )
@@ -306,7 +312,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         if self.cfg.pipeline_cfg.quantize_kv_cache:
             scale_dram_shape = (
                 1,
-                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type),
                 self.cfg.pipeline_cfg.max_num_tokens,
                 1
             )

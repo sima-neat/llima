@@ -74,9 +74,22 @@ void VisionModel::_initialize() {
     _logger->info("Vision model initialize starting ...");
     _validate_model_names();
     BaseModel::_initialize();
+    if (_cfg.model_type == "vlm-gemma4_unified") {
+        _unified_position_table.resize(static_cast<size_t>(_vm_cfg.num_position_embeddings) * 2 * _vm_cfg.hidden_size);
+        auto stream = _files->open_stream("devkit/vision_positions.bin");
+        stream->read(reinterpret_cast<char*>(_unified_position_table.data()), _unified_position_table.size() * sizeof(Eigen::bfloat16));
+        if (!*stream) throw std::runtime_error("Invalid Unified vision position table");
+    }
     _define_models();
     for (const auto& model_name: _cfg.vision_model_name) {
         MLAModelWithBuffer::load_all_models(_elf_dir / model_name, _files.get());
+    }
+    if (_cfg.support_audio()) {
+        _audio_model = std::make_unique<MLAModelWithBuffer>(
+            _elf_dir / (_cfg.audio_model_name + "_stage1_mla.elf"),
+            std::vector<MLABufferSlice>{&get_buffer("audio_ifm")},
+            std::vector<MLABufferSlice>{&get_buffer("vision_ofm")});
+        MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.audio_model_name, _files.get());
     }
     _logger->info("Vision model initialize completed");
 }
@@ -87,13 +100,22 @@ void VisionModel::_finalize() {
     for (const auto& model_name: _cfg.vision_model_name) {
         MLAModelWithBuffer::free_all_models(_elf_dir / model_name);
     }
+    if (_cfg.support_audio()) MLAModelWithBuffer::free_all_models(_elf_dir / _cfg.audio_model_name);
     BaseModel::_finalize();
     _logger->info("Vision model finalize completed");
 }
 
 
 void VisionModel::_define_buffers() {
-    if (
+    if (_cfg.support_audio()) {
+        define_buffer("audio_ifm", {_cfg.pipeline_cfg.input_token_group_size,
+                      _cfg.audio_cfg->samples_per_token}, "bfloat16", false);
+    }
+    if (_cfg.model_type == "vlm-gemma4_unified") {
+        const uint32_t side = _vm_cfg.spatial_patch_size * _vm_cfg.spatial_merge_size;
+        define_buffer("vision_ifm", {_cfg.pipeline_cfg.input_token_group_size, side * side * 3}, "bfloat16", false);
+        define_buffer("vision_position_ifm", {_cfg.pipeline_cfg.input_token_group_size, _vm_cfg.hidden_size});
+    } else if (
         _cfg.model_type.starts_with("vlm-lfm2")
         || _cfg.model_type.starts_with("vlm-qwen")
         || _cfg.model_type.starts_with("vlm-gemma4")
@@ -125,7 +147,7 @@ void VisionModel::_define_buffers() {
 
     define_buffer(
         "vision_ofm",
-        {_mm_cfg.mm_tokens_per_image, _cfg.lm_cfg.hidden_size},
+        {_cfg.model_type == "vlm-gemma4_unified" ? _cfg.pipeline_cfg.input_token_group_size : _mm_cfg.mm_tokens_per_image, _cfg.lm_cfg.hidden_size},
         _cfg.pipeline_cfg.quantize_embeddings ? "int8" : "bfloat16"
     );
     if (_cfg.pipeline_cfg.quantize_embeddings) {
@@ -178,14 +200,85 @@ void VisionModel::_define_models() {
             }
         }
         auto elf_file_name = fmt::format("{}_stage1_mla.elf", _cfg.vision_model_name[i]);
+        std::vector<MLABufferSlice> ifms{&ifm};
+        if (_cfg.model_type == "vlm-gemma4_unified") ifms.emplace_back(&get_buffer("vision_position_ifm"));
         _model_ptrs.emplace_back(std::make_unique<MLAModelWithBuffer>(
             _elf_dir / elf_file_name,
-            std::vector<MLABufferSlice>{&ifm},
+            std::move(ifms),
             std::move(ofms)
         ));
     }
 }
 
+void VisionModel::run_unified_model(const std::vector<Eigen::bfloat16>& patches,
+                                  const std::vector<uint16_t>& positions,
+                                  std::map<uint8_t, MLABufferSlice>* ofm_map_ptr) {
+    const size_t tokens = positions.size() / 2;
+    const size_t group = _cfg.pipeline_cfg.input_token_group_size;
+    const size_t side = _vm_cfg.spatial_patch_size * _vm_cfg.spatial_merge_size;
+    const size_t patch_dim = side * side * 3;
+    const size_t hidden = _cfg.lm_cfg.hidden_size;
+    if (tokens == 0 || positions.size() % 2 || tokens > _vm_cfg.max_soft_tokens || patches.size() != tokens * patch_dim) {
+        throw std::invalid_argument("Unified image patches/positions do not match the token budget");
+    }
+    auto& destination = ofm_map_ptr->at(0);
+    if (destination.get_buf_shapes()->front() != tokens) throw std::invalid_argument("Image placeholder count mismatch");
+    std::vector<Eigen::bfloat16> patch_chunk(group * patch_dim);
+    std::vector<Eigen::bfloat16> position_chunk(group * hidden);
+    for (size_t begin = 0; begin < tokens; begin += group) {
+        const size_t valid = std::min(group, tokens - begin);
+        std::fill(patch_chunk.begin(), patch_chunk.end(), Eigen::bfloat16{0.0f});
+        std::fill(position_chunk.begin(), position_chunk.end(), Eigen::bfloat16{0.0f});
+        std::copy_n(patches.begin() + begin * patch_dim, valid * patch_dim, patch_chunk.begin());
+        for (size_t row = 0; row < valid; ++row) {
+            const auto x = positions[(begin + row) * 2];
+            const auto y = positions[(begin + row) * 2 + 1];
+            if (x >= _vm_cfg.num_position_embeddings || y >= _vm_cfg.num_position_embeddings) {
+                throw std::invalid_argument("Image position exceeds the factorized table");
+            }
+            for (size_t c = 0; c < hidden; ++c) {
+                position_chunk[row * hidden + c] = Eigen::bfloat16{
+                    static_cast<float>(_unified_position_table[(x * 2) * hidden + c])
+                    + static_cast<float>(_unified_position_table[(y * 2 + 1) * hidden + c])};
+            }
+        }
+        get_buffer("vision_ifm").upload(patch_chunk.data());
+        get_buffer("vision_position_ifm").upload(position_chunk.data());
+        _model_ptrs.front()->run();
+        auto& output = get_buffer("vision_ofm");
+        output.invalidate_cache(0, valid * hidden * sizeof(Eigen::bfloat16));
+        destination.get_buf_ptr()->upload_raw(output.get_virtual_addr(),
+            destination.get_byte_offset() + begin * hidden * sizeof(Eigen::bfloat16),
+            valid * hidden * sizeof(Eigen::bfloat16));
+    }
+}
+
+
+void VisionModel::run_unified_audio(const std::vector<Eigen::bfloat16>& frames,
+                                  std::map<uint8_t, MLABufferSlice>* ofm_map_ptr) {
+    const auto& audio = _cfg.audio_cfg.value();
+    const size_t tokens = frames.size() / audio.samples_per_token;
+    const size_t group = _cfg.pipeline_cfg.input_token_group_size;
+    const size_t hidden = _cfg.lm_cfg.hidden_size;
+    auto& destination = ofm_map_ptr->at(0);
+    if (tokens == 0 || frames.size() % audio.samples_per_token || tokens > audio.max_tokens
+        || destination.get_buf_shapes()->front() != tokens) {
+        throw std::invalid_argument("Audio frames/placeholder count do not match the token budget");
+    }
+    std::vector<Eigen::bfloat16> chunk(group * audio.samples_per_token);
+    for (size_t begin = 0; begin < tokens; begin += group) {
+        const size_t valid = std::min(group, tokens - begin);
+        std::fill(chunk.begin(), chunk.end(), Eigen::bfloat16{0.0f});
+        std::copy_n(frames.begin() + begin * audio.samples_per_token, valid * audio.samples_per_token, chunk.begin());
+        get_buffer("audio_ifm").upload(chunk.data());
+        _audio_model->run();
+        auto& output = get_buffer("vision_ofm");
+        output.invalidate_cache(0, valid * hidden * sizeof(Eigen::bfloat16));
+        destination.get_buf_ptr()->upload_raw(output.get_virtual_addr(),
+            destination.get_byte_offset() + begin * hidden * sizeof(Eigen::bfloat16),
+            valid * hidden * sizeof(Eigen::bfloat16));
+    }
+}
 
 void VisionModel::_validate_model_names() const {
     if (_cfg.vision_model_name.empty()) {

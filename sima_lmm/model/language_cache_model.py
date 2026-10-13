@@ -44,6 +44,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
     token_idx: int
     logit_softcapping: float | None
     layer_type: str = "full_attention"
+    dynamic_mask: bool = False
+    context_capacity: int | None = None
 
     def __post_init__(self):
         assert self.num_tokens >= 1
@@ -80,6 +82,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
     @property
     def context_length(self) -> int:
+        if self.context_capacity is not None:
+            return self.context_capacity
         if self._is_speculative_decoding:
             return self.token_idx + 1
         return self.token_idx + self.num_tokens
@@ -102,7 +106,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         quantizable: bool,
     ):
         assert (
-            self.cfg.lm_cfg.attn_cfg.num_attention_heads % self.cfg.lm_cfg.attn_cfg.num_key_value_heads
+            self.cfg.lm_cfg.attn_cfg.num_attention_heads % self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type)
             == 0
         )
         quantize_kv_cache = self.cfg.pipeline_cfg.quantize_kv_cache
@@ -110,12 +114,12 @@ class LanguageCacheModel(LanguagePartBaseModel):
         # Shape of input key and value tensors.
         kv_tensor_shape = (
             1,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type),
             self.context_length,
             self._head_dim,
         )
         # Shape of scale tensors for quantized KV cache (per-token)
-        kv_scale_shape = (1, self.cfg.lm_cfg.attn_cfg.num_key_value_heads, self.context_length, 1)
+        kv_scale_shape = (1, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type), self.context_length, 1)
         input_shape = (1, self.cfg.lm_cfg.attn_cfg.num_attention_heads, self.num_tokens, self._head_dim)
         output_shape = (1, 1, self.num_tokens, self._q_size)
 
@@ -132,7 +136,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         # Shape of the attention mask
         if (
-            (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
+            self.dynamic_mask
+            or (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1)
             or self._is_speculative_decoding
             or self._uses_group_future_token_mask
         ):
@@ -151,7 +156,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
         if quantize_kv_cache:
             input_specs["cached_keys_scale"] = kv_scale_shape
         if (
-            self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+            self.dynamic_mask
+            or self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
             and self.num_tokens > 1
             or self._cache_mask_size > 1
             and self.num_tokens == 1
@@ -194,7 +200,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
         if self.num_tokens > 1:
             if (
-                self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
+                self.dynamic_mask
+                or self.cfg.model_type == VlmArchType.VLM_PALIGEMMA
                 or self._is_speculative_decoding
                 or self._uses_group_future_token_mask
             ):
@@ -270,7 +277,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         # Define DRAM shape to enable strided KV cache access for kv cache outputs.
         dram_shape = (
             1,
-            self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type),
             max(self.context_length, self.cfg.pipeline_cfg.max_num_tokens),
             self._head_dim
         )
@@ -288,7 +295,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
         if quantize_kv_cache:
             scale_dram_shape = (
                 1,
-                self.cfg.lm_cfg.attn_cfg.num_key_value_heads,
+                self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type),
                 max(self.context_length, self.cfg.pipeline_cfg.max_num_tokens),
                 1
             )
@@ -302,7 +309,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
             idx += 1
 
         # attn_mask
-        if (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or\
+        if self.dynamic_mask or (self.cfg.model_type == VlmArchType.VLM_PALIGEMMA and self.num_tokens > 1) or\
                 (self._cache_mask_size > 1 and self.num_tokens == 1) or\
                 self._is_speculative_decoding or self._uses_group_future_token_mask:
             attn_mask_tessellate_params = TensorTessellateParameters(

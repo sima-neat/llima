@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <fmt/ranges.h>
 
 #include "chat.hpp"
@@ -45,23 +46,10 @@ void Chat::add_query(std::string query) {
         return;
     }
 
-    // Check how many images need to be added to this message in addition to the query.
-    uint32_t num_images_in_messages = 0;
-    for (const auto& message: _messages) {
-        const auto& content = message["content"];
-        if (!content.is_array())
-            continue;
-        for (const auto& item: content) {
-            if (item.at("type") == "image")
-                ++num_images_in_messages;
-        }
-    }
-
+    // Preserve attachment order and add each attachment to one user message.
     nlohmann::ordered_json content;
-    if (!_images.empty()) {
-        for (uint32_t i = num_images_in_messages; i < _images.size(); ++i) {
-            content.push_back({{"type", "image"}, {"image", _images[i].string()}});
-        }
+    for (; _media_used < _media.size(); ++_media_used) {
+        content.push_back(_media[_media_used]);
     }
     content.push_back({{"type", "text"}, {"text", std::move(query)}});
     _messages.push_back({{"role", "user"}, {"content", std::move(content)}});
@@ -118,13 +106,14 @@ void Chat::set_messages(nlohmann::ordered_json messages) {
         clear_history();
         add_query(messages);
     } else {
-        assert(_images.size() == 0);
+        assert(_media.empty());
         _messages = std::move(messages);
     }
 }
 
 
 void Chat::clear_messages() {
+    _media_used = 0;
     if (_messages.empty() || _messages[0]["role"] != "system")
         _messages.clear();
     else
@@ -138,12 +127,21 @@ void Chat::set_tools(nlohmann::ordered_json tools) {
 
 
 void Chat::add_image(std::filesystem::path image_path) {
+    _media.push_back({{"type", "image"}, {"image", image_path.string()}});
     _images.emplace_back(std::move(image_path));
+}
+
+void Chat::add_audio(std::filesystem::path audio_path) {
+    if (!_vlm_helper.support_audio()) throw std::invalid_argument("This model has no compiled audio frontend");
+    _media.push_back({{"type", "audio"}, {"audio", audio_path.string()}});
 }
 
 
 void Chat::clear_images() {
     _images.clear();
+    _media_used = std::count_if(_media.begin(), _media.begin() + _media_used,
+                              [](const auto& item) { return item.at("type") != "image"; });
+    std::erase_if(_media, [](const auto& item) { return item.at("type") == "image"; });
 }
 
 

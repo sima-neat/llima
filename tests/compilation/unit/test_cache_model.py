@@ -97,7 +97,7 @@ def test_group_sliding_attention_matches_sequential_windows(
         model_type="gemma3",
         lm_cfg=SimpleNamespace(
             attn_cfg=SimpleNamespace(
-                num_attention_heads=2, num_key_value_heads=1, sliding_window=window,
+                num_attention_heads=2, num_key_value_heads=1, get_num_key_value_heads=lambda _: 1, sliding_window=window,
                 get_head_dim=lambda _: 16, get_q_size=lambda _: 32, get_kv_size=lambda _: 16,
             ),
             speculative_decoding_cfg=None, arch=LlmArchType.GEMMA, model_type="gemma3",
@@ -156,6 +156,7 @@ def test_gemma2_native_cache_softcapping(monkeypatch, quantizable):
     attention = SimpleNamespace(
         num_attention_heads=2,
         num_key_value_heads=1,
+        get_num_key_value_heads=lambda _: 1,
         get_head_dim=lambda _: 16,
         get_q_size=lambda _: 32,
         get_kv_size=lambda _: 16,

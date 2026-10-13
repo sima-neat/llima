@@ -138,7 +138,7 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             if self.final_softcapping is not None:
                 assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and (
                     self.cfg.lm_cfg.model_type == "gemma2"
-                    or self.cfg.model_type == VlmArchType.VLM_GEMMA4
+                    or self.cfg.model_type in (VlmArchType.VLM_GEMMA4, VlmArchType.VLM_GEMMA4_UNIFIED)
                 )
                 lm_head = graph.softcap(lm_head, self.cfg.lm_cfg.final_logit_softcapping)
             lm_heads.append(lm_head)

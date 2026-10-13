@@ -69,6 +69,9 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
         );
+        std::vector<std::map<uint8_t, MLABufferSlice>> create_audio_input_maps(
+            std::span<const uint32_t> input_token_ids
+        );
         std::optional<std::vector<uint32_t>> run_model(
             std::span<const uint32_t> input_token_ids,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
@@ -280,6 +283,17 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
+        std::vector<bool> _suppressed_tokens;
+        std::vector<std::pair<uint16_t, uint16_t>> _image_spans;
+        std::vector<std::pair<uint16_t, uint16_t>> _image_windows;
+        std::unique_ptr<MLABuffer> _image_hidden;
+        std::unique_ptr<MLABuffer> _image_queries;
+        std::unique_ptr<MLABuffer> _image_global_masks;
+        std::unique_ptr<MLABuffer> _image_sliding_masks;
+        uint16_t _image_scratch_rows = 0;
+        void _prepare_image_windows(uint16_t prompt_length);
+        void _upload_image_attention_masks(uint16_t begin, uint16_t valid_end, uint16_t slot);
+        uint32_t _run_image_window(uint16_t begin, uint16_t end, uint16_t prompt_length);
         std::shared_ptr<EmbeddingOffload> _embedding_offload;
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,

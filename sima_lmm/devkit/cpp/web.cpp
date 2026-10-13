@@ -1,4 +1,5 @@
 #include <fstream>
+#include <exception>
 #include <variant>
 #include <vector>
 
@@ -220,6 +221,18 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
                     } else if (type == "image" && item.contains("image")) {
                         // Internal format: {"type": "image", "image": "data:..."}
                         internal_content.push_back(nlohmann::ordered_json(item));
+                    } else if (type == "input_audio") {
+                        if (!_vision_language_model_ptr->support_audio()) {
+                            throw std::invalid_argument("This model has no compiled audio frontend");
+                        }
+                        const auto audio = item.value("input_audio", nlohmann::json::object());
+                        if (!audio.is_object() || !audio.contains("data") || !audio["data"].is_string()
+                            || audio["data"].get_ref<const std::string&>().empty()
+                            || !audio.contains("format") || !audio["format"].is_string()
+                            || (audio["format"] != "wav" && audio["format"] != "mp3")) {
+                            throw std::invalid_argument("input_audio requires base64 'data' and 'format' set to 'wav' or 'mp3'");
+                        }
+                        internal_content.push_back({{"type", "audio"}, {"audio", audio}});
                     } else {
                         // Other types (text, etc.) - pass through as-is
                         internal_content.push_back(nlohmann::ordered_json(item));
@@ -243,23 +256,21 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
 
         // Set the content (either original string or constructed array)
         if (internal_content.is_array() && !internal_content.empty()) {
-            // Check if content array contains ONLY text and no images
-            bool has_images = false;
+            // Collapse only text-only content; keep media and its original order.
+            bool text_only = true;
             std::string combined_text = "";
 
             for (const auto& item : internal_content) {
                 std::string item_type = item.value("type", "");
-                if (item_type == "image") {
-                    has_images = true;
-                    break;
-                } else if (item_type == "text") {
+                if (item_type != "text") {
+                    text_only = false;
+                } else {
                     if (!combined_text.empty()) combined_text += " ";
                     combined_text += item.value("text", "");
                 }
             }
 
-            // If only text (no images), collapse to string for tokenizer compatibility
-            if (!has_images && !combined_text.empty()) {
+            if (text_only && !combined_text.empty()) {
                 internal_msg["content"] = combined_text;
             } else {
                 internal_msg["content"] = internal_content;
@@ -460,6 +471,12 @@ void WEB::_handle_chat_completions(
         } else {
             _execute_normal_chat(res, chat, model, protocol);
         }
+    } catch (const std::invalid_argument& e) {
+        res.status = 400;
+        const nlohmann::json error_body = is_openai
+            ? nlohmann::json{{"error", {{"message", e.what()}, {"type", "invalid_request_error"}}}}
+            : nlohmann::json{{"error", e.what()}};
+        res.set_content(error_body.dump(), "application/json");
     } catch (const std::exception& e) {
         _logger->error("Error in chat handler: {}", e.what());
         res.status = 500;
@@ -1017,8 +1034,17 @@ void WEB::_execute_streaming_chat(
             _vision_language_model_ptr->set_text_callback(text_callback);
 
             // Create thread and track it for /stop endpoint
-            _vlm_thread = std::jthread([this, chat]() {
-                _vision_language_model_ptr->run_model(chat);
+            _vlm_thread = std::jthread([this, chat, &sink, is_openai]() {
+                try {
+                    _vision_language_model_ptr->run_model(chat);
+                } catch (const std::exception& e) {
+                    _logger->error("Error in streaming chat: {}", e.what());
+                    const nlohmann::json error = {{"error", {{"message", e.what()}}}};
+                    const auto chunk = is_openai
+                        ? "data: " + error.dump() + "\n\ndata: [DONE]\n\n"
+                        : error.dump() + "\n";
+                    sink.write(chunk.data(), chunk.size());
+                }
             });
 
             // Wait for completion
@@ -1100,10 +1126,16 @@ void WEB::_execute_normal_chat(
     _vision_language_model_ptr->set_text_callback(text_callback);
 
     // Run in thread for consistency with barge-in logic
-    _vlm_thread = std::jthread([this, chat]() {
-        _vision_language_model_ptr->run_model(chat);
+    std::exception_ptr inference_error;
+    _vlm_thread = std::jthread([this, chat, &inference_error]() {
+        try {
+            _vision_language_model_ptr->run_model(chat);
+        } catch (...) {
+            inference_error = std::current_exception();
+        }
     });
     _vlm_thread.join();
+    if (inference_error) std::rethrow_exception(inference_error);
 
     // No need to reset callbacks - they'll be overwritten on next request
 

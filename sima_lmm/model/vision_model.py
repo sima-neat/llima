@@ -11,6 +11,7 @@ from sima_lmm.model.base import (
     LayerConfiguration
 )
 from sima_lmm.model.gemma4_vision_model import Gemma4VisionLayerModel
+from sima_lmm.model.gemma4_unified_model import Gemma4UnifiedImageModel
 from sima_lmm.model.qwen_vision_model import QwenVisionLayerModel
 from sima_lmm.model.model_graph import (
     ModelGraph, Node,
@@ -75,6 +76,21 @@ class VisionModel(BaseModel):
     enable_filter_sharing = False
 
     def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+            model = self._get_part_model(0)
+            patches = ifms[0].reshape(-1, ifms[0].shape[-1])
+            positions = ifms[1].reshape(-1, 2)
+            valid = np.all(positions >= 0, axis=-1)
+            patches, positions = patches[valid], positions[valid]
+            position_embeddings = model.position_embeddings(positions)
+            group = self.cfg.pipeline_cfg.input_token_group_size
+            outputs = []
+            for begin in range(0, len(patches), group):
+                count = min(group, len(patches) - begin)
+                inputs = [np.pad(x[begin:begin + count], ((0, group - count), (0, 0)))[None, None]
+                          for x in (patches, position_embeddings)]
+                outputs.append(model.run_model(eval_mode, inputs)[0][..., :count, :])
+            return [np.concatenate(outputs, axis=2)]
         layer_ifms = ifms
         deepstack_outputs: dict[int, np.ndarray] = {}
         deepstack_indexes = self.cfg.vm_cfg.deepstack_visual_indexes
@@ -148,6 +164,11 @@ class VisionModel(BaseModel):
         include_embeddings = layer_idx == 0
         include_mm_proj = layer_idx == self.cfg.num_vision_layers - 1
         model_name = f"{self.model_name}_layer{layer_idx}"
+
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+            return Gemma4UnifiedImageModel(
+                self.cfg, model_name, sima_path=self.sima_path, hf_model=self.hf_model
+            )
 
         kwargs = {
             "cfg": self.cfg,

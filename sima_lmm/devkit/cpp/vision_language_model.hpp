@@ -73,6 +73,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
 
         Chat create_chat() { return Chat(_vlm_helper); }
         bool support_image() const { return _cfg.support_image(); }
+        bool support_audio() const { return _cfg.support_audio(); }
         ToolCallFormat tool_call_format() const { return _tool_call_format; }
 
         void set_info_callback(TextStreamer::InfoCallback callback) {

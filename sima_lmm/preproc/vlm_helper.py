@@ -17,7 +17,7 @@ from transformers import (
 from transformers.image_utils import load_images
 from transformers.utils import GENERATION_CONFIG_NAME
 
-from sima_lmm.config.vlm_config import VlmConfig,VisionArchType
+from sima_lmm.config.vlm_config import VlmConfig, VisionArchType, VlmArchType
 from sima_lmm.logging import sima_log_warning, sima_log_info
 
 class VlmHelper:
@@ -34,6 +34,8 @@ class VlmHelper:
         vlm_cfg: VlmConfig,
         hf_path: Path,
     ):
+        self.vlm_cfg = vlm_cfg
+        self.suppress_tokens = []
         try:
             if hf_path.suffix == ".gguf":
                 self.hf_tokenizer = LlamaCPPWrapper(
@@ -90,6 +92,8 @@ class VlmHelper:
                     hf_path, use_cache=False, cache_implementation=None
                 )
                 eos_token_id = hf_generation_config.eos_token_id
+                if vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+                    self.suppress_tokens = hf_generation_config.suppress_tokens or []
             else:
                 eos_token_id = self.hf_tokenizer.eos_token_id
 
@@ -117,7 +121,7 @@ class VlmHelper:
     def set_chat_template(self, chat_template: str | None):
         self.chat_template = chat_template
 
-    def preprocess(self, chat: "Chat") -> tuple[str, list[int], list[np.ndarray] | None]:
+    def preprocess(self, chat: "Chat", *, audio_inputs: list[np.ndarray] | None = None):
         """Preprocess the input query and the images.
 
         Args:
@@ -168,11 +172,17 @@ class VlmHelper:
             else:
                 add_special_tokens = True
 
+            audio_kwargs = {}
+            if audio_inputs:
+                audio_kwargs = {"audio": [frames.reshape(-1) for frames in audio_inputs],
+                                "sampling_rate": self.vlm_cfg.audio_cfg.sampling_rate}
             processed_dict = self.hf_processor(
-                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens
+                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens, **audio_kwargs
             )
             processed_images = processed_dict.get("pixel_values")
             image_grid_thw = processed_dict.get("image_grid_thw")
+            if self.vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+                image_grid_thw = np.asarray(processed_dict.get("image_position_ids")) if processed_images is not None else None
             if image_grid_thw is not None and not isinstance(image_grid_thw, list):
                     image_grid_thw = np.array(image_grid_thw).tolist()
             # Processed_images can be a numpy array or a list of numpy arrays
@@ -243,8 +253,6 @@ class VlmHelper:
         """
         assert vision_proj_list[0].shape[-1] == embed_weight.shape[-1]
 
-        num_image_token_ids_per_image = prod(vision_proj_list[0].shape[:-1])
-
         hidden_size = embed_weight.shape[-1]
         total_tokens = len(text_token_ids)
         result = np.empty((total_tokens, hidden_size), dtype=embed_weight.dtype)
@@ -258,6 +266,11 @@ class VlmHelper:
         while idx < total_tokens:
             token_id = text_token_ids[idx]
             if image_token_id is not None and token_id == image_token_id:
+                if image_count >= len(vision_proj_list):
+                    raise ValueError("More image placeholders than projected images")
+                num_image_token_ids_per_image = prod(vision_proj_list[image_count].shape[:-1])
+                if any(t != image_token_id for t in text_token_ids[idx:idx + num_image_token_ids_per_image]):
+                    raise ValueError("Image placeholder count does not match projected rows")
                 image_spans.append((idx, image_count))
                 idx += num_image_token_ids_per_image
                 image_count += 1
@@ -265,6 +278,8 @@ class VlmHelper:
                 text_positions.append(idx)
                 text_ids.append(token_id)
                 idx += 1
+        if image_count != len(vision_proj_list):
+            raise ValueError("Projected image count does not match prompt placeholders")
         if text_ids:
             result[np.asarray(text_positions, dtype=np.int32)] = embed_weight[np.asarray(text_ids)]
         for dest_idx, proj_idx in image_spans:
@@ -278,6 +293,8 @@ class VlmHelper:
 
     @property
     def image_token_id(self) -> int | None:
+        if self.vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+            return self.hf_tokenizer.convert_tokens_to_ids("<|image|>")
         
         image_token_id=getattr(
             self.hf_tokenizer,
@@ -299,6 +316,7 @@ class Chat:
     vlm_helper: VlmHelper
     messages: list[dict[str, str | list[dict[str, str]]]] = field(default_factory=list)
     images: list[str | Path | PIL.Image.Image] | None = None
+    audios: list[str | Path] | None = None
 
     def __post_init__(self):
         self.set_system_prompt(self.vlm_helper.system_prompt)
@@ -338,6 +356,10 @@ class Chat:
             if self.images:
                 for idx in range(num_images_in_messages, len(self.images)):
                     content.append({"type": "image", "image": self.images[idx]})
+            used_audio = sum(item.get("type") == "audio" for message in self.messages
+                             if isinstance(message["content"], list) for item in message["content"])
+            for path in (self.audios or [])[used_audio:]:
+                content.append({"type": "audio", "audio": str(path)})
             content.append({"type": "text", "text": query})
         else:
             content = query

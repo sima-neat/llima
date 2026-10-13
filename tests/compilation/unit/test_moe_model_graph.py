@@ -25,7 +25,7 @@ BASE = "model.layers.0"
 
 def _config(arch, *, norm_topk_prob=False, quantize_embeddings=False):
     attn = SimpleNamespace(
-        num_attention_heads=2, num_key_value_heads=1, head_dim=16, attn_output_gate=False,
+        num_attention_heads=2, num_key_value_heads=1, get_num_key_value_heads=lambda _: 1, head_dim=16, attn_output_gate=False,
         get_head_dim=lambda _: 16, get_q_size=lambda _: 32, get_kv_size=lambda _: 16,
     )
     lm = SimpleNamespace(

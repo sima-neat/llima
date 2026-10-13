@@ -42,9 +42,9 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 Use `llima run` as a simple runtime for initial model validation on Modalix.
 
 In CLI mode, chat history is enabled by default. Each prompt and response is
-kept as context for the next turn until you clear it with `clear history`. Images
-submitted with a prompt are also retained as part of that history. `clear history`
-removes the submitted prompts, responses, and all images. The configured system
+kept as context for the next turn until you clear it with `clear history`. Image
+and audio attachments are also retained as part of that history. `clear history`
+removes the submitted prompts, responses, and all attachments. The configured system
 prompt remains active until you use `clear system` or replace it with `set system`.
 
 ``` console
@@ -74,9 +74,10 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | Command | Description |
 |----|----|
 | `add image <file>` | Add an image to the current prompt context. |
+| `add audio <file>` | Attach audio to the next prompt for a model with a compiled audio frontend. |
 | `set system <prompt>` | Set the system prompt. |
-| `clear system` | Clear the system prompt, chat history, and images. |
-| `clear history` | Clear submitted prompts, responses, and all images while preserving the system prompt. |
+| `clear system` | Clear the system prompt, chat history, and attachments. |
+| `clear history` | Clear submitted prompts, responses, and attachments while preserving the system prompt. |
 | `print history` | Print chat history. |
 | `set audio <file>` | Set the audio file to transcribe as the query. |
 | `set language <lang>` | Set the language string used for transcription. |
@@ -86,6 +87,36 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `disable-thinking` | Disable thinking mode and clear chat history. |
 | `quit` | Quit. |
 | `help` | Print available commands. |
+
+## Audio in Web Mode
+
+Start `llima run <model> --mode web` to serve `/v1/chat/completions` on port
+9998. For models with a compiled audio frontend, include audio alongside text
+or images in the message's `content` array:
+
+```json
+{
+  "model": "gemma-4-12b",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Summarize what the speaker says."},
+      {
+        "type": "input_audio",
+        "input_audio": {"data": "<base64 audio bytes>", "format": "wav"}
+      }
+    ]
+  }]
+}
+```
+
+`format` accepts `wav` or `mp3`. Attachment order is preserved, and audio is
+decoded/resampled to mono 16 kHz before entering the model. Gemma 4 Unified
+accepts up to 30 seconds per attachment with the default compiled audio budget.
+Streaming uses the same `stream: true` option as text chat.
+
+The separate `/v1/audio/transcriptions` endpoint continues to accept multipart
+file uploads and uses the configured Whisper model.
 
 
 ## Build an Application with Neat

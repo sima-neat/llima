@@ -29,6 +29,8 @@ struct VisionModelConfig {
     uint16_t spatial_patch_size;
     uint16_t spatial_merge_size;
     uint32_t hidden_size;
+    uint16_t max_soft_tokens = 0;
+    uint16_t num_position_embeddings = 0;
     std::vector<uint8_t> deepstack_visual_indexes;
 
     std::vector<uint16_t> num_spatial_patches;
@@ -45,6 +47,9 @@ inline void to_json(nlohmann::json& j, const VisionModelConfig& v) {
     j["temporal_patch_size"] = v.temporal_patch_size;
     j["hidden_size"] = v.hidden_size;
     j["deepstack_visual_indexes"] = v.deepstack_visual_indexes;
+    j["max_soft_tokens"] = v.max_soft_tokens;
+    j["num_position_embeddings"] = v.num_position_embeddings;
+    j["spatial_merge_size"] = v.spatial_merge_size;
 }
 
 
@@ -71,6 +76,8 @@ inline void from_json(const nlohmann::json& j, VisionModelConfig& v) {
     v.cls_embed = j.value("cls_embed", false);
     v.spatial_merge_size = j.value("spatial_merge_size", 1);
     v.hidden_size = j.value("hidden_size", 0);
+    v.max_soft_tokens = j.value("max_soft_tokens", 0);
+    v.num_position_embeddings = j.value("num_position_embeddings", 0);
 
     if (j.contains("deepstack_visual_indexes"))
         v.deepstack_visual_indexes = j["deepstack_visual_indexes"].get<std::vector<uint8_t>>();
@@ -142,6 +149,7 @@ struct AttentionBlockConfig {
     uint8_t num_key_value_heads;
     uint32_t head_dim;
     std::optional<uint32_t> sliding_head_dim;
+    std::optional<uint8_t> sliding_num_key_value_heads;
     bool swa_enable;
     uint8_t swa_ratio = 0;  // Deprecated in 2.1.
     std::optional<uint32_t> sliding_window;
@@ -157,12 +165,16 @@ struct AttentionBlockConfig {
     uint32_t get_q_size(const std::string& layer_type) const {
         return num_attention_heads * get_head_dim(layer_type);
     }
+    uint8_t get_num_key_value_heads(const std::string& layer_type) const {
+        return layer_type == "sliding_attention" && sliding_num_key_value_heads.has_value()
+            ? *sliding_num_key_value_heads : num_key_value_heads;
+    }
     uint32_t get_kv_size(const std::string& layer_type) const {
-        return num_key_value_heads * get_head_dim(layer_type);
+        return get_num_key_value_heads(layer_type) * get_head_dim(layer_type);
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    AttentionBlockConfig, num_attention_heads, num_key_value_heads, head_dim, sliding_head_dim,
+    AttentionBlockConfig, num_attention_heads, num_key_value_heads, head_dim, sliding_head_dim, sliding_num_key_value_heads,
     swa_enable, swa_ratio, sliding_window, attn_output_gate
 )
 
@@ -214,6 +226,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
 
 struct LanguageModelConfig {
+    bool vision_bidirectional_attention = false;
     TokenEmbedConfig token_cfg;
     RoPEConfig rope_cfg;
     AttentionBlockConfig attn_cfg;
@@ -296,7 +309,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     LanguageModelConfig, token_cfg, rope_cfg, attn_cfg, num_hidden_layers, hidden_size,
     lm_head_num_splits, lm_head_split_dim, layer_types, conv_L_cache,
     hidden_size_per_layer_input, num_kv_shared_layers,
-    rms_norm_eps, rms_norm_unit_offset,
+    rms_norm_eps, rms_norm_unit_offset, vision_bidirectional_attention,
     linear_attn_cfg,
     draft_vocab_size, speculative_decoding_cfg, arch, moe_cfg
 )
@@ -364,18 +377,42 @@ inline void from_json(const nlohmann::json& j, VisionModelNames& names) {
 }
 
 
+struct AudioModelConfig {
+    uint16_t samples_per_token = 640;
+    uint32_t sampling_rate = 16000;
+    uint16_t max_tokens = 750;
+    float rms_norm_eps = 1e-6f;
+    uint32_t token_id = 0;
+    uint32_t begin_token_id = 0;
+    uint32_t end_token_id = 0;
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    AudioModelConfig, samples_per_token, sampling_rate, max_tokens, rms_norm_eps,
+    token_id, begin_token_id, end_token_id
+)
+
 struct VlmConfig {
     std::string model_name;
     std::string model_type;
     std::optional<VisionModelConfig> vm_cfg;
     std::optional<MMConnectionConfig> mm_cfg;
+    std::optional<AudioModelConfig> audio_cfg;
     LanguageModelConfig lm_cfg;
     PipelineConfig pipeline_cfg;
     VisionModelNames vision_model_name = {};
     std::string language_model_name;
+    std::string audio_model_name;
     std::string gguf_file_name = "";
 
     bool is_multimodal() const { return vm_cfg.has_value(); }
+    bool support_audio() const { return audio_cfg.has_value() && !audio_model_name.empty(); }
+    uint16_t get_prefill_cache_capacity(const std::string& layer_type) const {
+        if (layer_type != "sliding_attention") return pipeline_cfg.max_num_tokens;
+        return std::min<uint32_t>(pipeline_cfg.max_num_tokens, round_up_to(
+            lm_cfg.attn_cfg.sliding_window.value() + pipeline_cfg.input_token_group_size
+                + vm_cfg->max_soft_tokens - 2, pipeline_cfg.input_token_group_size));
+    }
+
     bool support_image() const {
         static bool disable_vision = get_env_var("SIMA_LLIMA_RUN_DISABLE_VISION", false);
         return (
@@ -387,7 +424,7 @@ struct VlmConfig {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     VlmConfig, model_name, model_type, vm_cfg, mm_cfg, lm_cfg, pipeline_cfg, vision_model_name,
-    language_model_name, gguf_file_name
+    language_model_name, gguf_file_name, audio_cfg, audio_model_name
 )
 
 }

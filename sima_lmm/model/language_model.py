@@ -212,7 +212,10 @@ class LanguageModel(BaseModel):
         ifms: list[np.ndarray],
         embeddings_tensor: np.ndarray | None = None,
         embedding_scales: np.ndarray | None = None,
+        image_spans: list[tuple[int, int]] | None = None,
     ) -> list[np.ndarray]:
+        if self.cfg.lm_cfg.vision_bidirectional_attention:
+            return self._run_unified_model(eval_mode, ifms[0], embeddings_tensor, image_spans or [])
         assert self.vlm_helper is not None
         expected_num_ifms = 2 if self.cfg.pipeline_cfg.quantize_embeddings else 1
         assert len(ifms) == expected_num_ifms
@@ -470,6 +473,95 @@ class LanguageModel(BaseModel):
         # Return the generated tokens.
         return np.array([new_tokens])
 
+    def _run_unified_model(self, eval_mode, embeddings, vocabulary, image_spans):
+        """Host mirror of normal chunk prefill and layer-major image windows."""
+        from sima_lmm.preproc.gemma4_unified import attention_mask, image_windows
+        if vocabulary is None:
+            vocabulary, _ = self.get_embeddings_tensor()
+        group = self.cfg.pipeline_cfg.input_token_group_size
+        context = self.cfg.pipeline_cfg.max_num_tokens
+        prompt = embeddings.shape[2]
+        if not 0 < prompt <= context:
+            raise ValueError("Prompt must be nonempty and fit the compiled context")
+        windows = dict(image_windows(image_spans, group))
+        embeddings = np.pad(embeddings, ((0, 0), (0, 0), (0, (-prompt) % group), (0, 0)))
+        keys, values = [], []
+        for kind in self.cfg.lm_cfg.layer_types:
+            shape = (1, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(kind), context,
+                     self.cfg.lm_cfg.attn_cfg.get_head_dim(kind))
+            keys.append(np.zeros(shape, np.float32))
+            values.append(np.zeros(shape, np.float32))
+        frequencies = {kind: self.calc_freq_real_imag(kind == "sliding_attention")
+                       for kind in set(self.cfg.lm_cfg.layer_types)}
+        def forward(begin, end, hidden, rows):
+            for layer, kind in enumerate(self.cfg.lm_cfg.layer_types):
+                real, imag = frequencies[kind]
+                queries = []
+                for offset in range(0, end - begin, rows):
+                    at = begin + offset
+                    pre = self._get_part_model("pre", rows, layer_idx=layer)
+                    q, k, v = pre.run_model(eval_mode, [hidden[..., offset:offset + rows, :],
+                        real[..., at:at + rows, :], imag[..., at:at + rows, :]])
+                    keys[layer][..., at:at + rows, :] = k
+                    values[layer][..., at:at + rows, :] = v
+                    queries.append(q)
+                final = layer + 1 == self.cfg.lm_cfg.num_hidden_layers
+                if final and end < prompt:
+                    return None
+                for slot, q in enumerate(queries):
+                    offset = slot * rows
+                    at = begin + offset
+                    if final and at + rows < prompt:
+                        continue
+                    sliding = kind == "sliding_attention"
+                    key_begin = max(0, at + 1 - self.cfg.lm_cfg.attn_cfg.sliding_window) if sliding else 0
+                    if rows > 1:
+                        capacity = self.cfg.get_prefill_cache_capacity(kind)
+                        key_begin = min(key_begin, context - capacity)
+                        cache_index = 0
+                    else:
+                        mask_size = self.cfg.pipeline_cfg.get_cache_mask_size(kind, at + 1 - key_begin, is_group=False)
+                        capacity = min(round_up_to(at + 1 - key_begin, mask_size), context - key_begin)
+                        cache_index = capacity - 1
+                    cache = self._get_part_model("sliding_cache" if sliding else "cache", rows, token_idx=cache_index)
+                    inputs = [q, keys[layer][..., key_begin:key_begin + capacity, :]]
+                    if rows > 1 or cache._cache_mask_size > 1:
+                        inputs.append(attention_mask(at, rows, key_begin, capacity,
+                            min(end, prompt) if begin < prompt else end, image_spans,
+                            self.cfg.lm_cfg.attn_cfg.sliding_window if sliding else 0))
+                    inputs.append(values[layer][..., key_begin:key_begin + capacity, :])
+                    attended = cache.run_model(eval_mode, inputs)[0]
+                    residual = hidden[..., offset:offset + rows, :]
+                    post_rows = rows
+                    if final:
+                        last = min(end, prompt) - at - 1 if begin < prompt else 0
+                        residual = residual[..., last:last + 1, :]
+                        attended = attended[..., last:last + 1, :]
+                        post_rows = 1
+                    outputs = self._get_part_model("post", post_rows, layer_idx=layer).run_model(eval_mode, [residual, attended])
+                    if final:
+                        return outputs
+                    hidden[..., offset:offset + rows, :] = outputs[0]
+        at = 0
+        while at < prompt:
+            end = windows.get(at, at + group)
+            outputs = forward(at, end, embeddings[..., at:end, :].copy(), group)
+            at = end
+        generated = []
+        for at in range(prompt, context):
+            if self.cfg.lm_cfg.lm_head_num_splits == 1 and not self.cfg.pipeline_cfg.return_logits:
+                token = int(outputs[0].item())
+            else:
+                logits = np.concatenate(outputs, axis=-1)
+                candidate_logits = logits.copy()
+                candidate_logits[..., getattr(self.vlm_helper, "suppress_tokens", [])] = -np.inf
+                token = int(np.argmax(candidate_logits))
+            generated.append(logits if self.cfg.pipeline_cfg.return_logits else token)
+            if token in self.vlm_helper.stop_tokens:
+                break
+            outputs = forward(at, at + 1, vocabulary[token][None, None, None].copy(), 1)
+        return np.array([generated])
+
     def _run_moe_post(self, eval_mode, num_tokens, layer_idx, hidden, self_attn):
         """MoE post block: router (TopK+softmax on-graph) -> experts -> weighted-sum."""
         moe = self.cfg.lm_cfg.moe_cfg
@@ -527,13 +619,18 @@ class LanguageModel(BaseModel):
         else:
             theta = self.cfg.lm_cfg.rope_cfg.rope_theta
             rope_type = self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
-        rope_dimension_count = self.cfg.lm_cfg.rope_cfg.rope_dimension_count
+        rope_dimension_count = self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(
+            "sliding_attention" if use_swa else "full_attention"
+        )
         scaling_cfg = asdict(self.cfg.lm_cfg.rope_cfg.rope_scaling)
         max_num_tokens = self.cfg.pipeline_cfg.max_num_tokens
         idx_base = 1 if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA else 0
-        return calc_freq_real_imag(
-            max_num_tokens, rope_type, theta, rope_dimension_count, scaling_cfg, idx_base
+        dimension = self.cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention" if use_swa else "full_attention") if rope_type == "proportional" else rope_dimension_count
+        re, im = calc_freq_real_imag(
+            max_num_tokens, "default" if rope_type == "proportional" else rope_type,
+            theta, dimension, scaling_cfg, idx_base
         )
+        return re[..., :rope_dimension_count // 2].copy(), im[..., :rope_dimension_count // 2].copy()
 
     def get_embeddings_tensor(
         self,
@@ -558,6 +655,8 @@ class LanguageModel(BaseModel):
             assert isinstance(self.hf_model, GgufModel)
             embeddings_tensor = self.hf_model.load_np_param(weight_name, force_float=True)
         embeddings_tensor = embeddings_tensor.astype(np.float32)
+        if self.cfg.lm_cfg.vision_bidirectional_attention:
+            embed_scale = float(np.asarray(embed_scale, dtype=bfloat16))
         embeddings_tensor *= embed_scale
 
         if self.cfg.pipeline_cfg.quantize_embeddings:
@@ -631,7 +730,9 @@ class LanguageModel(BaseModel):
                 return LanguageCacheModel(
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
-                    logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping
+                    logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
+                    dynamic_mask=self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1,
+                    context_capacity=self.cfg.get_prefill_cache_capacity("full_attention") if self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1 else None,
                 )
             case "sliding_cache":
                 model_name = f"{self.model_name}_n{num_tokens}_sliding_cache_token{token_idx}"
@@ -640,7 +741,9 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
-                    layer_type="sliding_attention"
+                    layer_type="sliding_attention",
+                    dynamic_mask=self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1,
+                    context_capacity=self.cfg.get_prefill_cache_capacity("sliding_attention") if self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1 else None,
                 )
             case "conv_fused":
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_conv"

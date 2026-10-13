@@ -1,4 +1,5 @@
 import logging
+import json
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +97,23 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg = VlmConfig.from_hf_config(
             model_format, hf_cache_path, model_config, image_resolution=image_resolution
         )
+        if vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+            processor_config = Path(hf_cache_path) / "processor_config.json"
+            processor_cfg = json.loads(processor_config.read_text())
+            vlm_cfg.vm_cfg.max_soft_tokens = processor_cfg["image_processor"]["max_soft_tokens"]
+            vlm_cfg.mm_cfg.mm_tokens_per_image = vlm_cfg.vm_cfg.max_soft_tokens
+            if vlm_cfg.audio_cfg is not None:
+                feature = processor_cfg["feature_extractor"]
+                vlm_cfg.audio_cfg.max_tokens = processor_cfg["audio_seq_length"]
+                vlm_cfg.audio_cfg.sampling_rate = feature["sampling_rate"]
+                if feature["audio_samples_per_token"] != vlm_cfg.audio_cfg.samples_per_token:
+                    raise ValueError("Audio processor and model disagree on samples per token")
+            if override_language_group_size is None:
+                override_language_group_size = 128
+            if quantize_embeddings or quantize_kv_cache:
+                raise ValueError("Gemma 4 Unified currently requires BF16 embeddings and KV cache")
+            if target_model is not None:
+                raise ValueError("Gemma 4 Unified speculative decoding is not supported yet")
         # Set the token size and offsets for group processing.
         vlm_cfg.config_pipeline(
             system_prompt, chat_template, max_num_tokens, override_language_group_size,
@@ -231,6 +249,16 @@ class VisionLanguageModel(BaseModel):
                 num_processes=num_processes, resume=resume
             )
 
+        if self.cfg.audio_cfg is not None:
+            from sima_lmm.model.gemma4_unified_model import Gemma4UnifiedAudioModel
+            audio_id = LayerID("audio", 0)
+            if audio_id in precision:
+                audio_model = Gemma4UnifiedAudioModel(
+                    self.cfg, f"{self.model_name}_audio", sima_path=self.sima_path, hf_model=self.hf_model
+                )
+                audio_model.gen_files(gen_mode, layer_cfg={"precision": precision[audio_id]},
+                                      log_level=log_level, resume=resume)
+
         self.language_model.gen_files(
             gen_mode, gen_config=gen_config, log_level=log_level,
             num_processes=num_processes, resume=resume
@@ -246,16 +274,26 @@ class VisionLanguageModel(BaseModel):
         Returns:
             Generated output text or output logits.
         """
-        prompt, input_idxs, images, _ = self.vlm_helper.preprocess(chat)
+        audio_inputs = None
+        if chat.audios:
+            if self.cfg.audio_cfg is None:
+                raise ValueError("This model has no audio frontend")
+            from sima_lmm.preproc.gemma4_unified import audio_frames
+            audio_inputs = [audio_frames(path, self.cfg.audio_cfg) for path in chat.audios]
+        if audio_inputs:
+            prompt, input_idxs, images, positions = self.vlm_helper.preprocess(chat, audio_inputs=audio_inputs)
+        else:
+            prompt, input_idxs, images, positions = self.vlm_helper.preprocess(chat)
 
         sima_log_info("prompt='%s'", prompt)
         sima_log_info("input_idxs=%s", input_idxs)
 
         # Run the model to generate output text.
         if eval_mode == EvalMode.HF:
+            audio_kwargs = {"audio_inputs": audio_inputs} if audio_inputs else {}
             output_dict = self.hf_model.execute_hf(
                 messages=chat.messages, images=chat.images,
-                max_new_tokens=self.cfg.pipeline_cfg.max_num_tokens, device="cpu"
+                max_new_tokens=self.cfg.pipeline_cfg.max_num_tokens, device="cpu", **audio_kwargs
             )
             num_input_tokens = output_dict["input_ids"].shape[1]
             output_tokens = output_dict["output_tokens"]
@@ -266,19 +304,71 @@ class VisionLanguageModel(BaseModel):
         else:
             ifms = [np.array([input_idxs])]
             if images is not None:
-                ifms.extend(
+                if self.cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
+                    for image, xy in zip(images, positions, strict=True):
+                        ifms.extend([image.astype(np.float32), xy])
+                else:
+                    ifms.extend(
                     [np.expand_dims(image, axis=0).astype(np.float32) for image in images]
-                )
+                    )
             if self.cfg.pipeline_cfg.return_logits:
-                return self.run_model(eval_mode, ifms)
-            output_tokens = self.run_model(eval_mode, ifms)
+                return self.run_model(eval_mode, ifms, audio_inputs=audio_inputs) if audio_inputs else self.run_model(eval_mode, ifms)
+            output_tokens = self.run_model(eval_mode, ifms, audio_inputs=audio_inputs) if audio_inputs else self.run_model(eval_mode, ifms)
             assert output_tokens.ndim == 2 and output_tokens.shape[0] == 1
             output_text = self.vlm_helper.decode(output_tokens[0].tolist())
         sima_log_info("output text=%s", output_text)
         return output_text
 
-    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray]) -> list[np.ndarray]:
+    def run_model(self, eval_mode: EvalMode, ifms: list[np.ndarray], *,
+                  audio_inputs: list[np.ndarray] | None = None) -> list[np.ndarray]:
         embeddings_tensor, embeddings_scale = self.language_model.get_embeddings_tensor()
+        if audio_inputs and self.cfg.audio_cfg is None:
+            raise ValueError("This model has no audio frontend")
+        if self.cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED and (len(ifms) > 1 or audio_inputs):
+            if len(ifms) % 2 != 1:
+                raise ValueError("Unified image inputs require patches and positions for each image")
+            projected = {self.vlm_helper.image_token_id: []}
+            if self.cfg.audio_cfg is not None:
+                projected[self.cfg.audio_cfg.token_id] = []
+            if len(ifms) > 1:
+                vision = VisionModel(self.cfg, self.vision_model_name, sima_path=self.sima_path, hf_model=self.hf_model)
+                projected[self.vlm_helper.image_token_id] = [
+                    vision.run_model(eval_mode, ifms[i:i + 2])[0] for i in range(1, len(ifms), 2)
+                ]
+            if audio_inputs:
+                from sima_lmm.model.gemma4_unified_model import Gemma4UnifiedAudioModel
+                audio_model = Gemma4UnifiedAudioModel(self.cfg, f"{self.model_name}_audio",
+                                                    sima_path=self.sima_path, hf_model=self.hf_model)
+                projected[self.cfg.audio_cfg.token_id] = [
+                    audio_model.run_model(eval_mode, [frames])[0] for frames in audio_inputs
+                ]
+            tokens = ifms[0][0].tolist()
+            hidden = embeddings_tensor[tokens].copy()
+            counts = dict.fromkeys(projected, 0)
+            spans = []
+            at = 0
+            while at < len(tokens):
+                if tokens[at] in projected:
+                    end = at + 1
+                    while end < len(tokens) and tokens[end] == tokens[at]:
+                        end += 1
+                    kind = tokens[at]
+                    if counts[kind] >= len(projected[kind]):
+                        raise ValueError("Media placeholders exceed the supplied attachments")
+                    rows = projected[kind][counts[kind]].reshape(-1, hidden.shape[-1])
+                    if len(rows) != end - at:
+                        raise ValueError("Media placeholder count does not match projected rows")
+                    hidden[at:end] = rows
+                    counts[kind] += 1
+                    if kind == self.vlm_helper.image_token_id:
+                        spans.append((at, end))
+                    at = end
+                else:
+                    at += 1
+            if any(counts[kind] != len(rows) for kind, rows in projected.items()):
+                raise ValueError("Supplied attachment has no matching placeholder")
+            return self.language_model.run_model(eval_mode, [hidden[None, None]],
+                embeddings_tensor=embeddings_tensor, image_spans=spans)
         if len(ifms) == 1:
             text_token_idxs = ifms[0]
             num_queries = text_token_idxs.shape[0]

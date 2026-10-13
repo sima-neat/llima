@@ -700,7 +700,7 @@ ToolCallFormat tool_call_format_for_model(std::string_view model_type) {
     if (model_type == "llm-lfm2" || model_type == "vlm-lfm2_vl") {
         return ToolCallFormat::Lfm;
     }
-    if (model_type == "vlm-gemma4") {
+    if (model_type == "vlm-gemma4" || model_type == "vlm-gemma4_unified") {
         return ToolCallFormat::Gemma;
     }
     if (model_type == "llm-mistral") {

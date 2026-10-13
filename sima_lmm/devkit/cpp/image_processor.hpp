@@ -29,6 +29,7 @@ class ImageProcessor {
         std::vector<Eigen::bfloat16> preprocess(const std::filesystem::path image_path);
         std::vector<Eigen::bfloat16> preprocess(const std::vector<uint8_t>& image_path);
         std::vector<Eigen::bfloat16> preprocess(const cv::Mat& rgb_image);
+        const std::vector<uint16_t>& image_positions() const { return _image_positions; }
 
         static void read_env_vars() {
             // Set the debug info from env variables.
@@ -41,6 +42,8 @@ class ImageProcessor {
 
     private:
         std::vector<Eigen::bfloat16> _preprocess(cv::Mat image);
+        std::vector<Eigen::bfloat16> _preprocess_unified(const cv::Mat& image);
+        std::vector<uint16_t> _image_positions;
         cv::Mat _convert_to_rgb(cv::Mat image);
         cv::Mat _pad_to_square(cv::Mat image);
         std::vector<Eigen::bfloat16> _cast_and_patchify(cv::Mat image);

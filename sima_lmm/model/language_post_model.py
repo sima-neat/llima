@@ -23,7 +23,7 @@ class LanguagePostModel(LanguagePostBaseModel):
     @property
     def uses_per_layer_inputs(self) -> bool:
         return (
-            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            self.cfg.model_type in (VlmArchType.VLM_GEMMA4, VlmArchType.VLM_GEMMA4_UNIFIED)
             and self.cfg.lm_cfg.hidden_size_per_layer_input > 0
         )
 
@@ -190,7 +190,7 @@ class LanguagePostModel(LanguagePostBaseModel):
                 merged_lora,
             )
         if (
-            self.cfg.model_type == VlmArchType.VLM_GEMMA4
+            self.cfg.model_type in (VlmArchType.VLM_GEMMA4, VlmArchType.VLM_GEMMA4_UNIFIED)
             and self.check_hf_param(f"{base_name}.layer_scalar")
         ):
             layer_scalar = graph.constant(graph.parameter(f"{base_name}.layer_scalar").reshape(1))

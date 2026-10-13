@@ -10,6 +10,7 @@
 
 #include "utils.hpp"
 #include "vlm_helper.hpp"
+#include "gemma4_unified_helpers.hpp"
 
 namespace simaai {
 namespace llima {
@@ -145,8 +146,9 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // Construct the actual prompt with full image tokens. Manually process the prompt because there
     // is no known automatic way.
     std::vector<std::vector<Eigen::bfloat16>> image_tensors;
+    std::vector<std::vector<uint16_t>> image_positions;
+    uint32_t num_images = 0;
     if (_vlm_cfg.support_image()) {
-        uint32_t num_images;
         if (_vlm_cfg.model_type == "vlm-llava") {
             std::string search = "<image>";
             std::string replace = "";
@@ -179,6 +181,10 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                 replace += "<|image_pad|>";
             }
             num_images = find_and_replace_all(formatted_prompt, search, replace);
+        } else if (_vlm_cfg.model_type == "vlm-gemma4_unified") {
+            // Actual token counts are known only after aspect-preserving preprocessing.
+            num_images = 0;
+            for (size_t pos = 0; (pos = formatted_prompt.find("<|image|>", pos)) != std::string::npos; pos += 9) ++num_images;
         } else if (_vlm_cfg.model_type == "vlm-gemma4") {
             std::string search = "<|image|>";
             std::string replace = "";
@@ -209,10 +215,12 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                     if (image_str.starts_with(base64_prefix)) {
                         auto image_bytes = base64_decode(image_str.substr(base64_prefix.size()));
                         image_tensors.emplace_back(_image_processor_ptr->preprocess(image_bytes));
+                        if (_vlm_cfg.model_type == "vlm-gemma4_unified") image_positions.push_back(_image_processor_ptr->image_positions());
                     } else {
                         // Assume regular file.
                         assert(std::filesystem::is_regular_file(image_str));
                         image_tensors.emplace_back(_image_processor_ptr->preprocess(image_str));
+                        if (_vlm_cfg.model_type == "vlm-gemma4_unified") image_positions.push_back(_image_processor_ptr->image_positions());
                     }
                 }
             }
@@ -220,8 +228,70 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
             assert(chat.get_images().size() == num_images);
             for (const auto& image_file_name: chat.get_images()) {
                 image_tensors.emplace_back(_image_processor_ptr->preprocess(image_file_name));
+                if (_vlm_cfg.model_type == "vlm-gemma4_unified") image_positions.push_back(_image_processor_ptr->image_positions());
             }
         }
+    }
+
+    if (_vlm_cfg.model_type == "vlm-gemma4_unified") {
+        if (image_positions.size() != image_tensors.size() || image_tensors.size() != num_images) {
+            throw std::runtime_error("Image placeholder/count mismatch");
+        }
+        size_t cursor = 0;
+        for (const auto& positions : image_positions) {
+            const auto at = formatted_prompt.find("<|image|>", cursor);
+            if (at == std::string::npos || positions.empty()) throw std::runtime_error("Image placeholder/count mismatch");
+            std::string expanded = "<|image>";
+            for (size_t i = 0; i < positions.size() / 2; ++i) expanded += "<|image|>";
+            expanded += "<image|>";
+            formatted_prompt.replace(at, 9, expanded);
+            cursor = at + expanded.size();
+        }
+    }
+
+    std::vector<std::vector<Eigen::bfloat16>> audio_tensors;
+    size_t audio_cursor = 0;
+    for (const auto& message : chat.get_messages()) {
+        const auto& content = message.at("content");
+        if (!content.is_array()) continue;
+        for (const auto& item : content) {
+            if (item.at("type") != "audio" && item.at("type") != "input_audio") continue;
+            if (!_vlm_cfg.support_audio()) throw std::invalid_argument("This model has no compiled audio frontend");
+            const auto& audio = *_vlm_cfg.audio_cfg;
+            const auto& source = item.at("audio");
+            const size_t budget = static_cast<size_t>(audio.max_tokens) * audio.samples_per_token;
+            ArrayXf samples;
+            if (source.is_string()) {
+                samples = load_audio(source.get<std::string>(), budget);
+            } else if (source.is_object() && source.contains("data") && source.at("data").is_string()) {
+                const auto& encoded = source.at("data").get_ref<const std::string&>();
+                const auto padding = encoded.find('=');
+                if (encoded.empty() || encoded.size() % 4 != 0
+                    || encoded.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != std::string::npos
+                    || (padding != std::string::npos &&
+                        (encoded.size() - padding > 2 || encoded.find_first_not_of('=', padding) != std::string::npos))) {
+                    throw std::invalid_argument("input_audio.data must contain valid base64 audio");
+                }
+                const auto bytes = base64_decode(encoded);
+                samples = load_audio(std::span<const uint8_t>(bytes), budget);
+            } else {
+                throw std::invalid_argument("Audio input requires a file path or base64 data");
+            }
+            auto frames = gemma4_audio_frames(samples, audio);
+            const auto at = formatted_prompt.find("<|audio|>", audio_cursor);
+            if (at == std::string::npos) throw std::invalid_argument("Audio placeholder/count mismatch");
+            std::string expanded = _tokenizer_ptr->id_to_token(audio.begin_token_id);
+            for (size_t i = 0; i < frames.size() / audio.samples_per_token; ++i) {
+                expanded += _tokenizer_ptr->id_to_token(audio.token_id);
+            }
+            expanded += _tokenizer_ptr->id_to_token(audio.end_token_id);
+            formatted_prompt.replace(at, 9, expanded);
+            audio_cursor = at + expanded.size();
+            audio_tensors.push_back(std::move(frames));
+        }
+    }
+    if (formatted_prompt.find("<|audio|>", audio_cursor) != std::string::npos) {
+        throw std::invalid_argument("Audio placeholder has no matching WAV attachment");
     }
 
     // Encode the formatted prompt to token ids.
@@ -270,7 +340,9 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         std::move(formatted_prompt),
         std::move(input_token_ids),
         stable_prefix_token_count,
-        std::move(image_tensors)
+        std::move(image_tensors),
+        std::move(image_positions),
+        std::move(audio_tensors)
     };
 }
 

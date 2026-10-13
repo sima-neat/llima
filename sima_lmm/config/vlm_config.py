@@ -21,7 +21,7 @@ _VISION_MODEL_TYPE_ALIASES = {
 
 def _normalize_attention_config(text_cfg: dict) -> dict:
     """Translate Gemma 4 per-layer overrides into our full/sliding contract."""
-    if text_cfg.get("model_type") != "gemma4_text" or not text_cfg.get("per_layer_config"):
+    if text_cfg.get("model_type") not in ("gemma4_text", "gemma4_unified_text") or not text_cfg.get("per_layer_config"):
         return text_cfg
 
     layer_types = text_cfg["layer_types"]
@@ -31,22 +31,29 @@ def _normalize_attention_config(text_cfg: dict) -> dict:
         raise ValueError("Gemma 4 layer override index is out of range")
 
     dimensions = {}
+    kv_heads = {}
     for index, layer_type in enumerate(layer_types):
         if layer_type not in ("full_attention", "sliding_attention"):
             raise ValueError(f"Unsupported Gemma 4 layer type: {layer_type}")
         values = overrides.get(index, {})
         for key, value in values.items():
-            if key != "head_dim" and value != text_cfg.get(key):
+            if key not in ("head_dim", "num_key_value_heads") and value != text_cfg.get(key):
                 raise ValueError(f"Unsupported Gemma 4 layer {index} override: {key}={value!r}")
         default = text_cfg.get("global_head_dim") if layer_type == "full_attention" else None
         dimension = values.get("head_dim", default or text_cfg["head_dim"])
         if dimensions.setdefault(layer_type, dimension) != dimension:
             raise ValueError(f"Inconsistent Gemma 4 head dimensions for {layer_type}")
+        default_heads = text_cfg.get("num_global_key_value_heads") if layer_type == "full_attention" else None
+        heads = values.get("num_key_value_heads", default_heads or text_cfg["num_key_value_heads"])
+        if kv_heads.setdefault(layer_type, heads) != heads:
+            raise ValueError(f"Inconsistent Gemma 4 KV head counts for {layer_type}")
 
     normalized = dict(text_cfg)
     normalized["head_dim"] = dimensions.get("sliding_attention", text_cfg["head_dim"])
     if "full_attention" in dimensions:
         normalized["global_head_dim"] = dimensions["full_attention"]
+        normalized["num_global_key_value_heads"] = kv_heads["full_attention"]
+    normalized["num_key_value_heads"] = kv_heads.get("sliding_attention", text_cfg["num_key_value_heads"])
     return normalized
 
 
@@ -111,6 +118,7 @@ class VlmArchType(str, ExtensibleEnum):
     VLM_CUSTOM = "vlm-custom"
     VLM_GEMMA3 = "vlm-gemma3"
     VLM_GEMMA4 = "vlm-gemma4"
+    VLM_GEMMA4_UNIFIED = "vlm-gemma4_unified"
     VLM_LFM2_VL = "vlm-lfm2_vl"
     VLM_LLAVA = "vlm-llava"
     VLM_PALIGEMMA = "vlm-paligemma"
@@ -127,6 +135,7 @@ class VisionArchType(str, ExtensibleEnum):
     QWEN2_VISION_ENCODER = "qwen2_5_vl"
     QWEN3_VISION_ENCODER = "qwen3_vl"
     GEMMA4_VISION_ENCODER = "gemma4_vision"
+    GEMMA4_UNIFIED = "gemma4_unified_vision"
     QWEN3_5_VISION_ENCODER = "qwen3_5"
 
 
@@ -264,6 +273,7 @@ class VisionModelConfig(BaseConfig):
     fullatt_block_indexes: list[int] = field(default_factory=list)
     deepstack_visual_indexes: list[int] = field(default_factory=list)
     rope_theta: float = 10000.0
+    max_soft_tokens: int = 0
 
     def set_config(self, arch: VisionArchType, model_cfg: dict, vision_cfg: dict):
         if "num_attention_heads" not in vision_cfg and "num_heads" in vision_cfg:
@@ -278,6 +288,13 @@ class VisionModelConfig(BaseConfig):
         self.cls_embed = arch == VisionArchType.CLIP
         if arch == VisionArchType.GEMMA4_VISION_ENCODER:
             self.spatial_merge_size = vision_cfg.get("pooling_kernel_size", 1)
+        elif arch == VisionArchType.GEMMA4_UNIFIED:
+            self.spatial_merge_size = vision_cfg["pooling_kernel_size"]
+            self.hidden_size = vision_cfg["mm_embed_dim"]
+            self.num_hidden_layers = 1
+            self.max_soft_tokens = vision_cfg.get("max_soft_tokens", 280)
+            self.num_position_embeddings = vision_cfg["mm_posemb_size"]
+            self.image_size = self.patch_size * self.spatial_merge_size
         if "rope_parameters" in vision_cfg:
             rope_params = vision_cfg["rope_parameters"]
             self.rope_theta = rope_params.get("rope_theta", self.rope_theta)
@@ -300,6 +317,18 @@ class VisionModelConfig(BaseConfig):
             return int(np.prod(self.num_patches)) + self.cls_embed
         else:
             raise ValueError("image_size must be int or list of int")
+
+
+@dataclass
+class AudioModelConfig(BaseConfig):
+    """Encoder-free Unified audio framing and prompt tokens."""
+    samples_per_token: int = 640
+    sampling_rate: int = 16000
+    max_tokens: int = 750
+    rms_norm_eps: float = 1e-6
+    token_id: int = 0
+    begin_token_id: int = 0
+    end_token_id: int = 0
 
 
 @dataclass
@@ -498,6 +527,7 @@ class AttentionBlockConfig(BaseConfig):
     num_key_value_heads: int = 0
     head_dim: int = 0
     sliding_head_dim: int | None = None
+    sliding_num_key_value_heads: int | None = None
     swa_enable: bool = False
     sliding_window: int = 0
     attention_bias: bool = False
@@ -515,6 +545,13 @@ class AttentionBlockConfig(BaseConfig):
         if "global_head_dim" in text_cfg and text_cfg["global_head_dim"] is not None:
             self.sliding_head_dim = self.head_dim
             self.head_dim = text_cfg["global_head_dim"]
+        if text_cfg.get("num_global_key_value_heads") is not None and text_cfg["num_global_key_value_heads"] != self.num_key_value_heads:
+            self.sliding_num_key_value_heads = self.num_key_value_heads
+            self.num_key_value_heads = text_cfg["num_global_key_value_heads"]
+        for layer_type in set(layer_types) & {"full_attention", "sliding_attention"}:
+            heads = self.get_num_key_value_heads(layer_type)
+            if heads <= 0 or self.num_attention_heads <= 0 or self.num_attention_heads % heads:
+                raise ValueError(f"Q heads must be divisible by KV heads for {layer_type}")
         self.swa_enable = any("sliding_attention" in lt for lt in layer_types)
         if self.sliding_window is None:
             self.sliding_window = 0
@@ -528,7 +565,12 @@ class AttentionBlockConfig(BaseConfig):
         return self.num_attention_heads * self.get_head_dim(layer_type)
 
     def get_kv_size(self, layer_type: str) -> int:
-        return self.num_key_value_heads * self.get_head_dim(layer_type)
+        return self.get_num_key_value_heads(layer_type) * self.get_head_dim(layer_type)
+
+    def get_num_key_value_heads(self, layer_type: str) -> int:
+        if layer_type == "sliding_attention" and self.sliding_num_key_value_heads is not None:
+            return self.sliding_num_key_value_heads
+        return self.num_key_value_heads
 
 
 @dataclass
@@ -721,6 +763,8 @@ class LanguageModelConfig(BaseConfig):
     hidden_size_per_layer_input: int = 0
     num_kv_shared_layers: int = 0
     use_double_wide_mlp: bool = False
+    attention_k_eq_v: bool = False
+    vision_bidirectional_attention: bool = False
     attn_logit_softcapping: float | None = None
     final_logit_softcapping: float | None = None
     lm_head_num_splits: int = 1
@@ -803,6 +847,7 @@ class LanguageModelConfig(BaseConfig):
     def set_config(self, text_cfg: dict, dtype: "LlmDataType", lm_arch: "LlmArchType", model_format: "ModelFormat"):
         text_cfg = _normalize_attention_config(text_cfg)
         self.model_type = text_cfg["model_type"]
+        self.vision_bidirectional_attention = self.model_type == "gemma4_unified_text"
         self.data_type = dtype
         self.arch = lm_arch
 
@@ -849,6 +894,7 @@ class LanguageModelConfig(BaseConfig):
             "hidden_size_per_layer_input",
             "num_kv_shared_layers",
             "use_double_wide_mlp",
+            "attention_k_eq_v",
         ):
             if key in text_cfg:
                 setattr(self, key, text_cfg[key])
@@ -1119,11 +1165,14 @@ class VlmConfig(BaseConfig):
     model_type: VlmArchType | None = None
     vm_cfg: VisionModelConfig | None = None
     mm_cfg: MMConnectionConfig | None = None
+    audio_cfg: AudioModelConfig | None = None
     lm_cfg: LanguageModelConfig = field(default_factory=LanguageModelConfig)
     pipeline_cfg: PipelineConfig = field(default_factory=PipelineConfig)
 
     @staticmethod
     def load(vlm_cfg: dict) -> "VlmConfig":
+        if vlm_cfg.get("audio_cfg") is not None:
+            vlm_cfg["audio_cfg"] = AudioModelConfig(**vlm_cfg["audio_cfg"])
         if vlm_cfg.get("vm_cfg") is not None:
             vlm_cfg["vm_cfg"]["arch"] = VisionArchType(vlm_cfg["vm_cfg"]["arch"])
             vlm_cfg["vm_cfg"] = VisionModelConfig(**vlm_cfg["vm_cfg"])
@@ -1148,6 +1197,8 @@ class VlmConfig(BaseConfig):
         if vm_arch is not None:
             self.vm_cfg.set_config(vm_arch, model_cfg, vision_cfg)
             self.mm_cfg.set_config(vm_arch, self.lm_cfg.hidden_size, model_cfg)
+            if vm_arch == VisionArchType.GEMMA4_UNIFIED:
+                self.mm_cfg.mm_tokens_per_image = self.vm_cfg.max_soft_tokens
         self.pipeline_cfg = PipelineConfig()
 
     @staticmethod
@@ -1224,6 +1275,8 @@ class VlmConfig(BaseConfig):
                     f"{vlm_cfg.vm_cfg.arch} models require --input_height and --input_width arguments"
                 )
             if image_resolution is not None:
+                if vlm_cfg.vm_cfg.arch == VisionArchType.GEMMA4_UNIFIED:
+                    raise ValueError("Gemma 4 Unified uses an aspect-preserving image token budget; omit --input_height/--input_width")
                 if vlm_cfg.vm_cfg.arch == VisionArchType.SIGLIP2:
                     height, width = image_resolution
                     if height * width > 262144:
@@ -1294,6 +1347,15 @@ class VlmConfig(BaseConfig):
             vlm_cfg.mm_cfg = None
             vlm_cfg.vm_cfg = None
 
+        if vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED and model_cfg.get("audio_config"):
+            audio = model_cfg["audio_config"]
+            vlm_cfg.audio_cfg = AudioModelConfig(
+                samples_per_token=audio.get("audio_samples_per_token", audio.get("audio_embed_dim", 640)),
+                rms_norm_eps=audio.get("rms_norm_eps", 1e-6),
+                token_id=model_cfg["audio_token_id"],
+                begin_token_id=model_cfg["boa_token_id"],
+                end_token_id=model_cfg.get("eoa_token_id", model_cfg.get("eoa_token_index")),
+            )
         apply_mla_constraint(vlm_cfg)
         return vlm_cfg
 
@@ -1323,6 +1385,17 @@ class VlmConfig(BaseConfig):
             for layer_idx in range(self.num_vision_layers)
         ]
 
+    def get_prefill_cache_capacity(self, layer_type: str) -> int:
+        """Static KV view covering the causal window and future same-image keys."""
+        context = self.pipeline_cfg.max_num_tokens
+        if layer_type != "sliding_attention":
+            return context
+        return min(context, round_up_to(
+            self.lm_cfg.attn_cfg.sliding_window + self.pipeline_cfg.input_token_group_size
+            + self.vm_cfg.max_soft_tokens - 2,
+            self.pipeline_cfg.input_token_group_size,
+        ))
+
     def config_pipeline(
         self,
         system_prompt: str | None,
@@ -1336,6 +1409,16 @@ class VlmConfig(BaseConfig):
         self.pipeline_cfg.set_max_num_tokens(max_num_tokens)
         self.pipeline_cfg.set_group_size(language_group_size)
         self.pipeline_cfg.set_future_token_mask_size(future_token_mask_size)
+
+        if self.lm_cfg.vision_bidirectional_attention:
+            if (self.lm_cfg.hidden_size_per_layer_input or self.lm_cfg.moe_cfg is not None
+                    or any(kind not in ("full_attention", "sliding_attention") for kind in self.lm_cfg.layer_types)):
+                raise ValueError("Gemma 4 Unified currently requires dense attention layers without per-layer embedding inputs")
+            group_size = self.pipeline_cfg.input_token_group_size
+            if group_size <= 1 or max_num_tokens % group_size:
+                raise ValueError("Gemma 4 Unified requires grouped prefill and context divisible by language_group_size")
+            if self.vm_cfg.max_soft_tokens > self.lm_cfg.attn_cfg.sliding_window:
+                raise ValueError("Gemma 4 Unified image token budget must not exceed sliding_window")
 
         group_size = self.pipeline_cfg.input_token_group_size
         if (
@@ -1424,6 +1507,8 @@ class VlmConfig(BaseConfig):
             # Cache models are shared across layers; include only for kinds that exist
             if has_attn:
                 group_cache_indices = group_cache_model_indices(pipeline_cfg)
+                if lm_cfg.vision_bidirectional_attention:
+                    group_cache_indices = [0]
                 single_cache_indices = single_cache_model_indices(pipeline_cfg)
                 has_sliding_attn = "sliding_attention" in layer_types
                 separate_sliding_cache = (
@@ -1457,9 +1542,8 @@ class VlmConfig(BaseConfig):
                 if has_sliding_attn and not is_gemma4_mtp_draft:
                     layers.extend(
                         LayerID("group_sliding_cache", n)
-                        for n in group_sliding_cache_model_indices(
-                            pipeline_cfg, lm_cfg.attn_cfg.sliding_window
-                        )
+                        for n in ([0] if lm_cfg.vision_bidirectional_attention else
+                                  group_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
                         if separate_sliding_cache
                         or n + pipeline_cfg.input_token_group_size > lm_cfg.attn_cfg.sliding_window
                     )
@@ -1520,6 +1604,8 @@ class VlmConfig(BaseConfig):
             layers.append(LayerID("group_per_layer", 0))
             layers.append(LayerID("single_per_layer", 0))
 
+        if self.audio_cfg is not None:
+            layers.append(LayerID("audio", 0))
         return layers
 
 
@@ -1580,7 +1666,7 @@ def get_model_arch_gen(
     lm_arch = None
     t_reg = re.fullmatch(
         r"(?P<arch>[a-zA-Z]+(?:_[a-zA-Z]+)*?)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
-        text_type,
+        text_type.replace("gemma4_unified_text", "gemma4_text"),
     )
     for arch in LlmArchType.values():
         if arch == t_reg.group("arch"):

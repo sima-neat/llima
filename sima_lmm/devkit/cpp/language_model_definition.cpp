@@ -53,7 +53,7 @@ void LanguageModel::_define_attn_models_iter(
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         pre_kv_cache_offset = {0, token_idx, 0};
         pre_kv_cache_shape = {
-            _cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            _cfg.lm_cfg.attn_cfg.get_num_key_value_heads(layer_type),
             _cfg.pipeline_cfg.max_num_tokens,
             _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
         };
@@ -133,7 +133,7 @@ void LanguageModel::_define_attn_models_iter(
                 MLABufferSlice(
                     &get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                    {_cfg.lm_cfg.attn_cfg.get_num_key_value_heads(layer_type), _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
             );
         }
@@ -149,7 +149,7 @@ void LanguageModel::_define_attn_models_iter(
                 MLABufferSlice(
                     &get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)),
                     {0, token_idx, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                    {_cfg.lm_cfg.attn_cfg.get_num_key_value_heads(layer_type), _cfg.pipeline_cfg.max_num_tokens, 1}
                 )
             );
         }
@@ -189,7 +189,8 @@ void LanguageModel::_define_attn_models_iter(
         && cache_mask_size > num_tokens
     );
     const uint16_t aligned_eff_token_idx = std::get<2>(cache_key);
-    const uint16_t aligned_eff_num_cached_tokens = use_single_future_token_mask
+    const uint16_t aligned_eff_num_cached_tokens = _cfg.lm_cfg.vision_bidirectional_attention && num_tokens > 1
+        ? _cfg.get_prefill_cache_capacity(layer_type) : use_single_future_token_mask
         ? aligned_eff_token_idx + 1
         : aligned_eff_token_idx + num_tokens;
     std::vector<uint32_t> cache_kv_cache_shape;
@@ -197,7 +198,7 @@ void LanguageModel::_define_attn_models_iter(
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_kv_cache_offset = {0, cache_token_idx_begin, 0};
         cache_kv_cache_shape = {
-            _cfg.lm_cfg.attn_cfg.num_key_value_heads,
+            _cfg.lm_cfg.attn_cfg.get_num_key_value_heads(kv_layer_type),
             _cfg.pipeline_cfg.max_num_tokens,
             _cfg.lm_cfg.attn_cfg.get_head_dim(kv_layer_type)
         };
@@ -234,12 +235,12 @@ void LanguageModel::_define_attn_models_iter(
                 : MLABufferSlice{
                     &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
                     {0, cache_token_idx_begin, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                    {_cfg.lm_cfg.attn_cfg.get_num_key_value_heads(kv_layer_type), _cfg.pipeline_cfg.max_num_tokens, 1}
                 }
         );
     }
 
-    if (use_group_future_token_mask) {
+    if (use_group_future_token_mask || (_cfg.lm_cfg.vision_bidirectional_attention && num_tokens > 1)) {
         cache_ifms.emplace_back(
             MLABufferSlice{
                 &get_buffer(
@@ -302,7 +303,7 @@ void LanguageModel::_define_attn_models_iter(
                 : MLABufferSlice{
                     &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
                     {0, cache_token_idx_begin, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
+                    {_cfg.lm_cfg.attn_cfg.get_num_key_value_heads(kv_layer_type), _cfg.pipeline_cfg.max_num_tokens, 1}
                 }
         );
     }

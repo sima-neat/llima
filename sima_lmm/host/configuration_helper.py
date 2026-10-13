@@ -27,6 +27,7 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_linear": (False, "LINEAR"),
     "conv_post_final": (False, "POST"),
     "vision": (False, "VISION"),
+    "audio": (False, "AUDIO"),
     "group_draft_fc": (True, "DRAFT_FC"),
     "single_draft_fc": (False, "DRAFT_FC"),
     "group_per_layer": (True, "PER_LAYER"),
