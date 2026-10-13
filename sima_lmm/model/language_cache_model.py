@@ -44,11 +44,13 @@ class LanguageCacheModel(LanguagePartBaseModel):
     token_idx: int
     logit_softcapping: float | None
     layer_type: str = "full_attention"
-    dynamic_mask: bool = False
-    context_capacity: int | None = None
 
     def __post_init__(self):
         assert self.num_tokens >= 1
+
+    @property
+    def dynamic_mask(self) -> bool:
+        return self.cfg.lm_cfg.vision_bidirectional_attention and self.num_tokens > 1
 
     @property
     def _is_speculative_decoding(self) -> bool:
@@ -82,8 +84,8 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
     @property
     def context_length(self) -> int:
-        if self.context_capacity is not None:
-            return self.context_capacity
+        if self.dynamic_mask:
+            return self.cfg.get_prefill_cache_capacity(self.layer_type)
         if self._is_speculative_decoding:
             return self.token_idx + 1
         return self.token_idx + self.num_tokens

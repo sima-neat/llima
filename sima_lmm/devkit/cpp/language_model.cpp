@@ -299,20 +299,21 @@ const LinearAttentionConfig& LanguageModel::_linear_attn_cfg() const {
 }
 
 
-std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_audio_input_maps(
+std::vector<MLABufferSlice> LanguageModel::create_audio_input_slices(
     std::span<const uint32_t> input_token_ids
 ) {
-    std::vector<std::map<uint8_t, MLABufferSlice>> maps;
-    if (!_cfg.support_audio()) return maps;
+    std::vector<MLABufferSlice> slices;
+    if (!_cfg.support_audio()) return slices;
     for (uint32_t begin = 0; begin < input_token_ids.size();) {
         if (input_token_ids[begin] != _cfg.audio_cfg->token_id) { ++begin; continue; }
         uint32_t end = begin + 1;
         while (end < input_token_ids.size() && input_token_ids[end] == _cfg.audio_cfg->token_id) ++end;
         if (end - begin > _cfg.audio_cfg->max_tokens) throw std::invalid_argument("Audio exceeds the compiled token budget");
-        maps.push_back({{0, {&get_buffer("input_embeds"), {begin, 0}, {end - begin, _cfg.lm_cfg.hidden_size}}}});
+        slices.emplace_back(&get_buffer("input_embeds"), std::vector<uint32_t>{begin, 0},
+                            std::vector<uint32_t>{end - begin, _cfg.lm_cfg.hidden_size});
         begin = end;
     }
-    return maps;
+    return slices;
 }
 
 std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffers(

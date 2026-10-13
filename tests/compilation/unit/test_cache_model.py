@@ -40,7 +40,7 @@ def test_single_cache_model_when_grouping_is_disabled():
     pipeline_cfg.set_future_token_mask_size(128)
     cfg = SimpleNamespace(
         pipeline_cfg=pipeline_cfg,
-        lm_cfg=SimpleNamespace(speculative_decoding_cfg=None),
+        lm_cfg=SimpleNamespace(speculative_decoding_cfg=None, vision_bidirectional_attention=False),
     )
 
     model = LanguageCacheModel(
@@ -62,7 +62,7 @@ def test_group_size_one_reuses_single_cache_model():
     pipeline_cfg.set_future_token_mask_size(128)
     cfg = SimpleNamespace(
         pipeline_cfg=pipeline_cfg,
-        lm_cfg=SimpleNamespace(speculative_decoding_cfg=None),
+        lm_cfg=SimpleNamespace(speculative_decoding_cfg=None, vision_bidirectional_attention=False),
     )
 
     model = LanguageCacheModel(
@@ -96,6 +96,7 @@ def test_group_sliding_attention_matches_sequential_windows(
     cfg = SimpleNamespace(
         model_type="gemma3",
         lm_cfg=SimpleNamespace(
+            vision_bidirectional_attention=False,
             attn_cfg=SimpleNamespace(
                 num_attention_heads=2, num_key_value_heads=1, get_num_key_value_heads=lambda _: 1, sliding_window=window,
                 get_head_dim=lambda _: 16, get_q_size=lambda _: 32, get_kv_size=lambda _: 16,
@@ -164,6 +165,7 @@ def test_gemma2_native_cache_softcapping(monkeypatch, quantizable):
     cfg = SimpleNamespace(
         model_type="gemma2",
         lm_cfg=SimpleNamespace(
+            vision_bidirectional_attention=False,
             attn_cfg=attention,
             speculative_decoding_cfg=None,
             arch=LlmArchType.GEMMA,

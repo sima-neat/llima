@@ -31,6 +31,7 @@ class Chat {
 
         void set_messages(nlohmann::ordered_json messages);
         const nlohmann::ordered_json& get_messages() const { return _messages; }
+        // Clear messages while retaining attachments for the next query.
         void clear_messages();
 
         void set_tools(nlohmann::ordered_json tools);
@@ -50,18 +51,21 @@ class Chat {
         void clear_images();
         const std::vector<std::filesystem::path>& get_images() const { return _images; }
 
-        void clear_history() { clear_messages(); clear_images(); _media.clear(); }
+        void clear_history();
         void print_history() const { std::cout << _messages << std::endl << std::flush; }
 
     protected:
         VlmHelper& _vlm_helper;
         nlohmann::ordered_json _messages;
         nlohmann::ordered_json _tools;
+        // Compatibility view for get_images(); preprocessing reads message content.
         std::vector<std::filesystem::path> _images;
-        std::vector<nlohmann::ordered_json> _media;
-        size_t _media_used = 0;
+        nlohmann::ordered_json _pending_media = nlohmann::ordered_json::array();
         bool _enable_thinking = false;
         std::string _reasoning_effort = "low";
+
+    private:
+        void _reset_messages();
 };
 
 

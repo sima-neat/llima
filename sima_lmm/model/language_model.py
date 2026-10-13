@@ -731,8 +731,6 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
-                    dynamic_mask=self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1,
-                    context_capacity=self.cfg.get_prefill_cache_capacity("full_attention") if self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1 else None,
                 )
             case "sliding_cache":
                 model_name = f"{self.model_name}_n{num_tokens}_sliding_cache_token{token_idx}"
@@ -742,8 +740,6 @@ class LanguageModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
                     layer_type="sliding_attention",
-                    dynamic_mask=self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1,
-                    context_capacity=self.cfg.get_prefill_cache_capacity("sliding_attention") if self.cfg.lm_cfg.vision_bidirectional_attention and num_tokens > 1 else None,
                 )
             case "conv_fused":
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_conv"

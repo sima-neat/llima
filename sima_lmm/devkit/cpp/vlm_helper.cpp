@@ -198,43 +198,30 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
             );
         }
 
-        // Preprocess images.
-        if (chat.get_images().size() == 0 && num_images > 0) {
-            // Images are embedded in the messages.
-            for (const auto& message: chat.get_messages()) {
-                const auto& content = message.at("content");
-                // OpenAI-compatible history may mix plain-string text messages with array content.
-                if (!content.is_array()) {
-                    continue;
+        // CLI and web attachments both live in message content.
+        for (const auto& message : chat.get_messages()) {
+            const auto& content = message.at("content");
+            if (!content.is_array()) continue;
+            for (const auto& item : content) {
+                if (item.at("type") != "image") continue;
+                const std::string_view source = item.at("image").get_ref<const std::string&>();
+                constexpr std::string_view base64_prefix = "data:image/jpeg;base64,";
+                if (source.starts_with(base64_prefix)) {
+                    image_tensors.emplace_back(_image_processor_ptr->preprocess(
+                        base64_decode(source.substr(base64_prefix.size()))));
+                } else {
+                    image_tensors.emplace_back(_image_processor_ptr->preprocess(source));
                 }
-                for (const auto& item: content) {
-                    if (item.at("type") != "image")
-                        continue;
-                    std::string_view image_str = item.at("image").get_ref<const std::string&>();
-                    const std::string_view base64_prefix = "data:image/jpeg;base64,";
-                    if (image_str.starts_with(base64_prefix)) {
-                        auto image_bytes = base64_decode(image_str.substr(base64_prefix.size()));
-                        image_tensors.emplace_back(_image_processor_ptr->preprocess(image_bytes));
-                        if (_vlm_cfg.model_type == "vlm-gemma4_unified") image_positions.push_back(_image_processor_ptr->image_positions());
-                    } else {
-                        // Assume regular file.
-                        assert(std::filesystem::is_regular_file(image_str));
-                        image_tensors.emplace_back(_image_processor_ptr->preprocess(image_str));
-                        if (_vlm_cfg.model_type == "vlm-gemma4_unified") image_positions.push_back(_image_processor_ptr->image_positions());
-                    }
+                if (_vlm_cfg.model_type == "vlm-gemma4_unified") {
+                    image_positions.push_back(_image_processor_ptr->image_positions());
                 }
-            }
-        } else {
-            assert(chat.get_images().size() == num_images);
-            for (const auto& image_file_name: chat.get_images()) {
-                image_tensors.emplace_back(_image_processor_ptr->preprocess(image_file_name));
-                if (_vlm_cfg.model_type == "vlm-gemma4_unified") image_positions.push_back(_image_processor_ptr->image_positions());
             }
         }
+        if (image_tensors.size() != num_images) throw std::invalid_argument("Image placeholder/count mismatch");
     }
 
     if (_vlm_cfg.model_type == "vlm-gemma4_unified") {
-        if (image_positions.size() != image_tensors.size() || image_tensors.size() != num_images) {
+        if (image_positions.size() != image_tensors.size()) {
             throw std::runtime_error("Image placeholder/count mismatch");
         }
         size_t cursor = 0;
@@ -255,7 +242,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         const auto& content = message.at("content");
         if (!content.is_array()) continue;
         for (const auto& item : content) {
-            if (item.at("type") != "audio" && item.at("type") != "input_audio") continue;
+            if (item.at("type") != "audio") continue;
             if (!_vlm_cfg.support_audio()) throw std::invalid_argument("This model has no compiled audio frontend");
             const auto& audio = *_vlm_cfg.audio_cfg;
             const auto& source = item.at("audio");

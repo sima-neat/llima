@@ -29,6 +29,7 @@ def _config(arch, *, norm_topk_prob=False, quantize_embeddings=False):
         get_head_dim=lambda _: 16, get_q_size=lambda _: 32, get_kv_size=lambda _: 16,
     )
     lm = SimpleNamespace(
+        vision_bidirectional_attention=False,
         arch=arch, num_hidden_layers=2, hidden_size=HIDDEN, layer_types=["full_attention"] * 2,
         attn_cfg=attn, lora_cfg=None, get_lora_rank=lambda *_: pytest.fail("LoRA lookup requires an adapter"),
         rms_norm_eps=1e-5, rms_norm_unit_offset=False,

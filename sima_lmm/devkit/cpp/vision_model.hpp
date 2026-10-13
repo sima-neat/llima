@@ -31,9 +31,9 @@ class VisionModel : public BaseModel<VlmConfig> {
         );
         void run_unified_model(const std::vector<Eigen::bfloat16>& patches,
                                const std::vector<uint16_t>& positions,
-                               std::map<uint8_t, MLABufferSlice>* ofm_map_ptr);
+                               const MLABufferSlice& destination);
         void run_unified_audio(const std::vector<Eigen::bfloat16>& frames,
-                               std::map<uint8_t, MLABufferSlice>* ofm_map_ptr);
+                               const MLABufferSlice& destination);
 
     private:
         virtual void _initialize() override;
@@ -42,6 +42,7 @@ class VisionModel : public BaseModel<VlmConfig> {
         virtual void _define_buffers() override;
         void _define_models();
         void _validate_model_names() const;
+        void _copy_media_output(const MLABufferSlice& destination, size_t begin, size_t valid);
 
         const VisionModelConfig& _vm_cfg;
         const MMConnectionConfig& _mm_cfg;

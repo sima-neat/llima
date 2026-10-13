@@ -212,7 +212,7 @@ void VisionModel::_define_models() {
 
 void VisionModel::run_unified_model(const std::vector<Eigen::bfloat16>& patches,
                                   const std::vector<uint16_t>& positions,
-                                  std::map<uint8_t, MLABufferSlice>* ofm_map_ptr) {
+                                  const MLABufferSlice& destination) {
     const size_t tokens = positions.size() / 2;
     const size_t group = _cfg.pipeline_cfg.input_token_group_size;
     const size_t side = _vm_cfg.spatial_patch_size * _vm_cfg.spatial_merge_size;
@@ -221,7 +221,6 @@ void VisionModel::run_unified_model(const std::vector<Eigen::bfloat16>& patches,
     if (tokens == 0 || positions.size() % 2 || tokens > _vm_cfg.max_soft_tokens || patches.size() != tokens * patch_dim) {
         throw std::invalid_argument("Unified image patches/positions do not match the token budget");
     }
-    auto& destination = ofm_map_ptr->at(0);
     if (destination.get_buf_shapes()->front() != tokens) throw std::invalid_argument("Image placeholder count mismatch");
     std::vector<Eigen::bfloat16> patch_chunk(group * patch_dim);
     std::vector<Eigen::bfloat16> position_chunk(group * hidden);
@@ -245,22 +244,16 @@ void VisionModel::run_unified_model(const std::vector<Eigen::bfloat16>& patches,
         get_buffer("vision_ifm").upload(patch_chunk.data());
         get_buffer("vision_position_ifm").upload(position_chunk.data());
         _model_ptrs.front()->run();
-        auto& output = get_buffer("vision_ofm");
-        output.invalidate_cache(0, valid * hidden * sizeof(Eigen::bfloat16));
-        destination.get_buf_ptr()->upload_raw(output.get_virtual_addr(),
-            destination.get_byte_offset() + begin * hidden * sizeof(Eigen::bfloat16),
-            valid * hidden * sizeof(Eigen::bfloat16));
+        _copy_media_output(destination, begin, valid);
     }
 }
 
 
 void VisionModel::run_unified_audio(const std::vector<Eigen::bfloat16>& frames,
-                                  std::map<uint8_t, MLABufferSlice>* ofm_map_ptr) {
+                                  const MLABufferSlice& destination) {
     const auto& audio = _cfg.audio_cfg.value();
     const size_t tokens = frames.size() / audio.samples_per_token;
     const size_t group = _cfg.pipeline_cfg.input_token_group_size;
-    const size_t hidden = _cfg.lm_cfg.hidden_size;
-    auto& destination = ofm_map_ptr->at(0);
     if (tokens == 0 || frames.size() % audio.samples_per_token || tokens > audio.max_tokens
         || destination.get_buf_shapes()->front() != tokens) {
         throw std::invalid_argument("Audio frames/placeholder count do not match the token budget");
@@ -272,12 +265,16 @@ void VisionModel::run_unified_audio(const std::vector<Eigen::bfloat16>& frames,
         std::copy_n(frames.begin() + begin * audio.samples_per_token, valid * audio.samples_per_token, chunk.begin());
         get_buffer("audio_ifm").upload(chunk.data());
         _audio_model->run();
-        auto& output = get_buffer("vision_ofm");
-        output.invalidate_cache(0, valid * hidden * sizeof(Eigen::bfloat16));
-        destination.get_buf_ptr()->upload_raw(output.get_virtual_addr(),
-            destination.get_byte_offset() + begin * hidden * sizeof(Eigen::bfloat16),
-            valid * hidden * sizeof(Eigen::bfloat16));
+        _copy_media_output(destination, begin, valid);
     }
+}
+
+void VisionModel::_copy_media_output(const MLABufferSlice& destination, size_t begin, size_t valid) {
+    const size_t row_bytes = _cfg.lm_cfg.hidden_size * sizeof(Eigen::bfloat16);
+    auto& output = get_buffer("vision_ofm");
+    output.invalidate_cache(0, valid * row_bytes);
+    destination.get_buf_ptr()->upload_raw(output.get_virtual_addr(),
+        destination.get_byte_offset() + begin * row_bytes, valid * row_bytes);
 }
 
 void VisionModel::_validate_model_names() const {

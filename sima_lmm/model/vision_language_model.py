@@ -280,17 +280,14 @@ class VisionLanguageModel(BaseModel):
                 raise ValueError("This model has no audio frontend")
             from sima_lmm.preproc.gemma4_unified import audio_frames
             audio_inputs = [audio_frames(path, self.cfg.audio_cfg) for path in chat.audios]
-        if audio_inputs:
-            prompt, input_idxs, images, positions = self.vlm_helper.preprocess(chat, audio_inputs=audio_inputs)
-        else:
-            prompt, input_idxs, images, positions = self.vlm_helper.preprocess(chat)
+        audio_kwargs = {"audio_inputs": audio_inputs} if audio_inputs else {}
+        prompt, input_idxs, images, positions = self.vlm_helper.preprocess(chat, **audio_kwargs)
 
         sima_log_info("prompt='%s'", prompt)
         sima_log_info("input_idxs=%s", input_idxs)
 
         # Run the model to generate output text.
         if eval_mode == EvalMode.HF:
-            audio_kwargs = {"audio_inputs": audio_inputs} if audio_inputs else {}
             output_dict = self.hf_model.execute_hf(
                 messages=chat.messages, images=chat.images,
                 max_new_tokens=self.cfg.pipeline_cfg.max_num_tokens, device="cpu", **audio_kwargs
@@ -309,11 +306,11 @@ class VisionLanguageModel(BaseModel):
                         ifms.extend([image.astype(np.float32), xy])
                 else:
                     ifms.extend(
-                    [np.expand_dims(image, axis=0).astype(np.float32) for image in images]
+                        [np.expand_dims(image, axis=0).astype(np.float32) for image in images]
                     )
+            output_tokens = self.run_model(eval_mode, ifms, **audio_kwargs)
             if self.cfg.pipeline_cfg.return_logits:
-                return self.run_model(eval_mode, ifms, audio_inputs=audio_inputs) if audio_inputs else self.run_model(eval_mode, ifms)
-            output_tokens = self.run_model(eval_mode, ifms, audio_inputs=audio_inputs) if audio_inputs else self.run_model(eval_mode, ifms)
+                return output_tokens
             assert output_tokens.ndim == 2 and output_tokens.shape[0] == 1
             output_text = self.vlm_helper.decode(output_tokens[0].tolist())
         sima_log_info("output text=%s", output_text)

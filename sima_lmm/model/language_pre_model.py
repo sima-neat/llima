@@ -122,7 +122,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             mla_q_out = mla_q_result
         output_nodes = [mla_q_out]
         if not self.cfg.lm_cfg.is_kv_shared_layer(self.layer_idx):
-            mla_k_out = self._build_attn_key(
+            mla_k_out, mla_v_out = self._build_attn_key_value(
                 graph,
                 f"{base_name}.self_attn",
                 attn_input,
@@ -130,13 +130,6 @@ class LanguagePreModel(LanguagePartBaseModel):
                 mla_input_freq_imag,
                 merged_lora,
             )
-            if isinstance(mla_k_out, tuple):
-                mla_k_out, mla_v_out = mla_k_out
-            else:
-                mla_v_out = self._build_attn_value(
-                    graph, f"{base_name}.self_attn", attn_input, merged_lora
-                )
-
             if self.cfg.pipeline_cfg.quantize_kv_cache:
                 k_quant, k_scale = graph.quant(mla_k_out)
                 v_quant, v_scale = graph.quant(mla_v_out)
@@ -219,7 +212,7 @@ class LanguagePreModel(LanguagePartBaseModel):
             return rotary_emb, gate_out
         return rotary_emb
 
-    def _build_attn_key(
+    def _build_attn_key_value(
         self,
         graph: ModelGraph,
         base_name: str,
@@ -227,7 +220,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         freq_real: Node,
         freq_imag: Node,
         merged_lora: bool = False,
-    ) -> Node | tuple[Node, Node]:
+    ) -> tuple[Node, Node]:
+        """Build keys and values, reusing Unified's full-attention projection."""
         lora_rank = None
         if self.cfg.lm_cfg.lora_cfg is not None:
             lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "k_proj")
@@ -250,38 +244,31 @@ class LanguagePreModel(LanguagePartBaseModel):
             k_proj = graph.rms_norm(k_norm_name, k_proj)
 
         reshape1 = graph.split_heads(k_proj, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type))
-        shared_value = None
+        value = None
         if self.cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED and self.cfg.lm_cfg.attention_k_eq_v and self.layer_type == "full_attention":
-            shared_value = graph.rms_norm(None, reshape1)
+            value = graph.rms_norm(None, reshape1)
 
         if k_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(k_norm_name, reshape1)
 
         rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
-        return (rotary_emb, shared_value) if shared_value is not None else rotary_emb
-
-    def _build_attn_value(
-        self, graph: ModelGraph, base_name: str, input_node: Node, merged_lora: bool = False
-    ) -> Node:
-        lora_rank = None
-        if self.cfg.lm_cfg.lora_cfg is not None:
-            lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "v_proj")
-        v_proj = graph.linear(
-            f"{base_name}.v_proj",
-            input_node,
-            merged_lora=merged_lora,
-            q_size=self._q_size,
-            kv_size=self._kv_size,
-            lora_rank=lora_rank,
-        )
-        if self.cfg.model_type not in (VlmArchType.VLM_GEMMA4, VlmArchType.VLM_GEMMA4_UNIFIED):
-            # Strided cache stores KV heads explicitly instead of flattened into kv_size.
-            return graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type))
-
-        # Gemma4 applies value RMS norm per KV head before writing V to cache.
-        split = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type))
-        split = graph.rms_norm(None, split)
-        return split
+        if value is None:
+            lora_rank = None
+            if self.cfg.lm_cfg.lora_cfg is not None:
+                lora_rank = self.cfg.lm_cfg.get_lora_rank(base_name, "v_proj")
+            v_proj = graph.linear(
+                f"{base_name}.v_proj",
+                rms_norm,
+                merged_lora=merged_lora,
+                q_size=self._q_size,
+                kv_size=self._kv_size,
+                lora_rank=lora_rank,
+            )
+            value = graph.split_heads(v_proj, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(self.layer_type))
+            if self.cfg.model_type in (VlmArchType.VLM_GEMMA4, VlmArchType.VLM_GEMMA4_UNIFIED):
+                # Gemma4 applies value RMS norm per KV head before writing V to cache.
+                value = graph.rms_norm(None, value)
+        return rotary_emb, value
 
     def get_mla_output_tessellate_params(self) -> dict[int, TensorTessellateParameters] :
         """

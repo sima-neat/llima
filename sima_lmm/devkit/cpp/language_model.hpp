@@ -69,7 +69,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
         );
-        std::vector<std::map<uint8_t, MLABufferSlice>> create_audio_input_maps(
+        std::vector<MLABufferSlice> create_audio_input_slices(
             std::span<const uint32_t> input_token_ids
         );
         std::optional<std::vector<uint32_t>> run_model(
