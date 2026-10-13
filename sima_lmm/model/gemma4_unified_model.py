@@ -31,7 +31,8 @@ class Gemma4UnifiedImageModel(BaseModel):
             "model.embed_vision.embedding_projection",
             "model.embed_vision.multimodal_embedder.embedding_projection",
         ) if self.check_hf_param(f"{name}.weight"))
-        graph.save([graph.linear(projection, hidden)])
+        output = graph.linear(projection, hidden)
+        graph.save(list(graph.quant(output)) if self.cfg.pipeline_cfg.quantize_embeddings else [output])
 
     @property
     def position_weight_name(self) -> str:
@@ -60,7 +61,8 @@ class Gemma4UnifiedAudioModel(BaseModel):
         rows = self.cfg.pipeline_cfg.input_token_group_size
         graph = ModelGraph(self, {"waveform": (1, 1, rows, audio.samples_per_token)}, quantizable)
         hidden = graph.rms_norm(None, graph.inputs["waveform"], epsilon=audio.rms_norm_eps)
-        graph.save([graph.linear("model.embed_audio.embedding_projection", hidden)])
+        output = graph.linear("model.embed_audio.embedding_projection", hidden)
+        graph.save(list(graph.quant(output)) if self.cfg.pipeline_cfg.quantize_embeddings else [output])
 
     def run_model(self, eval_mode, ifms):
         frames = ifms[0].reshape(-1, self.cfg.audio_cfg.samples_per_token)
@@ -71,5 +73,5 @@ class Gemma4UnifiedAudioModel(BaseModel):
         for begin in range(0, len(frames), rows):
             valid = min(rows, len(frames) - begin)
             chunk = np.pad(frames[begin:begin + valid], ((0, rows - valid), (0, 0)))[None, None]
-            outputs.append(super().run_model(eval_mode, [chunk])[0][..., :valid, :])
-        return [np.concatenate(outputs, axis=2)]
+            outputs.append([output[..., :valid, :] for output in super().run_model(eval_mode, [chunk])])
+        return [np.concatenate(parts, axis=2) for parts in zip(*outputs, strict=True)]

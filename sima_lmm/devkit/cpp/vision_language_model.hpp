@@ -108,7 +108,8 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint16_t> max_num_tokens,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr,
-            uint16_t stable_prefix_token_count = 0
+            uint16_t stable_prefix_token_count = 0,
+            const LanguageModel::MediaLoader& media_loader = {}
         );
 
         VlmHelper _vlm_helper;

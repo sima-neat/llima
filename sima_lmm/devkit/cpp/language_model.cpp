@@ -136,8 +136,8 @@ LanguageModel::LanguageModel(
     );
     if (_cfg.vision_bidirectional_attention() &&
         (!_use_group_token_models || !_cfg.vm_cfg.has_value() || _cfg.vm_cfg->max_soft_tokens == 0
-         || _cfg.pipeline_cfg.quantize_embeddings || _cfg.pipeline_cfg.quantize_kv_cache || _cfg.lm_cfg.is_spec_decode())) {
-        throw std::invalid_argument("Gemma 4 Unified requires grouped prefill, BF16 embeddings/KV and no speculative draft");
+         || _cfg.lm_cfg.is_spec_decode())) {
+        throw std::invalid_argument("Gemma 4 Unified requires grouped prefill and no speculative draft");
     }
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
@@ -299,23 +299,6 @@ const LinearAttentionConfig& LanguageModel::_linear_attn_cfg() const {
 }
 
 
-std::vector<MLABufferSlice> LanguageModel::create_audio_input_slices(
-    std::span<const uint32_t> input_token_ids
-) {
-    std::vector<MLABufferSlice> slices;
-    if (!_cfg.support_audio()) return slices;
-    for (uint32_t begin = 0; begin < input_token_ids.size();) {
-        if (input_token_ids[begin] != _cfg.audio_cfg->token_id) { ++begin; continue; }
-        uint32_t end = begin + 1;
-        while (end < input_token_ids.size() && input_token_ids[end] == _cfg.audio_cfg->token_id) ++end;
-        if (end - begin > _cfg.audio_cfg->max_tokens) throw std::invalid_argument("Audio exceeds the compiled token budget");
-        slices.emplace_back(&get_buffer("input_embeds"), std::vector<uint32_t>{begin, 0},
-                            std::vector<uint32_t>{end - begin, _cfg.lm_cfg.hidden_size});
-        begin = end;
-    }
-    return slices;
-}
-
 std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffers(
     std::span<const uint32_t> input_token_ids
 ) {
@@ -338,11 +321,27 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
         }
     }
 
+    if (_cfg.vision_bidirectional_attention()) {
+        for (uint16_t at = 0; at < num_input_tokens;) {
+            if (!_image_token_id || input_token_ids[at] != *_image_token_id) { ++at; continue; }
+            uint16_t end = at + 1;
+            while (end < num_input_tokens && input_token_ids[end] == *_image_token_id) ++end;
+            if (end - at > _cfg.vm_cfg->max_soft_tokens) throw std::invalid_argument("Image exceeds the compiled token budget");
+            _image_spans.emplace_back(at, end);
+            at = end;
+        }
+        _prepare_image_windows(num_input_tokens);
+        num_padded_input_tokens = _cfg.pipeline_cfg.input_token_group_size;
+        for (const auto& [begin, end] : _image_windows) {
+            num_padded_input_tokens = std::max<uint16_t>(num_padded_input_tokens, end - begin);
+        }
+    }
+
     // Allocate the input embeds with padding to the buffer.
     if (_embedding_offload) {
-        _embedding_offload->chunk_staging = !_image_token_id.has_value()
+        _embedding_offload->chunk_staging = _cfg.vision_bidirectional_attention() || !_image_token_id.has_value()
             || std::find(input_token_ids.begin(), input_token_ids.end(), *_image_token_id) == input_token_ids.end();
-        if (_embedding_offload->chunk_staging) {
+        if (_embedding_offload->chunk_staging && !_cfg.vision_bidirectional_attention()) {
             num_padded_input_tokens = std::max<uint16_t>(
                 _cfg.lm_cfg.get_single_num_tokens(),
                 _use_group_token_models ? _cfg.pipeline_cfg.input_token_group_size : 1
@@ -363,6 +362,8 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
         scale_buf.allocate();
         scale_buf.clear();
     }
+    // Unified media is projected on demand into the active chunk/window.
+    if (_cfg.vision_bidirectional_attention()) return {};
 
     std::vector<std::map<uint8_t, MLABufferSlice>> vision_ofm_maps;
     if (_cfg.vm_cfg.has_value()) {
@@ -386,15 +387,6 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
             token_idx = std::distance(input_token_ids.begin(), it);
 
             // Fill the ofm map.
-            if (_cfg.vision_bidirectional_attention()) {
-                uint32_t end = token_idx;
-                while (end < input_token_ids.size() && input_token_ids[end] == _image_token_id) ++end;
-                mm_tokens_per_image = end - token_idx;
-                if (mm_tokens_per_image > _cfg.vm_cfg->max_soft_tokens) {
-                    throw std::invalid_argument("Image exceeds the compiled token budget");
-                }
-                _image_spans.emplace_back(token_idx, end);
-            }
             std::map<uint8_t, MLABufferSlice> ofm_map;
             ofm_map.emplace(
                 std::piecewise_construct,
@@ -441,7 +433,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::optional<ChronoTimer> timer_ttft,
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids,
-    uint16_t stable_prefix_token_count
+    uint16_t stable_prefix_token_count,
+    const MediaLoader& media_loader
 ) {
     // Update the state.
     _is_running = true;
@@ -475,7 +468,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
 
         // Prefill.
-        auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
+        auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft, media_loader);
         const auto output_token_id_begin = input_token_ids.size();
         if (!_is_running.load(std::memory_order_relaxed)) {
             // Do nothing.
@@ -517,7 +510,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
 uint32_t LanguageModel::run_model_prefill(
     std::span<const uint32_t> input_token_ids,
     uint16_t num_cached_tokens,
-    std::optional<ChronoTimer> timer_ttft
+    std::optional<ChronoTimer> timer_ttft,
+    const MediaLoader& media_loader
 ) {
     if (_uses_per_layer_inputs())
         _prompt_per_layer_token_ids = _get_per_layer_token_ids(input_token_ids);
@@ -574,6 +568,7 @@ uint32_t LanguageModel::run_model_prefill(
                     [&](const auto& span) { return span.first == token_idx && span.second - span.first > num_tokens; });
                 if (_cfg.vision_bidirectional_attention() && window != _image_windows.end()) {
                     const uint16_t begin = token_idx;
+                    _prepare_unified_input(input_token_ids, begin, window->second, media_loader);
                     next_token_id = _run_image_window(begin, window->second, num_input_tokens);
                     if (!_is_running.load(std::memory_order_relaxed)) {
                         _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.begin() + begin);
@@ -583,11 +578,17 @@ uint32_t LanguageModel::run_model_prefill(
                     token_idx = window->second;
                     it = std::lower_bound(offsets.begin(), offsets.end(), token_idx);
                 } else {
+                    if (_cfg.vision_bidirectional_attention()) {
+                        _prepare_unified_input(input_token_ids, token_idx, token_idx + num_tokens, media_loader);
+                    }
                     next_token_id = run_model_once(num_tokens, token_idx, num_input_tokens, 0);
                     ++it;
                     token_idx += num_tokens;
                 }
             } else {
+                if (_cfg.vision_bidirectional_attention()) {
+                    _prepare_unified_input(input_token_ids, token_idx, token_idx + 1, media_loader);
+                }
                 if (_uses_per_layer_inputs()) {
                     _compute_and_upload_per_layer_inputs_prefill(1, token_idx, num_input_tokens);
                 }
@@ -1053,8 +1054,8 @@ uint32_t LanguageModel::run_model_once(
         if (_cfg.pipeline_cfg.quantize_embeddings) {
             normal_scale_buf = &get_buffer("input_embedding_scales");
         }
-        if (_embedding_offload) _prepare_offloaded_prompt(num_tokens, token_idx);
-        normal_input_row = _embedding_offload && _embedding_offload->chunk_staging ? 0 : token_idx;
+        if (_embedding_offload && !_cfg.vision_bidirectional_attention()) _prepare_offloaded_prompt(num_tokens, token_idx);
+        normal_input_row = _cfg.vision_bidirectional_attention() || (_embedding_offload && _embedding_offload->chunk_staging) ? 0 : token_idx;
         normal_input_num_tokens = num_tokens;
     } else {
         normal_input_buf = &get_buffer(_embedding_offload ? "offload_decode_embeds" : "embeddings");
@@ -1579,8 +1580,7 @@ void LanguageModel::_initialize() {
     _logger->info("Language model initialize starting ...");
     const bool draft_model = _cfg.lm_cfg.is_spec_decode()
         && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-    const auto mode = _cfg.vision_bidirectional_attention()
-        ? EmbeddingOffloadMode::Off : embedding_offload_mode();
+    const auto mode = embedding_offload_mode();
     if (!draft_model && mode != EmbeddingOffloadMode::Off) {
         const auto normal = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
         const auto per_layer = _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin");
@@ -3297,7 +3297,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
                 && (!_cfg.support_audio() || input_token_ids[next_token_idx] != _cfg.audio_cfg->token_id)
             )
                 ++next_token_idx;
-            if (!_embedding_offload)
+            if (!_embedding_offload && !_cfg.vision_bidirectional_attention())
                 _gather_embedding_rows(
                     input_token_ids.subspan(token_idx, next_token_idx - token_idx),
                     buf, scales_buf, token_idx

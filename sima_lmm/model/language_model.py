@@ -215,7 +215,7 @@ class LanguageModel(BaseModel):
         image_spans: list[tuple[int, int]] | None = None,
     ) -> list[np.ndarray]:
         if self.cfg.lm_cfg.vision_bidirectional_attention:
-            return self._run_unified_model(eval_mode, ifms[0], embeddings_tensor, image_spans or [])
+            return self._run_unified_model(eval_mode, ifms, embeddings_tensor, embedding_scales, image_spans or [])
         assert self.vlm_helper is not None
         expected_num_ifms = 2 if self.cfg.pipeline_cfg.quantize_embeddings else 1
         assert len(ifms) == expected_num_ifms
@@ -473,11 +473,16 @@ class LanguageModel(BaseModel):
         # Return the generated tokens.
         return np.array([new_tokens])
 
-    def _run_unified_model(self, eval_mode, embeddings, vocabulary, image_spans):
+    def _run_unified_model(self, eval_mode, ifms, vocabulary, vocabulary_scales, image_spans):
         """Host mirror of normal chunk prefill and layer-major image windows."""
         from sima_lmm.preproc.gemma4_unified import attention_mask, image_windows
         if vocabulary is None:
-            vocabulary, _ = self.get_embeddings_tensor()
+            vocabulary, vocabulary_scales = self.get_embeddings_tensor()
+        quantize_embeddings = self.cfg.pipeline_cfg.quantize_embeddings
+        quantize_kv = self.cfg.pipeline_cfg.quantize_kv_cache
+        assert len(ifms) == (2 if quantize_embeddings else 1)
+        embeddings = ifms[0]
+        scales = ifms[1] if quantize_embeddings else None
         group = self.cfg.pipeline_cfg.input_token_group_size
         context = self.cfg.pipeline_cfg.max_num_tokens
         prompt = embeddings.shape[2]
@@ -485,29 +490,57 @@ class LanguageModel(BaseModel):
             raise ValueError("Prompt must be nonempty and fit the compiled context")
         windows = dict(image_windows(image_spans, group))
         embeddings = np.pad(embeddings, ((0, 0), (0, 0), (0, (-prompt) % group), (0, 0)))
-        keys, values = [], []
-        for kind in self.cfg.lm_cfg.layer_types:
+        if scales is not None:
+            scales = np.pad(scales, ((0, 0), (0, 0), (0, (-prompt) % group), (0, 0)))
+        keys, values, key_scales, value_scales = [], [], [], []
+        sources = {}
+        for layer, kind in enumerate(self.cfg.lm_cfg.layer_types):
+            if self.cfg.lm_cfg.is_kv_shared_layer(layer):
+                source = sources[kind]
+                keys.append(keys[source])
+                values.append(values[source])
+                if quantize_kv:
+                    key_scales.append(key_scales[source])
+                    value_scales.append(value_scales[source])
+                continue
+            sources[kind] = layer
             shape = (1, self.cfg.lm_cfg.attn_cfg.get_num_key_value_heads(kind), context,
                      self.cfg.lm_cfg.attn_cfg.get_head_dim(kind))
-            keys.append(np.zeros(shape, np.float32))
-            values.append(np.zeros(shape, np.float32))
+            keys.append(np.zeros(shape, np.int8 if quantize_kv else np.float32))
+            values.append(np.zeros(shape, np.int8 if quantize_kv else np.float32))
+            if quantize_kv:
+                key_scales.append(np.zeros((*shape[:-1], 1), np.float32))
+                value_scales.append(np.zeros((*shape[:-1], 1), np.float32))
         frequencies = {kind: self.calc_freq_real_imag(kind == "sliding_attention")
                        for kind in set(self.cfg.lm_cfg.layer_types)}
-        def forward(begin, end, hidden, rows):
+        def forward(begin, end, hidden, rows, input_scales=None):
             for layer, kind in enumerate(self.cfg.lm_cfg.layer_types):
                 real, imag = frequencies[kind]
                 queries = []
                 for offset in range(0, end - begin, rows):
                     at = begin + offset
                     pre = self._get_part_model("pre", rows, layer_idx=layer)
-                    q, k, v = pre.run_model(eval_mode, [hidden[..., offset:offset + rows, :],
-                        real[..., at:at + rows, :], imag[..., at:at + rows, :]])
-                    keys[layer][..., at:at + rows, :] = k
-                    values[layer][..., at:at + rows, :] = v
-                    queries.append(q)
+                    inputs = [hidden[..., offset:offset + rows, :]]
+                    if layer == 0 and quantize_embeddings:
+                        inputs.append(input_scales[..., offset:offset + rows, :])
+                    inputs.extend([real[..., at:at + rows, :], imag[..., at:at + rows, :]])
+                    outputs = pre.run_model(eval_mode, inputs)
+                    if not self.cfg.lm_cfg.is_kv_shared_layer(layer):
+                        if quantize_kv:
+                            _, k, k_scale, v, v_scale = outputs
+                            key_scales[layer][..., at:at + rows, :] = k_scale
+                            value_scales[layer][..., at:at + rows, :] = v_scale
+                        else:
+                            _, k, v = outputs
+                        keys[layer][..., at:at + rows, :] = k
+                        values[layer][..., at:at + rows, :] = v
+                    queries.append(outputs[0])
                 final = layer + 1 == self.cfg.lm_cfg.num_hidden_layers
                 if final and end < prompt:
                     return None
+                residuals = hidden
+                if layer == 0 and quantize_embeddings:
+                    hidden = np.empty(hidden.shape, np.float32)
                 for slot, q in enumerate(queries):
                     offset = slot * rows
                     at = begin + offset
@@ -525,27 +558,39 @@ class LanguageModel(BaseModel):
                         cache_index = capacity - 1
                     cache = self._get_part_model("sliding_cache" if sliding else "cache", rows, token_idx=cache_index)
                     inputs = [q, keys[layer][..., key_begin:key_begin + capacity, :]]
+                    if quantize_kv:
+                        inputs.append(key_scales[layer][..., key_begin:key_begin + capacity, :])
                     if rows > 1 or cache._cache_mask_size > 1:
                         inputs.append(attention_mask(at, rows, key_begin, capacity,
                             min(end, prompt) if begin < prompt else end, image_spans,
                             self.cfg.lm_cfg.attn_cfg.sliding_window if sliding else 0))
                     inputs.append(values[layer][..., key_begin:key_begin + capacity, :])
+                    if quantize_kv:
+                        inputs.append(value_scales[layer][..., key_begin:key_begin + capacity, :])
                     attended = cache.run_model(eval_mode, inputs)[0]
-                    residual = hidden[..., offset:offset + rows, :]
+                    residual = residuals[..., offset:offset + rows, :]
+                    residual_scale = input_scales[..., offset:offset + rows, :] if layer == 0 and quantize_embeddings else None
                     post_rows = rows
                     if final:
                         last = min(end, prompt) - at - 1 if begin < prompt else 0
                         residual = residual[..., last:last + 1, :]
                         attended = attended[..., last:last + 1, :]
+                        if residual_scale is not None:
+                            residual_scale = residual_scale[..., last:last + 1, :]
                         post_rows = 1
-                    outputs = self._get_part_model("post", post_rows, layer_idx=layer).run_model(eval_mode, [residual, attended])
+                    post_inputs = [residual]
+                    if residual_scale is not None:
+                        post_inputs.append(residual_scale)
+                    post_inputs.append(attended)
+                    outputs = self._get_part_model("post", post_rows, layer_idx=layer).run_model(eval_mode, post_inputs)
                     if final:
                         return outputs
                     hidden[..., offset:offset + rows, :] = outputs[0]
         at = 0
         while at < prompt:
             end = windows.get(at, at + group)
-            outputs = forward(at, end, embeddings[..., at:end, :].copy(), group)
+            outputs = forward(at, end, embeddings[..., at:end, :].copy(), group,
+                              scales[..., at:end, :] if scales is not None else None)
             at = end
         generated = []
         for at in range(prompt, context):
@@ -559,7 +604,8 @@ class LanguageModel(BaseModel):
             generated.append(logits if self.cfg.pipeline_cfg.return_logits else token)
             if token in self.vlm_helper.stop_tokens:
                 break
-            outputs = forward(at, at + 1, vocabulary[token][None, None, None].copy(), 1)
+            outputs = forward(at, at + 1, vocabulary[token][None, None, None].copy(), 1,
+                              vocabulary_scales[token][None, None, None] if quantize_embeddings else None)
         return np.array([generated])
 
     def _run_moe_post(self, eval_mode, num_tokens, layer_idx, hidden, self_attn):

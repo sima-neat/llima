@@ -47,6 +47,8 @@ using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
 class LanguageModel : public BaseModel<VlmConfig> {
     public:
+        // Project media in [begin, end) into slices whose row zero corresponds to begin.
+        using MediaLoader = std::function<void(uint16_t, uint16_t, const MLABufferSlice&, const MLABufferSlice*)>;
         // Existing disk-loading overload; preserves source compatibility.
         LanguageModel(
             std::filesystem::path model_path,
@@ -69,20 +71,19 @@ class LanguageModel : public BaseModel<VlmConfig> {
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
         );
-        std::vector<MLABufferSlice> create_audio_input_slices(
-            std::span<const uint32_t> input_token_ids
-        );
         std::optional<std::vector<uint32_t>> run_model(
             std::span<const uint32_t> input_token_ids,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt,
-            uint16_t stable_prefix_token_count = 0
+            uint16_t stable_prefix_token_count = 0,
+            const MediaLoader& media_loader = {}
         );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
             uint16_t num_cached_tokens,
-            std::optional<ChronoTimer> = std::nullopt
+            std::optional<ChronoTimer> = std::nullopt,
+            const MediaLoader& media_loader = {}
         );
         void run_model_decode(uint16_t num_input_tokens, uint32_t token_id);
         uint32_t run_model_once(
@@ -294,6 +295,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _prepare_image_windows(uint16_t prompt_length);
         void _upload_image_attention_masks(uint16_t begin, uint16_t valid_end, uint16_t slot);
         uint32_t _run_image_window(uint16_t begin, uint16_t end, uint16_t prompt_length);
+        void _prepare_unified_input(std::span<const uint32_t> ids, uint16_t begin, uint16_t end,
+                                    const MediaLoader& media_loader);
         std::shared_ptr<EmbeddingOffload> _embedding_offload;
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,

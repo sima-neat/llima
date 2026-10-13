@@ -89,8 +89,8 @@ class VisionModel(BaseModel):
                 count = min(group, len(patches) - begin)
                 inputs = [np.pad(x[begin:begin + count], ((0, group - count), (0, 0)))[None, None]
                           for x in (patches, position_embeddings)]
-                outputs.append(model.run_model(eval_mode, inputs)[0][..., :count, :])
-            return [np.concatenate(outputs, axis=2)]
+                outputs.append([output[..., :count, :] for output in model.run_model(eval_mode, inputs)])
+            return [np.concatenate(parts, axis=2) for parts in zip(*outputs, strict=True)]
         layer_ifms = ifms
         deepstack_outputs: dict[int, np.ndarray] = {}
         deepstack_indexes = self.cfg.vm_cfg.deepstack_visual_indexes

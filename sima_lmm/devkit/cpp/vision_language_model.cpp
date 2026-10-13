@@ -115,24 +115,62 @@ std::optional<std::string> VisionLanguageModel::run_model(
         preprocessed_data.input_token_ids
     );
 
-    // Encode the image tensors to embeddings. The image embeddings are directly written to the
-    // input embeddings for the language models.
-    ChronoTimer timer_image_encode(true);
-    for (size_t i = 0; i < vision_ofm_maps.size(); ++i) {
-        if (_cfg.model_type == "vlm-gemma4_unified") {
-            _vision_model_ptr->run_unified_model(preprocessed_data.image_tensors.at(i),
-                preprocessed_data.image_positions.at(i), vision_ofm_maps[i].at(0));
-        } else {
+    struct MediaSpan { uint16_t begin, end; size_t index; bool audio; };
+    std::vector<MediaSpan> media;
+    LanguageModel::MediaLoader media_loader;
+    if (_cfg.vision_bidirectional_attention()) {
+        const auto image_token = _vlm_helper.get_image_token_id();
+        const auto& ids = preprocessed_data.input_token_ids;
+        size_t images = 0, audios = 0;
+        for (uint16_t at = 0; at < ids.size();) {
+            const bool audio = _cfg.support_audio() && ids[at] == _cfg.audio_cfg->token_id;
+            if (!audio && (!image_token || ids[at] != *image_token)) { ++at; continue; }
+            uint16_t end = at + 1;
+            while (end < ids.size() && ids[end] == ids[at]) ++end;
+            if (audio && end - at > _cfg.audio_cfg->max_tokens) {
+                throw std::invalid_argument("Audio exceeds the compiled token budget");
+            }
+            const size_t index = audio ? audios++ : images++;
+            const size_t rows = audio
+                ? preprocessed_data.audio_tensors.at(index).size() / _cfg.audio_cfg->samples_per_token
+                : preprocessed_data.image_positions.at(index).size() / 2;
+            if (rows != end - at) throw std::invalid_argument("Media placeholder/count mismatch");
+            media.push_back({at, end, index, audio});
+            at = end;
+        }
+        if (images != preprocessed_data.image_tensors.size() || audios != preprocessed_data.audio_tensors.size()) {
+            throw std::invalid_argument("Media placeholder/count mismatch");
+        }
+        media_loader = [&](uint16_t begin, uint16_t end, const MLABufferSlice& input,
+                           const MLABufferSlice* scales) {
+            for (const auto& span : media) {
+                const uint16_t first = std::max(begin, span.begin), last = std::min(end, span.end);
+                if (first >= last) continue;
+                const uint32_t rows = last - first, offset = first - span.begin;
+                const MLABufferSlice destination{input.get_buf_ptr(), {static_cast<uint32_t>(first - begin), 0}, {rows, _cfg.lm_cfg.hidden_size}};
+                const MLABufferSlice scale_rows{scales ? scales->get_buf_ptr() : nullptr,
+                    {static_cast<uint32_t>(first - begin), 0}, {rows, 1}};
+                if (span.audio) {
+                    const auto width = _cfg.audio_cfg->samples_per_token;
+                    _vision_model_ptr->run_unified_audio(
+                        std::span(preprocessed_data.audio_tensors[span.index]).subspan(offset * width, rows * width),
+                        destination, scales ? &scale_rows : nullptr);
+                } else {
+                    const auto side = _cfg.vm_cfg->spatial_patch_size * _cfg.vm_cfg->spatial_merge_size;
+                    const auto width = 3 * side * side;
+                    _vision_model_ptr->run_unified_model(
+                        std::span(preprocessed_data.image_tensors[span.index]).subspan(offset * width, rows * width),
+                        std::span(preprocessed_data.image_positions[span.index]).subspan(offset * 2, rows * 2),
+                        destination, scales ? &scale_rows : nullptr);
+                }
+            }
+        };
+    } else {
+        ChronoTimer timer_image_encode(true);
+        for (size_t i = 0; i < vision_ofm_maps.size(); ++i) {
             _vision_model_ptr->run_model(preprocessed_data.image_tensors.at(i), &vision_ofm_maps[i]);
         }
-    }
-    _logger->info("Image encode time: {:.2f}s", timer_image_encode.stop());
-    auto audio_slices = _language_model_ptr->create_audio_input_slices(preprocessed_data.input_token_ids);
-    if (audio_slices.size() != preprocessed_data.audio_tensors.size()) {
-        throw std::invalid_argument("Audio placeholder/count mismatch");
-    }
-    for (size_t i = 0; i < audio_slices.size(); ++i) {
-        _vision_model_ptr->run_unified_audio(preprocessed_data.audio_tensors[i], audio_slices[i]);
+        _logger->info("Image encode time: {:.2f}s", timer_image_encode.stop());
     }
 
     // Decode the text and image embeddings. When a draft VLM is configured
@@ -144,7 +182,7 @@ std::optional<std::string> VisionLanguageModel::run_model(
 
     auto output_token_ids = _run_language_model(
         preprocessed_data.input_token_ids, max_num_tokens, timer_ttft,
-        nullptr, preprocessed_data.stable_prefix_token_count
+        nullptr, preprocessed_data.stable_prefix_token_count, media_loader
     );
 
     if (output_token_ids.has_value())
@@ -158,11 +196,12 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_language_model(
     std::optional<uint16_t> max_num_tokens,
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result,
-    uint16_t stable_prefix_token_count
+    uint16_t stable_prefix_token_count,
+    const LanguageModel::MediaLoader& media_loader
 ) {
     if (_draft_vlm_ptr == nullptr) {
         return _language_model_ptr->run_model(
-            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count
+            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count, media_loader
         );
     }
     if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value()) {

@@ -14,7 +14,7 @@ from sima_lmm.config.vlm_config import AudioModelConfig, ModelFormat, VlmConfig
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import BaseModel, EvalMode
 from sima_lmm.model.language_model import LanguageModel
-from sima_lmm.model.model_graph import ModelGraph
+from sima_lmm.model.model_graph import ModelGraph, tensor_type
 from sima_lmm.preproc.gemma4_unified import image_windows
 from sima_lmm.preproc.gemma4_unified import audio_frames
 
@@ -57,9 +57,14 @@ def unified(tmp_path):
     return reference, language, params
 
 
-def test_unified_geometry_and_component_contract(unified):
+@pytest.mark.parametrize("quantize_embeddings,quantize_kv_cache", [
+    (False, False), (True, False), (False, True), (True, True),
+])
+def test_unified_geometry_and_component_contract(unified, quantize_embeddings, quantize_kv_cache):
     _, model, _ = unified
     cfg = model.cfg
+    cfg.pipeline_cfg.quantize_embeddings = quantize_embeddings
+    cfg.pipeline_cfg.quantize_kv_cache = quantize_kv_cache
     assert cfg.lm_cfg.attn_cfg.get_num_key_value_heads("sliding_attention") == 2
     assert cfg.lm_cfg.attn_cfg.get_num_key_value_heads("full_attention") == 1
     assert cfg.get_prefill_cache_capacity("sliding_attention") == 512
@@ -70,6 +75,26 @@ def test_unified_geometry_and_component_contract(unified):
     ]
     assert not any("per_layer" in p.part for p in ids)
     assert VlmConfig.load(asdict(cfg)) == cfg
+    for kind in ("pre", "post", "cache", "sliding_cache"):
+        part = model._get_part_model(kind, 128, **({"layer_idx": 0} if kind in ("pre", "post") else {"token_idx": 0}))
+        with patch.object(ModelGraph, "save", autospec=True) as save:
+            part.generate_graph({}, quantizable=True)
+        graph, outputs = save.call_args.args
+        if kind in ("pre", "post"):
+            assert ("input_scale" in graph.inputs) == quantize_embeddings
+            assert tensor_type(graph.inputs["input"]).scalar.numpy_type() == (np.int8 if quantize_embeddings else np.float32)
+            if kind == "pre":
+                assert len(outputs) == (5 if quantize_kv_cache else 3)
+                assert tensor_type(outputs[1]).scalar.numpy_type() == (np.int8 if quantize_kv_cache else np.float32)
+        else:
+            names = ["input", "cached_keys"]
+            if quantize_kv_cache:
+                names.append("cached_keys_scale")
+            names.extend(["attn_mask", "cached_values"])
+            if quantize_kv_cache:
+                names.append("cached_values_scale")
+            assert list(graph.inputs) == names
+            assert tensor_type(graph.inputs["cached_keys"]).scalar.numpy_type() == (np.int8 if quantize_kv_cache else np.float32)
     with pytest.raises(ValueError, match="grouped prefill"):
         cfg.config_pipeline(None, None, 1024, 1, 1)
 

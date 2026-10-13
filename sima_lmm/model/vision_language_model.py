@@ -110,8 +110,6 @@ class VisionLanguageModel(BaseModel):
                     raise ValueError("Audio processor and model disagree on samples per token")
             if override_language_group_size is None:
                 override_language_group_size = 128
-            if quantize_embeddings or quantize_kv_cache:
-                raise ValueError("Gemma 4 Unified currently requires BF16 embeddings and KV cache")
             if target_model is not None:
                 raise ValueError("Gemma 4 Unified speculative decoding is not supported yet")
         # Set the token size and offsets for group processing.
@@ -330,17 +328,18 @@ class VisionLanguageModel(BaseModel):
             if len(ifms) > 1:
                 vision = VisionModel(self.cfg, self.vision_model_name, sima_path=self.sima_path, hf_model=self.hf_model)
                 projected[self.vlm_helper.image_token_id] = [
-                    vision.run_model(eval_mode, ifms[i:i + 2])[0] for i in range(1, len(ifms), 2)
+                    vision.run_model(eval_mode, ifms[i:i + 2]) for i in range(1, len(ifms), 2)
                 ]
             if audio_inputs:
                 from sima_lmm.model.gemma4_unified_model import Gemma4UnifiedAudioModel
                 audio_model = Gemma4UnifiedAudioModel(self.cfg, f"{self.model_name}_audio",
                                                     sima_path=self.sima_path, hf_model=self.hf_model)
                 projected[self.cfg.audio_cfg.token_id] = [
-                    audio_model.run_model(eval_mode, [frames])[0] for frames in audio_inputs
+                    audio_model.run_model(eval_mode, [frames]) for frames in audio_inputs
                 ]
             tokens = ifms[0][0].tolist()
             hidden = embeddings_tensor[tokens].copy()
+            scales = embeddings_scale[tokens].copy() if embeddings_scale is not None else None
             counts = dict.fromkeys(projected, 0)
             spans = []
             at = 0
@@ -352,10 +351,13 @@ class VisionLanguageModel(BaseModel):
                     kind = tokens[at]
                     if counts[kind] >= len(projected[kind]):
                         raise ValueError("Media placeholders exceed the supplied attachments")
-                    rows = projected[kind][counts[kind]].reshape(-1, hidden.shape[-1])
+                    outputs = projected[kind][counts[kind]]
+                    rows = outputs[0].reshape(-1, hidden.shape[-1])
                     if len(rows) != end - at:
                         raise ValueError("Media placeholder count does not match projected rows")
                     hidden[at:end] = rows
+                    if scales is not None:
+                        scales[at:end] = outputs[1].reshape(-1, 1)
                     counts[kind] += 1
                     if kind == self.vlm_helper.image_token_id:
                         spans.append((at, end))
@@ -364,8 +366,11 @@ class VisionLanguageModel(BaseModel):
                     at += 1
             if any(counts[kind] != len(rows) for kind, rows in projected.items()):
                 raise ValueError("Supplied attachment has no matching placeholder")
-            return self.language_model.run_model(eval_mode, [hidden[None, None]],
-                embeddings_tensor=embeddings_tensor, image_spans=spans)
+            inputs = [hidden[None, None]]
+            if scales is not None:
+                inputs.append(scales[None, None])
+            return self.language_model.run_model(eval_mode, inputs,
+                embeddings_tensor=embeddings_tensor, embedding_scales=embeddings_scale, image_spans=spans)
         if len(ifms) == 1:
             text_token_idxs = ifms[0]
             num_queries = text_token_idxs.shape[0]

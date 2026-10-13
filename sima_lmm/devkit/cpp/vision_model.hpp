@@ -2,6 +2,7 @@
 #define _SIMA_LLIMA_VISION_MODEL_
 
 #include <memory>
+#include <span>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -29,11 +30,13 @@ class VisionModel : public BaseModel<VlmConfig> {
             const std::vector<Eigen::bfloat16>& ifm_tensor,
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
         );
-        void run_unified_model(const std::vector<Eigen::bfloat16>& patches,
-                               const std::vector<uint16_t>& positions,
-                               const MLABufferSlice& destination);
-        void run_unified_audio(const std::vector<Eigen::bfloat16>& frames,
-                               const MLABufferSlice& destination);
+        void run_unified_model(std::span<const Eigen::bfloat16> patches,
+                               std::span<const uint16_t> positions,
+                               const MLABufferSlice& destination,
+                               const MLABufferSlice* scale_destination = nullptr);
+        void run_unified_audio(std::span<const Eigen::bfloat16> frames,
+                               const MLABufferSlice& destination,
+                               const MLABufferSlice* scale_destination = nullptr);
 
     private:
         virtual void _initialize() override;
@@ -42,7 +45,8 @@ class VisionModel : public BaseModel<VlmConfig> {
         virtual void _define_buffers() override;
         void _define_models();
         void _validate_model_names() const;
-        void _copy_media_output(const MLABufferSlice& destination, size_t begin, size_t valid);
+        void _copy_media_output(const MLABufferSlice& destination, const MLABufferSlice* scale_destination,
+                                size_t begin, size_t valid);
 
         const VisionModelConfig& _vm_cfg;
         const MMConnectionConfig& _mm_cfg;

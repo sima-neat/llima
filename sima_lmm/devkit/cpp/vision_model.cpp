@@ -85,10 +85,12 @@ void VisionModel::_initialize() {
         MLAModelWithBuffer::load_all_models(_elf_dir / model_name, _files.get());
     }
     if (_cfg.support_audio()) {
+        std::vector<MLABufferSlice> outputs{&get_buffer("vision_ofm")};
+        if (_cfg.pipeline_cfg.quantize_embeddings) outputs.emplace_back(&get_buffer("vision_ofm_scale"));
         _audio_model = std::make_unique<MLAModelWithBuffer>(
             _elf_dir / (_cfg.audio_model_name + "_stage1_mla.elf"),
             std::vector<MLABufferSlice>{&get_buffer("audio_ifm")},
-            std::vector<MLABufferSlice>{&get_buffer("vision_ofm")});
+            std::move(outputs));
         MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.audio_model_name, _files.get());
     }
     _logger->info("Vision model initialize completed");
@@ -151,7 +153,8 @@ void VisionModel::_define_buffers() {
         _cfg.pipeline_cfg.quantize_embeddings ? "int8" : "bfloat16"
     );
     if (_cfg.pipeline_cfg.quantize_embeddings) {
-        define_buffer("vision_ofm_scale", {_mm_cfg.mm_tokens_per_image, 1});
+        define_buffer("vision_ofm_scale",
+            {_cfg.model_type == "vlm-gemma4_unified" ? _cfg.pipeline_cfg.input_token_group_size : _mm_cfg.mm_tokens_per_image, 1});
     }
     if (_cfg.vision_model_name.size() > 1) {
         uint32_t seq_len = (
@@ -210,9 +213,10 @@ void VisionModel::_define_models() {
     }
 }
 
-void VisionModel::run_unified_model(const std::vector<Eigen::bfloat16>& patches,
-                                  const std::vector<uint16_t>& positions,
-                                  const MLABufferSlice& destination) {
+void VisionModel::run_unified_model(std::span<const Eigen::bfloat16> patches,
+                                  std::span<const uint16_t> positions,
+                                  const MLABufferSlice& destination,
+                                  const MLABufferSlice* scale_destination) {
     const size_t tokens = positions.size() / 2;
     const size_t group = _cfg.pipeline_cfg.input_token_group_size;
     const size_t side = _vm_cfg.spatial_patch_size * _vm_cfg.spatial_merge_size;
@@ -244,13 +248,14 @@ void VisionModel::run_unified_model(const std::vector<Eigen::bfloat16>& patches,
         get_buffer("vision_ifm").upload(patch_chunk.data());
         get_buffer("vision_position_ifm").upload(position_chunk.data());
         _model_ptrs.front()->run();
-        _copy_media_output(destination, begin, valid);
+        _copy_media_output(destination, scale_destination, begin, valid);
     }
 }
 
 
-void VisionModel::run_unified_audio(const std::vector<Eigen::bfloat16>& frames,
-                                  const MLABufferSlice& destination) {
+void VisionModel::run_unified_audio(std::span<const Eigen::bfloat16> frames,
+                                  const MLABufferSlice& destination,
+                                  const MLABufferSlice* scale_destination) {
     const auto& audio = _cfg.audio_cfg.value();
     const size_t tokens = frames.size() / audio.samples_per_token;
     const size_t group = _cfg.pipeline_cfg.input_token_group_size;
@@ -265,16 +270,24 @@ void VisionModel::run_unified_audio(const std::vector<Eigen::bfloat16>& frames,
         std::copy_n(frames.begin() + begin * audio.samples_per_token, valid * audio.samples_per_token, chunk.begin());
         get_buffer("audio_ifm").upload(chunk.data());
         _audio_model->run();
-        _copy_media_output(destination, begin, valid);
+        _copy_media_output(destination, scale_destination, begin, valid);
     }
 }
 
-void VisionModel::_copy_media_output(const MLABufferSlice& destination, size_t begin, size_t valid) {
-    const size_t row_bytes = _cfg.lm_cfg.hidden_size * sizeof(Eigen::bfloat16);
-    auto& output = get_buffer("vision_ofm");
-    output.invalidate_cache(0, valid * row_bytes);
-    destination.get_buf_ptr()->upload_raw(output.get_virtual_addr(),
-        destination.get_byte_offset() + begin * row_bytes, valid * row_bytes);
+void VisionModel::_copy_media_output(const MLABufferSlice& destination,
+                                    const MLABufferSlice* scale_destination, size_t begin, size_t valid) {
+    auto copy = [&](MLABuffer& output, const MLABufferSlice& target) {
+        // Both buffers use MLA row padding, including the one-channel scale rows.
+        const size_t row_bytes = round_up_to(output.get_shape().back() * output.get_elem_size(), MLA_ROW_SIZE);
+        output.invalidate_cache(0, valid * row_bytes);
+        target.get_buf_ptr()->upload_raw(output.get_virtual_addr(),
+            target.get_byte_offset() + begin * row_bytes, valid * row_bytes);
+    };
+    if (_cfg.pipeline_cfg.quantize_embeddings && scale_destination == nullptr) {
+        throw std::invalid_argument("Quantized media output requires an embedding scale destination");
+    }
+    copy(get_buffer("vision_ofm"), destination);
+    if (_cfg.pipeline_cfg.quantize_embeddings) copy(get_buffer("vision_ofm_scale"), *scale_destination);
 }
 
 void VisionModel::_validate_model_names() const {
