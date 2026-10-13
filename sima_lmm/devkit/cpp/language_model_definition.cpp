@@ -762,6 +762,9 @@ void LanguageModel::_define_models() {
         }
         if (num_tokens == single_num_tokens) {
             for (uint16_t token_idx = 0; token_idx < max_num_tokens; ++token_idx) {
+                if (_cfg.lm_cfg.is_dflash() && token_idx + num_tokens > max_num_tokens) {
+                    break;
+                }
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
                     if (
                         _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"

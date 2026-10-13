@@ -2557,9 +2557,11 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
         && _cfg.lm_cfg.attn_cfg.sliding_head_dim.has_value()
         && _cfg.lm_cfg.attn_cfg.sliding_head_dim.value() != _cfg.lm_cfg.attn_cfg.head_dim
     );
+    // Bucket differences matter only when the sliding window truncates the context.
     const bool sliding_cache_mask_differs = (
         layer_type == "sliding_attention"
         && !separate_sliding_cache
+        && sliding_window < _cfg.pipeline_cfg.max_num_tokens
         && (
             _get_cache_mask_size("full_attention", sliding_window, true)
                 != _get_cache_mask_size("sliding_attention", sliding_window, true)
