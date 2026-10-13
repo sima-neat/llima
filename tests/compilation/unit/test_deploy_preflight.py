@@ -1,4 +1,5 @@
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -193,7 +194,9 @@ def test_speculative_preflight_runs_once_for_parent(
     ]
 
 
-def test_low_free_space_warns(tmp_path: Path, fake_run: FakeRun, deploy_calls: list, capsys) -> None:
+def test_low_free_space_warns(
+    tmp_path: Path, fake_run: FakeRun, deploy_calls: list, capsys
+) -> None:
     sima_dir = _write_sima_files(tmp_path / "compiled")
     (sima_dir / "mpk" / "model.tar.gz").write_bytes(b"\0" * 4096)
     fake_run.result = (0, "1\n", "")
@@ -230,3 +233,30 @@ def test_lora_preflight_requires_elf_files(tmp_path: Path, fake_run: FakeRun, mo
     with pytest.raises(RuntimeError, match="elf_files does not exist on devkit"):
         deploy_lora.deploy(tmp_path, "devkit:/models/llama")
     assert copies == []
+
+
+def test_lora_remote_root_destination_keeps_root(
+    tmp_path: Path, fake_run: FakeRun, monkeypatch
+) -> None:
+    copies = []
+    monkeypatch.setattr(
+        deploy_lora, "_copy_npy_files", lambda src, dst, rsh: copies.append((src, dst, rsh))
+    )
+
+    deploy_lora.deploy(tmp_path, "devkit:/")
+
+    script = fake_run.preflight_calls[0][-1]
+    assert script.splitlines()[0] == "test -d /elf_files || exit 5"
+    assert "mkdir -p /npy_files" in script
+    assert copies[0][1] == "devkit:/npy_files"
+
+
+def test_deployment_size_counts_extracted_elf(tmp_path: Path) -> None:
+    sima_dir = _write_sima_files(tmp_path / "compiled")
+    elf = tmp_path / "model_stage1_mla.elf"
+    elf.write_bytes(b"\0" * (1024 * 1024))
+    with tarfile.open(sima_dir / "mpk" / "model_mpk.tar.gz", "w:gz") as archive:
+        archive.add(elf, arcname=elf.name)
+
+    assert (sima_dir / "mpk" / "model_mpk.tar.gz").stat().st_size < 64 * 1024
+    assert deploy_lmm._deployment_size_kb([(None, sima_dir)]) >= 1024

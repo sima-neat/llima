@@ -129,12 +129,32 @@ def _deploy_sima_files(src_sima_dir: Path, dst_dir: Path | str, rsh: str | None 
     subprocess.check_call(cmd)
 
 
+def _extracted_size(mpk_file: Path) -> int:
+    """
+    Upper bound of the ELF extracted from an MPK archive: the uncompressed tar
+    size from the gzip trailer, which gzip stores modulo 4 GiB.
+    """
+    compressed_size = mpk_file.stat().st_size
+    try:
+        with mpk_file.open("rb") as stream:
+            stream.seek(-4, os.SEEK_END)
+            uncompressed_size = int.from_bytes(stream.read(4), "little")
+    except OSError:
+        return compressed_size
+    return max(uncompressed_size, compressed_size)
+
+
 def _deployment_size_kb(sources: list[tuple[str | None, Path]]) -> int:
-    """Upper-bound estimate of the deployed size, taken before ELF extraction."""
-    paths = []
+    """
+    Upper-bound estimate of the deployed size, taken before ELF extraction.
+    An archive that is larger than 4 GiB uncompressed is under-counted.
+    """
+    total_kb = 0
     for _, src_sima_dir in sources:
-        paths += [src_sima_dir / "devkit", src_sima_dir / "mpk", src_sima_dir / "npy_files"]
-    return local_size_kb(paths)
+        total_kb += local_size_kb([src_sima_dir / "devkit", src_sima_dir / "npy_files"])
+        mpk_files = (src_sima_dir / "mpk").glob("*.tar.gz")
+        total_kb += sum(_extracted_size(mpk_file) for mpk_file in mpk_files) // 1024
+    return total_kb
 
 
 def deploy(

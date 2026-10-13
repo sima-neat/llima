@@ -42,7 +42,7 @@ def _copy_npy_files(src_dir: Path, target_folder: str, rsh: str | None) -> None:
 
 
 def deploy(src_dir: Path, dst_dir: str, rsh: str | None = None, preflight: bool = True) -> None:
-    dst_dir = str(dst_dir).rstrip("/") or "/"
+    dst_dir = str(dst_dir)
     remote = parse_remote_destination(dst_dir)
     if remote is None or not preflight:
         _check_local_elf_dir(src_dir, dst_dir)
