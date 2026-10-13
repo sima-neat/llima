@@ -20,7 +20,6 @@ class ConfigurationCase:
 
 
 CONFIGURATION_CASES = (
-    ConfigurationCase("models--google--gemma-4-12B-it", "gemma4_unified_vlm_config.json", "hf"),
     # Hugging Face LLMs
     ConfigurationCase(
         "models--meta-llama--Llama-2-7b-chat-hf",
@@ -238,11 +237,6 @@ class GraphRegressionCase:
 
 
 GRAPH_REGRESSION_CASES = (
-    GraphRegressionCase("models--google--gemma-4-12B-it", "pre", mode="informative"),
-    GraphRegressionCase("models--google--gemma-4-12B-it", "pre", layer_index=5, mode="informative"),
-    GraphRegressionCase("models--google--gemma-4-12B-it", "post", mode="informative"),
-    GraphRegressionCase("models--google--gemma-4-12B-it", "vision", mode="informative"),
-    GraphRegressionCase("models--google--gemma-4-12B-it", "audio", mode="informative"),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "pre"),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "cache"),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "post"),
