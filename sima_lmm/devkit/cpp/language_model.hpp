@@ -486,6 +486,19 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
+        struct LMHeadLogitView {
+            MLABuffer* buffer;
+            const uint8_t* data;
+            size_t row_bytes;
+            uint32_t vocab_begin;
+            uint32_t width;
+        };
+        void _prepare_lm_head_logit_views(
+            uint16_t num_tokens, uint16_t output_rows, std::vector<LMHeadLogitView>& views
+        );
+        static uint32_t _argmax_lm_head_row(
+            std::span<const LMHeadLogitView> views, uint16_t row
+        );
         uint32_t _argmax_gemma4_mtp_masked_row(uint16_t num_tokens, uint16_t row);
         std::vector<uint32_t> _argmax_lm_head_rows(
             uint16_t num_tokens, uint16_t valid_tokens,

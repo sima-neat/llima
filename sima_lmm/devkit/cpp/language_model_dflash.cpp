@@ -19,14 +19,6 @@ bool is_attention(std::string_view layer_type) {
   return layer_type == "full_attention" || layer_type == "sliding_attention";
 }
 
-struct DFlashLogitView {
-  MLABuffer *buffer;
-  const uint8_t *data;
-  size_t row_stride;
-  uint32_t vocab_begin;
-  uint32_t width;
-};
-
 class ScopeExit {
 public:
   explicit ScopeExit(std::function<void()> callback)
@@ -44,7 +36,7 @@ struct LanguageModel::DFlashScratch {
   std::vector<uint32_t> proposals;
   std::vector<uint32_t> verify_input;
   std::vector<uint32_t> emitted;
-  std::vector<DFlashLogitView> logit_views;
+  std::vector<LMHeadLogitView> logit_views;
   std::vector<Eigen::bfloat16> attention_mask;
   std::vector<Eigen::bfloat16> linear_valid_mask;
 };
@@ -434,51 +426,17 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
   }
   MLAModelWithBuffer::run_queue();
 
-  const uint32_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
   auto &proposals = scratch.proposals;
   proposals.resize(num_tokens - 1);
   auto &views = scratch.logit_views;
-  views.clear();
-  auto add_view = [&](MLABuffer &buffer, uint32_t begin, uint32_t width) {
-    if (buffer.get_dtype() != "bfloat16" || buffer.get_shape().size() != 2 ||
-        buffer.get_shape().front() != proposals.size() ||
-        buffer.get_shape().back() != width) {
-      throw std::runtime_error("Invalid DFlash draft logit buffer");
-    }
-    buffer.invalidate_cache();
-    views.push_back(DFlashLogitView{
-        &buffer, static_cast<const uint8_t *>(buffer.get_virtual_addr()),
-        buffer.get_buf_len(std::vector<uint32_t>{1, width}), begin, width});
-  };
-  if (_cfg.lm_cfg.lm_head_num_splits == 1) {
-    add_view(get_buffer(fmt::format("n{}_buffer4", num_tokens)), 0,
-             vocab_size);
-  } else {
-    for (uint32_t split = 0, begin = 0; begin < vocab_size;
-         begin += _cfg.lm_cfg.lm_head_split_dim, ++split) {
-      const uint32_t width =
-          std::min(_cfg.lm_cfg.lm_head_split_dim, vocab_size - begin);
-      add_view(get_buffer(fmt::format("n{}_lm_split{}", num_tokens, split)),
-               begin, width);
-    }
+  _prepare_lm_head_logit_views(num_tokens, proposals.size(), views);
+  for (const auto &view : views) {
+    view.buffer->invalidate_cache();
   }
 
 #pragma omp parallel for schedule(static)
   for (int row = 0; row < static_cast<int>(proposals.size()); ++row) {
-    float best = -std::numeric_limits<float>::infinity();
-    uint32_t best_token = 0;
-    for (const auto &view : views) {
-      const auto *logits = reinterpret_cast<const Eigen::bfloat16 *>(
-          view.data + static_cast<size_t>(row) * view.row_stride);
-      const auto [split_best, split_index] =
-          argmax_bf16(logits, view.width);
-      const uint32_t token = view.vocab_begin + split_index;
-      if (split_best > best || (split_best == best && token < best_token)) {
-        best = split_best;
-        best_token = token;
-      }
-    }
-    proposals[row] = best_token;
+    proposals[row] = _argmax_lm_head_row(views, row);
   }
 
   // Drop the noisy block. The next accepted target context overwrites its rows.
@@ -710,11 +668,17 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     const uint16_t verify_start = _kv_cache_len;
     const auto &proposals =
         draft_lm._run_dflash_draft(*this, anchor, verify_start, scratch);
+    if (!_is_running.load(std::memory_order_relaxed)) {
+      break;
+    }
     auto &verify_input = scratch.verify_input;
     verify_input.front() = anchor;
     std::copy(proposals.begin(), proposals.end(), verify_input.begin() + 1);
     const auto [accepted, bonus_token] =
         _run_dflash_target_verify(verify_input, verify_start, scratch);
+    if (!_is_running.load(std::memory_order_relaxed)) {
+      break;
+    }
     auto &emitted = scratch.emitted;
     emitted.assign(proposals.begin(), proposals.begin() + accepted);
     emitted.push_back(bonus_token);

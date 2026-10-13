@@ -3496,6 +3496,58 @@ void LanguageModel::_compute_and_upload_per_layer_inputs_prefill(
 }
 
 
+void LanguageModel::_prepare_lm_head_logit_views(
+    uint16_t num_tokens, uint16_t output_rows, std::vector<LMHeadLogitView>& views
+) {
+    const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
+    const uint16_t num_splits = _cfg.lm_cfg.lm_head_num_splits;
+    views.clear();
+    views.reserve(num_splits);
+    const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
+    for (uint16_t split_idx = 0; split_idx < num_splits; ++split_idx) {
+        const uint32_t split_begin = static_cast<uint32_t>(split_idx) * split_dim;
+        const uint32_t split_size = (num_splits == 1)
+            ? output_size
+            : std::min<uint32_t>(split_dim, output_size - split_begin);
+        const std::string buf_name = (num_splits == 1)
+            ? fmt::format("n{}_buffer4", num_tokens)
+            : fmt::format("n{}_lm_split{}", num_tokens, split_idx);
+        auto& buf = get_buffer(buf_name);
+        if (buf.get_dtype() != "bfloat16" || buf.get_shape().size() != 2
+            || buf.get_shape().front() != output_rows || buf.get_shape().back() != split_size) {
+            throw std::runtime_error("Invalid lm_head logit buffer");
+        }
+        views.emplace_back(LMHeadLogitView{
+            &buf,
+            static_cast<const uint8_t*>(buf.get_virtual_addr()),
+            buf.get_buf_len(std::vector<uint32_t>{1, split_size}),
+            split_begin,
+            split_size
+        });
+    }
+}
+
+
+uint32_t LanguageModel::_argmax_lm_head_row(
+    std::span<const LMHeadLogitView> views, uint16_t row
+) {
+    uint32_t best_index = 0;
+    float best_value = -std::numeric_limits<float>::infinity();
+    for (const auto& view : views) {
+        const auto* row_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+            view.data + static_cast<size_t>(row) * view.row_bytes
+        );
+        const auto [value, offset] = argmax_bf16(row_ptr, view.width);
+        const uint32_t index = view.vocab_begin + offset;
+        if (value > best_value || (value == best_value && index < best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    return best_index;
+}
+
+
 std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
     uint16_t num_tokens, uint16_t valid_tokens,
     std::span<const uint32_t> expected_draft_tokens
@@ -3509,7 +3561,6 @@ std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
         ));
     }
 
-    const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
     const uint16_t num_splits = _cfg.lm_cfg.lm_head_num_splits;
     if (num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
         auto& buf = get_buffer(fmt::format("n{}_buffer4", num_tokens));
@@ -3529,56 +3580,16 @@ std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
         return token_ids;
     }
 
-    struct LogitView {
-        MLABuffer* buffer;
-        const uint8_t* data;
-        size_t row_bytes;
-        uint32_t vocab_begin;
-        uint32_t width;
-    };
-    std::vector<LogitView> views;
-    views.reserve(num_splits);
-    const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
-    for (uint16_t split_idx = 0; split_idx < num_splits; ++split_idx) {
-        const uint32_t split_begin = static_cast<uint32_t>(split_idx) * split_dim;
-        const uint32_t split_size = (num_splits == 1)
-            ? output_size
-            : std::min<uint32_t>(split_dim, output_size - split_begin);
-        const std::string buf_name = (num_splits == 1)
-            ? fmt::format("n{}_buffer4", num_tokens)
-            : fmt::format("n{}_lm_split{}", num_tokens, split_idx);
-        auto& buf = get_buffer(buf_name);
-        if (buf.get_dtype() != "bfloat16" || buf.get_shape().size() != 2
-            || buf.get_shape().front() != num_tokens || buf.get_shape().back() != split_size) {
-            throw std::runtime_error("Invalid lm_head logit buffer");
-        }
-        views.emplace_back(LogitView{
-            &buf,
-            static_cast<const uint8_t*>(buf.get_virtual_addr()),
-            buf.get_buf_len(std::vector<uint32_t>{1, split_size}),
-            split_begin,
-            split_size
-        });
-    }
+    std::vector<LMHeadLogitView> views;
+    _prepare_lm_head_logit_views(num_tokens, num_tokens, views);
 
     std::vector<uint32_t> best_indices;
     best_indices.reserve(valid_tokens);
     for (uint16_t row = 0; row < valid_tokens; ++row) {
-        uint32_t best_index = 0;
-        float best_value = -std::numeric_limits<float>::infinity();
         for (const auto& view : views) {
-            const size_t row_offset = static_cast<size_t>(row) * view.row_bytes;
-            view.buffer->invalidate_cache(row_offset, view.row_bytes);
-            const auto* row_ptr = reinterpret_cast<const Eigen::bfloat16*>(
-                view.data + row_offset
-            );
-            const auto [value, offset] = argmax_bf16(row_ptr, view.width);
-            const uint32_t index = view.vocab_begin + offset;
-            if (value > best_value || (value == best_value && index < best_index)) {
-                best_value = value;
-                best_index = index;
-            }
+            view.buffer->invalidate_cache(static_cast<size_t>(row) * view.row_bytes, view.row_bytes);
         }
+        const uint32_t best_index = _argmax_lm_head_row(views, row);
         best_indices.emplace_back(best_index);
         if (
             row < expected_draft_tokens.size()

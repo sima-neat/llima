@@ -63,7 +63,6 @@ class VisionLanguageModel(BaseModel):
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
-        speculative_method: str | None = None,
         speculative_block_size: int | None = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
@@ -79,8 +78,6 @@ class VisionLanguageModel(BaseModel):
             quantize_kv_cache: True if KV cache is quantized.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
-            speculative_method: Speculative decoding implementation for target/draft pairs.
-                None detects the method from the loaded draft configuration.
             speculative_block_size: DFlash verification width (4, 8 or 16); defaults to 8.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
@@ -95,10 +92,7 @@ class VisionLanguageModel(BaseModel):
             model_config = hf_model.model_config
 
         if target_model is not None:
-            detected_method = _detect_speculative_method(model_config)
-            if speculative_method is not None and speculative_method != detected_method:
-                raise ValueError("Draft checkpoint does not match the speculative method")
-            speculative_method = detected_method
+            speculative_method = _detect_speculative_method(model_config)
 
         vlm_cfg = VlmConfig.from_hf_config(
             model_format, hf_cache_path, model_config, image_resolution=image_resolution
@@ -153,10 +147,21 @@ class VisionLanguageModel(BaseModel):
                 vlm_helper = target_model.vlm_helper
 
             if speculative_method == SpeculativeDecodingMethod.DFLASH:
-                dflash_cfg = model_config.get("dflash_config", {})
+                dflash_cfg = model_config["dflash_config"]
                 budget = speculative_block_size or 8
-                target_layer_ids = dflash_cfg.get("target_layer_ids", [])
-                mask_token_id = dflash_cfg.get("mask_token_id", -1)
+                if target_model.cfg.pipeline_cfg.input_token_group_size <= budget:
+                    raise ValueError(
+                        "DFlash requires language_group_size > speculative_block_size"
+                    )
+                target_layer_ids = dflash_cfg["target_layer_ids"]
+                mask_token_id = dflash_cfg["mask_token_id"]
+                if not target_layer_ids or len(set(target_layer_ids)) != len(target_layer_ids) or any(
+                    layer < 0 or layer >= target_model.cfg.lm_cfg.num_hidden_layers
+                    for layer in target_layer_ids
+                ):
+                    raise ValueError("DFlash target_layer_ids must be nonempty, unique, and within the target layers")
+                if not 0 <= mask_token_id < target_model.cfg.lm_cfg.token_cfg.vocab_size:
+                    raise ValueError("DFlash mask_token_id must be within the target vocabulary")
                 spec_cfg = dict(
                     method=speculative_method,
                     speculative_budget=budget,

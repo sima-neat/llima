@@ -20,6 +20,10 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
             {"model_type": "llama", "architectures": ["LlamaForCausalLMEagle3"]},
             "eagle3",
         ),
+        (
+            {"architectures": ["DFlashDraftModel"]},
+            "dflash",
+        ),
     ],
 )
 def test_detect_speculative_method(config: dict, expected: str):
@@ -93,7 +97,7 @@ def test_cli_rejects_nonpositive_jobs(monkeypatch, capsys, jobs):
     assert "--jobs must be a positive integer" in capsys.readouterr().err
 
 
-def test_dflash_cli_forwards_method_and_block_size(monkeypatch, tmp_path):
+def test_dflash_cli_forwards_block_size(monkeypatch, tmp_path):
     (tmp_path / "model").mkdir()
     (tmp_path / "draft").mkdir()
     calls = []
@@ -109,8 +113,6 @@ def test_dflash_cli_forwards_method_and_block_size(monkeypatch, tmp_path):
             "1",
             "--draft_model_path",
             str(tmp_path / "draft"),
-            "--speculative_method",
-            "dflash",
             "--speculative_block_size",
             "8",
         ],
@@ -119,7 +121,7 @@ def test_dflash_cli_forwards_method_and_block_size(monkeypatch, tmp_path):
 
     compile_lmm.main()
 
-    assert calls[0][-2:] == ("dflash", 8)
+    assert calls[0][-1] == 8
 
 
 @pytest.mark.parametrize("option", ["--system_prompt_file", "--chat_template_file"])

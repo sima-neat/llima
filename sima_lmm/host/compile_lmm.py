@@ -52,8 +52,7 @@ def gen_files(
     language_group_size: int, future_token_mask_size: int,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None, speculative_method: str | None = None,
-    speculative_block_size: int | None = None,
+    draft_output_path: Path | None, speculative_block_size: int | None = None,
 ):
     enable_verbose_error_messages()
     models = list()
@@ -94,7 +93,6 @@ def gen_files(
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
             target_model=base_model,
-            speculative_method=speculative_method,
             speculative_block_size=speculative_block_size,
         )
         models.append(draft_model)
@@ -292,10 +290,6 @@ def main():
         help="Path of the speculative draft/assistant model for the base (target) model."
     )
     group.add_argument(
-        "--speculative_method", choices=("eagle3", "gemma4_mtp", "dflash"),
-        help="Speculative decoding method. Inferred from the draft checkpoint by default."
-    )
-    group.add_argument(
         "--speculative_block_size", type=int, choices=(4, 8, 16),
         help="DFlash verification width (default: 8)."
     )
@@ -372,9 +366,7 @@ def main():
         output_path = base_output_path
         draft_output_path = None
 
-    if args.draft_model_path is None and (
-        args.speculative_method is not None or args.speculative_block_size is not None
-    ):
+    if args.draft_model_path is None and args.speculative_block_size is not None:
         _abort("Speculative decoding options require --draft_model_path.")
 
     check_output_path_conflict(args.model_path, output_path)
@@ -437,7 +429,7 @@ def main():
             args.quantize_embeddings,
             args.quantize_kv_cache, return_logits, log_level, image_resolution,
             args.draft_model_path, draft_output_path,
-            args.speculative_method, args.speculative_block_size,
+            args.speculative_block_size,
         )
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
         _abort(str(exc))
