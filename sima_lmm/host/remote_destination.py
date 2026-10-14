@@ -1,6 +1,7 @@
 """Remote rsync destination checks shared by the deploy utilities."""
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -63,13 +64,17 @@ def parse_remote_destination(dst: str) -> RemoteDestination | None:
 
 
 def _remote_path_arg(path: str) -> str:
-    """Quote a remote path for the remote shell while keeping '~' expansion."""
+    """Quote a remote path for the remote shell while keeping '~' and '~user' expansion."""
     if not path:
         return "."
     if path == "~":
         return '"$HOME"'
     if path.startswith("~/"):
         return '"$HOME"/' + shlex.quote(path[2:])
+    named_home = re.fullmatch(r"(~[A-Za-z0-9._-]+)(?:/(.*))?", path, re.DOTALL)
+    if named_home:
+        home, rest = named_home.groups()
+        return f"{home}/{shlex.quote(rest)}" if rest else home
     return shlex.quote(path)
 
 

@@ -143,11 +143,12 @@ def deploy(src_dir: Path, dst_dir: Path | str) -> None:
             _deploy_sima_files(src_sima_dir, model_destination(model_name))
         return
 
-    # Check the remote destination once, before the slow ELF extraction, and
-    # reuse the same SSH connection for every transfer.
+    # Check every model directory before the slow ELF extraction, and reuse
+    # the same SSH connection for every transfer.
     with RemoteSession(remote.ssh_host) as session:
         print(f"Checking {remote} ...", flush=True)
-        session.preflight(remote.path)
+        for model_name, _ in sources:
+            session.preflight(remote.path if model_name is None else remote.child_path(model_name))
         for model_name, src_sima_dir in sources:
             _deploy_sima_files(src_sima_dir, model_destination(model_name), session.rsync_rsh)
 

@@ -210,7 +210,7 @@ def test_local_destination_skips_ssh(
     assert deploy_calls[0][1:] == (tmp_path / "deployed", None)
 
 
-def test_speculative_preflight_runs_once_for_parent(
+def test_speculative_preflight_checks_each_model_directory(
     tmp_path: Path, fake_run: FakeRun, deploy_calls: list
 ) -> None:
     source = tmp_path / "compiled"
@@ -222,8 +222,10 @@ def test_speculative_preflight_runs_once_for_parent(
 
     deploy_lmm.deploy(source, "devkit:/models/spec/")
 
-    assert len(fake_run.preflight_calls) == 1
-    assert "mkdir -p /models/spec/" in fake_run.preflight_calls[0][-1]
+    scripts = [cmd[-1] for cmd in fake_run.preflight_calls]
+    assert len(scripts) == 2
+    assert "mkdir -p /models/spec/target" in scripts[0]
+    assert "mkdir -p /models/spec/draft" in scripts[1]
     assert [dst for _, dst, _ in deploy_calls] == [
         "devkit:/models/spec/target", "devkit:/models/spec/draft"
     ]
@@ -232,9 +234,11 @@ def test_speculative_preflight_runs_once_for_parent(
 def test_home_relative_paths_keep_tilde_expansion(fake_run: FakeRun) -> None:
     with remote_destination.RemoteSession("devkit") as session:
         session.preflight("~/models/my model")
+        session.preflight("~alice/models/my model")
 
-    script = fake_run.preflight_calls[0][-1]
-    assert "mkdir -p \"$HOME\"/'models/my model'" in script
+    scripts = [cmd[-1] for cmd in fake_run.preflight_calls]
+    assert "mkdir -p \"$HOME\"/'models/my model'" in scripts[0]
+    assert "mkdir -p ~alice/'models/my model'" in scripts[1]
 
 
 def test_lora_preflight_requires_elf_files(tmp_path: Path, fake_run: FakeRun, monkeypatch) -> None:
