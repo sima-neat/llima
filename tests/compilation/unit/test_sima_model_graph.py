@@ -5,6 +5,7 @@ import pytest
 from ml_dtypes import int4
 
 from afe.backends.backends import Backend
+from afe.ir.attributes import ClipAttrs
 from afe.ir.defines import Status, TensorValue, TupleValue, get_expected_tensor_value
 from afe.ir.execute import create_node_executor, create_node_quant_executor
 from afe.ir.operations import BatchMatmulOp, ConvAddActivationOp, StridedSliceOp
@@ -319,6 +320,49 @@ def test_linear_preserves_quantized_weight_layout_and_metadata(block_size):
     assert attrs.c_block_size == (block_size or 48)
     # SiMa IR stores scales as [input groups, output channels].
     np.testing.assert_array_equal(attrs.requant.sc_correction, scales.T)
+
+
+@pytest.mark.parametrize(
+    "dtype,tokens,channels,relocatable,clipped,padded",
+    [
+        (int4, 1, 896, False, False, 1024),
+        (int4, 1, 2880, False, True, 3072),
+        (np.int8, 1, 896, False, False, 896),
+        (int4, 4, 896, False, False, 896),
+        (int4, 1, 1024, False, False, 1024),
+        (int4, 1, 8960, False, False, 8960),
+        (int4, 1, 256, False, False, 256),
+        (int4, 1, 896, True, False, 896),
+    ],
+)
+def test_linear_padding_preserves_grouped_projection(dtype, tokens, channels, relocatable, clipped, padded):
+    # The final G32 group has only 16 input channels.
+    weights = (np.arange(channels * 48).reshape(channels, 48) % 15 - 7).astype(dtype)
+    scales = np.linspace(0.01, 0.03, channels * 2, dtype=np.float32).reshape(channels, 2)
+    bias = np.linspace(-0.5, 0.5, channels, dtype=np.float32)
+    graph = ModelGraph(_source({"proj.weight": (scales, weights, 32), "proj.bias": bias}),
+                       {"x": (1, 1, tokens, 48)}, False)
+    clip = ClipAttrs(-0.25, 0.25, (1, 1, tokens, channels), ScalarType.bfloat16) if clipped else None
+    output = graph.linear("proj", graph.inputs["x"], relocatable=relocatable, activation=clip)
+    reference = graph._build_conv("proj", graph.inputs["x"], activation=clip)
+    assert tensor_type(output).shape == (1, 1, tokens, channels)
+    net = graph.finish([output, reference])
+    convs = [node.ir for node in net.nodes["MLA_0"].ir.nodes.values()
+             if isinstance(node.ir.operation, ConvAddActivationOp)]
+    attrs = convs[0].quant_attrs
+    assert attrs.conv_attrs.weight_shape[-1] == padded
+    assert attrs.c_block_size == 32
+    np.testing.assert_array_equal(attrs.weight_quant_data.reshape(48, padded)[:, :channels], weights.T)
+    np.testing.assert_array_equal(attrs.requant.sc_correction[:, :channels], scales.T)
+    np.testing.assert_array_equal(attrs.bias_quant_data[:channels], bias)
+    if padded != channels:
+        np.testing.assert_array_equal(attrs.weight_quant_data.reshape(48, padded)[:, channels:], 0)
+        np.testing.assert_array_equal(attrs.requant.sc_correction[:, channels:], 1)
+        np.testing.assert_array_equal(attrs.bias_quant_data[channels:], 0)
+        assert isinstance(output.ir.operation, StridedSliceOp)
+    x = np.linspace(-0.5, 0.5, tokens * 48).reshape(1, 1, tokens, 48).astype(activation_dtype(False))
+    actual, expected = graph.run(x=x)
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("proportional", [False, True])
