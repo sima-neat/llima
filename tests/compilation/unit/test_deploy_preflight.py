@@ -1,5 +1,4 @@
 import subprocess
-import tarfile
 from pathlib import Path
 
 import pytest
@@ -25,6 +24,8 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
         ("sima@192.168.1.20:/media/nvme", RemoteDestination("sima@192.168.1.20", "/media/nvme")),
         ("sima@devkit:models", RemoteDestination("sima@devkit", "models")),
         ("sima@devkit:", RemoteDestination("sima@devkit", "")),
+        ("[::1]::module", None),
+        ("sima@[::1]", None),
     ],
 )
 def test_parse_remote_destination(dst: str, expected: RemoteDestination | None) -> None:
@@ -42,7 +43,7 @@ def test_remote_child_path(path: str, child: str) -> None:
 class FakeRun:
     """Records subprocess.run calls made by the remote session."""
 
-    def __init__(self, returncode: int = 0, stdout: str = "419430400\n", stderr: str = ""):
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
         self.calls = []
         self.result = (returncode, stdout, stderr)
 
@@ -72,6 +73,7 @@ def _write_sima_files(src: Path) -> Path:
 
 @pytest.fixture
 def fake_run(monkeypatch) -> FakeRun:
+    monkeypatch.delenv("RSYNC_RSH", raising=False)
     fake = FakeRun()
     monkeypatch.setattr(remote_destination.subprocess, "run", fake)
     return fake
@@ -110,6 +112,18 @@ def test_preflight_runs_before_extraction_and_rsync_shares_connection(
     assert control_path in rsh
     assert "ControlMaster" not in rsh
     assert len(fake_run.exit_calls) == 1
+
+
+def test_ipv6_destination_uses_bare_address_for_ssh(
+    tmp_path: Path, fake_run: FakeRun, deploy_calls: list
+) -> None:
+    _write_sima_files(tmp_path / "compiled")
+
+    deploy_lmm.deploy(tmp_path / "compiled", "sima@[2001:db8::1]:/models")
+
+    assert "sima@2001:db8::1" in fake_run.preflight_calls[0]
+    assert deploy_calls[0][1] == "sima@[2001:db8::1]:/models"
+    assert fake_run.exit_calls[0][-1] == "sima@2001:db8::1"
 
 
 @pytest.mark.parametrize(
@@ -151,28 +165,49 @@ def test_connection_closed_when_transfer_fails(
     assert len(fake_run.exit_calls) == 1
 
 
-def test_custom_rsh_is_used_unchanged(
-    tmp_path: Path, fake_run: FakeRun, deploy_calls: list
+def test_rsync_rsh_ssh_options_share_connection(
+    tmp_path: Path, fake_run: FakeRun, deploy_calls: list, monkeypatch
 ) -> None:
     _write_sima_files(tmp_path / "compiled")
+    monkeypatch.setenv("RSYNC_RSH", "ssh -p 2222 -i ~/.ssh/modalix")
 
-    deploy_lmm.deploy(tmp_path / "compiled", "devkit:/models", rsh="ssh -p 2222")
+    deploy_lmm.deploy(tmp_path / "compiled", "devkit:/models")
 
-    assert fake_run.preflight_calls[0][:4] == ["ssh", "-p", "2222", "devkit"]
-    assert deploy_calls[0][2] == "ssh -p 2222"
+    preflight = fake_run.preflight_calls[0]
+    assert preflight[:5] == ["ssh", "-p", "2222", "-i", "~/.ssh/modalix"]
+    assert "ControlMaster=auto" in preflight
+    control_path = next(opt for opt in preflight if opt.startswith("ControlPath="))
+    rsh = deploy_calls[0][2]
+    assert rsh.startswith("ssh -p 2222 -i ")
+    assert control_path in rsh
+    assert len(fake_run.exit_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "rsync_rsh", ["sshpass -p secret ssh", "ssh -o ControlPath=/tmp/user-master"]
+)
+def test_rsync_rsh_without_sharing_is_used_unchanged(
+    tmp_path: Path, fake_run: FakeRun, deploy_calls: list, monkeypatch, rsync_rsh: str
+) -> None:
+    _write_sima_files(tmp_path / "compiled")
+    monkeypatch.setenv("RSYNC_RSH", rsync_rsh)
+
+    deploy_lmm.deploy(tmp_path / "compiled", "devkit:/models")
+
+    assert fake_run.preflight_calls[0][:-2] == rsync_rsh.split()
+    assert deploy_calls[0][2] == rsync_rsh
     assert fake_run.exit_calls == []
 
 
-def test_no_preflight_and_local_destinations_skip_ssh(
+def test_local_destination_skips_ssh(
     tmp_path: Path, fake_run: FakeRun, deploy_calls: list
 ) -> None:
     _write_sima_files(tmp_path / "compiled")
 
-    deploy_lmm.deploy(tmp_path / "compiled", "devkit:/models", preflight=False)
     deploy_lmm.deploy(tmp_path / "compiled", str(tmp_path / "deployed"))
 
     assert fake_run.calls == []
-    assert [dst for _, dst, _ in deploy_calls] == ["devkit:/models", tmp_path / "deployed"]
+    assert deploy_calls[0][1:] == (tmp_path / "deployed", None)
 
 
 def test_speculative_preflight_runs_once_for_parent(
@@ -194,19 +229,6 @@ def test_speculative_preflight_runs_once_for_parent(
     ]
 
 
-def test_low_free_space_warns(
-    tmp_path: Path, fake_run: FakeRun, deploy_calls: list, capsys
-) -> None:
-    sima_dir = _write_sima_files(tmp_path / "compiled")
-    (sima_dir / "mpk" / "model.tar.gz").write_bytes(b"\0" * 4096)
-    fake_run.result = (0, "1\n", "")
-
-    deploy_lmm.deploy(tmp_path / "compiled", "devkit:/models")
-
-    assert "Warning: the deployment may need" in capsys.readouterr().out
-    assert len(deploy_calls) == 1
-
-
 def test_home_relative_paths_keep_tilde_expansion(fake_run: FakeRun) -> None:
     with remote_destination.RemoteSession("devkit") as session:
         session.preflight("~/models/my model")
@@ -218,8 +240,9 @@ def test_home_relative_paths_keep_tilde_expansion(fake_run: FakeRun) -> None:
 def test_lora_preflight_requires_elf_files(tmp_path: Path, fake_run: FakeRun, monkeypatch) -> None:
     copies = []
     monkeypatch.setattr(
-        deploy_lora, "_copy_npy_files", lambda src, dst, rsh: copies.append((src, dst, rsh))
+        deploy_lora, "_copy_npy_files", lambda src, dst, rsh=None: copies.append((src, dst, rsh))
     )
+    monkeypatch.setattr(deploy_lora, "_check_local_elf_dir", pytest.fail)
 
     deploy_lora.deploy(tmp_path, "devkit:/models/llama/")
 
@@ -240,7 +263,7 @@ def test_lora_remote_root_destination_keeps_root(
 ) -> None:
     copies = []
     monkeypatch.setattr(
-        deploy_lora, "_copy_npy_files", lambda src, dst, rsh: copies.append((src, dst, rsh))
+        deploy_lora, "_copy_npy_files", lambda src, dst, rsh=None: copies.append((src, dst, rsh))
     )
 
     deploy_lora.deploy(tmp_path, "devkit:/")
@@ -249,14 +272,3 @@ def test_lora_remote_root_destination_keeps_root(
     assert script.splitlines()[0] == "test -d /elf_files || exit 5"
     assert "mkdir -p /npy_files" in script
     assert copies[0][1] == "devkit:/npy_files"
-
-
-def test_deployment_size_counts_extracted_elf(tmp_path: Path) -> None:
-    sima_dir = _write_sima_files(tmp_path / "compiled")
-    elf = tmp_path / "model_stage1_mla.elf"
-    elf.write_bytes(b"\0" * (1024 * 1024))
-    with tarfile.open(sima_dir / "mpk" / "model_mpk.tar.gz", "w:gz") as archive:
-        archive.add(elf, arcname=elf.name)
-
-    assert (sima_dir / "mpk" / "model_mpk.tar.gz").stat().st_size < 64 * 1024
-    assert deploy_lmm._deployment_size_kb([(None, sima_dir)]) >= 1024

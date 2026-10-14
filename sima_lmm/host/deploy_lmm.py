@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -8,9 +7,7 @@ from pathlib import Path
 
 from sima_lmm.host.remote_destination import (
     RemoteSession,
-    local_size_kb,
     parse_remote_destination,
-    report_free_space,
 )
 
 
@@ -129,37 +126,7 @@ def _deploy_sima_files(src_sima_dir: Path, dst_dir: Path | str, rsh: str | None 
     subprocess.check_call(cmd)
 
 
-def _extracted_size(mpk_file: Path) -> int:
-    """
-    Upper bound of the ELF extracted from an MPK archive: the uncompressed tar
-    size from the gzip trailer, which gzip stores modulo 4 GiB.
-    """
-    compressed_size = mpk_file.stat().st_size
-    try:
-        with mpk_file.open("rb") as stream:
-            stream.seek(-4, os.SEEK_END)
-            uncompressed_size = int.from_bytes(stream.read(4), "little")
-    except OSError:
-        return compressed_size
-    return max(uncompressed_size, compressed_size)
-
-
-def _deployment_size_kb(sources: list[tuple[str | None, Path]]) -> int:
-    """
-    Upper-bound estimate of the deployed size, taken before ELF extraction.
-    An archive that is larger than 4 GiB uncompressed is under-counted.
-    """
-    total_kb = 0
-    for _, src_sima_dir in sources:
-        total_kb += local_size_kb([src_sima_dir / "devkit", src_sima_dir / "npy_files"])
-        mpk_files = (src_sima_dir / "mpk").glob("*.tar.gz")
-        total_kb += sum(_extracted_size(mpk_file) for mpk_file in mpk_files) // 1024
-    return total_kb
-
-
-def deploy(
-    src_dir: Path, dst_dir: Path | str, rsh: str | None = None, preflight: bool = True
-) -> None:
+def deploy(src_dir: Path, dst_dir: Path | str) -> None:
     sources = _resolve_deploy_sources(src_dir)
     for _, src_sima_dir in sources:
         _validate_sima_files(src_sima_dir)
@@ -171,17 +138,16 @@ def deploy(
             return Path(dst_dir) if model_name is None else Path(dst_dir) / model_name
         return str(remote) if model_name is None else remote.join(model_name)
 
-    if remote is None or not preflight:
+    if remote is None:
         for model_name, src_sima_dir in sources:
-            _deploy_sima_files(src_sima_dir, model_destination(model_name), rsh)
+            _deploy_sima_files(src_sima_dir, model_destination(model_name))
         return
 
     # Check the remote destination once, before the slow ELF extraction, and
     # reuse the same SSH connection for every transfer.
-    with RemoteSession(remote.host, rsh) as session:
+    with RemoteSession(remote.ssh_host) as session:
         print(f"Checking {remote} ...", flush=True)
-        free_kb = session.preflight(remote.path)
-        report_free_space(str(remote), free_kb, _deployment_size_kb(sources))
+        session.preflight(remote.path)
         for model_name, src_sima_dir in sources:
             _deploy_sima_files(src_sima_dir, model_destination(model_name), session.rsync_rsh)
 
@@ -196,19 +162,10 @@ def main():
         "dst_dir",
         help="Destination directory, either a local path or a remote [user@]host:/path"
     )
-    parser.add_argument(
-        "--rsh", default=os.environ.get("RSYNC_RSH"),
-        help="Remote shell command for a remote destination, used for both the pre-flight "
-             "check and rsync (default: $RSYNC_RSH, otherwise ssh with a shared connection)"
-    )
-    parser.add_argument(
-        "--no-preflight", action="store_true",
-        help="Skip the remote destination check that runs before ELF extraction"
-    )
     args = parser.parse_args()
 
     try:
-        deploy(args.src_dir, args.dst_dir, rsh=args.rsh, preflight=not args.no_preflight)
+        deploy(args.src_dir, args.dst_dir)
     except RuntimeError as error:
         _abort(str(error))
 
