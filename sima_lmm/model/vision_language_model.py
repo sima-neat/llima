@@ -153,6 +153,13 @@ class VisionLanguageModel(BaseModel):
                     raise ValueError(
                         "DFlash requires language_group_size > speculative_block_size"
                     )
+                if (
+                    target_model.cfg.pipeline_cfg.max_num_tokens
+                    % target_model.cfg.pipeline_cfg.input_token_group_size
+                ):
+                    raise ValueError(
+                        "DFlash requires max_num_tokens divisible by language_group_size"
+                    )
                 target_layer_ids = dflash_cfg["target_layer_ids"]
                 mask_token_id = dflash_cfg["mask_token_id"]
                 if not target_layer_ids or len(set(target_layer_ids)) != len(target_layer_ids) or any(

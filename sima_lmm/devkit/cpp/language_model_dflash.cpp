@@ -511,6 +511,8 @@ LanguageModel::_run_model_dflash_speculative_decoding(
         std::min<uint16_t>(prefill_width, prompt_len - offset);
     anchor = run_model_once(prefill_width, offset, prompt_len, 0);
     if (!_is_running.load(std::memory_order_relaxed)) {
+      _cached_token_ids.clear();
+      draft_lm._cached_token_ids.clear();
       _notify_interrupt();
       _text_streamer.wait_streaming();
       return std::nullopt;
