@@ -96,3 +96,8 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
             "tests/runtime/test_http_black_box.py",
         ):
             self.assertNotIn("simaai-appcomplex.service", read(path), path)
+
+    def test_devkit_runtime_uses_16_gib_modalix_som_runner(self) -> None:
+        workflow = read(".github/workflows/vulcan-ci.yml")
+
+        self.assertIn("        - modalix-som-16gig\n", workflow)
