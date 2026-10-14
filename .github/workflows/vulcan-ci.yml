@@ -681,6 +681,7 @@ jobs:
           test -x "${prepare_models}"
 
           prepare_models_lock="/media/nvme/llima/.prepare-models.lock"
+          mkdir -p "$(dirname "${prepare_models_lock}")" "${LLIMA_MODELS_PATH}"
           flock \
             --verbose \
             --wait 1800 \
