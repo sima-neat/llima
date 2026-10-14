@@ -328,7 +328,7 @@ def test_linear_preserves_quantized_weight_layout_and_metadata(block_size):
         (int4, 1, 896, False, False, 1024),
         (int4, 1, 2880, False, True, 3072),
         (np.int8, 1, 896, False, False, 896),
-        (int4, 4, 896, False, False, 896),
+        (int4, 128, 896, False, False, 1024),
         (int4, 1, 1024, False, False, 1024),
         (int4, 1, 8960, False, False, 8960),
         (int4, 1, 256, False, False, 256),
