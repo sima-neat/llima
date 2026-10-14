@@ -223,6 +223,13 @@ weights, supply the corresponding `scale_process_func`; groups must retain the
 checkpoint's actual size. LoRA rank and merged-adapter behavior are explicit
 arguments to `linear()` and `mlp()`.
 
+For single-token prequantized INT4 projections, `linear()` pads row-aligned
+outputs above 512 channels to the next multiple of 512 when needed to enable
+32-way channel splitting, then slices back to the original output shape.
+Input-channel groups remain unchanged. INT8, floating weights, multi-token
+projections, LoRA and relocatable weights retain their original dimensions;
+the compiler still selects the layout and checks L2 conflicts.
+
 Build attention from projections and head layout operations. Fold query scaling
 into `linear()` to retain the existing projection rounding:
 

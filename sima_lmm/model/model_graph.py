@@ -1,6 +1,7 @@
 """Common native graph operations with model weights and precision bound once."""
 
 import math
+from dataclasses import replace
 from typing import Callable, Sequence, TypedDict, Unpack
 
 import numpy as np
@@ -360,6 +361,8 @@ class ModelGraph(SimaBuilder):
         WeightOptions documents keyword overrides, including source
         names and matching weight/scale/bias transforms for fused or sliced weights.
         Optional scale is folded into floating weights, quantization scales and bias.
+        Single-token INT4 projections may pad output channels for 32-way layouts;
+        the returned tensor always retains its original channel count.
         """
         _validate_weight_options(kwargs)
         if len(tensor_type(data).shape) != 4:
@@ -378,7 +381,7 @@ class ModelGraph(SimaBuilder):
                 kwargs[key] = scaled
         if lora_rank and merged_lora:
             kwargs["relocatable"] = True
-        proj = self._build_conv(name, data, **kwargs)
+        proj = self._build_conv(name, data, pad_output=not lora_rank, **kwargs)
 
         if lora_rank and not merged_lora:
             weight_shape = proj.ir._attrs.conv_attrs.weight_shape
@@ -936,10 +939,11 @@ class ModelGraph(SimaBuilder):
         is_fc: bool = True,
         stride: tuple[int, ...] = (1, 1),
         relocatable: bool = False,
+        pad_output: bool = False,
         is_depthwise: bool = False,
         padding: tuple[tuple[int, int], ...] = ((0, 0), (0, 0)),
         **kwargs,
-    ) -> AwesomeNode:
+    ) -> NodeOrHandle:
         """Lower a projection or convolution, allowing a local source for synthesized weights."""
         if get_param_func is None:
             get_param_func = self.model.get_hf_param
@@ -1050,6 +1054,29 @@ class ModelGraph(SimaBuilder):
         else:
             bias_tensor = None
 
+        output_channels = weight_tensor.shape[-1]
+        split_width = ((ceil_div_row(output_channels) + 31) // 32) * mla_row_size
+        padded_channels = output_channels
+        if (
+            pad_output and not relocatable and not self.quantizable
+            and ifm_type.shape[:3] == (1, 1, 1)
+            and weight_tensor.dtype.name == "int4" and scales is not None
+            and output_channels > 512 and output_channels % mla_row_size == 0
+            and output_channels - 31 * split_width <= 0
+        ):
+            # Uniform 32-way partitions need a positive final partition. Pad only
+            # output rows; input-channel groups and their scales remain unchanged.
+            padded_channels = 32 * split_width
+            extra = padded_channels - output_channels
+            weight_tensor = np.pad(weight_tensor, ((0, 0),) * 4 + ((0, extra),))
+            scales = np.pad(scales, ((0, 0), (0, extra)), constant_values=1)
+            if bias_tensor is not None:
+                bias_tensor = np.pad(bias_tensor, ((0, 0),) * (bias_tensor.ndim - 1) + ((0, extra),))
+            if isinstance(activation, ClipAttrs):
+                activation = replace(activation, shape=(*ifm_type.shape[:-1], padded_channels))
+            elif isinstance(activation, ReluAttrs):
+                activation = replace(activation, input_shape=(*ifm_type.shape[:-1], padded_channels))
+
         conv_attrs = ConvAttrs(
             stride=stride,
             dilation=(1, 1),
@@ -1071,6 +1098,8 @@ class ModelGraph(SimaBuilder):
             scales=scales,
             c_block_size=c_block_size,
         )
+        if padded_channels != output_channels:
+            return self._create_channel_slice(conv, 0, output_channels)
         return conv
 
     def _create_channel_slice(self, input_node: NodeOrHandle, begin: int, end: int) -> NodeOrHandle:
