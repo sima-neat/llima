@@ -108,10 +108,18 @@ output_directory/
 | `--no-quantize_embeddings` | サポートされているLLMおよびVLMでは、デフォルトで有効になっている埋め込みテーブルの量子化を無効にします。 |
 | `--no-quantize_kv_cache` | デフォルトで有効になっている KV キャッシュの量子化を無効にします。 |
 | `--return_logits` | 最終層の出力におけるロジットを返します（モデル評価器に必要なもの）。 |
-| `--draft_model_path` | 推測によるデコードに使用する互換性のある EAGLE3 または Gemma4 MTP のドラフト モデルへのパス。 |
+| `--draft_model_path` | 互換性のある EAGLE3、Gemma4 MTP、または DFlash のドラフトモデルへのパス。方式は自動検出されます。 |
+| `--speculative_block_size` | DFlash の検証幅: 4、8、または 16。デフォルト: 8。 |
 | `--lora_name` | ベースモデルと同時にコンパイルされている LoRA アダプターの名前。 |
 | `--lora_path` | ベースモデルと組み合わせてコンパイルするために、LoRAアダプターディレクトリへのパスを指定してください。 |
 | `--compile_lora`, `--no-compile_lora` | LoRA のパスが指定された場合に、アダプターの重みをコンパイルするかどうかを設定します。デフォルトでは有効になっています。 |
+
+DFlash では、プリフィルのグループサイズがブロックサイズを超え、コンテキスト長を割り切れる必要があります:
+
+``` console
+llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
+    --speculative_block_size 16
+```
 
 ## システムプロンプト
 
@@ -141,7 +149,9 @@ LLM 推論は、2つの明確なフェーズで構成され、コンパイラは
 **入力パラメータ** `get_layer_configuration` この関数は、各コンパイラユニットに対して呼び出され、
 以下の引数を受け取ります。
 
-- `model_properties`：`{"num_hidden_layers": int}` を含む辞書。
+- `model_properties`: 次の項目を含む辞書:
+  - `"num_hidden_layers"`: 言語レイヤー数
+  - `"is_draft_model"`: 推測デコードのドラフトモデルを設定する場合は `True`
 
 - `layer`：次の要素を含む辞書：
   - `"part"`：`"PRE"`、`"CACHE"`、`"POST"`などの論理コンポーネント。
