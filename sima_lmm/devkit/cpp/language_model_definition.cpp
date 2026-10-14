@@ -468,7 +468,7 @@ void LanguageModel::_define_attn_models_iter(
         }
 
         // Draft post produces an additional output: hidden states for next iteration.
-        if (is_eagle3_draft) {
+        if (is_eagle3_draft || is_gemma4_mtp_draft) {
             post_ofms.emplace_back(
                 MLABufferSlice{&get_buffer(fmt::format("n{}_buffer5", num_tokens))}
             );
