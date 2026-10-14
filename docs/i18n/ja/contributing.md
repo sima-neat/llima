@@ -168,6 +168,7 @@ graph.save([output])
 テセレーションは `sima_analysis.get_tessellate_parameters()` で一元的に推論します。HWC16 レイアウト、自動タイルサイズ、決定的な永続バッファ名を使用します。通常のコンポーネントは `BaseModel` から空の上書き設定を継承します。ストライド付き KV キャッシュなどの特殊なレイアウトでは、既存の `get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` メソッドを上書きします。キーはテンソルのインデックスで、負のインデックスは末尾から数えます。
 
 Whisper コンポーネント、すべてのネイティブ言語グラフ部分、標準の vision tower でこの API を使用しています。attention、MLP、回転のヘルパーは同じ実装を共有します。
+DFlash のコンテキスト融合、K/V 射影、状態リゾルバーのコンポーネントも `generate_graph()` と `ModelGraph` を使用します。最終ドラフトグラフは、対応するターゲットのパック済み出力ヘッドの重みとスケールを保持します。検証グラフは、ランタイムの状態リゾルバーが必要とする S1 と求解済みの中間値の出力を保持します。
 
 ## テスト
 
