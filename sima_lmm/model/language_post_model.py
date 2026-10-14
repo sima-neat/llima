@@ -6,11 +6,16 @@ from sima_lmm.model.base import LoraGenMode, LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
 from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.config.vlm_config import VlmArchType
+from sima_lmm.gguf.gguf_conversion import GgufModel
+from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
+from sima_lmm.utils import ceil_div
 
 
 @dataclass
 class LanguagePostModel(LanguagePostBaseModel):
     """Implementation for the post cache model of transformer-based language models."""
+
+    dflash_target_hf_model: LocalHuggingFaceModel | GgufModel | None = None
 
     def __post_init__(self):
         assert self.num_tokens >= 1
@@ -29,13 +34,39 @@ class LanguagePostModel(LanguagePostBaseModel):
 
     @property
     def uses_quantized_input_embeddings(self) -> bool:
-        # Draft post consumes floating hidden states, not a quantized embedding row.
-        return super().uses_quantized_input_embeddings and not self.is_draft
+        # EAGLE3 and MTP draft post consume floating hidden states.
+        return super().uses_quantized_input_embeddings and not (
+            self.is_eagle3_draft or self.is_gemma4_mtp_draft
+        )
 
     @property
     def _layer_base_name(self) -> str:
+        if self.is_dflash_draft:
+            return f"layers.{self.layer_idx}"
         base = self.hf_model.language_model_param_base_name
         return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
+
+    def _get_dflash_target_param(self, name: str, *, dequantize: bool = False):
+        if self.dflash_target_hf_model is None:
+            raise RuntimeError("DFlash draft is missing its paired target weight source")
+        param = self.dflash_target_hf_model.load_np_param(name)
+        if not dequantize or not isinstance(param, tuple):
+            return param
+
+        scales, weights, *metadata = param
+        scales = np.asarray(scales, dtype=np.float32).reshape(weights.shape[0], -1)
+        group_size = metadata[0] if metadata else ceil_div(weights.shape[1], scales.shape[1])
+        group_indices = np.minimum(
+            np.arange(weights.shape[1]) // group_size,
+            scales.shape[1] - 1,
+        )
+        return weights.astype(np.float32) * scales[:, group_indices]
+
+    def _check_dflash_target_param(self, name: str) -> bool:
+        return (
+            self.dflash_target_hf_model is not None
+            and self.dflash_target_hf_model.param_exists(name)
+        )
 
     def _build_per_layer_input_branch(
         self,

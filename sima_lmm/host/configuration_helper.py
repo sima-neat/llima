@@ -30,6 +30,8 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "audio": (False, "AUDIO"),
     "group_draft_fc": (True, "DRAFT_FC"),
     "single_draft_fc": (False, "DRAFT_FC"),
+    "group_dflash_context": (True, "DFLASH_CONTEXT"),
+    "single_dflash_context": (False, "DFLASH_CONTEXT"),
     "group_per_layer": (True, "PER_LAYER"),
     "single_per_layer": (False, "PER_LAYER"),
     "group_router": (True, "ROUTER"),
@@ -129,7 +131,8 @@ def _decode_layer_configuration(c: dict) -> LayerConfiguration | None:
 
 
 def _fetch_configuration(
-    configuration_path: str | Path, num_hidden_layers: int, layer_ids: list[LayerID]
+    configuration_path: str | Path, num_hidden_layers: int, layer_ids: list[LayerID],
+    is_draft_model: bool = False,
 ) -> GenConfiguration:
     """
     Read configuration from the file at configuration_path.
@@ -144,7 +147,10 @@ def _fetch_configuration(
             "get_layer_configuration(model_properties, layer) as a function"
         )
 
-    model_properties = {"num_hidden_layers": num_hidden_layers}
+    model_properties = {
+        "num_hidden_layers": num_hidden_layers,
+        "is_draft_model": is_draft_model,
+    }
     precision_configuration = {}
     lora_configuration = {}
     for layer_id in layer_ids:
@@ -174,7 +180,13 @@ def read_configuration_file(
     """
     num_hidden_layers = model.cfg.lm_cfg.num_hidden_layers
     layer_ids = model.cfg.get_layer_ids()
-    configurations = _fetch_configuration(configuration_path, num_hidden_layers, layer_ids)
+    speculative_cfg = model.cfg.lm_cfg.speculative_decoding_cfg
+    configurations = _fetch_configuration(
+        configuration_path,
+        num_hidden_layers,
+        layer_ids,
+        is_draft_model=speculative_cfg is not None and speculative_cfg.is_draft,
+    )
     return configurations
 
 

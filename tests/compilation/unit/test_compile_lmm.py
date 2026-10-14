@@ -20,6 +20,10 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
             {"model_type": "llama", "architectures": ["LlamaForCausalLMEagle3"]},
             "eagle3",
         ),
+        (
+            {"architectures": ["DFlashDraftModel"]},
+            "dflash",
+        ),
     ],
 )
 def test_detect_speculative_method(config: dict, expected: str):
@@ -28,7 +32,7 @@ def test_detect_speculative_method(config: dict, expected: str):
 
 def test_detect_speculative_method_rejects_unknown_draft():
     config = {"model_type": "llama", "architectures": ["LlamaForCausalLM"]}
-    with pytest.raises(ValueError, match="Expected a Gemma4 MTP or EAGLE3 draft model"):
+    with pytest.raises(ValueError, match="Expected a Gemma4 MTP, EAGLE3, or DFlash draft model"):
         _detect_speculative_method(config)
 
 
@@ -91,6 +95,33 @@ def test_cli_rejects_nonpositive_jobs(monkeypatch, capsys, jobs):
         compile_lmm.main()
     assert error.value.code == 2
     assert "--jobs must be a positive integer" in capsys.readouterr().err
+
+
+def test_dflash_cli_forwards_block_size(monkeypatch, tmp_path):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "draft").mkdir()
+    calls = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "llima-compile",
+            str(tmp_path / "model"),
+            "-o",
+            str(tmp_path / "output"),
+            "-j",
+            "1",
+            "--draft_model_path",
+            str(tmp_path / "draft"),
+            "--speculative_block_size",
+            "8",
+        ],
+    )
+    monkeypatch.setattr(compile_lmm, "gen_files", lambda *args: calls.append(args))
+
+    compile_lmm.main()
+
+    assert calls[0][-1] == 8
 
 
 @pytest.mark.parametrize("option", ["--system_prompt_file", "--chat_template_file"])

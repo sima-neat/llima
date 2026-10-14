@@ -2,6 +2,10 @@
 #ifndef _SIMA_UTILS_
 #define _SIMA_UTILS_
 
+#include <algorithm>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -18,8 +22,10 @@
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
+#include <Eigen/Core>
 #include <spdlog/spdlog.h>
 
 
@@ -69,6 +75,81 @@ concept C = std::is_integral_v<T>;
 inline auto ceil_div(C auto x, C auto y) { return (x + y - 1) / y; }
 inline auto round_up_to(C auto x, C auto y) { return ceil_div(x, y) * y; }
 inline auto round_up_to_row(C auto x) { return round_up_to(x, MLA_ROW_SIZE); }
+
+
+// Return {maximum value, lowest index containing it}. Modalix always takes the
+// AArch64 path; the scalar fallback keeps host-side builds usable.
+inline std::pair<float, uint32_t> argmax_bf16(
+    const Eigen::bfloat16* values, uint32_t size
+) {
+    if (size == 0) {
+        throw std::invalid_argument("argmax_bf16 requires at least one value");
+    }
+
+    const float first = static_cast<float>(values[0]);
+#if defined(__aarch64__)
+    float32x4_t best_lo = vdupq_n_f32(first);
+    float32x4_t best_hi = best_lo;
+    uint32x4_t index_lo = vdupq_n_u32(0);
+    uint32x4_t index_hi = index_lo;
+    uint32x4_t positions = {0, 1, 2, 3};
+    uint32_t i = 0;
+    for (; size - i >= 8; i += 8) {
+        uint16x8_t bits;
+        std::memcpy(&bits, values + i, sizeof(bits));
+        const float32x4_t lo = vreinterpretq_f32_u32(
+            vshll_n_u16(vget_low_u16(bits), 16)
+        );
+        const float32x4_t hi = vreinterpretq_f32_u32(
+            vshll_n_u16(vget_high_u16(bits), 16)
+        );
+        const uint32x4_t replace_lo = vcgtq_f32(lo, best_lo);
+        const uint32x4_t replace_hi = vcgtq_f32(hi, best_hi);
+        best_lo = vbslq_f32(replace_lo, lo, best_lo);
+        best_hi = vbslq_f32(replace_hi, hi, best_hi);
+        index_lo = vbslq_u32(replace_lo, positions, index_lo);
+        index_hi = vbslq_u32(
+            replace_hi, vaddq_u32(positions, vdupq_n_u32(4)), index_hi
+        );
+        positions = vaddq_u32(positions, vdupq_n_u32(8));
+    }
+
+    float maxima[8];
+    uint32_t indices[8];
+    vst1q_f32(maxima, best_lo);
+    vst1q_f32(maxima + 4, best_hi);
+    vst1q_u32(indices, index_lo);
+    vst1q_u32(indices + 4, index_hi);
+    float best = first;
+    uint32_t index = 0;
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        if (maxima[lane] > best
+            || (maxima[lane] == best && indices[lane] < index)) {
+            best = maxima[lane];
+            index = indices[lane];
+        }
+    }
+    for (; i < size; ++i) {
+        const float value = static_cast<float>(values[i]);
+        if (value > best) {
+            best = value;
+            index = i;
+        }
+    }
+    return {best, index};
+#else
+    float best = first;
+    uint32_t index = 0;
+    for (uint32_t i = 1; i < size; ++i) {
+        const float value = static_cast<float>(values[i]);
+        if (value > best) {
+            best = value;
+            index = i;
+        }
+    }
+    return {best, index};
+#endif
+}
 
 
 inline std::string trim(std::string in) {

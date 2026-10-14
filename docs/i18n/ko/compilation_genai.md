@@ -108,10 +108,18 @@ output_directory/
 | `--no-quantize_embeddings` | 기본적으로 지원되는 LLM 및 VLM에 대해 활성화되어 있는 임베딩 테이블 양자화를 비활성화합니다. |
 | `--no-quantize_kv_cache` | 기본적으로 활성화되어 있는 KV 캐시 양자화를 비활성화합니다. |
 | `--return_logits` | 마지막 레이어의 출력에서 로짓 값을 반환합니다(모델 평가에 필요). |
-| `--draft_model_path` | 추측 디코딩을 위한 호환 가능한 EAGLE3 또는 Gemma4 MTP 초안 모델의 경로입니다. |
+| `--draft_model_path` | 호환 가능한 EAGLE3, Gemma4 MTP 또는 DFlash 초안 모델의 경로입니다. 방식은 자동으로 감지됩니다. |
+| `--speculative_block_size` | DFlash 검증 너비: 4, 8 또는 16. 기본값: 8. |
 | `--lora_name` | 기본 모델과 함께 컴파일되는 LoRA 어댑터의 이름입니다. |
 | `--lora_path` | 기본 모델과 함께 컴파일할 때 사용할 LoRA 어댑터 디렉터리의 경로입니다. |
 | `--compile_lora`, `--no-compile_lora` | LoRA 경로가 제공될 때 어댑터 가중치 컴파일을 활성화하거나 비활성화합니다. 기본적으로 활성화되어 있습니다. |
+
+DFlash에서는 사전 채움 그룹 크기가 블록 크기보다 커야 하며, 컨텍스트 길이는 그룹 크기로 나누어떨어져야 합니다:
+
+``` console
+llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
+    --speculative_block_size 16
+```
 
 ## 시스템 프롬프트
 
@@ -142,7 +150,9 @@ LLM 추론은 두 개의 뚜렷한 단계로 구성되며, 컴파일러는 각 �
 
 `get_layer_configuration` 함수는 각 컴파일러 단위에 대해 호출되며, 다음 값을 받습니다.
 
-- `model_properties`: `{"num_hidden_layers": int}`를 포함하는 딕셔너리
+- `model_properties`: 다음 항목이 포함된 딕셔너리:
+  - `"num_hidden_layers"`: 언어 레이어 수
+  - `"is_draft_model"`: 추측 디코딩 초안 모델을 설정할 때 `True`
 
 - `layer`: 다음 항목이 포함된 사전:
   - `"part"`: `"PRE"`, `"CACHE"`, `"POST"`와 같은 논리적 구성 요소

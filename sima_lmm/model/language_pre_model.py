@@ -27,6 +27,8 @@ class LanguagePreModel(LanguagePartBaseModel):
 
     @property
     def _layer_base_name(self) -> str:
+        if self.is_dflash_draft:
+            return f"layers.{self.layer_idx}"
         base = self.hf_model.language_model_param_base_name
         return base if self.is_eagle3_draft else f"{base}.layers.{self.layer_idx}"
 

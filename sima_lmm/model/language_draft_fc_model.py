@@ -27,11 +27,17 @@ class LanguageDraftFCModel(LanguagePartBaseModel):
         layer_cfg: LayerConfiguration,
         quantizable: bool,
     ):
-        input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size * 3)
         output_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
-
-        graph = ModelGraph(self, {"input": input_shape}, quantizable)
-        output = graph.linear("fc", graph.inputs["input"])
+        if self.is_dflash:
+            input_count = len(self.cfg.lm_cfg.speculative_decoding_cfg.target_layer_ids)
+            input_specs = {f"input_{index}": output_shape for index in range(input_count)}
+        else:
+            input_specs = {"input": (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size * 3)}
+        graph = ModelGraph(self, input_specs, quantizable)
+        fc_input = graph.concat(list(graph.inputs.values()), 3) if self.is_dflash else graph.inputs["input"]
+        output = graph.linear("fc", fc_input)
+        if self.is_dflash:
+            output = graph.rms_norm("hidden_norm", output)
         assert get_expected_tensor_value(output.get_type().output).shape == output_shape
 
         graph.save([output])

@@ -1,6 +1,6 @@
 {
   "ja": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
     "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
@@ -9,7 +9,7 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "ko": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
     "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
@@ -18,7 +18,7 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "uk": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
     "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
@@ -27,7 +27,7 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "zh-Hant": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
     "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",

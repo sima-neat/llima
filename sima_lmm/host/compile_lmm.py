@@ -52,7 +52,7 @@ def gen_files(
     language_group_size: int, future_token_mask_size: int,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None
+    draft_output_path: Path | None, speculative_block_size: int | None = None,
 ):
     enable_verbose_error_messages()
     models = list()
@@ -93,9 +93,7 @@ def gen_files(
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
             target_model=base_model,
-        )
-        base_model.configure_speculative_decoding(
-            is_draft=False, method=draft_model.cfg.lm_cfg.speculative_decoding_cfg.method
+            speculative_block_size=speculative_block_size,
         )
         models.append(draft_model)
 
@@ -291,6 +289,10 @@ def main():
         "--draft_model_path", type=Path,
         help="Path of the speculative draft/assistant model for the base (target) model."
     )
+    group.add_argument(
+        "--speculative_block_size", type=int, choices=(4, 8, 16),
+        help="DFlash verification width (default: 8)."
+    )
     group = parser.add_argument_group("Options to compile LoRA")
     group.add_argument(
         "--lora_name", type=str, dest="lora_names", action="append",
@@ -364,6 +366,9 @@ def main():
         output_path = base_output_path
         draft_output_path = None
 
+    if args.draft_model_path is None and args.speculative_block_size is not None:
+        _abort("Speculative decoding options require --draft_model_path.")
+
     check_output_path_conflict(args.model_path, output_path)
 
     try:
@@ -423,7 +428,8 @@ def main():
             args.language_group_size, args.future_token_mask_size,
             args.quantize_embeddings,
             args.quantize_kv_cache, return_logits, log_level, image_resolution,
-            args.draft_model_path, draft_output_path
+            args.draft_model_path, draft_output_path,
+            args.speculative_block_size,
         )
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
         _abort(str(exc))

@@ -1307,7 +1307,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 // EAGLE3 speculative-decoding driver. Loops initialize_tree → tree_decoding →
 // update_inference_inputs while streaming accepted tokens. Caller serializes
 // invocations (VLM wrapper holds the run mutex).
-std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculative_decoding(
     LanguageModel& draft_lm,
     std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,

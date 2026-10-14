@@ -46,6 +46,8 @@ def activation_dtype(quantizable: bool) -> np.dtype:
 class WeightOptions(TypedDict, total=False):
     """Overrides shared by projections and convolutions; source metadata is retained."""
 
+    get_param_func: Callable[[str], np.ndarray | tuple]
+    check_param_func: Callable[[str], bool]
     src_weight_name: str
     src_bias_name: str
     reshape_str: str | None

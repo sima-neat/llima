@@ -680,18 +680,12 @@ jobs:
           prepare_models="_work/runtime-tests/share/sima-lmm/tests/runtime/prepare_genai_models.sh"
           test -x "${prepare_models}"
 
-          prepare_models_lock="/media/nvme/llima/.prepare-models.lock"
-          flock \
+          timeout \
             --verbose \
-            --wait 1800 \
-            --close \
-            "${prepare_models_lock}" \
-            timeout \
-              --verbose \
-              --signal=TERM \
-              --kill-after=30s \
-              3600 \
-              "${prepare_models}"
+            --signal=TERM \
+            --kill-after=30s \
+            3600 \
+            "${prepare_models}"
 
           {
             printf 'LLIMA_MODELS_PATH=%s\n' "${LLIMA_MODELS_PATH}"
