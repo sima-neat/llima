@@ -49,7 +49,6 @@
         "moe_cfg": null,
         "hidden_size": 4096,
         "num_hidden_layers": 32,
-        "max_position_embeddings": 2048,
         "rms_norm_eps": 1e-05,
         "rms_norm_unit_offset": false,
         "layer_types": [

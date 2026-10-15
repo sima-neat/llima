@@ -189,10 +189,6 @@ class GgufFileType(int, ExtensibleEnum):
     BF16 = 32
 
 
-MLA_CONSTRAINTS: dict = {
-    "max_position_embeddings": 2048,  # k-v cache size
-}
-
 # Number of tokens processed in parallel per speculative-decoding step.
 # "draft": the number of candidate tokens the draft model proposes per step (topk).
 # "target": the number of tokens the target model verifies in parallel per step.
@@ -686,7 +682,6 @@ class LanguageModelConfig(BaseConfig):
         moe_cfg: The Mixture-of-Experts routing settings; None for dense models.
         hidden_size: The dimension of the embedding.
         num_hidden_layers: The number of transformer blocks.
-        max_position_embeddings: The context length.
         rms_norm_eps: The small value in RMS norm to prevent zero devision.
         rms_norm_unit_offset: Whether to add 1 to the weights in
             RMS norm layers before multiplying.  This parameter is
@@ -717,7 +712,6 @@ class LanguageModelConfig(BaseConfig):
     moe_cfg: MixtureOfExpertsConfig | None = None
     hidden_size: int = 0
     num_hidden_layers: int = 0
-    max_position_embeddings: int = 0
     rms_norm_eps: float = 1e-05
     rms_norm_unit_offset: bool = False
     layer_types: list[str] = field(default_factory=list)
@@ -753,6 +747,7 @@ class LanguageModelConfig(BaseConfig):
 
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
+        cfg.pop("max_position_embeddings", None)
         cfg["token_cfg"] = TokenEmbedConfig(**cfg["token_cfg"])
         if cfg["rope_cfg"].get("rope_scaling") is not None:
             cfg["rope_cfg"]["rope_scaling"] = RopeScalingConfig(**cfg["rope_cfg"]["rope_scaling"])
@@ -832,7 +827,6 @@ class LanguageModelConfig(BaseConfig):
 
         self.hidden_size = text_cfg.get("hidden_size", 0)
         self.num_hidden_layers = num_hidden_layers
-        self.max_position_embeddings = text_cfg.get("max_position_embeddings", 0)
         self.rms_norm_eps = text_cfg.get("rms_norm_eps", text_cfg.get("norm_eps", 1e-05))
         self.rms_norm_unit_offset = (
             model_format == ModelFormat.FORMAT_HF
@@ -1302,7 +1296,6 @@ class VlmConfig(BaseConfig):
             vlm_cfg.mm_cfg = None
             vlm_cfg.vm_cfg = None
 
-        apply_mla_constraint(vlm_cfg)
         return vlm_cfg
 
     @property
@@ -1657,24 +1650,6 @@ def llm_parameter_count(text_cfg: dict) -> int:
     total *= num_hidden_layers
     total += count_token_embedding + count_lm_rms
     return total
-
-
-def apply_mla_constraint(vlm_cfg: VlmConfig) -> None:
-    """Apply MLA constraints.
-
-    TODO: modify RoPE if context_length (max_position_embeddings) is changed.
-
-    Args:
-        vlm_cfg (VlmConfig): The configuration of VLM model.
-
-    Returns:
-        None. Change is made in place.
-    """
-    cfg = vlm_cfg.lm_cfg
-    if cfg is not None:
-        for key, value in MLA_CONSTRAINTS.items():
-            if getattr(cfg, key) > value:
-                setattr(cfg, key, value)
 
 
 def _cache_model_index(
