@@ -747,7 +747,6 @@ class LanguageModelConfig(BaseConfig):
 
     @staticmethod
     def load(cfg: dict) -> "LanguageModelConfig":
-        cfg.pop("max_position_embeddings", None)
         cfg["token_cfg"] = TokenEmbedConfig(**cfg["token_cfg"])
         if cfg["rope_cfg"].get("rope_scaling") is not None:
             cfg["rope_cfg"]["rope_scaling"] = RopeScalingConfig(**cfg["rope_cfg"]["rope_scaling"])

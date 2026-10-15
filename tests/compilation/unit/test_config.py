@@ -589,10 +589,6 @@ def test_group_configuration_is_automatic_and_serializable():
     assert restored.pipeline_cfg.input_token_group_size == 128
     assert restored.pipeline_cfg.input_token_group_offsets == list(range(0, 1024, 128))
 
-    legacy = json.loads(json.dumps(asdict(config)))
-    legacy["lm_cfg"]["max_position_embeddings"] = 2048
-    assert asdict(VlmConfig.load(legacy)) == asdict(config)
-
 
 @pytest.mark.parametrize("group", [512, 1024])
 def test_sliding_attention_supports_groups_at_least_as_large_as_window(group):
