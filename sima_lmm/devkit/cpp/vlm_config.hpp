@@ -194,13 +194,17 @@ struct SpeculativeDecodingConfig {
     uint32_t num_centroids = 0;
     uint32_t centroid_intermediate_top_k = 0;
 
+    std::vector<uint8_t> target_layer_ids = {};
+    int32_t mask_token_id = -1;
+
+    bool is_dflash() const { return method == "dflash"; }
     bool is_eagle3() const { return method == "eagle3"; }
     bool is_gemma4_mtp() const { return method == "gemma4_mtp"; }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     SpeculativeDecodingConfig, method, is_draft, speculative_budget,
     backbone_hidden_size, use_ordered_embeddings, num_centroids,
-    centroid_intermediate_top_k
+    centroid_intermediate_top_k, target_layer_ids, mask_token_id
 )
 
 struct MixtureOfExpertsConfig {
@@ -268,6 +272,10 @@ struct LanguageModelConfig {
         return speculative_decoding_cfg.has_value();
     }
 
+    bool is_dflash() const {
+        return is_spec_decode() && speculative_decoding_cfg->is_dflash();
+    }
+
     bool is_speculative_draft() const {
         return is_spec_decode() && speculative_decoding_cfg.value().is_draft;
     }
@@ -286,7 +294,7 @@ struct LanguageModelConfig {
     }
 
     uint32_t get_lm_head_output_size() const {
-        if (is_speculative_draft() && draft_vocab_size > 0) {
+        if (is_speculative_draft() && !is_dflash() && draft_vocab_size > 0) {
             return draft_vocab_size;
         }
         return token_cfg.vocab_size;

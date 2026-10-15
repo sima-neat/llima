@@ -552,7 +552,13 @@ jobs:
       - publish-vulcan-artifacts
     runs-on:
       group: ${{ needs.resolve-test-runner.outputs.modalix_runner_group }}
-      labels: [self-hosted, Linux, ARM64, modalix, "vulcan-${{ needs.resolve-vulcan-config.outputs.vulcan_env }}"]
+      labels:
+        - self-hosted
+        - Linux
+        - ARM64
+        - modalix
+        - modalix-som-16gig
+        - "vulcan-${{ needs.resolve-vulcan-config.outputs.vulcan_env }}"
     env:
       VULCAN_ENV: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
       SIMA_CLI_CHECK_FOR_UPDATE: "0"
@@ -680,18 +686,12 @@ jobs:
           prepare_models="_work/runtime-tests/share/sima-lmm/tests/runtime/prepare_genai_models.sh"
           test -x "${prepare_models}"
 
-          prepare_models_lock="/media/nvme/llima/.prepare-models.lock"
-          flock \
+          timeout \
             --verbose \
-            --wait 1800 \
-            --close \
-            "${prepare_models_lock}" \
-            timeout \
-              --verbose \
-              --signal=TERM \
-              --kill-after=30s \
-              3600 \
-              "${prepare_models}"
+            --signal=TERM \
+            --kill-after=30s \
+            3600 \
+            "${prepare_models}"
 
           {
             printf 'LLIMA_MODELS_PATH=%s\n' "${LLIMA_MODELS_PATH}"

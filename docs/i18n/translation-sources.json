@@ -1,7 +1,7 @@
 {
   "ja": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
-    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
+    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
     "docs/deployment.md": "829d1044658669c1d7fd04fa4f03aa0c055c54f69fb65e41ac2a801f88560083",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",
@@ -9,8 +9,8 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "ko": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
-    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
+    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
     "docs/deployment.md": "829d1044658669c1d7fd04fa4f03aa0c055c54f69fb65e41ac2a801f88560083",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",
@@ -18,8 +18,8 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "uk": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
-    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
+    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
     "docs/deployment.md": "829d1044658669c1d7fd04fa4f03aa0c055c54f69fb65e41ac2a801f88560083",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",
@@ -27,8 +27,8 @@
     "docs/setup.md": "262944e5b1db5efa6205e733dc081b6457d9c37b4e7526e180d46c3ca783722d"
   },
   "zh-Hant": {
-    "docs/compilation_genai.md": "4ae150d46c3d122f2b3fccbe8a5569e50b97af6d1bb0188c9138f4467ce9aaba",
-    "docs/contributing.md": "739f59b70caacf76273d0b4b0fb671cbe4f80996c1b230c034b0cf4ba533e3f8",
+    "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
+    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
     "docs/deployment.md": "829d1044658669c1d7fd04fa4f03aa0c055c54f69fb65e41ac2a801f88560083",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "f42253a67051f3eaabc9dc660b73d5dbd5b9cacf8f45bf1f62c3f62a1061a30e",

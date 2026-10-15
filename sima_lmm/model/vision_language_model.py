@@ -25,13 +25,15 @@ def _detect_speculative_method(model_config: dict) -> str:
     architectures = model_config.get("architectures", [])
     if isinstance(architectures, str):
         architectures = [architectures]
+    if "DFlashDraftModel" in architectures:
+        return SpeculativeDecodingMethod.DFLASH
     if any("eagle3" in architecture.lower() for architecture in architectures):
         return SpeculativeDecodingMethod.EAGLE3
 
     raise ValueError(
         "Unsupported speculative draft configuration: "
         f"model_type={model_config.get('model_type')!r}, architectures={architectures!r}. "
-        "Expected a Gemma4 MTP or EAGLE3 draft model."
+        "Expected a Gemma4 MTP, EAGLE3, or DFlash draft model."
     )
 
 
@@ -61,7 +63,7 @@ class VisionLanguageModel(BaseModel):
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
-        speculative_method: str | None = None,
+        speculative_block_size: int | None = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -76,8 +78,7 @@ class VisionLanguageModel(BaseModel):
             quantize_kv_cache: True if KV cache is quantized.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
-            speculative_method: Speculative decoding implementation for target/draft pairs.
-                None detects the method from the loaded draft configuration.
+            speculative_block_size: DFlash verification width (4, 8 or 16); defaults to 8.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -90,7 +91,7 @@ class VisionLanguageModel(BaseModel):
             hf_model = GgufModel(hf_cache_path)
             model_config = hf_model.model_config
 
-        if target_model is not None and speculative_method is None:
+        if target_model is not None:
             speculative_method = _detect_speculative_method(model_config)
 
         vlm_cfg = VlmConfig.from_hf_config(
@@ -145,18 +146,59 @@ class VisionLanguageModel(BaseModel):
             else:
                 vlm_helper = target_model.vlm_helper
 
-            # Set speculative decoding configs for the draft model
-            if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:
-                speculative_budget = SPECULATIVE_BUDGET["gemma4_mtp_draft"]
-            else:
-                speculative_budget = SPECULATIVE_BUDGET["draft"]
-            vlm_cfg.lm_cfg.set_speculative_decoding_config(
-                dict(
+            if speculative_method == SpeculativeDecodingMethod.DFLASH:
+                dflash_cfg = model_config["dflash_config"]
+                budget = speculative_block_size or 8
+                if target_model.cfg.pipeline_cfg.input_token_group_size <= budget:
+                    raise ValueError(
+                        "DFlash requires language_group_size > speculative_block_size"
+                    )
+                if (
+                    target_model.cfg.pipeline_cfg.max_num_tokens
+                    % target_model.cfg.pipeline_cfg.input_token_group_size
+                ):
+                    raise ValueError(
+                        "DFlash requires max_num_tokens divisible by language_group_size"
+                    )
+                target_layer_ids = dflash_cfg["target_layer_ids"]
+                mask_token_id = dflash_cfg["mask_token_id"]
+                if not target_layer_ids or len(set(target_layer_ids)) != len(target_layer_ids) or any(
+                    layer < 0 or layer >= target_model.cfg.lm_cfg.num_hidden_layers
+                    for layer in target_layer_ids
+                ):
+                    raise ValueError("DFlash target_layer_ids must be nonempty, unique, and within the target layers")
+                if not 0 <= mask_token_id < target_model.cfg.lm_cfg.token_cfg.vocab_size:
+                    raise ValueError("DFlash mask_token_id must be within the target vocabulary")
+                spec_cfg = dict(
                     method=speculative_method,
-                    is_draft=True,
-                    speculative_budget=speculative_budget,
+                    speculative_budget=budget,
+                    target_layer_ids=target_layer_ids,
+                    mask_token_id=mask_token_id,
                 )
-            )
+                target_model.cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=False)
+                )
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=True)
+                )
+                for pipeline_cfg in (
+                    target_model.cfg.pipeline_cfg,
+                    vlm_cfg.pipeline_cfg,
+                ):
+                    if pipeline_cfg.future_token_mask_size == 1:
+                        pipeline_cfg.set_future_token_mask_size(budget)
+            else:
+                if speculative_block_size is not None:
+                    raise ValueError("--speculative_block_size is only valid for DFlash")
+                target_model.configure_speculative_decoding(is_draft=False, method=speculative_method)
+                budget_key = (
+                    "gemma4_mtp_draft"
+                    if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP else "draft"
+                )
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(method=speculative_method, is_draft=True,
+                         speculative_budget=SPECULATIVE_BUDGET[budget_key])
+                )
 
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
@@ -168,6 +210,8 @@ class VisionLanguageModel(BaseModel):
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        if target_model is not None and speculative_method == SpeculativeDecodingMethod.DFLASH:
+            model.language_model.dflash_target_hf_model = target_model.hf_model
         return model
 
     def set_lora_adapter(self, lora_path: Path):

@@ -208,6 +208,7 @@ class SpeculativeDecodingMethod(str, ExtensibleEnum):
     """Speculative decoding implementation to use for target/draft pairs."""
     EAGLE3 = "eagle3"
     GEMMA4_MTP = "gemma4_mtp"
+    DFLASH = "dflash"
 
 
 class BaseConfig(object):
@@ -650,14 +651,14 @@ class SpeculativeDecodingConfig(BaseConfig):
 
     Attributes:
         method: Speculative decoding implementation.
-        is_draft: True if the model is a draft model in a speculative decoding setup.
-        speculative_budget: Number of tokens the target/draft model processes in parallel decode per step.
-            EAGLE3 uses 16 for target and 5 for draft by default. Gemma4 MTP uses
-            7 target verification rows and a recurrent 6-token assistant budget.
-        backbone_hidden_size: Target hidden width consumed by Gemma4 MTP draft projections.
-        use_ordered_embeddings: Compile and run the centroid-masked Gemma4 MTP draft head.
+        is_draft: Whether this is the draft model.
+        speculative_budget: Parallel token width; MTP drafts run recurrently.
+        backbone_hidden_size: Target hidden width consumed by Gemma4 MTP projections.
+        use_ordered_embeddings: Enable the centroid-masked Gemma4 MTP draft head.
         num_centroids: Number of centroids in that head.
         centroid_intermediate_top_k: Number of active centroids during draft selection.
+        target_layer_ids: Target layers consumed by DFlash context fusion.
+        mask_token_id: DFlash mask token filling the proposal block.
     """
     method: str = SpeculativeDecodingMethod.EAGLE3
     is_draft: bool = False
@@ -666,6 +667,8 @@ class SpeculativeDecodingConfig(BaseConfig):
     use_ordered_embeddings: bool = False
     num_centroids: int = 0
     centroid_intermediate_top_k: int = 0
+    target_layer_ids: list[int] = field(default_factory=list)
+    mask_token_id: int = -1
 
 
 @dataclass
@@ -904,6 +907,11 @@ class LanguageModelConfig(BaseConfig):
             method = cfg.get("method", SpeculativeDecodingMethod.EAGLE3)
             if method not in SpeculativeDecodingMethod.values():
                 raise ValueError(f"Unsupported speculative decoding method: {method}")
+            budget = cfg.get("speculative_budget", 16)
+            if budget <= 1:
+                raise ValueError("speculative_budget must be greater than one")
+            if method == SpeculativeDecodingMethod.DFLASH and budget not in (4, 8, 16):
+                raise ValueError("DFlash speculative_budget must be 4, 8, or 16")
             if method == SpeculativeDecodingMethod.EAGLE3:
                 if self.linear_attn_cfg is not None:
                     raise ValueError(
@@ -1361,6 +1369,11 @@ class VlmConfig(BaseConfig):
             lm_cfg.speculative_decoding_cfg is not None
             and lm_cfg.speculative_decoding_cfg.is_draft
         )
+        is_dflash_draft = (
+            is_speculative_draft
+            and lm_cfg.speculative_decoding_cfg.method == "dflash"
+        )
+
         is_gemma4_mtp_draft = (
             is_speculative_draft
             and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
@@ -1368,7 +1381,9 @@ class VlmConfig(BaseConfig):
         verification_width = (
             lm_cfg.single_model_num_tokens
             if lm_cfg.speculative_decoding_cfg is not None
-            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.GEMMA4_MTP
+            and lm_cfg.speculative_decoding_cfg.method in (
+                SpeculativeDecodingMethod.GEMMA4_MTP, SpeculativeDecodingMethod.DFLASH
+            )
             else 1
         )
         if layer_types:
@@ -1388,6 +1403,12 @@ class VlmConfig(BaseConfig):
                     layers.append(LayerID("single_conv", i))
                 elif t == "full_attention" or t == "sliding_attention":
                     has_attn = True
+                    if is_dflash_draft:
+                        layers.append(LayerID("group_dflash_context", i))
+                        layers.append(LayerID("single_dflash_context", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_post", i))
+                        continue
                     if lm_cfg.moe_cfg is not None:
                         # MoE layers replace the single post (MLP) part with a router
                         # plus one model per expert, for both group and single paths.
@@ -1451,10 +1472,10 @@ class VlmConfig(BaseConfig):
                         single_cache_indices = single_shared_sliding_cache_model_indices(
                             pipeline_cfg, sliding_window
                         )
-                if not is_gemma4_mtp_draft:
+                if not (is_gemma4_mtp_draft or is_dflash_draft):
                     layers.extend(LayerID("group_cache", n) for n in group_cache_indices)
                 layers.extend(LayerID("single_cache", n) for n in single_cache_indices)
-                if has_sliding_attn and not is_gemma4_mtp_draft:
+                if has_sliding_attn and not (is_gemma4_mtp_draft or is_dflash_draft):
                     layers.extend(
                         LayerID("group_sliding_cache", n)
                         for n in group_sliding_cache_model_indices(
@@ -1487,7 +1508,7 @@ class VlmConfig(BaseConfig):
                 layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
         else:
             # Fallback: attention-only if no layer_types
-            if not is_gemma4_mtp_draft:
+            if not (is_gemma4_mtp_draft or is_dflash_draft):
                 layers.extend(LayerID("group_pre", n) for n in range(lm_cfg.num_hidden_layers))
                 num_group_post_layers = (
                     lm_cfg.num_hidden_layers
@@ -1506,10 +1527,7 @@ class VlmConfig(BaseConfig):
                 LayerID("vision", n)
                 for n in range(self.num_vision_layers)
             )
-        if (
-            is_speculative_draft
-            and lm_cfg.speculative_decoding_cfg.method == SpeculativeDecodingMethod.EAGLE3
-        ):
+        if is_speculative_draft and not is_gemma4_mtp_draft:
             layers.append(LayerID("group_draft_fc", 0))
             layers.append(LayerID("single_draft_fc", 0))
 

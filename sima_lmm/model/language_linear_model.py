@@ -22,6 +22,9 @@ class LanguageLinearModel(LanguagePartBaseModel):
         - hidden: (1, 1, num_tokens, hidden)
         - linear_conv_state_out: (1, 1, num_tokens + kernel - 2, linear_conv_dim)
         - linear_delta_state_out: (1, num_value_heads, key_head_dim, value_head_dim)
+
+    DFlash verification returns S1 instead of the final delta state, followed by
+    key, v_new and the decay matrix for accepted-prefix resolution.
     """
 
     num_tokens: int
@@ -38,6 +41,20 @@ class LanguageLinearModel(LanguagePartBaseModel):
         assert self.layer_idx < self.cfg.lm_cfg.num_hidden_layers - 1, (
             "Qwen3.5 linear_attention is not expected on the final layer."
         )
+
+    @property
+    def _emit_dflash_resolver_inputs(self) -> bool:
+        speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return (
+            speculative_cfg is not None
+            and speculative_cfg.method == "dflash"
+            and not speculative_cfg.is_draft
+            and self.num_tokens == speculative_cfg.speculative_budget
+        )
+
+    @property
+    def _uses_linear_valid_mask(self) -> bool:
+        return self.num_tokens > 1 and not self._emit_dflash_resolver_inputs
 
     @property
     def split_mlp(self) -> bool:
@@ -81,7 +98,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
             input_dtypes["input"] = np.int8
             input_specs["input_scale"] = scale_shape
         input_specs["linear_conv_state"] = conv_state_shape
-        if self.num_tokens > 1:
+        if self._uses_linear_valid_mask:
             input_specs["linear_valid_mask"] = valid_mask_shape
         input_specs["linear_delta_state"] = state_shape
         graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
@@ -89,7 +106,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
             mla_input_scale = graph.inputs["input_scale"]
         mla_conv_state = graph.inputs["linear_conv_state"]
-        if self.num_tokens > 1:
+        if self._uses_linear_valid_mask:
             mla_valid_mask = graph.inputs["linear_valid_mask"]
         else:
             mla_valid_mask = None
@@ -192,7 +209,10 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 mla_delta_state,
             )
         else:
-            core_attn_out, linear_delta_state_out = self._build_group_delta(
+            (
+                core_attn_out, linear_delta_state_out, resolver_key,
+                resolver_value, resolver_decay_mask,
+            ) = self._build_group_delta(
                 graph,
                 query,
                 key,
@@ -202,6 +222,7 @@ class LanguageLinearModel(LanguagePartBaseModel):
                 beta,
                 g,
                 mla_delta_state,
+                emit_resolver_inputs=self._emit_dflash_resolver_inputs,
             )
 
         z_heads = graph.split_heads(z, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads)
@@ -229,7 +250,10 @@ class LanguageLinearModel(LanguagePartBaseModel):
             merged_lora=merged_lora,
             with_residual_add=True,
         )
-        graph.save([mlp, linear_conv_state_out, linear_delta_state_out])
+        outputs = [mlp, linear_conv_state_out, linear_delta_state_out]
+        if self._emit_dflash_resolver_inputs:
+            outputs.extend([resolver_key, resolver_value, resolver_decay_mask])
+        graph.save(outputs)
 
     def _get_ab_projection_params(
         self, linear_base: str
@@ -553,7 +577,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
         beta: Node,
         g: Node,
         state: Node,
-    ) -> tuple[Node, Node]:
+        emit_resolver_inputs: bool = False,
+    ) -> tuple[Node, Node, Node, Node, Node]:
         """Build the grouped prefill computation in NHWC head-major layout."""
         g_cum = self._build_static_triangular_sums(graph, g, upper=True)
         strict_lower = graph.constant(
@@ -611,19 +636,27 @@ class LanguageLinearModel(LanguagePartBaseModel):
         attn_value = graph.matmul(qk, v_new)
         core_attn_out = graph.add(attn_inter, attn_value)
 
-        suffix_g = self._build_static_triangular_sums(
-            graph, g, upper=False
-        )
-        suffix_g_exp = graph.exp(suffix_g)
-        final_g_exp = graph.slice(suffix_g_exp, start=0, stop=1, axis=2)
-        final_decay_mask = graph.slice(suffix_g_exp, start=1, stop=self.num_tokens, axis=2)
-        final_decay_mask_tail = graph.constant(
-            np.ones((1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, 1, 1), dtype=np.float32),
-        )
-        final_decay_mask = graph.concat([final_decay_mask, final_decay_mask_tail], 2)
-        v_new_weighted = graph.mul(v_new, final_decay_mask)
-        state_updates = graph.matmul(key, v_new_weighted, transpose_a=True)
-        state_base = graph.mul(state, final_g_exp)
-        linear_delta_state_out = graph.add(state_base, state_updates)
+        if emit_resolver_inputs:
+            first_decay = graph.slice(g_exp, start=0, stop=1, axis=2)
+            first_key = graph.slice(key, start=0, stop=1, axis=2)
+            first_value = graph.slice(v_new, start=0, stop=1, axis=2)
+            first_update = graph.matmul(first_key, first_value, transpose_a=True)
+            state_base = graph.mul(state, first_decay)
+            linear_delta_state_out = graph.add(state_base, first_update)
+        else:
+            suffix_g = self._build_static_triangular_sums(
+                graph, g, upper=False
+            )
+            suffix_g_exp = graph.exp(suffix_g)
+            final_g_exp = graph.slice(suffix_g_exp, start=0, stop=1, axis=2)
+            final_decay_mask = graph.slice(suffix_g_exp, start=1, stop=self.num_tokens, axis=2)
+            final_decay_mask_tail = graph.constant(
+                np.ones((1, self.cfg.lm_cfg.linear_attn_cfg.num_value_heads, 1, 1), dtype=np.float32),
+            )
+            final_decay_mask = graph.concat([final_decay_mask, final_decay_mask_tail], 2)
+            v_new_weighted = graph.mul(v_new, final_decay_mask)
+            state_updates = graph.matmul(key, v_new_weighted, transpose_a=True)
+            state_base = graph.mul(state, final_g_exp)
+            linear_delta_state_out = graph.add(state_base, state_updates)
 
-        return core_attn_out, linear_delta_state_out
+        return core_attn_out, linear_delta_state_out, key, v_new, decay_mask

@@ -168,6 +168,7 @@ graph.save([output])
 테셀레이션은 `sima_analysis.get_tessellate_parameters()`에서 중앙 관리하여 추론합니다. HWC16 레이아웃, 자동 타일 크기, 결정적인 영구 버퍼 이름을 사용합니다. 일반 컴포넌트는 `BaseModel`에서 빈 재정의 설정을 상속합니다. 스트라이드 KV 캐시 같은 특수 레이아웃은 기존 `get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` 메서드를 재정의합니다. 키는 텐서 인덱스이며 음수 인덱스는 끝에서부터 셉니다.
 
 Whisper 컴포넌트, 모든 네이티브 언어 그래프 부분, 표준 vision tower에서 이 API를 사용합니다. attention, MLP, 회전 헬퍼는 같은 구현을 공유합니다.
+DFlash의 컨텍스트 융합, K/V 투영 및 상태 해석기 컴포넌트도 `generate_graph()`와 `ModelGraph`를 사용합니다. 최종 드래프트 그래프는 연결된 타깃의 패킹된 출력 헤드 가중치와 스케일을 유지하며, 검증 그래프는 런타임 상태 해석기가 필요로 하는 S1 및 풀이가 완료된 중간값 출력을 유지합니다.
 
 ## 테스트
 

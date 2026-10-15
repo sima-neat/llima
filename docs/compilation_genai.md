@@ -133,10 +133,18 @@ Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 819
 | `--no-quantize_embeddings` | Disable embedding-table quantization, which is enabled by default for supported LLMs and VLMs. |
 | `--no-quantize_kv_cache` | Disable KV-cache quantization, which is enabled by default. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
-| `--draft_model_path` | Path to a compatible EAGLE3 or Gemma4 MTP draft model for speculative decoding. |
+| `--draft_model_path` | Path to a compatible EAGLE3, Gemma4 MTP, or DFlash draft model; the method is detected automatically. |
+| `--speculative_block_size` | DFlash verification width: 4, 8, or 16. Default: 8. |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
 | `--compile_lora`, `--no-compile_lora` | Enable or disable adapter-weight compilation when LoRA paths are supplied. Enabled by default. |
+
+For DFlash, the prefill group must exceed the block size and divide the context length:
+
+``` console
+llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
+    --speculative_block_size 16
+```
 
 ## System Prompts
 
@@ -174,7 +182,9 @@ Because these phases have different performance characteristics, you can apply d
 The `get_layer_configuration` function is called for each compiler unit and
 receives:
 
-- `model_properties`: Dictionary with `{"num_hidden_layers": int}`
+- `model_properties`: Dictionary with:
+  - `"num_hidden_layers"`: Number of language layers
+  - `"is_draft_model"`: `True` when configuring a speculative draft model
 
 - `layer`: Dictionary with:
   - `"part"`: Logical component such as `"PRE"`, `"CACHE"`, `"POST"`,

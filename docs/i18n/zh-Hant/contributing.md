@@ -167,6 +167,7 @@ graph.save([output])
 細分布局集中由 `sima_analysis.get_tessellate_parameters()` 推論：HWC16 布局、自動 tile 大小與可確定的持久緩衝區名稱。一般元件從 `BaseModel` 繼承空的覆寫設定。具步幅的 KV 快取等特殊布局，覆寫現有的 `get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` 方法；鍵是張量索引，負索引從尾端計算。
 
 Whisper 元件、所有原生語言圖部分與標準 vision tower 都使用此 API；其 attention、MLP 與旋轉輔助函式共用相同實作。
+DFlash 的上下文融合、K/V 投影與狀態解析器元件也使用 `generate_graph()` 和 `ModelGraph`。最終的草稿圖保留配對目標模型的已打包輸出頭權重與尺度；驗證圖則保留執行階段狀態解析器所需的 S1 與已求解中間結果輸出。
 
 ## 測試
 

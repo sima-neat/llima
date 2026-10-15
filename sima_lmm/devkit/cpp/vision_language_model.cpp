@@ -158,15 +158,9 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_language_model(
             "Draft VLM is configured but target model lacks speculative decoding config"
         );
     }
-    if (_cfg.lm_cfg.speculative_decoding_cfg->is_gemma4_mtp()) {
-        return _language_model_ptr->run_model_gemma4_mtp(
-            *_draft_vlm_ptr->_language_model_ptr, input_token_ids,
-            max_num_tokens, timer_ttft, performance_result
-        );
-    }
     return _language_model_ptr->run_model_speculative_decoding(
         *_draft_vlm_ptr->_language_model_ptr, input_token_ids,
-        max_num_tokens, timer_ttft, performance_result
+        max_num_tokens, timer_ttft, performance_result, stable_prefix_token_count
     );
 }
 

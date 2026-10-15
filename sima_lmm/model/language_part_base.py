@@ -46,6 +46,15 @@ class LanguagePartBaseModel(BaseModel):
         return cfg is not None and cfg.is_draft
 
     @property
+    def is_dflash(self) -> bool:
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return cfg is not None and cfg.method == "dflash"
+
+    @property
+    def is_dflash_draft(self) -> bool:
+        return self.is_draft and self.is_dflash
+
+    @property
     def is_eagle3_draft(self) -> bool:
         cfg = self.cfg.lm_cfg.speculative_decoding_cfg
         return self.is_draft and cfg.method == SpeculativeDecodingMethod.EAGLE3
@@ -94,19 +103,29 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
 
     def _build_post_transformer(self, graph, input_node) -> list[Node]:
         """Build final normalization, logits and speculative state outputs."""
-        # LFM2 uses embedding_norm instead of norm for the final normalization.
-        base_prefix = self.hf_model.language_model_param_base_name
-        final_norm_name = (
-            "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
-        )
-        final_norm_full_name = f"{base_prefix}.{final_norm_name}"
-        if self.is_eagle3_draft:
-            final_norm_full_name = final_norm_name
-        rms_norm = graph.rms_norm(final_norm_full_name, input_node)
-
-        # Find the last layer's size based on the weight tensor shape.
-        output_embed_name = self._get_output_embed_name()
-        output_embed_param = graph.parameter(output_embed_name)
+        is_dflash_draft = self.is_dflash_draft
+        kwargs = {}
+        if is_dflash_draft:
+            rms_norm = graph.rms_norm("norm", input_node)
+            rms_norm = graph.slice(rms_norm, start=1, stop=self.num_tokens, axis=2)
+            output_embed_name = self._get_output_embed_name(self._check_dflash_target_param)
+            output_embed_param = self._get_dflash_target_param(output_embed_name)
+            kwargs.update(
+                get_param_func=lambda name: self._get_dflash_target_param(
+                    name, dequantize=graph.quantizable
+                ),
+                check_param_func=self._check_dflash_target_param,
+            )
+        else:
+            # LFM2 uses embedding_norm instead of norm for the final normalization.
+            base_prefix = self.hf_model.language_model_param_base_name
+            final_norm_name = (
+                "embedding_norm" if self.check_hf_param(f"{base_prefix}.embedding_norm.weight") else "norm"
+            )
+            final_norm_full_name = final_norm_name if self.is_eagle3_draft else f"{base_prefix}.{final_norm_name}"
+            rms_norm = graph.rms_norm(final_norm_full_name, input_node)
+            output_embed_name = self._get_output_embed_name()
+            output_embed_param = graph.parameter(output_embed_name)
         output_embed_weight = (
             output_embed_param[1] if isinstance(output_embed_param, tuple) else output_embed_param
         )
@@ -116,26 +135,26 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             < output_vocab_size
             <= (
                 self.cfg.lm_cfg.draft_vocab_size
-                if self.cfg.lm_cfg.draft_vocab_size > 0
+                if not is_dflash_draft and self.cfg.lm_cfg.draft_vocab_size > 0
                 else self.cfg.lm_cfg.token_cfg.vocab_size
             )
         )
 
         lm_heads = []
-        kwargs = {}
         kwargs["src_weight_name"] = output_embed_name
+        head_name = "dflash_lm_head" if is_dflash_draft else "lm_head"
         for i in range(self.cfg.lm_cfg.lm_head_num_splits):
             split_begin = i * self.cfg.lm_cfg.lm_head_split_dim
             split_end = min(split_begin + self.cfg.lm_cfg.lm_head_split_dim, output_vocab_size)
 
-            def param_process_func(x: np.ndarray) -> np.ndarray:
-                return x[split_begin:split_end]
+            def param_process_func(x: np.ndarray, begin=split_begin, end=split_end) -> np.ndarray:
+                return x[begin:end]
 
             kwargs["weight_process_func"] = param_process_func
             kwargs["scale_process_func"] = param_process_func
             kwargs["bias_process_func"] = param_process_func
-            lm_head = graph.linear(f"lm_head.{i}", rms_norm, **kwargs)
-            if self.final_softcapping is not None:
+            lm_head = graph.linear(f"{head_name}.{i}", rms_norm, **kwargs)
+            if self.final_softcapping is not None and not is_dflash_draft:
                 assert self.cfg.lm_cfg.arch == LlmArchType.GEMMA and (
                     self.cfg.lm_cfg.model_type == "gemma2"
                     or self.cfg.model_type == VlmArchType.VLM_GEMMA4
@@ -143,6 +162,8 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 lm_head = graph.softcap(lm_head, self.cfg.lm_cfg.final_logit_softcapping)
             lm_heads.append(lm_head)
 
+        if is_dflash_draft:
+            return lm_heads
         if self.is_eagle3_draft:
             lm_heads.append(input_node)
             return lm_heads
@@ -160,11 +181,11 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
         else:
             return lm_heads
 
-    def _get_output_embed_name(self):
+    def _get_output_embed_name(self, check_param_func=None):
         """
         Get the name of the model's output embedding weight tensor.
         """
-        if self.cfg.vm_cfg:
+        if self.cfg.vm_cfg or check_param_func is not None:
             # For VLMs, check for prefixed names first, which is the common case.
             ordered_candidates = [
                 "lm_head.weight",
@@ -181,8 +202,11 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
                 "model.lm_head.weight",
             ]
 
+        if check_param_func is not None:
+            ordered_candidates.append("model.lm_head.weight")
+        check_param_func = check_param_func or self.check_hf_param
         for name in ordered_candidates:
-            if self.check_hf_param(name):
+            if check_param_func(name):
                 return name
 
         raise RuntimeError(

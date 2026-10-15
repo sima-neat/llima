@@ -280,7 +280,10 @@ keys are tensor indices (negative indices count from the end).
 
 Whisper components, all native language graph parts and the standard vision tower
 show this API in use; their attention, MLP and rotary helpers share the same
-implementations.
+implementations. DFlash context fusion, K/V projection and state resolver components
+also use `generate_graph()` and `ModelGraph`. Its final draft graph keeps the paired
+target's packed output-head weights and scales; verification retains the S1 and
+solved-intermediate outputs expected by the runtime resolver.
 
 ## Testing
 

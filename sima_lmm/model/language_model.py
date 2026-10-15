@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import time
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from ml_dtypes import bfloat16
 from afe.ir.quantization_conv import block_quantize_weight_tensor
@@ -20,6 +20,10 @@ from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
 from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
+from sima_lmm.model.language_dflash_context_model import LanguageDFlashContextModel
+from sima_lmm.model.language_dflash_state_resolver_model import (
+    LanguageDFlashStateResolverModel,
+)
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
@@ -65,6 +69,10 @@ class LanguageModel(BaseModel):
     3. PostCacheModel: Post cache model implements the transformer layer after the self-attention
         block, including the layers after the last transformer layer.
     """
+    dflash_target_hf_model: LocalHuggingFaceModel | GgufModel | None = field(
+        default=None, kw_only=True
+    )
+
     def __post_init__(self):
         if self.cfg.pipeline_cfg.input_token_group_offsets:
             self.cfg.pipeline_cfg.input_token_group_offsets.sort()
@@ -95,7 +103,7 @@ class LanguageModel(BaseModel):
         # Create a list of all models to compile
         model_list = list()
         num_tokens = self.cfg.pipeline_cfg.input_token_group_size
-        single_model_num_tokens = self._single_model_num_tokens
+        single_model_num_tokens = self.cfg.lm_cfg.single_model_num_tokens
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
 
@@ -149,7 +157,7 @@ class LanguageModel(BaseModel):
                     )
                 case "single_linear":
                     part_model = self._get_part_model(
-                        "linear_fused", 1, layer_idx=layer_id.part_idx
+                        "linear_fused", single_model_num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "conv_post_final":
                     part_model = self._get_part_model(
@@ -162,6 +170,15 @@ class LanguageModel(BaseModel):
                 case "single_draft_fc":
                     part_model = self._get_part_model(
                         "draft_fc", single_model_num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "group_dflash_context":
+                    part_model = self._get_part_model(
+                        "dflash_context", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_dflash_context":
+                    part_model = self._get_part_model(
+                        "dflash_context", single_model_num_tokens,
+                        layer_idx=layer_id.part_idx,
                     )
                 case "group_per_layer":
                     part_model = self._get_part_model("per_layer", num_tokens)
@@ -202,6 +219,29 @@ class LanguageModel(BaseModel):
             if lora_mode:
                 curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
+
+        speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        if (
+            speculative_cfg is not None
+            and speculative_cfg.method == "dflash"
+            and not speculative_cfg.is_draft
+        ):
+            resolver_precision = next(
+                (
+                    curr_precision
+                    for layer_id, curr_precision in precision.items()
+                    if layer_id.part == "single_linear"
+                ),
+                None,
+            )
+            if resolver_precision is not None:
+                block_size = speculative_cfg.speculative_budget
+                model_list.append(
+                    (
+                        self._get_part_model("dflash_state_resolver", block_size),
+                        {"precision": resolver_precision},
+                    )
+                )
 
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
@@ -541,15 +581,19 @@ class LanguageModel(BaseModel):
         embed_scale: float = 1.0,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
+        is_draft = (
+            self.cfg.lm_cfg.speculative_decoding_cfg is not None
+            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
+        )
+        if weight_name is None and is_draft and not any(
+            name.endswith("embed_tokens.weight") for name in self.hf_model.weight_map
+        ):
+            return None, None
         if weight_name is None:
             base_name = self.hf_model.language_model_param_base_name
             weight_name = f"{base_name}.embed_tokens.weight"
             if self.cfg.lm_cfg.arch == LlmArchType.GEMMA:
                 embed_scale = self.cfg.lm_cfg.hidden_size ** 0.5
-        is_draft = (
-            self.cfg.lm_cfg.speculative_decoding_cfg is not None
-            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
-        )
         if is_draft and weight_name not in self.hf_model.weight_map:
             return None, None
         if isinstance(self.hf_model, LocalHuggingFaceModel):
@@ -582,10 +626,6 @@ class LanguageModel(BaseModel):
         assert embeddings is not None
         return embeddings, scale
 
-    @property
-    def _single_model_num_tokens(self) -> int:
-        return self.cfg.lm_cfg.single_model_num_tokens
-
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,
         token_idx: int | None = None, expert_idx: int = -1,
@@ -609,6 +649,7 @@ class LanguageModel(BaseModel):
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
                     expert_idx=expert_idx,
+                    dflash_target_hf_model=self.dflash_target_hf_model,
                 )
             case "router":
                 model_name = f"{self.model_name}_n{num_tokens}_router_layer{layer_idx}"
@@ -670,6 +711,25 @@ class LanguageModel(BaseModel):
                 return LanguageDraftFCModel(
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens
+                )
+            case "dflash_context":
+                model_name = (
+                    f"{self.model_name}_n{num_tokens}_dflash_context_layer{layer_idx}"
+                )
+                assert layer_idx is not None
+                return LanguageDFlashContextModel(
+                    self.cfg, model_name,
+                    sima_path=self.sima_path, hf_model=self.hf_model,
+                    num_tokens=num_tokens, layer_idx=layer_idx,
+                )
+            case "dflash_state_resolver":
+                model_name = f"{self.model_name}_n{num_tokens}_dflash_state_resolver"
+                return LanguageDFlashStateResolverModel(
+                    self.cfg,
+                    model_name,
+                    sima_path=self.sima_path,
+                    hf_model=self.hf_model,
+                    block_size=num_tokens,
                 )
             case "per_layer":
                 model_name = f"{self.model_name}_n{num_tokens}_per_layer"
