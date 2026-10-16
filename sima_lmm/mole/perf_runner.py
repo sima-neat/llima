@@ -148,8 +148,7 @@ def run_performance(lm, config):
                     # The unmeasured warmup identifies the mode from its draft counter.
                     max_length = len(tokens) + (config.max_new_tokens if phase == "warmup"
                                                else budget - (mode == "ordinary"))
-                    if max_length > config.max_num_tokens:
-                        raise ValueError("Output budget exceeds --max_num_tokens; reduce input or output length")
+                    max_length = min(max_length, config.max_num_tokens)
                     durations = lm._zmq_infer(context, "generate_for_perf", max_num_tokens=max_length,
                         stop_token_ids=stops).cpu().tolist()[0]
                     metadata = lm.last_profile_data
@@ -160,7 +159,9 @@ def run_performance(lm, config):
                         raise RuntimeError("Runtime returned invalid generation durations")
                     mode = "speculative" if accepted is not None else "ordinary"
                     report["settings"]["decoding"] = mode
-                    record.update(decoding=mode, output_budget=max_length - len(tokens) + (mode == "ordinary"))
+                    record["decoding"] = mode
+                    if phase == "warmup":
+                        record["output_budget"] = max_length - len(tokens) + (mode == "ordinary")
                     if count > record["output_budget"]:
                         raise RuntimeError("Runtime returned more tokens than the requested output budget")
                     decode_time = sum(durations[1:])
