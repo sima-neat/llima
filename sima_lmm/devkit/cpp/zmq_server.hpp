@@ -30,10 +30,11 @@ struct ZMQRequestMetadata {
     std::optional<size_t> continuation_start;
     std::optional<std::vector<uint32_t>> continuation_token_ids;
     bool use_group_prefill = true;
+    std::optional<uint16_t> new_tokens;
 
     MSGPACK_DEFINE_MAP(
         type, tensor_dtype, tensor_shape, max_num_tokens, stop_token_ids, continuation_start,
-        continuation_token_ids, use_group_prefill
+        continuation_token_ids, use_group_prefill, new_tokens
     );
 };
 
@@ -46,10 +47,12 @@ struct ZMQResponseMetadata {
     std::optional<uint32_t> generated_tokens;
     std::optional<uint32_t> accepted_draft_tokens;
     std::optional<std::string> error;
+    std::optional<std::vector<uint32_t>> generated_token_ids;
+    std::optional<std::string> benchmark_info;
 
     MSGPACK_DEFINE_MAP(
         tensor_dtype, tensor_shape, infer_time_ns, result_type, generated_tokens,
-        accepted_draft_tokens, error
+        accepted_draft_tokens, error, generated_token_ids, benchmark_info
     );
 };
 
@@ -68,6 +71,7 @@ class EXPORT ZMQServer {
 
     private:
         uint32_t _port;
+        std::string _benchmark_info;
         zmq::context_t _zmq_ctx;
         zmq::socket_t _zmq_socket;
 

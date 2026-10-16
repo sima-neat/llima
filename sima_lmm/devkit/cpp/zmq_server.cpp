@@ -32,6 +32,15 @@ ZMQServer::ZMQServer(
         );
     }
 
+    nlohmann::json info = {
+        {"protocol", 1}, {"runtime_version", SIMA_LMM_PACKAGE_VERSION}, {"target", std::filesystem::absolute(model_path).string()},
+        {"draft", draft_model_path.has_value() ? nlohmann::json(std::filesystem::absolute(*draft_model_path).string()) : nlohmann::json(nullptr)},
+        {"target_config", _vision_language_model_ptr->_cfg},
+        {"cache_policy", "reset"}, {"sampling", "greedy"}
+    };
+    if (draft_model_path) info["draft_config"] = _vision_language_draft_model_ptr->_cfg;
+    _benchmark_info = info.dump();
+
     // Override the signal handler for ctrl-c.
     struct sigaction new_sigint_action;
     new_sigint_action.sa_handler = [](int sig) {
@@ -127,6 +136,10 @@ void ZMQServer::run() {
                     );
                 }
 
+                if (request_messages[1].size() % sizeof(uint32_t) != 0
+                    || request_metadata.tensor_shape[1] != request_messages[1].size() / sizeof(uint32_t))
+                    throw std::runtime_error("Input frame size does not match token shape");
+
                 // Construct input token ids.
                 std::span<const uint32_t> input_token_ids(
                     reinterpret_cast<const uint32_t*>(request_messages[1].data()),
@@ -134,7 +147,27 @@ void ZMQServer::run() {
                 );
 
                 // Service the request and populate the response messages.
-                if (request_metadata.type == "generate") {
+                if (request_metadata.type == "benchmark_info") {
+                    response_metadata.tensor_dtype = "uint32";
+                    response_metadata.tensor_shape = {1, 1};
+                    uint32_t protocol = 1;
+                    response_messages[1] = {&protocol, sizeof(protocol)};
+                    response_metadata.benchmark_info = _benchmark_info;
+                } else if (request_metadata.type == "benchmark") {
+                    if (!request_metadata.new_tokens || !request_metadata.stop_token_ids)
+                        throw std::invalid_argument("Benchmark requires new_tokens and explicit stop_token_ids");
+                    std::vector<uint32_t> output;
+                    auto result = _vision_language_model_ptr->benchmark(
+                        input_token_ids, *request_metadata.new_tokens,
+                        *request_metadata.stop_token_ids, output
+                    );
+                    response_metadata.tensor_dtype = "float64";
+                    response_metadata.tensor_shape = {1, result.token_durations.size()};
+                    response_metadata.generated_tokens = result.generated_tokens;
+                    response_metadata.accepted_draft_tokens = result.accepted_draft_tokens;
+                    response_metadata.generated_token_ids = std::move(output);
+                    response_messages[1] = {result.token_durations.data(), result.token_durations.size() * sizeof(double)};
+                } else if (request_metadata.type == "generate") {
                     // Given a list of input token ids, return the list of generated token ids.
                     auto result = _vision_language_model_ptr->run_model(
                         input_token_ids, request_metadata.max_num_tokens,

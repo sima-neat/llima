@@ -332,6 +332,7 @@ target_compile_features(${TARGET_RUNTIME} PUBLIC cxx_std_20)
 target_compile_definitions(
     ${TARGET_RUNTIME}
     PRIVATE
+        SIMA_LMM_PACKAGE_VERSION="${SIMA_LMM_PACKAGE_VERSION}"
         SIMA_LMM_DEFAULT_ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/sima_lmm/assets"
 )
 

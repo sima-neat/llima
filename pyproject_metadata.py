@@ -99,6 +99,32 @@ def get_package(env, pkg_name, pkg_version):
 install_require = []
 
 
+mole_require = [
+    "numpy==1.26.4; python_version<'3.13'",
+    "numpy>=2.1,<3; python_version>='3.13'",
+    "torch==2.8.0",
+    "sentencepiece==0.2.0; python_version<'3.13'",
+    "sentencepiece==0.2.1; python_version>='3.13'",
+    "tiktoken",
+    "blobfile",
+    "pillow",
+    "protobuf==4.25.7",
+    "transformers==5.16.1",
+    "huggingface-hub>=1.5.0",
+    "datasets>=4.0.0",
+    "pyarrow<26; python_version<'3.13'",  # PyArrow 26 requires NumPy 2.
+    "fabric>=3.2.2",
+    "lm-eval[hf]>=0.4.11",
+    "loguru>=0.7.3",
+    "msgpack>=1.1.1",
+    "pytablewriter>=1.2.1",
+    "pyzmq>=27.1.0",
+    "rich>=14.1.0",
+    "tqdm>=4.67.1",
+    "matplotlib>=3.10.6",
+]
+
+
 sdk_ext_require = [
     # Same as other SDK packages.
     "numpy==1.23.5; python_version>='3.10' and python_version<'3.12'",
@@ -159,6 +185,7 @@ def dynamic_metadata(field, settings=None):
 
     if field == "optional-dependencies":
         return {
+            "mole": mole_require,
             "sdk_ext": sdk_ext_require,
             "sdk": sdk_require,
             "dev": tests_require + sdk_require,
