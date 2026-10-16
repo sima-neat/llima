@@ -51,15 +51,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${SIMA_MOLE_PYTHON:-}" ]] && command -v python3.12 >/dev/null 2>&1 \
-    && ! "${PYTHON_BIN}" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+    && ! "${PYTHON_BIN}" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info < (3, 14))' 2>/dev/null; then
   PYTHON_BIN="python3.12"
 fi
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "ERROR: Python interpreter not found: ${PYTHON_BIN}" >&2
   exit 1
 fi
-if ! "${PYTHON_BIN}" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
-  echo "ERROR: MoLE requires Python 3.11 or newer. Set SIMA_MOLE_PYTHON to a compatible interpreter." >&2
+if ! "${PYTHON_BIN}" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info < (3, 14))'; then
+  echo "ERROR: MoLE requires Python 3.11-3.13. Set SIMA_MOLE_PYTHON to a compatible interpreter." >&2
   exit 1
 fi
 
