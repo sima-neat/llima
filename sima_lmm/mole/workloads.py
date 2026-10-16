@@ -1,6 +1,5 @@
 """Download/cache performance workloads and record their source identities."""
 
-import hashlib
 import json
 import os
 from urllib.request import Request, urlopen
@@ -9,15 +8,11 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 
-def file_identity(path: Path) -> dict:
-    return {"file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-
-
 def _hf_file(repo: str, filename: str, revision: str | None = None):
     path = Path(hf_hub_download(repo, filename, repo_type="dataset", revision=revision or "main"))
     parts = path.parts
     sha = parts[parts.index("snapshots") + 1]
-    return path, {"repository": repo, "revision": sha, **file_identity(path)}
+    return path, {"repository": repo, "revision": sha, "file": filename}
 
 
 def _github_file(repo: str, filename: str):
@@ -43,7 +38,7 @@ def _github_file(repo: str, filename: str):
         temporary.write_bytes(data)
         temporary.replace(path)
     cached_revision.write_text(revision)
-    return path, {"repository": repo, "revision": revision, **file_identity(path)}
+    return path, {"repository": repo, "revision": revision, "file": filename}
 
 
 def _json_schema(value):

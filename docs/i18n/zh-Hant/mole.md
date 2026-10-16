@@ -104,4 +104,4 @@ MoLE 提供 `llima-benchmark accuracy` 和 `llima-benchmark perf` 子命令。�
 
 `--board_model` 決定一般或推測式解碼。比較模型時，以相同資料集與設定分別執行，只變更 `--board_model` 和 `-o`。每次執行會排除一次暖機，並在每個請求前重設 KV 狀態。使用模型的原生聊天範本與 EOS 停止。資料集輸出上限包含第一個 token；既有分組則測量第一個 token 加上 `--max_new_tokens` 次解碼。
 
-`-o` 將時間、token 數量、彙整指標、草稿貢獻、失敗、基準測試設定及資料集／tokenizer 識別資訊儲存至 `performance.json`。解碼 TPS 不包含 TTFT；生成時間不包含輸入準備和網路傳輸。這些工作負載測量效能而非準確度。
+`-o` 將時間、token 數量、彙整指標、草稿貢獻、失敗、基準測試設定及資料集來源儲存至 `performance.json`。解碼 TPS 不包含 TTFT；生成時間不包含輸入準備和網路傳輸。這些工作負載測量效能而非準確度。

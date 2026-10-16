@@ -104,4 +104,4 @@ Use `--dataset bfcl-v3|ifeval|alpacaeval|gsm8k|dialogsum` for native chat/tool p
 
 `--board_model` determines ordinary or speculative decoding. Compare models with separate runs using the same dataset and settings, changing only `--board_model` and `-o`. Each run excludes one warmup and resets KV state before every request. The model's native chat template and EOS stopping apply. Dataset output budgets include the first token; existing buckets measure the first token plus `--max_new_tokens` decode steps.
 
-`-o` saves `performance.json` with timings, token counts, aggregate metrics, draft contribution, failures, benchmark settings and dataset/tokenizer identities. Decode TPS excludes TTFT; generation timings exclude input preparation and network transport. These workloads measure performance, not accuracy.
+`-o` saves `performance.json` with timings, token counts, aggregate metrics, draft contribution, failures, benchmark settings and dataset sources. Decode TPS excludes TTFT; generation timings exclude input preparation and network transport. These workloads measure performance, not accuracy.

@@ -1,7 +1,6 @@
-"""Dataset performance measurements and reproducible JSON results."""
+"""Dataset performance measurements and JSON results."""
 
 import dataclasses
-import hashlib
 import importlib.metadata
 import json
 import math
@@ -16,7 +15,7 @@ from huggingface_hub.errors import RemoteEntryNotFoundError
 from loguru import logger
 
 from sima_lmm.mole import performance_bench
-from sima_lmm.mole.workloads import file_identity, load_workload
+from sima_lmm.mole.workloads import load_workload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,15 +62,6 @@ def _aggregate(records):
             "failures": sum(record.get("status") == "failed" for record in records)}
 
 
-def _tokenizer_identity(lm):
-    path = Path(lm.pretrained)
-    if path.is_dir():
-        files = [file_identity(file) for file in sorted(path.iterdir())
-                 if file.name in ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json")]
-        return {"path": str(path.resolve()), "files": files}
-    return {"repository": lm.pretrained, "revision": lm.revision}
-
-
 def run_performance(lm, config):
     options = config.performance
     report = {"schema_version": 1, "status": "running", "requests": [], "summary": {},
@@ -94,7 +84,7 @@ def run_performance(lm, config):
     prior_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1)
-        report["tokenizer"] = _tokenizer_identity(lm)
+        report["tokenizer"] = lm.pretrained
         mode = None
         stops = getattr(lm.config, "eos_token_id", None) or lm.tokenizer.eos_token_id
         generation_config = Path(lm.pretrained) / "generation_config.json"
@@ -151,7 +141,6 @@ def run_performance(lm, config):
                 record = {"sample_id": sample["id"], "category": sample["category"],
                           "source": sample.get("source"),
                           "phase": phase, "input_tokens": len(tokens),
-                          "input_sha256": hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
                           "output_budget": budget, "status": "failed"}
                 try:
                     # The existing ordinary endpoint returns the first token plus decode steps;
