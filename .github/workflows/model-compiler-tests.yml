@@ -34,7 +34,7 @@ env:
 jobs:
   test:
     name: Test LLiMa on Model Compiler
-    environment: ${{ inputs.vulcan_env }}
+    environment: ${{ (inputs.vulcan_env) == 'production' && 'prod' || (inputs.vulcan_env) }}
     runs-on:
       - self-hosted
       - linux
