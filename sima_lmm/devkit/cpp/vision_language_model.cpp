@@ -324,56 +324,6 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
 }
 
 
-GenerationPerformanceResult VisionLanguageModel::benchmark(
-    std::span<const uint32_t> input_token_ids, uint16_t new_tokens,
-    const std::set<uint32_t>& stop_token_ids,
-    std::vector<uint32_t>& output_token_ids
-) {
-    std::lock_guard<std::mutex> lock(_run_mutex);
-    if (input_token_ids.empty() || new_tokens == 0
-        // The last generated token does not need a KV-cache position.
-        || input_token_ids.size() + new_tokens - 1 > _cfg.pipeline_cfg.max_num_tokens)
-        throw std::invalid_argument("Benchmark input and output budget exceed the compiled context");
-    if (std::any_of(input_token_ids.begin(), input_token_ids.end(), [&](uint32_t token) {
-            return token >= _cfg.lm_cfg.token_cfg.vocab_size;
-        }))
-        throw std::invalid_argument("Benchmark input token exceeds the target vocabulary");
-    if (!_draft_vlm_ptr && _cfg.lm_cfg.is_spec_decode())
-        throw std::invalid_argument("Speculative benchmark requires a loaded draft model");
-    _language_model_ptr->clear_cached_token_ids();
-    if (_draft_vlm_ptr) _draft_vlm_ptr->_language_model_ptr->clear_cached_token_ids();
-    _text_streamer.disable();
-    const auto original_stops = _language_model_ptr->set_stop_token_ids(stop_token_ids);
-    const auto cleanup = [&]() {
-        _language_model_ptr->set_stop_token_ids(original_stops);
-        _language_model_ptr->clear_cached_token_ids();
-        if (_draft_vlm_ptr) _draft_vlm_ptr->_language_model_ptr->clear_cached_token_ids();
-        _text_streamer.enable();
-    };
-    try {
-        _language_model_ptr->create_input_buffers(input_token_ids);
-        output_token_ids.clear();
-        GenerationPerformanceResult result;
-        if (_draft_vlm_ptr) {
-            auto output = _run_language_model(
-                input_token_ids, input_token_ids.size() + new_tokens, std::nullopt, &result
-            );
-            if (!output.has_value())
-                throw std::runtime_error("Speculative benchmark interrupted or insufficient context");
-            output_token_ids = std::move(*output);
-        } else {
-            result = _language_model_ptr->_benchmark_ordinary(input_token_ids, new_tokens, output_token_ids);
-        }
-        if (output_token_ids.size() != result.token_durations.size())
-            throw std::runtime_error("Benchmark generated-token/timing count mismatch");
-        cleanup();
-        return result;
-    } catch (...) {
-        cleanup();
-        throw;
-    }
-}
-
 void VisionLanguageModel::stop_model() {
     _language_model_ptr->stop_model();
 }

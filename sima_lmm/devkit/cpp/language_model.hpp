@@ -288,11 +288,6 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
-        friend class VisionLanguageModel;
-        GenerationPerformanceResult _benchmark_ordinary(
-            std::span<const uint32_t> input_token_ids, uint16_t new_tokens,
-            std::vector<uint32_t>& output_token_ids
-        );
         std::shared_ptr<EmbeddingOffload> _embedding_offload;
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,

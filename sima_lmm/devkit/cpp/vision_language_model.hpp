@@ -99,13 +99,8 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         }
 
     private:
-        friend class ZMQServer;
         friend class CLI;
         friend class WEB;
-        GenerationPerformanceResult benchmark(
-            std::span<const uint32_t> input_token_ids, uint16_t new_tokens,
-            const std::set<uint32_t>& stop_token_ids, std::vector<uint32_t>& output_token_ids
-        );
         std::string_view model_type() const { return _cfg.model_type; }
         std::optional<std::vector<uint32_t>> _run_language_model(
             std::span<const uint32_t> input_token_ids,

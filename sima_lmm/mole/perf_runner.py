@@ -83,6 +83,8 @@ def run_performance(lm, config):
               "evaluator": {"python": platform.python_version(), "machine": platform.machine(),
                             "packages": {name: importlib.metadata.version(name) for name in
                                          ("sima-lmm", "torch", "transformers", "datasets")}},
+              "runtime": {"endpoint": config.board.tcp_uri, "model_selection": config.board.model,
+                          "managed_server": config.do_start_server},
               "timing": {"ttft": "target prefill to first generated token; excludes tokenization and input-buffer preparation",
                          "decode_tps": "tokens after the first / sum of their durations",
                          "speculative_tokens": "verification-round duration divided equally across emitted tokens; not individual arrival timestamps",
@@ -92,24 +94,8 @@ def run_performance(lm, config):
     prior_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1)
-        # An additive protocol handshake prevents silently ignoring new options on old servers.
-        lm._zmq_infer(torch.tensor([[0]]), "benchmark_info")
-        info = json.loads(lm.last_profile_data.get("benchmark_info") or "null")
-        if not info or info.get("protocol") != 1:
-            raise RuntimeError("Install matching LLiMa runtime packages: benchmark protocol 1 is required")
-        report["runtime"] = info
-        if not config.do_start_server:
-            selection, actual = config.board.model, info["target"]
-            if selection and selection != "/":
-                selected = Path(selection)
-                if not selected.is_absolute():
-                    raise ValueError("Explicit model selections when attaching must be absolute board paths")
-                if selected not in (Path(actual), Path(actual).parent):
-                    raise ValueError(f"Attached server model {actual} does not match selection {selection}")
         report["tokenizer"] = _tokenizer_identity(lm)
-        if info["target_config"]["pipeline_cfg"]["max_num_tokens"] < config.max_num_tokens:
-            raise ValueError("--max_num_tokens exceeds the selected target's compiled context")
-        mode = "speculative" if info["draft"] else "ordinary"
+        mode = None
         stops = getattr(lm.config, "eos_token_id", None) or lm.tokenizer.eos_token_id
         generation_config = Path(lm.pretrained) / "generation_config.json"
         if not Path(lm.pretrained).is_dir():
@@ -123,7 +109,6 @@ def run_performance(lm, config):
             stops = json.loads(generation_config.read_text()).get("eos_token_id", stops)
         stops = [stops] if isinstance(stops, int) else list(stops or [])
         report["settings"]["stop_token_ids"] = stops
-        report["settings"]["decoding"] = mode
         if options.dataset:
             samples, report["dataset"] = load_workload(options.dataset, config.limit)
         else:
@@ -165,33 +150,39 @@ def run_performance(lm, config):
                 context = torch.tensor([tokens], dtype=torch.int64)
                 record = {"sample_id": sample["id"], "category": sample["category"],
                           "source": sample.get("source"),
-                          "phase": phase, "decoding": mode, "input_tokens": len(tokens),
+                          "phase": phase, "input_tokens": len(tokens),
                           "input_sha256": hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
                           "output_budget": budget, "status": "failed"}
                 try:
-                    durations = lm._zmq_infer(context, "benchmark", new_tokens=budget,
+                    # The existing ordinary endpoint returns the first token plus decode steps;
+                    # speculative decoding counts all output tokens in max_num_tokens.
+                    # The unmeasured warmup identifies the mode from its draft counter.
+                    max_length = len(tokens) + (config.max_new_tokens if phase == "warmup"
+                                               else budget - (mode == "ordinary"))
+                    if max_length > config.max_num_tokens:
+                        raise ValueError("Output budget exceeds --max_num_tokens; reduce input or output length")
+                    durations = lm._zmq_infer(context, "generate_for_perf", max_num_tokens=max_length,
                         stop_token_ids=stops).cpu().tolist()[0]
                     metadata = lm.last_profile_data
-                    generated = metadata.get("generated_token_ids")
-                    if not generated or len(generated) != len(durations) or metadata.get("generated_tokens") != len(generated):
-                        raise RuntimeError("Runtime must return one generated token ID per timing")
+                    count, accepted = metadata.get("generated_tokens"), metadata.get("accepted_draft_tokens")
+                    if not durations or count != len(durations):
+                        raise RuntimeError("Runtime must return one timing per generated token")
                     if any(not math.isfinite(duration) or duration <= 0 for duration in durations):
                         raise RuntimeError("Runtime returned invalid generation durations")
-                    count, accepted = len(generated), metadata.get("accepted_draft_tokens")
+                    mode = "speculative" if accepted is not None else "ordinary"
+                    report["settings"]["decoding"] = mode
+                    record.update(decoding=mode, output_budget=max_length - len(tokens) + (mode == "ordinary"))
+                    if count > record["output_budget"]:
+                        raise RuntimeError("Runtime returned more tokens than the requested output budget")
                     decode_time = sum(durations[1:])
-                    eos = generated[-1] in stops
-                    record.update(status="ok", generated_token_ids=generated,
-                        generated_text=lm.tokenizer.decode(generated, skip_special_tokens=False),
-                        generated_tokens=count, token_durations_s=durations,
+                    record.update(status="ok", generated_tokens=count, token_durations_s=durations,
                         ttft_s=durations[0], decode_tokens=count - 1, decode_time_s=decode_time,
                         decode_tps=(count - 1) / decode_time if decode_time else None,
                         generation_time_s=sum(durations), accepted_draft_tokens=accepted,
                         draft_contribution=accepted / count if accepted is not None else None,
-                        stop_reason="eos" if eos else "output_limit" if count == budget else "context_limit",
-                        truncated=not eos, server_time_s=metadata["infer_time_ns"] / 1e9,
+                        output_budget_reached=count == record["output_budget"],
+                        server_time_s=metadata["infer_time_ns"] / 1e9,
                         roundtrip_time_s=metadata["zmq_roundtrip_time_ns"] / 1e9)
-                    if count < budget and not eos:
-                        raise RuntimeError("Generation stopped before EOS/output budget (compiled verification context exhausted)")
                     logger.info("{} {} {}: {} tokens, {:.1f} ms TTFT, {} tok/s", phase,
                                 sample["id"], mode, count, durations[0] * 1000,
                                 round(record["decode_tps"], 2) if record["decode_tps"] else None)

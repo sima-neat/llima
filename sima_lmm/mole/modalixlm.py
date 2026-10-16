@@ -238,7 +238,7 @@ class ModalixLM(HFLM):
     def _zmq_infer(
         self,
         tensor: torch.Tensor,
-        request_type: Literal["model_call", "generate", "generate_for_perf", "benchmark_info", "benchmark"],
+        request_type: Literal["model_call", "generate", "generate_for_perf"],
         **kwargs,
     ) -> torch.Tensor:
         """

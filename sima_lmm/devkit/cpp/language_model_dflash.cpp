@@ -427,37 +427,6 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
   return {static_cast<uint16_t>(token_ids.size() - 1), token_ids.back()};
 }
 
-GenerationPerformanceResult LanguageModel::_benchmark_ordinary(
-    std::span<const uint32_t> input_token_ids, uint16_t new_tokens,
-    std::vector<uint32_t>& output_token_ids) {
-  _is_running = true;
-  ScopeExit cleanup([&]() {
-    _is_running = false;
-    _rolling_checkpoint_slot = 0;
-    _writable_checkpoint_slots = 0;
-    _capture_state_checkpoints = false;
-  });
-  GenerationPerformanceResult result;
-  ChronoTimer timer(true);
-  _init_state_checkpoint_capture(input_token_ids.size(), 0);
-  _set_input_text_embeds(input_token_ids);
-  uint32_t token = run_model_prefill(input_token_ids, 0);
-  result.token_durations.push_back(timer.stop(true));
-  output_token_ids.push_back(token);
-  while (output_token_ids.size() < new_tokens && !_stop_token_ids.contains(token)) {
-    if (!_is_running.load(std::memory_order_relaxed))
-      throw std::runtime_error("Benchmark request interrupted");
-    token = run_model_once(1, input_token_ids.size() + output_token_ids.size() - 1,
-                           input_token_ids.size(), token);
-    result.token_durations.push_back(timer.stop(true));
-    output_token_ids.push_back(token);
-  }
-  if (!_is_running.load(std::memory_order_relaxed))
-    throw std::runtime_error("Benchmark request interrupted");
-  result.generated_tokens = output_token_ids.size();
-  return result;
-}
-
 std::optional<std::vector<uint32_t>>
 LanguageModel::_run_model_dflash_speculative_decoding(
     LanguageModel &draft_lm, std::span<const uint32_t> input_token_ids,
