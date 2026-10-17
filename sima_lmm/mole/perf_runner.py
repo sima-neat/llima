@@ -106,6 +106,9 @@ def run_performance(lm, config):
                 tokenizer=lm.tokenizer, max_toks=config.max_num_tokens,
                 n_samples=config.limit, input_lengths=config.input_lengths,
             )
+            if config.input_lengths is None:
+                data = {length: rows for length, rows in data.items()
+                        if length + config.max_new_tokens <= config.max_num_tokens}
             samples = [{"id": f"bucket-{length}-{index}", "category": f"n{length}", "input_ids": tokens}
                        for length, rows in data.items() for index, tokens in enumerate(rows)]
             report["dataset"] = {"name": "lambada-buckets", "repository": "cimec/lambada"}
