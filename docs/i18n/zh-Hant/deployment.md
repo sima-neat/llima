@@ -24,6 +24,8 @@ sima-user@docker-image-id:/home/docker$ llima-deploy <source_directory> <destina
 
 這個工具在內部使用 `rsync`，以實現高效的檔案傳輸，並且會跳過那些已經是最新的檔案。
 
+遠端部署會在提取 ELF 檔案之前先進行驗證，並檢查目標的權限。使用標準 SSH 時，該連線會重複用於傳輸，因此密碼驗證會在一開始進行。
+
 ## 部署流程
 
 在用 `llima-compile` 編譯您的模型之後，您將會得到如下的目錄結構：

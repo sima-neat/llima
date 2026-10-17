@@ -24,6 +24,8 @@ sima-user@docker-image-id:/home/docker$ llima-deploy <source_directory> <destina
 
 이 도구는 효율적인 파일 전송을 위해 내부적으로 `rsync`를 사용하며, 이미 최신 버전인 파일은 건너뜁니다.
 
+원격 배포는 ELF 파일을 추출하기 전에 인증을 수행하고 대상 권한을 확인합니다. 표준 SSH를 사용하는 경우 해당 연결이 전송에 재사용되므로 비밀번호 인증은 처음에 이루어집니다.
+
 ## 배포 워크플로우
 
 `llima-compile`을 사용하여 모델을 컴파일한 후 다음과 같은 디렉터리 구조를 갖게 됩니다.
