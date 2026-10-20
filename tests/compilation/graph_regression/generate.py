@@ -107,7 +107,10 @@ def _standard_models(
         digest = hashlib.sha256(case.id.encode("utf-8")).digest()
         seed = int.from_bytes(digest[:8], "big")
         middle_layer = 1 + seed % (num_layers - 2)
-        models = [vision_model._get_part_model(index) for index in (0, middle_layer)]
+        indices = (0, middle_layer)
+        if cfg.model_type == "vlm-smolvlm":
+            indices += (num_layers - 1,)
+        models = [vision_model._get_part_model(index) for index in indices]
         return models, FileGenPrecision.BF16
     else:
         raise ValueError(f"Unsupported standard native graph component: {case.component}")

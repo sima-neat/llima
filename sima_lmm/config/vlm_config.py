@@ -16,6 +16,7 @@ _VISION_MODEL_TYPE_ALIASES = {
     "qwen2_5_vl_vision": "qwen2_5_vl",
     "qwen3_vl_vision": "qwen3_vl",
     "qwen3_5_vision": "qwen3_5",
+    "smolvlm_vision": "siglip",
 }
 
 
@@ -117,6 +118,7 @@ class VlmArchType(str, ExtensibleEnum):
     VLM_QWEN2_5_VL = "vlm-qwen2_5_vl"
     VLM_QWEN3_VL = "vlm-qwen3_vl"
     VLM_QWEN3_5_VL = "vlm-qwen3_5"
+    VLM_SMOLVLM = "vlm-smolvlm"
 
 class VisionArchType(str, ExtensibleEnum):
     """Vision architecture type.
@@ -326,6 +328,16 @@ class MMConnectionConfig(BaseConfig):
         self.hidden_act = None if vm_arch == VisionArchType.SIGLIP else "gelu"
         self.num_layers = 2 if self.hidden_act == "gelu" else 1
         self.proj_dim = lm_hidden_size
+        if model_cfg.get("model_type") == "smolvlm":
+            factor = model_cfg.get("scale_factor")
+            vision = model_cfg["vision_config"]
+            patches = vision["image_size"] // vision["patch_size"]
+            if not isinstance(factor, int) or factor <= 0 or patches % factor:
+                raise ValueError("SmolVLM scale_factor must divide the vision patch grid")
+            self.downsample_factor = factor
+            self.mm_tokens_per_image = (patches // factor) ** 2
+            self.projector_use_layernorm = False
+            return
         if "mm_tokens_per_image" in model_cfg:
             self.mm_tokens_per_image = model_cfg["mm_tokens_per_image"]
         elif "num_image_tokens" in model_cfg.get("vision_config", {}):
@@ -1176,6 +1188,15 @@ class VlmConfig(BaseConfig):
         is_gemma4_assistant = model_cfg.get("model_type") == "gemma4_assistant"
         text_config = model_cfg["text_config"] if (is_vlm or is_gemma4_assistant) else model_cfg
         vision_config = model_cfg["vision_config"] if is_vlm else None
+        if model_cfg.get("model_type") == "smolvlm":
+            if model_format != ModelFormat.FORMAT_HF:
+                raise ValueError("SmolVLM requires Hugging Face safetensors input")
+            expected_resolution = [vision_config["image_size"]] * 2
+            if image_resolution is not None and list(image_resolution) != expected_resolution:
+                raise ValueError(
+                    f"SmolVLM requires its checkpoint tile size {expected_resolution}; "
+                    f"got {image_resolution}"
+                )
 
         # Check model type
         assert "model_type" in model_cfg and "architectures" in model_cfg
@@ -1246,7 +1267,7 @@ class VlmConfig(BaseConfig):
                             f"(patch_size * spatial_merge_size), which is {divisor}."
                         )
                     vlm_cfg.vm_cfg.image_size = image_resolution
-                else:
+                elif model_type != "smolvlm":
                     sima_log_warning("Ignoring --input_height and --input_width as the model is not Siglip2, Qwen-VL, or Gemma4 based.")
             if vlm_cfg.vm_cfg.arch == VisionArchType.SIGLIP2:
                 if isinstance(vlm_cfg.vm_cfg.image_size, list):

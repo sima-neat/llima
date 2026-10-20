@@ -110,6 +110,7 @@ mole_require = [
     "pillow",
     "protobuf==4.25.7",
     "transformers==5.16.1",
+    "num2words>=0.5.14",  # Required by the SmolVLM2 processor.
     "huggingface-hub>=1.5.0",
     "datasets>=4.0.0",
     "pyarrow<26; python_version<'3.13'",  # PyArrow 26 requires NumPy 2.
@@ -140,6 +141,7 @@ sdk_ext_require = [
     "pillow",  # Required for VLM image preprocessing
     "protobuf==4.25.7",  # Required for SentencePiece with extended vocabulary.
     "transformers==5.16.1",  # Required for load/verify HF models and use HF processor.
+    "num2words>=0.5.14",  # Required by the SmolVLM2 processor.
     "huggingface-hub>=1.5.0", # Required to work with current transformers version.
     "gguf==0.17.1",  # Required for GGUF weights dequantization
     "llama_cpp_python==0.3.16",  # Required to run GGUF inference

@@ -87,10 +87,11 @@ def test_regression_enforces_baseline_policy(tmp_path, mode, failure):
         )
 
 
-def test_vision_regression_selects_same_intermediate_layer_for_both_revisions(monkeypatch):
+@pytest.mark.parametrize("model_type", ["vlm-custom", "vlm-smolvlm"])
+def test_vision_regression_selects_same_intermediate_layer_for_both_revisions(monkeypatch, model_type):
     case = GraphRegressionCase("synthetic", "vision")
     source = SimpleNamespace(
-        cfg=SimpleNamespace(num_vision_layers=26),
+        cfg=SimpleNamespace(num_vision_layers=26, model_type=model_type),
         vision_model_name="vision",
         sima_path="unused",
         hf_model=None,
@@ -103,3 +104,8 @@ def test_vision_regression_selects_same_intermediate_layer_for_both_revisions(mo
     assert [model.layer_idx for model in first] == [model.layer_idx for model in second]
     assert first[0].layer_idx == 0
     assert 0 < first[1].layer_idx < source.cfg.num_vision_layers - 1
+    if model_type == "vlm-smolvlm":
+        assert len(first) == 3
+        assert first[2].layer_idx == source.cfg.num_vision_layers - 1
+    else:
+        assert len(first) == 2
