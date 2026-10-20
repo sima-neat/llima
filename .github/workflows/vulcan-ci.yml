@@ -131,7 +131,15 @@ jobs:
 
   resolve-test-runner:
     name: Resolve Test Runner
-    uses: sima-neat/.github/.github/workflows/vulcan-resolve-modalix-runner.yml@main
+    needs: [resolve-vulcan-config]
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-modalix-runner.yml@codex/elxr-runner-selection
+    with:
+      shared_workflow_ref: codex/elxr-runner-selection
+      allow-version-fallback: false
+      runner-labels: '["self-hosted", "Linux", "ARM64", "modalix", "modalix-som-16gig", "vulcan-${{ needs.resolve-vulcan-config.outputs.vulcan_env }}"]'
+    secrets:
+      app_id: ${{ secrets.NEAT_RELEASES_APP_ID }}
+      app_private_key: ${{ secrets.NEAT_RELEASES_APP_PRIVATE_KEY }}
 
   build:
     name: Build all LLiMa packages on one Vulcan instance
@@ -532,18 +540,36 @@ jobs:
       - publish-vulcan-artifacts
     runs-on:
       group: ${{ needs.resolve-test-runner.outputs.modalix_runner_group }}
-      labels:
-        - self-hosted
-        - Linux
-        - ARM64
-        - modalix
-        - modalix-som-16gig
-        - "vulcan-${{ needs.resolve-vulcan-config.outputs.vulcan_env }}"
+      labels: ${{ fromJSON(needs.resolve-test-runner.outputs.runner_labels) }}
     env:
       VULCAN_ENV: ${{ needs.resolve-vulcan-config.outputs.vulcan_env }}
       SIMA_CLI_CHECK_FOR_UPDATE: "0"
 
     steps:
+      - name: Verify selected DevKit firmware
+        env:
+          EXPECTED_ELXR_VERSION: ${{ needs.resolve-test-runner.outputs.elxr_version }}
+          VERSION_FALLBACK: ${{ needs.resolve-test-runner.outputs.version_fallback }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          from pathlib import Path
+          actual = None
+          for path in (Path('/etc/build'), Path('/etc/buildinfo')):
+              if path.is_file():
+                  match = re.search(r'^SIMA_BUILD_VERSION\s*=\s*([\w.\-+]+)', path.read_text(), re.MULTILINE)
+                  if match:
+                      actual = match.group(1)
+                      break
+          expected = os.environ['EXPECTED_ELXR_VERSION']
+          print(f"Runner: {os.environ['RUNNER_NAME']}; requested firmware: {expected}; actual firmware: {actual}")
+          if not actual:
+              raise SystemExit('Cannot verify DevKit firmware')
+          if expected and os.environ['VERSION_FALLBACK'] != 'true' and actual != expected:
+              raise SystemExit('DevKit firmware does not match the resolved label; refusing to run')
+          PYTHON
       - name: Checkout code
         uses: actions/checkout@v5
         with:

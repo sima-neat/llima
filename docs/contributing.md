@@ -474,3 +474,14 @@ A contribution is ready when affected tests pass without unintended skips,
 required package and Modalix checks complete or are explicitly unavailable,
 compatibility and docs are addressed, and the PR contains reproducible
 evidence.
+
+### CI firmware runner selection
+
+CI uses the shared Modalix runner resolver with `elxr_version` from
+`deps/manifest.json`. The current branch requires an exact firmware label
+(`allow-version-fallback: false`) in addition to the hardware and environment
+labels. A runner checks its actual firmware before proceeding. Internals performs
+a read-only device verification; LLiMa then runs its existing runtime tests.
+The reusable workflow uses the Release Engineering App through the
+`NEAT_RELEASES_APP_ID` and `NEAT_RELEASES_APP_PRIVATE_KEY` Actions secrets.
+The App requires organization self-hosted-runners read access. Selection never updates firmware.
