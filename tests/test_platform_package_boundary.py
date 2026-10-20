@@ -70,10 +70,10 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
 
         self.assertEqual(manifest["platform-version"], "3.0.0")
         self.assertRegex(
-            manifest["sysroot-version"],
-            r"^3[.]0[.]0~(?:pre[0-9]+|git[0-9]{12}[.][0-9a-f]{7,40}-[0-9]+)$",
+            manifest["elxr_version"],
+            r"^3[.]0[.]0_(?:master|develop)_B[1-9][0-9]*$",
         )
-        self.assertIn('["sysroot-version"]', workflow)
+        self.assertIn("needs.resolve-sysroot.outputs.sysroot_version", workflow)
         self.assertIn('/workspace/scripts/ci/prepare_sysroot.sh "${sysroot_version}"', workflow)
         self.assertNotIn('SDK_APT_CHANNEL=daily', workflow)
         self.assertIn("MACHINE=modalix", installer)

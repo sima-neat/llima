@@ -50,6 +50,16 @@ runtime packages.
 
 ### Runtime and packaging
 
+The exact firmware target is `elxr_version` in `deps/manifest.json` (currently
+`3.0.0_master_B2263`). CI calls the shared `.github` `resolve-sysroot.yml` workflow
+to resolve the matching APT platform package version, then provisions the disposable
+SDK container with that exact `SYSROOT_VERSION`. The resolver uses the SHA-256
+package-index reference from APT `Release` metadata and fails on missing or
+ambiguous matches. The resulting `sysroot-resolution` artifact records the chosen
+version and index checksum. The old manifest `sysroot-version` field is deprecated;
+do not specify both fields. This does not update DevKit firmware.
+
+
 Use the Neat SDK as the supported build environment. Build all runtime packages
 and packaged tests with:
 
