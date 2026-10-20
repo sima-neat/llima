@@ -675,6 +675,8 @@ jobs:
           PY
 
       - name: Prepare GenAI models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN || secrets.HUGGINGFACE_TOKEN }}
         run: |
           set -euo pipefail
           export LLIMA_MODELS_PATH="${LLIMA_MODELS_PATH:-/media/nvme/llima/models}"
