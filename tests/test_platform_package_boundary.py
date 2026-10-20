@@ -71,18 +71,11 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
         self.assertEqual(manifest["platform-version"], "3.0.0")
         self.assertRegex(
             manifest["sysroot-version"],
-            r"^3[.]0[.]0~git[0-9]{12}[.][0-9a-f]{7,40}-[0-9]+$",
+            r"^3[.]0[.]0~(?:pre[0-9]+|git[0-9]{12}[.][0-9a-f]{7,40}-[0-9]+)$",
         )
         self.assertIn('["sysroot-version"]', workflow)
-        self.assertIn(
-            'if [[ "${sdk_platform_version}" != "${sysroot_version}" ]]', workflow
-        )
-        self.assertIn(
-            'setup-sdk-sysroot.sh "${sysroot_version}" "${SDK_PKG_LIST:-}"',
-            workflow,
-        )
-        self.assertIn('"Platform Revision = ${sysroot_version}"', workflow)
-        self.assertNotIn('sysroot update "${sysroot_version}"', workflow)
+        self.assertIn('/workspace/scripts/ci/prepare_sysroot.sh "${sysroot_version}"', workflow)
+        self.assertNotIn('SDK_APT_CHANNEL=daily', workflow)
         self.assertIn("MACHINE=modalix", installer)
         self.assertIn('actual="$(read_devkit_platform_version', installer)
         self.assertIn('if [[ "${actual}" != "${expected}" ]]', installer)

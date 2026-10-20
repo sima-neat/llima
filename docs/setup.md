@@ -24,3 +24,25 @@ With 128GB machine, compilation can take several hours to complete depends on th
 - Have a valid Hugging Face account to download open-source models.
 - Some models, such as `google/paligemma`, require accepting a license agreement on Hugging Face. Make sure to review and accept the license before attempting to download these models.
 - Authorize the CLI to access Hugging Face using an [user access token](https://huggingface.co/docs/hub/en/security-tokens) and `huggingface-cli`. Note, installing `sima-cli` automatically installs `huggingface-cli`.
+
+### CI sysroot selection
+
+`deps/manifest.json` pins the exact platform build used for runtime packages.
+This branch selects master `3.0.0~pre2263`; develop receipts such as
+`3.0.0~git202610140145.e5ece50-2121` remain supported. `sdk.channel` selects the
+SDK toolchain image and is independent of the platform build channel.
+
+CI calls `scripts/ci/prepare_sysroot.sh` in its disposable SDK container.
+Daily receipts use `sysroot update`. Master 3.0 receipts use the same SDK-owned
+transactional installer, pinned to SDK commit
+`2c325eeb1f0e4551ac32f2b9ef53a4cc18a07ccf` with an archive checksum, to provision
+from the pre-release Agate repository. The helper removes the obsolete
+`appcomplex-dev` request from that installer because master no longer publishes
+it. This temporary compatibility step should be retired once the cached SDK
+includes the upstream fix. The original SDK image receipt is preserved; the
+active overlay and package inventory record the exact selected sysroot.
+
+This helper is for disposable CI containers, not active developer environments.
+LLiMa continues to use platform libraries directly; it does not depend on
+Internals packages. Building against this sysroot does not qualify a DevKit or
+update its firmware.
