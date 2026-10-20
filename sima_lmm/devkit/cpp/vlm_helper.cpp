@@ -134,16 +134,6 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // Apply chat template.
     minja::chat_template_inputs inputs;
     inputs.messages = chat.get_messages();
-    if (_vlm_cfg.model_type == "vlm-smolvlm") {
-        // The checkpoint template iterates structured content, including system turns.
-        for (auto& message : inputs.messages) {
-            if (message.at("content").is_string()) {
-                message["content"] = nlohmann::ordered_json::array({
-                    {{"type", "text"}, {"text", message.at("content")}}
-                });
-            }
-        }
-    }
     inputs.tools = chat.get_tools();
     inputs.extra_context["enable_thinking"] = chat.get_enable_thinking();
     // gpt-oss (harmony) renders this into the system block as "Reasoning: <effort>".

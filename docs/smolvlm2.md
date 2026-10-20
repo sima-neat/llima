@@ -15,9 +15,9 @@ not implemented for SmolVLM2.
 ## Compiler and runtime behavior
 
 Use the ordinary Hugging Face `llima-compile` workflow. The checkpoint supplies
-the encoder tile size; `--input_height` and `--input_width` may only repeat that
-size. The language model uses standard 1D Llama RoPE: theta 100,000 for 256M/500M
-and 130,000 for 2.2B.
+the fixed encoder size; `--input_height` and `--input_width` are ignored with
+the usual SigLIP warning. The language model uses standard 1D Llama RoPE:
+theta 100,000 for 256M/500M and 130,000 for 2.2B.
 
 The C++ runtime pads each image to a square with the checkpoint's mean color,
 then resizes to the encoder input size, preserving the full image and its aspect
@@ -27,9 +27,9 @@ existing OpenCV image processor with Lanczos-4, which differs from the checkpoin
 processor's PIL Lanczos pixels.
 
 The encoder receives full square tiles, so all patch positions are valid.
-Arbitrary masked rectangular encoder inputs and changed encoder resolutions
-are not accepted by this implementation. The compiler-side Python processor
-provides reference comparisons and asset preparation; inference and image
+The compiled encoder keeps its checkpoint resolution; arbitrary masked
+rectangular encoder inputs are not implemented. The compiler-side Python
+processor provides reference comparisons and asset preparation; inference and image
 processing run in C++ on Modalix.
 
 ## Sampled video frames

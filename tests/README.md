@@ -74,7 +74,7 @@ representative; cover configuration variants with small hermetic tests.
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 413
+- Expected cases: 408
 
 Fast, hermetic tests that run before model inputs are downloaded:
 

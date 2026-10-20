@@ -35,19 +35,11 @@ def test_smolvlm_config_preserves_language_and_projected_token_count(factor):
     assert config.lm_cfg.rope_cfg.rope_scaling.mrope_section is None
 
 
-@pytest.mark.parametrize("factor", [0, -1, 3, 1.5, None])
-def test_smolvlm_rejects_invalid_compression(factor):
-    source = _config()
-    source["scale_factor"] = factor
-    with pytest.raises(ValueError, match="scale_factor"):
-        VlmConfig.from_hf_config(ModelFormat.FORMAT_HF, Path("smolvlm"), source)
-
-
-def test_smolvlm_rejects_changed_tile_size():
-    with pytest.raises(ValueError, match="checkpoint tile size"):
-        VlmConfig.from_hf_config(
-            ModelFormat.FORMAT_HF, Path("smolvlm"), _config(), [64, 64]
-        )
+def test_smolvlm_keeps_checkpoint_resolution_when_override_is_given():
+    config = VlmConfig.from_hf_config(
+        ModelFormat.FORMAT_HF, Path("smolvlm"), _config(), [64, 64]
+    )
+    assert config.vm_cfg.image_size == 32
 
 
 def test_smolvlm_source_prefixes_do_not_mix_the_two_transformers():

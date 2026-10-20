@@ -27,7 +27,7 @@
         "mm_tokens_per_image": 64,
         "proj_dim": 576,
         "downsample_factor": 4,
-        "projector_use_layernorm": false
+        "projector_use_layernorm": true
     },
     "lm_cfg": {
         "model_type": "llama",
