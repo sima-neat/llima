@@ -1,8 +1,5 @@
 # LLiMa CLI
 
-The [SmolVLM2 integration guide](smolvlm2.md) describes the new C++ image and
-sampled-frame path and its pending compilation/device validation.
-
 Use the `llima` CLI on Modalix to manage precompiled models and do simple
 runtime testing. It is useful for checking that a model loads, accepts prompts,
 and produces output before you integrate it with Neat Framework direct APIs or

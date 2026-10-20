@@ -25,9 +25,6 @@ The input format alone does not establish compatibility. The model
 architecture, size, tokenizer, and any multimodal components must also be
 supported.
 
-See [SmolVLM2 integration](smolvlm2.md) for the targeted checkpoint sizes,
-encoder tiles, and validation status of the new image/frame path.
-
 ### Start with a SiMa.ai pre-quantized model
 
 :::tip Recommended input
