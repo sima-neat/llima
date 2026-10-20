@@ -93,4 +93,10 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
     def test_devkit_runtime_uses_16_gib_modalix_som_runner(self) -> None:
         workflow = read(".github/workflows/vulcan-ci.yml")
 
-        self.assertIn("        - modalix-som-16gig\n", workflow)
+        resolver = workflow.split("  resolve-test-runner:", 1)[1].split("  build:", 1)[0]
+        runtime = workflow.split("  test-devkit:", 1)[1]
+        self.assertIn('"modalix-som-16gig"', resolver)
+        self.assertIn("allow-version-fallback: false", resolver)
+        self.assertIn("fromJSON(needs.resolve-test-runner.outputs.runner_labels)", runtime)
+        self.assertIn("needs.resolve-test-runner.outputs.modalix_runner_group", runtime)
+        self.assertLess(runtime.index("Verify selected DevKit firmware"), runtime.index("Checkout code"))
