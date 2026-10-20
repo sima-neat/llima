@@ -113,9 +113,9 @@ jobs:
 
   resolve-sysroot:
     name: Resolve Sysroot
-    uses: sima-neat/.github/.github/workflows/resolve-sysroot.yml@c877e54caaa4653a6cd68fb438fa0b86c5d73d5c
+    uses: sima-neat/.github/.github/workflows/resolve-sysroot.yml@main
     with:
-      shared_workflow_ref: c877e54caaa4653a6cd68fb438fa0b86c5d73d5c
+      shared_workflow_ref: main
 
   resolve-vulcan-config:
     name: Resolve Vulcan Config
