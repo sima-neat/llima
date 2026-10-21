@@ -32,6 +32,8 @@ llima-benchmark accuracy /media/nvme/llima/models/<compiled-qwen3.5-2b> -b modal
 
 This starts the installed `/usr/bin/llima` runtime locally, without SSH or another host. The MoLE environment remains separate from the runtime and compiler. `--board_venv_path` can select a different runtime installation; `--no-board_start_server` attaches without taking ownership of the server. Managed runs stop only their owned server, including on failures and interruptions.
 
+Host-driven server startup first tries SSH agent/key authentication. If authentication fails and no explicit password was supplied, it prompts for a password. `--board_ssh_pass` retains the existing explicit-password workflow. DevKit-local execution does not use SSH.
+
 `model_id` also accepts a Hugging Face repository, with optional `--model_revision`. MoLE resolves an immutable revision and downloads only tokenizer/config/processor assets; weights are not downloaded. These files must match the deployed assets. The compiled `vlm_config.json`, including any chat-template override, remains authoritative.
 
 Each task retains its upstream generation settings. `--max_new_tokens` explicitly overrides output budgets and is recorded. Context plus output must fit both `--max_num_tokens` and the compiled context; inputs are never truncated to make them fit. The current adapter supports greedy decoding. Unsupported sampling/beam settings, logits tasks, multiround tasks, audio/video and non-image visuals fail clearly. Thinking defaults off; `--enable_thinking` selects native thinking behavior. The runtime's existing reasoning parser supplies final content to scoring while raw output is retained.

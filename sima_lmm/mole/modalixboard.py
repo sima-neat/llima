@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fabric import Connection
 from loguru import logger
+from paramiko.ssh_exception import AuthenticationException, PasswordRequiredException
 
 
 def _is_modalix() -> bool:
@@ -107,12 +108,24 @@ class ModalixBoard:
                         f'"$HOME"{shlex.quote(llima_path[1:])}'
                         if llima_path.startswith("~/") else shlex.quote(llima_path)
                     )
-                if self.ssh_password is None:
-                    self.ssh_password = getpass(f"{self.ssh_user}@{host}'s password: ")
                 self._connection = Connection(
                     host=host, user=self.ssh_user,
-                    connect_kwargs={"password": self.ssh_password}, connect_timeout=10,
+                    connect_kwargs=({"password": self.ssh_password}
+                                    if self.ssh_password is not None else {}),
+                    connect_timeout=10,
                 )
+                try:
+                    self._connection.open()
+                except (AuthenticationException, PasswordRequiredException):
+                    if self.ssh_password is not None:
+                        raise
+                    self._connection.close()
+                    self.ssh_password = getpass(f"{self.ssh_user}@{host}'s password: ")
+                    self._connection = Connection(
+                        host=host, user=self.ssh_user,
+                        connect_kwargs={"password": self.ssh_password}, connect_timeout=10,
+                    )
+                    self._connection.open()
                 remote_log = f"llima-benchmark-{self.port}-{time.time_ns()}.log"
                 server_log = f"{host}:~/{remote_log}"
                 result = self._connection.run(
