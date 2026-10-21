@@ -62,7 +62,6 @@ class EXPORT WEB {
 
         // Helpers
         void _set_cors_headers(httplib::Response& res);
-        nlohmann::ordered_json _parse_endpoint_messages(const nlohmann::json& messages);
         std::string _format_openai_sse_chunk(
             const std::string& content,
             const std::string& model,

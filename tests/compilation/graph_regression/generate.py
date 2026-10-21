@@ -94,6 +94,12 @@ def _standard_models(
             layer_idx=LAYER_IDX,
             final_softcapping=cfg.lm_cfg.final_logit_softcapping,
         )
+    elif case.component == "audio":
+        from sima_lmm.model.gemma4_audio_model import AudioModel
+
+        audio = AudioModel(cfg, vlm_model.model_name, sima_path=vlm_model.sima_path, hf_model=vlm_model.hf_model)
+        return [audio._get_part_model(index) for index in (0, cfg.audio_cfg.num_hidden_layers // 2,
+                                                         cfg.audio_cfg.num_hidden_layers - 1)], FileGenPrecision.BF16
     elif case.component == "vision":
         vision_model = VisionModel(
             cfg,
@@ -183,7 +189,7 @@ def _record_models(
             str(path.relative_to(output_dir.resolve())) for path in graph_paths
         ],
     }
-    if case.component == "vision":
+    if case.component in ("vision", "audio"):
         manifest["cases"][case.id]["layer_indices"] = [model.layer_idx for model in models]
     print(f"Generated {case.id}: {len(graph_paths)} native graphs", flush=True)
 

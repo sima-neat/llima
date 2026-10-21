@@ -13,6 +13,7 @@ from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
+from sima_lmm.model.gemma4_audio_model import AudioModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
 from sima_lmm.logging import sima_log_info
 
@@ -64,6 +65,7 @@ class VisionLanguageModel(BaseModel):
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
         speculative_block_size: int | None = None,
+        max_audio_duration: int | None = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
@@ -79,6 +81,7 @@ class VisionLanguageModel(BaseModel):
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
             speculative_block_size: DFlash verification width (4, 8 or 16); defaults to 8.
+            max_audio_duration: Maximum audio clip duration in seconds (1–30); defaults to 30.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -97,6 +100,12 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg = VlmConfig.from_hf_config(
             model_format, hf_cache_path, model_config, image_resolution=image_resolution
         )
+        if max_audio_duration is not None:
+            if not 1 <= max_audio_duration <= 30:
+                raise ValueError("max_audio_duration must be between 1 and 30 seconds")
+            if vlm_cfg.audio_cfg is None:
+                raise ValueError("max_audio_duration requires a model with an audio encoder")
+            vlm_cfg.audio_cfg.max_tokens = max_audio_duration * 25
         # Set the token size and offsets for group processing.
         vlm_cfg.config_pipeline(
             system_prompt, chat_template, max_num_tokens, override_language_group_size,
@@ -273,6 +282,12 @@ class VisionLanguageModel(BaseModel):
             vision_model.gen_files(
                 gen_mode, gen_config=gen_config, log_level=log_level,
                 num_processes=num_processes, resume=resume
+            )
+
+        if self.cfg.audio_cfg is not None:
+            AudioModel(self.cfg, self.model_name, sima_path=self.sima_path, hf_model=self.hf_model).gen_files(
+                gen_mode, gen_config=gen_config, log_level=log_level,
+                num_processes=num_processes, resume=resume,
             )
 
         self.language_model.gen_files(

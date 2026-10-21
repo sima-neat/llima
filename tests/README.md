@@ -68,7 +68,7 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 398
+- Expected cases: 406
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -122,9 +122,11 @@ coverage of the other GGUF quantization formats.
 
 - Location: `tests/compilation/graph_regression/`
 - Marker: `compiler_graph_regression`
-- Expected cases: 37
+- Expected cases: 38
 
-All current cases are required.
+Existing cases are required. Gemma 4 audio is informative until its first
+compiler publication; it checks the first, middle and final encoder layers
+using the same E2B checkpoint as the other Gemma 4 cases.
 
 Every case:
 

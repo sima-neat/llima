@@ -47,6 +47,7 @@ using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
 class LanguageModel : public BaseModel<VlmConfig> {
     public:
+        using MediaLoader = std::function<void(uint16_t, uint16_t, const MLABufferSlice&, const MLABufferSlice*)>;
         // Existing disk-loading overload; preserves source compatibility.
         LanguageModel(
             std::filesystem::path model_path,
@@ -74,12 +75,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt,
-            uint16_t stable_prefix_token_count = 0
+            uint16_t stable_prefix_token_count = 0,
+            const MediaLoader& media_loader = {}
         );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
             uint16_t num_cached_tokens,
-            std::optional<ChronoTimer> = std::nullopt
+            std::optional<ChronoTimer> = std::nullopt,
+            const MediaLoader& media_loader = {}
         );
         void run_model_decode(uint16_t num_input_tokens, uint32_t token_id);
         uint32_t run_model_once(
@@ -87,7 +90,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t token_idx,
             uint16_t num_input_tokens,
             uint32_t token_id,
-            std::vector<Eigen::bfloat16>* logits_ptr = nullptr
+            std::vector<Eigen::bfloat16>* logits_ptr = nullptr,
+            const MediaLoader& media_loader = {}
         );
         LogLikelihoodResult run_model_for_loglikelihood(
             std::span<const uint32_t> input_token_ids,
@@ -112,14 +116,16 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint16_t> override_max_num_tokens,
             std::optional<ChronoTimer> timer_ttft,
             GenerationPerformanceResult* performance_result,
-            uint16_t stable_prefix_token_count
+            uint16_t stable_prefix_token_count,
+            const MediaLoader& media_loader = {}
         );
         std::optional<std::vector<uint32_t>> run_model_gemma4_mtp(
             LanguageModel& draft_lm,
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
-            GenerationPerformanceResult* performance_result = nullptr
+            GenerationPerformanceResult* performance_result = nullptr,
+            const MediaLoader& media_loader = {}
         );
         void stop_model() { _is_running = false; }
 
@@ -288,6 +294,10 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
+        bool _is_media_token(uint32_t token) const {
+            return (_image_token_id && token == *_image_token_id)
+                || (_cfg.support_audio() && token == _cfg.audio_cfg->token_id);
+        }
         std::shared_ptr<EmbeddingOffload> _embedding_offload;
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,

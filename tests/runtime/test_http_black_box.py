@@ -217,13 +217,21 @@ def _reconstruct_openai_reasoning_stream(body: bytes) -> tuple[str, str, bool]:
     return "".join(reasoning), "".join(content), saw_done
 
 
-def test_openai_http_protocol_and_recovery(tmp_path):
+def test_http_protocol_and_recovery(tmp_path):
     assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
 
     with _running_web_server(tmp_path):
         malformed_status, _, malformed_body = _post("/v1/chat/completions", b"{")
         assert malformed_status in {400, 500}
         assert json.loads(malformed_body)["error"]
+
+        for endpoint, payload in (
+            ("/api/chat", {"messages": [{"role": "user", "content": QUERY, "images": ["%%%"]}]}),
+            ("/api/generate", {"prompt": QUERY, "images": ["===="]}),
+        ):
+            status, _, body = _post(endpoint, json.dumps(payload | {"stream": False}).encode())
+            assert status == 400, body.decode()
+            assert json.loads(body)["error"]
 
         status, headers, body = _post(
             "/v1/chat/completions", _chat_body(stream=False)

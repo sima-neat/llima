@@ -121,7 +121,7 @@ def test_dflash_cli_forwards_block_size(monkeypatch, tmp_path):
 
     compile_lmm.main()
 
-    assert calls[0][-1] == 8
+    assert calls[0][19] == 8
 
 
 @pytest.mark.parametrize("option", ["--system_prompt_file", "--chat_template_file"])

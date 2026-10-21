@@ -73,6 +73,9 @@ def _make_inputs(case: GraphRegressionCase, signature: tuple) -> dict[str, np.nd
             value = rng.integers(0, 2, shape).astype(dtype)
         else:
             raise TypeError(f"Unsupported native graph input dtype for {case.id}: {dtype}")
+        if case.component == "audio" and name == "mask":
+            value.fill(0)
+            value[:, :, :3 * shape[2] // 4, :] = 1
         feeds[name] = value
     return feeds
 

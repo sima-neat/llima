@@ -1,4 +1,5 @@
 #include <fstream>
+#include <exception>
 #include <variant>
 #include <vector>
 
@@ -6,6 +7,10 @@
 
 #include <fmt/chrono.h>
 #include <nlohmann/json.hpp>
+
+extern "C" {
+#include <libavformat/avformat.h>
+}
 
 
 #include "reasoning_parser.hpp"
@@ -182,14 +187,47 @@ void WEB::_set_cors_headers(httplib::Response& res) {
     res.set_header("Access-Control-Allow-Headers", "Content-Type");
 }
 
-nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messages) {
+static nlohmann::ordered_json parse_ollama_media(const nlohmann::json& attachment) {
+    if (!attachment.is_string()) throw std::invalid_argument("images must contain base64 strings");
+    const auto& encoded = attachment.get_ref<const std::string&>();
+    const auto padding = encoded.find('=');
+    if (encoded.empty() || encoded.size() % 4
+        || encoded.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != std::string::npos
+        || (padding != std::string::npos && (encoded.size() - padding > 2
+            || encoded.find_first_not_of('=', padding) != std::string::npos)))
+        throw std::invalid_argument("images must contain valid base64 media");
+    std::vector<uint8_t> bytes;
+    try {
+        bytes = base64_decode(encoded);
+    } catch (const std::runtime_error&) {
+        throw std::invalid_argument("images must contain valid base64 media");
+    }
+
+    AVProbeData probe{};
+    probe.filename = "";
+    probe.buf_size = bytes.size();
+    bytes.resize(bytes.size() + AVPROBE_PADDING_SIZE, 0);
+    probe.buf = bytes.data();
+    const auto* format = av_probe_input_format(&probe, 1);
+    if (format && (std::string_view(format->name) == "wav" || std::string_view(format->name) == "mp3")) {
+        return {{"type", "audio"}, {"audio", {{"data", encoded}, {"format", format->name}}}};
+    }
+    // Keep the existing image representation; ImageProcessor decodes the actual format.
+    return {{"type", "image"}, {"image", "data:image/jpeg;base64," + encoded}};
+}
+
+static nlohmann::ordered_json parse_endpoint_messages(
+    const nlohmann::json& messages, bool support_image, bool support_audio
+) {
     nlohmann::ordered_json internal_messages = nlohmann::ordered_json::array();
 
     for (const auto& msg : messages) {
         nlohmann::ordered_json internal_msg;
         internal_msg["role"] = msg.value("role", "user");
 
-        // Handle Ollama's images array format first
+        // Ollama uses the images array for image and audio attachments.
+        if (msg.contains("images") && !msg["images"].is_null() && !msg["images"].is_array())
+            throw std::invalid_argument("images must be an array of base64 media");
         bool has_ollama_images = msg.contains("images") && msg["images"].is_array();
 
         // Prepare content array (may be from content field or constructed from text + images)
@@ -220,6 +258,18 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
                     } else if (type == "image" && item.contains("image")) {
                         // Internal format: {"type": "image", "image": "data:..."}
                         internal_content.push_back(nlohmann::ordered_json(item));
+                    } else if (type == "input_audio") {
+                        if (!support_audio) {
+                            throw std::invalid_argument("This model has no compiled audio frontend");
+                        }
+                        const auto audio = item.value("input_audio", nlohmann::json::object());
+                        if (!audio.is_object() || !audio.contains("data") || !audio["data"].is_string()
+                            || audio["data"].get_ref<const std::string&>().empty()
+                            || !audio.contains("format") || !audio["format"].is_string()
+                            || (audio["format"] != "wav" && audio["format"] != "mp3")) {
+                            throw std::invalid_argument("input_audio requires base64 'data' and 'format' set to 'wav' or 'mp3'");
+                        }
+                        internal_content.push_back({{"type", "audio"}, {"audio", audio}});
                     } else {
                         // Other types (text, etc.) - pass through as-is
                         internal_content.push_back(nlohmann::ordered_json(item));
@@ -228,38 +278,35 @@ nlohmann::ordered_json WEB::_parse_endpoint_messages(const nlohmann::json& messa
             }
         }
 
-        // Handle Ollama's images array: convert base64 to data URI
+        // Preserve the order of attachments, regardless of their media type.
         if (has_ollama_images) {
-            for (const auto& image_data : msg["images"]) {
-                if (image_data.is_string()) {
-                    std::string base64_data = image_data.get<std::string>();
-                    // Ollama sends raw base64, convert to data URI
-                    // Default to JPEG, though we could try to detect format
-                    std::string data_uri = "data:image/jpeg;base64," + base64_data;
-                    internal_content.push_back({{"type", "image"}, {"image", data_uri}});
-                }
+            for (const auto& attachment : msg["images"]) {
+                auto media = parse_ollama_media(attachment);
+                if (media["type"] == "audio" && !support_audio)
+                    throw std::invalid_argument("This model has no compiled audio frontend");
+                if (media["type"] == "image" && !support_image)
+                    throw std::invalid_argument("This model has no compiled image frontend");
+                internal_content.push_back(std::move(media));
             }
         }
 
         // Set the content (either original string or constructed array)
         if (internal_content.is_array() && !internal_content.empty()) {
-            // Check if content array contains ONLY text and no images
-            bool has_images = false;
+            // Collapse only text-only content; keep media and its original order.
+            bool text_only = true;
             std::string combined_text = "";
 
             for (const auto& item : internal_content) {
                 std::string item_type = item.value("type", "");
-                if (item_type == "image") {
-                    has_images = true;
-                    break;
-                } else if (item_type == "text") {
+                if (item_type != "text") {
+                    text_only = false;
+                } else {
                     if (!combined_text.empty()) combined_text += " ";
                     combined_text += item.value("text", "");
                 }
             }
 
-            // If only text (no images), collapse to string for tokenizer compatibility
-            if (!has_images && !combined_text.empty()) {
+            if (text_only && !combined_text.empty()) {
                 internal_msg["content"] = combined_text;
             } else {
                 internal_msg["content"] = internal_content;
@@ -460,6 +507,12 @@ void WEB::_handle_chat_completions(
         } else {
             _execute_normal_chat(res, chat, model, protocol);
         }
+    } catch (const std::invalid_argument& e) {
+        res.status = 400;
+        const nlohmann::json error_body = is_openai
+            ? nlohmann::json{{"error", {{"message", e.what()}, {"type", "invalid_request_error"}}}}
+            : nlohmann::json{{"error", e.what()}};
+        res.set_content(error_body.dump(), "application/json");
     } catch (const std::exception& e) {
         _logger->error("Error in chat handler: {}", e.what());
         res.status = 500;
@@ -782,10 +835,21 @@ std::optional<Chat> WEB::_prepare_chat_context(
     }
 
     if (json_data.contains("messages")) {
-        auto internal_messages = _parse_endpoint_messages(json_data["messages"]);
+        auto internal_messages = parse_endpoint_messages(
+            json_data["messages"], _vision_language_model_ptr->support_image(),
+            _vision_language_model_ptr->support_audio()
+        );
         chat.set_messages(internal_messages);
     } else if (json_data.contains("prompt")) {
         chat.add_query(json_data["prompt"]);
+        if (protocol == ChatProtocol::OllamaGenerate && json_data.contains("images")) {
+            auto messages = chat.get_messages();
+            messages.back()["images"] = json_data["images"];
+            chat.set_messages(parse_endpoint_messages(
+                messages, _vision_language_model_ptr->support_image(),
+                _vision_language_model_ptr->support_audio()
+            ));
+        }
     } else {
         res.status = 400;
         res.set_content(R"({"error": "Missing messages or prompt"})", "application/json");
@@ -1017,8 +1081,17 @@ void WEB::_execute_streaming_chat(
             _vision_language_model_ptr->set_text_callback(text_callback);
 
             // Create thread and track it for /stop endpoint
-            _vlm_thread = std::jthread([this, chat]() {
-                _vision_language_model_ptr->run_model(chat);
+            _vlm_thread = std::jthread([this, chat, &sink, is_openai]() {
+                try {
+                    _vision_language_model_ptr->run_model(chat);
+                } catch (const std::exception& e) {
+                    _logger->error("Error in streaming chat: {}", e.what());
+                    const nlohmann::json error = {{"error", {{"message", e.what()}}}};
+                    const auto chunk = is_openai
+                        ? "data: " + error.dump() + "\n\ndata: [DONE]\n\n"
+                        : error.dump() + "\n";
+                    sink.write(chunk.data(), chunk.size());
+                }
             });
 
             // Wait for completion
@@ -1100,10 +1173,16 @@ void WEB::_execute_normal_chat(
     _vision_language_model_ptr->set_text_callback(text_callback);
 
     // Run in thread for consistency with barge-in logic
-    _vlm_thread = std::jthread([this, chat]() {
-        _vision_language_model_ptr->run_model(chat);
+    std::exception_ptr inference_error;
+    _vlm_thread = std::jthread([this, chat, &inference_error]() {
+        try {
+            _vision_language_model_ptr->run_model(chat);
+        } catch (...) {
+            inference_error = std::current_exception();
+        }
     });
     _vlm_thread.join();
+    if (inference_error) std::rethrow_exception(inference_error);
 
     // No need to reset callbacks - they'll be overwritten on next request
 

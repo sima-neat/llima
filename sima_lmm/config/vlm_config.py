@@ -300,6 +300,62 @@ class VisionModelConfig(BaseConfig):
 
 
 @dataclass
+class AudioModelConfig(BaseConfig):
+    """Gemma 4 audio encoder dimensions and prompt-token contract."""
+
+    hidden_size: int = 1024
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 8
+    output_proj_dims: int = 1536
+    subsampling_conv_channels: list[int] = field(default_factory=lambda: [128, 32])
+    conv_kernel_size: int = 5
+    attention_chunk_size: int = 12
+    attention_context_left: int = 13
+    attention_context_right: int = 0
+    attention_logit_cap: float = 50.0
+    attention_invalid_logits_value: float = -1e9
+    residual_weight: float = 0.5
+    gradient_clipping: float = 1e10
+    hidden_act: str = "silu"
+    rms_norm_eps: float = 1e-6
+    token_id: int = 258881
+    begin_token_id: int = 256000
+    end_token_id: int = 258883
+    max_tokens: int = 750
+    sampling_rate: int = 16000
+    num_mel_bins: int = 128
+    frame_length: int = 320
+    hop_length: int = 160
+    fft_length: int = 512
+
+    def __post_init__(self):
+        if (
+            min(self.hidden_size, self.num_hidden_layers, self.num_attention_heads,
+                self.output_proj_dims, self.attention_chunk_size, self.max_tokens) <= 0
+            or self.hidden_size % self.num_attention_heads
+            or self.hidden_size % 2
+            or len(self.subsampling_conv_channels) != 2
+            or min(self.subsampling_conv_channels) <= 0
+            or self.attention_context_left != self.attention_chunk_size + 1
+            or self.attention_context_right != 0
+            or self.conv_kernel_size <= 0
+            or self.max_tokens > 750
+            or self.num_mel_bins <= 0 or self.num_mel_bins % 4
+            or self.num_mel_bins != self.subsampling_conv_channels[0]
+            or (self.sampling_rate, self.frame_length, self.hop_length, self.fft_length) != (16000, 320, 160, 512)
+        ):
+            raise ValueError("Unsupported Gemma 4 audio encoder dimensions or attention context")
+
+    @property
+    def num_frames(self) -> int:
+        return 4 * self.max_tokens
+
+    @property
+    def padded_tokens(self) -> int:
+        return round_up_to(self.max_tokens, self.attention_chunk_size)
+
+
+@dataclass
 class MMConnectionConfig(BaseConfig):
     """Configuration of Multi-Modal Connection.
 
@@ -1122,9 +1178,12 @@ class VlmConfig(BaseConfig):
     mm_cfg: MMConnectionConfig | None = None
     lm_cfg: LanguageModelConfig = field(default_factory=LanguageModelConfig)
     pipeline_cfg: PipelineConfig = field(default_factory=PipelineConfig)
+    audio_cfg: AudioModelConfig | None = None
 
     @staticmethod
     def load(vlm_cfg: dict) -> "VlmConfig":
+        if vlm_cfg.get("audio_cfg") is not None:
+            vlm_cfg["audio_cfg"] = AudioModelConfig(**vlm_cfg["audio_cfg"])
         if vlm_cfg.get("vm_cfg") is not None:
             vlm_cfg["vm_cfg"]["arch"] = VisionArchType(vlm_cfg["vm_cfg"]["arch"])
             vlm_cfg["vm_cfg"] = VisionModelConfig(**vlm_cfg["vm_cfg"])
@@ -1295,6 +1354,15 @@ class VlmConfig(BaseConfig):
             vlm_cfg.mm_cfg = None
             vlm_cfg.vm_cfg = None
 
+        if model_format == ModelFormat.FORMAT_HF and model_type == "gemma4" and model_cfg.get("audio_config"):
+            audio = dict(model_cfg["audio_config"])
+            fields = AudioModelConfig.__dataclass_fields__
+            vlm_cfg.audio_cfg = AudioModelConfig(
+                **{key: value for key, value in audio.items() if key in fields},
+                token_id=model_cfg["audio_token_id"],
+                begin_token_id=model_cfg["boa_token_id"],
+                end_token_id=model_cfg["eoa_token_id"],
+            )
         return vlm_cfg
 
     @property
@@ -1322,6 +1390,9 @@ class VlmConfig(BaseConfig):
             f"{model_name}_layer{layer_idx}"
             for layer_idx in range(self.num_vision_layers)
         ]
+
+    def get_audio_model_names(self, model_name: str) -> list[str]:
+        return [f"{model_name}_audio_layer{i}" for i in range(self.audio_cfg.num_hidden_layers)] if self.audio_cfg else []
 
     def config_pipeline(
         self,
@@ -1530,6 +1601,8 @@ class VlmConfig(BaseConfig):
             layers.append(LayerID("group_per_layer", 0))
             layers.append(LayerID("single_per_layer", 0))
 
+        if self.audio_cfg is not None:
+            layers.extend(LayerID("audio", i) for i in range(self.audio_cfg.num_hidden_layers))
         return layers
 
 

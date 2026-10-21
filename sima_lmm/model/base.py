@@ -433,6 +433,20 @@ class BaseModel(ABC):
         if write_cfg:
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name
+            if self.cfg.audio_cfg is not None:
+                from sima_lmm.preproc.audio_preprocessing import audio_feature_constants
+
+                cfg_dict["audio_model_name"] = self.cfg.get_audio_model_names(self.model_name)
+                extractor = self.vlm_helper.hf_processor.feature_extractor
+                audio = self.cfg.audio_cfg
+                if (extractor.feature_size, extractor.frame_length, extractor.hop_length,
+                    extractor.fft_length, extractor.sampling_rate) != (
+                    audio.num_mel_bins, audio.frame_length, audio.hop_length,
+                    audio.fft_length, audio.sampling_rate
+                ):
+                    raise ValueError("Gemma audio processor dimensions differ from the compiled frontend")
+                with open(self.sima_devkit_path / "audio_preprocessor_config.json", "w") as f:
+                    json.dump(audio_feature_constants(extractor), f)
             if self.cfg.vm_cfg is not None:
                 cfg_dict["vision_model_name"] = self.cfg.get_vision_model_names(
                     self.vision_model_name

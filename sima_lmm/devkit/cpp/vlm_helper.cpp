@@ -103,6 +103,8 @@ VlmHelper::VlmHelper(
             _init_pad_token_id(tokenizer_config_json);
             _init_image_processor(files);
         }
+        if (_vlm_cfg.support_audio())
+            _audio_processor_ptr = std::make_unique<Gemma4AudioPreprocessor>(*_vlm_cfg.audio_cfg, files);
     } else {
         // GGUf format.
         assert(!_vlm_cfg.is_multimodal());
@@ -224,6 +226,48 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         }
     }
 
+    std::vector<AudioInput> audio_tensors;
+    size_t audio_cursor = 0;
+    for (const auto& message : chat.get_messages()) {
+        const auto& content = message.at("content");
+        if (!content.is_array()) continue;
+        for (const auto& item : content) {
+            if (item.at("type") != "audio") continue;
+            if (!_vlm_cfg.support_audio()) throw std::invalid_argument("This model has no compiled audio frontend");
+            const auto& audio = *_vlm_cfg.audio_cfg;
+            const auto& source = item.at("audio");
+            const size_t budget = std::min<uint32_t>(30 * audio.sampling_rate, audio.num_frames() * audio.hop_length);
+            ArrayXf samples;
+            if (source.is_string()) {
+                const auto path = source.get<std::string>();
+                if (!std::filesystem::is_regular_file(path)) throw std::invalid_argument("Audio file does not exist");
+                samples = load_audio(path, budget);
+            } else if (source.is_object() && source.contains("data") && source["data"].is_string()
+                       && source.contains("format") && (source["format"] == "wav" || source["format"] == "mp3")) {
+                const auto encoded = source["data"].get<std::string>();
+                if (encoded.empty() || encoded.size() % 4
+                    || encoded.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=") != std::string::npos)
+                    throw std::invalid_argument("input_audio.data must contain valid base64 audio");
+                const auto bytes = base64_decode(encoded);
+                samples = load_audio(std::span<const uint8_t>(bytes), budget);
+            } else {
+                throw std::invalid_argument("Audio input requires a path or base64 data with wav/mp3 format");
+            }
+            auto features = _audio_processor_ptr->preprocess(samples);
+            const auto at = formatted_prompt.find("<|audio|>", audio_cursor);
+            if (at == std::string::npos) throw std::invalid_argument("Audio attachment has no prompt placeholder");
+            std::string expanded = _tokenizer_ptr->id_to_token(audio.begin_token_id);
+            for (uint32_t i = 0; i < features.num_tokens; ++i) expanded += _tokenizer_ptr->id_to_token(audio.token_id);
+            expanded += _tokenizer_ptr->id_to_token(audio.end_token_id);
+            formatted_prompt.replace(at, std::string_view("<|audio|>").size(), expanded);
+            audio_cursor = at + expanded.size();
+            audio_tensors.push_back(std::move(features));
+        }
+    }
+    if (_vlm_cfg.support_audio()
+        && formatted_prompt.find("<|audio|>", audio_cursor) != std::string::npos)
+        throw std::invalid_argument("Audio placeholder has no matching attachment");
+
     // Encode the formatted prompt to token ids.
     auto add_special_tokens = !formatted_prompt.starts_with(_bos_token);
     auto input_token_ids = _tokenizer_ptr->encode(formatted_prompt, add_special_tokens);
@@ -270,7 +314,8 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         std::move(formatted_prompt),
         std::move(input_token_ids),
         stable_prefix_token_count,
-        std::move(image_tensors)
+        std::move(image_tensors),
+        std::move(audio_tensors)
     };
 }
 

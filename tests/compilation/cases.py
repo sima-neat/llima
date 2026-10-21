@@ -237,6 +237,9 @@ class GraphRegressionCase:
 
 
 GRAPH_REGRESSION_CASES = (
+    GraphRegressionCase(
+        "models--google--gemma-4-E2B-it", "audio", (240, 240), mode="informative"
+    ),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "pre"),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "cache"),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "post"),

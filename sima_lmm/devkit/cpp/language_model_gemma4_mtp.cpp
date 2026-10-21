@@ -719,7 +719,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result
+    GenerationPerformanceResult* performance_result,
+    const MediaLoader& media_loader
 ) {
     if (!_cfg.lm_cfg.is_gemma4_mtp_target()) {
         throw std::runtime_error("gemma4_mtp speculative decoding must run on the target model");
@@ -794,7 +795,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             auto first_token = run_model_prefill(
                 input_token_ids,
                 prefill_cached_tokens,
-                timer_ttft
+                timer_ttft,
+                media_loader
             );
             const double first_duration = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - first_begin

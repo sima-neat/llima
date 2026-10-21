@@ -372,6 +372,31 @@ inline void from_json(const nlohmann::json& j, VisionModelNames& names) {
 }
 
 
+struct AudioModelConfig {
+    uint32_t hidden_size = 1024;
+    uint32_t num_hidden_layers = 12;
+    uint32_t max_tokens = 750;
+    uint32_t attention_chunk_size = 12;
+    uint32_t sampling_rate = 16000;
+    uint32_t num_mel_bins = 128;
+    uint32_t frame_length = 320;
+    uint32_t hop_length = 160;
+    uint32_t fft_length = 512;
+    uint32_t token_id = 258881;
+    uint32_t begin_token_id = 256000;
+    uint32_t end_token_id = 258883;
+
+    uint32_t num_frames() const { return 4 * max_tokens; }
+    uint32_t padded_tokens() const {
+        return (max_tokens + attention_chunk_size - 1) / attention_chunk_size * attention_chunk_size;
+    }
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    AudioModelConfig, hidden_size, num_hidden_layers, max_tokens, attention_chunk_size,
+    sampling_rate, num_mel_bins, frame_length, hop_length, fft_length,
+    token_id, begin_token_id, end_token_id
+)
+
 struct VlmConfig {
     std::string model_name;
     std::string model_type;
@@ -382,6 +407,10 @@ struct VlmConfig {
     VisionModelNames vision_model_name = {};
     std::string language_model_name;
     std::string gguf_file_name = "";
+    std::optional<AudioModelConfig> audio_cfg;
+    std::vector<std::string> audio_model_name;
+
+    bool support_audio() const { return audio_cfg.has_value() && !audio_model_name.empty(); }
 
     bool is_multimodal() const { return vm_cfg.has_value(); }
     bool support_image() const {
@@ -395,7 +424,7 @@ struct VlmConfig {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     VlmConfig, model_name, model_type, vm_cfg, mm_cfg, lm_cfg, pipeline_cfg, vision_model_name,
-    language_model_name, gguf_file_name
+    language_model_name, gguf_file_name, audio_cfg, audio_model_name
 )
 
 }

@@ -17,6 +17,7 @@
 #include "language_model.hpp"
 #include "tool_call_parser.hpp"
 #include "vision_model.hpp"
+#include "audio_model.hpp"
 #include "vlm_helper.hpp"
 
 namespace simaai {
@@ -73,6 +74,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
 
         Chat create_chat() { return Chat(_vlm_helper); }
         bool support_image() const { return _cfg.support_image(); }
+        bool support_audio() const { return _cfg.support_audio(); }
         ToolCallFormat tool_call_format() const { return _tool_call_format; }
 
         void set_info_callback(TextStreamer::InfoCallback callback) {
@@ -107,13 +109,15 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint16_t> max_num_tokens,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr,
-            uint16_t stable_prefix_token_count = 0
+            uint16_t stable_prefix_token_count = 0,
+            const LanguageModel::MediaLoader& media_loader = {}
         );
 
         VlmHelper _vlm_helper;
         TextStreamer _text_streamer;
         ToolCallFormat _tool_call_format = ToolCallFormat::GenericJson;
         std::unique_ptr<VisionModel> _vision_model_ptr;
+        std::unique_ptr<AudioModel> _audio_model_ptr;
         std::unique_ptr<LanguageModel> _language_model_ptr;
         std::mutex _run_mutex;  // Protects run_model from concurrent access
         // Non-owning pointer to the draft VLM for speculative decoding;
