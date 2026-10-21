@@ -116,6 +116,10 @@ CONFIGURATION_CASES = (
         "lfm2.5_vl_450m_vlm_config.json",
         "hf",
     ),
+    ConfigurationCase(
+        "models--HuggingFaceTB--SmolVLM2-256M-Video-Instruct",
+        "smolvlm2_256m_vlm_config.json", "hf",
+    ),
     # GGUF LLMs
     ConfigurationCase(
         "models--unsloth--Llama-3.1-8B-Instruct-GGUF",
@@ -239,6 +243,12 @@ class GraphRegressionCase:
 GRAPH_REGRESSION_CASES = (
     GraphRegressionCase(
         "models--google--gemma-4-E2B-it", "audio", (240, 240), mode="informative"
+    ),
+    *(
+        GraphRegressionCase(
+            "models--HuggingFaceTB--SmolVLM2-256M-Video-Instruct", component, mode="informative"
+        )
+        for component in ("pre", "cache", "post", "vision")
     ),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "pre"),
     GraphRegressionCase("models--meta-llama--Llama-3.2-1B-Instruct", "cache"),

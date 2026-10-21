@@ -17,7 +17,7 @@ from transformers import (
 from transformers.image_utils import load_images
 from transformers.utils import GENERATION_CONFIG_NAME
 
-from sima_lmm.config.vlm_config import VlmConfig,VisionArchType
+from sima_lmm.config.vlm_config import VlmConfig, VisionArchType, VlmArchType
 from sima_lmm.logging import sima_log_warning, sima_log_info
 
 class VlmHelper:
@@ -34,6 +34,7 @@ class VlmHelper:
         vlm_cfg: VlmConfig,
         hf_path: Path,
     ):
+        self.model_type = vlm_cfg.model_type
         try:
             if hf_path.suffix == ".gguf":
                 self.hf_tokenizer = LlamaCPPWrapper(
@@ -72,7 +73,7 @@ class VlmHelper:
                     self.hf_processor = AutoProcessor.from_pretrained(hf_path, **kwargs)
                     self.hf_tokenizer = self.hf_processor.tokenizer
                     assert isinstance(self.hf_processor, ProcessorMixin)
-                    if vlm_cfg.vm_cfg.arch in (
+                    if vlm_cfg.model_type == VlmArchType.VLM_SMOLVLM or vlm_cfg.vm_cfg.arch in (
                         VisionArchType.SIGLIP2,
                         VisionArchType.QWEN2_VISION_ENCODER,
                         VisionArchType.QWEN3_VISION_ENCODER,
@@ -158,7 +159,18 @@ class VlmHelper:
                 resized_images = []
                 for img in images:
                     img_np = np.array(img)
-                    resized_img_np = cv2.resize(img_np, target_size, interpolation=cv2.INTER_CUBIC)
+                    interpolation = cv2.INTER_CUBIC
+                    if self.model_type == VlmArchType.VLM_SMOLVLM:
+                        height, width = img_np.shape[:2]
+                        side = max(height, width)
+                        top, left = (side - height) // 2, (side - width) // 2
+                        img_np = cv2.copyMakeBorder(
+                            img_np, top, side - height - top, left, side - width - left,
+                            cv2.BORDER_CONSTANT,
+                            value=tuple(int(mean * 255) for mean in self.hf_processor.image_processor.image_mean),
+                        )
+                        interpolation = cv2.INTER_LANCZOS4
+                    resized_img_np = cv2.resize(img_np, target_size, interpolation=interpolation)
                     resized_images.append(PIL.Image.fromarray(resized_img_np))
                 images = resized_images
             if self.hf_tokenizer.bos_token is not None and formatted_prompt.startswith(
@@ -168,10 +180,19 @@ class VlmHelper:
             else:
                 add_special_tokens = True
 
+            processor_kwargs = {}
+            if self.model_type == VlmArchType.VLM_SMOLVLM:
+                processor_kwargs = {"do_image_splitting": False, "do_resize": False}
             processed_dict = self.hf_processor(
-                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens
+                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens,
+                **processor_kwargs,
             )
             processed_images = processed_dict.get("pixel_values")
+            if self.model_type == VlmArchType.VLM_SMOLVLM and processed_images is not None:
+                processed_images = np.asarray(processed_images)
+                if processed_images.ndim != 5 or processed_images.shape[0] != 1:
+                    raise ValueError("SmolVLM preprocessing expects one batch of image tiles")
+                processed_images = processed_images[0]
             image_grid_thw = processed_dict.get("image_grid_thw")
             if image_grid_thw is not None and not isinstance(image_grid_thw, list):
                     image_grid_thw = np.array(image_grid_thw).tolist()

@@ -181,6 +181,12 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                 replace += "<|image_pad|>";
             }
             num_images = find_and_replace_all(formatted_prompt, search, replace);
+        } else if (_vlm_cfg.model_type == "vlm-smolvlm") {
+            std::string replace = "<fake_token_around_image><global-img>";
+            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i)
+                replace += "<image>";
+            replace += "<fake_token_around_image>";
+            num_images = find_and_replace_all(formatted_prompt, "<image>", replace);
         } else if (_vlm_cfg.model_type == "vlm-gemma4") {
             std::string search = "<|image|>";
             std::string replace = "";
@@ -494,6 +500,9 @@ void VlmHelper::_init_image_processor(FileProvider& files) {
     int resample = json.value("resample", 3);
     cv::InterpolationFlags interpolation;
     switch (resample) {
+        case 1:
+            interpolation = cv::INTER_LANCZOS4;
+            break;
         case 2:
             interpolation = cv::INTER_LINEAR;
             break;

@@ -470,7 +470,7 @@ class LocalHuggingFaceModel:
     @cached_property
     def vision_model_param_base_name(self) -> str:
         # Known vision model base name segments (extensible for future models).
-        vision_base_names = ("vision_tower", "visual")
+        vision_base_names = ("vision_tower", "visual", "vision_model")
         
         # Filter for keys that have a known vision base name as a path segment.
         vision_keys = [
@@ -499,7 +499,7 @@ class LocalHuggingFaceModel:
     def language_model_param_base_name(self) -> str:
         for name in self.weight_map.keys():
             parts = name.split(".")
-            if "language_model" in parts and "layers" in parts:
+            if ("language_model" in parts or "text_model" in parts) and "layers" in parts:
                 return ".".join(parts[:parts.index("layers")])
 
         base_names = list()

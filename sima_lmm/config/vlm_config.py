@@ -16,6 +16,7 @@ _VISION_MODEL_TYPE_ALIASES = {
     "qwen2_5_vl_vision": "qwen2_5_vl",
     "qwen3_vl_vision": "qwen3_vl",
     "qwen3_5_vision": "qwen3_5",
+    "smolvlm_vision": "siglip",
 }
 
 
@@ -117,6 +118,7 @@ class VlmArchType(str, ExtensibleEnum):
     VLM_QWEN2_5_VL = "vlm-qwen2_5_vl"
     VLM_QWEN3_VL = "vlm-qwen3_vl"
     VLM_QWEN3_5_VL = "vlm-qwen3_5"
+    VLM_SMOLVLM = "vlm-smolvlm"
 
 class VisionArchType(str, ExtensibleEnum):
     """Vision architecture type.
@@ -368,7 +370,7 @@ class MMConnectionConfig(BaseConfig):
             If mm_tokens_per_image is less than num_patches, AvgPool is inserted.
         proj_dim: The number of projected tokens for an image.
         downsample_factor: Reduces vision tokens by factor² via PixelUnshuffle.
-        projector_use_layernorm: Whether to apply LayerNorm, which is absent in LFM2.5-VL projector.
+        projector_use_layernorm: Whether the LFM2 projector applies LayerNorm.
     """
     num_layers: int = 2
     hidden_act: str = "gelu"
@@ -1337,6 +1339,11 @@ class VlmConfig(BaseConfig):
                 imgs = vlm_cfg.vm_cfg.image_size
                 ps = vlm_cfg.vm_cfg.patch_size
                 vlm_cfg.mm_cfg.mm_tokens_per_image = (imgs // ps) ** 2
+            elif vlm_cfg.model_type == VlmArchType.VLM_SMOLVLM:
+                vlm_cfg.mm_cfg.downsample_factor = model_cfg["scale_factor"]
+                vlm_cfg.mm_cfg.mm_tokens_per_image = (
+                    vlm_cfg.vm_cfg.num_patches // vlm_cfg.mm_cfg.downsample_factor
+                ) ** 2
             if vlm_cfg.model_type in (VlmArchType.VLM_LFM2_VL, VlmArchType.VLM_GEMMA4):
                 if not vlm_cfg.vm_cfg.temporal_patch_size:
                     vlm_cfg.vm_cfg.temporal_patch_size = 1

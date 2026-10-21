@@ -213,7 +213,7 @@ jobs:
           set -euo pipefail
           test_stage="${RUNNER_TEMP}/llima-compiler-tests"
           junit_report="${RUNNER_TEMP}/compiler-unit-junit.xml"
-          expected_test_count=406
+          expected_test_count=416
 
           rm -rf "${test_stage}"
           mkdir -p "${test_stage}"
@@ -278,7 +278,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-config-junit.xml"
-          expected_test_count=26
+          expected_test_count=27
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -345,7 +345,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-graph-regression-junit.xml"
-          expected_test_count=38
+          expected_test_count=42
           base_wheel_dir="${RUNNER_TEMP}/llima-base-wheel"
           base_package_root="${RUNNER_TEMP}/llima-base-package"
           base_resolution="${RUNNER_TEMP}/llima-base-resolution.json"
@@ -515,7 +515,7 @@ jobs:
         run: |
           set -euo pipefail
           junit_report="${RUNNER_TEMP}/compiler-graph-integration-junit.xml"
-          expected_test_count=31
+          expected_test_count=34
 
           (
             cd "${LLIMA_TEST_STAGE}"
@@ -559,7 +559,7 @@ jobs:
           {
             echo "### Generated-graph and quantization integration"
             echo
-            echo "- Standard/embedding/Whisper/GGUF cases: 31"
+            echo "- Standard/embedding/Whisper/GGUF/SmolVLM cases: 34"
             echo "- Serial speculative-decoding cases: 6"
             echo "- Unexpected skips: 0"
           } >> "${GITHUB_STEP_SUMMARY}"

@@ -221,6 +221,8 @@ class StandardVisionLayerModel(BaseModel):
                 )
             if self.cfg.model_type == VlmArchType.VLM_LFM2_VL:
                 projector_base_name = "model.multi_modal_projector"
+            elif self.cfg.model_type == VlmArchType.VLM_SMOLVLM:
+                projector_base_name = "model.connector.modality_projection"
             else:
                 projector_base_name = "multi_modal_projector"
             vision_output = self._build_mm_projector(
@@ -362,6 +364,17 @@ class StandardVisionLayerModel(BaseModel):
 
     def _build_mm_projector(self, graph: ModelGraph, base_name: str, input_node: Node) -> Node:
         match self.cfg.model_type:
+            case VlmArchType.VLM_SMOLVLM:
+                patches = self.cfg.vm_cfg.num_patches
+                spatial = graph.split_concat(
+                    input_node, axis=1, split_axis=2, split_block=patches, split_repeat=1
+                )
+                spatial = graph.space_to_depth(spatial, self.cfg.mm_cfg.downsample_factor)
+                grid = patches // self.cfg.mm_cfg.downsample_factor
+                tokens = graph.split_concat(
+                    spatial, axis=2, split_axis=1, split_block=grid, split_repeat=1
+                )
+                last = graph.linear(f"{base_name}.proj", tokens)
             case VlmArchType.VLM_LFM2_VL:
                 # NHWC: (1, 1, seq_len, hidden) → (1, num_patches_h, num_patches_w, hidden)
                 if isinstance(self.cfg.vm_cfg.num_patches, list):
