@@ -74,7 +74,7 @@ representative; cover configuration variants with small hermetic tests.
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 416
+- Expected cases: 418
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -331,6 +331,7 @@ LLiMa-specific reasoning fixtures:
 - `simaai/whisper-small-a16w8`
 - `Qwen3-0.6B-Autoround-a16w4`
 - `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`
+- `florianvoss/Gemma-4-E2B-it-GPTQ-Multimodal-a16w4` (audio HTTP fixture)
 
 The shared environment contract is:
 
@@ -341,6 +342,7 @@ The shared environment contract is:
 - `SIMA_TEST_LLIMA_ASR_REPO`
 - `SIMA_TEST_LLIMA_REASONING_QWEN_MODEL`
 - `SIMA_TEST_LLIMA_REASONING_GEMMA_MODEL`
+- `SIMA_TEST_LLIMA_AUDIO_MODEL`, `SIMA_TEST_LLIMA_AUDIO_REPO`, `SIMA_TEST_LLIMA_AUDIO_REVISION`
 
 Models are retained on the runner between CI runs.
 
@@ -417,6 +419,7 @@ Pytest validates the installed package and external interfaces:
 | CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
 | Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
 | OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
+| Audio HTTP | Gemma multipart JSON/text/SSE, explicit Whisper precedence and translation, upload validation, cancellation and chat recovery |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
 
 `tests/runtime/pytest.ini` is packaged with these tests and prevents compiler

@@ -6,9 +6,9 @@
 #include <ctime>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 
 #include "chat.hpp"
 #include "utils.hpp"
@@ -43,7 +43,7 @@ class EXPORT WEB {
         void stop();
 
     private:
-        void _stop_and_detach_vlm_thread();  // Helper to stop and detach active VLM thread
+        void _stop_active_inference();
         void _handle_stop(const httplib::Request& req, httplib::Response& res);
         void _handle_set_lora(const httplib::Request& req, httplib::Response& res);
         void _handle_unset_lora(const httplib::Request& req, httplib::Response& res);
@@ -58,6 +58,11 @@ class EXPORT WEB {
             const httplib::Request& req,
             httplib::Response& res,
             const std::string& task
+        );
+
+        void _handle_gemma_audio_transcription(
+            const httplib::Request& req,
+            httplib::Response& res
         );
 
         // Helpers
@@ -129,7 +134,8 @@ class EXPORT WEB {
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
         bool _enable_thinking;
-        std::jthread _vlm_thread;
+        // Callbacks and preprocessing belong to one HTTP inference at a time.
+        std::mutex _inference_mutex;
 
         // HTTP server. For HTTPS, use SSLServer and define CPPHTTPLIB_OPENSSL_SUPPORT before
         // including the httplib.h header.

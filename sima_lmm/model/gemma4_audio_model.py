@@ -48,8 +48,6 @@ class Gemma4AudioLayerModel(BaseModel):
 
     def generate_graph(self, layer_cfg: LayerConfiguration, quantizable: bool):
         audio = self.cfg.audio_cfg
-        if audio is None or not 0 <= self.layer_idx < audio.num_hidden_layers:
-            raise ValueError(f"Invalid audio encoder layer index {self.layer_idx}")
         shape = ((1, 1, audio.num_frames, audio.num_mel_bins) if self.layer_idx == 0
                  else (1, 1, audio.padded_tokens, audio.hidden_size))
         graph = ModelGraph(self, {"hidden": shape, "mask": (1, 1, audio.num_frames, 1)}, quantizable)

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import json
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ from sima_lmm.config.vlm_config import AudioModelConfig, ModelFormat, VlmConfig
 from sima_lmm.model import vision_language_model
 from sima_lmm.model.gemma4_audio_model import Gemma4AudioLayerModel
 from sima_lmm.model.model_graph import ModelGraph
-from sima_lmm.preproc.audio_preprocessing import audio_feature_constants, gemma4_audio_features
+from sima_lmm.preproc.audio_preprocessing import audio_feature_constants, gemma4_audio_features, load_audio
 
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
@@ -39,6 +40,19 @@ def test_audio_duration_controls_encoder_capacity_and_input_limit(monkeypatch, t
     assert np.count_nonzero(mask[0, 0, ::4]) == 250
     with pytest.raises(ValueError, match="compiled token budget"):
         gemma4_audio_features(np.zeros(160001, np.float32), audio, constants)
+
+
+@pytest.mark.parametrize("rate", [16000, 48000])
+def test_load_audio_preserves_resampler_tail_and_budget(tmp_path, rate):
+    path = tmp_path / "stereo.wav"
+    with wave.open(str(path), "wb") as output:
+        output.setparams((2, 2, rate, 0, "NONE", "not compressed"))
+        output.writeframes(np.full((rate // 10, 2), 8192, dtype="<i2").tobytes())
+    samples = load_audio(path, max_samples=1600)
+    assert samples.shape == (1600,)
+    np.testing.assert_array_equal(samples, np.full(1600, 0.25, dtype=np.float32))
+    with pytest.raises(ValueError, match="compiled token budget"):
+        load_audio(path, max_samples=1599)
 
 
 @pytest.mark.parametrize("samples", [641, 801, 16000, 480000])

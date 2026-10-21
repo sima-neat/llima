@@ -1,5 +1,7 @@
 """Shared audio decoding and Gemma 4's model-specific mel frontend."""
 
+from itertools import chain
+
 import av
 import numpy as np
 
@@ -9,20 +11,15 @@ def load_audio(file, sr: int = 16000, max_samples: int | None = None) -> np.ndar
     parts, count = [], 0
     with av.open(str(file)) as container:
         resampler = av.AudioResampler(format="s16", layout="mono", rate=sr)
-        for frame in container.decode(audio=0):
-            frame.pts = None
+        for frame in chain(container.decode(audio=0), (None,)):
+            if frame is not None:
+                frame.pts = None
             for resampled in resampler.resample(frame):
                 values = resampled.to_ndarray().flatten()
                 count += len(values)
                 if max_samples is not None and count > max_samples:
                     raise ValueError("Audio exceeds the compiled token budget")
                 parts.append(values)
-        for resampled in resampler.resample(None):
-            values = resampled.to_ndarray().flatten()
-            count += len(values)
-            if max_samples is not None and count > max_samples:
-                raise ValueError("Audio exceeds the compiled token budget")
-            parts.append(values)
     if not count:
         raise ValueError("Audio input is empty")
     return np.concatenate(parts).astype(np.float32) / 32768.0
@@ -64,9 +61,7 @@ def gemma4_audio_features(samples: np.ndarray, audio, constants: dict) -> tuple[
     valid = np.arange(count) * audio.hop_length + audio.frame_length < left + len(samples)
     if not valid[::4].any():
         raise ValueError("Audio is too short to produce a valid audio token")
-    # Discard only invalid padding frames beyond the compiled capacity.
-    if valid[audio.num_frames:].any():
-        raise ValueError("Audio exceeds the compiled token budget")
+    # The sample budget already bounds valid frames; discard trailing padding.
     count = min(count, audio.num_frames)
     features = np.zeros((1, 1, audio.num_frames, audio.num_mel_bins), np.float32)
     mask = np.zeros((1, 1, audio.num_frames, 1), np.float32)

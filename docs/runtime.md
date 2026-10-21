@@ -88,36 +88,10 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `quit` | Quit. |
 | `help` | Print available commands. |
 
-Models compiled with an audio encoder accept `add audio <file>` followed by a
-question or transcription request. Audio stays part of the conversation;
-`clear history` removes it. This is separate from Whisper's `set audio`
-transcription command. Gemma 4 E2B/E4B accept up to 30 seconds per clip, or the
-shorter limit set at compilation with `--max_audio_duration`;
-audio tokens count toward the compiled context limit. Older compiled models
-without `audio_cfg` and `audio_model_name` remain text/vision-only.
-
-`/v1/chat/completions` accepts OpenAI audio content parts alongside text and images:
-
-```json
-{"type": "input_audio", "input_audio": {"data": "<base64 audio>", "format": "wav"}}
-```
-
-`format` accepts `wav` or `mp3`. The runtime decodes to mono 16-kHz samples and
-applies the model's frontend. Empty clips and clips exceeding the compiled
-budget are rejected. `/v1/audio/transcriptions` retains its Whisper behavior.
-
-Ollama-compatible `/api/chat` and `/api/generate` accept base64 images or WAV/MP3
-audio in `images`. The runtime detects the media type from the decoded bytes.
-For `/api/chat`, put `images` inside the user message; for `/api/generate`, put
-it alongside `prompt`:
-
-```json
-{"messages": [{"role": "user", "content": "Transcribe this.", "images": ["<base64 audio>"]}], "stream": false}
-```
-
-```json
-{"prompt": "Transcribe this.", "images": ["<base64 audio>"], "stream": false}
-```
+Audio-capable chat models accept `add audio <file>` followed by a question or
+transcription request. `clear history` removes attachments. Clips must fit the
+compiled audio duration (`--max_audio_duration`) and context limits. `set audio`
+uses the separately configured speech-to-text model instead.
 
 
 ## Build an Application with Neat

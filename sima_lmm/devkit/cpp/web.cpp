@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <fstream>
+#include <cstdio>
 #include <exception>
 #include <variant>
 #include <vector>
@@ -19,6 +21,31 @@ extern "C" {
 
 namespace simaai {
 namespace llima {
+
+namespace {
+
+std::string multipart_field(const httplib::Request& req, const char* name,
+                            const std::string& fallback = {}) {
+    if (req.has_param(name)) return req.get_param_value(name);
+    if (req.has_file(name)) return req.get_file_value(name).content;
+    return fallback;
+}
+
+bool multipart_flag(const httplib::Request& req, const char* name) {
+    const auto value = multipart_field(req, name);
+    return value == "true" || value == "1" || value == "True";
+}
+
+template<typename Model>
+struct ModelCallbackGuard {
+    Model* model;
+    ~ModelCallbackGuard() {
+        model->set_info_callback([](const std::string&, double) {});
+        model->set_text_callback([](const std::string&, bool, bool) {});
+    }
+};
+
+} // namespace
 
 static std::string get_iso_timestamp() {
     auto now = std::chrono::system_clock::now();
@@ -154,27 +181,22 @@ void WEB::run() {
 
 void WEB::stop() {
     _logger->info("User interrupt received. Stopping the HTTP server.");
+    _stop_active_inference();
     _http_server.stop();
 }
 
 
-void WEB::_stop_and_detach_vlm_thread() {
-    if (_vlm_thread.joinable()) {
-        _logger->info("Received stop from remote.");
-        _vision_language_model_ptr->stop_model();
-
-        // Wait for VLM to send STOP token and queue to drain
-        _vision_language_model_ptr->wait_for_streamer_completion();
-
-        _vlm_thread.detach();
-        _logger->info("VLM stopped.");
-    }
+void WEB::_stop_active_inference() {
+    // Inference runs on the request thread; other requests only signal cancellation.
+    _vision_language_model_ptr->stop_model();
+    if (_whisper_model_ptr) _whisper_model_ptr->stop_model();
 }
+
 
 void WEB::_handle_stop(const httplib::Request& req, httplib::Response& res) {
     _set_cors_headers(res);
 
-    _stop_and_detach_vlm_thread();
+    _stop_active_inference();
 
     // Send response immediately
     res.status = 200;
@@ -499,7 +521,7 @@ void WEB::_handle_chat_completions(
         Chat chat = std::move(chat_opt.value());
 
         // 2. Barge-in check
-        _stop_and_detach_vlm_thread();
+        _stop_active_inference();
 
         // 3. Execution
         if (stream) {
@@ -539,8 +561,14 @@ void WEB::_handle_audio_transcriptions(
             return;
         }
 
+        if (!_whisper_model_ptr && _vision_language_model_ptr->support_audio()
+            && task == "transcribe") {
+            _handle_gemma_audio_transcription(req, res);
+            return;
+        }
+
         // Barge-in check
-        _stop_and_detach_vlm_thread();
+        _stop_active_inference();
 
         const auto file = req.get_file_value("file");
 
@@ -548,17 +576,8 @@ void WEB::_handle_audio_transcriptions(
         output_file.write(file.content.c_str(), file.content.size());
         output_file.close();
 
-        // Get language from form data
-        std::string language = "auto";
-        // Older cpp-httplib stores plain multipart fields in params.
-        if (req.has_param("language")) {
-            language = req.get_param_value("language");
-        } else if (req.has_file("language")) {
-            const auto lang_file = req.get_file_value("language");
-            if (!lang_file.content.empty()) {
-                language = lang_file.content;
-            }
-        }
+        auto language = multipart_field(req, "language", "auto");
+        if (language.empty()) language = "auto";
 
         if (!_whisper_model_ptr) {
             res.status = 503;
@@ -566,20 +585,12 @@ void WEB::_handle_audio_transcriptions(
             return;
         }
 
-        bool stream = false;
-        if (req.has_param("stream")) {
-            auto value = req.get_param_value("stream");
-            stream = value == "true" || value == "1" || value == "True";
-        } else if (req.has_file("stream")) {
-            auto value = req.get_file_value("stream").content;
-            stream = value == "true" || value == "1" || value == "True";
-        }
-
-        if (stream) {
+        if (multipart_flag(req, "stream")) {
             _execute_streaming_audio_transcription(res, language, task);
             return;
         }
 
+        std::lock_guard lock(_inference_mutex);
         auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
         nlohmann::json response = {
             {"text", result.text},
@@ -598,6 +609,131 @@ void WEB::_handle_audio_transcriptions(
     }
 }
 
+void WEB::_handle_gemma_audio_transcription(
+    const httplib::Request& req, httplib::Response& res
+) {
+    try {
+        const auto format = multipart_field(req, "response_format", "json");
+        if (format != "json" && format != "text")
+            throw std::invalid_argument("Gemma transcription supports response_format 'json' or 'text'");
+        const bool stream = multipart_flag(req, "stream");
+        if (stream && format != "json")
+            throw std::invalid_argument("Streaming Gemma transcription requires response_format 'json'");
+        auto language = multipart_field(req, "language", "auto");
+        if (language == "auto") language.clear();
+        if (!language.empty()) {
+            if (language.size() != 2 || !std::all_of(language.begin(), language.end(),
+                    [](unsigned char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'); }))
+                throw std::invalid_argument("language must be a two-letter ISO-639-1 code or 'auto'");
+            std::transform(language.begin(), language.end(), language.begin(),
+                [](unsigned char ch) { return ch >= 'A' && ch <= 'Z' ? ch + ('a' - 'A') : ch; });
+        }
+
+        // Follow Google's Gemma 4 ASR guidance: instruction first, then audio,
+        // a transcript without commentary/newlines, and digits for numbers.
+        // https://ai.google.dev/gemma/docs/capabilities/audio
+        std::string instruction = language.empty()
+            ? "Transcribe this speech in its original language."
+            : fmt::format("Transcribe this speech in the language identified by ISO-639-1 code '{}' "
+                          "into text in that same language.", language);
+        instruction += " Return only the transcription on one line, without explanations. "
+                       "Write numbers using digits rather than spelling them out.";
+        const auto context = multipart_field(req, "prompt");
+        if (!context.empty()) instruction += "\nTranscription context: " + context;
+
+        // Each upload owns an anonymous file, including throughout an SSE
+        // response. Filenames from the client are never used as local paths.
+        const auto file = req.get_file_value("file");
+        auto upload = std::shared_ptr<FILE>(std::tmpfile(), &std::fclose);
+        if (!upload) throw std::runtime_error("Could not create temporary audio file");
+        if (std::fwrite(file.content.data(), 1, file.content.size(), upload.get()) != file.content.size()
+            || std::fflush(upload.get()) != 0)
+            throw std::runtime_error("Could not write temporary audio file");
+        const auto audio_path = fmt::format("/proc/self/fd/{}", fileno(upload.get()));
+
+        _stop_active_inference();
+        auto chat = _vision_language_model_ptr->create_chat();
+        chat.set_enable_thinking(false);
+        auto messages = chat.get_messages();
+        messages.push_back({{"role", "user"}, {"content", {
+            {{"type", "text"}, {"text", instruction}},
+            {{"type", "audio"}, {"audio", audio_path}}
+        }}});
+        chat.set_messages(std::move(messages));
+        {
+            std::lock_guard lock(_inference_mutex);
+            // Validate before committing HTTP 200/SSE headers. Decoder failures,
+            // empty/oversized clips and context overflow remain HTTP 400.
+            auto prepared = _vision_language_model_ptr->_vlm_helper.preprocess(chat);
+            if (prepared.input_token_ids.size() > _vision_language_model_ptr->_cfg.pipeline_cfg.max_num_tokens)
+                throw std::invalid_argument("Audio and prompt exceed the compiled context length");
+        }
+
+        auto execute = [this, chat, upload, language](httplib::DataSink* sink) {
+            std::lock_guard lock(_inference_mutex);
+            ModelCallbackGuard callbacks{_vision_language_model_ptr.get()};
+            std::string transcript;
+            std::string finish_reason = "stop";
+            std::optional<double> ttft, tps;
+            _vision_language_model_ptr->set_info_callback(
+                [&](const std::string& metric, double value) {
+                    if (metric == "ttft") ttft = value;
+                    else if (metric == "tps") tps = value;
+                    else if (metric == "FULL") finish_reason = "length";
+                });
+            _vision_language_model_ptr->set_text_callback(
+                [&](const std::string& text, bool, bool) {
+                    transcript += text;
+                    if (sink && !text.empty()) {
+                        const auto chunk = _format_audio_sse_chunk(text, "transcribe", false);
+                        if (!sink->write(chunk.data(), chunk.size()))
+                            _vision_language_model_ptr->stop_model();
+                    }
+                });
+            const auto result = _vision_language_model_ptr->run_model(chat);
+            if (!result) finish_reason = "cancelled";
+            nlohmann::json response = {{"text", trim(std::move(transcript))}, {"task", "transcribe"}};
+            // Gemma does not expose Whisper's language-detection/confidence
+            // scores. Only echo a language explicitly supplied by the client.
+            std::optional<std::string> requested_language;
+            if (!language.empty()) {
+                requested_language = language;
+                response["language"] = language;
+            }
+            if (sink) {
+                const auto chunk = _format_audio_sse_chunk(
+                    "", "transcribe", true, finish_reason, ttft, tps, requested_language, "transcribe"
+                ) + "data: [DONE]\n\n";
+                sink->write(chunk.data(), chunk.size());
+            }
+            return response;
+        };
+
+        if (!stream) {
+            const auto response = execute(nullptr);
+            res.set_content(format == "text" ? response.at("text").get<std::string>() : response.dump(),
+                            format == "text" ? "text/plain; charset=utf-8" : "application/json");
+            return;
+        }
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream",
+            [execute](size_t, httplib::DataSink& sink) {
+                try {
+                    execute(&sink);
+                } catch (const std::exception& error) {
+                    const auto body = nlohmann::json{{"object", "audio.transcription.error"}, {"error", error.what()}};
+                    const auto chunk = "data: " + body.dump() + "\n\ndata: [DONE]\n\n";
+                    sink.write(chunk.data(), chunk.size());
+                }
+                sink.done();
+                return true;
+            });
+    } catch (const std::invalid_argument& error) {
+        res.status = 400;
+        res.set_content(nlohmann::json{{"error", error.what()}}.dump(), "application/json");
+    }
+}
+
 void WEB::_execute_streaming_audio_transcription(
     httplib::Response& res,
     const std::string& language,
@@ -611,17 +747,12 @@ void WEB::_execute_streaming_audio_transcription(
         "text/event-stream",
         [this, language, task](size_t offset, httplib::DataSink &sink) {
             (void)offset;
+            std::lock_guard lock(_inference_mutex);
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
             std::optional<std::string> finish_reason;
 
-            struct WhisperCallbackGuard {
-                WhisperModel* model;
-                ~WhisperCallbackGuard() {
-                    model->set_info_callback([](const std::string&, double) {});
-                    model->set_text_callback([](const std::string&, bool, bool) {});
-                }
-            } callback_guard{_whisper_model_ptr.get()};
+            ModelCallbackGuard callbacks{_whisper_model_ptr.get()};
 
             auto info_callback = [&](const std::string& metric_type, double metric_value) {
                 if (metric_type == "ttft") {
@@ -890,6 +1021,8 @@ void WEB::_execute_streaming_chat(
         is_openai ? "text/event-stream" : "application/x-ndjson",
         [this, chat, model, protocol](size_t offset, httplib::DataSink &sink) {
             (void)offset;
+            std::lock_guard lock(_inference_mutex);
+            ModelCallbackGuard callbacks{_vision_language_model_ptr.get()};
             const bool is_openai = protocol == ChatProtocol::OpenAI;
             const auto created = std::time(nullptr);
             const auto completion_id = "chatcmpl-" + std::to_string(created);
@@ -1080,24 +1213,16 @@ void WEB::_execute_streaming_chat(
             _vision_language_model_ptr->set_info_callback(info_callback);
             _vision_language_model_ptr->set_text_callback(text_callback);
 
-            // Create thread and track it for /stop endpoint
-            _vlm_thread = std::jthread([this, chat, &sink, is_openai]() {
-                try {
-                    _vision_language_model_ptr->run_model(chat);
-                } catch (const std::exception& e) {
-                    _logger->error("Error in streaming chat: {}", e.what());
-                    const nlohmann::json error = {{"error", {{"message", e.what()}}}};
-                    const auto chunk = is_openai
-                        ? "data: " + error.dump() + "\n\ndata: [DONE]\n\n"
-                        : error.dump() + "\n";
-                    sink.write(chunk.data(), chunk.size());
-                }
-            });
-
-            // Wait for completion
-            _vlm_thread.join();
-
-            // No need to reset callbacks - they'll be overwritten on next request
+            try {
+                _vision_language_model_ptr->run_model(chat);
+            } catch (const std::exception& e) {
+                _logger->error("Error in streaming chat: {}", e.what());
+                const nlohmann::json error = {{"error", {{"message", e.what()}}}};
+                const auto chunk = is_openai
+                    ? "data: " + error.dump() + "\n\ndata: [DONE]\n\n"
+                    : error.dump() + "\n";
+                sink.write(chunk.data(), chunk.size());
+            }
 
             sink.done();
             return true;
@@ -1144,6 +1269,8 @@ void WEB::_execute_normal_chat(
     const std::string& model,
     ChatProtocol protocol
 ) {
+    std::lock_guard lock(_inference_mutex);
+    ModelCallbackGuard callbacks{_vision_language_model_ptr.get()};
     std::string reasoning_response;
     std::string full_response;
     std::string finish_reason = "stop";
@@ -1172,19 +1299,7 @@ void WEB::_execute_normal_chat(
     _vision_language_model_ptr->set_info_callback(info_callback);
     _vision_language_model_ptr->set_text_callback(text_callback);
 
-    // Run in thread for consistency with barge-in logic
-    std::exception_ptr inference_error;
-    _vlm_thread = std::jthread([this, chat, &inference_error]() {
-        try {
-            _vision_language_model_ptr->run_model(chat);
-        } catch (...) {
-            inference_error = std::current_exception();
-        }
-    });
-    _vlm_thread.join();
-    if (inference_error) std::rethrow_exception(inference_error);
-
-    // No need to reset callbacks - they'll be overwritten on next request
+    _vision_language_model_ptr->run_model(chat);
 
     nlohmann::json tool_calls = nullptr;
     if (chat.has_tools()) {
@@ -1260,9 +1375,10 @@ void WEB::_handle_set_lora(const httplib::Request& req, httplib::Response& res) 
         return;
     }
 
-    _stop_and_detach_vlm_thread();
+    _stop_active_inference();
 
     try {
+        std::lock_guard lock(_inference_mutex);
         _vision_language_model_ptr->set_reloc(json_data["name"]);
         res.status = 200;
         _logger->info("Set LoRA weights completed.");
@@ -1278,7 +1394,8 @@ void WEB::_handle_set_lora(const httplib::Request& req, httplib::Response& res) 
 void WEB::_handle_unset_lora(const httplib::Request& req, httplib::Response& res) {
     _set_cors_headers(res);
 
-    _stop_and_detach_vlm_thread();
+    _stop_active_inference();
+    std::lock_guard lock(_inference_mutex);
     _vision_language_model_ptr->unset_reloc();
 
     // Send response immediately

@@ -9,7 +9,6 @@
 #include <cmath>
 #include <fmt/std.h>
 #include <nlohmann/json.hpp>
-#include <unistd.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>

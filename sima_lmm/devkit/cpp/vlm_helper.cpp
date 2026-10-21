@@ -148,88 +148,49 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // is no known automatic way.
     std::vector<std::vector<Eigen::bfloat16>> image_tensors;
     if (_vlm_cfg.support_image()) {
+        auto expand_images = [&](const std::string& placeholder, std::string_view token,
+                                 std::string_view prefix = {}, std::string_view suffix = {}) {
+            std::string expanded(prefix);
+            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) expanded += token;
+            expanded += suffix;
+            return find_and_replace_all(formatted_prompt, placeholder, expanded);
+        };
         uint32_t num_images;
-        if (_vlm_cfg.model_type == "vlm-llava") {
-            std::string search = "<image>";
-            std::string replace = "";
-            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) {
-                replace += "<image>";
-            }
-            num_images = find_and_replace_all(formatted_prompt, search, replace);
-        } else if (_vlm_cfg.model_type == "vlm-gemma3") {
-            std::string search = "<start_of_image>";
-            std::string replace = "\n\n<start_of_image>";
-            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) {
-                replace += "<image_soft_token>";
-            }
-            replace += "<end_of_image>\n\n";
-            num_images = find_and_replace_all(formatted_prompt, search, replace);
-        } else if (_vlm_cfg.model_type.starts_with("vlm-lfm2")) {
-            std::string search = "<image>";
-            std::string replace = "<|image_start|>";
-            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) {
-                replace += "<image>";
-            }
-            replace += "<|image_end|>";
-            num_images = find_and_replace_all(formatted_prompt, search, replace);
-        } else if (_vlm_cfg.model_type.starts_with("vlm-qwen")) {
-            std::string search = "<|image_pad|>";
-            std::string replace = "";
-            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) {
-                // Use <|image_pad|> instead of <|placeholder|> so that the language model can find
-                // the image_token locations.
-                replace += "<|image_pad|>";
-            }
-            num_images = find_and_replace_all(formatted_prompt, search, replace);
-        } else if (_vlm_cfg.model_type == "vlm-smolvlm") {
-            std::string replace = "<fake_token_around_image><global-img>";
-            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i)
-                replace += "<image>";
-            replace += "<fake_token_around_image>";
-            num_images = find_and_replace_all(formatted_prompt, "<image>", replace);
-        } else if (_vlm_cfg.model_type == "vlm-gemma4") {
-            std::string search = "<|image|>";
-            std::string replace = "";
-            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i) {
-                replace += "<|image|>";
-            }
-            num_images = find_and_replace_all(formatted_prompt, search, replace);
-        } else {
-            throw std::runtime_error(
-                fmt::format("Image support for {} is not implemented", _vlm_cfg.model_type)
-            );
-        }
+        if (_vlm_cfg.model_type == "vlm-llava")
+            num_images = expand_images("<image>", "<image>");
+        else if (_vlm_cfg.model_type == "vlm-gemma3")
+            num_images = expand_images("<start_of_image>", "<image_soft_token>",
+                                       "\n\n<start_of_image>", "<end_of_image>\n\n");
+        else if (_vlm_cfg.model_type.starts_with("vlm-lfm2"))
+            num_images = expand_images("<image>", "<image>", "<|image_start|>", "<|image_end|>");
+        else if (_vlm_cfg.model_type.starts_with("vlm-qwen"))
+            num_images = expand_images("<|image_pad|>", "<|image_pad|>");
+        else if (_vlm_cfg.model_type == "vlm-smolvlm")
+            num_images = expand_images("<image>", "<image>",
+                                       "<fake_token_around_image><global-img>", "<fake_token_around_image>");
+        else if (_vlm_cfg.model_type == "vlm-gemma4")
+            num_images = expand_images("<|image|>", "<|image|>");
+        else
+            throw std::runtime_error(fmt::format("Image support for {} is not implemented", _vlm_cfg.model_type));
 
-        // Preprocess images.
-        if (chat.get_images().size() == 0 && num_images > 0) {
-            // Images are embedded in the messages.
-            for (const auto& message: chat.get_messages()) {
-                const auto& content = message.at("content");
-                // OpenAI-compatible history may mix plain-string text messages with array content.
-                if (!content.is_array()) {
-                    continue;
+        // CLI and HTTP attachments are both stored in message content.
+        for (const auto& message : chat.get_messages()) {
+            const auto& content = message.at("content");
+            if (!content.is_array()) continue;
+            for (const auto& item : content) {
+                if (item.at("type") != "image") continue;
+                std::string_view image = item.at("image").get_ref<const std::string&>();
+                constexpr std::string_view base64_prefix = "data:image/jpeg;base64,";
+                if (image.starts_with(base64_prefix)) {
+                    auto bytes = base64_decode(image.substr(base64_prefix.size()));
+                    image_tensors.emplace_back(_image_processor_ptr->preprocess(bytes));
+                } else {
+                    assert(std::filesystem::is_regular_file(image));
+                    image_tensors.emplace_back(_image_processor_ptr->preprocess(image));
                 }
-                for (const auto& item: content) {
-                    if (item.at("type") != "image")
-                        continue;
-                    std::string_view image_str = item.at("image").get_ref<const std::string&>();
-                    const std::string_view base64_prefix = "data:image/jpeg;base64,";
-                    if (image_str.starts_with(base64_prefix)) {
-                        auto image_bytes = base64_decode(image_str.substr(base64_prefix.size()));
-                        image_tensors.emplace_back(_image_processor_ptr->preprocess(image_bytes));
-                    } else {
-                        // Assume regular file.
-                        assert(std::filesystem::is_regular_file(image_str));
-                        image_tensors.emplace_back(_image_processor_ptr->preprocess(image_str));
-                    }
-                }
-            }
-        } else {
-            assert(chat.get_images().size() == num_images);
-            for (const auto& image_file_name: chat.get_images()) {
-                image_tensors.emplace_back(_image_processor_ptr->preprocess(image_file_name));
             }
         }
+        assert(image_tensors.size() == num_images);
     }
 
     std::vector<AudioInput> audio_tensors;

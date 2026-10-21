@@ -1362,7 +1362,7 @@ class VlmConfig(BaseConfig):
             vlm_cfg.vm_cfg = None
 
         if model_format == ModelFormat.FORMAT_HF and model_type == "gemma4" and model_cfg.get("audio_config"):
-            audio = dict(model_cfg["audio_config"])
+            audio = model_cfg["audio_config"]
             fields = AudioModelConfig.__dataclass_fields__
             vlm_cfg.audio_cfg = AudioModelConfig(
                 **{key: value for key, value in audio.items() if key in fields},
