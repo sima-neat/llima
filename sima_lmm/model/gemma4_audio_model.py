@@ -9,6 +9,11 @@ from sima_lmm.model.base import BaseModel, EvalMode, GenConfiguration, FileGenMo
 from sima_lmm.model.model_graph import ModelGraph, Node
 
 
+_ATTENTION_MASK_VALUE = -1e9
+_FFN_RESIDUAL_SCALE = 0.5
+_ACTIVATION_CLIP = 1e10
+
+
 @dataclass
 class AudioModel(BaseModel):
     enable_filter_sharing = False
@@ -76,10 +81,10 @@ class Gemma4AudioLayerModel(BaseModel):
         base = f"model.audio_tower.layers.{self.layer_idx}"
         hidden = self._feed_forward(graph, f"{base}.feed_forward1", hidden)
         residual = hidden
-        hidden = graph.clip(hidden, -audio.gradient_clipping, audio.gradient_clipping)
+        hidden = graph.clip(hidden, -_ACTIVATION_CLIP, _ACTIVATION_CLIP)
         hidden = graph.rms_norm(f"{base}.norm_pre_attn", hidden, epsilon=1e-6)
         hidden = self._attention(graph, f"{base}.self_attn", hidden, mask)
-        hidden = graph.clip(hidden, -audio.gradient_clipping, audio.gradient_clipping)
+        hidden = graph.clip(hidden, -_ACTIVATION_CLIP, _ACTIVATION_CLIP)
         hidden = graph.rms_norm(f"{base}.norm_post_attn", hidden, epsilon=1e-6)
         hidden = graph.add(residual, hidden)
 
@@ -92,12 +97,12 @@ class Gemma4AudioLayerModel(BaseModel):
         hidden = graph.mul(first, graph.sigmoid(gate))
         hidden = graph.conv(f"{conv}.depthwise_conv1d", hidden, is_depthwise=True,
                             padding=((0, 0), (audio.conv_kernel_size - 1, 0)))
-        hidden = graph.clip(hidden, -audio.gradient_clipping, audio.gradient_clipping)
+        hidden = graph.clip(hidden, -_ACTIVATION_CLIP, _ACTIVATION_CLIP)
         hidden = graph.rms_norm(f"{conv}.conv_norm", hidden, epsilon=audio.rms_norm_eps)
         hidden = graph.activation(hidden, audio.hidden_act)
         hidden = graph.add(residual, self._linear(graph, f"{conv}.linear_end", hidden))
         hidden = self._feed_forward(graph, f"{base}.feed_forward2", hidden)
-        hidden = graph.clip(hidden, -audio.gradient_clipping, audio.gradient_clipping)
+        hidden = graph.clip(hidden, -_ACTIVATION_CLIP, _ACTIVATION_CLIP)
         hidden = graph.rms_norm(f"{base}.norm_out", hidden, epsilon=1e-6)
         if self.layer_idx == audio.num_hidden_layers - 1:
             hidden = graph.slice(hidden, start=0, stop=audio.max_tokens, axis=2)
@@ -126,14 +131,14 @@ class Gemma4AudioLayerModel(BaseModel):
     def _feed_forward(self, graph: ModelGraph, name: str, hidden: Node) -> Node:
         audio = self.cfg.audio_cfg
         residual = hidden
-        hidden = graph.clip(hidden, -audio.gradient_clipping, audio.gradient_clipping)
+        hidden = graph.clip(hidden, -_ACTIVATION_CLIP, _ACTIVATION_CLIP)
         hidden = graph.rms_norm(f"{name}.pre_layer_norm", hidden, epsilon=1e-6)
         hidden = self._linear(graph, f"{name}.ffw_layer_1", hidden)
         hidden = graph.activation(hidden, audio.hidden_act)
         hidden = self._linear(graph, f"{name}.ffw_layer_2", hidden)
-        hidden = graph.clip(hidden, -audio.gradient_clipping, audio.gradient_clipping)
+        hidden = graph.clip(hidden, -_ACTIVATION_CLIP, _ACTIVATION_CLIP)
         hidden = graph.rms_norm(f"{name}.post_layer_norm", hidden, epsilon=1e-6)
-        return graph.add(residual, graph.mul(hidden, graph.constant([audio.residual_weight])))
+        return graph.add(residual, graph.mul(hidden, graph.constant([_FFN_RESIDUAL_SCALE])))
 
     def _attention(self, graph: ModelGraph, name: str, hidden: Node, mask: Node) -> Node:
         """Fold heads and local blocks into rank-four MLA batch matmuls."""
@@ -184,7 +189,7 @@ class Gemma4AudioLayerModel(BaseModel):
         causal = graph.constant(((kpos >= qpos) & (kpos <= qpos + chunk)).astype(np.float32)[None, None])
         valid = graph.mul(valid, causal)
         penalty = graph.mul(graph.sub(graph.constant(np.ones((1, 1, 1, 1), np.float32)), valid),
-                            graph.constant([audio.attention_invalid_logits_value]))
+                            graph.constant([_ATTENTION_MASK_VALUE]))
         probabilities = graph.softmax(graph.add(scores, penalty))
         output = graph.matmul(probabilities, values)
         output = graph.reshape(output, [1, heads, rows, dim])

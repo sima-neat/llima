@@ -138,9 +138,6 @@
         "conv_kernel_size": 5,
         "attention_chunk_size": 12,
         "attention_logit_cap": 50.0,
-        "attention_invalid_logits_value": -1000000000.0,
-        "residual_weight": 0.5,
-        "gradient_clipping": 10000000000.0,
         "hidden_act": "silu",
         "rms_norm_eps": 0.000001,
         "max_tokens": 750

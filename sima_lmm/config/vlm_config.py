@@ -312,9 +312,6 @@ class AudioModelConfig(BaseConfig):
     conv_kernel_size: int = 5
     attention_chunk_size: int = 12
     attention_logit_cap: float = 50.0
-    attention_invalid_logits_value: float = -1e9
-    residual_weight: float = 0.5
-    gradient_clipping: float = 1e10
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     max_tokens: int = 750
