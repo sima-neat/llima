@@ -49,7 +49,16 @@ def choose_evaluator(tasks: list[str], text_manager, backend: str) -> str:
     """Keep text tasks on lm-eval; route image tasks to the image evaluator internally."""
     if backend != "modalix":
         return "lm-eval"
-    from lm_eval import utils
+    try:
+        from lm_eval.tasks._yaml_loader import load_yaml
+
+        def load_task_yaml(path):
+            return load_yaml(path, resolve_func=False, recursive=True)
+    except ImportError:
+        from lm_eval.utils import load_yaml_config
+
+        def load_task_yaml(path):
+            return load_yaml_config(str(path), mode="simple")
 
     kinds = []
     for task in tasks:
@@ -58,7 +67,7 @@ def choose_evaluator(tasks: list[str], text_manager, backend: str) -> str:
             continue
         entry = text_manager.task_index[task]
         yaml_path = entry.yaml_path if hasattr(entry, "yaml_path") else entry.get("yaml_path")
-        cfg = utils.load_yaml_config(str(yaml_path), mode="simple") if yaml_path else {}
+        cfg = load_task_yaml(yaml_path) if yaml_path else {}
         kinds.append("lmms-eval" if cfg.get("doc_to_image") is not None else "lm-eval")
     if len(set(kinds)) > 1:
         raise UnsupportedInput("Run text and image tasks in separate accuracy invocations")

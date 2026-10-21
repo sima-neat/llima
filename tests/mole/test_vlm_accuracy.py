@@ -246,3 +246,14 @@ def test_runtime_context_limit_is_rejected():
     finally:
         client.close()
         peer.close()
+
+
+def test_real_task_manager_routes_text_and_images():
+    from lm_eval.tasks import TaskManager
+    from sima_lmm.mole.vlm_accuracy import choose_evaluator
+
+    manager = TaskManager()
+    assert choose_evaluator(["gsm8k"], manager, "modalix") == "lm-eval"
+    assert choose_evaluator(["chartqa"], manager, "modalix") == "lmms-eval"
+    with pytest.raises(UnsupportedInput, match="separate"):
+        choose_evaluator(["gsm8k", "chartqa"], manager, "modalix")
