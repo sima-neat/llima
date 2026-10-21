@@ -25,6 +25,7 @@ from sima_lmm.mole.modalixboard import ModalixBoard
 from sima_lmm.mole.modalixlm import HuggingFaceLM, ModalixLM
 from sima_lmm.mole.utils import make_table
 from sima_lmm.mole.perf_runner import PerformanceOptions, run_performance, write_results
+from sima_lmm.mole.vlm_accuracy import AccuracyOptions, choose_evaluator, run_vlm_accuracy
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,6 +65,8 @@ class Config:
     max_new_tokens: int | None
     input_lengths: tuple[int, ...] | None
     performance: PerformanceOptions = dataclasses.field(default_factory=PerformanceOptions)
+    accuracy: AccuracyOptions = dataclasses.field(default_factory=AccuracyOptions)
+    evaluator: str = "lm-eval"
     batch_size: int = dataclasses.field(init=False, default=1)
     random_seed: int = dataclasses.field(init=False, default=42)
 
@@ -84,6 +87,7 @@ def prepare_mole(
     max_new_tokens: int = 256,
     input_lengths: list[int] | None = None,
     performance: PerformanceOptions | None = None,
+    accuracy: AccuracyOptions | None = None,
 ) -> Config | None:
     """
     prepare_mole Prepares and validates the configuration for a MOLE evaluation run.
@@ -106,6 +110,7 @@ def prepare_mole(
         A Config object if the setup is successful, otherwise None.
     """
     performance = performance or PerformanceOptions()
+    accuracy = accuracy or AccuracyOptions()
     try:
         performance.validate()
         if do_perf and (max_new_tokens < 1 or max_num_tokens > 65535 or max_num_tokens <= max_new_tokens):
@@ -138,7 +143,9 @@ def prepare_mole(
     if not Path(model_id).is_dir():
         hfapi = huggingface_hub.HfApi()
         try:
-            info = hfapi.model_info(model_id, revision=performance.model_revision)
+            info = hfapi.model_info(
+                model_id, revision=performance.model_revision if do_perf else accuracy.model_revision
+            )
             if do_perf:
                 performance = dataclasses.replace(performance, model_revision=info.sha)
         except huggingface_hub.errors.RepositoryNotFoundError as e:
@@ -168,13 +175,24 @@ def prepare_mole(
             return None
         normalized_input_lengths = tuple(sorted(input_lengths))
 
+    evaluator = "lm-eval"
     if tasks:
         metadata = {"pretrained": model_id}
         task_manager = lm_eval.tasks.TaskManager(metadata=metadata)
-        for task in tasks:
-            if task not in task_manager.all_tasks:
-                logger.error("Specified task is invalid: {}", task)
-                return None
+        try:
+            evaluator = choose_evaluator(tasks, task_manager, backend)
+            if evaluator == "lm-eval":
+                for task in tasks:
+                    if task not in task_manager.all_tasks:
+                        raise ValueError(f"Specified task is invalid: {task}")
+                if accuracy != AccuracyOptions():
+                    raise ValueError("Image accuracy options require a Modalix image/text task")
+            elif (len(tasks) != len(set(tasks)) or (limit is not None and limit < 1)
+                  or not 1 <= max_num_tokens <= 65535):
+                raise ValueError("Image tasks must be unique, with a positive sample limit and context in [1, 65535]")
+        except (ValueError, ImportError) as exc:
+            logger.error(str(exc))
+            return None
 
     if output_path is None:
         output_path = Path("results") / (Path(model_id).name if Path(model_id).is_dir() else model_id)
@@ -204,6 +222,8 @@ def prepare_mole(
         max_new_tokens=max_new_tokens,
         input_lengths=normalized_input_lengths,
         performance=performance,
+        accuracy=accuracy,
+        evaluator=evaluator,
     )
 
 
@@ -264,6 +284,17 @@ def run(config: Config) -> dict[str, Any]:
     Returns:
         A dictionary containing the evaluation results.
     """
+
+    if config.evaluator == "lmms-eval":
+        try:
+            report = run_vlm_accuracy(config)
+            rich.print(make_table(report["results"], table_title=_table_title(config)))
+            return report
+        except KeyboardInterrupt:
+            raise SystemExit(130)
+        except Exception as exc:
+            logger.error("Image/text accuracy evaluation failed: {}; see accuracy.json", exc)
+            raise SystemExit(1)
 
     # Eval Setup
     metadata = {"pretrained": config.model_id}

@@ -106,6 +106,15 @@ VENV_PYTHON="${VENV_PATH}/bin/python"
 # A branch wheel can retain the same public version as an older installation.
 # Reinstall only LLiMa itself without disturbing the resolved MoLE dependencies.
 "${VENV_PYTHON}" -m pip install --force-reinstall --no-deps "${WHEEL_PATH}"
+mapfile -t LMMS_WHEELS < <(
+  find "${SCRIPT_DIR}" -maxdepth 1 -type f -name 'lmms_eval-*.whl' -print | sort
+)
+if [[ "${#LMMS_WHEELS[@]}" -ne 1 ]]; then
+  echo "ERROR: Expected exactly one bundled lmms-eval image profile wheel." >&2
+  exit 1
+fi
+"${VENV_PYTHON}" -m pip install --upgrade "${LMMS_WHEELS[0]}"
+"${VENV_PYTHON}" -c 'import lmms_eval.evaluator'
 "${VENV_PATH}/bin/llima-benchmark" --help >/dev/null
 
 echo "[mole] Installed successfully."

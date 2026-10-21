@@ -211,9 +211,14 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                     if (item.at("type") != "image")
                         continue;
                     std::string_view image_str = item.at("image").get_ref<const std::string&>();
-                    const std::string_view base64_prefix = "data:image/jpeg;base64,";
-                    if (image_str.starts_with(base64_prefix)) {
-                        auto image_bytes = base64_decode(image_str.substr(base64_prefix.size()));
+                    if (image_str.starts_with("data:")) {
+                        const auto comma = image_str.find(',');
+                        const auto header = image_str.substr(0, comma);
+                        if (comma == std::string_view::npos
+                            || (header != "data:image/jpeg;base64"
+                                && header != "data:image/png;base64"))
+                            throw std::invalid_argument("Expected a base64 PNG or JPEG image");
+                        auto image_bytes = base64_decode(image_str.substr(comma + 1));
                         image_tensors.emplace_back(_image_processor_ptr->preprocess(image_bytes));
                     } else {
                         // Assume regular file.
@@ -228,6 +233,8 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                 image_tensors.emplace_back(_image_processor_ptr->preprocess(image_file_name));
             }
         }
+        if (image_tensors.size() != num_images)
+            throw std::invalid_argument("Chat template image placeholders do not match image inputs");
     }
 
     // Encode the formatted prompt to token ids.

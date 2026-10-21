@@ -3,6 +3,7 @@ from pathlib import Path
 
 from sima_lmm.mole.modalixboard import ModalixBoard
 from sima_lmm.mole.perf_runner import PerformanceOptions
+from sima_lmm.mole.vlm_accuracy import AccuracyOptions
 from sima_lmm.mole.mole import perf_bench, prepare_mole, run
 
 def main():
@@ -41,7 +42,19 @@ def main():
         "accuracy", parents=[common_parser], formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         help="Benchmark accuracy"
     )
-    acc_parser.set_defaults(max_new_tokens=0)
+    acc_parser.add_argument(
+        "--accuracy_manifest", type=Path,
+        help="Image task dataset revisions/prepared local datasets (JSON)",
+    )
+    acc_parser.add_argument("--model_revision", help="Tokenizer/processor repository revision for image accuracy")
+    acc_parser.add_argument(
+        "--max_new_tokens", type=int, default=None,
+        help="Override upstream image-task output budgets; otherwise retain each task's generation settings",
+    )
+    acc_parser.add_argument(
+        "--enable_thinking", action=argparse.BooleanOptionalAction, default=False,
+        help="Enable the deployed VLM's native thinking template for image accuracy",
+    )
     acc_parser.add_argument(
         "-b", "--backend", type=str, choices=["hf", "modalix"], required=True,
         help="Model evaluation backend"
@@ -89,6 +102,12 @@ def main():
         max_new_tokens=args.max_new_tokens,
         input_lengths=getattr(args, "input_lengths", None),
         performance=performance,
+        accuracy=AccuracyOptions(
+            manifest=getattr(args, "accuracy_manifest", None),
+            model_revision=getattr(args, "model_revision", None),
+            max_new_tokens=args.max_new_tokens if args.command == "accuracy" else None,
+            enable_thinking=getattr(args, "enable_thinking", False),
+        ),
     )
     if config is None:
         parser.error("Invalid argument combinations")

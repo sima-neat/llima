@@ -101,6 +101,13 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
     private:
         friend class CLI;
         friend class WEB;
+        friend class ZMQServer;
+        std::optional<std::vector<uint32_t>> _run_chat_model(
+            const Chat& chat,
+            std::optional<uint16_t> max_new_tokens,
+            std::optional<uint16_t> strict_max_context = std::nullopt,
+            PreprocessedChat* prepared = nullptr
+        );
         std::string_view model_type() const { return _cfg.model_type; }
         std::optional<std::vector<uint32_t>> _run_language_model(
             std::span<const uint32_t> input_token_ids,

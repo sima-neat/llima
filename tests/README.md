@@ -29,6 +29,29 @@ controls the two expensive test jobs. Latest-tag promotion requires successful
 artifact publication and accepts an intentional test skip only when the
 corresponding resolver output is false.
 
+## MoLE evaluator checks
+
+The package build installs the candidate MoLE publication package in its own
+virtual environment, checks dependency consistency and runs `tests/mole/` with
+network access disabled through Hugging Face's offline settings. This exercises
+upstream RealWorldQA, DocVQA and ChartQA protocols/scoring against prepared tiny
+datasets and the actual ZMQ client in both host and DevKit-local modes. It does
+not validate MLA execution or measured model accuracy.
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+  python -P -m pytest -o addopts='' tests/mole -q
+```
+
+The runtime suite's `test_zmq_black_box.py` also checks image/text generation,
+multiple images, malformed request recovery and runtime identity against the
+installed candidate packages on Modalix. Set `SIMA_TEST_LLIMA_VLM_MODEL` to the
+packaged Qwen3.5-2B model directory for the initial model validation. Run the
+full dataset evaluation in both modes following
+[Multimodal accuracy](../docs/multimodal_accuracy.md) before publishing support
+or accuracy results. Those hardware checks are required even if hermetic tests
+and the package build pass.
+
 ## Model compiler CI
 
 ### Purpose

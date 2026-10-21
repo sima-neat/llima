@@ -23,6 +23,7 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 find "${OUTPUT_DIR}" -maxdepth 1 -type f \
   \( -name 'sima_lmm-*.whl' -o -name 'sima_lmm-*.whl.sha256' \
+     -o -name 'lmms_eval-*.whl' -o -name 'lmms_eval-*.whl.sha256' \
      -o -name 'install_mole.sh' -o -name 'metadata.json' \) \
   -delete
 
@@ -157,6 +158,7 @@ if [[ "${SOURCE_WHEEL}" != "${OUTPUT_DIR}/${WHEEL_NAME}" ]]; then
   cp "${SOURCE_WHEEL}" "${OUTPUT_DIR}/${WHEEL_NAME}"
 fi
 install -m 0755 "${INSTALLER_SOURCE}" "${OUTPUT_DIR}/install_mole.sh"
+"${PYTHON_BIN}" "${ROOT_DIR}/tools/build_lmms_profile.py" --output "${OUTPUT_DIR}"
 
 SIMA_CLI_CHECK_FOR_UPDATE=0 "${SIMA_CLI_BIN}" packages build "${OUTPUT_DIR}" \
   --name "gh:sima-neat/llima/mole" \

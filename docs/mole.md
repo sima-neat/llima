@@ -2,9 +2,9 @@
 
 ## Overview
 
-MoLE (Modalix Language Model Evaluator) is a benchmarking tool for evaluating the accuracy and performance of LLMs running on the Modalix platform.
+MoLE measures text and image-plus-text accuracy and language-model performance on Modalix.
 
-It extends [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) and supports two backends:
+Text accuracy uses [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness). Modalix image-plus-text accuracy selects the bundled [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) image profile internally, reusing upstream tasks, extraction and scoring. Both use `llima-benchmark accuracy`. MoLE supports two backends:
 
 - **hf** — runs evaluation on the host using HuggingFace transformers (baseline reference)
 - **modalix** — runs evaluation on a Modalix board via the `llima benchmark-server`
@@ -60,7 +60,7 @@ Evaluates model quality against standard tasks:
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 
 :::important
-Accuracy and loglikelihood benchmarking with `-b modalix` requires the deployed model to be compiled with `--return_logits`. This flag is off by default. See [Model Compilation](compilation_genai.md). If the model was compiled without this flag, the benchmark fails with: `model not compiled with --return_logits; accuracy/loglikelihood tasks are unsupported`.
+Tasks that consume logits or loglikelihoods require `--return_logits` during compilation. Generation-based tasks, including image-plus-text evaluation, do not require it. See [Model Compilation](compilation_genai.md).
 :::
 
 In `-b modalix` mode, result tables are labeled as Modalix backend results and include the board target. The HuggingFace `model_id` still appears because MoLE uses it for tokenization and task metadata.
@@ -72,6 +72,10 @@ To use the HuggingFace backend as a reference baseline:
 ```
 
 For all available options, run `llima-benchmark accuracy -h`.
+
+### Image-plus-text accuracy
+
+The same accuracy command supports image tasks on a remote Modalix from a host, or entirely on the DevKit using the existing local server lifecycle. No separate evaluator installation or command is needed. See [Multimodal accuracy](multimodal_accuracy.md) for Qwen3.5-2B invocation, prepared local datasets, reproducibility metadata, result exports and validation status.
 
 ### Performance Benchmarking
 

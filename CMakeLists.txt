@@ -366,6 +366,7 @@ target_link_libraries(
     PRIVATE
         OpenMP::OpenMP_CXX
         OpenSSL::Crypto
+        ${CMAKE_DL_LIBS}
         PkgConfig::FFTW3
         cnpy-static
         ${SIMA_LMM_HEAP_LIBRARY}

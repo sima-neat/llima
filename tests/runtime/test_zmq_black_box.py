@@ -1,3 +1,5 @@
+import base64
+import json
 import os
 import platform
 import shutil
@@ -105,3 +107,90 @@ def test_zmq_generate_request_and_remote_stop(tmp_path):
                 output += remaining
                 raise AssertionError(f"ZMQ server did not stop after SIGINT:\n{output}")
         assert process.returncode == 0, output
+
+
+def test_zmq_image_text_generation_and_request_recovery(tmp_path):
+    """Run against installed packages/real MLA, including a model without logits."""
+    assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
+    models = Path(os.environ.get("LLIMA_MODELS_PATH", DEFAULT_MODELS_PATH))
+    model = Path(os.environ.get("SIMA_TEST_LLIMA_VLM_MODEL", "LFM2.5-VL-450M-Autoround-a16w4"))
+    if not model.is_absolute():
+        model = models / model
+    assert (model / "devkit/vlm_config.json").is_file()
+    llima = shutil.which("llima")
+    assert llima is not None and Path(llima).resolve().is_relative_to("/usr")
+    assets = Path(os.environ.get("SIMA_LMM_TEST_ASSETS_PATH", "/usr/share/sima_lmm/assets"))
+    image = assets / "sjc.jpg"
+    assert image.is_file()
+    encoded = "data:image/jpeg;base64," + base64.b64encode(image.read_bytes()).decode()
+    port = _unused_tcp_port()
+    with (tmp_path / "server.log").open("w") as log:
+        process = subprocess.Popen(
+            [llima, "benchmark-server", str(model), "--port", str(port)],
+            cwd=tmp_path, stdout=log, stderr=subprocess.STDOUT,
+        )
+    context = zmq.Context()
+    client = context.socket(zmq.REQ)
+    client.linger = 0
+    client.rcvtimeo = client.sndtimeo = 600_000
+    client.curve_publickey, client.curve_secretkey = zmq.curve_keypair()
+    client.curve_serverkey = SERVER_PUBLIC_KEY
+    client.connect(f"tcp://127.0.0.1:{port}")
+
+    def request(kind, body=b"", **kwargs):
+        client.send_multipart([msgpack.packb({"type": kind, **kwargs}, use_bin_type=True), body])
+        response = client.recv_multipart()
+        assert len(response) == 2
+        metadata = msgpack.unpackb(response[0], raw=False)
+        return metadata, response[1]
+
+    try:
+        info_metadata, body = request("multimodal_info")
+        assert not info_metadata.get("error"), info_metadata
+        identity = json.loads(body)
+        assert identity["protocol_version"] == 1
+        assert len(identity["runtime"]["library_sha256"]) == 64
+        assert identity["files"]["devkit/tokenizer.json"]["sha256"]
+        assert identity.get("preprocessor_config.json") or identity.get("processor_config.json")
+        budget = identity["max_num_tokens"]
+
+        # The unsupported request must not kill the REP server or prevent a later valid request.
+        unsupported, _ = request("generate_multimodal", json.dumps({"messages": []}).encode(),
+                                 max_num_tokens=budget, max_new_tokens=32)
+        assert unsupported["error_type"] == "unsupported"
+        malformed, _ = request("generate", b"", tensor_dtype="uint32", tensor_shape=[1, 4])
+        assert malformed.get("error")
+
+        for image_count in (1, 2):
+            content = [{"type": "text", "text": "Examine these images: "}]
+            for _ in range(image_count):
+                content.extend([{"type": "image", "image": encoded},
+                                {"type": "text", "text": " Describe this scene briefly. "}])
+            metadata, answer = request(
+                "generate_multimodal",
+                json.dumps({"messages": [{"role": "user", "content": content}]}).encode(),
+                max_num_tokens=budget, max_new_tokens=32, enable_thinking=False,
+            )
+            assert not metadata.get("error"), metadata
+            assert metadata["tensor_dtype"] == "utf8"
+            assert metadata["tensor_shape"] == [len(answer)]
+            assert answer.decode().strip()
+            assert metadata["input_tokens"] > 0
+            assert 0 < metadata["generated_tokens"] <= 32
+            assert metadata["finish_reason"] in ("stop", "length")
+            assert len(metadata["prompt_sha256"]) == 64
+            assert isinstance(metadata["raw_answer"], str)
+
+        client.send(b"stop")
+        process.wait(timeout=30)
+    finally:
+        client.close()
+        context.term()
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        assert process.returncode == 0, (tmp_path / "server.log").read_text()
