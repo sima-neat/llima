@@ -6,7 +6,7 @@ Image accuracy uses the deployed model's native C++ chat template, image preproc
 
 ## Validation status
 
-The initial targets are `realworldqa`, `docvqa_val` and `chartqa`, starting with a compiled Qwen3.5-2B VLM. Their unchanged upstream protocols/scoring have hermetic integration coverage. Packaged Qwen3.5-2B execution and measured accuracy on a DevKit must be validated before claiming hardware support or publishing registry metrics.
+The initial targets are `realworldqa`, `docvqa_val` and `chartqa`, starting with a compiled Qwen3.5-2B VLM. Their unchanged upstream protocols/scoring have integration coverage and a six-sample Qwen3.5-2B smoke evaluation on a Neat 3.0 DevKit in both host-driven and DevKit-local modes. Answers, prompt/image hashes, token counts and metrics matched across modes. See [validation evidence](multimodal_accuracy_validation.md). Full-dataset accuracy has not been measured; these smoke scores must not be published as registry accuracy.
 
 Other upstream image tasks use the same adapter when their protocols fit, but TextVQA, OCRBench, MMMU, MMBench and MMStar are not yet validated support claims. Use individual upstream task names, rather than groups or wildcards. Run text and image tasks in separate invocations. Text accuracy continues to use lm-evaluation-harness, including existing HF host workflows. Performance benchmarking is separate.
 
@@ -87,7 +87,7 @@ Compare host and local runs using identical dataset files/revisions and sample I
 
 The MoLE build pins lmms-eval's exact source commit in `deps/manifest.json`, builds it on the packaging host and bundles a pure-Python wheel. `tools/build_lmms_profile.py` preserves every upstream code/task asset and license, records their hashes, and narrows wheel dependency metadata to imports required for image task evaluation. Its local version identifies the commit. Upstream's `v0.7.3` tag currently declares distribution version `0.7.2`; commit and source-tree hashes resolve that ambiguity.
 
-The profile reuses MoLE's Torch, Transformers, datasets, Pillow and text-harness dependencies and includes evaluate, sacrebleu, accelerate, aiohttp, pandas, pytz and tenacity. It excludes unrelated model, audio/video, judge-service and training extras. Missing task-specific optional dependencies fail rather than installing software during evaluation. Import, dependency-consistency and prepared-task scoring checks run on ARM64 Python 3.12; target DevKit installation remains part of packaged validation.
+The profile reuses MoLE's Torch, Transformers, datasets, Pillow and text-harness dependencies and includes evaluate, sacrebleu, accelerate, aiohttp, pandas, pytz and tenacity. It excludes unrelated model, audio/video, judge-service and training extras. Missing task-specific optional dependencies fail rather than installing software during evaluation. Import, dependency-consistency and prepared-task scoring checks passed on ARM64 Python 3.12 and on the target Neat 3.0 DevKit with Python 3.13.5. The evaluator stays separate from runtime and compiler dependencies.
 
 Run the hermetic checks with the candidate MoLE environment:
 
