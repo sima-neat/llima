@@ -1,6 +1,7 @@
 #ifndef _SIMA_LLIMA_VISION_LANGUAGE_MODEL_
 #define _SIMA_LLIMA_VISION_LANGUAGE_MODEL_
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -109,8 +110,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint16_t> max_num_tokens,
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr,
-            uint16_t stable_prefix_token_count = 0,
-            const LanguageModel::MediaLoader& media_loader = {}
+            uint16_t stable_prefix_token_count = 0
         );
 
         VlmHelper _vlm_helper;
@@ -120,6 +120,7 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
         std::unique_ptr<AudioModel> _audio_model_ptr;
         std::unique_ptr<LanguageModel> _language_model_ptr;
         std::mutex _run_mutex;  // Protects run_model from concurrent access
+        std::atomic<bool> _stop_requested{false};
         // Non-owning pointer to the draft VLM for speculative decoding;
         // nullptr in non-spec mode. The owner (CLI) outlives this target VLM.
         VisionLanguageModel* _draft_vlm_ptr = nullptr;

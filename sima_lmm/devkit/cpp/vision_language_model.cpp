@@ -69,6 +69,7 @@ std::optional<std::string> VisionLanguageModel::run_model(
 ) {
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
+    _stop_requested = false;
     std::vector<std::pair<uint32_t, std::string>> preserved_tokens;
     auto* tokenizer = _vlm_helper.get_tokenizer();
     if (chat.has_tools()) {
@@ -113,72 +114,51 @@ std::optional<std::string> VisionLanguageModel::run_model(
         && preprocessed_data.input_token_ids.size() > _cfg.pipeline_cfg.max_num_tokens)
         throw std::invalid_argument("Audio and text exceed the compiled context length");
 
-    // Create buffers for the input embeds and deepstack features (for qwen3) and ofm maps for
-    // vision models.
-    auto vision_ofm_maps = _language_model_ptr->create_input_buffers(
+    // Encoders write directly into the prompt embeddings and their INT8 scales.
+    auto output_maps = _language_model_ptr->create_input_buffers(
         preprocessed_data.input_token_ids
     );
 
-    // Encode the image tensors to embeddings. The image embeddings are directly written to the
-    // input embeddings for the language models.
+    if (output_maps.audio.size() != preprocessed_data.audio_tensors.size())
+        throw std::invalid_argument("Audio attachment has no matching prompt span");
+    // Later clips overwrite earlier audio padding. Vision and text are filled afterward.
+    ChronoTimer timer_audio_encode(true);
+    const auto& ids = preprocessed_data.input_token_ids;
+    for (size_t i = 0; i < output_maps.audio.size(); ++i) {
+        if (_stop_requested) return std::nullopt;
+        const auto begin = output_maps.audio[i].at(0).get_buf_begins()->front();
+        const auto end = std::find_if(ids.begin() + begin, ids.end(),
+            [&](uint32_t id) { return id != _cfg.audio_cfg->token_id; });
+        if (std::distance(ids.begin() + begin, end) != preprocessed_data.audio_tensors[i].num_tokens)
+            throw std::invalid_argument("Audio tokens do not match the supplied features");
+        _audio_model_ptr->run_model(preprocessed_data.audio_tensors[i], &output_maps.audio[i]);
+    }
+    _logger->info("Audio encode time: {:.2f}s", timer_audio_encode.stop());
+
     ChronoTimer timer_image_encode(true);
-    for (size_t i = 0; i < vision_ofm_maps.size(); ++i) {
-        _vision_model_ptr->run_model(preprocessed_data.image_tensors[i], &vision_ofm_maps[i]);
+    for (size_t i = 0; i < output_maps.images.size(); ++i) {
+        if (_stop_requested) return std::nullopt;
+        _vision_model_ptr->run_model(preprocessed_data.image_tensors[i], &output_maps.images[i]);
     }
     _logger->info("Image encode time: {:.2f}s", timer_image_encode.stop());
 
-    struct AudioSpan { uint16_t begin, end; size_t index; };
-    std::vector<AudioSpan> audio_spans;
-    const auto& ids = preprocessed_data.input_token_ids;
-    if (_cfg.support_audio()) {
-        for (size_t begin = 0; begin < ids.size();) {
-            if (ids[begin] != _cfg.audio_cfg->token_id) { ++begin; continue; }
-            auto end = begin + 1;
-            while (end < ids.size() && ids[end] == _cfg.audio_cfg->token_id) ++end;
-            const auto index = audio_spans.size();
-            if (index >= preprocessed_data.audio_tensors.size()
-                || end - begin != preprocessed_data.audio_tensors[index].num_tokens)
-                throw std::invalid_argument("Audio tokens do not match the supplied features");
-            audio_spans.push_back({static_cast<uint16_t>(begin), static_cast<uint16_t>(end), index});
-            begin = end;
-        }
-    }
-    if (audio_spans.size() != preprocessed_data.audio_tensors.size())
-        throw std::invalid_argument("Audio attachment has no matching prompt span");
-    std::optional<size_t> loaded_audio;
-    LanguageModel::MediaLoader media_loader;
-    if (!audio_spans.empty()) {
-        media_loader = [&](uint16_t begin, uint16_t end, const MLABufferSlice& input,
-                           const MLABufferSlice* scales) {
-            for (const auto& span : audio_spans) {
-                const uint16_t first = std::max(begin, span.begin), last = std::min(end, span.end);
-                if (first >= last) continue;
-                if (loaded_audio != span.index) {
-                    _audio_model_ptr->run_model(preprocessed_data.audio_tensors[span.index]);
-                    loaded_audio = span.index;
-                }
-                const uint32_t row = input.get_buf_begins()->front() + first - begin;
-                const MLABufferSlice destination(input.get_buf_ptr(), {row, 0},
-                                                 {static_cast<uint32_t>(last - first), _cfg.lm_cfg.hidden_size});
-                std::optional<MLABufferSlice> scale_destination;
-                if (scales) scale_destination.emplace(scales->get_buf_ptr(), std::vector<uint32_t>{row, 0},
-                                                      std::vector<uint32_t>{static_cast<uint32_t>(last - first), 1});
-                _audio_model_ptr->copy_output(first - span.begin, last - first, destination,
-                                              scale_destination ? &*scale_destination : nullptr);
-            }
-        };
+    if (!output_maps.audio.empty()) {
+        // Refresh cache lines shared by device-written scales and later CPU text writes.
+        for (const auto& [index, output] : output_maps.audio.front())
+            output.get_buf_ptr()->invalidate_cache();
     }
 
-    // Decode the text and image embeddings. When a draft VLM is configured
+    // Decode the prepared prompt embeddings. When a draft VLM is configured
     // (set_draft_vlm), dispatch to speculative decoding; otherwise run the
     // normal language-model decode loop.
     std::optional<uint16_t> max_num_tokens{};
     if (max_new_tokens.has_value())
         max_num_tokens = preprocessed_data.input_token_ids.size() + max_new_tokens.value();
 
+    if (_stop_requested) return std::nullopt;
     auto output_token_ids = _run_language_model(
         preprocessed_data.input_token_ids, max_num_tokens, timer_ttft,
-        nullptr, preprocessed_data.stable_prefix_token_count, media_loader
+        nullptr, preprocessed_data.stable_prefix_token_count
     );
 
     if (output_token_ids.has_value())
@@ -192,12 +172,11 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_language_model(
     std::optional<uint16_t> max_num_tokens,
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result,
-    uint16_t stable_prefix_token_count,
-    const LanguageModel::MediaLoader& media_loader
+    uint16_t stable_prefix_token_count
 ) {
     if (_draft_vlm_ptr == nullptr) {
         return _language_model_ptr->run_model(
-            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count, media_loader
+            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count
         );
     }
     if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
@@ -207,7 +186,7 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_language_model(
     }
     return _language_model_ptr->run_model_speculative_decoding(
         *_draft_vlm_ptr->_language_model_ptr, input_token_ids,
-        max_num_tokens, timer_ttft, performance_result, stable_prefix_token_count, media_loader
+        max_num_tokens, timer_ttft, performance_result, stable_prefix_token_count
     );
 }
 
@@ -372,6 +351,7 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
 
 
 void VisionLanguageModel::stop_model() {
+    _stop_requested = true;
     _language_model_ptr->stop_model();
 }
 

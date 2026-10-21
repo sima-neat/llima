@@ -294,7 +294,7 @@ const LinearAttentionConfig& LanguageModel::_linear_attn_cfg() const {
 }
 
 
-std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffers(
+MediaOutputMaps LanguageModel::create_input_buffers(
     std::span<const uint32_t> input_token_ids
 ) {
     // Log.
@@ -302,20 +302,32 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
 
     // Determine the shape of the buffer for input embeds.
     const uint16_t num_input_tokens = input_token_ids.size();
-    uint16_t num_padded_input_tokens = num_input_tokens;
+    uint32_t num_padded_input_tokens = num_input_tokens;
     if (_use_group_token_models) {
         for (const auto& offset: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
-            if (offset + _cfg.pipeline_cfg.input_token_group_size > num_input_tokens) {
+            if (offset + _cfg.pipeline_cfg.input_token_group_size >= num_input_tokens) {
                 num_padded_input_tokens = offset + _cfg.pipeline_cfg.input_token_group_size;
                 break;
             }
         }
     }
 
+    std::vector<uint32_t> audio_starts;
+    if (_cfg.support_audio()) {
+        for (uint32_t i = 0; i < input_token_ids.size(); ++i) {
+            if (input_token_ids[i] == _cfg.audio_cfg->token_id
+                && (i == 0 || input_token_ids[i - 1] != _cfg.audio_cfg->token_id)) {
+                audio_starts.push_back(i);
+                // Each audio graph writes its compiled capacity, including padding.
+                num_padded_input_tokens = std::max(num_padded_input_tokens, i + _cfg.audio_cfg->max_tokens);
+            }
+        }
+    }
+
     // Allocate the input embeds with padding to the buffer.
     if (_embedding_offload) {
-        _embedding_offload->chunk_staging = !_image_token_id.has_value()
-            || std::find(input_token_ids.begin(), input_token_ids.end(), *_image_token_id) == input_token_ids.end();
+        _embedding_offload->chunk_staging = audio_starts.empty() && (!_image_token_id.has_value()
+            || std::find(input_token_ids.begin(), input_token_ids.end(), *_image_token_id) == input_token_ids.end());
         if (_embedding_offload->chunk_staging) {
             num_padded_input_tokens = std::max<uint16_t>(
                 _cfg.lm_cfg.get_single_num_tokens(),
@@ -338,7 +350,18 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
         scale_buf.clear();
     }
 
-    std::vector<std::map<uint8_t, MLABufferSlice>> vision_ofm_maps;
+    auto embedding_outputs = [&](uint32_t begin, uint32_t rows) {
+        std::map<uint8_t, MLABufferSlice> outputs{
+            {0, MLABufferSlice(&input_embeds_buf, {begin, 0}, {rows, _cfg.lm_cfg.hidden_size})}
+        };
+        if (_cfg.pipeline_cfg.quantize_embeddings)
+            outputs.emplace(1, MLABufferSlice(&get_buffer("input_embedding_scales"), {begin, 0}, {rows, 1}));
+        return outputs;
+    };
+    MediaOutputMaps output_maps;
+    for (auto begin : audio_starts)
+        output_maps.audio.push_back(embedding_outputs(begin, _cfg.audio_cfg->max_tokens));
+
     if (_cfg.vm_cfg.has_value()) {
         // Allocate the deepstack feature caches for qwen3 with the same size as input embeds.
         for (size_t i = 0; i < _cfg.vm_cfg.value().deepstack_visual_indexes.size(); ++i) {
@@ -360,28 +383,8 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
             token_idx = std::distance(input_token_ids.begin(), it);
 
             // Fill the ofm map.
-            std::map<uint8_t, MLABufferSlice> ofm_map;
-            ofm_map.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(0),
-                std::forward_as_tuple(
-                    &get_buffer("input_embeds"),
-                    std::vector<uint32_t>{token_idx, 0},
-                    std::vector<uint32_t>{mm_tokens_per_image, _cfg.lm_cfg.hidden_size}
-                )
-            );
+            auto ofm_map = embedding_outputs(token_idx, mm_tokens_per_image);
             const uint8_t deepstack_ofm_begin = _cfg.pipeline_cfg.quantize_embeddings ? 2 : 1;
-            if (_cfg.pipeline_cfg.quantize_embeddings) {
-                ofm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(1),
-                    std::forward_as_tuple(
-                        &get_buffer("input_embedding_scales"),
-                        std::vector<uint32_t>{token_idx, 0},
-                        std::vector<uint32_t>{mm_tokens_per_image, 1}
-                    )
-                );
-            }
             for (size_t i = 0; i < _cfg.vm_cfg.value().deepstack_visual_indexes.size(); ++i) {
                 ofm_map.emplace(
                     std::piecewise_construct,
@@ -393,11 +396,11 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
                     )
                 );
             }
-            vision_ofm_maps.emplace_back(ofm_map);
+            output_maps.images.emplace_back(std::move(ofm_map));
             token_idx += _cfg.mm_cfg.value().mm_tokens_per_image;
         } while (token_idx < input_token_ids.size());
     }
-    return vision_ofm_maps;
+    return output_maps;
 }
 
 
@@ -406,8 +409,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::optional<ChronoTimer> timer_ttft,
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids,
-    uint16_t stable_prefix_token_count,
-    const MediaLoader& media_loader
+    uint16_t stable_prefix_token_count
 ) {
     // Update the state.
     _is_running = true;
@@ -428,7 +430,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
 
         // Prefill.
-        auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft, media_loader);
+        auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
         const auto output_token_id_begin = input_token_ids.size();
         if (!_is_running.load(std::memory_order_relaxed)) {
             // Do nothing.
@@ -478,8 +480,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
 std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
     LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count,
-    const MediaLoader& media_loader) {
+    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count) {
     if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value() ||
         !draft_lm._cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
         throw std::invalid_argument("Both models must contain speculative-decoding configuration");
@@ -494,7 +495,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     }
     if (target.is_gemma4_mtp()) {
         return run_model_gemma4_mtp(draft_lm, input_token_ids, override_max_num_tokens, timer_ttft,
-                                    performance_result, media_loader);
+                                    performance_result);
     }
     if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.hidden_size ||
         _cfg.lm_cfg.token_cfg.vocab_size != draft_lm._cfg.lm_cfg.token_cfg.vocab_size) {
@@ -545,8 +546,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
 uint32_t LanguageModel::run_model_prefill(
     std::span<const uint32_t> input_token_ids,
     uint16_t num_cached_tokens,
-    std::optional<ChronoTimer> timer_ttft,
-    const MediaLoader& media_loader
+    std::optional<ChronoTimer> timer_ttft
 ) {
     if (_uses_per_layer_inputs())
         _prompt_per_layer_token_ids = _get_per_layer_token_ids(input_token_ids);
@@ -594,14 +594,14 @@ uint32_t LanguageModel::run_model_prefill(
                         num_tokens, token_idx, num_input_tokens
                     );
                 }
-                next_token_id = run_model_once(num_tokens, token_idx, num_input_tokens, 0, nullptr, media_loader);
+                next_token_id = run_model_once(num_tokens, token_idx, num_input_tokens, 0);
                 ++it;
                 token_idx += num_tokens;
             } else {
                 if (_uses_per_layer_inputs()) {
                     _compute_and_upload_per_layer_inputs_prefill(1, token_idx, num_input_tokens);
                 }
-                next_token_id = run_model_once(1, token_idx, num_input_tokens, 0, nullptr, media_loader);
+                next_token_id = run_model_once(1, token_idx, num_input_tokens, 0);
                 token_idx += 1;
             }
             if (!_is_running.load(std::memory_order_relaxed)) {
@@ -624,7 +624,7 @@ uint32_t LanguageModel::run_model_prefill(
             if (_uses_per_layer_inputs()) {
                 _compute_and_upload_per_layer_inputs_prefill(1, token_idx, num_input_tokens);
             }
-            next_token_id = run_model_once(1, token_idx, num_input_tokens, 0, nullptr, media_loader);
+            next_token_id = run_model_once(1, token_idx, num_input_tokens, 0);
             if (!_is_running.load(std::memory_order_relaxed)) {
                 if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                 _cached_token_ids.assign(
@@ -1034,8 +1034,7 @@ uint32_t LanguageModel::run_model_once(
     uint16_t token_idx,
     uint16_t num_input_tokens,
     uint32_t token_id,
-    std::vector<Eigen::bfloat16>* logits_ptr,
-    const MediaLoader& media_loader
+    std::vector<Eigen::bfloat16>* logits_ptr
 ) {
     if (token_idx == 0 && logits_ptr)
         _prepare_state_checkpoints_for_prefill(0);
@@ -1063,13 +1062,6 @@ uint32_t LanguageModel::run_model_once(
         if (_embedding_offload) _prepare_offloaded_prompt(num_tokens, token_idx);
         normal_input_row = _embedding_offload && _embedding_offload->chunk_staging ? 0 : token_idx;
         normal_input_num_tokens = num_tokens;
-        if (media_loader) {
-            const MLABufferSlice destination(normal_input_buf, {normal_input_row, 0}, {num_tokens, _cfg.lm_cfg.hidden_size});
-            std::optional<MLABufferSlice> scales;
-            if (normal_scale_buf) scales.emplace(normal_scale_buf, std::vector<uint32_t>{normal_input_row, 0},
-                                                 std::vector<uint32_t>{num_tokens, 1});
-            media_loader(token_idx, next_token_idx, destination, scales ? &*scales : nullptr);
-        }
     } else {
         normal_input_buf = &get_buffer(_embedding_offload ? "offload_decode_embeds" : "embeddings");
         if (_cfg.pipeline_cfg.quantize_embeddings) {
@@ -3345,7 +3337,7 @@ void LanguageModel::_prepare_offloaded_prompt(uint16_t num_tokens, uint16_t toke
     size_t begin = token_idx;
     while (begin < end) {
         if (_is_media_token(state.prompt_ids[begin])) {
-            ++begin; // Vision has already written this position.
+            ++begin; // Encoders have already written this position.
             continue;
         }
         size_t next = begin + 1;
