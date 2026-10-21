@@ -43,8 +43,8 @@ Use `llima run` as a simple runtime for initial model validation on Modalix.
 
 In CLI mode, chat history is enabled by default. Each prompt and response is
 kept as context for the next turn until you clear it with `clear history`. Images
-submitted with a prompt are also retained as part of that history. `clear history`
-removes the submitted prompts, responses, and all images. The configured system
+and audio submitted with a prompt are retained as part of that history. `clear history`
+removes the submitted prompts, responses, and attachments. The configured system
 prompt remains active until you use `clear system` or replace it with `set system`.
 
 ``` console

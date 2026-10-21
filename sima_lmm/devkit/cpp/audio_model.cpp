@@ -27,7 +27,9 @@ AudioModel::AudioModel(std::filesystem::path path, std::shared_ptr<FileProvider>
 
 void AudioModel::_define_buffers() {
     const auto& audio = *_cfg.audio_cfg;
-    define_buffer("audio_features", {audio.num_frames(), audio.num_mel_bins});
+    const auto frontend = nlohmann::json::parse(*_files->open_stream("devkit/audio_preprocessor_config.json"));
+    const auto mel_bins = frontend.value("num_mel_bins", 128U);
+    define_buffer("audio_features", {audio.num_frames(), mel_bins});
     define_buffer("audio_mask", {audio.num_frames(), 1});
     define_buffer("audio_hidden_0", {audio.padded_tokens(), audio.hidden_size});
     define_buffer("audio_hidden_1", {audio.padded_tokens(), audio.hidden_size});
@@ -43,7 +45,7 @@ void AudioModel::_finalize() {
 
 void AudioModel::run_model(const AudioInput& audio) {
     const auto& cfg = *_cfg.audio_cfg;
-    if (audio.features.size() != static_cast<size_t>(cfg.num_frames()) * cfg.num_mel_bins
+    if (audio.features.size() != get_buffer("audio_features").get_num_elems()
         || audio.mask.size() != cfg.num_frames() || !audio.num_tokens || audio.num_tokens > cfg.max_tokens)
         throw std::invalid_argument("Audio features do not match the compiled encoder");
     get_buffer("audio_features").upload(audio.features.data());

@@ -203,7 +203,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
             if (!_vlm_cfg.support_audio()) throw std::invalid_argument("This model has no compiled audio frontend");
             const auto& audio = *_vlm_cfg.audio_cfg;
             const auto& source = item.at("audio");
-            const size_t budget = std::min<uint32_t>(30 * audio.sampling_rate, audio.num_frames() * audio.hop_length);
+            const size_t budget = _audio_processor_ptr->max_samples();
             ArrayXf samples;
             if (source.is_string()) {
                 const auto path = source.get<std::string>();

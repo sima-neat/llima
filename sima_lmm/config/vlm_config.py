@@ -308,12 +308,9 @@ class AudioModelConfig(BaseConfig):
     hidden_size: int = 1024
     num_hidden_layers: int = 12
     num_attention_heads: int = 8
-    output_proj_dims: int = 1536
     subsampling_conv_channels: list[int] = field(default_factory=lambda: [128, 32])
     conv_kernel_size: int = 5
     attention_chunk_size: int = 12
-    attention_context_left: int = 13
-    attention_context_right: int = 0
     attention_logit_cap: float = 50.0
     attention_invalid_logits_value: float = -1e9
     residual_weight: float = 0.5
@@ -324,29 +321,6 @@ class AudioModelConfig(BaseConfig):
     begin_token_id: int = 256000
     end_token_id: int = 258883
     max_tokens: int = 750
-    sampling_rate: int = 16000
-    num_mel_bins: int = 128
-    frame_length: int = 320
-    hop_length: int = 160
-    fft_length: int = 512
-
-    def __post_init__(self):
-        if (
-            min(self.hidden_size, self.num_hidden_layers, self.num_attention_heads,
-                self.output_proj_dims, self.attention_chunk_size, self.max_tokens) <= 0
-            or self.hidden_size % self.num_attention_heads
-            or self.hidden_size % 2
-            or len(self.subsampling_conv_channels) != 2
-            or min(self.subsampling_conv_channels) <= 0
-            or self.attention_context_left != self.attention_chunk_size + 1
-            or self.attention_context_right != 0
-            or self.conv_kernel_size <= 0
-            or self.max_tokens > 750
-            or self.num_mel_bins <= 0 or self.num_mel_bins % 4
-            or self.num_mel_bins != self.subsampling_conv_channels[0]
-            or (self.sampling_rate, self.frame_length, self.hop_length, self.fft_length) != (16000, 320, 160, 512)
-        ):
-            raise ValueError("Unsupported Gemma 4 audio encoder dimensions or attention context")
 
     @property
     def num_frames(self) -> int:
@@ -355,6 +329,42 @@ class AudioModelConfig(BaseConfig):
     @property
     def padded_tokens(self) -> int:
         return round_up_to(self.max_tokens, self.attention_chunk_size)
+
+
+@dataclass
+class AudioPreprocessorConfig(BaseConfig):
+    """Resolved audio frontend settings and coefficients exported to the runtime."""
+
+    feature_extractor_type: str = ""
+    sampling_rate: int = 0
+    num_mel_bins: int = 0
+    frame_length: int = 0
+    hop_length: int = 0
+    fft_length: int = 0
+    window: list[float] = field(default_factory=list)
+    mel_filters: list[list[float]] = field(default_factory=list)
+    mel_floor: float = 0.0
+    per_bin_mean: list[float] | None = None
+    per_bin_stddev: list[float] | None = None
+
+    def set_config(self, feature_extractor, audio: AudioModelConfig):
+        if feature_extractor.dither or feature_extractor.preemphasis or feature_extractor.input_scale_factor != 1:
+            raise ValueError("Gemma audio currently requires zero dither/preemphasis and unit input scale")
+        if (feature_extractor.sampling_rate, feature_extractor.hop_length) != (16000, 160):
+            raise ValueError("Gemma audio requires 16-kHz sampling and a 160-sample hop")
+        if feature_extractor.feature_size != audio.subsampling_conv_channels[0]:
+            raise ValueError("Gemma audio mel bins must match the first subsampling convolution width")
+        self.feature_extractor_type = type(feature_extractor).__name__
+        self.sampling_rate = feature_extractor.sampling_rate
+        self.num_mel_bins = feature_extractor.feature_size
+        self.frame_length = feature_extractor.frame_length
+        self.hop_length = feature_extractor.hop_length
+        self.fft_length = feature_extractor.fft_length
+        self.window = feature_extractor.window.tolist()
+        self.mel_filters = feature_extractor.mel_filters.tolist()
+        self.mel_floor = float(feature_extractor.mel_floor)
+        self.per_bin_mean = None if feature_extractor.per_bin_mean is None else feature_extractor.per_bin_mean.reshape(-1).tolist()
+        self.per_bin_stddev = None if feature_extractor.per_bin_stddev is None else feature_extractor.per_bin_stddev.reshape(-1).tolist()
 
 
 @dataclass
@@ -1185,7 +1195,9 @@ class VlmConfig(BaseConfig):
     @staticmethod
     def load(vlm_cfg: dict) -> "VlmConfig":
         if vlm_cfg.get("audio_cfg") is not None:
-            vlm_cfg["audio_cfg"] = AudioModelConfig(**vlm_cfg["audio_cfg"])
+            audio = AudioModelConfig()
+            audio.set_config(vlm_cfg["audio_cfg"])
+            vlm_cfg["audio_cfg"] = audio
         if vlm_cfg.get("vm_cfg") is not None:
             vlm_cfg["vm_cfg"]["arch"] = VisionArchType(vlm_cfg["vm_cfg"]["arch"])
             vlm_cfg["vm_cfg"] = VisionModelConfig(**vlm_cfg["vm_cfg"])
@@ -1362,14 +1374,11 @@ class VlmConfig(BaseConfig):
             vlm_cfg.vm_cfg = None
 
         if model_format == ModelFormat.FORMAT_HF and model_type == "gemma4" and model_cfg.get("audio_config"):
-            audio = model_cfg["audio_config"]
-            fields = AudioModelConfig.__dataclass_fields__
-            vlm_cfg.audio_cfg = AudioModelConfig(
-                **{key: value for key, value in audio.items() if key in fields},
-                token_id=model_cfg["audio_token_id"],
-                begin_token_id=model_cfg["boa_token_id"],
-                end_token_id=model_cfg["eoa_token_id"],
-            )
+            vlm_cfg.audio_cfg = AudioModelConfig()
+            vlm_cfg.audio_cfg.set_config(model_cfg["audio_config"])
+            vlm_cfg.audio_cfg.token_id = model_cfg["audio_token_id"]
+            vlm_cfg.audio_cfg.begin_token_id = model_cfg["boa_token_id"]
+            vlm_cfg.audio_cfg.end_token_id = model_cfg["eoa_token_id"]
         return vlm_cfg
 
     @property

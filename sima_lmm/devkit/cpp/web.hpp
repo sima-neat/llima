@@ -3,6 +3,7 @@
 #define _SIMA_LLIMA_WEB_
 
 #include <csignal>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -128,7 +129,8 @@ class EXPORT WEB {
         void _execute_streaming_audio_transcription(
             httplib::Response& res,
             const std::string& language,
-            const std::string& task
+            const std::string& task,
+            std::shared_ptr<FILE> upload
         );
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
@@ -145,7 +147,6 @@ class EXPORT WEB {
         std::shared_ptr<spdlog::logger> _logger;
 
         inline static const uint32_t _SERVER_PORT = 9998;
-        inline static const std::string _AUDIO_FILE_NAME = "/tmp/audio.webm";
         inline static WEB* _singleton_ptr = nullptr;
         inline static struct sigaction _old_sigint_action = {};
 

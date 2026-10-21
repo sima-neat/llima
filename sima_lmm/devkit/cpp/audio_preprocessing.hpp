@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <complex>
 #include <filesystem>
@@ -33,8 +34,12 @@ class Gemma4AudioPreprocessor {
         Gemma4AudioPreprocessor(const Gemma4AudioPreprocessor&) = delete;
         Gemma4AudioPreprocessor& operator=(const Gemma4AudioPreprocessor&) = delete;
         AudioInput preprocess(const ArrayXf& samples);
+        size_t max_samples() const {
+            return std::min<uint32_t>(30 * _sampling_rate, _cfg.num_frames() * _hop_length);
+        }
     private:
         const AudioModelConfig& _cfg;
+        uint32_t _sampling_rate, _num_mel_bins, _frame_length, _hop_length, _fft_length;
         ArrayXf _window;
         ArrayXXd _mel_filters;
         ArrayXd _mean, _stddev;

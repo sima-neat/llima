@@ -377,11 +377,6 @@ struct AudioModelConfig {
     uint32_t num_hidden_layers = 12;
     uint32_t max_tokens = 750;
     uint32_t attention_chunk_size = 12;
-    uint32_t sampling_rate = 16000;
-    uint32_t num_mel_bins = 128;
-    uint32_t frame_length = 320;
-    uint32_t hop_length = 160;
-    uint32_t fft_length = 512;
     uint32_t token_id = 258881;
     uint32_t begin_token_id = 256000;
     uint32_t end_token_id = 258883;
@@ -393,7 +388,6 @@ struct AudioModelConfig {
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     AudioModelConfig, hidden_size, num_hidden_layers, max_tokens, attention_chunk_size,
-    sampling_rate, num_mel_bins, frame_length, hop_length, fft_length,
     token_id, begin_token_id, end_token_id
 )
 

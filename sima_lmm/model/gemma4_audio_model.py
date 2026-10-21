@@ -48,12 +48,14 @@ class Gemma4AudioLayerModel(BaseModel):
 
     def generate_graph(self, layer_cfg: LayerConfiguration, quantizable: bool):
         audio = self.cfg.audio_cfg
-        shape = ((1, 1, audio.num_frames, audio.num_mel_bins) if self.layer_idx == 0
+        # The supported stem normalizes the mel axis to its first conv width.
+        mel_bins = audio.subsampling_conv_channels[0]
+        shape = ((1, 1, audio.num_frames, mel_bins) if self.layer_idx == 0
                  else (1, 1, audio.padded_tokens, audio.hidden_size))
         graph = ModelGraph(self, {"hidden": shape, "mask": (1, 1, audio.num_frames, 1)}, quantizable)
         hidden, mask = graph.inputs["hidden"], graph.inputs["mask"]
         if self.layer_idx == 0:
-            hidden = graph.reshape(hidden, [1, audio.num_frames, audio.num_mel_bins, 1])
+            hidden = graph.reshape(hidden, [1, audio.num_frames, mel_bins, 1])
             for i, channels in enumerate(audio.subsampling_conv_channels):
                 frames = audio.num_frames // (2 ** i)
                 conv_mask = graph.slice(mask, begin=[0], end=[audio.num_frames],
@@ -65,7 +67,7 @@ class Gemma4AudioLayerModel(BaseModel):
                 hidden = graph.layer_norm(f"{base}.norm", hidden, epsilon=audio.rms_norm_eps)
                 hidden = graph.relu(hidden)
             hidden = graph.reshape(hidden, [1, 1, audio.max_tokens,
-                                            (audio.num_mel_bins // 4) * channels])
+                                            (mel_bins // 4) * channels])
             hidden = graph.linear("model.audio_tower.subsample_conv_projection.input_proj_linear", hidden)
             if audio.padded_tokens > audio.max_tokens:
                 hidden = graph.concat([hidden, graph.constant(np.zeros(

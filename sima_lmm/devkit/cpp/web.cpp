@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <fstream>
 #include <cstdio>
 #include <exception>
 #include <variant>
@@ -34,6 +33,16 @@ std::string multipart_field(const httplib::Request& req, const char* name,
 bool multipart_flag(const httplib::Request& req, const char* name) {
     const auto value = multipart_field(req, name);
     return value == "true" || value == "1" || value == "True";
+}
+
+std::shared_ptr<FILE> create_audio_upload(const std::string& data) {
+    auto* file = std::tmpfile();
+    if (!file) throw std::runtime_error("Could not create temporary audio file");
+    auto upload = std::shared_ptr<FILE>(file, &std::fclose);
+    if (std::fwrite(data.data(), 1, data.size(), upload.get()) != data.size()
+        || std::fflush(upload.get()) != 0)
+        throw std::runtime_error("Could not write temporary audio file");
+    return upload;
 }
 
 template<typename Model>
@@ -97,9 +106,6 @@ WEB::WEB(
 
 WEB::~WEB() {
     stop();
-    if (std::filesystem::is_regular_file(_AUDIO_FILE_NAME)) {
-        std::filesystem::remove(_AUDIO_FILE_NAME);
-    }
     sigaction(SIGINT, &_old_sigint_action, nullptr);
 }
 
@@ -570,12 +576,6 @@ void WEB::_handle_audio_transcriptions(
         // Barge-in check
         _stop_active_inference();
 
-        const auto file = req.get_file_value("file");
-
-        std::ofstream output_file(_AUDIO_FILE_NAME, std::ios::out | std::ios::binary);
-        output_file.write(file.content.c_str(), file.content.size());
-        output_file.close();
-
         auto language = multipart_field(req, "language", "auto");
         if (language.empty()) language = "auto";
 
@@ -585,13 +585,15 @@ void WEB::_handle_audio_transcriptions(
             return;
         }
 
+        auto upload = create_audio_upload(req.get_file_value("file").content);
         if (multipart_flag(req, "stream")) {
-            _execute_streaming_audio_transcription(res, language, task);
+            _execute_streaming_audio_transcription(res, language, task, std::move(upload));
             return;
         }
 
         std::lock_guard lock(_inference_mutex);
-        auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+        auto result = _whisper_model_ptr->run_model(
+            fmt::format("/proc/self/fd/{}", fileno(upload.get())), language, task);
         nlohmann::json response = {
             {"text", result.text},
             {"language", result.language},
@@ -643,12 +645,7 @@ void WEB::_handle_gemma_audio_transcription(
 
         // Each upload owns an anonymous file, including throughout an SSE
         // response. Filenames from the client are never used as local paths.
-        const auto file = req.get_file_value("file");
-        auto upload = std::shared_ptr<FILE>(std::tmpfile(), &std::fclose);
-        if (!upload) throw std::runtime_error("Could not create temporary audio file");
-        if (std::fwrite(file.content.data(), 1, file.content.size(), upload.get()) != file.content.size()
-            || std::fflush(upload.get()) != 0)
-            throw std::runtime_error("Could not write temporary audio file");
+        auto upload = create_audio_upload(req.get_file_value("file").content);
         const auto audio_path = fmt::format("/proc/self/fd/{}", fileno(upload.get()));
 
         _stop_active_inference();
@@ -660,9 +657,9 @@ void WEB::_handle_gemma_audio_transcription(
             {{"type", "audio"}, {"audio", audio_path}}
         }}});
         chat.set_messages(std::move(messages));
-        {
+        if (stream) {
             std::lock_guard lock(_inference_mutex);
-            // Validate before committing HTTP 200/SSE headers. Decoder failures,
+            // Validate before committing SSE headers. Decoder failures,
             // empty/oversized clips and context overflow remain HTTP 400.
             auto prepared = _vision_language_model_ptr->_vlm_helper.preprocess(chat);
             if (prepared.input_token_ids.size() > _vision_language_model_ptr->_cfg.pipeline_cfg.max_num_tokens)
@@ -737,7 +734,8 @@ void WEB::_handle_gemma_audio_transcription(
 void WEB::_execute_streaming_audio_transcription(
     httplib::Response& res,
     const std::string& language,
-    const std::string& task
+    const std::string& task,
+    std::shared_ptr<FILE> upload
 ) {
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
@@ -745,7 +743,7 @@ void WEB::_execute_streaming_audio_transcription(
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, language, task](size_t offset, httplib::DataSink &sink) {
+        [this, language, task, upload = std::move(upload)](size_t offset, httplib::DataSink &sink) {
             (void)offset;
             std::lock_guard lock(_inference_mutex);
             std::optional<double> ttft_value;
@@ -778,7 +776,8 @@ void WEB::_execute_streaming_audio_transcription(
             try {
                 _whisper_model_ptr->set_info_callback(info_callback);
                 _whisper_model_ptr->set_text_callback(text_callback);
-                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+                auto result = _whisper_model_ptr->run_model(
+                    fmt::format("/proc/self/fd/{}", fileno(upload.get())), language, task);
                 std::string chunk = _format_audio_sse_chunk(
                     "", task, true, finish_reason.value_or("stop"), ttft_value, tps_value,
                     result.language, result.task, result.no_speech_prob, result.avg_logprob
