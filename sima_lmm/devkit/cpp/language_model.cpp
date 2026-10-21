@@ -97,10 +97,12 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer,
-    std::shared_ptr<FileProvider> file_provider
+    std::shared_ptr<FileProvider> file_provider,
+    std::optional<uint32_t> audio_token_id
 ) : BaseModel(model_path, std::move(file_provider)),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
+    _audio_token_id(audio_token_id),
     _pad_token_id(pad_token_id),
     _max_num_tokens(_cfg.pipeline_cfg.max_num_tokens),
     _text_streamer(text_streamer),
@@ -313,10 +315,10 @@ MediaOutputMaps LanguageModel::create_input_buffers(
     }
 
     std::vector<uint32_t> audio_starts;
-    if (_cfg.support_audio()) {
+    if (_cfg.support_audio() && _audio_token_id) {
         for (uint32_t i = 0; i < input_token_ids.size(); ++i) {
-            if (input_token_ids[i] == _cfg.audio_cfg->token_id
-                && (i == 0 || input_token_ids[i - 1] != _cfg.audio_cfg->token_id)) {
+            if (input_token_ids[i] == *_audio_token_id
+                && (i == 0 || input_token_ids[i - 1] != *_audio_token_id)) {
                 audio_starts.push_back(i);
                 // Each audio graph writes its compiled capacity, including padding.
                 num_padded_input_tokens = std::max(num_padded_input_tokens, i + _cfg.audio_cfg->max_tokens);
@@ -3401,7 +3403,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
     while (token_idx < num_input_tokens) {
         const auto& token_id = input_token_ids[token_idx];
         if (_is_media_token(token_id)) {
-            const bool audio = _cfg.support_audio() && token_id == _cfg.audio_cfg->token_id;
+            const bool audio = _audio_token_id && token_id == *_audio_token_id;
             auto next_token_idx = token_idx + 1;
             if (audio) {
                 while (next_token_idx < num_input_tokens && input_token_ids[next_token_idx] == token_id) ++next_token_idx;

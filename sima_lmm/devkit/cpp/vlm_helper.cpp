@@ -100,11 +100,14 @@ VlmHelper::VlmHelper(
         _init_stop_token_ids(files, &tokenizer_config_json);
         if (_vlm_cfg.is_multimodal()) {
             _init_image_token_id(tokenizer_config_json);
-            _init_pad_token_id(tokenizer_config_json);
             _init_image_processor(files);
         }
-        if (_vlm_cfg.support_audio())
+        if (_vlm_cfg.is_multimodal() || _vlm_cfg.support_audio())
+            _init_pad_token_id(tokenizer_config_json);
+        if (_vlm_cfg.support_audio()) {
+            _init_audio_tokens(tokenizer_config_json);
             _audio_processor_ptr = std::make_unique<Gemma4AudioPreprocessor>(*_vlm_cfg.audio_cfg, files);
+        }
     } else {
         // GGUf format.
         assert(!_vlm_cfg.is_multimodal());
@@ -201,7 +204,6 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         for (const auto& item : content) {
             if (item.at("type") != "audio") continue;
             if (!_vlm_cfg.support_audio()) throw std::invalid_argument("This model has no compiled audio frontend");
-            const auto& audio = *_vlm_cfg.audio_cfg;
             const auto& source = item.at("audio");
             const size_t budget = _audio_processor_ptr->max_samples();
             ArrayXf samples;
@@ -221,18 +223,18 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                 throw std::invalid_argument("Audio input requires a path or base64 data with wav/mp3 format");
             }
             auto features = _audio_processor_ptr->preprocess(samples);
-            const auto at = formatted_prompt.find("<|audio|>", audio_cursor);
+            const auto at = formatted_prompt.find(_audio_token, audio_cursor);
             if (at == std::string::npos) throw std::invalid_argument("Audio attachment has no prompt placeholder");
-            std::string expanded = _tokenizer_ptr->id_to_token(audio.begin_token_id);
-            for (uint32_t i = 0; i < features.num_tokens; ++i) expanded += _tokenizer_ptr->id_to_token(audio.token_id);
-            expanded += _tokenizer_ptr->id_to_token(audio.end_token_id);
-            formatted_prompt.replace(at, std::string_view("<|audio|>").size(), expanded);
+            std::string expanded = _audio_begin_token;
+            for (uint32_t i = 0; i < features.num_tokens; ++i) expanded += _audio_token;
+            expanded += _audio_end_token;
+            formatted_prompt.replace(at, _audio_token.size(), expanded);
             audio_cursor = at + expanded.size();
             audio_tensors.push_back(std::move(features));
         }
     }
     if (_vlm_cfg.support_audio()
-        && formatted_prompt.find("<|audio|>", audio_cursor) != std::string::npos)
+        && formatted_prompt.find(_audio_token, audio_cursor) != std::string::npos)
         throw std::invalid_argument("Audio placeholder has no matching attachment");
 
     // Encode the formatted prompt to token ids.
@@ -417,6 +419,14 @@ void VlmHelper::_init_image_token_id(const nlohmann::json& tokenizer_config_json
         throw std::runtime_error("Failed to find image token");
     }
     _image_token_id = _tokenizer_ptr->token_to_id(image_token);
+}
+
+
+void VlmHelper::_init_audio_tokens(const nlohmann::json& tokenizer_config_json) {
+    _audio_token = tokenizer_config_json.at("audio_token").get<std::string>();
+    _audio_begin_token = tokenizer_config_json.at("boa_token").get<std::string>();
+    _audio_end_token = tokenizer_config_json.at("eoa_token").get<std::string>();
+    _audio_token_id = _tokenizer_ptr->token_to_id(_audio_token);
 }
 
 

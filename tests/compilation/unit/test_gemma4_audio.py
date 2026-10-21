@@ -26,6 +26,7 @@ def test_audio_duration_controls_encoder_capacity_and_input_limit(monkeypatch, t
     reference = Path(__file__).parents[1] / "configuration/references/gemma4_e2b_it_vlm_config.json"
     raw_config = json.loads(reference.read_text())
     raw_config["audio_cfg"].update({"output_proj_dims": 1536,
+        "token_id": 258881, "begin_token_id": 256000, "end_token_id": 258883,
         "attention_context_left": 13, "attention_context_right": 0,
         "sampling_rate": 16000, "num_mel_bins": 128, "frame_length": 320,
         "hop_length": 160, "fft_length": 512})

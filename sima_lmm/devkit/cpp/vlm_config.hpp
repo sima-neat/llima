@@ -377,9 +377,6 @@ struct AudioModelConfig {
     uint32_t num_hidden_layers = 12;
     uint32_t max_tokens = 750;
     uint32_t attention_chunk_size = 12;
-    uint32_t token_id = 258881;
-    uint32_t begin_token_id = 256000;
-    uint32_t end_token_id = 258883;
 
     uint32_t num_frames() const { return 4 * max_tokens; }
     uint32_t padded_tokens() const {
@@ -387,8 +384,7 @@ struct AudioModelConfig {
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    AudioModelConfig, hidden_size, num_hidden_layers, max_tokens, attention_chunk_size,
-    token_id, begin_token_id, end_token_id
+    AudioModelConfig, hidden_size, num_hidden_layers, max_tokens, attention_chunk_size
 )
 
 struct VlmConfig {

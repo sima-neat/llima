@@ -70,6 +70,7 @@ class VlmHelper {
         Tokenizer* get_tokenizer() { return _tokenizer_ptr.get(); }
         std::set<uint32_t> get_stop_token_ids() const { return _stop_token_ids; }
         std::optional<uint32_t> get_image_token_id() const { return _image_token_id; }
+        std::optional<uint32_t> get_audio_token_id() const { return _audio_token_id; }
         std::optional<uint32_t> get_pad_token_id() const { return _pad_token_id; }
 
     private:
@@ -83,6 +84,7 @@ class VlmHelper {
             const nlohmann::json* tokenizer_config_json = nullptr
         );
         void _init_image_token_id(const nlohmann::json& tokenizer_config_json);
+        void _init_audio_tokens(const nlohmann::json& tokenizer_config_json);
         void _init_pad_token_id(const nlohmann::json& tokenizer_config_json);
         void _init_image_processor(FileProvider& files);
 
@@ -97,6 +99,8 @@ class VlmHelper {
         std::string _bos_token;
         std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;
+        std::optional<uint32_t> _audio_token_id;
+        std::string _audio_token, _audio_begin_token, _audio_end_token;
         std::optional<uint32_t> _pad_token_id;
 };
 

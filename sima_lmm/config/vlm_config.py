@@ -303,7 +303,7 @@ class VisionModelConfig(BaseConfig):
 
 @dataclass
 class AudioModelConfig(BaseConfig):
-    """Gemma 4 audio encoder dimensions and prompt-token contract."""
+    """Gemma 4 audio encoder dimensions and compiled capacity."""
 
     hidden_size: int = 1024
     num_hidden_layers: int = 12
@@ -317,9 +317,6 @@ class AudioModelConfig(BaseConfig):
     gradient_clipping: float = 1e10
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
-    token_id: int = 258881
-    begin_token_id: int = 256000
-    end_token_id: int = 258883
     max_tokens: int = 750
 
     @property
@@ -1376,9 +1373,6 @@ class VlmConfig(BaseConfig):
         if model_format == ModelFormat.FORMAT_HF and model_type == "gemma4" and model_cfg.get("audio_config"):
             vlm_cfg.audio_cfg = AudioModelConfig()
             vlm_cfg.audio_cfg.set_config(model_cfg["audio_config"])
-            vlm_cfg.audio_cfg.token_id = model_cfg["audio_token_id"]
-            vlm_cfg.audio_cfg.begin_token_id = model_cfg["boa_token_id"]
-            vlm_cfg.audio_cfg.end_token_id = model_cfg["eoa_token_id"]
         return vlm_cfg
 
     @property

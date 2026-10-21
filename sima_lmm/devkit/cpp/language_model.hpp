@@ -66,7 +66,8 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer,
-            std::shared_ptr<FileProvider> file_provider
+            std::shared_ptr<FileProvider> file_provider,
+            std::optional<uint32_t> audio_token_id = std::nullopt
         );
         virtual ~LanguageModel() override { _finalize(); }
 
@@ -294,7 +295,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
     private:
         bool _is_media_token(uint32_t token) const {
             return (_image_token_id && token == *_image_token_id)
-                || (_cfg.support_audio() && token == _cfg.audio_cfg->token_id);
+                || (_audio_token_id && token == *_audio_token_id);
         }
         std::shared_ptr<EmbeddingOffload> _embedding_offload;
         void _gather_embedding_rows(
@@ -566,6 +567,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;
+        std::optional<uint32_t> _audio_token_id;
         std::optional<uint32_t> _pad_token_id;
         uint16_t _max_num_tokens;
         TextStreamer& _text_streamer;

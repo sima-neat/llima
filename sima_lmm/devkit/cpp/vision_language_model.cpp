@@ -41,7 +41,8 @@ VisionLanguageModel::VisionLanguageModel(
         _vlm_helper.get_image_token_id(),
         _vlm_helper.get_pad_token_id(),
         _text_streamer,
-        _files
+        _files,
+        _vlm_helper.get_audio_token_id()
     );
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
@@ -124,11 +125,12 @@ std::optional<std::string> VisionLanguageModel::run_model(
     // Later clips overwrite earlier audio padding. Vision and text are filled afterward.
     ChronoTimer timer_audio_encode(true);
     const auto& ids = preprocessed_data.input_token_ids;
+    const auto audio_token_id = _vlm_helper.get_audio_token_id();
     for (size_t i = 0; i < output_maps.audio.size(); ++i) {
         if (_stop_requested) return std::nullopt;
         const auto begin = output_maps.audio[i].at(0).get_buf_begins()->front();
         const auto end = std::find_if(ids.begin() + begin, ids.end(),
-            [&](uint32_t id) { return id != _cfg.audio_cfg->token_id; });
+            [&](uint32_t id) { return id != audio_token_id; });
         if (std::distance(ids.begin() + begin, end) != preprocessed_data.audio_tensors[i].num_tokens)
             throw std::invalid_argument("Audio tokens do not match the supplied features");
         _audio_model_ptr->run_model(preprocessed_data.audio_tensors[i], &output_maps.audio[i]);

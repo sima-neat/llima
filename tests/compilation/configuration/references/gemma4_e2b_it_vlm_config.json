@@ -143,9 +143,6 @@
         "gradient_clipping": 10000000000.0,
         "hidden_act": "silu",
         "rms_norm_eps": 0.000001,
-        "token_id": 258881,
-        "begin_token_id": 256000,
-        "end_token_id": 258883,
         "max_tokens": 750
     },
     "pipeline_cfg": {
