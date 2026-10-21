@@ -224,12 +224,7 @@ static nlohmann::ordered_json parse_ollama_media(const nlohmann::json& attachmen
         || (padding != std::string::npos && (encoded.size() - padding > 2
             || encoded.find_first_not_of('=', padding) != std::string::npos)))
         throw std::invalid_argument("images must contain valid base64 media");
-    std::vector<uint8_t> bytes;
-    try {
-        bytes = base64_decode(encoded);
-    } catch (const std::runtime_error&) {
-        throw std::invalid_argument("images must contain valid base64 media");
-    }
+    auto bytes = base64_decode(encoded);
 
     AVProbeData probe{};
     probe.filename = "";

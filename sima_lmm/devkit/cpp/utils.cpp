@@ -27,7 +27,7 @@ std::vector<uint8_t> base64_decode(std::string_view base64_data) {
     BIO_free_all(bio_chain);
 
     if (decoded_length <= 0)
-        throw std::runtime_error("Failed to decode base64 data");
+        throw std::invalid_argument("Failed to decode base64 data");
     decoded_data.resize(decoded_length);
     return decoded_data;
 }
