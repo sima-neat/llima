@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <fmt/ranges.h>
 
 #include "chat.hpp"
@@ -27,6 +28,7 @@ void Chat::set_system_prompt(std::string system_prompt) {
     nlohmann::ordered_json system_message;
     system_message["role"] = "system";
     system_message["content"] = std::move(system_prompt);
+    clear_messages();
     _messages = nlohmann::ordered_json::array({system_message});
 }
 
@@ -45,24 +47,8 @@ void Chat::add_query(std::string query) {
         return;
     }
 
-    // Check how many images need to be added to this message in addition to the query.
-    uint32_t num_images_in_messages = 0;
-    for (const auto& message: _messages) {
-        const auto& content = message["content"];
-        if (!content.is_array())
-            continue;
-        for (const auto& item: content) {
-            if (item.at("type") == "image")
-                ++num_images_in_messages;
-        }
-    }
-
-    nlohmann::ordered_json content;
-    if (!_images.empty()) {
-        for (uint32_t i = num_images_in_messages; i < _images.size(); ++i) {
-            content.push_back({{"type", "image"}, {"image", _images[i].string()}});
-        }
-    }
+    auto content = std::move(_pending_media);
+    _pending_media = nlohmann::ordered_json::array();
     content.push_back({{"type", "text"}, {"text", std::move(query)}});
     _messages.push_back({{"role", "user"}, {"content", std::move(content)}});
 }
@@ -118,17 +104,40 @@ void Chat::set_messages(nlohmann::ordered_json messages) {
         clear_history();
         add_query(messages);
     } else {
-        assert(_images.size() == 0);
+        assert(_images.empty() && _pending_media.empty());
         _messages = std::move(messages);
     }
 }
 
 
 void Chat::clear_messages() {
+    // Keep attachments for replay, including any not yet submitted.
+    auto media = nlohmann::ordered_json::array();
+    for (const auto& message : _messages) {
+        const auto& content = message.at("content");
+        if (!content.is_array()) continue;
+        for (const auto& item : content) {
+            if (item.at("type") == "image" || item.at("type") == "audio") media.push_back(item);
+        }
+    }
+    for (const auto& item : _pending_media) media.push_back(item);
+    _pending_media = std::move(media);
+    _reset_messages();
+}
+
+
+void Chat::_reset_messages() {
     if (_messages.empty() || _messages[0]["role"] != "system")
         _messages.clear();
     else
         _messages.erase(_messages.begin() + 1, _messages.end());
+}
+
+
+void Chat::clear_history() {
+    _reset_messages();
+    _images.clear();
+    _pending_media.clear();
 }
 
 
@@ -138,12 +147,26 @@ void Chat::set_tools(nlohmann::ordered_json tools) {
 
 
 void Chat::add_image(std::filesystem::path image_path) {
+    _pending_media.push_back({{"type", "image"}, {"image", image_path.string()}});
     _images.emplace_back(std::move(image_path));
+}
+
+void Chat::add_audio(std::filesystem::path audio_path) {
+    if (!_vlm_helper.support_audio()) throw std::invalid_argument("This model has no compiled audio frontend");
+    _pending_media.push_back({{"type", "audio"}, {"audio", audio_path.string()}});
 }
 
 
 void Chat::clear_images() {
     _images.clear();
+    auto remove_images = [](auto& content) {
+        if (content.is_array()) {
+            content.erase(std::remove_if(content.begin(), content.end(),
+                [](const auto& item) { return item.at("type") == "image"; }), content.end());
+        }
+    };
+    remove_images(_pending_media);
+    for (auto& message : _messages) remove_images(message["content"]);
 }
 
 

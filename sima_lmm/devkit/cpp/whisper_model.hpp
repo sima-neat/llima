@@ -14,12 +14,7 @@
 
 #include <fftw3.h>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-#include <libswresample/swresample.h>
-}
+
 
 #include "base_model.hpp"
 #include "eigen_types.hpp"
@@ -50,7 +45,6 @@ class WhisperPreprocessor {
 
     private:
         explicit WhisperPreprocessor(std::unique_ptr<std::istream> config);
-        ArrayXf _load_audio_ffmpeg(const std::filesystem::path& audio_file_name);
         ArrayXXbf _log_mel_spectrogram(ArrayXf& audio_tensor);
 
         ArrayXXd _mel_filters;

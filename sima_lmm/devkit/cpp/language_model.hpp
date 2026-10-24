@@ -6,7 +6,6 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -45,6 +44,11 @@ struct GenerationPerformanceResult {
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
+struct MediaOutputMaps {
+    std::vector<std::map<uint8_t, MLABufferSlice>> images;
+    std::vector<std::map<uint8_t, MLABufferSlice>> audio;
+};
+
 class LanguageModel : public BaseModel<VlmConfig> {
     public:
         // Existing disk-loading overload; preserves source compatibility.
@@ -62,11 +66,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer,
-            std::shared_ptr<FileProvider> file_provider
+            std::shared_ptr<FileProvider> file_provider,
+            std::optional<uint32_t> audio_token_id = std::nullopt
         );
         virtual ~LanguageModel() override { _finalize(); }
 
-        std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
+        MediaOutputMaps create_input_buffers(
             std::span<const uint32_t> input_token_ids
         );
         std::optional<std::vector<uint32_t>> run_model(
@@ -288,6 +293,10 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _eagle3_stable_kv = 0;
 
     private:
+        bool _is_media_token(uint32_t token) const {
+            return (_image_token_id && token == *_image_token_id)
+                || (_audio_token_id && token == *_audio_token_id);
+        }
         std::shared_ptr<EmbeddingOffload> _embedding_offload;
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,
@@ -558,6 +567,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;
+        std::optional<uint32_t> _audio_token_id;
         std::optional<uint32_t> _pad_token_id;
         uint16_t _max_num_tokens;
         TextStreamer& _text_streamer;

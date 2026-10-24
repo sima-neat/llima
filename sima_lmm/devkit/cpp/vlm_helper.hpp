@@ -15,6 +15,7 @@
 #include "chat.hpp"
 #include "file_provider.hpp"
 #include "image_processor.hpp"
+#include "audio_preprocessing.hpp"
 #include "tokenizer.hpp"
 #include "vlm_config.hpp"
 
@@ -27,6 +28,7 @@ struct PreprocessedChat {
     std::vector<uint32_t> input_token_ids;
     uint16_t stable_prefix_token_count;
     std::vector<std::vector<Eigen::bfloat16>> image_tensors;
+    std::vector<AudioInput> audio_tensors;
 };
 
 class Chat;
@@ -64,9 +66,11 @@ class VlmHelper {
 
         bool is_multimodal() const { return _vlm_cfg.is_multimodal(); }
         bool support_image() const { return _vlm_cfg.support_image(); }
+        bool support_audio() const { return _vlm_cfg.support_audio(); }
         Tokenizer* get_tokenizer() { return _tokenizer_ptr.get(); }
         std::set<uint32_t> get_stop_token_ids() const { return _stop_token_ids; }
         std::optional<uint32_t> get_image_token_id() const { return _image_token_id; }
+        std::optional<uint32_t> get_audio_token_id() const { return _audio_token_id; }
         std::optional<uint32_t> get_pad_token_id() const { return _pad_token_id; }
 
     private:
@@ -80,6 +84,7 @@ class VlmHelper {
             const nlohmann::json* tokenizer_config_json = nullptr
         );
         void _init_image_token_id(const nlohmann::json& tokenizer_config_json);
+        void _init_audio_tokens(const nlohmann::json& tokenizer_config_json);
         void _init_pad_token_id(const nlohmann::json& tokenizer_config_json);
         void _init_image_processor(FileProvider& files);
 
@@ -87,12 +92,15 @@ class VlmHelper {
         std::unique_ptr<Tokenizer> _tokenizer_ptr;
         std::unique_ptr<minja::chat_template> _chat_template_ptr;
         std::unique_ptr<ImageProcessor> _image_processor_ptr;
+        std::unique_ptr<Gemma4AudioPreprocessor> _audio_processor_ptr;
         std::optional<std::string> _system_prompt;
         bool _enable_thinking;
         std::string _reasoning_effort;
         std::string _bos_token;
         std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;
+        std::optional<uint32_t> _audio_token_id;
+        std::string _audio_token, _audio_begin_token, _audio_end_token;
         std::optional<uint32_t> _pad_token_id;
 };
 

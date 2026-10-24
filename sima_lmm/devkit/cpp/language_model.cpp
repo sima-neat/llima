@@ -97,10 +97,12 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer,
-    std::shared_ptr<FileProvider> file_provider
+    std::shared_ptr<FileProvider> file_provider,
+    std::optional<uint32_t> audio_token_id
 ) : BaseModel(model_path, std::move(file_provider)),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
+    _audio_token_id(audio_token_id),
     _pad_token_id(pad_token_id),
     _max_num_tokens(_cfg.pipeline_cfg.max_num_tokens),
     _text_streamer(text_streamer),
@@ -294,7 +296,7 @@ const LinearAttentionConfig& LanguageModel::_linear_attn_cfg() const {
 }
 
 
-std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffers(
+MediaOutputMaps LanguageModel::create_input_buffers(
     std::span<const uint32_t> input_token_ids
 ) {
     // Log.
@@ -302,20 +304,32 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
 
     // Determine the shape of the buffer for input embeds.
     const uint16_t num_input_tokens = input_token_ids.size();
-    uint16_t num_padded_input_tokens = num_input_tokens;
+    uint32_t num_padded_input_tokens = num_input_tokens;
     if (_use_group_token_models) {
         for (const auto& offset: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
-            if (offset + _cfg.pipeline_cfg.input_token_group_size > num_input_tokens) {
+            if (offset + _cfg.pipeline_cfg.input_token_group_size >= num_input_tokens) {
                 num_padded_input_tokens = offset + _cfg.pipeline_cfg.input_token_group_size;
                 break;
             }
         }
     }
 
+    std::vector<uint32_t> audio_starts;
+    if (_cfg.support_audio() && _audio_token_id) {
+        for (uint32_t i = 0; i < input_token_ids.size(); ++i) {
+            if (input_token_ids[i] == *_audio_token_id
+                && (i == 0 || input_token_ids[i - 1] != *_audio_token_id)) {
+                audio_starts.push_back(i);
+                // Each audio graph writes its compiled capacity, including padding.
+                num_padded_input_tokens = std::max(num_padded_input_tokens, i + _cfg.audio_cfg->max_tokens);
+            }
+        }
+    }
+
     // Allocate the input embeds with padding to the buffer.
     if (_embedding_offload) {
-        _embedding_offload->chunk_staging = !_image_token_id.has_value()
-            || std::find(input_token_ids.begin(), input_token_ids.end(), *_image_token_id) == input_token_ids.end();
+        _embedding_offload->chunk_staging = audio_starts.empty() && (!_image_token_id.has_value()
+            || std::find(input_token_ids.begin(), input_token_ids.end(), *_image_token_id) == input_token_ids.end());
         if (_embedding_offload->chunk_staging) {
             num_padded_input_tokens = std::max<uint16_t>(
                 _cfg.lm_cfg.get_single_num_tokens(),
@@ -338,7 +352,18 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
         scale_buf.clear();
     }
 
-    std::vector<std::map<uint8_t, MLABufferSlice>> vision_ofm_maps;
+    auto embedding_outputs = [&](uint32_t begin, uint32_t rows) {
+        std::map<uint8_t, MLABufferSlice> outputs{
+            {0, MLABufferSlice(&input_embeds_buf, {begin, 0}, {rows, _cfg.lm_cfg.hidden_size})}
+        };
+        if (_cfg.pipeline_cfg.quantize_embeddings)
+            outputs.emplace(1, MLABufferSlice(&get_buffer("input_embedding_scales"), {begin, 0}, {rows, 1}));
+        return outputs;
+    };
+    MediaOutputMaps output_maps;
+    for (auto begin : audio_starts)
+        output_maps.audio.push_back(embedding_outputs(begin, _cfg.audio_cfg->max_tokens));
+
     if (_cfg.vm_cfg.has_value()) {
         // Allocate the deepstack feature caches for qwen3 with the same size as input embeds.
         for (size_t i = 0; i < _cfg.vm_cfg.value().deepstack_visual_indexes.size(); ++i) {
@@ -360,28 +385,8 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
             token_idx = std::distance(input_token_ids.begin(), it);
 
             // Fill the ofm map.
-            std::map<uint8_t, MLABufferSlice> ofm_map;
-            ofm_map.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(0),
-                std::forward_as_tuple(
-                    &get_buffer("input_embeds"),
-                    std::vector<uint32_t>{token_idx, 0},
-                    std::vector<uint32_t>{mm_tokens_per_image, _cfg.lm_cfg.hidden_size}
-                )
-            );
+            auto ofm_map = embedding_outputs(token_idx, mm_tokens_per_image);
             const uint8_t deepstack_ofm_begin = _cfg.pipeline_cfg.quantize_embeddings ? 2 : 1;
-            if (_cfg.pipeline_cfg.quantize_embeddings) {
-                ofm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(1),
-                    std::forward_as_tuple(
-                        &get_buffer("input_embedding_scales"),
-                        std::vector<uint32_t>{token_idx, 0},
-                        std::vector<uint32_t>{mm_tokens_per_image, 1}
-                    )
-                );
-            }
             for (size_t i = 0; i < _cfg.vm_cfg.value().deepstack_visual_indexes.size(); ++i) {
                 ofm_map.emplace(
                     std::piecewise_construct,
@@ -393,11 +398,11 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
                     )
                 );
             }
-            vision_ofm_maps.emplace_back(ofm_map);
+            output_maps.images.emplace_back(std::move(ofm_map));
             token_idx += _cfg.mm_cfg.value().mm_tokens_per_image;
         } while (token_idx < input_token_ids.size());
     }
-    return vision_ofm_maps;
+    return output_maps;
 }
 
 
@@ -820,7 +825,7 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
         LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
         std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
         const uint32_t per_layer_token_id = (
-            _image_token_id.has_value() && input_token_id == _image_token_id.value()
+            _is_media_token(input_token_id)
         ) ? _pad_token_id.value() : input_token_id;
         const size_t shard_idx = (
             per_layer_token_id / _per_layer_embedding_rows_per_shard
@@ -1078,7 +1083,7 @@ uint32_t LanguageModel::run_model_once(
         if (!use_input_tokens) {
             // Resident decode binds its shard row; offloaded decode fills n1 staging.
             const uint32_t per_layer_token_id = (
-                _image_token_id.has_value() && token_id == _image_token_id.value()
+                _is_media_token(token_id)
             ) ? _pad_token_id.value() : token_id;
             const size_t shard_idx = (
                 per_layer_token_id / _per_layer_embedding_rows_per_shard
@@ -3333,12 +3338,12 @@ void LanguageModel::_prepare_offloaded_prompt(uint16_t num_tokens, uint16_t toke
     const size_t end = std::min<size_t>(state.prompt_ids.size(), static_cast<size_t>(token_idx) + num_tokens);
     size_t begin = token_idx;
     while (begin < end) {
-        if (_image_token_id && state.prompt_ids[begin] == *_image_token_id) {
-            ++begin; // Vision has already written this position.
+        if (_is_media_token(state.prompt_ids[begin])) {
+            ++begin; // Encoders have already written this position.
             continue;
         }
         size_t next = begin + 1;
-        while (next < end && (!_image_token_id || state.prompt_ids[next] != *_image_token_id)) ++next;
+        while (next < end && !_is_media_token(state.prompt_ids[next])) ++next;
         _gather_embedding_rows(
             std::span<const uint32_t>(state.prompt_ids).subspan(begin, next - begin),
             destination, scales, state.chunk_staging ? begin - token_idx : begin
@@ -3393,19 +3398,26 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
         ? &get_buffer("input_embedding_scales") : nullptr;
     uint32_t token_idx = 0;
     uint32_t num_images = 0;
+    uint32_t num_media = 0;
     uint16_t num_cached_tokens = 0;
     while (token_idx < num_input_tokens) {
         const auto& token_id = input_token_ids[token_idx];
-        if (_image_token_id.has_value() && token_id == _image_token_id.value()) {
-            auto next_token_idx = token_idx + _cfg.mm_cfg.value().mm_tokens_per_image;
-            ++num_images;
+        if (_is_media_token(token_id)) {
+            const bool audio = _audio_token_id && token_id == *_audio_token_id;
+            auto next_token_idx = token_idx + 1;
+            if (audio) {
+                while (next_token_idx < num_input_tokens && input_token_ids[next_token_idx] == token_id) ++next_token_idx;
+            } else {
+                next_token_idx = token_idx + _cfg.mm_cfg.value().mm_tokens_per_image;
+                ++num_images;
+            }
+            ++num_media;
             token_idx = next_token_idx;
         } else {
             auto next_token_idx = token_idx + 1;
             while (
                 next_token_idx < num_input_tokens
-                && (!_image_token_id
-                    || input_token_ids[next_token_idx] != *_image_token_id)
+                && !_is_media_token(input_token_ids[next_token_idx])
             )
                 ++next_token_idx;
             if (!_embedding_offload)
@@ -3415,7 +3427,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
                 );
             for (auto idx = token_idx; idx < next_token_idx; ++idx) {
                 if (
-                    num_images == 0
+                    num_media == 0
                     && idx == num_cached_tokens
                     && idx < _cached_token_ids.size()
                     && input_token_ids[idx] == _cached_token_ids[idx]
@@ -3451,19 +3463,9 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
 std::vector<uint32_t> LanguageModel::_get_per_layer_token_ids(
     std::span<const uint32_t> input_token_ids
 ) const {
-    // Text-only Gemma4 uses per-layer inputs without defining an image token.
-    if (!_image_token_id.has_value())
-        return std::vector<uint32_t>(input_token_ids.begin(), input_token_ids.end());
-
-    const uint32_t img_id = _image_token_id.value();
-    if (std::find(input_token_ids.begin(), input_token_ids.end(), img_id) == input_token_ids.end()) {
-        return std::vector<uint32_t>(input_token_ids.begin(), input_token_ids.end());
-    }
     std::vector<uint32_t> token_ids(input_token_ids.begin(), input_token_ids.end());
-    const uint32_t pad_id = _pad_token_id.value();
     for (auto& token_id : token_ids) {
-        if (token_id == img_id)
-            token_id = pad_id;
+        if (_is_media_token(token_id)) token_id = _pad_token_id.value();
     }
     return token_ids;
 }

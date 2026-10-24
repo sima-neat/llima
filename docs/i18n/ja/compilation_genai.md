@@ -108,6 +108,7 @@ output_directory/
 | `--no-quantize_embeddings` | サポートされているLLMおよびVLMでは、デフォルトで有効になっている埋め込みテーブルの量子化を無効にします。 |
 | `--no-quantize_kv_cache` | デフォルトで有効になっている KV キャッシュの量子化を無効にします。 |
 | `--return_logits` | 最終層の出力におけるロジットを返します（モデル評価器に必要なもの）。 |
+| `--max_audio_duration` | 各クリップの最大音声長（秒単位、1～30、デフォルト: 30）。上限を短くすると音声エンコーダーのグラフサイズが小さくなります。音声対応モデルが必要です。 |
 | `--draft_model_path` | 互換性のある EAGLE3、Gemma4 MTP、または DFlash のドラフトモデルへのパス。方式は自動検出されます。 |
 | `--speculative_block_size` | DFlash の検証幅: 4、8、または 16。デフォルト: 8。 |
 | `--lora_name` | ベースモデルと同時にコンパイルされている LoRA アダプターの名前。 |

@@ -43,8 +43,8 @@ Use `llima run` as a simple runtime for initial model validation on Modalix.
 
 In CLI mode, chat history is enabled by default. Each prompt and response is
 kept as context for the next turn until you clear it with `clear history`. Images
-submitted with a prompt are also retained as part of that history. `clear history`
-removes the submitted prompts, responses, and all images. The configured system
+and audio submitted with a prompt are retained as part of that history. `clear history`
+removes the submitted prompts, responses, and attachments. The configured system
 prompt remains active until you use `clear system` or replace it with `set system`.
 
 ``` console
@@ -74,9 +74,10 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | Command | Description |
 |----|----|
 | `add image <file>` | Add an image to the current prompt context. |
+| `add audio <file>` | Attach audio to an audio-capable chat model. |
 | `set system <prompt>` | Set the system prompt. |
-| `clear system` | Clear the system prompt, chat history, and images. |
-| `clear history` | Clear submitted prompts, responses, and all images while preserving the system prompt. |
+| `clear system` | Clear the system prompt, chat history, and attachments. |
+| `clear history` | Clear submitted prompts, responses, and attachments while preserving the system prompt. |
 | `print history` | Print chat history. |
 | `set audio <file>` | Set the audio file to transcribe as the query. |
 | `set language <lang>` | Set the language string used for transcription. |
@@ -86,6 +87,11 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `disable-thinking` | Disable thinking mode and clear chat history. |
 | `quit` | Quit. |
 | `help` | Print available commands. |
+
+Audio-capable chat models accept `add audio <file>` followed by a question or
+transcription request. `clear history` removes attachments. Clips must fit the
+compiled audio duration (`--max_audio_duration`) and context limits. `set audio`
+uses the separately configured speech-to-text model instead.
 
 
 ## Build an Application with Neat

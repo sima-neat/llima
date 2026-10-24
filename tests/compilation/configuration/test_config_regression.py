@@ -42,6 +42,7 @@ def _normalize_gguf_config(config: VlmConfig) -> dict:
     normalized.pop("model_name", None)
     normalized.pop("mm_cfg", None)
     normalized.pop("vm_cfg", None)
+    normalized.pop("audio_cfg", None)
 
     language_config = normalized["lm_cfg"]
     language_config.pop("data_type", None)

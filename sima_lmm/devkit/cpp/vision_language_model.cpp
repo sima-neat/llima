@@ -34,13 +34,15 @@ VisionLanguageModel::VisionLanguageModel(
         // (fetch -> load -> evict), one ELF on disk at a time.
         _vision_model_ptr = std::make_unique<VisionModel>(model_path, _files);
     }
+    if (_cfg.support_audio()) _audio_model_ptr = std::make_unique<AudioModel>(model_path, _files);
     _language_model_ptr = std::make_unique<LanguageModel>(
         model_path,
         _vlm_helper.get_stop_token_ids(),
         _vlm_helper.get_image_token_id(),
         _vlm_helper.get_pad_token_id(),
         _text_streamer,
-        _files
+        _files,
+        _vlm_helper.get_audio_token_id()
     );
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
@@ -68,6 +70,7 @@ std::optional<std::string> VisionLanguageModel::run_model(
 ) {
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
+    _stop_requested = false;
     std::vector<std::pair<uint32_t, std::string>> preserved_tokens;
     auto* tokenizer = _vlm_helper.get_tokenizer();
     if (chat.has_tools()) {
@@ -108,28 +111,53 @@ std::optional<std::string> VisionLanguageModel::run_model(
     auto preprocessed_data = _vlm_helper.preprocess(chat);
     _logger->info("Formatted prompt: {}", preprocessed_data.formatted_prompt);
     _logger->info("Preprocess time: {:.2f}s", timer_preprocess.stop());
+    if (!preprocessed_data.audio_tensors.empty()
+        && preprocessed_data.input_token_ids.size() > _cfg.pipeline_cfg.max_num_tokens)
+        throw std::invalid_argument("Audio and text exceed the compiled context length");
 
-    // Create buffers for the input embeds and deepstack features (for qwen3) and ofm maps for
-    // vision models.
-    auto vision_ofm_maps = _language_model_ptr->create_input_buffers(
+    // Encoders write directly into the prompt embeddings and their INT8 scales.
+    auto output_maps = _language_model_ptr->create_input_buffers(
         preprocessed_data.input_token_ids
     );
 
-    // Encode the image tensors to embeddings. The image embeddings are directly written to the
-    // input embeddings for the language models.
+    if (output_maps.audio.size() != preprocessed_data.audio_tensors.size())
+        throw std::invalid_argument("Audio attachment has no matching prompt span");
+    // Later clips overwrite earlier audio padding. Vision and text are filled afterward.
+    ChronoTimer timer_audio_encode(true);
+    const auto& ids = preprocessed_data.input_token_ids;
+    const auto audio_token_id = _vlm_helper.get_audio_token_id();
+    for (size_t i = 0; i < output_maps.audio.size(); ++i) {
+        if (_stop_requested) return std::nullopt;
+        const auto begin = output_maps.audio[i].at(0).get_buf_begins()->front();
+        const auto end = std::find_if(ids.begin() + begin, ids.end(),
+            [&](uint32_t id) { return id != audio_token_id; });
+        if (std::distance(ids.begin() + begin, end) != preprocessed_data.audio_tensors[i].num_tokens)
+            throw std::invalid_argument("Audio tokens do not match the supplied features");
+        _audio_model_ptr->run_model(preprocessed_data.audio_tensors[i], &output_maps.audio[i]);
+    }
+    _logger->info("Audio encode time: {:.2f}s", timer_audio_encode.stop());
+
     ChronoTimer timer_image_encode(true);
-    for (size_t i = 0; i < vision_ofm_maps.size(); ++i) {
-        _vision_model_ptr->run_model(preprocessed_data.image_tensors[i], &vision_ofm_maps[i]);
+    for (size_t i = 0; i < output_maps.images.size(); ++i) {
+        if (_stop_requested) return std::nullopt;
+        _vision_model_ptr->run_model(preprocessed_data.image_tensors[i], &output_maps.images[i]);
     }
     _logger->info("Image encode time: {:.2f}s", timer_image_encode.stop());
 
-    // Decode the text and image embeddings. When a draft VLM is configured
+    if (!output_maps.audio.empty()) {
+        // Refresh cache lines shared by device-written scales and later CPU text writes.
+        for (const auto& [index, output] : output_maps.audio.front())
+            output.get_buf_ptr()->invalidate_cache();
+    }
+
+    // Decode the prepared prompt embeddings. When a draft VLM is configured
     // (set_draft_vlm), dispatch to speculative decoding; otherwise run the
     // normal language-model decode loop.
     std::optional<uint16_t> max_num_tokens{};
     if (max_new_tokens.has_value())
         max_num_tokens = preprocessed_data.input_token_ids.size() + max_new_tokens.value();
 
+    if (_stop_requested) return std::nullopt;
     auto output_token_ids = _run_language_model(
         preprocessed_data.input_token_ids, max_num_tokens, timer_ttft,
         nullptr, preprocessed_data.stable_prefix_token_count
@@ -325,6 +353,7 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
 
 
 void VisionLanguageModel::stop_model() {
+    _stop_requested = true;
     _language_model_ptr->stop_model();
 }
 

@@ -417,6 +417,8 @@ if(SIMA_LMM_BUILD_PYTHON)
 endif()
 
 set(SIMA_LMM_PUBLIC_HEADERS
+    sima_lmm/devkit/cpp/audio_model.hpp
+    sima_lmm/devkit/cpp/audio_preprocessing.hpp
     sima_lmm/devkit/cpp/base_model.hpp
     sima_lmm/devkit/cpp/file_provider.hpp
     sima_lmm/devkit/cpp/chat.hpp

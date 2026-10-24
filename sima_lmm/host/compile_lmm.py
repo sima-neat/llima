@@ -53,6 +53,7 @@ def gen_files(
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None, speculative_block_size: int | None = None,
+    max_audio_duration: int | None = None,
 ):
     enable_verbose_error_messages()
     models = list()
@@ -69,7 +70,8 @@ def gen_files(
         return_logits=return_logits,
         quantize_embeddings=quantize_embeddings,
         quantize_kv_cache=quantize_kv_cache,
-        image_resolution=image_resolution
+        image_resolution=image_resolution,
+        max_audio_duration=max_audio_duration,
     )
     models.append(base_model)
 
@@ -286,6 +288,10 @@ def main():
         help="The width of the input image (for Siglip2 based models)"
     )
     group.add_argument(
+        "--max_audio_duration", type=int, choices=range(1, 31), metavar="SECONDS",
+        help="Maximum audio duration per clip for audio-capable models (1–30 seconds; default: 30)."
+    )
+    group.add_argument(
         "--draft_model_path", type=Path,
         help="Path of the speculative draft/assistant model for the base (target) model."
     )
@@ -430,6 +436,7 @@ def main():
             args.quantize_kv_cache, return_logits, log_level, image_resolution,
             args.draft_model_path, draft_output_path,
             args.speculative_block_size,
+            args.max_audio_duration,
         )
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
         _abort(str(exc))
