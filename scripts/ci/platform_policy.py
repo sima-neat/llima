@@ -44,8 +44,10 @@ def validate_request(manifest: Path, version: str) -> None:
 def patch_setup(path: Path) -> None:
     text = path.read_text()
     old = "a65apps-dev appcomplex-dev simaai-gst-plugins-dev"
-    if text.count(old) != 1:
-        raise ValueError("Pinned SDK package list changed; refusing an unreviewed compatibility patch")
+    if "appcomplex-dev" not in text:
+        return
+    if text.count(old) != 1 or text.count("appcomplex-dev") != 1:
+        raise ValueError("Installed SDK package list is ambiguous; refusing a compatibility patch")
     path.write_text(text.replace(old, "a65apps-dev simaai-gst-plugins-dev"))
 
 

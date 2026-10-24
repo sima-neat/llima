@@ -78,25 +78,26 @@ class PlatformPolicyContracts(unittest.TestCase):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 policy.validate_request(path, version)
 
-    def test_narrow_bootstrap_patch_changes_only_retired_package(self):
+    def test_installed_wrapper_copy_changes_only_retired_package(self):
         path = self.root / "setup-sdk-sysroot.sh"
         before = "prefix\n  a65apps-dev appcomplex-dev simaai-gst-plugins-dev simaai-heap-dev\nsuffix\n"
         path.write_text(before)
         policy.patch_setup(path)
         self.assertEqual(path.read_text(), before.replace("appcomplex-dev ", ""))
-        with self.assertRaisesRegex(ValueError, "unreviewed compatibility patch"):
-            policy.patch_setup(path)
+        fixed = path.read_text()
+        policy.patch_setup(path)
+        self.assertEqual(path.read_text(), fixed)
 
     def test_drifted_sdk_package_list_is_not_patched(self):
         path = self.root / "setup-sdk-sysroot.sh"
-        for count in (0, 2):
+        for count in (2, 3):
             before = "a65apps-dev appcomplex-dev simaai-gst-plugins-dev\n" * count
             path.write_text(before)
             with self.subTest(count=count), self.assertRaises(ValueError):
                 policy.patch_setup(path)
             self.assertEqual(path.read_text(), before)
 
-    def test_bootstrap_release_copy_preserves_image_identity(self):
+    def test_temporary_release_copy_preserves_image_identity(self):
         source, output = self.root / "sdk-release", self.root / "provisioning-release"
         before = ("Platform Base = 3.0.0\nPlatform Version = old-image-revision\n"
             "Platform Channel = daily\nPlatform Repository = https://debian.neat.sima.ai/daily\nOther = unchanged\n")
@@ -174,6 +175,68 @@ class PlatformPolicyContracts(unittest.TestCase):
                      "SYSROOT": str(self.root), "LLIMA_DISPOSABLE_CI": "1"}, capture_output=True, text=True)
             self.assertEqual(result.returncode, exit_code, result.stderr)
             self.assertEqual(invocation.read_text().splitlines(), ["update", receipt] + ([] if exit_code else ["status"]))
+
+    def master_fixture(self, *, retired=True, exit_code=0):
+        wrapper = self.root / "setup-sdk-sysroot.sh"
+        wrapper.write_text("#!/bin/sh\npackages='a65apps-dev " +
+            ("appcomplex-dev " if retired else "") + "simaai-gst-plugins-dev simaai-heap-dev'\n")
+        wrapper.chmod(0o755)
+        release = self.root / "sdk-release"
+        release.write_text("Platform Base = 3.0.0\nPlatform Version = original-image\n"
+            "Platform Channel = daily\nPlatform Repository = https://debian.neat.sima.ai/daily\n")
+        configure = self.root / "configure-apt-repos.sh"
+        configure.write_text('#!/bin/sh\n[ "$SDK_APT_CHANNEL" = pre-release ] || exit 91\n'
+            '[ "$1" = "3.0.0~pre2372" ] || exit 92\nprintf "configure\\n" >> "$INVOCATION"\n')
+        configure.chmod(0o755)
+        updater = self.root / "sysroot"
+        updater.write_text("#!" + sys.executable + "\n" +
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "with open(os.environ['INVOCATION'], 'a') as log: log.write(sys.argv[1]+'\\n')\n"
+            "if sys.argv[1] == 'update':\n"
+            "    wrapper = Path(os.environ['SYSROOT_PLATFORM_SETUP'])\n"
+            "    release = Path(os.environ['SDK_RELEASE_FILE'])\n"
+            "    assert wrapper.is_file() and os.access(wrapper, os.X_OK)\n"
+            "    assert 'appcomplex-dev' not in wrapper.read_text()\n"
+            "    assert 'Platform Channel = pre-release' in release.read_text()\n"
+            "    assert 'Platform Repository = https://debian.neat.sima.ai/pre-release' in release.read_text()\n"
+            "    assert 'Platform Version = original-image' in release.read_text()\n"
+            "    assert sys.argv[2:] == ['3.0.0~pre2372']\n"
+            "    Path(os.environ['OBSERVED']).write_text(json.dumps({'wrapper': str(wrapper), 'release': str(release)}))\n"
+            f"    raise SystemExit({exit_code})\n")
+        updater.chmod(0o755)
+        self.inventory(f"simaai-palette-modalix\tarm64\t{RECEIPT}\t/usr/share\n")
+        environment = {**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}",
+            "SDK_RELEASE_FILE": str(release), "SYSROOT": str(self.root), "LLIMA_DISPOSABLE_CI": "1",
+            "INVOCATION": str(self.root / "invocation"), "OBSERVED": str(self.root / "observed")}
+        return wrapper, release, environment
+
+    def test_master_provisioning_uses_installed_tools_without_changing_them(self):
+        for retired in (True, False):
+            for exit_code in (0, 17):
+                with self.subTest(retired=retired, exit_code=exit_code):
+                    wrapper, release, environment = self.master_fixture(retired=retired, exit_code=exit_code)
+                    originals = wrapper.read_bytes(), release.read_bytes()
+                    (self.root / "invocation").unlink(missing_ok=True)
+                    result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT],
+                        env=environment, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    self.assertEqual((wrapper.read_bytes(), release.read_bytes()), originals)
+                    expected = ["configure", "update"] + ([] if exit_code else ["status"])
+                    self.assertEqual((self.root / "invocation").read_text().splitlines(), expected)
+                    observed = json.loads((self.root / "observed").read_text())
+                    self.assertFalse(Path(observed["wrapper"]).exists())
+                    self.assertFalse(Path(observed["release"]).exists())
+
+    def test_ambiguous_installed_wrapper_refuses_before_sdk_commands(self):
+        wrapper, release, environment = self.master_fixture()
+        wrapper.write_text(wrapper.read_text() + "# duplicate appcomplex-dev request\n")
+        originals = wrapper.read_bytes(), release.read_bytes()
+        result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT],
+            env=environment, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ambiguous", result.stderr)
+        self.assertFalse((self.root / "invocation").exists())
+        self.assertEqual((wrapper.read_bytes(), release.read_bytes()), originals)
 
     def test_provisioning_requires_explicit_disposable_ci_admission(self):
         invocation = self.root / "invocation"

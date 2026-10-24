@@ -6,7 +6,7 @@
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
-    "docs/setup.md": "393b74792e835a1ff9fa6e8a657182e7bbdf4f781573b92a85d8a15d85d350f4"
+    "docs/setup.md": "ed34e9fa77e14282891bdfdf1904dd33d9e9336a2b4122d92edeb11fbf2c2533"
   },
   "ko": {
     "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
@@ -15,7 +15,7 @@
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
-    "docs/setup.md": "393b74792e835a1ff9fa6e8a657182e7bbdf4f781573b92a85d8a15d85d350f4"
+    "docs/setup.md": "ed34e9fa77e14282891bdfdf1904dd33d9e9336a2b4122d92edeb11fbf2c2533"
   },
   "uk": {
     "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
@@ -24,7 +24,7 @@
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
-    "docs/setup.md": "393b74792e835a1ff9fa6e8a657182e7bbdf4f781573b92a85d8a15d85d350f4"
+    "docs/setup.md": "ed34e9fa77e14282891bdfdf1904dd33d9e9336a2b4122d92edeb11fbf2c2533"
   },
   "zh-Hant": {
     "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
@@ -33,6 +33,6 @@
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",
     "docs/runtime.md": "4ca0291d556976f17308653f23fd35e23782c2da3ec2fb80adb6754ce5c19484",
-    "docs/setup.md": "393b74792e835a1ff9fa6e8a657182e7bbdf4f781573b92a85d8a15d85d350f4"
+    "docs/setup.md": "ed34e9fa77e14282891bdfdf1904dd33d9e9336a2b4122d92edeb11fbf2c2533"
   }
 }

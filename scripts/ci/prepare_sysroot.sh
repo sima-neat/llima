@@ -11,34 +11,22 @@ python3 "$ci_dir/platform_policy.py" request --manifest "$manifest" --version "$
 if [[ ! "$version" =~ ^3\.0\.0~pre[0-9]+$ ]]; then
   sysroot update "$version"
 else
-  [[ "${EUID}" == 0 ]] || { echo 'CI sysroot provisioning requires root' >&2; exit 1; }
-  [[ -f /etc/sdk-release ]] || { echo 'Run inside a Modalix SDK container' >&2; exit 1; }
-  # Current SDK helpers support master Agate, but still request appcomplex-dev.
-  # Keep this temporary bundle immutable and patch only that retired request.
-  sdk_commit=2c325eeb1f0e4551ac32f2b9ef53a4cc18a07ccf
-  sdk_archive_sha256=acb57f5fc634500897689e937de2241acf3589ffbf5e977c600701153ee33ca8
+  sdk_release="${SDK_RELEASE_FILE:-/etc/sdk-release}"
+  [[ -f "$sdk_release" ]] || { echo 'Run inside a Modalix SDK container' >&2; exit 1; }
+  for tool in setup-sdk-sysroot.sh configure-apt-repos.sh sysroot; do
+    command -v "$tool" >/dev/null || { echo "Required installed SDK tool is missing: $tool" >&2; exit 1; }
+  done
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
-  # Validate the image receipt before downloading or installing the helper bundle.
-  python3 "$ci_dir/platform_policy.py" release /etc/sdk-release "$work/sdk-release"
-  curl --fail --location --silent --show-error --retry 3 \
-    "https://github.com/sima-neat/sdk/archive/${sdk_commit}.tar.gz" -o "$work/sdk.tar.gz"
-  printf '%s  %s\n' "$sdk_archive_sha256" "$work/sdk.tar.gz" | sha256sum --check -
-  mkdir "$work/source"
-  tar -xf "$work/sdk.tar.gz" --strip-components=1 -C "$work/source"
-  python3 "$ci_dir/platform_policy.py" patch-setup "$work/source/scripts/setup-sdk-sysroot.sh"
-  for script in configure-apt-repos.sh setup-sdk-sysroot.sh validate-sysroot-package-versions.sh \
-    install-sysroot-overlay.sh sysroot-directory.py; do
-    install -m 755 "$work/source/scripts/$script" "/usr/local/bin/$script"
-  done
-  install -m 755 "$work/source/scripts/sysroot.sh" /usr/local/bin/sysroot
-  install -m 755 "$work/source/scripts/simaai_setup_sdk.py" /opt/bin/simaai_setup_sdk.py
-  install -m 644 "$work/source/config/platform-package-patterns.txt" \
-    /usr/local/share/sima-sdk/platform-package-patterns.txt
+  python3 "$ci_dir/platform_policy.py" release "$sdk_release" "$work/sdk-release"
+  # Keep installed SDK tools unchanged. Only a temporary wrapper copy omits the
+  # retired package request; an already-fixed installed wrapper needs no patch.
+  cp -p "$(command -v setup-sdk-sysroot.sh)" "$work/setup-sdk-sysroot.sh"
+  python3 "$ci_dir/platform_policy.py" patch-setup "$work/setup-sdk-sysroot.sh"
   export SDK_APT_CHANNEL=pre-release
   configure-apt-repos.sh "$version"
-  # Select the new repository without rewriting the image's original receipt.
-  SDK_RELEASE_FILE="$work/sdk-release" sysroot update "$version"
+  SDK_RELEASE_FILE="$work/sdk-release" \
+    SYSROOT_PLATFORM_SETUP="$work/setup-sdk-sysroot.sh" sysroot update "$version"
 fi
 python3 "$ci_dir/platform_policy.py" inventory --version "$version" \
   --sysroot "${SYSROOT:-/opt/toolchain/aarch64/modalix}"
