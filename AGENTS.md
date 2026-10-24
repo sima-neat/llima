@@ -3,6 +3,15 @@
 Use the relevant sections of the [Contributor Guide](docs/contributing.md) for
 setup, graph development, validation commands, and contribution policy.
 
+## Issues and Pull Requests
+
+- Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.md) for defects
+  and the [feature request template](.github/ISSUE_TEMPLATE/feature_request.md)
+  for proposed improvements. Complete the relevant sections and redact secrets
+  from logs and reproduction details.
+- Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md) for PRs,
+  target `develop`, and link completed issues with `Fixes #<issue>`.
+
 ## Before Editing
 
 1. Classify the primary surface:

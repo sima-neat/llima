@@ -449,6 +449,11 @@ sima-cli playbooks install ./skills
 The install summary must report `detected: 3`, `valid: 3`, and `discarded: 0`.
 The `sima-cli` version must satisfy `min_cli_version` in each `playbook.yml`.
 
+For issues, use the [bug report template](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)
+for defects and the [feature request template](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)
+for proposed improvements. Complete the relevant sections and redact secrets
+from logs and reproduction details.
+
 For pull requests:
 
 - branch from and target current `develop`;
