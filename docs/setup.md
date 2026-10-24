@@ -27,24 +27,7 @@ With 128GB machine, compilation can take several hours to complete depends on th
 
 ### CI sysroot selection
 
-`deps/manifest.json` selects the firmware target `3.0.0_master_B2372`; CI resolves
-the matching master sysroot receipt `3.0.0~pre2372`. Develop receipts such as
-`3.0.0~git202610140145.e5ece50-2121` remain supported. `sdk.channel` selects the
-SDK toolchain image and is independent of the platform build channel.
-
-CI calls `scripts/ci/prepare_sysroot.sh` in its disposable SDK container.
-CI validates the shared resolver output against the firmware declaration before
-provisioning. Master 3.0 receipts use the SDK-owned transactional installer, pinned
-to SDK commit `2c325eeb1f0e4551ac32f2b9ef53a4cc18a07ccf` with an archive checksum,
-to provision from the pre-release Agate repository. Current SDK development
-helpers support master receipts but still request the retired `appcomplex-dev`
-package; the CI helper removes only that request from the pinned installer. This
-temporary compatibility step should be retired once the SDK package selection
-is fixed. The original SDK image receipt is preserved; the active overlay and
-package inventory record the exact selected sysroot. Provisioning fails if that
-inventory does not contain exactly the resolved platform version.
-
-This helper is for disposable CI containers, not active developer environments.
-LLiMa continues to use platform libraries directly; it does not depend on
-Internals packages. Building against this sysroot does not qualify a DevKit or
-update its firmware.
+`deps/manifest.json` declares `elxr_version`. Shared workflows resolve the matching
+`SYSROOT_VERSION` and select an exact-firmware DevKit, with fallback disabled.
+CI provisions the resolved sysroot using the SDK image's installed tools in a
+disposable container and verifies the resulting package inventory.

@@ -24,20 +24,6 @@ Model Compiler 需要安裝在一台符合以下要求的機器上。
 
 ### CI sysroot 選擇
 
-`deps/manifest.json` 選擇韌體目標 `3.0.0_master_B2372`，CI 會解析相符的
-master sysroot 版本記錄 `3.0.0~pre2372`。
-`3.0.0~git202610140145.e5ece50-2121` 等 develop 版本記錄仍受支援。
-`sdk.channel` 選擇 SDK 工具鏈映像，與平台建置通道無關。
-
-CI 在拋棄式 SDK 容器中呼叫 `scripts/ci/prepare_sysroot.sh`。
-準備前會驗證共用解析器輸出是否符合韌體宣告。master 3.0 版本使用 SDK 管理的
-交易式安裝程式，固定至 SDK 提交 `2c325eeb1f0e4551ac32f2b9ef53a4cc18a07ccf` 並以封存檔
-檢查碼驗證，從 pre-release Agate 儲存庫準備環境。目前 SDK 開發版輔助程式支援
-master 版本，但仍會要求已停用的 `appcomplex-dev` 套件；CI 輔助程式只會從固定版本的
-安裝程式移除該要求。SDK 套件選擇修正後，應移除此暫時性的相容處理。
-原始 SDK 映像記錄會保留；使用中的覆疊與套件清單會記錄選定的確切 sysroot。
-若該清單未包含解析器選定的確切平台版本，準備作業便會失敗。
-
-此輔助程式僅用於拋棄式 CI 容器，不適用於使用中的開發環境。
-LLiMa 仍直接使用平台函式庫，不依賴 Internals 套件。使用此 sysroot 建置並不代表
-已完成 DevKit 驗證，也不會更新其韌體。
+`deps/manifest.json` 宣告 `elxr_version`。共用工作流程會解析相符的
+`SYSROOT_VERSION`，並停用版本退回，選擇韌體完全相符的 DevKit。
+CI 在拋棄式容器中使用 SDK 映像已安裝的工具準備指定的 sysroot，並驗證產生的套件清單。
