@@ -1,7 +1,7 @@
 {
   "ja": {
     "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
-    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
+    "docs/contributing.md": "e0069abd777206a310c82053a3b1c41fc6141db18b8968a184c2d4b3366c68bf",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",
@@ -10,7 +10,7 @@
   },
   "ko": {
     "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
-    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
+    "docs/contributing.md": "e0069abd777206a310c82053a3b1c41fc6141db18b8968a184c2d4b3366c68bf",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",
@@ -19,7 +19,7 @@
   },
   "uk": {
     "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
-    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
+    "docs/contributing.md": "e0069abd777206a310c82053a3b1c41fc6141db18b8968a184c2d4b3366c68bf",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",
@@ -28,7 +28,7 @@
   },
   "zh-Hant": {
     "docs/compilation_genai.md": "2777c5291c9844ca30fcdf207fbc74515d9f6f0b28025a69defc7293300abd11",
-    "docs/contributing.md": "d2ffabaebafff71e602984d804b952e91470b636d965d234081a9d6791c1e0d2",
+    "docs/contributing.md": "e0069abd777206a310c82053a3b1c41fc6141db18b8968a184c2d4b3366c68bf",
     "docs/deployment.md": "756f07d97cda3f1bd62d9cc238db121b6cdd460be118b06bbad820ec94ab8713",
     "docs/index.md": "9841ef9b9eb429ef61c70198ab43ba5c49d42e176005bbf7c6569fa68f67434e",
     "docs/mole.md": "6b6573aff1cff7c26990193b4cdcd25070a755a0cceb00af3c629157698ecb4b",

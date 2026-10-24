@@ -298,6 +298,10 @@ sima-cli playbooks install ./skills
 安裝摘要必須報告 `detected: 3`、`valid: 3` 和 `discarded: 0`。
 每個 `playbook.yml` 中的 `sima-cli` 版本必須滿足 `min_cli_version`。
 
+回報缺陷時，請使用[錯誤回報範本](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)；
+提出改善建議時，請使用[功能請求範本](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)。
+請填寫相關欄位，並移除日誌和重現步驟中的機密資訊。
+
 對於提交的程式碼變更：
 
 - 從目前的分支切換到並以目前的分支作為目標分支：`develop`；

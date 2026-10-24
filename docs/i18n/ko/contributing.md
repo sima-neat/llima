@@ -298,6 +298,10 @@ sima-cli playbooks install ./skills
 설치 요약에는 `detected: 3`, `valid: 3` 및 `discarded: 0`가 반드시 포함되어야 합니다.
 각 `playbook.yml`에서 `sima-cli` 버전은 `min_cli_version`을 충족해야 합니다.
 
+결함을 보고할 때는 [버그 보고 템플릿](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)을,
+개선을 제안할 때는 [기능 요청 템플릿](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)을 사용하세요.
+해당 항목을 작성하고 로그와 재현 절차에서 비밀 정보를 삭제하세요.
+
 풀 리퀘스트의 경우:
 
 - 현재 `develop` 브랜치에서 분기하여 해당 브랜치를 대상으로 함

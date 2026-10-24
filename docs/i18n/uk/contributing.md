@@ -306,6 +306,10 @@ sima-cli playbooks install ./skills
 Звіт про встановлення має містити інформацію про те, що було `detected: 3`, що було `valid: 3` і що було `discarded: 0`.
 Версія `sima-cli` має відповідати вимогам `min_cli_version` у кожному файлі `playbook.yml`.
 
+Для повідомлень про дефекти використовуйте [шаблон звіту про помилку](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md),
+а для пропозицій покращень — [шаблон запиту функції](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md).
+Заповніть відповідні розділи та видаліть секретні дані з журналів і кроків відтворення.
+
 Для запитів на внесення змін:
 
 - створіть гілку на основі та націльте її на поточну гілку `develop`;

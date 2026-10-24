@@ -298,6 +298,10 @@ sima-cli playbooks install ./skills
 インストール概要には、`detected: 3`、`valid: 3`、および`discarded: 0`の結果を必ず含めてください。
 各`playbook.yml`において、`sima-cli`のバージョンは、`min_cli_version`を満たしている必要があります。
 
+問題を報告する場合は[バグ報告テンプレート](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)、
+改善を提案する場合は[機能リクエストテンプレート](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)を使用してください。
+該当する項目を記入し、ログや再現手順から機密情報を削除してください。
+
 プルリクエストの場合：
 
 - 現在の`develop`から分岐させ、それをターゲットとする。
