@@ -69,20 +69,15 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
         workflow = read(".github/workflows/vulcan-ci.yml")
 
         self.assertEqual(manifest["platform-version"], "3.0.0")
+        self.assertNotIn("sysroot-version", manifest)
+        self.assertEqual(manifest["elxr_version"], "3.0.0_master_B2372")
         self.assertRegex(
-            manifest["sysroot-version"],
-            r"^3[.]0[.]0~git[0-9]{12}[.][0-9a-f]{7,40}-[0-9]+$",
+            manifest["elxr_version"],
+            r"^3[.]0[.]0_(?:master|develop)_B[1-9][0-9]*$",
         )
-        self.assertIn('["sysroot-version"]', workflow)
-        self.assertIn(
-            'if [[ "${sdk_platform_version}" != "${sysroot_version}" ]]', workflow
-        )
-        self.assertIn(
-            'setup-sdk-sysroot.sh "${sysroot_version}" "${SDK_PKG_LIST:-}"',
-            workflow,
-        )
-        self.assertIn('"Platform Revision = ${sysroot_version}"', workflow)
-        self.assertNotIn('sysroot update "${sysroot_version}"', workflow)
+        self.assertIn("needs.resolve-sysroot.outputs.sysroot_version", workflow)
+        self.assertIn('/workspace/scripts/ci/prepare_sysroot.sh "${sysroot_version}"', workflow)
+        self.assertNotIn('SDK_APT_CHANNEL=daily', workflow)
         self.assertIn("MACHINE=modalix", installer)
         self.assertIn('actual="$(read_devkit_platform_version', installer)
         self.assertIn('if [[ "${actual}" != "${expected}" ]]', installer)
@@ -100,4 +95,12 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
     def test_devkit_runtime_uses_16_gib_modalix_som_runner(self) -> None:
         workflow = read(".github/workflows/vulcan-ci.yml")
 
-        self.assertIn("        - modalix-som-16gig\n", workflow)
+        resolver = workflow.split("  resolve-test-runner:", 1)[1].split("  build:", 1)[0]
+        runtime = workflow.split("  test-devkit:", 1)[1]
+        self.assertIn('"modalix-som-16gig"', resolver)
+        self.assertIn("allow-version-fallback: false", resolver)
+        self.assertIn("fromJSON(needs.resolve-test-runner.outputs.runner_labels)", runtime)
+        self.assertIn("needs.resolve-test-runner.outputs.modalix_runner_group", runtime)
+        self.assertLess(runtime.index("Verify selected DevKit firmware"), runtime.index("Install exact root artifact"))
+        self.assertIn("scripts/ci/platform_policy.py firmware", runtime)
+        self.assertIn("LLIMA_DISPOSABLE_CI=1", workflow)
