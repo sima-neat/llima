@@ -50,17 +50,6 @@ runtime packages.
 
 ### Runtime and packaging
 
-The exact firmware target is `elxr_version` in `deps/manifest.json` (currently
-`3.0.0_master_B2372`). CI calls the shared `.github` `resolve-sysroot.yml` workflow
-to resolve the matching APT platform package version, then provisions the disposable
-SDK container with that exact `SYSROOT_VERSION`. The resolver uses the SHA-256
-package-index reference from APT `Release` metadata and fails on missing or
-ambiguous matches. The resulting `sysroot-resolution` artifact records the chosen
-version and index checksum. The old manifest `sysroot-version` field is no longer
-accepted in this repository; do not specify both fields. Local CI helper invocation
-requires the resolver output explicitly; it never falls back to the old pin. This
-does not update DevKit firmware.
-
 Use the Neat SDK as the supported build environment. Build all runtime packages
 and packaged tests with:
 
@@ -475,14 +464,3 @@ A contribution is ready when affected tests pass without unintended skips,
 required package and Modalix checks complete or are explicitly unavailable,
 compatibility and docs are addressed, and the PR contains reproducible
 evidence.
-
-### CI firmware runner selection
-
-CI uses the shared Modalix runner resolver with `elxr_version` from
-`deps/manifest.json`. The current branch requires an exact firmware label
-(`allow-version-fallback: false`) in addition to the hardware and environment
-labels. The selected runner checks its actual firmware before LLiMa runs its
-existing runtime tests.
-The reusable workflow uses the Release Engineering App through the
-`NEAT_RELEASES_APP_ID` and `NEAT_RELEASES_APP_PRIVATE_KEY` Actions secrets.
-The App requires organization self-hosted-runners read access. Selection never updates firmware.

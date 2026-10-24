@@ -39,15 +39,6 @@ sima-cli playbooks install \
 
 ### 執行階段和封裝
 
-確切的韌體目標由 `deps/manifest.json` 中的 `elxr_version` 指定，目前為
-`3.0.0_master_B2372`。CI 會呼叫共用 `.github` 的 `resolve-sysroot.yml` 工作流程，
-解析相符的 APT 平台套件版本，再使用該確切的 `SYSROOT_VERSION` 準備拋棄式 SDK 容器。
-解析器使用 APT `Release` 中繼資料的 SHA-256 套件索引參照；若找不到相符項目或有多個
-相符項目便會失敗。`sysroot-resolution` 成品會記錄選定版本與索引檢查碼。
-此儲存庫不再接受舊的 `sysroot-version` 欄位，請勿同時指定兩個欄位。
-在本機呼叫 CI 輔助程式也必須明確提供解析器輸出，不會退回舊的固定版本。
-此過程不會更新 DevKit 韌體。
-
 請使用 Neat SDK 作為支援的建置環境。建置所有執行階段套件和封裝的測試：
 
 ```bash
@@ -318,12 +309,3 @@ sima-cli playbooks install ./skills
 - 排除憑證和私人資產。
 
 當相關測試在沒有意外跳過的情況下通過，所需套件和 Modalix 檢查完成或明確指出無法使用，且已處理相容性和檔案問題，並且 PR 包含可重複驗證的證據時，即表示貢獻已準備就緒。
-
-### CI 韌體執行器選擇
-
-CI 使用 `deps/manifest.json` 的 `elxr_version` 呼叫共用 Modalix 執行器解析器。
-除了硬體及環境標籤外，還必須符合確切的韌體標籤
-（`allow-version-fallback: false`）。選定的執行器會先檢查實際韌體，再執行 LLiMa
-現有的執行階段測試。可重複使用的工作流程透過 Actions 機密值
-`NEAT_RELEASES_APP_ID` 與 `NEAT_RELEASES_APP_PRIVATE_KEY` 使用 Release Engineering App。
-該 App 需要組織自架執行器的讀取權限。此選擇過程不會更新韌體。

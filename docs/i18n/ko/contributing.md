@@ -39,16 +39,6 @@ sima-cli playbooks install \
 
 ### 런타임 및 패키징
 
-정확한 펌웨어 대상은 `deps/manifest.json`의 `elxr_version`으로 지정하며, 현재 값은
-`3.0.0_master_B2372`입니다. CI는 공유 `.github`의 `resolve-sysroot.yml` 워크플로로
-일치하는 APT 플랫폼 패키지 버전을 찾은 뒤, 해당 정확한 `SYSROOT_VERSION`으로 일회용
-SDK 컨테이너를 준비합니다. 리졸버는 APT `Release` 메타데이터의 SHA-256 패키지 인덱스
-참조를 사용하며, 일치 항목이 없거나 여러 개이면 실패합니다. `sysroot-resolution`
-아티팩트에는 선택한 버전과 인덱스 체크섬이 기록됩니다. 기존 매니페스트 필드
-`sysroot-version`은 이 저장소에서 더 이상 허용하지 않으므로 두 필드를 함께 지정하지 마세요.
-CI 헬퍼를 로컬에서 호출할 때도 리졸버 출력을 명시해야 하며, 이전 고정 버전으로
-폴백하지 않습니다. 이 과정은 DevKit 펌웨어를 업데이트하지 않습니다.
-
 지원되는 빌드 환경으로 Neat SDK를 사용하세요. 모든 런타임 패키지와 패키지화된 테스트를 다음 명령어로 빌드합니다.
 
 ```bash
@@ -321,13 +311,3 @@ sima-cli playbooks install ./skills
 예상치 않은 건너뛰기 없이 관련 테스트가 통과하고, 필수 패키지 및 Modalix
 검사가 완료되거나 사용할 수 없음이 명시되며, 호환성과 문서 문제가 해결되고,
 PR에 재현 가능한 증거가 포함되면 기여할 준비가 된 것입니다.
-
-### CI 펌웨어별 러너 선택
-
-CI는 `deps/manifest.json`의 `elxr_version`으로 공유 Modalix 러너 리졸버를 호출합니다.
-하드웨어 및 환경 레이블에 더해 정확한 펌웨어 레이블을 요구합니다
-(`allow-version-fallback: false`). 선택된 러너는 LLiMa의 기존 런타임 테스트를 실행하기 전에
-실제 펌웨어를 확인합니다. 재사용 워크플로는 Actions 비밀 값 `NEAT_RELEASES_APP_ID`와
-`NEAT_RELEASES_APP_PRIVATE_KEY`를 통해 Release Engineering App을 사용합니다.
-App에는 조직의 자체 호스팅 러너에 대한 읽기 권한이 필요합니다. 러너 선택은
-펌웨어를 업데이트하지 않습니다.
