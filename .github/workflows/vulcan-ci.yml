@@ -237,6 +237,9 @@ jobs:
             echo "Resolved archive name: ${ARCHIVE_NAME}"
 
             echo "::group::Build Debian packages"
+            # Complete pending host package configuration in this disposable SDK
+            # before build.sh installs prerequisites. Never alter the target sysroot.
+            sudo env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
             ./build.sh --install-deps-only
             ./build.sh --all --clean
             echo "::endgroup::"
