@@ -315,3 +315,14 @@ sima-cli playbooks install ./skills
 예상치 않은 건너뛰기 없이 관련 테스트가 통과하고, 필수 패키지 및 Modalix
 검사가 완료되거나 사용할 수 없음이 명시되며, 호환성과 문서 문제가 해결되고,
 PR에 재현 가능한 증거가 포함되면 기여할 준비가 된 것입니다.
+
+## SDK 패키지 잠금 처리
+
+CI의 SDK 호스트 패키지 작업은 `sima-neat/.github@main`의 공유 헬퍼를 사용합니다.
+이 헬퍼는 확인된 dpkg/APT 잠금 경합에 대해서만 작업당 최대 120초 동안 재시도하며,
+경합 시 잠금 소유자와 프로세스 진단 정보를 제공합니다.
+관련 없는 오류는 즉시 실패로 처리하며, 잠금 파일과 잠금을 보유한 프로세스는 그대로 둡니다.
+헬퍼는 대상 sysroot나 DevKit 패키지 데이터베이스를 관리하지 않습니다.
+로컬 CI 설정 스크립트에서는 검토된 공유 체크아웃에 있는 `scripts/sdk-package.sh`의
+절대 경로를 `SDK_PACKAGE_HELPER`로 설정하세요.
+[공유 헬퍼 규약](https://github.com/sima-neat/.github/tree/main/actions/setup-sdk-package-helper)을 참조하세요.
