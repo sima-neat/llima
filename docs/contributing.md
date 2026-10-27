@@ -472,8 +472,8 @@ evidence.
 
 ## SDK package lock handling
 
-CI SDK host package operations use the revision-pinned helper from
-`sima-neat/.github`. It retries only recognized dpkg/APT lock contention for up
+CI SDK host package operations use the shared helper from
+`sima-neat/.github@main`. It retries only recognized dpkg/APT lock contention for up
 to 120 seconds per operation, with owner/process diagnostics on contention.
 Unrelated errors fail immediately; lock files and lock owners are left intact.
 The helper does not manage the target sysroot or DevKit package database.
