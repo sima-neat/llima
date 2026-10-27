@@ -190,6 +190,9 @@ jobs:
           exit 1
         fi
 
+        # Configure only the selected disposable SDK, never its target sysroot.
+        "${SDK_PACKAGE_HELPER:?Shared SDK package helper required}" "${sdk_container}" configure
+
         docker exec \
           -e SYSROOT_VERSION="${{ needs.resolve-sysroot.outputs.sysroot_version }}" \
           -e LLIMA_DISPOSABLE_CI=1 \
@@ -237,9 +240,6 @@ jobs:
             echo "Resolved archive name: ${ARCHIVE_NAME}"
 
             echo "::group::Build Debian packages"
-            # Complete pending host package configuration in this disposable SDK
-            # before build.sh installs prerequisites. Never alter the target sysroot.
-            sudo env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
             ./build.sh --install-deps-only
             ./build.sh --all --clean
             echo "::endgroup::"
