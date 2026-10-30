@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +17,33 @@ def read(path: str) -> str:
 
 
 class PlatformPackageBoundaryTest(unittest.TestCase):
+    def test_cpack_scratch_stays_outside_published_dist(self):
+        source = read('build.sh')
+        block = source[source.index('CPACK_OUTPUT_DIR='):source.index('echo "[build] Generated packages:')]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'dist/_CPack_Packages/stale').mkdir(parents=True)
+            (root / 'dist/_CPack_Packages/stale/empty.py').touch()
+            (root / 'build').mkdir()
+            (root / 'bin').mkdir()
+            cpack = root / 'bin/cpack'
+            cpack.write_text('#!/bin/bash\nset -eu\n'
+                'for argument in "$@"; do\n'
+                '  case "$argument" in CPACK_PACKAGE_DIRECTORY=*) output="${argument#*=}";; esac\n'
+                'done\n'
+                'mkdir -p "$output/_CPack_Packages/staging"\n'
+                ': > "$output/_CPack_Packages/staging/empty.py"\n'
+                'for component in core dev cli; do printf "fixture package" > "$output/sima-lmm-0.6.0-Linux-$component.deb"; done\n')
+            cpack.chmod(0o755)
+            script = 'set -euo pipefail\nCOMPONENTS=()\n' + block
+            result = subprocess.run(['bash', '-c', script], text=True, capture_output=True,
+                env={**os.environ, 'ROOT_DIR': str(root), 'BUILD_DIR': str(root / 'build'),
+                     'PATH': str(root / 'bin') + ':' + os.environ['PATH']})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sorted(p.name for p in (root / 'dist').iterdir()),
+                ['sima-lmm-0.6.0-Linux-cli.deb', 'sima-lmm-0.6.0-Linux-core.deb', 'sima-lmm-0.6.0-Linux-dev.deb'])
+            self.assertTrue((root / 'build/packages/_CPack_Packages/staging/empty.py').is_file())
+
     def test_runtime_uses_platform_libraries_without_neat_internals(self) -> None:
         cmake = read("CMakeLists.txt")
         build = read("build.sh")
@@ -70,7 +100,7 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
 
         self.assertEqual(manifest["platform-version"], "3.0.0")
         self.assertNotIn("sysroot-version", manifest)
-        self.assertEqual(manifest["elxr_version"], "3.0.0_master_B2372")
+        self.assertEqual(manifest["elxr_version"], "3.0.0_master_B2499")
         self.assertRegex(
             manifest["elxr_version"],
             r"^3[.]0[.]0_(?:master|develop)_B[1-9][0-9]*$",

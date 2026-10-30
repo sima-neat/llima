@@ -1,8 +1,9 @@
 {
   "sdk": {
-    "channel": "develop"
+    "channel": "develop",
+    "sysroot-version": "3.0.0"
   },
   "package-version": "0.6.0",
   "platform-version": "3.0.0",
-  "elxr_version": "3.0.0_master_B2372"
+  "elxr_version": "3.0.0_master_B2499"
 }
