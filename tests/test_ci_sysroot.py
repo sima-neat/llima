@@ -37,8 +37,51 @@ class PlatformPolicyContracts(unittest.TestCase):
         return path
 
     def test_current_declaration_requires_matching_derived_receipt(self):
-        policy.validate_request(ROOT / "deps/manifest.json", RECEIPT)
-        self.assertEqual(policy.declaration(ROOT / "deps/manifest.json"), FIRMWARE)
+        policy.validate_request(ROOT / "deps/manifest.json", '3.0.0')
+        self.assertEqual(policy.declaration(ROOT / "deps/manifest.json"), '3.0.0_master_B2499')
+        with self.assertRaises(ValueError):
+            policy.validate_request(ROOT / "deps/manifest.json", '3.0.0~pre2499')
+
+    def test_official_release_checks_cache_without_running_update(self):
+        root = self.root / 'sysroot'
+        inventory = root / 'var/lib/sima-sdk/sysroot-packages.tsv'
+        inventory.parent.mkdir(parents=True)
+        inventory.write_text('simaai-palette-modalix\tarm64\t3.0.0\t/usr\n'
+                             'simaai-base-files-modalix\tall\t3.0.0\t/etc\n')
+        (root / 'usr/include').mkdir(parents=True)
+        (root / 'etc').mkdir()
+        firmware = root / 'etc/packageinfo'
+        firmware.write_text('SIMA_PACKAGE_VERSION = 3.0.0_master_B2499\n')
+        release = self.root / 'sdk-release'
+        release.write_text('Platform Version = 3.0.0\nPlatform Base = 3.0.0\nPlatform Channel = release\n')
+        marker = self.root / 'calls'
+        tool = self.root / 'sysroot-command'
+        bindir = self.root / 'bin'; bindir.mkdir()
+        tool = bindir / 'sysroot'
+        tool.write_text('#!/bin/sh\necho "$*" >> "$INVOCATION"\n[ "$1" = status ]\n')
+        tool.chmod(0o755)
+        env = {**os.environ, 'PATH': str(bindir) + ':' + os.environ['PATH'],
+               'SYSROOT': str(root), 'SDK_RELEASE_FILE': str(release),
+               'LLIMA_DISPOSABLE_CI': '1', 'INVOCATION': str(marker)}
+        def run():
+            return subprocess.run(['bash', str(ROOT / 'scripts/ci/prepare_sysroot.sh'), '3.0.0'],
+                                  env=env, text=True, capture_output=True)
+        result = run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(marker.read_text().splitlines(), ['status'])
+        for change in ('firmware', 'inventory', 'overlay', 'receipt'):
+            before = firmware.read_text(), inventory.read_text(), release.read_text()
+            overlay = inventory.parent / 'sysroot-overlay'
+            if change == 'firmware': firmware.write_text('SIMA_PACKAGE_VERSION = 3.0.0_master_B2372\n')
+            if change == 'inventory': inventory.write_text(inventory.read_text().replace('3.0.0', '3.0.1'))
+            if change == 'overlay': overlay.mkdir()
+            if change == 'receipt': release.write_text(release.read_text() + 'Platform Base = 3.0.0\n')
+            marker.unlink(missing_ok=True)
+            with self.subTest(change=change):
+                self.assertNotEqual(run().returncode, 0)
+                self.assertFalse(marker.exists())
+            firmware.write_text(before[0]); inventory.write_text(before[1]); release.write_text(before[2])
+            if overlay.exists(): overlay.rmdir()
 
     def test_invalid_or_dual_declarations_are_refused(self):
         for changes in [
@@ -217,7 +260,7 @@ class PlatformPolicyContracts(unittest.TestCase):
                     wrapper, release, environment = self.master_fixture(retired=retired, exit_code=exit_code)
                     originals = wrapper.read_bytes(), release.read_bytes()
                     (self.root / "invocation").unlink(missing_ok=True)
-                    result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT],
+                    result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT, str(self.manifest())],
                         env=environment, capture_output=True, text=True)
                     self.assertEqual(result.returncode, exit_code, result.stderr)
                     self.assertEqual((wrapper.read_bytes(), release.read_bytes()), originals)
@@ -231,7 +274,7 @@ class PlatformPolicyContracts(unittest.TestCase):
         wrapper, release, environment = self.master_fixture()
         wrapper.write_text(wrapper.read_text() + "# duplicate appcomplex-dev request\n")
         originals = wrapper.read_bytes(), release.read_bytes()
-        result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT],
+        result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT, str(self.manifest())],
             env=environment, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ambiguous", result.stderr)
@@ -243,7 +286,7 @@ class PlatformPolicyContracts(unittest.TestCase):
         updater = self.root / "sysroot"
         updater.write_text('#!/bin/sh\ntouch "$INVOCATION"\n')
         updater.chmod(0o755)
-        result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT],
+        result = subprocess.run(["bash", str(ROOT / "scripts/ci/prepare_sysroot.sh"), RECEIPT, str(self.manifest())],
             env={**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}", "INVOCATION": str(invocation),
                  "LLIMA_DISPOSABLE_CI": ""}, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)

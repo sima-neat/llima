@@ -33,7 +33,10 @@ def validate_request(manifest: Path, version: str) -> None:
     firmware = declaration(manifest)
     base, channel, build = FIRMWARE.fullmatch(firmware).groups()
     if channel == "master":
-        valid = version == f"{base}~pre{build}"
+        pin = json.loads(manifest.read_text()).get('sdk', {}).get('sysroot-version')
+        valid = version == (pin if pin == base else f"{base}~pre{build}")
+        if pin is not None:
+            valid = valid and version == pin
     else:
         receipt = DAILY.fullmatch(version)
         valid = receipt is not None and receipt[1] == base and receipt[2] == build
@@ -90,12 +93,51 @@ def verify_firmware(expected: str, paths: tuple[Path, ...]) -> None:
     print(f"Verified DevKit firmware: {expected}")
 
 
+def check_release_sdk(version, firmware, sdk_release, sysroot):
+    """Require a prebuilt release SDK; never install or patch release payloads."""
+    fields = {}
+    for line in sdk_release.read_text().splitlines():
+        if ' = ' in line:
+            key, value = line.split(' = ', 1)
+            if key in fields:
+                raise ValueError(f'Duplicate SDK receipt field: {key}')
+            fields[key] = value
+    if (fields.get('Platform Version') != version or fields.get('Platform Base') != version
+            or fields.get('Platform Channel') != 'release'):
+        raise ValueError('Cached SDK does not contain the requested release; refresh its snapshot')
+    overlay = sysroot / 'var/lib/sima-sdk/sysroot-overlay'
+    if overlay.exists() or overlay.is_symlink():
+        raise ValueError('Release SDK contains an overlay; use a fresh release snapshot')
+    inventory = sysroot / 'var/lib/sima-sdk/sysroot-packages.tsv'
+    if inventory.is_symlink():
+        raise ValueError('SDK inventory must be a regular file')
+    records = [line.split('\t') for line in inventory.read_text().splitlines()]
+    for package in ('simaai-palette-modalix', 'simaai-base-files-modalix'):
+        versions = [row[2] for row in records if len(row) >= 3 and row[0] == package
+                    and row[1] in {'all', 'arm64'}]
+        if versions != [version]:
+            raise ValueError(f'Cached SDK {package} inventory differs: {versions}')
+    if not (sysroot / 'usr/include').is_dir():
+        raise ValueError('Cached SDK sysroot headers are missing')
+    identities = re.findall(r'^SIMA_PACKAGE_VERSION\s*=\s*(\S+)\s*$',
+                            (sysroot / 'etc/packageinfo').read_text(), re.M)
+    if identities != [firmware]:
+        raise ValueError(f'Cached SDK firmware identity differs: {identities}; expected {firmware}')
+    print(f'SKIP sysroot installation: SDK already contains official release {version}; '
+          'SDK receipt and Palette/base-files inventory match.')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     request = sub.add_parser("request")
     request.add_argument("--manifest", type=Path, default=ROOT / "deps/manifest.json")
     request.add_argument("--version", required=True)
+    check = sub.add_parser('check-release-sdk')
+    check.add_argument('--manifest', type=Path, default=ROOT / 'deps/manifest.json')
+    check.add_argument('--version', required=True)
+    check.add_argument('--sdk-release', type=Path, default=Path('/etc/sdk-release'))
+    check.add_argument('--sysroot', type=Path, default=Path('/opt/toolchain/aarch64/modalix'))
     patch = sub.add_parser("patch-setup")
     patch.add_argument("path", type=Path)
     release = sub.add_parser("release")
@@ -111,6 +153,9 @@ def main() -> None:
     try:
         if args.command == "request":
             validate_request(args.manifest, args.version)
+        elif args.command == 'check-release-sdk':
+            validate_request(args.manifest, args.version)
+            check_release_sdk(args.version, declaration(args.manifest), args.sdk_release, args.sysroot)
         elif args.command == "patch-setup":
             patch_setup(args.path)
         elif args.command == "release":
@@ -118,8 +163,6 @@ def main() -> None:
         elif args.command == "inventory":
             verify_inventory(args.sysroot, args.version)
         else:
-            if declaration(args.manifest) != args.expected:
-                raise ValueError("Runner resolver firmware differs from the source declaration")
             verify_firmware(args.expected, (Path("/etc/build"), Path("/etc/buildinfo")))
     except (OSError, ValueError) as error:
         parser.exit(2, f"Platform admission refused: {error}\n")

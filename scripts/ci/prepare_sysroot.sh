@@ -8,7 +8,10 @@ python3 "$ci_dir/platform_policy.py" request --manifest "$manifest" --version "$
 [[ "${LLIMA_DISPOSABLE_CI:-}" == 1 ]] || {
   echo 'Provisioning is restricted to an explicitly disposable CI SDK container' >&2; exit 1;
 }
-if [[ ! "$version" =~ ^3\.0\.0~pre[0-9]+$ ]]; then
+if [[ "$version" != *~* ]]; then
+  python3 "$ci_dir/platform_policy.py" check-release-sdk --manifest "$manifest" --version "$version" \
+    --sdk-release "${SDK_RELEASE_FILE:-/etc/sdk-release}" --sysroot "${SYSROOT:-/opt/toolchain/aarch64/modalix}"
+elif [[ ! "$version" =~ ^3\.0\.0~pre[0-9]+$ ]]; then
   sysroot update "$version"
 else
   sdk_release="${SDK_RELEASE_FILE:-/etc/sdk-release}"

@@ -70,7 +70,7 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
 
         self.assertEqual(manifest["platform-version"], "3.0.0")
         self.assertNotIn("sysroot-version", manifest)
-        self.assertEqual(manifest["elxr_version"], "3.0.0_master_B2372")
+        self.assertEqual(manifest["elxr_version"], "3.0.0_master_B2499")
         self.assertRegex(
             manifest["elxr_version"],
             r"^3[.]0[.]0_(?:master|develop)_B[1-9][0-9]*$",
