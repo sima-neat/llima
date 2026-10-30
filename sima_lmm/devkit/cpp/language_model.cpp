@@ -2070,14 +2070,17 @@ void LanguageModel::_finalize() {
 }
 
 
-void LanguageModel::_define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count) {
+void LanguageModel::_define_buffer_freq_table(const std::string& name, uint32_t layer_head_dim) {
+    // The pre models take head_dim-wide cos and sin tables, not the half-width phasor;
+    // calc_freq_real_imag fills them. The layers that bind "local" are exactly the ones whose
+    // head dim is sliding_head_dim, so one width per prefix is enough.
     define_buffer(
         fmt::format("{}_freq_real", name),
-        {_cfg.pipeline_cfg.max_num_tokens, rope_dimension_count / 2}
+        {_cfg.pipeline_cfg.max_num_tokens, layer_head_dim}
     );
     define_buffer(
         fmt::format("{}_freq_imag", name),
-        {_cfg.pipeline_cfg.max_num_tokens, rope_dimension_count / 2}
+        {_cfg.pipeline_cfg.max_num_tokens, layer_head_dim}
     );
 }
 
@@ -2131,12 +2134,10 @@ void LanguageModel::_define_buffers() {
     }
 
     // Frequency tables.
-    _define_buffer_freq_table(
-        "global", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("full_attention")
-    );
+    _define_buffer_freq_table("global", _cfg.lm_cfg.attn_cfg.get_head_dim("full_attention"));
     if (_cfg.lm_cfg.attn_cfg.swa_enable)
         _define_buffer_freq_table(
-            "local", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention")
+            "local", _cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention")
         );
 
     if (_has_linear_attention_layers()) {

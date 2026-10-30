@@ -7,6 +7,7 @@ from sima_lmm.model.base import TensorTessellateParameters, LoraGenMode, LayerCo
 from sima_lmm.model.model_graph import ModelGraph, Node
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
 from sima_lmm.config.vlm_config import LlmArchType, VlmArchType
+from sima_lmm.utils import rope_channel_layout
 
 
 @dataclass
@@ -59,6 +60,47 @@ class LanguagePreModel(LanguagePartBaseModel):
     def _kv_size(self) -> int:
         return self.cfg.lm_cfg.attn_cfg.get_kv_size(self.layer_type)
 
+    @property
+    def _rope_channel_layout(self) -> tuple[int, int, int]:
+        """
+        Channel layout of this layer's rotation: (head_dim, half_rope_dim, imag_start).
+
+        The rotation pairs channel i with channel imag_start + i for i < half_rope_dim and
+        leaves every other channel unchanged. Partial RoPE rotates a prefix of the head and
+        passes the tail through; proportional RoPE (Gemma4 full-attention layers) keeps the
+        imaginary half at head_dim // 2, so an unrotated segment sits between the halves.
+
+        The freq_real and freq_imag inputs are head_dim-wide cos and sin tables laid out to
+        match: the producers duplicate each frequency onto both channels of its pair, negate
+        the sin of the real channel i, and fill unrotated channels with the neutral cos 1 and
+        sin 0. The producers are
+        sima_lmm.utils.calc_freq_real_imag on the host and rope_utils.cpp
+        calc_freq_real_imag on the DevKit; both derive the layout from rope_channel_layout.
+        """
+        head_dim = self._head_dim
+        half_rope_dim, imag_start = rope_channel_layout(
+            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type),
+            head_dim,
+            self._is_proportional_rope_layer
+        )
+        return head_dim, half_rope_dim, imag_start
+
+    def _rope_rotate_half_perm(self) -> list[int]:
+        """
+        Channel permutation of the rotation's imaginary term, HuggingFace's rotate_half without
+        its sign: output channel i is data[imag_start + i], output channel imag_start + i is
+        data[i], and every unrotated channel maps to itself, where the neutral sin of 0 in
+        the uploaded table discards it. The minus sign of the rotation lives in the sin table.
+
+        The MLA executes the permutation as whole channel block moves when half_rope_dim and
+        imag_start are multiples of the 16-channel row.
+        """
+        head_dim, half_rope_dim, imag_start = self._rope_channel_layout
+        perm = list(range(head_dim))
+        perm[:half_rope_dim] = range(imag_start, imag_start + half_rope_dim)
+        perm[imag_start:imag_start + half_rope_dim] = range(half_rope_dim)
+        return perm
+
     def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
@@ -68,12 +110,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         input_shape = (1, 1, self.num_tokens, self._input_hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
-        freq_shape = (
-            1,
-            1,
-            self.num_tokens,
-            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2,
-        )
+        freq_shape = (1, 1, self.num_tokens, self._head_dim)
         input_specs = {"input": input_shape}
         input_dtypes = {}
         if self.uses_quantized_input_embeddings and self.layer_idx == 0:
@@ -109,12 +146,13 @@ class LanguagePreModel(LanguagePartBaseModel):
             attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
         else:
             attn_input = rms_norm
+        rope_cos, rope_sin = mla_input_freq_real, mla_input_freq_imag
         mla_q_result = self._build_attn_query(
             graph,
             f"{base_name}.self_attn",
             attn_input,
-            mla_input_freq_real,
-            mla_input_freq_imag,
+            rope_cos,
+            rope_sin,
             merged_lora,
         )
         gate_out = None
@@ -128,8 +166,8 @@ class LanguagePreModel(LanguagePartBaseModel):
                 graph,
                 f"{base_name}.self_attn",
                 attn_input,
-                mla_input_freq_real,
-                mla_input_freq_imag,
+                rope_cos,
+                rope_sin,
                 merged_lora,
             )
             mla_v_out = self._build_attn_value(
@@ -148,26 +186,27 @@ class LanguagePreModel(LanguagePartBaseModel):
         graph.save(output_nodes)
 
     def _build_rotary_emb(
-        self, graph: ModelGraph, data: Node, freq_real: Node, freq_imag: Node
-    ):
+        self, graph: ModelGraph, data: Node, rope_cos: Node, rope_sin: Node
+    ) -> Node:
         """
-        Create nodes that compute rotary embedding.
+        Create nodes that compute rotary embedding as
+
+            data * cos + rotate_half(data) * sin
+
+        This equals the complex multiply of each (real, imaginary) channel pair by
+        (cos + i sin) exactly: the permutation only moves channels, the sin table carries the
+        rotation's sign, and negation is exact, so both round the same products in bfloat16.
         """
-        return graph.rope(
-            data,
-            freq_real,
-            freq_imag,
-            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type),
-            proportional=self._is_proportional_rope_layer,
-        )
+        rotate_half = graph.channel_permute(data, self._rope_rotate_half_perm())
+        return graph.add(graph.mul(data, rope_cos), graph.mul(rotate_half, rope_sin))
 
     def _build_attn_query(
         self,
         graph: ModelGraph,
         base_name: str,
         rms_norm: Node,
-        freq_real: Node,
-        freq_imag: Node,
+        rope_cos: Node,
+        rope_sin: Node,
         merged_lora: bool = False,
     ) -> Node | tuple[Node, Node]:
         lora_rank = None
@@ -207,7 +246,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         if q_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(q_norm_name, reshape1)
 
-        rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_rotary_emb(graph, reshape1, rope_cos, rope_sin)
 
         if self.cfg.model_type != VlmArchType.VLM_GEMMA4:
             rotary_emb = graph.mul(
@@ -223,8 +262,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         graph: ModelGraph,
         base_name: str,
         rms_norm: Node,
-        freq_real: Node,
-        freq_imag: Node,
+        rope_cos: Node,
+        rope_sin: Node,
         merged_lora: bool = False,
     ) -> Node:
         lora_rank = None
@@ -253,7 +292,7 @@ class LanguagePreModel(LanguagePartBaseModel):
         if k_norm_name and self.cfg.lm_cfg.arch != LlmArchType.OLMOE:
             reshape1 = graph.rms_norm(k_norm_name, reshape1)
 
-        rotary_emb = self._build_rotary_emb(graph, reshape1, freq_real, freq_imag)
+        rotary_emb = self._build_rotary_emb(graph, reshape1, rope_cos, rope_sin)
         return rotary_emb
 
     def _build_attn_value(

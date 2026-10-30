@@ -65,14 +65,18 @@ def _rope_scaling_llama3(
 def _rope_scaling_longrope(
     inv_freq: np.ndarray, long_factor: list[float], short_factor: list[float],
     max_position_embeddings: int, original_max_position_embeddings: int
-) -> tuple[np.ndarray, float]:
+) -> np.ndarray:
     """
     Computes "longrope" scaling for RoPE.
 
-    The scaling factor is computed based on "max_position_embeddings" in inference and
+    Which factor applies is decided by "max_position_embeddings" in inference against
     "original_max_position_embeddings" in pretraining.
 
     https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py#L322.
+
+    The companion post-processing scale on cos/sin is not computed here: RoPEConfig derives
+    it once as rope_scaling.attention_factor, and both calc_freq_real_imag and the runtime's
+    rope_utils.cpp read it from there so host and DevKit cannot disagree.
 
     Args:
         inv_freq: Precomputed RoPE inverse frequencies without scaling.
@@ -82,27 +86,41 @@ def _rope_scaling_longrope(
         original_max_position_embeddings: The context length used in training.
 
     Returns:
-        Scaled inverse frequencies for the RoPE embeddings and post-processing scaling factor
-        applied to the computed cos/sin.  The inverse frequencies have the same length as
-        long_factor or short_factor.
+        Scaled inverse frequencies for the RoPE embeddings, the same length as long_factor
+        or short_factor.
     """
     n_freqs = len(inv_freq)
     assert len(long_factor) <= n_freqs
     assert len(short_factor) <= n_freqs
 
-    factor = max_position_embeddings / original_max_position_embeddings
-    if factor <= 1.0:
-        attention_factor = 1.0
-    else:
-        attention_factor = np.sqrt(1 + np.log(factor) / np.log(original_max_position_embeddings))
-
     if max_position_embeddings > original_max_position_embeddings:
         ext_factors = np.array(long_factor, dtype=np.float32)
     else:
         ext_factors = np.array(short_factor, dtype=np.float32)
-    inv_freq = inv_freq[:len(ext_factors)] / ext_factors
+    return inv_freq[:len(ext_factors)] / ext_factors
 
-    return inv_freq, attention_factor
+
+def rope_channel_layout(
+    rope_dimension_count: int, head_dim: int, proportional: bool = False
+) -> tuple[int, int]:
+    """
+    Channel layout of a rotation over head_dim channels: (half_rope_dim, imag_start).
+
+    The rotation pairs channel i with channel imag_start + i for i < half_rope_dim and leaves
+    every other channel unchanged. Partial RoPE rotates a prefix of the head and passes the
+    tail through; proportional RoPE (Gemma4 full-attention layers) keeps the imaginary half
+    at head_dim // 2, so an unrotated segment sits between the halves.
+
+    The frequency tables the language pre models consume are laid out to match: each
+    frequency appears on both channels of its pair, with the sin of the real channel i negated,
+    and unrotated channels hold the neutral rotation of cos 1 and sin 0. This is the compiler
+    side of that contract; the runtime builds the same layout in rope_utils.cpp
+    rope_channel_layout.
+    """
+    half_rope_dim = rope_dimension_count // 2
+    imag_start = head_dim // 2 if proportional else half_rope_dim
+    assert imag_start + half_rope_dim <= head_dim
+    return half_rope_dim, imag_start
 
 
 def _rope_scaling_yarn(inv_freq, factor, beta_fast, beta_slow,
@@ -137,15 +155,39 @@ def _rope_scaling_yarn(inv_freq, factor, beta_fast, beta_slow,
 
 
 def calc_freq_real_imag(
-    max_num_tokens: int, rope_type: str, theta: float, head_dim: int, scaling_cfg: dict,
-    idx_base: int = 0
+    max_num_tokens: int, rope_type: str, theta: float, rope_dimension_count: int,
+    head_dim: int, scaling_cfg: dict, idx_base: int = 0
 ) -> tuple[np.ndarray, np.ndarray]:
-    inv_freq = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float64) / head_dim))
+    """
+    Build the head_dim-wide cos and sin tables that the language pre models consume.
+
+    Returns two (1, 1, max_num_tokens, head_dim) arrays in HWC layout.
+
+    This is the compiler side of the frequency-table contract. The runtime side is
+    rope_utils.cpp calc_freq_real_imag, which the DevKit uploads into the same freq_real /
+    freq_imag inputs; the two must stay numerically identical, so every rope_type either
+    both accept or both reject.
+    """
+    # Proportional RoPE (Gemma4 full-attention layers) spaces the active frequencies over the
+    # full head dim; every other variant spaces them over the active rotary dim itself.
+    proportional = rope_type == "proportional"
+    frequency_denominator = head_dim if proportional else rope_dimension_count
+    inv_freq = 1.0 / (
+        theta ** (
+            np.arange(0, rope_dimension_count, 2, dtype=np.float64) / frequency_denominator
+        )
+    )
     inv_freq = inv_freq.astype(np.float32)
+    # LongRoPE and YaRN scale cos/sin; 1.0 for every other type.
+    attention_factor = 1.0
     factor = scaling_cfg.get("factor")
-    attention_factor = 1.0  # YaRN scales cos/sin by mscale; 1.0 for every other type.
     match rope_type:
-        case "" | "default":
+        # "mrope" and "proportional" select a channel layout and a frequency spacing, not a
+        # frequency rescaling, so the inverse frequencies stay unscaled here. mRoPE's
+        # per-section token indices are a separate, later step: the DevKit applies them in
+        # rope_utils.cpp calc_mrope_with_image, and host evaluation uses this text-only
+        # table as it stands.
+        case "" | "default" | "mrope" | "proportional":
             pass
         case "linear":
             inv_freq /= factor
@@ -157,38 +199,56 @@ def calc_freq_real_imag(
                 scaling_cfg.get("original_max_position_embeddings")
             )
         case "longrope":
-            inv_freq, _ = _rope_scaling_longrope(
+            inv_freq = _rope_scaling_longrope(
                 inv_freq,
                 scaling_cfg.get("long_factor"),
                 scaling_cfg.get("short_factor"),
-                max_num_tokens + idx_base,
+                max_num_tokens,
                 scaling_cfg.get("original_max_position_embeddings")
             )
+            attention_factor = scaling_cfg.get("attention_factor") or 1.0
         case "yarn":
             inv_freq, attention_factor = _rope_scaling_yarn(
                 inv_freq, factor,
                 scaling_cfg.get("beta_fast", 32.0),
                 scaling_cfg.get("beta_slow", 1.0),
                 scaling_cfg.get("original_max_position_embeddings"),
-                theta, head_dim,
+                theta, rope_dimension_count,
                 scaling_cfg.get("truncate", True),
                 scaling_cfg.get("attention_factor"),
             )
         case _:
             raise ValueError(f"{rope_type} rope type is not supported.")
 
-    n_scaled_freq = len(inv_freq)
+    half_rope_dim, imag_start = rope_channel_layout(
+        rope_dimension_count, head_dim, proportional
+    )
+    n_scaled_freq = min(len(inv_freq), half_rope_dim)
     t = np.arange(idx_base, max_num_tokens + idx_base, dtype=np.float32)
-    inv_freq = np.outer(inv_freq, t).reshape(n_scaled_freq, max_num_tokens)
+    angles = np.outer(inv_freq[:n_scaled_freq], t).reshape(n_scaled_freq, max_num_tokens)
 
-    # Return in HWC layout. Perform a copy so that the last dimension is contiguous.
-    inv_freq = np.expand_dims(inv_freq.transpose(1, 0), axis=(0, 1)).copy()
-    re = (np.cos(inv_freq, dtype=np.float64) * attention_factor).astype(np.float32)
-    im = (np.sin(inv_freq, dtype=np.float64) * attention_factor).astype(np.float32)
+    # Transpose to HWC layout, then copy so that the last dimension is contiguous.
+    angles = np.expand_dims(angles.transpose(1, 0), axis=(0, 1)).copy()
 
-    # Insert 1 for indices that are not scaled
-    if n_scaled_freq < head_dim // 2:
-        n_unscaled_freq = head_dim // 2 - n_scaled_freq
-        re = np.pad(re, ((0, 0), (0, 0), (0, 0), (0, n_unscaled_freq)), constant_values=1)
-        im = np.pad(im, ((0, 0), (0, 0), (0, 0), (0, n_unscaled_freq)), constant_values=1)
+    # cos and sin stay in float32, attention factor included, to match the runtime, which
+    # evaluates and scales them in float32 on the float32 angles; the tables are consumed as
+    # bfloat16, so a wider intermediate would buy nothing and cost bit-exactness against the
+    # DevKit.
+    #
+    # LongRoPE and YaRN scale the rotated channels; the neutral channels below must stay at
+    # cos 1 and sin 0, so apply it here rather than to the finished tables.
+    cos = np.cos(angles) * np.float32(attention_factor)
+    sin = np.sin(angles) * np.float32(attention_factor)
+
+    # Each frequency lands on both channels of its rotation pair. The pre model multiplies sin
+    # by a pure channel swap of the data, so the sin of the real channel carries the minus
+    # sign of the rotation: out[i] = x[i] * cos - x[imag_start + i] * sin. Channels the
+    # rotation does not reach keep the neutral rotation of cos 1 and sin 0: the tail of a
+    # partial rotation, the middle segment of a proportional one, and any frequency that the
+    # scaling dropped.
+    re = np.ones((1, 1, max_num_tokens, head_dim), dtype=np.float32)
+    im = np.zeros((1, 1, max_num_tokens, head_dim), dtype=np.float32)
+    for start, sign in ((0, -1), (imag_start, 1)):
+        re[..., start:start + n_scaled_freq] = cos
+        im[..., start:start + n_scaled_freq] = sign * sin
     return re, im
