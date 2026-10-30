@@ -24,7 +24,6 @@ from sima_lmm.utils import ceil_div_row, mla_max_num_rows, mla_row_size, round_u
 _bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
 Node = NodeOrHandle
 
-
 def activation_type(quantizable: bool) -> ScalarType:
     """
     Return the data type to use for most node inputs and outputs.
@@ -1131,6 +1130,30 @@ class ModelGraph(SimaBuilder):
             input_type=input_type.scalar,
         )
         return self.create_conv_node(input_node, weights, None, conv_attrs)
+
+    def channel_permute(self, data: NodeOrHandle, perm: Sequence[int]) -> NodeOrHandle:
+        """Reorder the channel axis: output channel j is input channel perm[j].
+
+        The permutation is a ChannelPermuteOp, a data-movement node that keeps the input's type
+        and quantization. N2A compiles it as whole 16-channel block moves when the permutation
+        allows it.
+
+        Args:
+            data: The input node.
+            perm: A permutation of range(C), where C is the input's channel count.
+        """
+        if not hasattr(self, "create_channel_permute_node"):
+            raise RuntimeError(
+                "LLiMa needs a Model SDK that provides ChannelPermuteOp "
+                "(SimaBuilder.create_channel_permute_node); install the SDK version "
+                "pinned in deps/manifest.json"
+            )
+        channels = tensor_type(data).shape[-1]
+        if sorted(perm) != list(range(channels)):
+            raise ValueError(
+                f"Channel permutation must reorder range({channels}); got {list(perm)}"
+            )
+        return self.create_channel_permute_node(data, perm)
 
     def _build_conv_lora(
         self, base_name: str, ifm: NodeOrHandle, lora_shape: tuple[int, int]
