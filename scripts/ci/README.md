@@ -18,3 +18,8 @@ output against the actual board, with fallback disabled. Tests still require a
 
 Publish this branch before building Core's matching branch so Core can consume
 LLiMa through its existing snap policy and verify the complete declared cohort.
+
+CPack writes temporary packaging trees under the build directory. Only completed
+Debian archives are copied into `dist/`; `_CPack_Packages` is build scratch and
+must never be uploaded as a published resource. The other root, Debian,
+compiler and MoLE distributions retain their existing layouts.
