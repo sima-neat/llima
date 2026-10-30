@@ -2,18 +2,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from afe.apis.defines import gen2_target
-from afe.backends.backends import Backend
-from afe.ir.defines import Status
-from afe.ir.serializer import save_awesomenet
-from afe.ir.tensor_type import TensorType, ScalarType
-
-from sima_lmm.model.base import TensorTessellateParameters, LayerConfiguration
+from sima_lmm.model.base import LayerConfiguration
 from sima_lmm.model.language_part_base import LanguagePartBaseModel
-from sima_lmm.model.onnx_builder import OnnxNode
-from sima_lmm.model.sima_builder import (
-    SimaBuilder, build_conv_from_dense_with_lora, activation_type, activation_dtype
-)
+from sima_lmm.model.model_graph import ModelGraph
 
 
 @dataclass
@@ -39,202 +30,69 @@ class LanguagePerLayerModel(LanguagePartBaseModel):
             "LanguagePerLayerModel requires hidden_size_per_layer_input > 0"
         )
 
-    def gen_onnx_files(self):
-        lm_base = self.hf_model.language_model_param_base_name
-        L = self.cfg.lm_cfg.num_hidden_layers
-        H = self.cfg.lm_cfg.hidden_size_per_layer_input
-
-        self.create_onnx_builder()
-        self._onnx_builder.create_input_node(
-            "per_layer_emb_staging", (1, L * H, 1, self.num_tokens)
-        )
-        self._onnx_builder.create_input_node(
-            "input", (1, self.cfg.lm_cfg.hidden_size, 1, self.num_tokens)
-        )
-
-        output_node = self._build_onnx_per_layer_projection(
-            lm_base, self._onnx_builder.input_nodes
-        )
-        self._onnx_builder.create_output_node(
-            self._onnx_builder.get_node_output_name(output_node),
-            (1, H, 1, L * self.num_tokens),
-        )
-
-        self._onnx_builder.create_and_save_model()
-        self._onnx_builder = None
-
-    def gen_model_sdk_files_directly(
+    def generate_graph(
         self,
         layer_cfg: LayerConfiguration,
-        log_level: int,
         quantizable: bool,
     ):
-        del layer_cfg, log_level
-        g = self._build_sima_nodes(
-            self.hf_model.language_model_param_base_name,
-            quantizable,
-        )
-        save_awesomenet(
-            g,
-            self.model_name + (".fp32" if quantizable else ""),
-            str(self.sima_model_sdk_path),
-        )
-
-    def _build_onnx_per_layer_projection(
-        self, lm_base: str, input_nodes: list[OnnxNode]
-    ) -> OnnxNode:
-        L = self.cfg.lm_cfg.num_hidden_layers
-
-        proj = self._onnx_builder.build_conv_from_dense_with_lora(
-            f"{lm_base}.per_layer_model_projection", input_nodes[1], None
-        )
-        proj = self._onnx_builder.build_op(
-            f"{lm_base}.per_layer_proj_scale",
-            [proj, self.cfg.lm_cfg.hidden_size ** -0.5],
-            "Mul",
-        )
-        proj = self._onnx_builder.build_split_and_concat(
-            f"{lm_base}.per_layer_proj_reshape", proj, L, split_axis=1, concat_axis=3
-        )
-        proj_normed = self._build_rms_norm(f"{lm_base}.per_layer_projection_norm", proj)
-
-        emb = self._onnx_builder.build_split_and_concat(
-            f"{lm_base}.per_layer_emb_reshape", input_nodes[0], L, split_axis=1, concat_axis=3
-        )
-        combined = self._onnx_builder.build_op(
-            f"{lm_base}.per_layer_combine", [emb, proj_normed], "Add"
-        )
-        return self._onnx_builder.build_op(
-            f"{lm_base}.per_layer_combine_scale", [combined, 2.0 ** -0.5], "Mul"
-        )
-
-    def _build_sima_nodes(self, lm_base: str, quantizable: bool):
+        del layer_cfg
+        lm_base = self.hf_model.language_model_param_base_name
         L = self.cfg.lm_cfg.num_hidden_layers
         H = self.cfg.lm_cfg.hidden_size_per_layer_input
         staging_shape = (1, 1, self.num_tokens, L * H)
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
         scale_shape = (1, 1, self.num_tokens, 1)
-        builder = SimaBuilder(Status.RELAY if quantizable else Status.SIMA_QUANTIZED, gen2_target)
-        staging_dtype = (
-            ScalarType.int8
-            if self.cfg.pipeline_cfg.quantize_embeddings
-            else activation_type(quantizable)
-        )
-        input_dtype = (
-            ScalarType.int8
-            if self.uses_quantized_input_embeddings
-            else activation_type(quantizable)
-        )
-
-        model_input_staging = builder.create_placeholder_node(
-            "per_layer_emb_staging",
-            TensorType(staging_dtype, staging_shape),
-        )
+        input_specs = {"per_layer_emb_staging": staging_shape}
+        input_dtypes = {}
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            model_input_staging_scale = builder.create_placeholder_node(
-                "per_layer_emb_staging_scale",
-                TensorType(activation_type(quantizable), scale_shape),
-            )
-        model_input_input = builder.create_placeholder_node(
-            "input",
-            TensorType(input_dtype, input_shape),
-        )
+            input_dtypes["per_layer_emb_staging"] = np.int8
+            input_specs["per_layer_emb_staging_scale"] = scale_shape
+        input_specs["input"] = input_shape
+        if self.uses_quantized_input_embeddings:
+            input_dtypes["input"] = np.int8
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            model_input_input_scale = builder.create_placeholder_node(
-                "input_scale",
-                TensorType(activation_type(quantizable), scale_shape),
-            )
-
-        subnet_inputs = [model_input_staging]
+            input_specs["input_scale"] = scale_shape
+        graph = ModelGraph(self, input_specs, quantizable, input_dtypes=input_dtypes)
+        mla_input_staging = graph.inputs["per_layer_emb_staging"]
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            subnet_inputs.append(model_input_staging_scale)
-        subnet_inputs.append(model_input_input)
+            mla_input_staging_scale = graph.inputs["per_layer_emb_staging_scale"]
+        mla_input_input = graph.inputs["input"]
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            subnet_inputs.append(model_input_input_scale)
-        builder.begin_subnet(subnet_inputs)
-        mla_input_staging = builder.create_placeholder_node(
-            "MLA_0/per_layer_emb_staging",
-            TensorType(staging_dtype, staging_shape),
-        )
-        if self.cfg.pipeline_cfg.quantize_embeddings:
-            mla_input_staging_scale = builder.create_placeholder_node(
-                "MLA_0/per_layer_emb_staging_scale",
-                TensorType(activation_type(quantizable), scale_shape),
-            )
-        mla_input_input = builder.create_placeholder_node(
-            "MLA_0/input",
-            TensorType(input_dtype, input_shape),
-        )
-        if self.cfg.pipeline_cfg.quantize_embeddings:
-            mla_input_input_scale = builder.create_placeholder_node(
-                "MLA_0/input_scale",
-                TensorType(activation_type(quantizable), scale_shape),
-            )
+            mla_input_input_scale = graph.inputs["input_scale"]
 
         if self.uses_quantized_input_embeddings:
-            projection_input = builder.create_dynamic_dequant_node(
-                mla_input_input, mla_input_input_scale
-            )
+            projection_input = graph.dequant(mla_input_input, mla_input_input_scale)
         else:
             projection_input = mla_input_input
-        proj = build_conv_from_dense_with_lora(
-            builder,
-            self.get_hf_param,
-            self.check_hf_param,
-            f"{lm_base}.per_layer_model_projection",
-            projection_input,
-            None,
-        )
-        proj = builder.create_mul_node(
+        proj = graph.linear(f"{lm_base}.per_layer_model_projection", projection_input, lora_rank=None)
+        proj = graph.mul(
             proj,
-            builder.create_constant_node(
-                np.array(
-                    [self.cfg.lm_cfg.hidden_size ** -0.5],
-                    dtype=activation_dtype(quantizable),
-                )
-            ),
+            graph.constant([self.cfg.lm_cfg.hidden_size**-0.5]),
         )
-        proj = builder.create_slice_concat_node(
+        proj = graph.split_concat(
             proj,
             axis=2,
             split_axis=3,
             split_block=L,
             split_repeat=1,
         )
-        proj_normed = self._build_sima_rms_norm(
-            builder,
-            f"{lm_base}.per_layer_projection_norm",
-            proj,
-        )
+        proj_normed = graph.rms_norm(f"{lm_base}.per_layer_projection_norm", proj)
 
         if self.cfg.pipeline_cfg.quantize_embeddings:
-            staging = builder.create_dynamic_dequant_node(
-                mla_input_staging, mla_input_staging_scale
-            )
+            staging = graph.dequant(mla_input_staging, mla_input_staging_scale)
         else:
             staging = mla_input_staging
-        emb = builder.create_slice_concat_node(
+        emb = graph.split_concat(
             staging,
             axis=2,
             split_axis=3,
             split_block=L,
             split_repeat=1,
         )
-        combined = builder.create_add_node(emb, proj_normed)
-        _ = builder.create_mul_node(
+        combined = graph.add(emb, proj_normed)
+        output = graph.mul(
             combined,
-            builder.create_constant_node(
-                np.array([2.0 ** -0.5], dtype=activation_dtype(quantizable))
-            ),
+            graph.constant([2.0**-0.5]),
         )
 
-        mla_node = builder.finish_subnet("MLA_0")
-        if activation_type(quantizable) != ScalarType.float32:
-            builder.create_cast_node(mla_node, ScalarType.float32, backend=Backend.EV)
-        return builder.finish(self.model_name)
-
-    def get_mla_input_tessellate_params(self) -> dict:
-        return {}
-
-    def get_mla_output_tessellate_params(self) -> dict:
-        return {}
+        graph.save([output])

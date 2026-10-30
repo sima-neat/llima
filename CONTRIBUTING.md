@@ -63,6 +63,14 @@ packages. `llima-compile` covers LLMs and VLMs; existing Whisper maintenance
 uses the separate
 [Whisper/ASR path](docs/contributing.md#whisper-and-asr-development).
 
+Use the matching pinned Transformers implementation as the architecture and
+numerical reference, or pinned model repository code when Transformers lacks
+support. ModelGraph keeps LLM hidden states in the same logical
+order, adding a singleton axis: `[B, T, C]` becomes `[B, 1, T, C]`. Attention
+Q/K/V retain `[B, heads, T, D]`. Vision image tensors use NHWC
+`[B, height, width, C]` instead of Transformers' usual NCHW
+`[B, C, height, width]`. Align these layouts before numerical comparisons.
+
 ## Validate
 
 Run the smallest tier that proves the change.
@@ -117,13 +125,21 @@ model compilation.
   breaks and migration steps.
 - Keep downloaded weights, customer data, secrets, and generated binary model
   artifacts out of Git. Use immutable model revisions and approved caches.
-- Follow local style, keep changes focused, and add tests and user
-  documentation with behavior changes.
+- Follow local style and keep changes focused. Reuse existing test coverage;
+  add or extend tests for uncovered behavior or meaningful regression risk.
+  Update user documentation when user-visible behavior changes.
 - Fail with actionable context instead of silently changing model, revision,
   precision, format, or execution path.
 - Keep shared state safe and teardown bounded.
 
 See [Coding Standards](docs/contributing.md#coding-standards) for details.
+
+## Issues
+
+Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.md) for defects
+and the [feature request template](.github/ISSUE_TEMPLATE/feature_request.md)
+for proposed improvements. Complete the relevant sections and redact secrets
+from logs and reproduction details.
 
 ## Pull Requests
 

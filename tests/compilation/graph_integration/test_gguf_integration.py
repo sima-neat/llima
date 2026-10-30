@@ -29,7 +29,6 @@ def _build_component(case: GgufGraphCase, vlm_model):
         model = LanguagePreModel(
             vlm_model.cfg,
             f"{vlm_model.model_name}_language_n{num_tokens}_pre_layer{case.layer_index}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=num_tokens,
@@ -40,7 +39,6 @@ def _build_component(case: GgufGraphCase, vlm_model):
         model = LanguageCacheModel(
             vlm_model.cfg,
             f"{vlm_model.model_name}_language_n{num_tokens}_cache_token{case.layer_index}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=num_tokens,
@@ -52,7 +50,6 @@ def _build_component(case: GgufGraphCase, vlm_model):
         model = LanguagePostModel(
             vlm_model.cfg,
             f"{vlm_model.model_name}_language_n{num_tokens}_post_layer{case.layer_index}",
-            onnx_path=vlm_model.onnx_path,
             sima_path=vlm_model.sima_path,
             hf_model=vlm_model.hf_model,
             num_tokens=num_tokens,

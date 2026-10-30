@@ -4,9 +4,12 @@
 
 Use the
 [SiMa.ai Pre-Quantized Models collection](https://huggingface.co/collections/simaai/pre-quantized-models)
-as the mandatory first lookup. The collection indexes independent,
-model-specific repositories. It does not provide one generic quantization
-script.
+as the first lookup when selecting the default source or a recipe for a custom
+fine-tune. Honor an explicitly selected source; a supplied compatible
+pre-quantized checkpoint or an explicit FP/BF16/GGUF compilation request needs
+no collection lookup. A supplied FP/BF16 fine-tune to pre-quantize still needs
+the exact matching repository's recipe. The collection indexes independent,
+model-specific repositories. It does not provide one generic quantization script.
 
 Require an exact match for:
 
@@ -47,7 +50,7 @@ Use the exact matching pre-quantized model repository as a recipe carrier:
 4. Create a GPU environment matching `versions.txt`.
 5. Run that repository's unmodified `quantize.py` using only flags exposed by
    the script.
-6. Validate the compressed output, then compile it with LLiMa.
+6. Validate the compressed output; compile it with LLiMa when requested.
 
 Download the model-specific recipe files without downloading its weights when
 the installed `hf download` supports positional filenames:

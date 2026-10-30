@@ -94,8 +94,8 @@ output_directory/
 | `--input_width` | 入力画像の幅をピクセル単位で指定します。`--input_height` とともに必ず指定してください。Qwen 2 VL、Qwen 3 VL、Qwen3.5、および Gemma 4 のモデルでは必須です。SigLIP2 モデルのデフォルトサイズを上書きする場合はオプションです。 |
 | `--system_prompt` | CLIモードおよびモデルのウォームアップのために保存するシステムプロンプト。 |
 | `--system_prompt_file` | システムプロンプトが記述されたテキストファイルへのパス。 |
-| `--chat_template` | コンパイルされたモデルに保存するチャットテンプレート文字列です。システムプロンプトとチャットテンプレートファイルのオプションとは、どちらか一方のみを指定できます。 |
-| `--chat_template_file` | チャットテンプレートが格納されているファイルへのパス。システムプロンプトオプションとは排他的であり、`--chat_template` とはどちらか一方のみを指定できます。 |
+| `--chat_template` | コンパイルされたモデルに保存するチャットテンプレート文字列です。`--chat_template_file` とは、どちらか一方のみを指定できます。 |
+| `--chat_template_file` | チャットテンプレートが格納されているファイルへのパス。`--chat_template` とはどちらか一方のみを指定できます。 |
 
 :::note
 ほとんどのモデルは、最大8192トークンまでのコンテキスト長をサポートしています。8Kのコンテキスト長を有効にするには、`--max_num_tokens 8192`を使用してください。
@@ -105,14 +105,21 @@ output_directory/
 |----|----|
 | `--language_group_size` | プリフィル中に並列でトークンを処理する際のバッチサイズ。より大きな値（例：256）を使用すると、大規模な入力プロンプトに対するTTFT（トークン生成までの時間）を改善できますが、小規模な入力プロンプトに対するTTFTを低下させる可能性があります。デフォルト値：128。 |
 | `--future_token_mask_size` | トークン位置を跨いでコンパイル済みのモデルを再利用するためのマスクサイズ。値を大きくすると、コンパイルされたバイナリファイルの数が減りますが、1秒あたりのトークン数（TPS）が低下する可能性があります。デフォルト値：128。 |
-| `--enable_filter_sharing` | グループモデルと単一モデル間でフィルターの共有を有効にすることで、DRAMの使用量を削減できます。ただし、その代償として、TTFT（最初のトークンが生成されるまでの時間）が増加し、TPS（1秒あたりのトークン数）が低下します。これは、両方のモデルタイプが同じ精度を使用する場合にのみ有効であり、LoRA を使用してコンパイルする場合には必須です。 |
 | `--no-quantize_embeddings` | サポートされているLLMおよびVLMでは、デフォルトで有効になっている埋め込みテーブルの量子化を無効にします。 |
 | `--no-quantize_kv_cache` | デフォルトで有効になっている KV キャッシュの量子化を無効にします。 |
 | `--return_logits` | 最終層の出力におけるロジットを返します（モデル評価器に必要なもの）。 |
-| `--draft_model_path` | 推測によるデコードに使用する EAGLE3 のドラフト モデルへのパス。 |
+| `--draft_model_path` | 互換性のある EAGLE3、Gemma4 MTP、または DFlash のドラフトモデルへのパス。方式は自動検出されます。 |
+| `--speculative_block_size` | DFlash の検証幅: 4、8、または 16。デフォルト: 8。 |
 | `--lora_name` | ベースモデルと同時にコンパイルされている LoRA アダプターの名前。 |
 | `--lora_path` | ベースモデルと組み合わせてコンパイルするために、LoRAアダプターディレクトリへのパスを指定してください。 |
 | `--compile_lora`, `--no-compile_lora` | LoRA のパスが指定された場合に、アダプターの重みをコンパイルするかどうかを設定します。デフォルトでは有効になっています。 |
+
+DFlash では、プリフィルのグループサイズがブロックサイズを超え、コンテキスト長を割り切れる必要があります:
+
+``` console
+llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
+    --speculative_block_size 16
+```
 
 ## システムプロンプト
 
@@ -142,14 +149,22 @@ LLM 推論は、2つの明確なフェーズで構成され、コンパイラは
 **入力パラメータ** `get_layer_configuration` この関数は、各コンパイラユニットに対して呼び出され、
 以下の引数を受け取ります。
 
-- `model_properties`：`{"num_hidden_layers": int}` を含む辞書。
+- `model_properties`: 次の項目を含む辞書:
+  - `"num_hidden_layers"`: 言語レイヤー数
+  - `"is_draft_model"`: 推測デコードのドラフトモデルを設定する場合は `True`
 
 - `layer`：次の要素を含む辞書：
   - `"part"`：`"PRE"`、`"CACHE"`、`"POST"`などの論理コンポーネント。
-    `"VISION"`、`"DRAFT_FC"`、または`"PER_LAYER"`
+    `"VISION"`、`"DRAFT_FC"`、または`"PER_LAYER"`。Mixture-of-Experts モデルでは
+    `"ROUTER"`、`"EXPERT"`、`"WEIGHTEDSUM"` が追加されます。
   - `"is_group"`: 複数のトークン/グループのバリアントの場合は`True`、それ以外の場合は`False`
   - `"index"`：そのコンパイラユニットのインデックス。`"PRE"`および`"POST"`の場合
     通常は、トランスフォーマー層に対応します。`"CACHE"` の場合は、トランスフォーマー層ではなく、キャッシュまたはトークン位置のバリアントを識別します。
+  - `"expert_idx"`：`"EXPERT"` レコードにおける層内のエキスパートのインデックスです。
+    密モデルを含む、それ以外のすべてのパートでは `-1` です。
+
+  必要な値はキーで読み取ってください。今後のリリースで新しいキーが追加される可能性があるため、
+  この辞書を固定された引数リストに展開したり、キーの集合が完全に一致すると断定したりしないでください。
 
 **戻り値**
 
@@ -254,7 +269,7 @@ def get_layer_configuration(model_properties, layer):
 LoRA (低ランク適応) を使用すると、ベースモデルを微調整し、アダプターを動的に適用または削除できます。これにより、ベースモデルを再コンパイルすることなく、ランタイムで変更できます。ベースモデルは、並列 LoRA ブランチ（ゼロで初期化）を使用してコンパイルされ、アダプターの重みは個別に `.npy` ファイルとしてコンパイルされ、必要に応じてロードされます。
 
 :::note
-LoRA を使用してコンパイルする場合は、フィルター共有を有効にする必要があります。`--enable_filter_sharing` を使用して有効にしてください。より高い精度を実現するために、LoRA ブランチは、INT4 が指定されていても、常に INT8 でコンパイルされます。
+より高い精度を実現するために、LoRA ブランチは、INT4 が指定されていても、常に INT8 でコンパイルされます。
 :::
 
 1.  **ベースモデルとLoRAアダプターをダウンロードしてください**:
@@ -280,7 +295,6 @@ LoRA を使用してコンパイルする場合は、フィルター共有を有
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -293,7 +307,6 @@ LoRA を使用してコンパイルする場合は、フィルター共有を有
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \

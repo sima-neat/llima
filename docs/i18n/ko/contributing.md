@@ -100,6 +100,76 @@ Whisper 모델 리포지토리에는 인코더 계층마다 하나의 ELF가 포
 
 컴파일러 변경 사항은 일반적으로 `sima_lmm/config/whisper_config.py`, `sima_lmm/model/whisper_*.py` 및 스크립트에 영향을 미치고, 런타임 변경 사항은 `sima_lmm/devkit/cpp/whisper_*`에 영향을 미칩니다. `tests/README.md`에 설명된 패키지된 C++ ASR 런타임 테스트와 Modalix의 대표 오디오를 사용하여 유효성을 검사합니다. 이것은 일반적인 ASR 아키텍처 프레임워크가 아닌 Whisper에 특정한 경로입니다.
 
+### 네이티브 그래프 컴포넌트
+
+`sima_lmm/model/model_graph.py`의 `ModelGraph`를 사용합니다. 컴포넌트의 소스 가중치, 정밀도, 출력 경로를 한 번 설정합니다. 그래프 노드 구성은 클래스 안에 두고, 독립적인 배열 레이아웃 및 이름 지정 유틸리티는 모듈 함수로 유지합니다. 모델 컴포넌트는 그래프 메서드를 사용하므로 구현에서는 토폴로지에 집중할 수 있습니다:
+
+```python
+from sima_lmm.model.model_graph import ModelGraph
+
+def generate_graph(self, layer_cfg, quantizable):
+    graph = ModelGraph(self, {"hidden": (1, 1, self.num_tokens, self.cfg.d_model)}, quantizable)
+    hidden = graph.layer_norm("model.norm", graph.inputs["hidden"])
+    output = graph.mlp("model.mlp", hidden, "gelu", residual=graph.inputs["hidden"])
+    graph.save([output])
+```
+
+독립적인 컴포넌트의 입력, 최상위 토폴로지, `graph.save()`를 `generate_graph()` 안에서 정의합니다. Whisper의 통합 디코더 그래프에 사용되는 pre/cache/post 부분처럼 공유하는 그래프 구성에는 `_build_nodes(graph, inputs)`를 유지합니다.
+
+로그 범위는 `BaseModel.gen_files()`에서 설정하므로 그래프 구성에는 별도의 로그 인수가 필요하지 않습니다.
+
+형상에서 추론하는 입력 유형은 `quantizable=True`일 때 FP32(나중에 양자화할 부동소수점 그래프), `False`일 때 BF16(소스 가중치 정밀도를 사용하는 직접 그래프)입니다. 캐시 같은 정수 입력에는 `input_dtypes={"cache": np.int8}`를 사용하고 이름을 입력 사양과 일치시킵니다. 저수준 호출에는 기존의 명시적인 AFE 텐서 사양도 지원됩니다. 입력과 출력 순서는 제공한 사양을 따르며, 형상과 출력 유형은 AFE가 추론합니다. `constant()`는 부동소수점 데이터를 활성화 정밀도로 변환합니다. 정수 상수에 특정 비트 폭이 필요하면 예를 들어 `dtype=np.int32`를 지정합니다. 노드 이름은 AFE의 결정적인 생성 카운터를 따릅니다.
+
+그래프 노드 유형 주석에는 `model_graph.py`에서 `Node`를 가져옵니다. 헬퍼에는 별도의 `quantizable` 플래그 대신 그래프를 전달합니다. `graph.constant()`는 부동소수점 정밀도를 자동으로 선택합니다. 호스트 측 배열 계산에 해당 정밀도가 필요하면 NumPy `graph.dtype`를 사용합니다. 단계 플래그는 `generate_graph()`와 그래프 생성에만 유지합니다.
+
+`save()`는 MLA 서브넷을 종료하고 외부 그래프의 출력 튜플을 생성합니다. 정수 출력을 유지하고, EV에서 BF16 출력을 FP32로 변환하며, 표준 아티팩트 이름으로 저장합니다(부동소수점 그래프는 `.fp32`). 완성된 네트워크를 얻으려면 `finish()`를 사용합니다. 둘 다 `transform_subnet`를 받아 외부 출력을 추출하기 전에 모델별 재작성을 수행할 수 있습니다. 컴포넌트 헬퍼에는 그래프 자체를 전달하며 입력, 정밀도, 소스 가중치를 같은 객체에 유지합니다.
+
+이름으로 지정한 NumPy 입력을 사용해 완성된 그래프를 실행합니다:
+
+```python
+graph.finish([output])
+outputs = graph.run(hidden=x)
+outputs_jax = graph.run(hidden=x, use_jax=True)
+graph.save()
+```
+
+입력 이름, 형상, 데이터 유형은 선언한 입력과 일치해야 하며 암시적 유형 변환은 적용하지 않습니다. 출력은 `finish()`에 전달한 순서를 따릅니다. NumPy 실행은 AFE fast mode를 사용하므로 MLA 기준 연산과 결과가 다를 수 있습니다. `use_jax=True`는 JAX 기준 실행을 선택하며 fast mode는 영향을 주지 않습니다. JAX 연산은 설정된 백엔드를 사용하며 호환되는 JAX 설치 환경에서는 GPU를 사용할 수 있습니다. 이 API는 양자화, 컴파일 또는 Modalix 실행을 수행하지 않습니다. 그래프를 한 번만 완료한 뒤 `run()`과 `save()`를 반복 사용합니다. `save(outputs)`로 완료와 저장을 한 번에 수행할 수도 있습니다.
+
+일반적인 연산에는 `add`, `sub`, `mul`, `matmul`, `concat`, `slice`, `transpose`, `reshape`, `softmax`, `topk`, `sum_channels`, `argmax`, `linear`, `conv`, `layer_norm`, `rms_norm`, `activation`, `softcap`, `mlp`, `rope`, `rope2d`, `split_heads`, `merge_heads`, `split_concat`, `clip`, `avgpool2d`, `space_to_depth`, `quant`, `dequant`가 있습니다. 게이트 MLP는 `projections=("gate_proj", "up_proj", "down_proj")`를 사용하며 기본값은 `("fc1", "fc2")`입니다. `rms_norm("model.norm", input)`은 언어 모델 설정의 epsilon과 가중치 오프셋을 사용합니다. vision 및 GDN 정규화에서 `epsilon`을 명시하면 `weight_offset`도 지정하지 않는 한 가중치 오프셋은 0입니다. `rms_norm(None, input, epsilon=...)`는 가중치 없는 채널을 추론합니다. RoPE는 전체, 부분 및 비율 지정 split-half 회전을 지원합니다. `rope2d(input, cos_x, sin_x, cos_y, sin_y)`는 채널의 네 분할을 `[x-real, x-imag, y-real, y-imag]` 순서로 회전합니다. `split_heads(input, heads, repeat=...)`는 grouped-query 패턴을 위해 각 헤드를 반복합니다. `split_concat()`는 reshape만으로 표현할 수 없는 공간/토큰 레이아웃에 AFE의 재그룹화 연산을 제공합니다. `space_to_depth(input, blocksize)`는 완전한 공간 블록을 채널로 병합합니다. `quant(input)`는 `(int8_values, scale)`을 반환하고 `dequant(int8_values, scale)`는 그래프의 활성화 정밀도를 복원합니다. `argmax(input)`는 INT32 채널 인덱스를 반환합니다. `slice(input, begin, end, stride, axis)`는 순위 4 FP32/BF16 텐서의 정렬되지 않은 연속 단일 축 채널 슬라이스에 선택자 컨볼루션을 자동으로 사용합니다. 다른 슬라이스는 AFE의 네이티브 동작을 유지합니다.
+
+`linear("model.proj", input)`는 `model.proj.weight`와 선택적 바이어스를 찾아 OI 소스 가중치를 SiMa 레이아웃으로 변환합니다. 패킹된 가중치 값, 스케일, 정렬되지 않은 그룹 크기, 재배치 메타데이터를 유지합니다. `conv()`는 OIW 또는 OIHW 소스 레이아웃을 추론합니다. 명시적인 변환으로 Qwen의 5차원 패치 가중치 같은 다른 레이아웃도 변환할 수 있습니다. `WeightOptions`는 소스 이름, 레이아웃, 가중치/스케일/바이어스 변환 및 재배치 재정의 옵션을 설명합니다. 그룹 가중치를 슬라이싱할 때는 해당 `scale_process_func`를 제공하고 체크포인트의 실제 그룹 크기를 유지해야 합니다. LoRA 순위와 병합 어댑터 동작은 `linear()` 및 `mlp()`의 명시적 인수입니다.
+
+프로젝션과 헤드 레이아웃 연산으로 attention을 구성합니다. 기존 프로젝션 반올림을 유지하도록 쿼리 스케일링을 `linear()`에 포함합니다:
+
+```python
+queries = graph.split_heads(graph.linear("attn.q_proj", hidden, scale=head_dim ** -0.5), heads)
+keys = graph.split_heads(graph.linear("attn.k_proj", hidden), heads)
+values = graph.split_heads(graph.linear("attn.v_proj", hidden), heads)
+context = graph.attention(queries, keys, values)
+output = graph.linear("attn.out_proj", graph.merge_heads(context))
+```
+
+`split_heads()`는 정렬되지 않은 헤드 채널을 선택자 컨볼루션으로 처리합니다. 표준 vision attention은 이러한 컨볼루션을 피하도록 정렬되지 않은 헤드의 프로젝션 가중치를 패딩합니다. 그룹 출력 가중치는 원래 레이아웃을 유지합니다. `attention()`는 쿼리/키 길이를 사용해 cross-attention을 포함한 큰 attention 텐서에 대해 별도의 헤드 분기를 선택합니다. 가산 `mask`를 받고, `score_scale`를 지정하지 않으면 쿼리가 이미 스케일링되었다고 가정합니다. 이 스케일은 Q×K 이후, 마스크 이전에 적용하여 Qwen vision 같은 모델의 BF16 연산 순서를 유지합니다. 마스크는 순위 4 텐서, 벡터 또는 스칼라이고 `[N,H,T_query,T_key]`로 브로드캐스트할 수 있어야 합니다. 지원하지 않는 형상은 `ValueError`를 발생시킵니다.
+
+`graph.matmul(lhs, rhs)`는 MLA 배치 행렬 곱을 생성합니다. 두 전치 플래그의 기본값은 `False`입니다. Kᵀ×V에는 `transpose_a=True`, Q×Kᵀ에는 `transpose_b=True`를 사용합니다. 입력은 배치와 축약 차원이 일치하는 순위 4 FP32/BF16 텐서여야 합니다. 헤드 수가 나누어떨어지면 grouped-query attention에 암시적 반복을 사용합니다. 잘못된 형상이나 유형은 `ValueError`를 발생시킵니다.
+
+`graph.softmax(x)`는 기본적으로 마지막 축을 사용하며 명시적인 `axis`도 지원합니다. 연속 단일 축 슬라이스에는 `graph.slice(x, start=0, stop=128, axis=-1)`를 사용하고 다중 축에는 기존 `begin`/`end`/`stride`/`axis` 목록을 사용합니다. 단일 축 형식의 시작 기본값은 0이며, 축을 명시하고 범위 안의 비어 있지 않은 경계를 지정해야 합니다. 정렬되지 않은 채널 처리도 유지합니다. 두 형식을 혼합하지 마세요.
+
+`ModelGraph`는 AFE의 `SimaBuilder`를 확장하므로 같은 객체에서 공통 헬퍼와 네이티브 연산을 사용할 수 있습니다:
+
+```python
+projected = graph.linear("model.proj", graph.inputs["hidden"])
+output = graph.add(projected, graph.inputs["hidden"])
+graph.save([output])
+```
+
+간결한 기본 연산은 AFE 메서드의 직접 별칭이며 시그니처, 유형 추론, 결정적인 이름 지정을 유지합니다. 일반적이지 않은 연산에는 상속된 `create_*` 메서드를 같은 그래프에서 사용할 수 있습니다. 사용자 정의 다중 서브넷 생명주기가 필요한 그래프는 AFE의 `SimaBuilder`와 저수준 연산 헬퍼를 직접 사용할 수 있습니다.
+
+테셀레이션은 `sima_analysis.get_tessellate_parameters()`에서 중앙 관리하여 추론합니다. HWC16 레이아웃, 자동 타일 크기, 결정적인 영구 버퍼 이름을 사용합니다. 일반 컴포넌트는 `BaseModel`에서 빈 재정의 설정을 상속합니다. 스트라이드 KV 캐시 같은 특수 레이아웃은 기존 `get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` 메서드를 재정의합니다. 키는 텐서 인덱스이며 음수 인덱스는 끝에서부터 셉니다.
+
+Whisper 컴포넌트, 모든 네이티브 언어 그래프 부분, 표준 vision tower에서 이 API를 사용합니다. attention, MLP, 회전 헬퍼는 같은 구현을 공유합니다.
+DFlash의 컨텍스트 융합, K/V 투영 및 상태 해석기 컴포넌트도 `generate_graph()`와 `ModelGraph`를 사용합니다. 최종 드래프트 그래프는 연결된 타깃의 패킹된 출력 헤드 가중치와 스케일을 유지하며, 검증 그래프는 런타임 상태 해석기가 필요로 하는 S1 및 풀이가 완료된 중간값 출력을 유지합니다.
+
 ## 테스트
 
 실패 지표에 따라 테스트를 선택합니다. 빌드는 동작 검증을 대체하지 않으며, 건너뛴 필수 테스트 케이스는 통과로 간주되지 않습니다.
@@ -129,7 +199,7 @@ python -P -m pytest \
 `--model-inputs-path` 및 `LLIMA_HF_MODELS_PATH`는 준비된 Hugging Face/GGUF 입력 루트를 선택합니다. CI는 `tools/hf-safetensors/` 아래의 매니페스트를 사용합니다.
 테스트 생략을 허용하는 대신 필요한 입력을 구성합니다.
 
-테스트 매트릭스, 예상 값, 기본 정책은 `tests/README.md`에, CI 호출은 `.github/workflows/model-compiler-tests.yml`에 있습니다. 실행 중에 ONNX 및 숫자 비교 아티팩트를 생성하고, 이진 기본값을 커밋하는 대신 생성합니다.
+테스트 매트릭스, 예상 개수, 베이스라인 정책은 `tests/README.md`에 있습니다. CI 호출은 `.github/workflows/model-compiler-tests.yml`에 있습니다. 바이너리 베이스라인을 커밋하는 대신 실행 중에 네이티브 SDK 그래프와 수치 비교 아티팩트를 생성하세요.
 
 ### 런타임 유효성 검사
 
@@ -139,7 +209,7 @@ python -P -m pytest \
 ./build.sh --all --clean
 ```
 
-이 작업은 빌드를 수행하지만 테스트는 실행하지 않습니다. 호환되는 LLiMa 및 내부 패키지를 Modalix에 설치하고, 추가 아카이브를 추출한 다음, `tests/README.md`에 있는 DevKit 런타임 테스트 지침에 따라 패키지화된 CTest 및 pytest를 실행합니다.
+이 작업은 빌드만 수행하며 테스트는 실행하지 않습니다. Modalix에 일치하는 후보 LLiMa 패키지를 설치하고, 추가 아카이브를 추출한 다음, `tests/README.md`의 DevKit 런타임 테스트 지침에 따라 패키지화된 CTest와 pytest를 실행합니다.
 
 모델 로딩, 추론, 토큰화, 다중 모달 전처리, 추론 디코딩, CLI/HTTP/ZMQ 또는 리소스 수명 주기에 변경 사항이 적용될 때 관련 하드웨어 테스트를 실행합니다. 필요한 경우 대표적인 간단한 테스트를 추가합니다.
 
@@ -228,6 +298,10 @@ sima-cli playbooks install ./skills
 설치 요약에는 `detected: 3`, `valid: 3` 및 `discarded: 0`가 반드시 포함되어야 합니다.
 각 `playbook.yml`에서 `sima-cli` 버전은 `min_cli_version`을 충족해야 합니다.
 
+결함을 보고할 때는 [버그 보고 템플릿](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)을,
+개선을 제안할 때는 [기능 요청 템플릿](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)을 사용하세요.
+해당 항목을 작성하고 로그와 재현 절차에서 비밀 정보를 삭제하세요.
+
 풀 리퀘스트의 경우:
 
 - 현재 `develop` 브랜치에서 분기하여 해당 브랜치를 대상으로 함
@@ -241,3 +315,14 @@ sima-cli playbooks install ./skills
 예상치 않은 건너뛰기 없이 관련 테스트가 통과하고, 필수 패키지 및 Modalix
 검사가 완료되거나 사용할 수 없음이 명시되며, 호환성과 문서 문제가 해결되고,
 PR에 재현 가능한 증거가 포함되면 기여할 준비가 된 것입니다.
+
+## SDK 패키지 잠금 처리
+
+CI의 SDK 호스트 패키지 작업은 `sima-neat/.github@main`의 공유 헬퍼를 사용합니다.
+이 헬퍼는 확인된 dpkg/APT 잠금 경합에 대해서만 작업당 최대 120초 동안 재시도하며,
+경합 시 잠금 소유자와 프로세스 진단 정보를 제공합니다.
+관련 없는 오류는 즉시 실패로 처리하며, 잠금 파일과 잠금을 보유한 프로세스는 그대로 둡니다.
+헬퍼는 대상 sysroot나 DevKit 패키지 데이터베이스를 관리하지 않습니다.
+로컬 CI 설정 스크립트에서는 검토된 공유 체크아웃에 있는 `scripts/sdk-package.sh`의
+절대 경로를 `SDK_PACKAGE_HELPER`로 설정하세요.
+[공유 헬퍼 규약](https://github.com/sima-neat/.github/tree/main/actions/setup-sdk-package-helper)을 참조하세요.

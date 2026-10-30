@@ -9,6 +9,10 @@ std::unique_ptr<Tokenizer> Tokenizer::from_hf_json(
     return std::make_unique<HFTokenizer>(tokenizer_json_file_name);
 }
 
+std::unique_ptr<Tokenizer> Tokenizer::from_hf_json(std::istream& tokenizer_json_stream) {
+    return std::make_unique<HFTokenizer>(tokenizer_json_stream);
+}
+
 std::unique_ptr<Tokenizer> Tokenizer::from_gguf(const std::filesystem::path gguf_file_name) {
     return std::make_unique<GGUFTokenizer>(gguf_file_name);
 }

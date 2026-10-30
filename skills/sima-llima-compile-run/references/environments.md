@@ -49,7 +49,7 @@ llima-compile --help
 
 Install an approved LLiMa artifact there if needed; do not create another
 environment with an incompatible Model Compiler. Ensure space for source
-weights, ONNX, intermediates, and compiled output.
+weights, native graphs, intermediates, and compiled output.
 
 ## Modalix
 

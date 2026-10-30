@@ -11,15 +11,15 @@ It extends [EleutherAI's lm-evaluation-harness](https://github.com/EleutherAI/lm
 
 ## Installation
 
-MoLE is a host-side benchmarking tool. Install and run it on the host machine outside the SDK Docker container, not from the SDK container and not on the Modalix device. The Modalix device only needs the LLiMa runtime and the `llima benchmark-server` process. See [Neat Framework installation](/getting-started/neat-library/) for the runtime installation flow.
+Install MoLE in a separate virtual environment on a host or a Modalix DevKit, outside the SDK Docker container. DevKit execution also requires the installed LLiMa runtime. See [Neat Framework installation](/getting-started/neat-library/) for the runtime installation flow.
 
-Install MoLE on the host using `sima-cli`:
+Install MoLE using `sima-cli`:
 
 ``` console
 host:~$ sima-cli neat install llima/mole
 ```
 
-This installs MoLE into a host virtual environment at `~/sima-mole-venv`.
+This installs MoLE into a virtual environment at `~/sima-mole-venv`.
 
 ## Usage
 
@@ -29,7 +29,9 @@ First, activate the MoLE virtual environment:
 host:~$ source ~/sima-mole-venv/bin/activate
 ```
 
-MoLE is then invoked via the `llima-benchmark` CLI with two subcommands. The `<model_id>` argument is always the HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). In `-b modalix` mode this is not just a display label: it must match the tokenizer and config used to compile the deployed board model, because the board returns token scores only and does not provide tokenizer metadata.
+For Modalix evaluation from a host, `--board_ip` is required. On a Modalix DevKit, omit it to use the local runtime. Provide `--board_model` when starting a server; local server logs are saved to `<output_dir>/server.log`. Use `--no-board_start_server` to attach to an existing server without starting or stopping it.
+
+MoLE provides the `llima-benchmark accuracy` and `llima-benchmark perf` subcommands. For Modalix, `<model_id>` accepts a HuggingFace model ID or a local tokenizer/config directory matching the deployed model. MoLE uses that tokenizer to prepare requests.
 
 ### Accuracy Benchmarking
 
@@ -50,8 +52,8 @@ Evaluates model quality against standard tasks:
 | `-b` | Backend to use: `modalix` (run on board) or `hf` (run on host as reference baseline). |
 | `-t` | **Required.** One or more evaluation tasks. Example tasks: `hellaswag`, `triviaqa`, `piqa`, `winogrande`, `wikitext`. See the [task list](https://github.com/EleutherAI/lm-evaluation-harness/blob/v0.4.11/lm_eval/tasks/README.md) for all available tasks. |
 | `-o` | Output directory for benchmark results. |
-| `--board_ip` | IP address of the Modalix board. Required for `-b modalix`. |
-| `--board_model` | Path to the compiled model directory on the Modalix device (e.g., `/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`). Required for `-b modalix`. |
+| `--board_ip` | Remote board IP or host name. Required when running from a host; omit for local Modalix execution. |
+| `--board_model` | Compiled model directory on the DevKit. Required when starting a server. |
 | `--max_num_tokens` | Maximum context length. Must be equal to or smaller than the value used during compilation. |
 | `-n, --num_samples` | Number of samples to evaluate. Runs the full task set if not specified. |
 | `--board_ssh_user` | SSH username for the Modalix board. Optional, default: `sima`. \# |
@@ -88,8 +90,8 @@ Measures Time To First Token (TTFT) and Tokens Per Second (TPS) on a Modalix boa
 |----|----|
 | `model_id` | HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). For Modalix performance runs, this should match the tokenizer/config for the deployed model. |
 | `-o` | Output directory for benchmark results. |
-| `--board_ip` | IP address of the Modalix board. |
-| `--board_model` | Path to the compiled model directory on the Modalix device (e.g., `/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`). |
+| `--board_ip` | Remote board IP or host name. Required when running from a host; omit for local Modalix execution. |
+| `--board_model` | Compiled model directory on the DevKit. Required when starting a server. |
 | `--max_num_tokens` | Maximum context length. Must be equal to or smaller than the value used during compilation. |
 | `--max_new_tokens` | Maximum number of tokens to generate in the output. |
 | `--input_lengths` | Optional exact input-token lengths to benchmark. Values must be unique and each value plus `--max_new_tokens` must fit within `--max_num_tokens`. When omitted, MoLE generates automatic power-of-two buckets. |
@@ -97,3 +99,9 @@ Measures Time To First Token (TTFT) and Tokens Per Second (TPS) on a Modalix boa
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 
 For all available options, run `llima-benchmark perf -h`.
+
+Use `--dataset bfcl-v3|ifeval|alpacaeval|gsm8k|dialogsum` for native chat/tool prompts instead of token-length buckets. Omitting `-n` runs the full selected dataset; `-n 20` runs its first 20 samples. Datasets download automatically and are cached. BFCL covers simple/multiple cases; tools are not executed.
+
+`--board_model` determines ordinary or speculative decoding. Compare models with separate runs using the same dataset and settings, changing only `--board_model` and `-o`. Each run excludes one warmup and resets KV state before every request. The model's native chat template and EOS stopping apply. Dataset output budgets include the first token; existing buckets measure the first token plus `--max_new_tokens` decode steps.
+
+`-o` saves `performance.json` with timings, token counts, aggregate metrics, draft contribution, failures, benchmark settings and dataset sources. Decode TPS excludes TTFT; generation timings exclude input preparation and network transport. These workloads measure performance, not accuracy.

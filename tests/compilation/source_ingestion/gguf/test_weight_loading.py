@@ -15,6 +15,11 @@ from tests.compilation.helpers.paths import require_readable_path
 
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_source]
 
+# Weight-name mapping and shapes are independent of the quantization format.
+WEIGHT_MAPPING_CASES = tuple(
+    case for case in GGUF_FILE_CASES if case.quantization == "BF16"
+)
+
 
 def _read_hf_weight_shapes(
     hf_model: LocalHuggingFaceModel,
@@ -50,15 +55,15 @@ def weight_mapping_failures(
                 f"{case.quantization} GGUF model",
             )
         )
-        for case in GGUF_FILE_CASES
+        for case in WEIGHT_MAPPING_CASES
     }
     hf_weight_shapes = _read_hf_weight_shapes(hf_model)
     failures: dict[str, str | None] = {
-        case.quantization: None for case in GGUF_FILE_CASES
+        case.quantization: None for case in WEIGHT_MAPPING_CASES
     }
 
     for name, hf_shape in hf_weight_shapes.items():
-        for case in GGUF_FILE_CASES:
+        for case in WEIGHT_MAPPING_CASES:
             if failures[case.quantization] is not None:
                 continue
 
@@ -79,7 +84,7 @@ def weight_mapping_failures(
     return failures
 
 
-@pytest.mark.parametrize("case", GGUF_FILE_CASES, ids=lambda case: case.id)
+@pytest.mark.parametrize("case", WEIGHT_MAPPING_CASES, ids=lambda case: case.id)
 def test_hf_weight_names_resolve_with_matching_shapes(
     case: GgufFileCase,
     weight_mapping_failures: dict[str, str | None],

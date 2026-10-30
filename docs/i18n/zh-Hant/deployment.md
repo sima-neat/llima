@@ -30,7 +30,6 @@ sima-user@docker-image-id:/home/docker$ llima-deploy <source_directory> <destina
 
 ``` text
 Llama-3.2-3B-Instruct_out/
-├── onnx_files/
 └── sima_files/
     ├── devkit/
     └── mpk/

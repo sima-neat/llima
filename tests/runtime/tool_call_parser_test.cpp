@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include "tool_call_parser.hpp"
+#include "reasoning_parser.hpp"
 
 namespace {
 
@@ -400,6 +401,97 @@ void test_streams_non_tool_gemma_json_without_waiting_for_end() {
     }
 }
 
+// Exercise the same reasoning -> tool parser boundary as CLI HTTP and Neat Core.
+void test_gptoss_harmony_pipeline() {
+    using simaai::llima::ReasoningFormat;
+    using simaai::llima::ReasoningStreamParser;
+    const auto format = tool_call_format_for_model("llm-gpt_oss");
+    expect(format == ToolCallFormat::GptOss, "GPT-OSS must select Harmony tool parsing");
+    const std::string arguments = R"({"a":1,"nested":{"text":"quoted \" braces {}"}})";
+    const std::vector<std::string> messages{
+        "to=functions.get<|channel|>commentary json<|message|>" + arguments,
+        "<|channel|>commentary to=functions.get json<|message|>" + arguments,
+        "<|channel|>analysis<|message|>Choose a tool."
+            "<|start|>assistant to=functions.get<|channel|>commentary json<|message|>"
+            + arguments,
+        "<|start|>assistant to=functions.get<|channel|>commentary json<|message|>"
+            + arguments + "<|call|>",
+    };
+    for (bool enabled : {false, true}) {
+        for (const auto& message : messages) {
+            // Every two-chunk split plus one-byte chunks across the whole message.
+            for (size_t split = 0; split <= message.size() + 1; ++split) {
+                ReasoningStreamParser reasoning(ReasoningFormat::GptOss, enabled);
+                ToolCallStreamParser tools(format, {"get"});
+                std::string content, analysis;
+                auto feed = [&](std::string_view chunk, bool done) {
+                    for (const auto& event : reasoning.add(chunk, done)) {
+                        if (event.reasoning) analysis += event.text;
+                        else {
+                            content += event.text;
+                            expect(tools.add(event.text).empty(),
+                                   "Harmony calls must stay buffered until completion");
+                        }
+                    }
+                };
+                if (split <= message.size()) {
+                    feed(std::string_view(message).substr(0, split), false);
+                    feed(std::string_view(message).substr(split), true);
+                } else {
+                    for (char c : message) feed(std::string_view(&c, 1), false);
+                    feed("", true);
+                }
+                const auto calls = try_parse_tool_calls(format, content, {"get"});
+                const auto streamed = tools.add("", true);
+                expect(!calls.is_null(), "Harmony recipient must reach non-streaming tool parsing");
+                const auto* event = streamed.size() == 1
+                    ? std::get_if<ToolCallStreamParser::ToolCalls>(&streamed[0]) : nullptr;
+                expect(event != nullptr, "Harmony recipient must reach streaming tool parsing");
+                if (!calls.is_null() && event) {
+                    expect(calls[0]["function"]["name"] == "get" &&
+                               arguments_from(calls) == nlohmann::json::parse(arguments),
+                           "Harmony names and nested arguments must be preserved");
+                    expect(event->calls[0]["function"] == calls[0]["function"],
+                           "streaming and non-streaming Harmony calls must agree");
+                }
+                expect(analysis == (enabled && message.starts_with("<|channel|>analysis")
+                            ? "Choose a tool." : ""),
+                       "Harmony headers must not leak into reasoning");
+            }
+        }
+    }
+
+    expect(try_parse_tool_calls(format, messages[0], {"other"}).is_null(),
+           "Harmony must retain the existing allowed-tool validation");
+    expect(try_parse_tool_calls(format,
+        "to=functions.get<|channel|>commentary json<|message|>{", {"get"}).is_null(),
+        "truncated Harmony arguments must not create a tool call");
+    expect(!try_parse_tool_calls(format,
+        R"({"name":"get","arguments":{"a":1}})", {"get"}).is_null(),
+        "GPT-OSS must retain generic JSON tool-call compatibility");
+
+    for (bool enabled : {false, true}) {
+        ReasoningStreamParser reasoning(ReasoningFormat::GptOss, enabled);
+        ToolCallStreamParser tools(format, {"get"});
+        std::string content;
+        const std::string message = "<|channel|>analysis<|message|>Think."
+            "<|start|>assistant<|channel|>final<|message|>An ordinary answer.";
+        for (char c : message) {
+            for (const auto& event : reasoning.add(std::string_view(&c, 1))) {
+                if (!event.reasoning) content += event.text;
+            }
+        }
+        for (const auto& event : reasoning.add("", true)) {
+            if (!event.reasoning) content += event.text;
+        }
+        expect(content == "An ordinary answer.", "ordinary Harmony answers must remain intact");
+        const auto events = tools.add(content, true);
+        expect(events.size() == 1 &&
+                   std::holds_alternative<ToolCallStreamParser::Content>(events[0]),
+               "ordinary Harmony answers must stay content");
+    }
+}
+
 void test_preserves_stream_content_provenance() {
     ToolCallStreamParser parser(ToolCallFormat::Lfm, {"send"});
 
@@ -446,6 +538,7 @@ int main() {
     test_streams_gemma_json_tool_call_envelope();
     test_streams_non_tool_gemma_json_without_waiting_for_end();
     test_preserves_stream_content_provenance();
+    test_gptoss_harmony_pipeline();
 
     if (failures != 0) {
         std::cerr << failures << " tool-call parser assertion(s) failed\n";

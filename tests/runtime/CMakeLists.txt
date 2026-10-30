@@ -7,11 +7,11 @@ target_link_libraries(sima_lmm_embedding_offload_test PRIVATE OpenMP::OpenMP_CXX
 add_test(NAME runtime.embedding_offload COMMAND sima_lmm_embedding_offload_test)
 set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
 add_test(NAME runtime.embedding_offload_generation COMMAND sima_lmm_embedding_offload_generation_test)
-set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK dispatcher TIMEOUT 900)
+set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
 
 add_executable(
-    sima_lmm_dispatcher_lifecycle_test
-    dispatcher_lifecycle_test.cpp
+    sima_lmm_mla_rt_lifecycle_test
+    mla_rt_lifecycle_test.cpp
 )
 add_executable(
     sima_lmm_text_generation_test
@@ -33,8 +33,17 @@ add_executable(
     sima_lmm_reasoning_parser_test
     reasoning_parser_test.cpp
 )
+add_executable(
+    sima_lmm_gemma4_mtp_helpers_test
+    gemma4_mtp_helpers_test.cpp
+)
+add_executable(
+    sima_lmm_gemma4_mtp_cache_test
+    gemma4_mtp_cache_test.cpp
+)
+target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime)
 target_link_libraries(
-    sima_lmm_dispatcher_lifecycle_test
+    sima_lmm_mla_rt_lifecycle_test
     PRIVATE
         sima_lmm_runtime
 )
@@ -63,23 +72,32 @@ target_link_libraries(
     PRIVATE
         sima_lmm_runtime
 )
+target_link_libraries(
+    sima_lmm_gemma4_mtp_helpers_test
+    PRIVATE
+        sima_lmm_runtime
+)
+# Keep the parser assertions active in release/package builds.
+target_compile_options(sima_lmm_reasoning_parser_test PRIVATE -UNDEBUG)
 set_target_properties(
     sima_lmm_embedding_offload_generation_test
     sima_lmm_embedding_offload_test
-    sima_lmm_dispatcher_lifecycle_test
+    sima_lmm_mla_rt_lifecycle_test
     sima_lmm_text_generation_test
     sima_lmm_vision_generation_test
     sima_lmm_asr_transcription_test
     sima_lmm_tool_call_parser_test
     sima_lmm_reasoning_parser_test
+    sima_lmm_gemma4_mtp_helpers_test
+    sima_lmm_gemma4_mtp_cache_test
     PROPERTIES
         INSTALL_RPATH
-            "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR};${SIMAAI_DISPATCHER_INSTALL_LIB_DIR}"
+            "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}"
 )
 
 add_test(
-    NAME runtime.dispatcher_lifecycle
-    COMMAND "$<TARGET_FILE:sima_lmm_dispatcher_lifecycle_test>"
+    NAME runtime.mla_rt_lifecycle
+    COMMAND "$<TARGET_FILE:sima_lmm_mla_rt_lifecycle_test>"
 )
 add_test(
     NAME runtime.text_generation
@@ -103,32 +121,37 @@ add_test(
     COMMAND
         "$<TARGET_FILE:sima_lmm_reasoning_parser_test>"
 )
+add_test(
+    NAME runtime.gemma4_mtp_helpers
+    COMMAND
+        "$<TARGET_FILE:sima_lmm_gemma4_mtp_helpers_test>"
+)
 set_tests_properties(
-    runtime.dispatcher_lifecycle
+    runtime.mla_rt_lifecycle
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;smoke"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;smoke"
+        RESOURCE_LOCK mla
         TIMEOUT 30
 )
 set_tests_properties(
     runtime.text_generation
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;genai;llm;long"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;genai;llm;long"
+        RESOURCE_LOCK mla
         TIMEOUT 900
 )
 set_tests_properties(
     runtime.vision_generation
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;genai;vlm;long"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;genai;vlm;long"
+        RESOURCE_LOCK mla
         TIMEOUT 900
 )
 set_tests_properties(
     runtime.asr_transcription
     PROPERTIES
-        LABELS "devkit;runtime;dispatcher;genai;asr;long"
-        RESOURCE_LOCK dispatcher
+        LABELS "devkit;runtime;mla;genai;asr;long"
+        RESOURCE_LOCK mla
         TIMEOUT 900
 )
 set_tests_properties(
@@ -143,17 +166,25 @@ set_tests_properties(
         LABELS "devkit;runtime;unit"
         TIMEOUT 30
 )
+set_tests_properties(
+    runtime.gemma4_mtp_helpers
+    PROPERTIES
+        LABELS "devkit;runtime;unit;gemma4;speculative"
+        TIMEOUT 30
+)
 
 install(
     TARGETS
         sima_lmm_embedding_offload_generation_test
         sima_lmm_embedding_offload_test
-        sima_lmm_dispatcher_lifecycle_test
+        sima_lmm_mla_rt_lifecycle_test
         sima_lmm_text_generation_test
         sima_lmm_vision_generation_test
         sima_lmm_asr_transcription_test
         sima_lmm_tool_call_parser_test
         sima_lmm_reasoning_parser_test
+        sima_lmm_gemma4_mtp_helpers_test
+        sima_lmm_gemma4_mtp_cache_test
     RUNTIME DESTINATION lib/sima-lmm/tests
     COMPONENT extras
 )
@@ -172,17 +203,19 @@ install(
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.hpp"
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp"
         asr_transcription_test.cpp
-        dispatcher_lifecycle_test.cpp
+        mla_rt_lifecycle_test.cpp
+        gemma4_mtp_helpers_test.cpp
+        gemma4_mtp_cache_test.cpp
         pytest.ini
         runtime_test_utils.hpp
         test_cli_black_box.py
         test_http_black_box.py
-        test_mla_memory_cleanup.py
         test_model_manager.py
         test_python_runtime_lifecycle.py
         test_zmq_black_box.py
         text_generation_test.cpp
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/reasoning_parser.hpp"
+        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/gemma4_mtp_helpers.hpp"
         reasoning_parser_test.cpp
         tool_call_parser_test.cpp
         vision_generation_test.cpp
@@ -197,3 +230,15 @@ install(
     DESTINATION share/sima-lmm/tests/runtime
     COMPONENT extras
 )
+
+foreach(provider_test IN ITEMS file_provider file_provider_routing)
+    add_executable(sima_lmm_${provider_test}_test ${provider_test}_test.cpp)
+    target_include_directories(sima_lmm_${provider_test}_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+    target_link_libraries(sima_lmm_${provider_test}_test PRIVATE sima_lmm_runtime)
+    add_test(NAME runtime.${provider_test} COMMAND sima_lmm_${provider_test}_test)
+    set_tests_properties(runtime.${provider_test} PROPERTIES LABELS "devkit;runtime;provider" TIMEOUT 900)
+    install(TARGETS sima_lmm_${provider_test}_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+endforeach()
+set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;runtime;long" RESOURCE_LOCK mla)
+install(FILES file_provider_test.cpp file_provider_routing_test.cpp
+    DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)

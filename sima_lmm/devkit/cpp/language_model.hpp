@@ -47,12 +47,22 @@ using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
 class LanguageModel : public BaseModel<VlmConfig> {
     public:
+        // Existing disk-loading overload; preserves source compatibility.
         LanguageModel(
             std::filesystem::path model_path,
             std::set<uint32_t> stop_token_ids,
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer
+        );
+        // Reads the model files through file_provider (nullptr = from disk).
+        LanguageModel(
+            std::filesystem::path model_path,
+            std::set<uint32_t> stop_token_ids,
+            std::optional<uint32_t> image_token_id,
+            std::optional<uint32_t> pad_token_id,
+            TextStreamer& text_streamer,
+            std::shared_ptr<FileProvider> file_provider
         );
         virtual ~LanguageModel() override { _finalize(); }
 
@@ -90,6 +100,21 @@ class LanguageModel : public BaseModel<VlmConfig> {
         // std::nullopt when generation aborted (e.g. cache full pre-init).
         // Caller is responsible for serializing concurrent invocations.
         std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
+            std::optional<ChronoTimer> timer_ttft = std::nullopt,
+            GenerationPerformanceResult* performance_result = nullptr
+        );
+        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            uint16_t stable_prefix_token_count
+        );
+        std::optional<std::vector<uint32_t>> run_model_gemma4_mtp(
             LanguageModel& draft_lm,
             std::span<const uint32_t> input_token_ids,
             std::optional<uint16_t> override_max_num_tokens = std::nullopt,
@@ -151,6 +176,16 @@ class LanguageModel : public BaseModel<VlmConfig> {
         struct DraftForwardResult {
             std::vector<Eigen::bfloat16> hidden_states;  // (seq_length, hidden_size)
             std::vector<Eigen::bfloat16> logits;         // (num_tokens, draft_vocab_size)
+        };
+
+        struct Gemma4MtpTargetBatchResult {
+            std::vector<uint32_t> next_token_ids;
+            std::vector<Eigen::bfloat16> hidden_states;
+        };
+
+        struct Gemma4MtpDraftStepResult {
+            uint32_t token_id;
+            std::vector<Eigen::bfloat16> projected_hidden_state;  // (backbone_hidden_size)
         };
 
         // Draft model forward with lm_head fused. is_prefill picks n128 (with FC
@@ -260,6 +295,47 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         void _prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx);
         void _define_draft_fc_models();
+        void _define_dflash_models();
+        void _append_dflash_context(
+            LanguageModel& target_lm, uint16_t num_tokens,
+            uint16_t token_idx, uint16_t valid_tokens
+        );
+        struct DFlashScratch;
+        MLABuffer* _get_dflash_hidden_buffer(uint16_t num_tokens, uint8_t layer_idx);
+        void _bind_dflash_linear_conv_state(uint16_t prefix_tokens);
+        void _resolve_dflash_linear_state(uint16_t prefix_tokens);
+        void _commit_dflash_linear_state(uint16_t prefix_tokens);
+        void _save_dflash_state_checkpoint(
+            uint16_t token_count, uint16_t prefix_tokens
+        );
+        void _upload_dflash_attention_mask(
+            uint16_t num_tokens, uint16_t token_idx,
+            uint8_t layer_idx, bool bidirectional,
+            std::vector<Eigen::bfloat16>& mask
+        );
+        std::pair<uint16_t, uint32_t> _run_dflash_target_verify(
+            std::span<const uint32_t> input_ids, uint16_t token_idx,
+            DFlashScratch& scratch
+        );
+        const std::vector<uint32_t>& _run_dflash_draft(
+            LanguageModel& target_lm, uint32_t anchor_token, uint16_t token_idx,
+            DFlashScratch& scratch
+        );
+        std::optional<std::vector<uint32_t>> _run_model_dflash_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            uint16_t stable_prefix_token_count
+        );
+        std::optional<std::vector<uint32_t>> _run_model_eagle3_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result
+        );
         struct CachedState {
             // Hidden-layer indices belonging to this stateful family.
             std::vector<uint8_t> layer_indices;
@@ -278,6 +354,17 @@ class LanguageModel : public BaseModel<VlmConfig> {
             // Tail snapshots indexed as [layer_slot][checkpoint_slot][byte_offset].
             std::vector<std::vector<std::vector<uint8_t>>> checkpoints;
         };
+        struct AttentionBindingBuffers {
+            MLABuffer* key = nullptr;
+            MLABuffer* value = nullptr;
+            MLABuffer* key_scale = nullptr;
+            MLABuffer* value_scale = nullptr;
+        };
+        struct BoundAttentionModels {
+            MLAModelWithBuffer* pre;
+            MLAModelWithBuffer* cache;
+            MLAModelWithBuffer* post;
+        };
 
         virtual void _initialize() override;
         virtual void _finalize() override;
@@ -293,10 +380,25 @@ class LanguageModel : public BaseModel<VlmConfig> {
             const std::vector<MLABufferSlice>& ofms
         );
         void _define_attn_models_iter(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx);
+        // Mixture-of-Experts post block: router + experts + weighted-sum (replaces post).
+        void _define_moe_post_models(
+            uint16_t num_tokens, uint8_t layer_idx,
+            const std::vector<MLABufferSlice>& post_ifms,
+            const std::vector<MLABufferSlice>& post_ofms
+        );
+        // Runtime for one MoE post block: router -> host weight scatter -> experts ->
+        // weighted-sum. Gated on _cfg.lm_cfg.is_moe().
+        void _run_moe_post(
+            std::map<uint8_t, MLABufferSlice>* ifm_map,
+            uint16_t num_tokens, uint8_t layer_idx
+        );
         LanguageModelMapKey _get_cache_model_key(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
         ) const;
-        LanguageModelMapKey _bind_attn_models(
+        uint16_t _get_cache_token_idx_begin(
+            uint16_t num_tokens, uint16_t token_idx, const std::string& layer_type
+        ) const;
+        BoundAttentionModels _bind_attn_models(
             uint16_t num_tokens,
             uint16_t token_idx,
             uint8_t layer_idx,
@@ -315,6 +417,11 @@ class LanguageModel : public BaseModel<VlmConfig> {
             bool use_sliding_cache
         );
         std::filesystem::path _get_elf_path_post(uint16_t num_tokens, uint8_t layer_idx);
+        std::filesystem::path _get_elf_path_router(uint16_t num_tokens, uint8_t layer_idx);
+        std::filesystem::path _get_elf_path_expert(
+            uint16_t num_tokens, uint8_t layer_idx, uint16_t expert_idx
+        );
+        std::filesystem::path _get_elf_path_weightedsum(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
@@ -344,10 +451,16 @@ class LanguageModel : public BaseModel<VlmConfig> {
         bool _uses_per_layer_inputs() const {
             return _cfg.model_type == "vlm-gemma4" && _cfg.lm_cfg.hidden_size_per_layer_input > 0;
         }
+        void _init_state_checkpoint_capture(
+            size_t input_token_count, uint16_t stable_prefix_token_count
+        );
         uint16_t _prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens);
         void _upload_group_future_token_masks(uint16_t num_tokens, uint16_t token_idx);
         void _save_state_checkpoint(
             uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
+        );
+        std::optional<size_t> _select_state_checkpoint_slot(
+            uint16_t token_count, bool is_prefill
         );
         void _move_state_tail_for_decode(uint16_t valid_tokens);
 
@@ -368,16 +481,77 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> input_token_ids
         ) const;
         void _upload_per_layer_embedding_rows(
-            std::span<const uint32_t> token_ids, uint16_t num_tokens
+            std::span<const uint32_t> token_ids, uint16_t num_tokens,
+            uint16_t valid_tokens = 0
         );
         void _load_per_layer_embeddings();
         void _compute_and_upload_per_layer_inputs_prefill(
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
+        struct LMHeadLogitView {
+            MLABuffer* buffer;
+            const uint8_t* data;
+            size_t row_bytes;
+            uint32_t vocab_begin;
+            uint32_t width;
+        };
+        void _prepare_lm_head_logit_views(
+            uint16_t num_tokens, uint16_t output_rows, std::vector<LMHeadLogitView>& views
+        );
+        static uint32_t _argmax_lm_head_row(
+            std::span<const LMHeadLogitView> views, uint16_t row
+        );
+        uint32_t _argmax_gemma4_mtp_masked_row(uint16_t num_tokens, uint16_t row);
+        std::vector<uint32_t> _argmax_lm_head_rows(
+            uint16_t num_tokens, uint16_t valid_tokens,
+            std::span<const uint32_t> expected_draft_tokens
+        );
+        std::vector<Eigen::bfloat16> _read_embedding_row_bf16(uint32_t token_id);
+        std::vector<Eigen::bfloat16> _read_gemma4_mtp_target_hidden_rows(
+            uint16_t num_tokens, uint16_t valid_tokens
+        );
+        void _upload_gemma4_mtp_freq_rows(
+            uint16_t num_tokens, uint16_t position_id, uint16_t valid_tokens
+        );
+        void _upload_gemma4_mtp_causal_mask(
+            MLABuffer& buffer,
+            uint16_t num_tokens,
+            uint16_t first_visible_token_count,
+            uint16_t valid_tokens,
+            uint16_t cache_token_idx_begin,
+            uint16_t context_length,
+            uint16_t sliding_window = 0
+        );
+        uint8_t _find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const;
+        std::vector<uint8_t> _prepare_gemma4_mtp_shared_kv_layers(
+            const LanguageModel& target_lm
+        ) const;
+        void _bind_kv_cache_inputs(
+            LanguageModel& kv_owner,
+            uint8_t source_layer,
+            std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
+            uint8_t cache_ifm_idx,
+            uint16_t cache_token_idx_begin,
+            uint16_t aligned_eff_num_cached_tokens,
+            bool has_future_token_mask
+        );
+        Gemma4MtpTargetBatchResult _run_gemma4_mtp_target_batch(
+            uint16_t token_idx, std::span<const uint32_t> token_ids
+        );
+        Gemma4MtpDraftStepResult _run_gemma4_mtp_draft_step(
+            LanguageModel& target_lm,
+            std::span<const uint8_t> shared_kv_layers,
+            uint32_t token_id,
+            const std::vector<Eigen::bfloat16>& hidden_state,
+            uint16_t query_position_id,
+            uint16_t shared_kv_len
+        );
 
         void _notify_first_token(uint32_t token_id, double duration);
-        void _notify_new_token(uint32_t token_id, double duration);
+        void _notify_new_token(
+            uint32_t token_id, double duration, bool from_draft = false
+        );
         void _notify_cache_full() const;
         void _notify_stop() const;
         void _notify_interrupt() const;
@@ -397,8 +571,42 @@ class LanguageModel : public BaseModel<VlmConfig> {
         LanguageModelMap _conv_final_model_map;
         LanguageModelMap _per_layer_model_map;
         LanguageModelMap _linear_model_map;
-        // Draft-only: FC fusion models indexed by num_tokens (128 prefill, 5 decode).
+        // Mixture-of-Experts maps. router/weightedsum are keyed like post
+        // ({num_tokens, layer_idx, 0}); the expert map repurposes the third key slot
+        // as the expert index ({num_tokens, layer_idx, expert_idx}).
+        LanguageModelMap _router_model_map;
+        LanguageModelMap _expert_model_map;
+        LanguageModelMap _weightedsum_model_map;
+        // Preresolved handles + staging for the MoE host round-trip, one per MoE variant.
+        struct MoeHostCache {
+            uint16_t num_tokens = 0;             // the moe_nt this entry serves
+            MLABuffer* values = nullptr;         // n{nt}_router_values
+            MLABuffer* indices = nullptr;        // n{nt}_router_indices
+            MLABuffer* weights = nullptr;        // n{nt}_router_weights
+            std::vector<MLABuffer*> expert_out;  // top_k decode slots or num_experts prefill outputs
+            // Decode only: top_k OFM overrides routing each expert into its combine slot.
+            std::vector<std::map<uint8_t, MLABufferSlice>> slot_ofm;
+            // Host staging, sized once; never reallocated on the critical path.
+            std::vector<Eigen::bfloat16> values_scratch;   // nt * top_k
+            std::vector<int32_t> indices_scratch;          // nt * top_k
+            std::vector<Eigen::bfloat16> weights_scratch;  // nt * num_experts
+            std::vector<uint8_t> activated_scratch;        // num_experts (prefill only)
+        };
+        std::vector<MoeHostCache> _moe_host;
+        void _init_moe_host_cache();
+        MoeHostCache& _get_moe_host(uint16_t moe_nt);
+
+        // Draft-only context-fusion models indexed by their compiled width.
         std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
+        LanguageModelMap _dflash_context_model_map;
+        LanguageModelMap _dflash_state_resolver_model_map;
+        uint16_t _dflash_resolved_prefix = 0;
+
+        std::vector<AttentionBindingBuffers> _attention_binding_buffers;
+        MLABuffer* _global_freq_real = nullptr;
+        MLABuffer* _global_freq_imag = nullptr;
+        MLABuffer* _local_freq_real = nullptr;
+        MLABuffer* _local_freq_imag = nullptr;
 
         RopeTable _master_rope_table;
         RopeTable _global_freq_host;  // pristine CPU copy; source for tree-RoPE rows
@@ -422,6 +630,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _cached_eagle3_stable_kv = 0;
         uint16_t _kv_cache_len = 0;  // tokens in KV cache; set by prefill, advanced by decode
         std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
+        std::vector<uint32_t> _gemma4_token_ordering;
         std::vector<uint16_t> _checkpoint_boundaries;
         std::vector<CachedState> _cached_states;
         // Positions are zero for unused slots. Slot 0 is reserved only for a system/tool prefix.
@@ -432,6 +641,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         size_t _rolling_checkpoint_slot = 0;
 
         std::vector<std::vector<Eigen::bfloat16>> _eagle3_intermediate_hidden_states;
+        std::optional<std::vector<Eigen::bfloat16>> _gemma4_mtp_prefill_hidden_state;
 
         std::atomic<bool> _is_running;
         std::optional<std::string> _reloc_name;

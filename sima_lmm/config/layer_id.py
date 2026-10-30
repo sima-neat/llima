@@ -15,7 +15,8 @@ class LayerID:
             'single_cache', 'single_sliding_cache', 'single_post', 'group_conv',
             'single_conv', 'group_linear', 'single_linear', 'conv_post_final', 'vision',
             'group_per_layer',
-            'single_per_layer', and for Mixture-of-Experts models 'group_router',
+            'single_per_layer', 'group_dflash_context', 'single_dflash_context',
+            and for Mixture-of-Experts models 'group_router',
             'single_router', 'group_expert', 'single_expert',
             'group_weightedsum', 'single_weightedsum'.
         part_idx: Index of the layer.

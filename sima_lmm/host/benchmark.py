@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 from sima_lmm.mole.modalixboard import ModalixBoard
+from sima_lmm.mole.perf_runner import PerformanceOptions
 from sima_lmm.mole.mole import perf_bench, prepare_mole, run
 
 def main():
@@ -17,14 +18,17 @@ def main():
         "--max_num_tokens", type=int, default=2048, help="Max number of tokens"
     )
     common_parser.add_argument("-o", "--output", type=Path, help="Output directory")
-    common_parser.add_argument("--board_ip", type=str, help="Board IP or host name")
+    common_parser.add_argument(
+        "--board_ip", type=str,
+        help="Remote board IP or host name; omit only when running on a Modalix DevKit",
+    )
     common_parser.add_argument("--board_port", type=int, default=8002, help="Board port")
     common_parser.add_argument(
         "--board_start_server", type=bool, action=argparse.BooleanOptionalAction, default=True,
         help="Start board server"
     )
     common_parser.add_argument("--board_venv_path", type=str, help="Python venv path on the board")
-    common_parser.add_argument("--board_model", type=str, help="Model ID or path on the board")
+    common_parser.add_argument("--board_model", type=str, help="Compiled model or speculative model bundle on the board")
     common_parser.add_argument(
         "--board_ssh_user", type=str, default="sima", help="Board user name for SSH connection"
     )
@@ -58,7 +62,10 @@ def main():
         "--input_lengths", type=int, nargs="+",
         help="Exact input-token lengths to benchmark; omit for automatic buckets"
     )
+    perf_parser.add_argument("--dataset", choices=["bfcl-v3", "ifeval", "alpacaeval", "gsm8k", "dialogsum"],
+                             help="Single-turn workload; runs the full dataset unless -n is specified")
     args = parser.parse_args()
+    performance = PerformanceOptions(dataset=getattr(args, "dataset", None))
 
     # Create and validate mole config.
     board = None
@@ -66,7 +73,7 @@ def main():
         board = ModalixBoard(
             address=args.board_ip, port=args.board_port, model=args.board_model,
             ssh_user=args.board_ssh_user, ssh_password=args.board_ssh_pass,
-            venv_path=args.board_venv_path
+            venv_path=args.board_venv_path,
         )
 
     config = prepare_mole(
@@ -81,6 +88,7 @@ def main():
         max_num_tokens=args.max_num_tokens,
         max_new_tokens=args.max_new_tokens,
         input_lengths=getattr(args, "input_lengths", None),
+        performance=performance,
     )
     if config is None:
         parser.error("Invalid argument combinations")

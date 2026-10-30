@@ -94,8 +94,8 @@ output_directory/
 | `--input_width` | 픽셀 단위의 입력 이미지 너비입니다. `--input_height`와 함께 제공해야 합니다. Qwen 2 VL, Qwen 3 VL, Qwen3.5, Gemma 4 모델에 필수이며, SigLIP2 모델의 설정된 크기를 변경할 때 선택적으로 사용할 수 있습니다. |
 | `--system_prompt` | CLI 모드와 모델 초기화를 위해 저장할 시스템 프롬프트입니다. |
 | `--system_prompt_file` | 시스템 프롬프트를 포함하는 텍스트 파일의 경로입니다. |
-| `--chat_template` | 컴파일된 모델에 저장할 채팅 템플릿 문자열입니다. 시스템 프롬프트 및 채팅 템플릿 파일 옵션과 상호 배타적입니다. |
-| `--chat_template_file` | 채팅 템플릿이 포함된 파일의 경로입니다. 시스템 프롬프트 옵션과 `--chat_template`는 상호 배타적입니다. |
+| `--chat_template` | 컴파일된 모델에 저장할 채팅 템플릿 문자열입니다. `--chat_template_file`과 상호 배타적입니다. |
+| `--chat_template_file` | 채팅 템플릿이 포함된 파일의 경로입니다. `--chat_template`과 상호 배타적입니다. |
 
 :::note
 대부분의 모델은 최대 8192개의 토큰까지의 컨텍스트 길이를 지원합니다. 8K 컨텍스트 길이를 사용하려면 `--max_num_tokens 8192`를 사용하세요.
@@ -105,14 +105,21 @@ output_directory/
 |----|----|
 | `--language_group_size` | 사전 학습 단계에서 병렬 토큰 처리를 위한 배치 크기입니다. 더 큰 값(예: 256)을 사용하면 큰 입력 프롬프트에 대해 TTFT(Time To First Token)를 개선할 수 있지만, 작은 입력 프롬프트에 대해서는 TTFT를 저하시킬 수 있습니다. 기본값: 128. |
 | `--future_token_mask_size` | 토큰 위치 간에 컴파일된 모델을 재사용하기 위한 마스크 크기입니다. 값이 클수록 컴파일된 바이너리 파일의 수가 줄어들지만, 초당 토큰 수(TPS)가 감소할 수 있습니다. 기본값: 128. |
-| `--enable_filter_sharing` | 그룹 모델과 단일 모델 간에 필터 공유를 활성화하여 DRAM 사용량을 줄이되, TTFT(첫 번째 토큰 생성까지의 시간)는 증가하고 TPS(초당 토큰 수)는 감소합니다. 이는 두 모델 유형 모두 동일한 정밀도를 사용할 때만 효과가 있으며, LoRA를 사용하여 컴파일할 때 필수적으로 적용해야 합니다. |
 | `--no-quantize_embeddings` | 기본적으로 지원되는 LLM 및 VLM에 대해 활성화되어 있는 임베딩 테이블 양자화를 비활성화합니다. |
 | `--no-quantize_kv_cache` | 기본적으로 활성화되어 있는 KV 캐시 양자화를 비활성화합니다. |
 | `--return_logits` | 마지막 레이어의 출력에서 로짓 값을 반환합니다(모델 평가에 필요). |
-| `--draft_model_path` | 추론 디코딩을 위한 EAGLE3 초안 모델의 경로입니다. |
+| `--draft_model_path` | 호환 가능한 EAGLE3, Gemma4 MTP 또는 DFlash 초안 모델의 경로입니다. 방식은 자동으로 감지됩니다. |
+| `--speculative_block_size` | DFlash 검증 너비: 4, 8 또는 16. 기본값: 8. |
 | `--lora_name` | 기본 모델과 함께 컴파일되는 LoRA 어댑터의 이름입니다. |
 | `--lora_path` | 기본 모델과 함께 컴파일할 때 사용할 LoRA 어댑터 디렉터리의 경로입니다. |
 | `--compile_lora`, `--no-compile_lora` | LoRA 경로가 제공될 때 어댑터 가중치 컴파일을 활성화하거나 비활성화합니다. 기본적으로 활성화되어 있습니다. |
+
+DFlash에서는 사전 채움 그룹 크기가 블록 크기보다 커야 하며, 컨텍스트 길이는 그룹 크기로 나누어떨어져야 합니다:
+
+``` console
+llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
+    --speculative_block_size 16
+```
 
 ## 시스템 프롬프트
 
@@ -143,14 +150,22 @@ LLM 추론은 두 개의 뚜렷한 단계로 구성되며, 컴파일러는 각 �
 
 `get_layer_configuration` 함수는 각 컴파일러 단위에 대해 호출되며, 다음 값을 받습니다.
 
-- `model_properties`: `{"num_hidden_layers": int}`를 포함하는 딕셔너리
+- `model_properties`: 다음 항목이 포함된 딕셔너리:
+  - `"num_hidden_layers"`: 언어 레이어 수
+  - `"is_draft_model"`: 추측 디코딩 초안 모델을 설정할 때 `True`
 
 - `layer`: 다음 항목이 포함된 사전:
   - `"part"`: `"PRE"`, `"CACHE"`, `"POST"`와 같은 논리적 구성 요소
-    `"VISION"`, `"DRAFT_FC"` 또는 `"PER_LAYER"`
+    `"VISION"`, `"DRAFT_FC"` 또는 `"PER_LAYER"`. Mixture-of-Experts 모델은
+    `"ROUTER"`, `"EXPERT"`, `"WEIGHTEDSUM"`을 추가합니다.
   - `"is_group"`: 다중 토큰/그룹 변형의 경우 `True`이고, 그렇지 않은 경우 `False`입니다.
   - `"index"`: 해당 컴파일러 단위의 인덱스입니다. `"PRE"` 및 `"POST"`의 경우
     일반적으로 트랜스포머 레이어에 해당합니다. `"CACHE"`의 경우 트랜스포머 레이어가 아닌 캐시 또는 토큰 위치 변형을 식별합니다.
+  - `"expert_idx"`: `"EXPERT"` 레코드에서 레이어 내 전문가의 인덱스입니다.
+    모든 밀집 모델을 포함한 다른 모든 구성 요소에서는 `-1`입니다.
+
+  필요한 값은 키로 읽으십시오. 향후 릴리스에서 새 키가 추가될 수 있으므로
+  이 사전을 고정된 인수 목록으로 풀거나 정확한 키 집합을 단언하지 마십시오.
 
 **반환 값**
 
@@ -255,7 +270,7 @@ def get_layer_configuration(model_properties, layer):
 LoRA (저랭크 적응)를 사용하면 기본 모델을 미세 조정하고 어댑터를 동적으로 적용하거나 런타임에 기본 모델을 다시 컴파일하지 않고 제거할 수 있습니다. 기본 모델은 병렬 LoRA 분기와 함께 컴파일됩니다(0으로 초기화됨). 어댑터 가중치는 별도로 `.npy` 파일로 컴파일되어 필요에 따라 로드됩니다.
 
 :::note
-LoRA를 사용하여 컴파일할 때는 필터 공유가 필요합니다. `--enable_filter_sharing`를 사용하여 활성화하세요. 더 나은 정확도를 위해 INT4가 지정되었더라도 LoRA 브랜치는 항상 INT8으로 컴파일됩니다.
+더 나은 정확도를 위해 INT4가 지정되었더라도 LoRA 브랜치는 항상 INT8으로 컴파일됩니다.
 :::
 
 1.  **기본 모델과 LoRA 어댑터를 다운로드하세요**:
@@ -281,7 +296,6 @@ LoRA를 사용하여 컴파일할 때는 필터 공유가 필요합니다. `--en
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -294,7 +308,6 @@ LoRA를 사용하여 컴파일할 때는 필터 공유가 필요합니다. `--en
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \

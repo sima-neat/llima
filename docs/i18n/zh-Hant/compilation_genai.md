@@ -95,8 +95,8 @@ output_directory/
 | `--input_width` | 輸入圖片的寬度，單位為像素。必須與 `--input_height` 一起提供。對於 Qwen 2 VL、Qwen 3 VL、Qwen3.5 和 Gemma 4 而言，這是必需的；對於覆寫 SigLIP2 模型已設定的大小而言，則是可選的。 |
 | `--system_prompt` | 系統提示，用於儲存以供 CLI 模式使用，以及用於模型預熱。 |
 | `--system_prompt_file` | 指向包含系統提示的文字檔案的路徑。 |
-| `--chat_template` | 聊天範本字串，用於儲存在編譯後的模型中。與「系統提示」和「聊天範本檔案」選項為互斥關係。 |
-| `--chat_template_file` | 檔案路徑，指向包含對話範本的檔案。與「系統提示」選項互斥，且與 `--chat_template` 互斥。 |
+| `--chat_template` | 聊天範本字串，用於儲存在編譯後的模型中。與 `--chat_template_file` 互斥。 |
+| `--chat_template_file` | 檔案路徑，指向包含對話範本的檔案。與 `--chat_template` 互斥。 |
 
 :::note
 大多數模型支援最多 8192 個 token 的上下文長度。請使用 `--max_num_tokens 8192` 以啟用 8K 的上下文長度。
@@ -106,14 +106,21 @@ output_directory/
 |----|----|
 | `--language_group_size` | 在預填階段，用於平行處理分詞的批次大小。較大的值（例如，256）可以改善大型輸入提示的首次產生詞元所需時間（TTFT），但可能會使小型輸入提示的 TTFT 變差。預設值：128。 |
 | `--future_token_mask_size` | 用於跨分詞位置重複使用已編譯模型的遮罩大小。較大的值會減少已編譯的二進位檔案數量，但可能會降低每秒詞元數（TPS）。預設值：128。 |
-| `--enable_filter_sharing` | 啟用群組模型和單一模型之間的篩選器共享功能，以減少 DRAM 使用量，但會增加 TTFT（首次產生詞元所需時間）並降低 TPS（每秒詞元數）。此功能僅在兩種模型類型都使用相同的精確度時才有效，並且在使用 LoRA 進行編譯時是必需的。 |
 | `--no-quantize_embeddings` | 停用嵌入表格量化功能。預設情況下，此功能會針對支援的 LLM 和 VLM 啟用。 |
 | `--no-quantize_kv_cache` | 停用 KV 快取量化功能，因為預設情況下已啟用此功能。 |
 | `--return_logits` | 傳回最後一層輸出的 logits 值（模型評估器需要此值）。 |
-| `--draft_model_path` | 用於推測性解碼的 EAGLE3 草稿模型的路徑。 |
+| `--draft_model_path` | 相容的 EAGLE3、Gemma4 MTP 或 DFlash 草稿模型路徑。方法會自動偵測。 |
+| `--speculative_block_size` | DFlash 驗證寬度：4、8 或 16。預設：8。 |
 | `--lora_name` | 與基礎模型一同編譯的 LoRA 配接器的名稱。 |
 | `--lora_path` | 用於與基礎模型一起編譯的 LoRA 轉接器目錄的路徑。 |
 | `--compile_lora`, `--no-compile_lora` | 當提供 LoRA 路徑時，啟用或停用配接器權重編譯。預設為啟用。 |
+
+使用 DFlash 時，預填群組大小必須大於區塊大小，且上下文長度必須能被群組大小整除：
+
+``` console
+llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
+    --speculative_block_size 16
+```
 
 ## 系統提示
 
@@ -144,15 +151,23 @@ LLM 推論包含兩個不同的階段，編譯器會為每個階段產生最佳�
 
 `get_layer_configuration` 函式會針對每個編譯單元進行呼叫，並接收：
 
-- `model_properties`：包含 `{"num_hidden_layers": int}` 的字典。
+- `model_properties`：包含以下項目的字典：
+  - `"num_hidden_layers"`：語言層數
+  - `"is_draft_model"`：設定推測性解碼草稿模型時為 `True`
 
 - `layer`：包含以下詞彙的字典：
   - `"part"`：邏輯元件，例如 `"PRE"`、`"CACHE"`、`"POST"`。
-    `"VISION"`、`"DRAFT_FC"` 或 `"PER_LAYER"`。
+    `"VISION"`、`"DRAFT_FC"` 或 `"PER_LAYER"`。Mixture-of-Experts 模型會新增
+    `"ROUTER"`、`"EXPERT"` 和 `"WEIGHTEDSUM"`。
   - `"is_group"`：對於多個詞彙/群組的變體，其值為`True`，否則為`False`。
   - `"index"`：該編譯單元的索引。對於 `"PRE"` 和 `"POST"`，
     通常對應於一個轉換器層。對於 `"CACHE"`，它會識別
 一個快取或權杖位置變體，而不是一個轉換器層。
+  - `"expert_idx"`：在 `"EXPERT"` 記錄中，表示該層內專家的索引。
+    其他所有元件（包括所有密集模型）皆為 `-1`。
+
+  請透過鍵讀取所需的值。未來版本可能新增鍵，因此請勿將此字典解包為
+  固定的引數清單，也不要斷言鍵的集合必須完全一致。
 
 **傳回值**
 
@@ -257,7 +272,7 @@ def get_layer_configuration(model_properties, layer):
 LoRA（低階適應）允許對基礎模型進行微調，並且可以在執行階段動態地應用或移除適配器，而無需重新編譯基礎模型。基礎模型使用並行的 LoRA 分支進行編譯（初始化為零），並且適配器權重會單獨編譯到 `.npy` 檔案中，這些檔案會在需要時載入。
 
 :::note
-在搭配 LoRA 進行編譯時，需要啟用篩選器共享功能。請透過 `--enable_filter_sharing` 來啟用。即使指定了 INT4，LoRA 分支總是會以 INT8 進行編譯，以提高準確度。
+即使指定了 INT4，LoRA 分支總是會以 INT8 進行編譯，以提高準確度。
 :::
 
 1.  **下載基礎模型和 LoRA 轉接器**：
@@ -283,7 +298,6 @@ LoRA（低階適應）允許對基礎模型進行微調，並且可以在執行�
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -296,7 +310,6 @@ LoRA（低階適應）允許對基礎模型進行微調，並且可以在執行�
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \

@@ -24,3 +24,10 @@ With 128GB machine, compilation can take several hours to complete depends on th
 - Have a valid Hugging Face account to download open-source models.
 - Some models, such as `google/paligemma`, require accepting a license agreement on Hugging Face. Make sure to review and accept the license before attempting to download these models.
 - Authorize the CLI to access Hugging Face using an [user access token](https://huggingface.co/docs/hub/en/security-tokens) and `huggingface-cli`. Note, installing `sima-cli` automatically installs `huggingface-cli`.
+
+### CI sysroot selection
+
+`deps/manifest.json` declares `elxr_version`. Shared workflows resolve the matching
+`SYSROOT_VERSION` and select an exact-firmware DevKit, with fallback disabled.
+CI provisions the resolved sysroot using the SDK image's installed tools in a
+disposable container and verifies the resulting package inventory.

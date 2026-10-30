@@ -20,7 +20,7 @@ from sima_lmm.devkit.model_manager import (
 )
 
 
-pytestmark = pytest.mark.no_dispatcher
+pytestmark = pytest.mark.no_hardware
 
 MODEL_NAME = "test-model"
 REVISION = "a" * 40

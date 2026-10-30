@@ -11,15 +11,15 @@ MoLE(Modalix 언어 모델 평가기)는 Modalix 플랫폼에서 실행되는 LL
 
 ## 설치 방법
 
-MoLE은 호스트 측 벤치마크 도구입니다. SDK Docker 컨테이너가 아닌 호스트 시스템에 설치하고 실행하며, Modalix 장치 내에서 실행하지 마십시오. Modalix 장치에는 LLiMa 런타임과 `llima benchmark-server` 프로세스만 있으면 됩니다. 런타임 설치 절차는 [Neat Framework 설치](/getting-started/neat-library/)를 참조하십시오.
+SDK Docker 컨테이너 외부의 호스트 또는 Modalix DevKit에서 별도의 가상 환경에 MoLE을 설치하십시오. DevKit에서 실행하려면 LLiMa 런타임도 설치되어 있어야 합니다. 런타임 설치 절차는 [Neat Framework 설치](/getting-started/neat-library/)를 참조하십시오.
 
-`sima-cli`를 사용하여 호스트에 MoLE을 설치합니다.
+`sima-cli`를 사용하여 MoLE을 설치합니다.
 
 ``` console
 host:~$ sima-cli neat install llima/mole
 ```
 
-이 명령은 MoLE을 `~/sima-mole-venv`에 있는 호스트 가상 환경에 설치합니다.
+이 명령은 MoLE을 `~/sima-mole-venv`의 가상 환경에 설치합니다.
 
 ## 사용법
 
@@ -29,7 +29,9 @@ host:~$ sima-cli neat install llima/mole
 host:~$ source ~/sima-mole-venv/bin/activate
 ```
 
-MoLE은 두 개의 하위 명령을 사용하여 `llima-benchmark` CLI를 통해 호출됩니다. `<model_id>` 인수는 항상 HuggingFace 모델 ID(예: `meta-llama/Llama-3.2-3B-Instruct`)입니다. `-b modalix` 모드에서는 단순한 표시 레이블이 아니라, 배포된 보드 모델을 컴파일하는 데 사용된 토크나이저 및 구성과 일치해야 합니다. 왜냐하면 보드는 토큰 점수만 반환하고 토크나이저 메타데이터는 제공하지 않기 때문입니다.
+호스트에서 Modalix 평가를 실행할 때는 `--board_ip`가 필수입니다. Modalix DevKit에서는 이 옵션을 생략하면 로컬 런타임을 사용합니다. 서버를 시작할 때는 `--board_model`을 지정하십시오. 로컬 서버 로그는 `<output_dir>/server.log`에 저장됩니다. 기존 서버를 시작하거나 중지하지 않고 연결하려면 `--no-board_start_server`를 사용하십시오.
+
+MoLE은 `llima-benchmark accuracy`와 `llima-benchmark perf`를 제공합니다. Modalix에서는 `<model_id>`에 HuggingFace 모델 ID 또는 배포 모델과 일치하는 로컬 토크나이저/설정 디렉터리를 지정할 수 있습니다. MoLE은 해당 토크나이저로 요청을 준비합니다.
 
 ### 정확도 벤치마크
 
@@ -50,8 +52,8 @@ MoLE은 두 개의 하위 명령을 사용하여 `llima-benchmark` CLI를 통해
 | `-b` | 사용할 백엔드: `modalix` (보드에서 실행) 또는 `hf` (참조 기준선으로 호스트에서 실행). |
 | `-t` | **필수.** 하나 이상의 평가 작업이 필요합니다. 예시 작업: `hellaswag`, `triviaqa`, `piqa`, `winogrande`, `wikitext`. 사용 가능한 모든 작업은 [ 작업 목록 ](https://github.com/EleutherAI/lm-evaluation-harness/blob/v0.4.11/lm_eval/tasks/README.md)에서 확인하십시오. |
 | `-o` | 벤치마크 결과가 저장될 출력 디렉터리입니다. |
-| `--board_ip` | Modalix 보드의 IP 주소입니다. `-b modalix`에 필요합니다. |
-| `--board_model` | Modalix 장치에서 컴파일된 모델 디렉터리의 경로입니다(예: `/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`). `-b modalix`에 필요합니다. |
+| `--board_ip` | 원격 보드의 IP 주소 또는 호스트 이름. 호스트에서 실행할 때 필수이며, Modalix에서 로컬로 실행할 때는 생략합니다. |
+| `--board_model` | DevKit의 컴파일된 모델 디렉터리. 서버를 시작할 때 필수입니다. |
 | `--max_num_tokens` | 최대 컨텍스트 길이입니다. 컴파일 과정에서 사용된 값과 같거나 더 작아야 합니다. |
 | `-n, --num_samples` | 평가할 샘플의 개수입니다. 지정하지 않으면 전체 작업 세트를 실행합니다. |
 | `--board_ssh_user` | Modalix 보드에 사용할 SSH 사용자 이름입니다. 선택 사항이며, 기본값은 `sima`입니다. |
@@ -88,8 +90,8 @@ MoLE은 두 개의 하위 명령을 사용하여 `llima-benchmark` CLI를 통해
 |----|----|
 | `model_id` | HuggingFace 모델 ID(예: `meta-llama/Llama-3.2-3B-Instruct`). Modalix 성능 테스트를 수행할 때는 배포된 모델의 토크나이저/구성 파일과 일치해야 합니다. |
 | `-o` | 벤치마크 결과가 저장될 출력 디렉터리입니다. |
-| `--board_ip` | Modalix 보드의 IP 주소입니다. |
-| `--board_model` | Modalix 장치에서 컴파일된 모델 디렉터리의 경로입니다(예: `/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`). |
+| `--board_ip` | 원격 보드의 IP 주소 또는 호스트 이름. 호스트에서 실행할 때 필수이며, Modalix에서 로컬로 실행할 때는 생략합니다. |
+| `--board_model` | DevKit의 컴파일된 모델 디렉터리. 서버를 시작할 때 필수입니다. |
 | `--max_num_tokens` | 최대 컨텍스트 길이입니다. 컴파일 과정에서 사용된 값과 같거나 더 작아야 합니다. |
 | `--max_new_tokens` | 출력 결과로 생성할 수 있는 최대 토큰 수입니다. |
 | `--input_lengths` | 벤치마크를 위해 사용할 수 있는 선택적인 정확한 입력 토큰 길이입니다. 값은 고유해야 하며, 각 값에 `--max_new_tokens`를 더한 값이 `--max_num_tokens` 내에 있어야 합니다. 생략하면 MoLE가 자동으로 2의 거듭제곱을 기반으로 하는 버킷을 생성합니다. |
@@ -97,3 +99,9 @@ MoLE은 두 개의 하위 명령을 사용하여 `llima-benchmark` CLI를 통해
 | `--board_ssh_pass` | Modalix 보드의 SSH 비밀번호입니다. 선택 사항입니다. 비대화형 자동 벤치마크를 활성화하려면 설정하세요. |
 
 사용 가능한 모든 옵션에 대해 `llima-benchmark perf -h`를 실행합니다.
+
+토큰 길이 버킷 대신 `--dataset bfcl-v3|ifeval|alpacaeval|gsm8k|dialogsum`으로 네이티브 채팅/도구 프롬프트를 사용합니다. `-n`을 생략하면 선택한 데이터셋 전체를 실행하고 `-n 20`은 처음 20개 샘플을 실행합니다. 데이터셋은 자동으로 다운로드되어 캐시됩니다. BFCL은 simple/multiple 사례를 포함하며 실제 도구는 실행하지 않습니다.
+
+`--board_model`에 따라 일반 또는 투기적 디코딩이 결정됩니다. 모델을 비교하려면 같은 데이터셋과 설정으로 별도 실행하되 `--board_model`과 `-o`만 변경합니다. 워밍업 1회는 측정에서 제외하며 매 요청 전 KV 상태를 초기화합니다. 모델의 네이티브 채팅 템플릿과 EOS 종료를 사용합니다. 데이터셋 출력 한도에는 첫 토큰이 포함되며 기존 버킷은 첫 토큰과 `--max_new_tokens` 디코드 단계를 측정합니다.
+
+`-o`는 시간, 토큰 수, 집계 지표, 드래프트 기여도, 실패, 벤치마크 설정 및 데이터셋 출처를 `performance.json`에 저장합니다. 디코드 TPS는 TTFT를 제외하며 생성 시간은 입력 준비와 네트워크 전송을 제외합니다. 이 워크로드는 정확도가 아닌 성능을 측정합니다.

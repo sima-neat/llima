@@ -10,7 +10,7 @@
 # All rights reserved.
 #########################################################
 """
-Generate golden VlmConfig JSON files for all supported models.
+Generate golden VlmConfig JSON files for representative model architectures.
 
 Run this script once to create reference configs, and again whenever
 a new config field is intentionally added. The output files should be
@@ -59,6 +59,7 @@ _EXAMPLE_CONFIGS = [
     # LiquidAI
     ("models--LiquidAI--LFM2-350M",                       "lfm2_vlm_config.json",                 None),
     # VLMs
+    ("models--HuggingFaceTB--SmolVLM2-256M-Video-Instruct", "smolvlm2_256m_vlm_config.json", None),
     ("models--stribomon--gemma3-siglip448",                "gemma3_siglip448_vlm_config.json",     None),
     ("models--Qwen--Qwen2.5-VL-3B-Instruct",              "qwen2.5_vl_vlm_config.json",           [448, 448]),
     ("models--Qwen--Qwen3-VL-2B-Instruct",                "qwen3_vl_vlm_config.json",             [448, 448]),

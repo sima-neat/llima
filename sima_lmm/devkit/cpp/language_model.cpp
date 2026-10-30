@@ -7,6 +7,7 @@
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <utility>
 #include <string_view>
 
 #include <Eigen/Dense>
@@ -64,6 +65,19 @@ LogLikelihoodResult score_logits(
 
 namespace {
 constexpr size_t PER_LAYER_EMBEDDING_MAX_SHARD_SIZE = 1024ULL * 1024 * 1024;
+
+// Load a whole .bin file into one buffer and check its size. The old
+// load_file() checked "file size == buffer size". load_stream() alone only
+// catches a file that is too SHORT, so we also check that no bytes are left
+// over (a file that is too LONG, e.g. from another model).
+void load_whole_file(MLABuffer& buffer, std::istream& stream, const std::string& name) {
+    buffer.load_stream(stream);
+    if (stream.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error(fmt::format(
+            "Invalid size for {}: file is larger than buffer {}", name, buffer.get_name()
+        ));
+    }
+}
 }
 
 LanguageModel::LanguageModel(
@@ -72,7 +86,19 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer
-) : BaseModel(model_path),
+) : LanguageModel(
+        std::move(model_path), std::move(stop_token_ids), image_token_id, pad_token_id,
+        text_streamer, nullptr
+    ) {}
+
+LanguageModel::LanguageModel(
+    std::filesystem::path model_path,
+    std::set<uint32_t> stop_token_ids,
+    std::optional<uint32_t> image_token_id,
+    std::optional<uint32_t> pad_token_id,
+    TextStreamer& text_streamer,
+    std::shared_ptr<FileProvider> file_provider
+) : BaseModel(model_path, std::move(file_provider)),
     _stop_token_ids(std::move(stop_token_ids)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id),
@@ -90,7 +116,11 @@ LanguageModel::LanguageModel(
             "max_num_tokens must be a positive multiple of 1024"
         );
     }
-    if (_cfg.lm_cfg.is_spec_decode() && _cfg.lm_cfg.attn_cfg.swa_enable) {
+    if (
+        _cfg.lm_cfg.is_spec_decode()
+        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_eagle3()
+        && _cfg.lm_cfg.attn_cfg.swa_enable
+    ) {
         throw std::runtime_error(
             "EAGLE3 speculative decoding does not support sliding-window attention"
         );
@@ -99,6 +129,10 @@ LanguageModel::LanguageModel(
     _use_group_token_models = (
         _cfg.pipeline_cfg.input_token_group_offsets.has_value()
         && _cfg.pipeline_cfg.input_token_group_offsets.value().size() > 0
+        // Gemma4 MTP assistants only execute their speculative-width path. Their
+        // serialized pipeline config retains target group offsets, but the compiler
+        // intentionally does not emit grouped assistant pre/cache/post models.
+        && !_cfg.lm_cfg.is_gemma4_mtp_draft()
     );
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
@@ -221,8 +255,7 @@ LanguageModel::LanguageModel(
 
     // EAGLE3: build the constant tree_mask_init (eye(topk)) once. Only the
     // draft uses it (consumed in topk_generate's depth loop seed and concat).
-    if (_cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft) {
+    if (_cfg.lm_cfg.is_eagle3_draft()) {
         const int topk = _cfg.lm_cfg.speculative_decoding_cfg.value().speculative_budget;
         _eagle3_tree_mask_init.data = std::vector<std::vector<std::vector<std::vector<float>>>>(
             1, std::vector<std::vector<std::vector<float>>>(
@@ -388,20 +421,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         _notify_cache_full();
         output_token_ids = std::vector<uint32_t>();
     } else {
-        if (!_cached_states.empty()) {
-            _capture_state_checkpoints = true;
-            _rolling_checkpoint_slot = 0;
-            _writable_checkpoint_slots = 0;
-            auto system_boundary = std::upper_bound(
-                _checkpoint_boundaries.begin(),
-                _checkpoint_boundaries.end(),
-                std::min<size_t>(stable_prefix_token_count, input_token_ids.size())
-            );
-            _system_checkpoint_position = system_boundary == _checkpoint_boundaries.begin()
-                ? 0 : *std::prev(system_boundary);
-            if (_system_checkpoint_position && _state_checkpoint_positions[0] != _system_checkpoint_position)
-                _state_checkpoint_positions[0] = 0;
-        }
+        _init_state_checkpoint_capture(input_token_ids.size(), stable_prefix_token_count);
 
         // Create input embeds from input token ids and image embeds.
         auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
@@ -409,11 +429,14 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         // Prefill.
         auto token_id = run_model_prefill(input_token_ids, num_cached_tokens, timer_ttft);
         const auto output_token_id_begin = input_token_ids.size();
-        if (_stop_token_ids.contains(token_id)) {
+        if (!_is_running.load(std::memory_order_relaxed)) {
+            // Do nothing.
+        } else if (input_token_ids.size() == _max_num_tokens) {
+            _notify_cache_full();
+            output_token_ids = std::vector<uint32_t>();
+        } else if (_stop_token_ids.contains(token_id)) {
             _notify_stop();
             output_token_ids = std::vector<uint32_t>{token_id};
-        } else if (!_is_running.load(std::memory_order_relaxed)) {
-            // Do nothing.
         } else {
             // Decode.
             run_model_decode(input_token_ids.size(), token_id);
@@ -442,6 +465,80 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     }
 }
 
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result) {
+    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
+                                          timer_ttft, performance_result, 0);
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count) {
+    if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value() ||
+        !draft_lm._cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
+        throw std::invalid_argument("Both models must contain speculative-decoding configuration");
+    }
+    const auto& target = _cfg.lm_cfg.speculative_decoding_cfg.value();
+    const auto& draft = draft_lm._cfg.lm_cfg.speculative_decoding_cfg.value();
+    if (target.is_draft || !draft.is_draft) {
+        throw std::invalid_argument("Speculative decoding requires a target paired with a draft");
+    }
+    if (target.method != draft.method) {
+        throw std::invalid_argument("Target and draft speculative methods do not match");
+    }
+    if (target.is_gemma4_mtp()) {
+        return run_model_gemma4_mtp(draft_lm, input_token_ids, override_max_num_tokens, timer_ttft,
+                                    performance_result);
+    }
+    if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.hidden_size ||
+        _cfg.lm_cfg.token_cfg.vocab_size != draft_lm._cfg.lm_cfg.token_cfg.vocab_size) {
+        throw std::invalid_argument("Target and draft hidden or vocabulary sizes do not match");
+    }
+    if (target.method == "dflash") {
+        if (target.speculative_budget != draft.speculative_budget ||
+            target.target_layer_ids != draft.target_layer_ids) {
+            throw std::invalid_argument(
+                "DFlash target and draft block configuration does not match");
+        }
+        if (_cfg.pipeline_cfg.input_token_group_size !=
+            draft_lm._cfg.pipeline_cfg.input_token_group_size) {
+            throw std::invalid_argument(
+                "DFlash target and draft language group sizes do not match");
+        }
+        if (_cfg.pipeline_cfg.input_token_group_size <= target.speculative_budget) {
+            throw std::invalid_argument("DFlash language group size must exceed the block size");
+        }
+        if (draft_lm._cfg.pipeline_cfg.max_num_tokens < _cfg.pipeline_cfg.max_num_tokens) {
+            throw std::invalid_argument("DFlash draft cache is smaller than the target cache");
+        }
+        if (_cfg.pipeline_cfg.quantize_embeddings !=
+            draft_lm._cfg.pipeline_cfg.quantize_embeddings) {
+            throw std::invalid_argument(
+                "DFlash target and draft embedding quantization modes do not match");
+        }
+        if (_cfg.pipeline_cfg.future_token_mask_size <= 1 ||
+            draft_lm._cfg.pipeline_cfg.future_token_mask_size <= 1) {
+            throw std::invalid_argument(
+                "DFlash models require a multi-token future-mask configuration");
+        }
+        if (target.mask_token_id != draft.mask_token_id || draft.mask_token_id < 0 ||
+            static_cast<uint32_t>(draft.mask_token_id) >= _cfg.lm_cfg.token_cfg.vocab_size) {
+            throw std::invalid_argument("DFlash target and draft mask token IDs do not match");
+        }
+        return _run_model_dflash_speculative_decoding(
+            draft_lm, input_token_ids, override_max_num_tokens, timer_ttft, performance_result,
+            stable_prefix_token_count);
+    }
+    if (target.method == "eagle3") {
+        return _run_model_eagle3_speculative_decoding(
+            draft_lm, input_token_ids, override_max_num_tokens, timer_ttft, performance_result);
+    }
+    throw std::invalid_argument("Unsupported speculative-decoding method: " + target.method);
+}
 
 uint32_t LanguageModel::run_model_prefill(
     std::span<const uint32_t> input_token_ids,
@@ -505,7 +602,7 @@ uint32_t LanguageModel::run_model_prefill(
                 token_idx += 1;
             }
             if (!_is_running.load(std::memory_order_relaxed)) {
-                _notify_interrupt();
+                if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                 _cached_token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx
                 );
@@ -513,7 +610,7 @@ uint32_t LanguageModel::run_model_prefill(
             }
         }
         if (
-            !_cached_states.empty() 
+            !_cached_states.empty()
             && last_group_valid_tokens > 0
             && last_group_valid_tokens < group_size
         ) {
@@ -526,7 +623,7 @@ uint32_t LanguageModel::run_model_prefill(
             }
             next_token_id = run_model_once(1, token_idx, num_input_tokens, 0);
             if (!_is_running.load(std::memory_order_relaxed)) {
-                _notify_interrupt();
+                if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                 _cached_token_ids.assign(
                     input_token_ids.begin(), input_token_ids.begin() + token_idx + 1
                 );
@@ -536,7 +633,8 @@ uint32_t LanguageModel::run_model_prefill(
     }
     _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
     auto duration = timer_ttft.value().stop();
-    _notify_first_token(next_token_id, duration);
+    if (num_input_tokens < _max_num_tokens)
+        _notify_first_token(next_token_id, duration);
     _cached_first_generated_token = next_token_id;
     return next_token_id;
 }
@@ -553,10 +651,12 @@ void LanguageModel::run_model_decode(
         token_id = next_token_id;
 
         auto duration = timer_tps.stop(true);
-        _notify_new_token(next_token_id, duration);
-        if (_stop_token_ids.contains(token_id)) {
-            _notify_stop();
-            return;
+        if (token_idx + 1 < _max_num_tokens) {
+            _notify_new_token(next_token_id, duration);
+            if (_stop_token_ids.contains(token_id)) {
+                _notify_stop();
+                return;
+            }
         }
         if (!_is_running.load(std::memory_order_relaxed)) {
             _notify_interrupt();
@@ -626,7 +726,10 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
 
     auto score_current_logits = [this](uint32_t target_token_id) -> LogLikelihoodResult {
         MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-        buf_ptr->invalidate_cache();
+        buf_ptr->invalidate_cache(
+            0, static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+                sizeof(Eigen::bfloat16)
+        );
 
         const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
             buf_ptr->get_virtual_addr()
@@ -787,12 +890,16 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
-            const auto cache_key = _bind_attn_models(
+            const auto attn_models = _bind_attn_models(
                 num_tokens, token_idx, layer_idx, normal_scale_buf, normal_input_row
             );
-            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
-            _cache_model_map.at(cache_key).add_to_queue();
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
+            attn_models.pre->add_to_queue(&ifm_map);
+            attn_models.cache->add_to_queue();
+            if (_cfg.lm_cfg.is_moe()) {
+                _run_moe_post(&ifm_map, num_tokens, layer_idx);
+            } else {
+                attn_models.post->add_to_queue(&ifm_map);
+            }
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
             if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
@@ -848,7 +955,10 @@ LogLikelihoodResult LanguageModel::_run_model_once_for_loglikelihood(
     _run_model_once_for_loglikelihood_logits(token_idx, input_token_id);
 
     MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-    buf_ptr->invalidate_cache();
+    buf_ptr->invalidate_cache(
+        0, static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+            sizeof(Eigen::bfloat16)
+    );
 
     const auto* logits_ptr = reinterpret_cast<const Eigen::bfloat16*>(
         buf_ptr->get_virtual_addr()
@@ -906,10 +1016,8 @@ void LanguageModel::_upload_group_future_token_masks(
         "group_future_token_mask", "full_attention", 0
     );
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
-        const uint16_t cache_token_idx_begin = std::max(
-            0,
-            token_idx + num_tokens
-                - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+        const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+            num_tokens, token_idx, "sliding_attention"
         );
         upload_group_mask(
             "group_sliding_future_token_mask", "sliding_attention", cache_token_idx_begin
@@ -1031,6 +1139,12 @@ uint32_t LanguageModel::run_model_once(
         get_buffer("linear_valid_mask").upload(valid_mask.data());
     }
 
+    const bool direct_dflash_capture = (
+        _cfg.lm_cfg.is_dflash()
+        && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+        && num_tokens == _cfg.pipeline_cfg.input_token_group_size
+    );
+    MLABuffer* dflash_layer_input = nullptr;
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
 
@@ -1045,15 +1159,41 @@ uint32_t LanguageModel::run_model_once(
                     std::vector<uint32_t>{normal_input_num_tokens, _cfg.lm_cfg.hidden_size}
                 )
             );
+        } else if (dflash_layer_input != nullptr) {
+            ifm_map.emplace(
+                0,
+                MLABufferSlice{
+                    dflash_layer_input,
+                    {0, 0},
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                }
+            );
         }
+
+        MLABuffer* dflash_capture_buffer = nullptr;
+        std::map<uint8_t, MLABufferSlice> ofm_map;
+        if (direct_dflash_capture && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1) {
+            dflash_capture_buffer = _get_dflash_hidden_buffer(num_tokens, layer_idx);
+            if (dflash_capture_buffer != nullptr) {
+                ofm_map.emplace(
+                    0,
+                    MLABufferSlice{
+                        dflash_capture_buffer,
+                        {0, 0},
+                        {num_tokens, _cfg.lm_cfg.hidden_size}
+                    }
+                );
+            }
+        }
+        auto* output_overrides = ofm_map.empty() ? nullptr : &ofm_map;
         if (
             _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
             || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
         ) {
-            const auto cache_key = _bind_attn_models(
+            const auto attn_models = _bind_attn_models(
                 num_tokens, token_idx, layer_idx, normal_scale_buf, normal_input_row
             );
-            _pre_model_map.at(model_key).add_to_queue(&ifm_map);
+            attn_models.pre->add_to_queue(&ifm_map);
 
             if (
                 num_input_tokens > next_token_idx
@@ -1062,7 +1202,7 @@ uint32_t LanguageModel::run_model_once(
                 break;
             }
 
-            _cache_model_map.at(cache_key).add_to_queue();
+            attn_models.cache->add_to_queue();
 
             const bool is_draft = _cfg.lm_cfg.is_spec_decode()
                 && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
@@ -1077,8 +1217,8 @@ uint32_t LanguageModel::run_model_once(
                 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
             );
 
-            // Non-spec uses n1 for the final row. Target speculative prefill
-            // reuses n16 and binds a contiguous window containing the final row.
+            // Non-spec uses n1 for the final row. Target speculative prefill reuses
+            // the compiled verification width with a contiguous window containing that row.
             if (num_tokens > 1 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
                 && !_cfg.lm_cfg.is_spec_decode()) {
                 const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
@@ -1166,7 +1306,7 @@ uint32_t LanguageModel::run_model_once(
                     std::piecewise_construct,
                     std::forward_as_tuple(0),
                     std::forward_as_tuple(
-                        nullptr,
+                        dflash_layer_input,
                         std::vector<uint32_t>{slice_start, 0},
                         std::vector<uint32_t>{single_num_tokens, _cfg.lm_cfg.hidden_size}
                     )
@@ -1235,34 +1375,28 @@ uint32_t LanguageModel::run_model_once(
                     );
                 }
             }
-            _post_model_map.at(model_key).add_to_queue(&ifm_map);
-
-            // Spec-decoding capture: download n128_buffer1 (this layer's hidden
-            // states) for layers 2, N/2, N-3 so the orchestrator can feed them
-            // into FC fusion.
-            if (
-                _cfg.lm_cfg.is_spec_decode()
-                && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
-            ) {
-                const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
-                const std::vector<uint8_t> capture_layers = {
-                    2,
-                    static_cast<uint8_t>(num_layers / 2),
-                    static_cast<uint8_t>(num_layers - 3),
-                };
-                auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
-                if (it != capture_layers.end()) {
-                    MLAModelWithBuffer::run_queue();
-                    if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
-                        _eagle3_intermediate_hidden_states.resize(capture_layers.size());
-                    }
-                    size_t idx = std::distance(capture_layers.begin(), it);
-                    auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
-                    const size_t num_elems = static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size;
-                    _eagle3_intermediate_hidden_states[idx].resize(num_elems);
-                    buf.download(_eagle3_intermediate_hidden_states[idx].data());
-                }
+            if (_uses_per_layer_inputs() && num_tokens > 1
+                && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
+                && !_cfg.lm_cfg.is_spec_decode()) {
+                uint32_t layer_row_offset = static_cast<uint32_t>(layer_idx) * num_tokens;
+                ifm_map.emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(2),
+                    std::forward_as_tuple(
+                        nullptr,
+                        std::vector<uint32_t>{
+                            layer_row_offset + static_cast<uint32_t>(num_input_tokens - 1 - token_idx), 0
+                        },
+                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size_per_layer_input}
+                    )
+                );
             }
+            if (_cfg.lm_cfg.is_moe()) {
+                _run_moe_post(&ifm_map, num_tokens, layer_idx);
+            } else {
+                attn_models.post->add_to_queue(&ifm_map, output_overrides);
+            }
+
         } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
             LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
             if (_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0) {
@@ -1301,11 +1435,43 @@ uint32_t LanguageModel::run_model_once(
                     1, normal_scale_buf, {normal_input_row, 0}
                 );
             }
-            _linear_model_map.at(linear_model_key).add_to_queue(&ifm_map);
+            _linear_model_map.at(linear_model_key).add_to_queue(
+                &ifm_map, output_overrides
+            );
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
             );
+        }
+
+        dflash_layer_input = dflash_capture_buffer;
+
+        if (
+            _cfg.lm_cfg.is_spec_decode()
+            && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+            && _cfg.lm_cfg.speculative_decoding_cfg->is_eagle3()
+            && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1
+        ) {
+            const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
+            const std::vector<uint8_t> capture_layers{
+                2,
+                static_cast<uint8_t>(num_layers / 2),
+                static_cast<uint8_t>(num_layers - 3),
+            };
+            const auto it = std::find(
+                capture_layers.begin(), capture_layers.end(), layer_idx
+            );
+            if (it != capture_layers.end()) {
+                MLAModelWithBuffer::run_queue();
+                const size_t capture_idx = std::distance(capture_layers.begin(), it);
+                if (_eagle3_intermediate_hidden_states.size() < capture_layers.size()) {
+                    _eagle3_intermediate_hidden_states.resize(capture_layers.size());
+                }
+                auto& buffer = get_buffer(fmt::format("n{}_buffer1", num_tokens));
+                auto& capture = _eagle3_intermediate_hidden_states[capture_idx];
+                capture.resize(static_cast<size_t>(num_tokens) * _cfg.lm_cfg.hidden_size);
+                buffer.download(capture.data());
+            }
         }
     }
 
@@ -1318,27 +1484,31 @@ uint32_t LanguageModel::run_model_once(
             );
         }
     }
-
     // If this run landed exactly on a checkpoint boundary, save the tail.
-    if (
+    const bool save_checkpoint = (
         _capture_state_checkpoints
         && std::binary_search(
             _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(), next_token_idx
         )
-    ) {
+    );
+    if (save_checkpoint) {
         // A partial prefill group can land exactly on a checkpoint boundary.
         _save_state_checkpoint(
-            next_token_idx, num_tokens, next_token_idx - token_idx, token_idx < num_input_tokens
+            next_token_idx, num_tokens, next_token_idx - token_idx,
+            token_idx < num_input_tokens
         );
     }
 
     if (logits_ptr) {
         assert(num_tokens == 1 && _cfg.pipeline_cfg.return_logits);
         MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-        buf_ptr->invalidate_cache();
+        buf_ptr->invalidate_cache(
+            0, static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+                sizeof(Eigen::bfloat16)
+        );
 
         // Append the logits.
-        Eigen::bfloat16* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
+        auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
         logits_ptr->insert(logits_ptr->end(), ptr, ptr + _cfg.lm_cfg.token_cfg.vocab_size);
 
         // Return dummy token id.
@@ -1369,13 +1539,18 @@ uint32_t LanguageModel::run_model_once(
                 MLABuffer* buf_ptr = &get_buffer(
                     fmt::format("n{}_buffer4", logits_num_tokens)
                 );
-                buf_ptr->invalidate_cache();
-                auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
+                const size_t row_bytes =
+                    static_cast<size_t>(vocab_size) * sizeof(Eigen::bfloat16);
+                const size_t row_offset = static_cast<size_t>(row) * row_bytes;
+                buf_ptr->invalidate_cache(row_offset, row_bytes);
+                auto* ptr = reinterpret_cast<Eigen::bfloat16*>(
+                    static_cast<uint8_t*>(buf_ptr->get_virtual_addr()) + row_offset
+                );
                 uint32_t best_idx = 0;
-                Eigen::bfloat16 best_val = ptr[row * vocab_size];
+                Eigen::bfloat16 best_val = ptr[0];
                 for (uint32_t i = 1; i < vocab_size; ++i) {
-                    if (ptr[row * vocab_size + i] > best_val) {
-                        best_val = ptr[row * vocab_size + i];
+                    if (ptr[i] > best_val) {
+                        best_val = ptr[i];
                         best_idx = i;
                     }
                 }
@@ -1391,25 +1566,46 @@ uint32_t LanguageModel::run_model_once(
                     MLABuffer* buf_ptr = &get_buffer(
                         fmt::format("n{}_lm_split{}", logits_num_tokens, i)
                     );
-                    buf_ptr->invalidate_cache();
-                    auto* ptr = reinterpret_cast<Eigen::bfloat16*>(buf_ptr->get_virtual_addr());
+                    const size_t row_bytes =
+                        static_cast<size_t>(split_size) * sizeof(Eigen::bfloat16);
+                    const size_t row_offset = static_cast<size_t>(row) * row_bytes;
+                    buf_ptr->invalidate_cache(row_offset, row_bytes);
+                    auto* ptr = reinterpret_cast<Eigen::bfloat16*>(
+                        static_cast<uint8_t*>(buf_ptr->get_virtual_addr()) + row_offset
+                    );
                     for (uint32_t j = 0; j < split_size; ++j) {
-                        if (ptr[row * split_size + j] > best_val) {
-                            best_val = ptr[row * split_size + j];
+                        if (ptr[j] > best_val) {
+                            best_val = ptr[j];
                             best_idx = split_begin + j;
                         }
                     }
                 }
                 next_token_id = best_idx;
             }
+            if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+                auto hidden_rows = _read_gemma4_mtp_target_hidden_rows(
+                    logits_num_tokens, static_cast<uint16_t>(row + 1)
+                );
+                const size_t hidden_size = _cfg.lm_cfg.hidden_size;
+                const auto row_begin = hidden_rows.begin()
+                    + static_cast<std::ptrdiff_t>(row * hidden_size);
+                _gemma4_mtp_prefill_hidden_state.emplace(
+                    row_begin,
+                    row_begin + static_cast<std::ptrdiff_t>(hidden_size)
+                );
+            }
         } else {
             // Non-spec: read from single n1_buffer4
             MLABuffer* buf_ptr = &get_buffer("n1_buffer4");
-            buf_ptr->invalidate_cache();
+            const size_t result_bytes = _need_argmax
+                ? static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+                      sizeof(Eigen::bfloat16)
+                : sizeof(uint32_t);
+            buf_ptr->invalidate_cache(0, result_bytes);
             if (_need_argmax) {
                 next_token_id = _calc_next_token_id(buf_ptr);
             } else {
-                uint32_t* ptr = (uint32_t*)buf_ptr->get_virtual_addr();
+                auto* ptr = reinterpret_cast<uint32_t*>(buf_ptr->get_virtual_addr());
                 next_token_id = ptr[0];
             }
         }
@@ -1451,31 +1647,48 @@ void LanguageModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name);
+    MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name, _files.get());
+
+    // Resolve the MoE host round-trip handles once (buffers allocated above).
+    if (_cfg.lm_cfg.is_moe()) {
+        _init_moe_host_cache();
+    }
 
     // Upload language embeddings (drafts use the target's embeddings, so skip).
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
     if (!draft_model) {
         if (!_embedding_offload) {
-            auto embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
-            if (std::filesystem::exists(embeddings_file_name)) {
-                get_buffer("embeddings").load_file(embeddings_file_name);
+            const auto embeddings_bin = "devkit/" + _cfg.language_model_name + "_embeddings.bin";
+            // The .bin file is optional. Use exists() to check softly: if it
+            // is there, exists() pulls it and we use it; if it is missing we
+            // fall back to the required .npy below with get_path(), which
+            // pulls it and fails loudly if it is not there either. Both go
+            // through _files, so PCIe and disk take the same path. Do NOT use
+            // get_path() for the optional check — it throws when the file is
+            // missing.
+            if (_files->exists(embeddings_bin)) {
+                load_whole_file(get_buffer("embeddings"), *_files->open_stream(embeddings_bin),
+                                embeddings_bin);
             } else {
                 // Compatibility with packages generated before raw embedding files were introduced.
-                embeddings_file_name = _devkit_dir / (_cfg.language_model_name + "_embeddings.npy");
-                auto embeddings_tensor = cnpy::npy_load(embeddings_file_name);
+                const auto embeddings_npy = "devkit/" + _cfg.language_model_name + "_embeddings.npy";
+                auto embeddings_tensor = cnpy::npy_load(_files->get_path(embeddings_npy));
+                // cnpy has read the whole file into memory, so the disk copy
+                // is no longer needed (over PCIe this frees recv_root space).
+                _files->release(embeddings_npy);
                 get_buffer("embeddings").upload(embeddings_tensor.data<void>());
             }
         }
         if (_cfg.pipeline_cfg.quantize_embeddings) {
-            const auto scale_file_name = (
-                _devkit_dir / (_cfg.language_model_name + "_embedding_scales.bin")
-            );
-            get_buffer("embedding_scales").load_file(scale_file_name);
+            const auto scale_file =
+                "devkit/" + _cfg.language_model_name + "_embedding_scales.bin";
+            load_whole_file(get_buffer("embedding_scales"), *_files->open_stream(scale_file),
+                            scale_file);
         }
-    } else {
+    } else if (is_eagle3_draft) {
         // Load d2t mapping (int64 in npy, narrows to int32 — values fit easily).
-        auto d2t_file_name = _devkit_dir / "d2t.npy";
-        auto d2t_tensor = cnpy::npy_load(d2t_file_name);
+        auto d2t_tensor = cnpy::npy_load(_files->get_path("devkit/d2t.npy"));
+        _files->release("devkit/d2t.npy");   // already in memory
         const int64_t* src = d2t_tensor.data<int64_t>();
         const size_t n = d2t_tensor.num_vals;
         _d2t.resize(n);
@@ -1483,6 +1696,101 @@ void LanguageModel::_initialize() {
             _d2t[i] = static_cast<int32_t>(src[i]);
         }
         _logger->info("Loaded d2t mapping with {} entries", _d2t.size());
+    } else if (
+        _cfg.lm_cfg.speculative_decoding_cfg
+        && _cfg.lm_cfg.speculative_decoding_cfg->use_ordered_embeddings
+    ) {
+        const auto ordering_file_name = _files->get_path("devkit/gemma4_token_ordering.npy");
+        const auto ordering_tensor = cnpy::npy_load(ordering_file_name);
+        _files->release("devkit/gemma4_token_ordering.npy");
+        const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
+        if (
+            ordering_tensor.word_size != sizeof(int64_t)
+            || ordering_tensor.num_vals != vocab_size
+        ) {
+            throw std::runtime_error(fmt::format(
+                "Invalid Gemma4 MTP token ordering in {}: expected {} int64 entries",
+                ordering_file_name.string(),
+                vocab_size
+            ));
+        }
+        if (
+            _cfg.lm_cfg.speculative_decoding_cfg->num_centroids == 0
+            || vocab_size % _cfg.lm_cfg.speculative_decoding_cfg->num_centroids != 0
+            || _cfg.lm_cfg.speculative_decoding_cfg->centroid_intermediate_top_k == 0
+            || _cfg.lm_cfg.speculative_decoding_cfg->centroid_intermediate_top_k
+                > _cfg.lm_cfg.speculative_decoding_cfg->num_centroids
+        ) {
+            throw std::runtime_error("Invalid Gemma4 MTP ordered-embedding configuration");
+        }
+
+        const int64_t* source = ordering_tensor.data<int64_t>();
+        std::vector<uint8_t> seen(vocab_size, 0);
+        _gemma4_token_ordering.resize(vocab_size);
+        for (size_t index = 0; index < vocab_size; ++index) {
+            const int64_t token_id = source[index];
+            if (
+                token_id < 0 || static_cast<size_t>(token_id) >= vocab_size
+                || seen[static_cast<size_t>(token_id)] != 0
+            ) {
+                throw std::runtime_error(fmt::format(
+                    "Invalid Gemma4 MTP token ordering entry at index {}", index
+                ));
+            }
+            seen[static_cast<size_t>(token_id)] = 1;
+            _gemma4_token_ordering[index] = static_cast<uint32_t>(token_id);
+        }
+        _logger->info(
+            "Loaded Gemma4 MTP token ordering with {} entries",
+            _gemma4_token_ordering.size()
+        );
+    }
+
+    // Upload attention sinks (gpt_oss): broadcast each layer's per-head vector across its
+    // buffer rows. Raw bf16, shape (num_layers, num_heads).
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        const auto sinks_asset = "devkit/" + _cfg.language_model_name + "_sinks.bin";
+        const auto sinks_file_name = _files->get_path(sinks_asset);
+        std::ifstream sinks_file(sinks_file_name, std::ios::binary);
+        if (!sinks_file) {
+            throw std::runtime_error(
+                fmt::format("Missing attention sinks file: {}", sinks_file_name.string())
+            );
+        }
+        const uint16_t num_heads = _cfg.lm_cfg.attn_cfg.num_attention_heads;
+        std::vector<uint16_t> sinks(  // raw bf16, 2 bytes/elem
+            static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers) * num_heads
+        );
+        // A stale or truncated file would leave entries zeroed, and a zero sink is not neutral:
+        // it is a logit in the softmax, so it silently reweights attention. Require an exact match.
+        const auto expected_bytes = static_cast<std::uintmax_t>(sinks.size() * sizeof(uint16_t));
+        const auto actual_bytes = std::filesystem::file_size(sinks_file_name);
+        if (actual_bytes != expected_bytes) {
+            throw std::runtime_error(fmt::format(
+                "Attention sinks file {} has {} bytes, expected {} for {} layers x {} heads. "
+                "The file is stale or truncated; recompile the model.",
+                sinks_file_name.string(), actual_bytes, expected_bytes,
+                static_cast<unsigned>(_cfg.lm_cfg.num_hidden_layers), num_heads
+            ));
+        }
+        sinks_file.read(
+            reinterpret_cast<char*>(sinks.data()),
+            static_cast<std::streamsize>(expected_bytes)
+        );
+        sinks_file.close();
+        _files->release(sinks_asset);
+        for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
+            auto& buf = get_buffer(fmt::format("sinks_l{}", layer));
+            const size_t rows = buf.get_shape()[0];
+            std::vector<uint16_t> host(rows * num_heads);
+            for (size_t r = 0; r < rows; ++r) {
+                std::copy_n(
+                    sinks.data() + static_cast<size_t>(layer) * num_heads, num_heads,
+                    host.begin() + r * num_heads
+                );
+            }
+            buf.upload(host.data());
+        }
     }
 
     // Upload freq real and imag.
@@ -1500,9 +1808,14 @@ void LanguageModel::_initialize() {
     // the (mutated) device buffer.
     _global_freq_host = rope_table;
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        // A distinct local base freq (Gemma3) means an unscaled local rope; when it
+        // matches rope_theta the sliding layers share the global scaling (gpt-oss YaRN).
+        const std::string local_rope_type =
+            _cfg.lm_cfg.rope_cfg.rope_local_base_freq != _cfg.lm_cfg.rope_cfg.rope_theta
+            ? "default" : _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type;
         rope_table = calc_freq_real_imag(
             _cfg.pipeline_cfg.max_num_tokens,
-            "default",
+            local_rope_type,
             _cfg.lm_cfg.rope_cfg.rope_local_base_freq,
             _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention"),
             _cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention"),
@@ -1532,11 +1845,16 @@ void LanguageModel::_initialize() {
         );
         MLABuffer& future_token_mask_buf = get_buffer("future_token_mask");
         future_token_mask_buf.clear();
-        future_token_mask_buf.upload_raw(
-            future_token_mask.data(),
-            _cfg.pipeline_cfg.max_num_tokens * 2,
-            future_token_mask.size() * 2
-        );
+        // The pointwise Gemma4 MTP draft has exactly one max_num_tokens-wide
+        // mask row, with no legacy tail space. Its runtime mask is populated
+        // immediately before every draft execution.
+        if (!_cfg.lm_cfg.is_gemma4_mtp_draft()) {
+            future_token_mask_buf.upload_raw(
+                future_token_mask.data(),
+                _cfg.pipeline_cfg.max_num_tokens * 2,
+                future_token_mask.size() * 2
+            );
+        }
     }
     // Clear the KV caches and caches states.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
@@ -1558,6 +1876,25 @@ void LanguageModel::_initialize() {
 
     _logger->info("Language model initialize completed");
 }
+
+void LanguageModel::_init_state_checkpoint_capture(
+    size_t input_token_count, uint16_t stable_prefix_token_count
+) {
+    if (_cached_states.empty())
+        return;
+    _capture_state_checkpoints = true;
+    _rolling_checkpoint_slot = 0;
+    _writable_checkpoint_slots = 0;
+    const auto system_boundary = std::upper_bound(
+        _checkpoint_boundaries.begin(), _checkpoint_boundaries.end(),
+        std::min<size_t>(stable_prefix_token_count, input_token_count)
+    );
+    _system_checkpoint_position = system_boundary == _checkpoint_boundaries.begin()
+        ? 0 : *std::prev(system_boundary);
+    if (_system_checkpoint_position && _state_checkpoint_positions[0] != _system_checkpoint_position)
+        _state_checkpoint_positions[0] = 0;
+}
+
 
 // Restore the latest checkpoint, or clear state when checkpoints are unavailable.
 uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cached_tokens) {
@@ -1616,8 +1953,7 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
             buf.upload_raw(
                 checkpoints[checkpoint_slot].data(),
                 dst_offset,
-                state.tail_bytes,
-                true
+                state.tail_bytes
             );
         }
     }
@@ -1625,11 +1961,11 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
 }
 
 
-void LanguageModel::_save_state_checkpoint(
-    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
+std::optional<size_t> LanguageModel::_select_state_checkpoint_slot(
+    uint16_t token_count, bool is_prefill
 ) {
     if (token_count < _system_checkpoint_position)
-        return;
+        return std::nullopt;
 
     size_t checkpoint_slot = 0;
     if (token_count != _system_checkpoint_position) {
@@ -1654,6 +1990,16 @@ void LanguageModel::_save_state_checkpoint(
         }
         checkpoint_slot = _rolling_checkpoint_slot;
     }
+    return checkpoint_slot;
+}
+
+
+void LanguageModel::_save_state_checkpoint(
+    uint16_t token_count, uint16_t num_tokens, uint16_t valid_tokens, bool is_prefill
+) {
+    const auto checkpoint_slot = _select_state_checkpoint_slot(token_count, is_prefill);
+    if (!checkpoint_slot.has_value())
+        return;
 
     // Save the L-1 tail of each stateful layer's MLA buffer
     // so a future prefill can resume from this boundary without replay.
@@ -1671,16 +2017,16 @@ void LanguageModel::_save_state_checkpoint(
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
-            auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
+            buf.invalidate_cache(src_offset_bytes, state.tail_bytes);
+            auto* ptr = static_cast<const uint8_t*>(buf.get_virtual_addr());
             std::memcpy(
-                state.checkpoints[layer_slot][checkpoint_slot].data(),
+                state.checkpoints[layer_slot][*checkpoint_slot].data(),
                 ptr + src_offset_bytes,
                 state.tail_bytes
             );
         }
     }
-    _state_checkpoint_positions[checkpoint_slot] = token_count;
+    _state_checkpoint_positions[*checkpoint_slot] = token_count;
 }
 
 
@@ -1697,10 +2043,19 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
         for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
             auto layer_idx = state.layer_indices[layer_slot];
             auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache();
-            auto* ptr = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
-            std::memmove(ptr + dst_offset_bytes, ptr + src_offset_bytes, state.tail_bytes);
-            buf.flush_cache();
+            const size_t access_begin = std::min(src_offset_bytes, dst_offset_bytes);
+            const size_t access_end = std::max(
+                src_offset_bytes + state.tail_bytes,
+                dst_offset_bytes + state.tail_bytes
+            );
+            buf.invalidate_cache(access_begin, access_end - access_begin);
+            auto* ptr = static_cast<uint8_t*>(buf.get_virtual_addr());
+            std::memmove(
+                ptr + dst_offset_bytes,
+                ptr + src_offset_bytes,
+                state.tail_bytes
+            );
+            buf.flush_cache(dst_offset_bytes, state.tail_bytes);
         }
     }
 }
@@ -1729,8 +2084,9 @@ void LanguageModel::_define_buffer_freq_table(const std::string& name, uint32_t 
 
 void LanguageModel::_define_buffers() {
     // Embedding table. Drafts use the target's embeddings, so skip.
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
     if (!is_draft) {
         if (!_embedding_offload) define_buffer(
             "embeddings",
@@ -1783,10 +2139,16 @@ void LanguageModel::_define_buffers() {
             "local", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention")
         );
 
-    if (_use_group_token_models && _has_linear_attention_layers()) {
+    if (_has_linear_attention_layers()) {
         define_buffer(
             "linear_valid_mask",
-            {_cfg.pipeline_cfg.input_token_group_size, 1},
+            {
+                std::max(
+                    _cfg.pipeline_cfg.input_token_group_size,
+                    _cfg.lm_cfg.get_single_num_tokens()
+                ),
+                1
+            },
             "bfloat16",
             true
         );
@@ -1820,6 +2182,40 @@ void LanguageModel::_define_buffers() {
                 fmt::format("linear_delta_state_history_alt_l{}", i),
                 {1, linear_cfg.get_recurrent_state_size()}
             );
+            if (
+                _cfg.lm_cfg.is_dflash()
+                && !_cfg.lm_cfg.speculative_decoding_cfg.value().is_draft
+            ) {
+                const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
+                define_buffer(
+                    fmt::format("linear_conv_prefix_states_l{}", i),
+                    {block_size + linear_cfg.conv_kernel_dim - 2, linear_cfg.get_conv_dim()}
+                );
+                define_buffer(
+                    fmt::format("linear_delta_resolver_output_l{}", i),
+                    {1, linear_cfg.get_recurrent_state_size()}
+                );
+                define_buffer(
+                    fmt::format("linear_delta_resolver_key_l{}", i),
+                    {
+                        linear_cfg.num_value_heads,
+                        block_size,
+                        linear_cfg.key_head_dim
+                    }
+                );
+                define_buffer(
+                    fmt::format("linear_delta_resolver_value_l{}", i),
+                    {
+                        linear_cfg.num_value_heads,
+                        block_size,
+                        linear_cfg.value_head_dim
+                    }
+                );
+                define_buffer(
+                    fmt::format("linear_delta_resolver_decay_mask_l{}", i),
+                    {linear_cfg.num_value_heads, block_size, block_size}
+                );
+            }
         } else {
             if (_cfg.pipeline_cfg.use_strided_kv_cache) {
                 cache_shape = {
@@ -1852,6 +2248,21 @@ void LanguageModel::_define_buffers() {
         }
     }
 
+    // gpt_oss attention sinks: per-head logit for the (shared) cache model, one buffer per
+    // layer broadcast across tokens; the cache model slices num_tokens rows.
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        uint16_t max_sink_tokens = _cfg.lm_cfg.get_single_num_tokens();
+        if (_use_group_token_models) {
+            max_sink_tokens = std::max(max_sink_tokens, _cfg.pipeline_cfg.input_token_group_size);
+        }
+        for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
+            define_buffer(
+                fmt::format("sinks_l{}", i),
+                {max_sink_tokens, _cfg.lm_cfg.attn_cfg.num_attention_heads}
+            );
+        }
+    }
+
     // Deepstack features for qwen3.
     if (_cfg.vm_cfg.has_value()) {
         for (size_t i = 0; i < _cfg.vm_cfg.value().deepstack_visual_indexes.size(); ++i) {
@@ -1863,10 +2274,13 @@ void LanguageModel::_define_buffers() {
     }
 
     // Other buffers.
-    std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
-    if (_use_group_token_models) {
-        const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
-        num_tokens_vec.emplace_back(num_tokens);
+    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+    std::vector<uint16_t> num_tokens_vec{single_num_tokens};
+    if (
+        _use_group_token_models
+        && _cfg.pipeline_cfg.input_token_group_size != single_num_tokens
+    ) {
+        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
     }
     const uint16_t max_future_token_mask_size = _get_max_future_token_mask_size();
     if (max_future_token_mask_size > 1) {
@@ -1884,6 +2298,18 @@ void LanguageModel::_define_buffers() {
                 {full_token_mask_size}
             );
         }
+    }
+    if (
+        _cfg.lm_cfg.is_spec_decode()
+        && _cfg.lm_cfg.speculative_decoding_cfg->is_gemma4_mtp()
+        && _cfg.lm_cfg.attn_cfg.swa_enable
+    ) {
+        // Full and sliding attention can use different compiled mask strides.
+        // They need separate storage because the entire transformer is queued.
+        define_buffer(
+            "gemma4_mtp_sliding_future_token_mask",
+            {_cfg.lm_cfg.get_single_num_tokens(), _cfg.pipeline_cfg.max_num_tokens}
+        );
     }
     const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
     if (
@@ -1921,6 +2347,16 @@ void LanguageModel::_define_buffers() {
         define_buffer(
             fmt::format("n{}_buffer1", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
         );
+        if (_cfg.lm_cfg.is_dflash() && !is_draft) {
+            const auto capture_count =
+                _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size();
+            for (size_t index = 0; index < capture_count; ++index) {
+                define_buffer(
+                    fmt::format("dflash_target_hidden_n{}_{}", num_tokens, index),
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                );
+            }
+        }
 
         // Pre output and cache input.
         define_buffer(
@@ -1942,6 +2378,41 @@ void LanguageModel::_define_buffers() {
             );
         }
 
+        if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+            define_buffer(
+                fmt::format("n{}_target_hidden_states", num_tokens),
+                {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+        }
+
+        // Mixture-of-Experts working buffers (router outputs + per-expert outputs).
+        if (_cfg.lm_cfg.is_moe()) {
+            const uint16_t num_experts = _cfg.lm_cfg.moe_cfg.value().num_experts;
+            const uint16_t top_k = _cfg.lm_cfg.moe_cfg.value().num_experts_per_tok;
+            // Router outputs: top-k weights + selected indices (int32 from the MLA), residual
+            // h, and norm(h) (computed once by the router; every expert consumes it).
+            define_buffer(fmt::format("n{}_router_values", num_tokens), {num_tokens, top_k});
+            define_buffer(
+                fmt::format("n{}_router_indices", num_tokens), {num_tokens, top_k}, "int32"
+            );
+            define_buffer(
+                fmt::format("n{}_residual", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+            define_buffer(
+                fmt::format("n{}_norm_hidden", num_tokens), {num_tokens, _cfg.lm_cfg.hidden_size}
+            );
+            // Dense per-expert routing weights (host scatters the k values here).
+            define_buffer(fmt::format("n{}_router_weights", num_tokens), {num_tokens, num_experts});
+            // Decode routes selected experts into top-k slots; prefill combines all experts.
+            const uint16_t num_outputs = num_tokens == 1 ? top_k : num_experts;
+            for (uint16_t e = 0; e < num_outputs; ++e) {
+                define_buffer(
+                    fmt::format("n{}_expert{}", num_tokens, e),
+                    {num_tokens, _cfg.lm_cfg.hidden_size}
+                );
+            }
+        }
+
         // Qwen3.5: transient gate buffer, written by Pre and consumed by Post within the same layer.
         if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
             define_buffer(
@@ -1950,8 +2421,8 @@ void LanguageModel::_define_buffers() {
             );
         }
 
-        // Draft-only buffers: second pre input, draft hidden states output, FC fusion buffers.
-        if (is_draft) {
+        // EAGLE3 draft-only buffers: second pre input, hidden-state output, FC fusion.
+        if (is_eagle3_draft) {
             define_buffer(
                 fmt::format("n{}_buffer1a", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
@@ -1964,6 +2435,23 @@ void LanguageModel::_define_buffers() {
                 fmt::format("fc_n{}_input", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size * 3}
             );
+        } else if (is_gemma4_mtp_draft) {
+            define_buffer(
+                fmt::format("gemma4_mtp_input_n{}", num_tokens),
+                {num_tokens, 2 * _cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size}
+            );
+            define_buffer(
+                fmt::format("n{}_buffer5", num_tokens),
+                {num_tokens, _cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size}
+            );
+            if (_cfg.lm_cfg.speculative_decoding_cfg->use_ordered_embeddings) {
+                define_buffer(
+                    fmt::format("n{}_gemma4_mtp_centroid_logits", num_tokens),
+                    {num_tokens, _cfg.lm_cfg.speculative_decoding_cfg->num_centroids}
+                );
+            }
+        }
+        if (is_eagle3_draft || (_cfg.lm_cfg.is_dflash() && is_draft)) {
             define_buffer(
                 fmt::format("fc_n{}_output", num_tokens),
                 {num_tokens, _cfg.lm_cfg.hidden_size}
@@ -2004,24 +2492,34 @@ void LanguageModel::_define_buffers() {
             );
             _per_layer_embedding_shards.emplace_back(&get_buffer(name));
         }
-        // Input staging for the standalone per-layer model, filled from token-id gathers.
-        define_buffer("per_layer_emb_staging_n1", {1, out_dim}, dtype);
-        if (_cfg.pipeline_cfg.quantize_embeddings) {
-            define_buffer("per_layer_emb_staging_scale_n1", {1, 1});
-        }
+        // MTP target verification consumes a native speculative-width projection.
+        const auto speculative_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+        std::vector<uint16_t> per_layer_num_tokens_vec{
+            (_cfg.lm_cfg.is_gemma4_mtp_target() || _cfg.lm_cfg.is_dflash())
+                ? speculative_num_tokens : uint16_t{1}
+        };
         if (_use_group_token_models) {
+            const auto group_num_tokens = _cfg.pipeline_cfg.input_token_group_size;
+            if (
+                std::find(
+                    per_layer_num_tokens_vec.begin(),
+                    per_layer_num_tokens_vec.end(),
+                    group_num_tokens
+                ) == per_layer_num_tokens_vec.end()
+            ) {
+                per_layer_num_tokens_vec.emplace_back(group_num_tokens);
+            }
+        }
+        for (const auto num_tokens: per_layer_num_tokens_vec) {
             define_buffer(
-                fmt::format("per_layer_emb_staging_n{}", _cfg.pipeline_cfg.input_token_group_size),
-                {_cfg.pipeline_cfg.input_token_group_size, out_dim},
+                fmt::format("per_layer_emb_staging_n{}", num_tokens),
+                {num_tokens, out_dim},
                 dtype
             );
             if (_cfg.pipeline_cfg.quantize_embeddings) {
                 define_buffer(
-                    fmt::format(
-                        "per_layer_emb_staging_scale_n{}",
-                        _cfg.pipeline_cfg.input_token_group_size
-                    ),
-                    {_cfg.pipeline_cfg.input_token_group_size, 1}
+                    fmt::format("per_layer_emb_staging_scale_n{}", num_tokens),
+                    {num_tokens, 1}
                 );
             }
         }
@@ -2039,45 +2537,94 @@ void LanguageModel::_define_buffers() {
         for (const auto& num_tokens: num_tokens_vec) {
             // Target prefill reuses the single-token-group final post model
             // (n16 for EAGLE3). Only drafts need group-width final-post outputs.
-            if (!is_draft && num_tokens != _cfg.lm_cfg.get_single_num_tokens()) {
+            if (
+                !is_draft
+                && num_tokens != _cfg.lm_cfg.get_single_num_tokens()
+            ) {
                 continue;
             }
-            if (_cfg.lm_cfg.lm_head_num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
+            if (
+                _cfg.lm_cfg.lm_head_num_splits == 1
+                && !_cfg.pipeline_cfg.return_logits
+                && !(is_draft && _cfg.lm_cfg.is_dflash())
+            ) {
                 define_buffer(
                     fmt::format("n{}_buffer4", num_tokens), {num_tokens, 1}, "int32"
                 );
             } else if (_cfg.lm_cfg.lm_head_num_splits == 1) {
+                const uint16_t output_rows = is_draft && _cfg.lm_cfg.is_dflash()
+                    ? num_tokens - 1 : num_tokens;
                 define_buffer(
                     fmt::format("n{}_buffer4", num_tokens),
-                    {num_tokens, lm_head_output_size}
+                    {output_rows, lm_head_output_size}
                 );
             } else {
                 uint32_t i = 0;
                 for(uint32_t split_begin = 0; split_begin < lm_head_output_size; split_begin += split_dim, ++i) {
                     uint32_t split_size = std::min(lm_head_output_size, split_begin + split_dim) - split_begin;
+                    const uint16_t output_rows = is_draft && _cfg.lm_cfg.is_dflash()
+                        ? num_tokens - 1 : num_tokens;
                     define_buffer(
                         fmt::format("n{}_lm_split{}", num_tokens, i),
-                        {num_tokens, split_size}
+                        {output_rows, split_size}
                     );
                 }
             }
+        }
+    }
+
+    _global_freq_real = &get_buffer("global_freq_real");
+    _global_freq_imag = &get_buffer("global_freq_imag");
+    if (_cfg.lm_cfg.attn_cfg.swa_enable) {
+        _local_freq_real = &get_buffer("local_freq_real");
+        _local_freq_imag = &get_buffer("local_freq_imag");
+    }
+    // Gemma4 assistants bind the target's KV buffers at each draft step.
+    // All assistant layers share KV, so there are no private buffers to cache.
+    if (_cfg.lm_cfg.is_gemma4_mtp_draft()) {
+        return;
+    }
+    _attention_binding_buffers.resize(_cfg.lm_cfg.num_hidden_layers);
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
+        const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
+        if (layer_type != "full_attention" && layer_type != "sliding_attention") continue;
+        const auto source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
+        auto& buffers = _attention_binding_buffers[layer_idx];
+        buffers.key = &get_buffer(fmt::format("cache_key_l{}", source_layer));
+        buffers.value = &get_buffer(fmt::format("cache_val_l{}", source_layer));
+        if (_cfg.pipeline_cfg.quantize_kv_cache) {
+            buffers.key_scale = &get_buffer(
+                fmt::format("cache_key_scale_l{}", source_layer)
+            );
+            buffers.value_scale = &get_buffer(
+                fmt::format("cache_val_scale_l{}", source_layer)
+            );
         }
     }
 }
 
 
 
+uint16_t LanguageModel::_get_cache_token_idx_begin(
+    uint16_t num_tokens, uint16_t token_idx, const std::string& layer_type
+) const {
+    if (layer_type != "sliding_attention") {
+        return 0;
+    }
+    // Retain the first query's full window for prefill and verification.
+    return std::max(
+        0, token_idx + 1 - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
+    );
+}
+
+
 LanguageModelMapKey LanguageModel::_get_cache_model_key(
     uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
 ) const {
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    uint16_t cache_token_idx_begin = 0;
-    if (layer_type == "sliding_attention") {
-        cache_token_idx_begin = std::max(
-            0,
-            token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-        );
-    }
+    const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+        num_tokens, token_idx, layer_type
+    );
 
     const uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
@@ -2089,9 +2636,11 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
         && _cfg.lm_cfg.attn_cfg.sliding_head_dim.has_value()
         && _cfg.lm_cfg.attn_cfg.sliding_head_dim.value() != _cfg.lm_cfg.attn_cfg.head_dim
     );
+    // Bucket differences matter only when the sliding window truncates the context.
     const bool sliding_cache_mask_differs = (
         layer_type == "sliding_attention"
         && !separate_sliding_cache
+        && sliding_window < _cfg.pipeline_cfg.max_num_tokens
         && (
             _get_cache_mask_size("full_attention", sliding_window, true)
                 != _get_cache_mask_size("sliding_attention", sliding_window, true)
@@ -2101,7 +2650,11 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     );
     const bool use_sliding_cache = (
         separate_sliding_cache
-        || (sliding_cache_mask_differs && eff_num_cached_tokens >= sliding_window)
+        || (layer_type == "sliding_attention"
+            && (!is_single_model || _cfg.lm_cfg.is_spec_decode())
+            && token_idx + num_tokens > sliding_window)
+        || (is_single_model && sliding_cache_mask_differs
+            && eff_num_cached_tokens >= sliding_window)
     );
     const std::string cache_layer_type = (
         use_sliding_cache ? "sliding_attention" : "full_attention"
@@ -2129,6 +2682,11 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     } else {
         aligned_eff_token_idx = eff_token_idx;
     }
+    if (use_sliding_cache && is_single_model && _cfg.lm_cfg.is_spec_decode()) {
+        aligned_eff_token_idx = std::min<uint16_t>(
+            aligned_eff_token_idx, sliding_window + num_tokens - 2
+        );
+    }
 
     // The second key field is a cache executable kind, not a transformer layer.
     return LanguageModelMapKey{
@@ -2139,7 +2697,7 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
 }
 
 
-LanguageModelMapKey LanguageModel::_bind_attn_models(
+LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
     uint16_t num_tokens,
     uint16_t token_idx,
     uint8_t layer_idx,
@@ -2152,29 +2710,27 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     );
     auto& pre_model = _pre_model_map.at(pre_post_key);
     auto& cache_model = _cache_model_map.at(cache_key);
-    auto& post_model = _post_model_map.at(pre_post_key);
+    // MoE has no post model; bind these inputs to the router (it consumes the raw hidden).
+    auto& post_model = _cfg.lm_cfg.is_moe()
+        ? _router_model_map.at(pre_post_key)
+        : _post_model_map.at(pre_post_key);
 
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
+    const auto& binding_buffers = _attention_binding_buffers.at(layer_idx);
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     const bool is_single_model = num_tokens == single_num_tokens;
 
-    uint16_t cache_token_idx_begin = 0;
-    const char* freq_prefix = "global";
-    if (layer_type == "sliding_attention") {
-        freq_prefix = "local";
-        cache_token_idx_begin = std::max(
-            0,
-            token_idx + num_tokens - static_cast<int>(_cfg.lm_cfg.attn_cfg.sliding_window.value())
-        );
-    }
-
-    const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-        && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-    const bool pre_uses_embedding_scale = (
-        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0
+    const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
+        num_tokens, token_idx, layer_type
     );
-    const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_draft;
+
+    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
+    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
+    const bool pre_uses_embedding_scale = (
+        _cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 && !is_gemma4_mtp_draft
+    );
+    const bool post_uses_embedding_scale = pre_uses_embedding_scale && !is_eagle3_draft;
     if (pre_uses_embedding_scale) {
         if (embedding_scale_buf == nullptr) {
             throw std::runtime_error("Quantized embedding input is missing its scale buffer");
@@ -2182,35 +2738,45 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         pre_model._bind_ifm(1, embedding_scale_buf, {embedding_scale_row, 0});
     }
     const uint8_t freq_ifm_idx = (
-        1 + static_cast<uint8_t>(pre_uses_embedding_scale) + static_cast<uint8_t>(is_draft)
+        1 + static_cast<uint8_t>(pre_uses_embedding_scale)
+        + static_cast<uint8_t>(is_eagle3_draft)
     );
-    auto& freq_real = get_buffer(fmt::format("{}_freq_real", freq_prefix));
-    auto& freq_imag = get_buffer(fmt::format("{}_freq_imag", freq_prefix));
-    pre_model._bind_ifm(freq_ifm_idx, &freq_real, {token_idx, 0});
-    pre_model._bind_ifm(freq_ifm_idx + 1, &freq_imag, {token_idx, 0});
+    MLABuffer* freq_real = layer_type == "sliding_attention"
+        ? _local_freq_real : _global_freq_real;
+    MLABuffer* freq_imag = layer_type == "sliding_attention"
+        ? _local_freq_imag : _global_freq_imag;
+    pre_model._bind_ifm(freq_ifm_idx, freq_real, {token_idx, 0});
+    pre_model._bind_ifm(freq_ifm_idx + 1, freq_imag, {token_idx, 0});
+
+    if (is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
+        throw std::runtime_error(
+            "Gemma4 MTP shared-KV binding must use run_model_gemma4_mtp"
+        );
+    }
 
     if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         uint8_t ofm_idx = 1;
-        auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", layer_idx));
-        auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", layer_idx));
         if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-            pre_model._bind_ofm(ofm_idx++, &key_buffer, {0, token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.key, {0, token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
-                pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
+                pre_model._bind_ofm(
+                    ofm_idx++, binding_buffers.key_scale, {0, token_idx, 0}
+                );
             }
-            pre_model._bind_ofm(ofm_idx++, &val_buffer, {0, token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.value, {0, token_idx, 0});
         } else {
-            pre_model._bind_ofm(ofm_idx++, &key_buffer, {token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.key, {token_idx, 0});
             if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
-                pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
+                pre_model._bind_ofm(
+                    ofm_idx++, binding_buffers.key_scale, {0, token_idx, 0}
+                );
             }
-            pre_model._bind_ofm(ofm_idx++, &val_buffer, {token_idx, 0});
+            pre_model._bind_ofm(ofm_idx++, binding_buffers.value, {token_idx, 0});
         }
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
-            pre_model._bind_ofm(ofm_idx, &scale, {0, token_idx, 0});
+            pre_model._bind_ofm(
+                ofm_idx, binding_buffers.value_scale, {0, token_idx, 0}
+            );
         }
     }
 
@@ -2228,25 +2794,30 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
     // IFM 0 is the query buffer. Its pointer, begin, and shape are invariant
     // for a compact cache key, so only the layer-owned cache inputs are rebound.
     uint8_t cache_ifm_idx = 1;
-    auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", kv_source_layer));
-    auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", kv_source_layer));
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
-            cache_ifm_idx++, &key_buffer, {0, cache_token_idx_begin, 0}
+            cache_ifm_idx++, binding_buffers.key, {0, cache_token_idx_begin, 0}
         );
     } else {
-        cache_model._bind_ifm(cache_ifm_idx++, &key_buffer, {cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx++, binding_buffers.key, {cache_token_idx_begin, 0}
+        );
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer));
-        cache_model._bind_ifm(cache_ifm_idx++, &scale, {0, cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx++, binding_buffers.key_scale,
+            {0, cache_token_idx_begin, 0}
+        );
     }
     if (use_group_future_token_mask) {
         // Group-mask buffer, begin, and shape are fixed by the compact key.
         ++cache_ifm_idx;
     } else if (use_single_future_token_mask) {
         auto& mask = get_buffer("future_token_mask");
-        if (_cfg.lm_cfg.is_spec_decode()) {
+        if (_cfg.lm_cfg.is_dflash()) {
+            // DFlash uploads the compact [B, aligned_context] mask layout.
+            cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, 0});
+        } else if (_cfg.lm_cfg.is_spec_decode()) {
             cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, cache_token_idx_begin});
         } else {
             cache_model._bind_ifm(
@@ -2255,16 +2826,25 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
             );
         }
     }
+    // gpt_oss sinks: cache model is layer-shared, so bind this layer's sinks before cached_values.
+    if (_cfg.lm_cfg.uses_attention_sinks()) {
+        auto& sinks_buf = get_buffer(fmt::format("sinks_l{}", layer_idx));
+        cache_model._bind_ifm(cache_ifm_idx++, &sinks_buf, {0, 0});
+    }
     if (_cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(
-            cache_ifm_idx++, &val_buffer, {0, cache_token_idx_begin, 0}
+            cache_ifm_idx++, binding_buffers.value, {0, cache_token_idx_begin, 0}
         );
     } else {
-        cache_model._bind_ifm(cache_ifm_idx++, &val_buffer, {cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx++, binding_buffers.value, {cache_token_idx_begin, 0}
+        );
     }
     if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer));
-        cache_model._bind_ifm(cache_ifm_idx, &scale, {0, cache_token_idx_begin, 0});
+        cache_model._bind_ifm(
+            cache_ifm_idx, binding_buffers.value_scale,
+            {0, cache_token_idx_begin, 0}
+        );
     }
 
     if (post_uses_embedding_scale) {
@@ -2286,13 +2866,140 @@ LanguageModelMapKey LanguageModel::_bind_attn_models(
         auto& deepstack = get_buffer(fmt::format("deepstack_feature_l{}_cache", layer_idx));
         post_model._bind_ifm(post_ifm_idx, &deepstack, {token_idx, 0});
     }
-    return cache_key;
+    return {&pre_model, &cache_model, &post_model};
 }
 
 
+void LanguageModel::_init_moe_host_cache() {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+
+    // Same num_tokens set the MoE buffers were defined for, and the set of moe_nt values
+    // _run_moe_post can ask for.
+    std::vector<uint16_t> num_tokens_vec{_cfg.lm_cfg.get_single_num_tokens()};
+    if (_use_group_token_models) {
+        num_tokens_vec.emplace_back(_cfg.pipeline_cfg.input_token_group_size);
+    }
+
+    _moe_host.clear();
+    _moe_host.reserve(num_tokens_vec.size());
+    for (const auto& nt: num_tokens_vec) {
+        MoeHostCache mh;
+        mh.num_tokens = nt;
+        mh.values = &get_buffer(fmt::format("n{}_router_values", nt));
+        mh.indices = &get_buffer(fmt::format("n{}_router_indices", nt));
+        mh.weights = &get_buffer(fmt::format("n{}_router_weights", nt));
+        const uint16_t num_outputs = nt == 1 ? top_k : num_experts;
+        mh.expert_out.reserve(num_outputs);
+        for (uint16_t e = 0; e < num_outputs; ++e) {
+            mh.expert_out.emplace_back(&get_buffer(fmt::format("n{}_expert{}", nt, e)));
+        }
+        // Only the single-token variant takes the slot-routing path in _run_moe_post.
+        if (nt == 1) {
+            mh.slot_ofm.resize(top_k);
+            for (uint16_t slot = 0; slot < top_k; ++slot) {
+                mh.slot_ofm[slot].emplace(
+                    std::piecewise_construct,
+                    std::forward_as_tuple(0),
+                    std::forward_as_tuple(
+                        mh.expert_out[slot],
+                        std::vector<uint32_t>{0, 0},
+                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
+                    )
+                );
+            }
+        }
+        mh.values_scratch.resize(static_cast<size_t>(nt) * top_k);
+        mh.indices_scratch.resize(static_cast<size_t>(nt) * top_k);
+        mh.weights_scratch.resize(static_cast<size_t>(nt) * num_experts);
+        mh.activated_scratch.resize(num_experts);
+        _moe_host.emplace_back(std::move(mh));
+    }
+}
 
 
+LanguageModel::MoeHostCache& LanguageModel::_get_moe_host(uint16_t moe_nt) {
+    // At most two entries (single-token and group), so a scan beats any container.
+    for (auto& mh: _moe_host) {
+        if (mh.num_tokens == moe_nt) return mh;
+    }
+    throw std::runtime_error(
+        fmt::format("No MoE host cache defined for num_tokens = {}", moe_nt)
+    );
+}
 
+
+void LanguageModel::_run_moe_post(
+    std::map<uint8_t, MLABufferSlice>* ifm_map,
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+    const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
+    // The last layer processes only the last token (n1), like the non-MoE last post.
+    const uint16_t moe_nt = (is_last && !_cfg.lm_cfg.is_spec_decode()) ? 1 : num_tokens;
+
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+
+    // Router -> values + indices + residual + norm(h) (TopK+softmax on MLA).
+    _router_model_map.at(model_key).add_to_queue(ifm_map);
+
+    // Flush this layer's pre+cache+router (+ prev layer's experts+ws) so indices are ready.
+    MLAModelWithBuffer::run_queue();
+
+    // Host: scatter the k weights into dense router_weights (indices are int32 from the MLA).
+    MoeHostCache& mh = _get_moe_host(moe_nt);
+    auto& values = mh.values_scratch;
+    auto& indices = mh.indices_scratch;
+    auto& weights = mh.weights_scratch;
+    auto& activated = mh.activated_scratch;
+    mh.values->download(values.data());
+    mh.indices->download(indices.data());
+    std::fill(weights.begin(), weights.end(), Eigen::bfloat16(0.0f));
+    std::fill(activated.begin(), activated.end(), uint8_t{0});
+
+    // Scatter each row's selections and record the experts needed by prefill.
+    for (uint16_t r = 0; r < moe_nt; ++r) {
+        for (uint16_t j = 0; j < top_k; ++j) {
+            const size_t sel = static_cast<size_t>(r) * top_k + j;
+            const int32_t expert = indices[sel];
+            if (expert < 0 || expert >= num_experts) {
+                throw std::runtime_error(fmt::format(
+                    "MoE router emitted out-of-range expert index {} at selection {} "
+                    "(layer {}, num_experts {})",
+                    expert, sel, layer_idx, num_experts
+                ));
+            }
+            weights[static_cast<size_t>(r) * num_experts + expert] = values[sel];
+            activated[expert] = 1;
+        }
+    }
+    mh.weights->upload(weights.data());
+
+    // Experts. Prefill runs the selected experts (rest zeroed); decode runs the top-k,
+    // routing each into the first combine slots.
+    if (moe_nt > 1) {
+        for (uint16_t e = 0; e < num_experts; ++e) {
+            if (activated[e]) {
+                _expert_model_map.at({num_tokens, layer_idx, e}).add_to_queue();
+            } else {
+                mh.expert_out[e]->clear();
+            }
+        }
+    } else {
+        for (uint16_t slot = 0; slot < top_k; ++slot) {
+            const uint16_t e = static_cast<uint16_t>(indices[slot]);  // moe_nt==1 row 0
+            // Route this expert's output into combine slot `slot` (prebuilt override).
+            _expert_model_map.at({num_tokens, layer_idx, e})
+                .add_to_queue(nullptr, &mh.slot_ofm[slot]);
+        }
+    }
+
+    // Weighted sum -> layer output. No flush: experts+ws ride to the next router flush.
+    _weightedsum_model_map.at(model_key).add_to_queue();
+}
 
 
 void LanguageModel::compact_kv_after_accept(
@@ -2412,15 +3119,24 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         _logger->info("No relocation is needed");
         return;
     }
+    // The file list below comes from a directory listing on local disk. A
+    // deferred provider has no listing, so the folder is not
+    // there: say so, instead of "Relocation directory does not exist".
+    if (_files->pulls_files()) {
+        throw std::runtime_error(
+            "LoRA requires a local model directory; the asset provider cannot list npy_files"
+        );
+    }
 
     // Key to access the reloc addr maps.
     struct RelocMapType {
         std::string model_type;
         uint16_t num_tokens;
         uint8_t layer_idx;
+        uint16_t expert_idx;
         auto operator<=>(const RelocMapType&) const = default;
     };
-    using RelocMap = std::map<std::string, uint64_t>;
+    using RelocMap = std::map<std::string, MLABuffer*>;
 
     // Allocate the memory for the new content to be relocated and collect the maps of the addresses
     // to relocate the models' dma descriptors.
@@ -2440,14 +3156,19 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
             continue;
 
         // Extract the num_tokens and layer_idx from the file name.
-        std::regex pattern(R"(_n(\d+)_(pre|post)_layer(\d+)_)");
+        std::regex pattern(R"(_n(\d+)_(pre|post|router)_layer(\d+)(?:_expert(\d+))?_)");
         std::smatch match;
         RelocMapType model_key;
         if (std::regex_search(file_name_str, match, pattern)) {
             uint16_t num_tokens = std::stoi(match[1].str());
             std::string model_type = match[2].str();
             uint8_t layer_idx = std::stoi(match[3].str());
-            model_key = {model_type, num_tokens, layer_idx};
+            uint16_t expert_idx = 0;
+            if (match[4].matched) {
+                model_type = "expert";
+                expert_idx = std::stoi(match[4].str());
+            }
+            model_key = {model_type, num_tokens, layer_idx, expert_idx};
         } else {
             auto msg = fmt::format("Invalid file name for relocation: {}", file_name);
             throw std::runtime_error(msg);
@@ -2457,8 +3178,12 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         if (!_use_group_token_models && model_key.num_tokens > 1)
             continue;
 
-        // Upload the tensor to the buffer.
-        auto tensor = cnpy::npy_load(file_name);
+        // Upload the tensor to the buffer. The directory listing above stays on
+        // disk (the seam has no listing API yet), but the file read routes
+        // through the provider by its model-root-relative name.
+        auto tensor = cnpy::npy_load(
+            _files->get_path("npy_files/" + reloc_name + "/" + file_name.filename().string())
+        );
         auto buffer_name = file_name.stem();
 
         // If the buffer does not exist, define and allocate it first.
@@ -2471,20 +3196,27 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         // Upload the tensor.
         buf.upload(tensor.data<void>());
 
-        // Append the reloc addr map.
-        reloc_addr_maps[model_key][buffer_name] = buf.get_buf_addr();
+        // Append the reloc buffer map. The buf_id reloc path imports the
+        // adapter's DMA-BUF in update_reloc rather than taking its address.
+        reloc_addr_maps[model_key][buffer_name] = &buf;
     }
 
     // Relocation the dma descriptors
     for (const auto& [reloc_map_type, reloc_addr_map]: reloc_addr_maps) {
         // For each pre/post model, we only need to relocate the unique model once.
-        LanguageModelMapKey model_key{reloc_map_type.num_tokens, reloc_map_type.layer_idx, 0};
+        LanguageModelMapKey model_key{
+            reloc_map_type.num_tokens, reloc_map_type.layer_idx, reloc_map_type.expert_idx
+        };
 
         MLAModelWithBuffer* model_ptr;
         if (reloc_map_type.model_type == "pre") {
             model_ptr = &_pre_model_map.at(model_key);
         } else if (reloc_map_type.model_type == "post") {
             model_ptr = &_post_model_map.at(model_key);
+        } else if (reloc_map_type.model_type == "router") {
+            model_ptr = &_router_model_map.at(model_key);
+        } else if (reloc_map_type.model_type == "expert") {
+            model_ptr = &_expert_model_map.at(model_key);
         } else {
             auto msg = fmt::format(
                 "Relocate data for {} is not supported", reloc_map_type.model_type
@@ -2625,13 +3357,28 @@ void LanguageModel::_stage_embedding_rows(
     MLABuffer& destination,
     MLABuffer* destination_scales
 ) {
-    destination.clear(false);
-    if (destination_scales) destination_scales->clear(false);
+    const bool fills_destination = (
+        destination.get_shape().size() == 2
+        && token_ids.size() == destination.get_shape().front()
+        && (
+            destination_scales == nullptr
+            || (
+                destination_scales->get_shape().size() == 2
+                && token_ids.size() == destination_scales->get_shape().front()
+            )
+        )
+    );
+    if (!fills_destination) {
+        destination.clear(false);
+        if (destination_scales) destination_scales->clear(false);
+    }
     source_model._gather_embedding_rows(token_ids, destination, destination_scales);
     // Speculative batches can have fewer valid rows than their MLA shape.
     // Publish the cleared padding as well as the gathered rows.
-    destination.flush_cache();
-    if (destination_scales) destination_scales->flush_cache();
+    if (!fills_destination) {
+        destination.flush_cache();
+        if (destination_scales) destination_scales->flush_cache();
+    }
 }
 
 
@@ -2641,23 +3388,9 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
 
     const uint16_t num_input_tokens = input_token_ids.size();
     if (_embedding_offload) _embedding_offload->prompt_ids.assign(input_token_ids.begin(), input_token_ids.end());
-    const size_t embeddings_elem_size = _cfg.pipeline_cfg.quantize_embeddings ? 1 : 2;
-    const size_t embeddings_row_size = _cfg.lm_cfg.hidden_size * embeddings_elem_size;
-    const uint8_t* embeddings_ptr = _embedding_offload ? nullptr
-        : reinterpret_cast<const uint8_t*>(get_buffer("embeddings").get_virtual_addr());
-
     MLABuffer& buf = get_buffer("input_embeds");
-    const size_t input_row_size = _cfg.lm_cfg.hidden_size * buf.get_elem_size();
-    MLABuffer* scales_buf = nullptr;
-    const MLABuffer* embedding_scales_buf = nullptr;
-    size_t scale_row_size = 0;
-    if (_cfg.pipeline_cfg.quantize_embeddings) {
-        scales_buf = &get_buffer("input_embedding_scales");
-        embedding_scales_buf = &get_buffer("embedding_scales");
-        scale_row_size = scales_buf->get_buf_len(std::vector<uint32_t>{1, 1});
-        if (_cfg.vm_cfg.has_value())
-            scales_buf->invalidate_cache();
-    }
+    MLABuffer* scales_buf = _cfg.pipeline_cfg.quantize_embeddings
+        ? &get_buffer("input_embedding_scales") : nullptr;
     uint32_t token_idx = 0;
     uint32_t num_images = 0;
     uint16_t num_cached_tokens = 0;
@@ -2669,41 +3402,29 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
             token_idx = next_token_idx;
         } else {
             auto next_token_idx = token_idx + 1;
-            if (!_embedding_offload) {
-                buf.upload_raw(
-                    embeddings_ptr + token_id * embeddings_row_size,
-                    token_idx * input_row_size,
-                    input_row_size,
-                    false
+            while (
+                next_token_idx < num_input_tokens
+                && (!_image_token_id
+                    || input_token_ids[next_token_idx] != *_image_token_id)
+            )
+                ++next_token_idx;
+            if (!_embedding_offload)
+                _gather_embedding_rows(
+                    input_token_ids.subspan(token_idx, next_token_idx - token_idx),
+                    buf, scales_buf, token_idx
                 );
-                if (scales_buf != nullptr) {
-                    const auto* scale_src = reinterpret_cast<const uint8_t*>(
-                        embedding_scales_buf->get_virtual_addr()
-                    ) + static_cast<size_t>(token_id) * scale_row_size;
-                    scales_buf->upload_raw(
-                        scale_src,
-                        static_cast<size_t>(token_idx) * scale_row_size,
-                        scale_row_size,
-                        false
-                    );
-                }
-            }
-            if (
-                num_images == 0
-                && token_idx == num_cached_tokens
-                && token_idx < _cached_token_ids.size()
-                && token_id == _cached_token_ids[token_idx]
-            ) {
-                ++num_cached_tokens;
+            for (auto idx = token_idx; idx < next_token_idx; ++idx) {
+                if (
+                    num_images == 0
+                    && idx == num_cached_tokens
+                    && idx < _cached_token_ids.size()
+                    && input_token_ids[idx] == _cached_token_ids[idx]
+                )
+                    ++num_cached_tokens;
             }
             token_idx = next_token_idx;
         }
     }
-    buf.flush_cache();
-    if (scales_buf != nullptr) {
-        scales_buf->flush_cache();
-    }
-
     // Update rope table if needed.
     if (
         _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type == "mrope"
@@ -2719,6 +3440,9 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
     }
     _has_image_token = num_images > 0;
 
+    _text_streamer.push(
+        DecodeCallbackType::CACHED_PROMPT_TOKENS, num_cached_tokens, 0.0
+    );
     _logger->info("Number of tokens cached: {:d}", num_cached_tokens);
     return num_cached_tokens;
 }
@@ -2746,9 +3470,8 @@ std::vector<uint32_t> LanguageModel::_get_per_layer_token_ids(
 
 
 void LanguageModel::_load_per_layer_embeddings() {
-    const auto file_name = (
-        _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin")
-    );
+    const auto file_rel = "devkit/" + _cfg.language_model_name + "_per_layer_embeddings.bin";
+    const auto file_name = _files->get_path(file_rel);
     const size_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
     const size_t out_dim = static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers)
                          * _cfg.lm_cfg.hidden_size_per_layer_input;
@@ -2765,8 +3488,8 @@ void LanguageModel::_load_per_layer_embeddings() {
     }
 
     // Resident mode streams complete tables; offload mode has no table shards.
-    std::ifstream stream;
-    if (!_embedding_offload) stream.open(file_name, std::ios::binary);
+    std::unique_ptr<std::istream> stream;
+    if (!_embedding_offload) stream = _files->open_stream(file_rel);
     for (auto* shard : _per_layer_embedding_shards) {
         if (shard->get_buf_len() != shard->get_shape()[0] * token_row_size) {
             throw std::runtime_error(fmt::format(
@@ -2774,24 +3497,28 @@ void LanguageModel::_load_per_layer_embeddings() {
                 shard->get_name()
             ));
         }
-        shard->load_stream(stream);
+        shard->load_stream(*stream);
     }
 
     if (_cfg.pipeline_cfg.quantize_embeddings) {
-        const auto scale_file_name = (
-            _devkit_dir
-            / (_cfg.language_model_name + "_per_layer_embedding_scales.bin")
-        );
-        get_buffer("per_layer_embedding_scales").load_file(scale_file_name);
+        const auto scale_file =
+            "devkit/" + _cfg.language_model_name + "_per_layer_embedding_scales.bin";
+        load_whole_file(get_buffer("per_layer_embedding_scales"), *_files->open_stream(scale_file),
+                        scale_file);
     }
 }
 
 
 void LanguageModel::_upload_per_layer_embedding_rows(
-    std::span<const uint32_t> token_ids, uint16_t num_tokens
+    std::span<const uint32_t> token_ids, uint16_t num_tokens,
+    uint16_t valid_tokens
 ) {
     if (!_uses_per_layer_inputs())
         return;
+    if (valid_tokens == 0)
+        valid_tokens = num_tokens;
+    if (valid_tokens > num_tokens || token_ids.size() < valid_tokens)
+        throw std::runtime_error("Invalid per-layer embedding staging row count");
     auto& staging = get_buffer(fmt::format("per_layer_emb_staging_n{}", num_tokens));
     const size_t row_size = staging.get_shape().back() * staging.get_elem_size();
     auto* dst = reinterpret_cast<uint8_t*>(staging.get_virtual_addr());
@@ -2810,9 +3537,11 @@ void LanguageModel::_upload_per_layer_embedding_rows(
         );
     }
     if (_embedding_offload) {
-        _embedding_offload->per_layer->gather(token_ids.first(num_tokens), dst, row_size);
+        _embedding_offload->per_layer->gather(
+            token_ids.first(valid_tokens), dst, row_size
+        );
     }
-    for (uint16_t i = 0; i < num_tokens; ++i) {
+    for (uint16_t i = 0; i < valid_tokens; ++i) {
         if (!_embedding_offload) {
             const size_t shard_idx = token_ids[i] / _per_layer_embedding_rows_per_shard;
             const size_t row_in_shard = token_ids[i] % _per_layer_embedding_rows_per_shard;
@@ -2846,35 +3575,136 @@ void LanguageModel::_compute_and_upload_per_layer_inputs_prefill(
 }
 
 
-uint32_t LanguageModel::_calc_next_token_id(MLABuffer* buf_ptr) {
-    Eigen::bfloat16* ptr = (Eigen::bfloat16*)buf_ptr->get_virtual_addr();
-    Eigen::bfloat16 max_val = ptr[0];
-    uint32_t max_index = 0;
-    #pragma omp parallel
-    {
-        // Other workers can already be updating the shared maximum below.
-        Eigen::bfloat16 thread_max_val = ptr[0];
-        uint32_t thread_max_index = 0;
+void LanguageModel::_prepare_lm_head_logit_views(
+    uint16_t num_tokens, uint16_t output_rows, std::vector<LMHeadLogitView>& views
+) {
+    const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
+    const uint16_t num_splits = _cfg.lm_cfg.lm_head_num_splits;
+    views.clear();
+    views.reserve(num_splits);
+    const uint32_t split_dim = _cfg.lm_cfg.lm_head_split_dim;
+    for (uint16_t split_idx = 0; split_idx < num_splits; ++split_idx) {
+        const uint32_t split_begin = static_cast<uint32_t>(split_idx) * split_dim;
+        const uint32_t split_size = (num_splits == 1)
+            ? output_size
+            : std::min<uint32_t>(split_dim, output_size - split_begin);
+        const std::string buf_name = (num_splits == 1)
+            ? fmt::format("n{}_buffer4", num_tokens)
+            : fmt::format("n{}_lm_split{}", num_tokens, split_idx);
+        auto& buf = get_buffer(buf_name);
+        if (buf.get_dtype() != "bfloat16" || buf.get_shape().size() != 2
+            || buf.get_shape().front() != output_rows || buf.get_shape().back() != split_size) {
+            throw std::runtime_error("Invalid lm_head logit buffer");
+        }
+        views.emplace_back(LMHeadLogitView{
+            &buf,
+            static_cast<const uint8_t*>(buf.get_virtual_addr()),
+            buf.get_buf_len(std::vector<uint32_t>{1, split_size}),
+            split_begin,
+            split_size
+        });
+    }
+}
 
-        #pragma omp for nowait
-        for (uint32_t i = 0; i < _cfg.lm_cfg.token_cfg.vocab_size; ++i) {
-            if (ptr[i] > thread_max_val) {
-                thread_max_val = ptr[i];
-                thread_max_index = i;
+
+uint32_t LanguageModel::_argmax_lm_head_row(
+    std::span<const LMHeadLogitView> views, uint16_t row
+) {
+    uint32_t best_index = 0;
+    float best_value = -std::numeric_limits<float>::infinity();
+    for (const auto& view : views) {
+        const auto* row_ptr = reinterpret_cast<const Eigen::bfloat16*>(
+            view.data + static_cast<size_t>(row) * view.row_bytes
+        );
+        const auto [value, offset] = argmax_bf16(row_ptr, view.width);
+        const uint32_t index = view.vocab_begin + offset;
+        if (value > best_value || (value == best_value && index < best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    return best_index;
+}
+
+
+std::vector<uint32_t> LanguageModel::_argmax_lm_head_rows(
+    uint16_t num_tokens, uint16_t valid_tokens,
+    std::span<const uint32_t> expected_draft_tokens
+) {
+    if (
+        valid_tokens == 0 || valid_tokens > num_tokens
+        || expected_draft_tokens.size() + 1 != valid_tokens
+    ) {
+        throw std::runtime_error(fmt::format(
+            "Requested {} lm_head rows from n{} output", valid_tokens, num_tokens
+        ));
+    }
+
+    const uint16_t num_splits = _cfg.lm_cfg.lm_head_num_splits;
+    if (num_splits == 1 && !_cfg.pipeline_cfg.return_logits) {
+        auto& buf = get_buffer(fmt::format("n{}_buffer4", num_tokens));
+        buf.invalidate_cache();
+        const auto* output = static_cast<const uint32_t*>(buf.get_virtual_addr());
+        std::vector<uint32_t> token_ids;
+        token_ids.reserve(valid_tokens);
+        for (uint16_t row = 0; row < valid_tokens; ++row) {
+            token_ids.emplace_back(output[row]);
+            if (
+                row < expected_draft_tokens.size()
+                && output[row] != expected_draft_tokens[row]
+            ) {
+                break;
             }
         }
+        return token_ids;
+    }
 
+    std::vector<LMHeadLogitView> views;
+    _prepare_lm_head_logit_views(num_tokens, num_tokens, views);
+
+    std::vector<uint32_t> best_indices;
+    best_indices.reserve(valid_tokens);
+    for (uint16_t row = 0; row < valid_tokens; ++row) {
+        for (const auto& view : views) {
+            view.buffer->invalidate_cache(static_cast<size_t>(row) * view.row_bytes, view.row_bytes);
+        }
+        const uint32_t best_index = _argmax_lm_head_row(views, row);
+        best_indices.emplace_back(best_index);
+        if (
+            row < expected_draft_tokens.size()
+            && best_index != expected_draft_tokens[row]
+        ) {
+            break;
+        }
+    }
+    return best_indices;
+}
+
+uint32_t LanguageModel::_calc_next_token_id(MLABuffer* buf_ptr) {
+    const auto* values = reinterpret_cast<const Eigen::bfloat16*>(
+        buf_ptr->get_virtual_addr()
+    );
+    const uint32_t vocab_size = _cfg.lm_cfg.token_cfg.vocab_size;
+    float best_value = static_cast<float>(values[0]);
+    uint32_t best_index = 0;
+    #pragma omp parallel for num_threads(4)
+    for (uint32_t part = 0; part < 4; ++part) {
+        const uint32_t begin = static_cast<uint64_t>(vocab_size) * part / 4;
+        const uint32_t end = static_cast<uint64_t>(vocab_size) * (part + 1) / 4;
+        const auto [local_value, local_offset] = argmax_bf16(
+            values + begin, end - begin
+        );
+        const uint32_t local_index = begin + local_offset;
         #pragma omp critical
         {
-            if (thread_max_val > max_val) {
-                max_val = thread_max_val;
-                max_index = thread_max_index;
-            } else if ((thread_max_val == max_val) && (thread_max_index < max_index)) {
-                max_index = thread_max_index;
+            if (local_value > best_value
+                || (local_value == best_value && local_index < best_index)) {
+                best_value = local_value;
+                best_index = local_index;
             }
         }
     }
-    return max_index;
+    return best_index;
 }
 
 
@@ -2884,9 +3714,11 @@ void LanguageModel::_notify_first_token(uint32_t token_id, double duration) {
 }
 
 
-void LanguageModel::_notify_new_token(uint32_t token_id, double duration) {
+void LanguageModel::_notify_new_token(
+    uint32_t token_id, double duration, bool from_draft
+) {
     _logger->info("Got token: {:d} in {:.5f}s", token_id, duration);
-    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration);
+    _text_streamer.push(DecodeCallbackType::TPS, token_id, duration, from_draft);
 }
 
 

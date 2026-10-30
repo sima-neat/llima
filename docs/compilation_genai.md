@@ -119,8 +119,8 @@ The `llima-compile` tool accepts various arguments to customize the compilation 
 | `--input_width` | Input image width in pixels. Must be provided with `--input_height`. Required for Qwen 2 VL, Qwen 3 VL, Qwen3.5, and Gemma 4; optional for overriding a SigLIP2 model's configured size. |
 | `--system_prompt` | System prompt to store for CLI mode and model warm-up. |
 | `--system_prompt_file` | Path to a text file containing the system prompt. |
-| `--chat_template` | Chat template string to store in the compiled model. Mutually exclusive with the system-prompt and chat-template file options. |
-| `--chat_template_file` | Path to a file containing the chat template. Mutually exclusive with the system-prompt options and `--chat_template`. |
+| `--chat_template` | Chat template string to store in the compiled model. Mutually exclusive with `--chat_template_file`. |
+| `--chat_template_file` | Path to a file containing the chat template. Mutually exclusive with `--chat_template`. |
 
 :::note
 Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 8192` to enable an 8K context length.
@@ -130,14 +130,21 @@ Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 819
 |----|----|
 | `--language_group_size` | Batch size for parallel token processing during prefill. Larger values (e.g., 256) can improve TTFT for large input prompts, but can decrease TTFT for smaller input prompts. Default: 128. |
 | `--future_token_mask_size` | Mask size for reusing compiled models across token positions. Larger values reduce number of compiled binary files, but may reduce TPS. Default: 128. |
-| `--enable_filter_sharing` | Enable filter sharing between group and single models to reduce DRAM usage at a cost of higher TTFT and lower TPS. This is only effective when both model types use the same precision and is required when compiling with LoRA. |
 | `--no-quantize_embeddings` | Disable embedding-table quantization, which is enabled by default for supported LLMs and VLMs. |
 | `--no-quantize_kv_cache` | Disable KV-cache quantization, which is enabled by default. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
-| `--draft_model_path` | Path to an EAGLE3 draft model for speculative decoding. |
+| `--draft_model_path` | Path to a compatible EAGLE3, Gemma4 MTP, or DFlash draft model; the method is detected automatically. |
+| `--speculative_block_size` | DFlash verification width: 4, 8, or 16. Default: 8. |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |
 | `--lora_path` | Path to the LoRA adapter directory to compile with the base model. |
 | `--compile_lora`, `--no-compile_lora` | Enable or disable adapter-weight compilation when LoRA paths are supplied. Enabled by default. |
+
+For DFlash, the prefill group must exceed the block size and divide the context length:
+
+``` console
+llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
+    --speculative_block_size 16
+```
 
 ## System Prompts
 
@@ -175,15 +182,24 @@ Because these phases have different performance characteristics, you can apply d
 The `get_layer_configuration` function is called for each compiler unit and
 receives:
 
-- `model_properties`: Dictionary with `{"num_hidden_layers": int}`
+- `model_properties`: Dictionary with:
+  - `"num_hidden_layers"`: Number of language layers
+  - `"is_draft_model"`: `True` when configuring a speculative draft model
 
 - `layer`: Dictionary with:
   - `"part"`: Logical component such as `"PRE"`, `"CACHE"`, `"POST"`,
-    `"VISION"`, `"DRAFT_FC"`, or `"PER_LAYER"`
+    `"VISION"`, `"DRAFT_FC"`, or `"PER_LAYER"`. Mixture-of-Experts models add
+    `"ROUTER"`, `"EXPERT"`, and `"WEIGHTEDSUM"`.
   - `"is_group"`: `True` for a multi-token/group variant and `False` otherwise
   - `"index"`: Index of that compiler unit. For `"PRE"` and `"POST"` this
     normally corresponds to a transformer layer. For `"CACHE"` it identifies
     a cache or token-position variant rather than a transformer layer.
+  - `"expert_idx"`: Index of the expert within the layer, for `"EXPERT"`
+    records. `-1` for every other part, including all dense models.
+
+  Read the values you need by key. New keys may be added in future releases,
+  so avoid unpacking this dictionary into a fixed argument list or asserting
+  an exact set of keys.
 
 **Return Values**
 
@@ -290,7 +306,7 @@ runtime.
 LoRA (Low-Rank Adaptation) allows a base model to be fine-tuned and the adapter to be dynamically applied or removed at runtime without recompiling the base model. The base model is compiled with parallel LoRA branches (initialized to zero), and the adapter weights are compiled separately into `.npy` files that are loaded on demand.
 
 :::note
-Filter sharing is required when compiling with LoRA. Enable it with `--enable_filter_sharing`. LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
+LoRA branches are always compiled in INT8 even if INT4 is specified, for better accuracy.
 :::
 
 1.  **Download the base model and LoRA adapter**:
@@ -316,7 +332,6 @@ Filter sharing is required when compiling with LoRA. Enable it with `--enable_fi
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter \
         --lora_path my-lora \
         -c lora_config.py \
@@ -329,7 +344,6 @@ Filter sharing is required when compiling with LoRA. Enable it with `--enable_fi
 
     ``` console
     sima-user@docker-image-id:/home/docker$ llima-compile Llama-3.2-3B-Instruct \
-        --enable_filter_sharing \
         --lora_name my_adapter_A --lora_path my-lora_A \
         --lora_name my_adapter_B --lora_path my-lora_B \
         -c lora_config.py \

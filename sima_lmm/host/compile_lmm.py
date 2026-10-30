@@ -4,16 +4,16 @@ try:
     from afe.apis.error_handling_variables import enable_verbose_error_messages
 except ImportError:
     print("Missing sima-frontend library.  "
-          "This program requires Palette tools to be installed.", file=sys.stderr
+          "Activate the Model Compiler environment before running llima-compile.", file=sys.stderr
     )
     sys.exit(-1)
 import argparse
 import logging
 from pathlib import Path
 import psutil
+from time import monotonic
 
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
 from sima_lmm.host.configuration_helper import (
     _abort, default_configuration, read_configuration_file
@@ -49,10 +49,10 @@ def gen_files(
     num_processes: int, resume: bool, model_path: Path, lora_path: Path | None,
     output_path: Path, file_gen_mode: FileGenMode, configuration_path: Path | None,
     system_prompt: str | None, chat_template: str | None, max_num_tokens: int,
-    language_group_size: int, future_token_mask_size: int, enable_filter_sharing: bool,
+    language_group_size: int, future_token_mask_size: int,
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
-    draft_output_path: Path | None
+    draft_output_path: Path | None, speculative_block_size: int | None = None,
 ):
     enable_verbose_error_messages()
     models = list()
@@ -60,7 +60,6 @@ def gen_files(
     base_model = VisionLanguageModel.from_hf_cache(
         hf_cache_path=model_path,
         model_name=model_path.name,
-        onnx_path=Path(output_path / "onnx_files"),
         sima_path=Path(output_path / "sima_files"),
         max_num_tokens=max_num_tokens,
         system_prompt=system_prompt,
@@ -68,7 +67,6 @@ def gen_files(
         override_language_group_size=language_group_size,
         override_language_future_token_mask_size=future_token_mask_size,
         return_logits=return_logits,
-        enable_filter_sharing=enable_filter_sharing,
         quantize_embeddings=quantize_embeddings,
         quantize_kv_cache=quantize_kv_cache,
         image_resolution=image_resolution
@@ -81,11 +79,9 @@ def gen_files(
 
     # Check if draft model is provided
     if draft_model_path is not None:
-        base_model.configure_speculative_decoding(is_draft=False)
         draft_model = VisionLanguageModel.from_hf_cache(
             hf_cache_path=draft_model_path,
             model_name=draft_model_path.name,
-            onnx_path=Path(draft_output_path / "onnx_files"),
             sima_path=Path(draft_output_path / "sima_files"),
             max_num_tokens=max_num_tokens,
             system_prompt=system_prompt,
@@ -93,46 +89,37 @@ def gen_files(
             override_language_group_size=language_group_size,
             override_language_future_token_mask_size=future_token_mask_size,
             return_logits=return_logits,
-            enable_filter_sharing=enable_filter_sharing,
             quantize_embeddings=quantize_embeddings,
             quantize_kv_cache=quantize_kv_cache,
             image_resolution=image_resolution,
-            target_model=base_model
+            target_model=base_model,
+            speculative_block_size=speculative_block_size,
         )
         models.append(draft_model)
 
-    for model in models:
-        if configuration_path is None:
-            gen_config = default_configuration(model)
-        else:
-            gen_config = read_configuration_file(model, configuration_path)
+    configurations = [
+        default_configuration(model) if configuration_path is None
+        else read_configuration_file(model, configuration_path)
+        for model in models
+    ]
+    if file_gen_mode != FileGenMode.DEVKIT and not any(c["precision"] for c in configurations):
+        _abort(
+            f"Configuration {configuration_path or '(default)'} selects no components. "
+            "Return {'compile': True} for at least one component."
+        )
 
+    for model, gen_config in zip(models, configurations):
         if file_gen_mode == FileGenMode.ALL:
-            # Use different compiler stages for HF and for GGUF
-            if isinstance(model.hf_model, LocalHuggingFaceModel):
-                # Check if this is an llm-compressor quantized model (AWQ/GPTQ)
-                if model.hf_model.is_compressed_tensors_model():
-                    # Pre-quantized models use MODEL_SDK_DIRECT like GGUF
-                    modes = [
-                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
-                        FileGenMode.MODEL_SDK_COMPILE
-                    ]
-                else:
-                    # Use staged SiMa Builder generation for HF models, including LoRA,
-                    # quantized embeddings, dynamic KV-cache nodes, and Qwen 3.5 linear layers.
-                    modes = [
-                        FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_FP,
-                        FileGenMode.FP_TO_QUANT, FileGenMode.MODEL_SDK_COMPILE
-                    ]
+            modes = [FileGenMode.DEVKIT]
+            if (
+                isinstance(model.hf_model, LocalHuggingFaceModel)
+                and not model.hf_model.is_compressed_tensors_model()
+            ):
+                modes.extend([FileGenMode.SOURCE_TO_FP, FileGenMode.FP_TO_QUANT])
             else:
-                assert isinstance(model.hf_model, GgufModel)
-                modes = [
-                    FileGenMode.DEVKIT, FileGenMode.SOURCE_TO_QUANT,
-                    FileGenMode.MODEL_SDK_COMPILE
-                ]
+                modes.append(FileGenMode.SOURCE_TO_QUANT)
+            modes.append(FileGenMode.MODEL_SDK_COMPILE)
         else:
-            if isinstance(model.hf_model, GgufModel) and file_gen_mode == FileGenMode.SOURCE_TO_ONNX:
-                _abort("ONNX generation mode not supported for GGUF models")
             modes = [file_gen_mode]
 
         _print_precisions(gen_config["precision"], FileGenMode.SOURCE_TO_QUANT in modes or FileGenMode.FP_TO_QUANT in modes)
@@ -173,10 +160,8 @@ def check_output_path_conflict(model_path: Path, output_path: Path):
 
 # Association from command line argument names to FileGenMode enum values.
 _FILE_GEN_MODE_OPTIONS: list[tuple[str, FileGenMode]] = [
-    ("onnx", FileGenMode.SOURCE_TO_ONNX),
     ("source_to_fp", FileGenMode.SOURCE_TO_FP),
     ("fp_to_quant", FileGenMode.FP_TO_QUANT),
-    ("quantize", FileGenMode.ONNX_TO_QUANT),
     ("model_sdk", FileGenMode.SOURCE_TO_QUANT),
     ("compile", FileGenMode.MODEL_SDK_COMPILE),
     ("devkit", FileGenMode.DEVKIT)
@@ -210,11 +195,6 @@ def main():
 
     group = parser.add_argument_group("Options to run only one compiler pass")
     egroup = group.add_mutually_exclusive_group()
-    egroup.add_argument("--onnx", action="store_true", help="Compile to ONNX files")
-    egroup.add_argument(
-        "--quantize", action="store_true",
-        help="Convert ONNX files to Model SDK files and quantize them"
-    )
     egroup.add_argument(
         "--source_to_fp", action="store_true", help="Compile to floating-point Model SDK files"
     )
@@ -261,12 +241,8 @@ def main():
         )
     )
     group.add_argument(
-        "--enable_filter_sharing", action=argparse.BooleanOptionalAction, default=False,
-        help=(
-            "Enables filter sharing between group and single models to reduce the overall DRAM"
-            " usage at a cost of higher TTFT and lower TPS. This is only effective when both group"
-            " and single models are compiled with the same precision."
-        )
+        "--enable_filter_sharing", "--no-enable_filter_sharing",
+        action="store_true", help=argparse.SUPPRESS,
     )
     group.add_argument(
         "--quantize_embeddings", action=argparse.BooleanOptionalAction, default=True,
@@ -291,6 +267,7 @@ def main():
         "--system_prompt_file", type=Path,
         help="Path of file containing system prompt that is passed to the model"
     )
+    egroup = group.add_mutually_exclusive_group()
     egroup.add_argument(
         "--chat_template", type=str,
         help="Chat template string to be used for conversation formatting"
@@ -310,9 +287,12 @@ def main():
     )
     group.add_argument(
         "--draft_model_path", type=Path,
-        help="Path of the EAGLE3 draft model for the base (target) model."
+        help="Path of the speculative draft/assistant model for the base (target) model."
     )
-
+    group.add_argument(
+        "--speculative_block_size", type=int, choices=(4, 8, 16),
+        help="DFlash verification width (default: 8)."
+    )
     group = parser.add_argument_group("Options to compile LoRA")
     group.add_argument(
         "--lora_name", type=str, dest="lora_names", action="append",
@@ -335,11 +315,31 @@ def main():
         help="Only compile files that are missing"
     )
     group.add_argument(
-        "-c", "--configuration_file",
+        "-c", "--configuration_file", type=Path,
         help="Configuration file with layer-specific compilation options"
     )
 
     args = parser.parse_args()
+
+    if args.enable_filter_sharing:
+        print(
+            "Warning: filter-sharing flags are deprecated and ignored. "
+            "Filter sharing is enabled automatically for decoder components.",
+            file=sys.stderr,
+        )
+
+    if args.jobs is not None and args.jobs <= 0:
+        parser.error("--jobs must be a positive integer")
+
+    for label, path in (("Model", args.model_path), ("Draft model", args.draft_model_path)):
+        if path is None:
+            continue
+        if not path.exists():
+            parser.error(f"{label} path not found: {path}")
+        if not (path.is_dir() or (path.is_file() and path.suffix == ".gguf")):
+            parser.error(f"{label} path must be a Hugging Face directory or a .gguf file: {path}")
+    if args.configuration_file is not None and not args.configuration_file.is_file():
+        parser.error(f"Configuration file not found or not a regular file: {args.configuration_file}")
 
     if args.jobs is None:
         print(
@@ -349,7 +349,7 @@ def main():
         )
     num_processes = args.jobs
     if num_processes is None:
-        num_processes = psutil.cpu_count(logical=False)
+        num_processes = psutil.cpu_count(logical=False) or 1
 
     if args.output is None:
         if args.draft_model_path is not None:
@@ -366,6 +366,9 @@ def main():
         output_path = base_output_path
         draft_output_path = None
 
+    if args.draft_model_path is None and args.speculative_block_size is not None:
+        _abort("Speculative decoding options require --draft_model_path.")
+
     check_output_path_conflict(args.model_path, output_path)
 
     try:
@@ -377,9 +380,9 @@ def main():
         system_prompt = args.system_prompt
     elif args.system_prompt_file:
         try:
-            system_prompt = open(args.system_prompt_file, "r").read()
-        except IOError:
-            _abort("Cannot read file: " + args.system_prompt_file)
+            system_prompt = args.system_prompt_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"Cannot read system prompt file {args.system_prompt_file}: {exc}")
     else:
         system_prompt = None
 
@@ -387,9 +390,9 @@ def main():
         chat_template = args.chat_template
     elif args.chat_template_file:
         try:
-            chat_template = open(args.chat_template_file, "r").read()
-        except IOError:
-            _abort("Cannot read file: " + args.chat_template_file)
+            chat_template = args.chat_template_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            parser.error(f"Cannot read chat template file {args.chat_template_file}: {exc}")
     else:
         chat_template = None
 
@@ -407,12 +410,6 @@ def main():
     elif args.input_height is not None or args.input_width is not None:
         _abort("Both --input_height and --input_width must be provided.")
 
-    is_onnx_generation = mode_flag == FileGenMode.SOURCE_TO_ONNX
-    if is_onnx_generation and (args.quantize_embeddings or args.quantize_kv_cache):
-        _abort(
-            "ONNX generation does not support embedding or KV-cache quantization. "
-            "Pass --no-quantize_embeddings --no-quantize_kv_cache."
-        )
     lora_path_for_base_model = None
     if args.lora_names is not None and args.lora_paths is not None:
         if len(args.lora_names) != len(args.lora_paths):
@@ -423,14 +420,19 @@ def main():
 
     return_logits = args.return_logits or args.draft_model_path is not None
 
-    gen_files(
-        num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
-        mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
-        args.language_group_size, args.future_token_mask_size,
-        args.enable_filter_sharing, args.quantize_embeddings,
-        args.quantize_kv_cache, return_logits, log_level, image_resolution,
-        args.draft_model_path, draft_output_path
-    )
+    started = monotonic()
+    try:
+        gen_files(
+            num_processes, args.resume, args.model_path, lora_path_for_base_model, output_path,
+            mode_flag, args.configuration_file, system_prompt, chat_template, args.max_num_tokens,
+            args.language_group_size, args.future_token_mask_size,
+            args.quantize_embeddings,
+            args.quantize_kv_cache, return_logits, log_level, image_resolution,
+            args.draft_model_path, draft_output_path,
+            args.speculative_block_size,
+        )
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
+        _abort(str(exc))
 
     # Compile LoRA weights if requested.
     if args.compile_lora and args.lora_paths:
@@ -442,6 +444,11 @@ def main():
                 lora_weight_map_path
             )
 
+    minutes, seconds = divmod(int(monotonic() - started), 60)
+    action = "Compilation" if mode_flag in (FileGenMode.ALL, FileGenMode.MODEL_SDK_COMPILE) else "File generation"
+    print(f"{action} finished in {minutes}m {seconds}s.", flush=True)
+    print(f"Output: {base_output_path.resolve()}", flush=True)
 
-if __name__ == "__main__":  
+
+if __name__ == "__main__":
     main()

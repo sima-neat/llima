@@ -2,32 +2,37 @@ import logging
 import numpy as np
 import time
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
-from afe.ir.tensor_type import ScalarType
+from ml_dtypes import bfloat16
 from afe.ir.quantization_conv import block_quantize_weight_tensor
 
-from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
+from sima_lmm.logging import sima_log_info, sima_log_warning
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.base import (
-    BaseModel, EvalMode, FileGenMode, FileGenPrecision, LoraGenMode, GenConfiguration
-)
+from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.language_post_model import LanguagePostModel
+from sima_lmm.model.language_moe_router_model import LanguageMoeRouterModel
+from sima_lmm.model.language_moe_weightedsum_model import LanguageMoeWeightedSumModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
 from sima_lmm.model.language_draft_fc_model import LanguageDraftFCModel
+from sima_lmm.model.language_dflash_context_model import LanguageDFlashContextModel
+from sima_lmm.model.language_dflash_state_resolver_model import (
+    LanguageDFlashStateResolverModel,
+)
 from sima_lmm.model.language_linear_model import LanguageLinearModel
 from sima_lmm.model.language_per_layer_model import LanguagePerLayerModel
 from sima_lmm.utils import calc_freq_real_imag, round_up_to
 from sima_lmm.config.layer_id import LayerID
-from sima_lmm.config.vlm_config import LlmArchType, VlmArchType, PipelineConfig
-
-
-bfloat16 = ScalarType.numpy_type(ScalarType.bfloat16)
+from sima_lmm.config.vlm_config import (
+    LlmArchType,
+    PipelineConfig,
+    VlmArchType,
+)
 
 
 def quantize_embedding_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -64,6 +69,10 @@ class LanguageModel(BaseModel):
     3. PostCacheModel: Post cache model implements the transformer layer after the self-attention
         block, including the layers after the last transformer layer.
     """
+    dflash_target_hf_model: LocalHuggingFaceModel | GgufModel | None = field(
+        default=None, kw_only=True
+    )
+
     def __post_init__(self):
         if self.cfg.pipeline_cfg.input_token_group_offsets:
             self.cfg.pipeline_cfg.input_token_group_offsets.sort()
@@ -94,7 +103,7 @@ class LanguageModel(BaseModel):
         # Create a list of all models to compile
         model_list = list()
         num_tokens = self.cfg.pipeline_cfg.input_token_group_size
-        single_model_num_tokens = self._single_model_num_tokens
+        single_model_num_tokens = self.cfg.lm_cfg.single_model_num_tokens
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
 
@@ -131,7 +140,8 @@ class LanguageModel(BaseModel):
                     )
                 case "single_sliding_cache":
                     part_model = self._get_part_model(
-                        "sliding_cache", 1, token_idx=layer_id.part_idx
+                        "sliding_cache", single_model_num_tokens,
+                        token_idx=layer_id.part_idx
                     )
                 case "group_conv":
                     part_model = self._get_part_model(
@@ -147,7 +157,7 @@ class LanguageModel(BaseModel):
                     )
                 case "single_linear":
                     part_model = self._get_part_model(
-                        "linear_fused", 1, layer_idx=layer_id.part_idx
+                        "linear_fused", single_model_num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "conv_post_final":
                     part_model = self._get_part_model(
@@ -161,10 +171,47 @@ class LanguageModel(BaseModel):
                     part_model = self._get_part_model(
                         "draft_fc", single_model_num_tokens, layer_idx=layer_id.part_idx
                     )
+                case "group_dflash_context":
+                    part_model = self._get_part_model(
+                        "dflash_context", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_dflash_context":
+                    part_model = self._get_part_model(
+                        "dflash_context", single_model_num_tokens,
+                        layer_idx=layer_id.part_idx,
+                    )
                 case "group_per_layer":
                     part_model = self._get_part_model("per_layer", num_tokens)
                 case "single_per_layer":
-                    part_model = self._get_part_model("per_layer", 1)
+                    part_model = self._get_part_model(
+                        "per_layer", single_model_num_tokens
+                    )
+                case "group_router":
+                    part_model = self._get_part_model(
+                        "router", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_router":
+                    part_model = self._get_part_model(
+                        "router", single_model_num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "group_expert":
+                    part_model = self._get_part_model(
+                        "post", num_tokens, layer_idx=layer_id.part_idx,
+                        expert_idx=layer_id.expert_idx,
+                    )
+                case "single_expert":
+                    part_model = self._get_part_model(
+                        "post", single_model_num_tokens, layer_idx=layer_id.part_idx,
+                        expert_idx=layer_id.expert_idx,
+                    )
+                case "group_weightedsum":
+                    part_model = self._get_part_model(
+                        "moe_weightedsum", num_tokens, layer_idx=layer_id.part_idx
+                    )
+                case "single_weightedsum":
+                    part_model = self._get_part_model(
+                        "moe_weightedsum", single_model_num_tokens, layer_idx=layer_id.part_idx
+                    )
                 case _:
                     # Not a part of this model
                     continue
@@ -172,6 +219,29 @@ class LanguageModel(BaseModel):
             if lora_mode:
                 curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
+
+        speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        if (
+            speculative_cfg is not None
+            and speculative_cfg.method == "dflash"
+            and not speculative_cfg.is_draft
+        ):
+            resolver_precision = next(
+                (
+                    curr_precision
+                    for layer_id, curr_precision in precision.items()
+                    if layer_id.part == "single_linear"
+                ),
+                None,
+            )
+            if resolver_precision is not None:
+                block_size = speculative_cfg.speculative_budget
+                model_list.append(
+                    (
+                        self._get_part_model("dflash_state_resolver", block_size),
+                        {"precision": resolver_precision},
+                    )
+                )
 
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
@@ -378,6 +448,19 @@ class LanguageModel(BaseModel):
                     )
                     mask[..., :token_idx + 1 - token_idx_begin] = 0
                     cache_ifms.append(mask)
+                if self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS:
+                    # Per-head attention sink logit, slotted right before cached_values.
+                    base_name = self.hf_model.language_model_param_base_name
+                    sinks = self.get_hf_param(
+                        f"{base_name}.layers.{layer_idx}.self_attn.sinks"
+                    ).astype(np.float32)
+                    num_attn_heads = self.cfg.lm_cfg.attn_cfg.num_attention_heads
+                    cache_ifms.append(
+                        np.broadcast_to(
+                            sinks.reshape(1, 1, 1, num_attn_heads),
+                            (1, 1, num_tokens, num_attn_heads),
+                        ).copy()
+                    )
                 cache_ifms.append(
                     cache_val[layer_idx][..., token_idx_begin:aligned_token_idx + num_tokens, :]
                 )
@@ -391,12 +474,17 @@ class LanguageModel(BaseModel):
                 )
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 
-                post_ifms = [pre_ifms[0]]
-                if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
-                    post_ifms.append(pre_ifms[1])
-                post_ifms.append(cache_ofms[0])
-                post_model = self._get_part_model("post", num_tokens, layer_idx=layer_idx)
-                post_ofms = post_model.run_model(eval_mode, post_ifms)
+                if self.cfg.lm_cfg.moe_cfg is not None:
+                    post_ofms = self._run_moe_post(
+                        eval_mode, num_tokens, layer_idx, pre_ifms, cache_ofms[0]
+                    )
+                else:
+                    post_ifms = [pre_ifms[0]]
+                    if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
+                        post_ifms.append(pre_ifms[1])
+                    post_ifms.append(cache_ofms[0])
+                    post_model = self._get_part_model("post", num_tokens, layer_idx=layer_idx)
+                    post_ofms = post_model.run_model(eval_mode, post_ifms)
 
             # Download the argmax output.
             if num_input_tokens <= next_token_idx:
@@ -422,10 +510,60 @@ class LanguageModel(BaseModel):
         # Return the generated tokens.
         return np.array([new_tokens])
 
+    def _run_moe_post(self, eval_mode, num_tokens, layer_idx, hidden, self_attn):
+        """MoE post block: router (TopK+softmax on-graph) -> experts -> weighted-sum."""
+        moe = self.cfg.lm_cfg.moe_cfg
+        num_experts = moe.num_experts
+
+        router_model = self._get_part_model("router", num_tokens, layer_idx=layer_idx)
+        router_inputs = [hidden[0]]
+        if self.cfg.pipeline_cfg.quantize_embeddings and layer_idx == 0:
+            router_inputs.append(hidden[1])
+        values, indices, residual, norm_hidden = router_model.run_model(
+            eval_mode, router_inputs + [self_attn]
+        )
+        vals = values[0, 0]                    # (num_tokens, top_k)
+        idxs = indices[0, 0].astype(np.int64)  # (num_tokens, top_k)
+
+        # Scatter the k routing weights into a dense (num_tokens, num_experts) tensor.
+        router_weights = np.zeros((num_tokens, num_experts), dtype=np.float32)
+        for t in range(num_tokens):
+            router_weights[t, idxs[t]] = vals[t]
+        rw = router_weights[None, None]  # NHWC: (1, 1, num_tokens, num_experts)
+
+        # Only run experts at least one token selected; the rest have weight 0.
+        activated = set(int(e) for e in idxs.flatten())
+
+        def run_expert(e):
+            ex_model = self._get_part_model(
+                "post", num_tokens, layer_idx=layer_idx, expert_idx=e
+            )
+            return ex_model.run_model(eval_mode, [norm_hidden, rw])[0]
+
+        expert_outs = []
+        if num_tokens > 1:
+            # Group combine consumes all num_experts slots; skipped ones are zeros.
+            zero = np.zeros(
+                (1, 1, num_tokens, self.cfg.lm_cfg.hidden_size), dtype=np.float32
+            )
+            for e in range(num_experts):
+                expert_outs.append(run_expert(e) if e in activated else zero)
+        else:
+            for e in sorted(activated):
+                expert_outs.append(run_expert(e))
+
+        ws_model = self._get_part_model("moe_weightedsum", num_tokens, layer_idx=layer_idx)
+        return ws_model.run_model(eval_mode, expert_outs + [residual])
+
     def calc_freq_real_imag(self, use_swa: bool) -> tuple[np.ndarray, np.ndarray]:
         if use_swa:
             theta = self.cfg.lm_cfg.rope_cfg.rope_local_base_freq
-            rope_type = "default"
+            # A distinct local base freq (Gemma3) means an unscaled local rope; when it
+            # matches rope_theta the sliding layers share the global scaling (gpt-oss YaRN).
+            rope_type = (
+                "default" if theta != self.cfg.lm_cfg.rope_cfg.rope_theta
+                else self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
+            )
         else:
             theta = self.cfg.lm_cfg.rope_cfg.rope_theta
             rope_type = self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
@@ -443,15 +581,19 @@ class LanguageModel(BaseModel):
         embed_scale: float = 1.0,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
         assert self.hf_model, "HF cache needs to be provided to obtain the embeddings tensor."
+        is_draft = (
+            self.cfg.lm_cfg.speculative_decoding_cfg is not None
+            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
+        )
+        if weight_name is None and is_draft and not any(
+            name.endswith("embed_tokens.weight") for name in self.hf_model.weight_map
+        ):
+            return None, None
         if weight_name is None:
             base_name = self.hf_model.language_model_param_base_name
             weight_name = f"{base_name}.embed_tokens.weight"
             if self.cfg.lm_cfg.arch == LlmArchType.GEMMA:
                 embed_scale = self.cfg.lm_cfg.hidden_size ** 0.5
-        is_draft = (
-            self.cfg.lm_cfg.speculative_decoding_cfg is not None
-            and self.cfg.lm_cfg.speculative_decoding_cfg.is_draft
-        )
         if is_draft and weight_name not in self.hf_model.weight_map:
             return None, None
         if isinstance(self.hf_model, LocalHuggingFaceModel):
@@ -484,29 +626,43 @@ class LanguageModel(BaseModel):
         assert embeddings is not None
         return embeddings, scale
 
-    @property
-    def _single_model_num_tokens(self) -> int:
-        if self.cfg.lm_cfg.speculative_decoding_cfg is None:
-            return 1
-        return self.cfg.lm_cfg.speculative_decoding_cfg.speculative_budget
-
     def _get_part_model(
         self, part: str, num_tokens: int, layer_idx: int | None = None,
-        token_idx: int | None = None,
+        token_idx: int | None = None, expert_idx: int = -1,
     ) -> BaseModel:
         match part:
             case "pre":
                 model_name = f"{self.model_name}_n{num_tokens}_pre_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguagePreModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                 )
             case "post":
-                model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
+                if expert_idx >= 0:
+                    model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}_expert{expert_idx}"
+                else:
+                    model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}"
                 assert layer_idx is not None
                 return LanguagePostModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                    final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
+                    expert_idx=expert_idx,
+                    dflash_target_hf_model=self.dflash_target_hf_model,
+                )
+            case "router":
+                model_name = f"{self.model_name}_n{num_tokens}_router_layer{layer_idx}"
+                assert layer_idx is not None
+                return LanguageMoeRouterModel(
+                    self.cfg, model_name, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                )
+            case "moe_weightedsum":
+                model_name = f"{self.model_name}_n{num_tokens}_moe_weightedsum_layer{layer_idx}"
+                assert layer_idx is not None
+                return LanguageMoeWeightedSumModel(
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
                 )
@@ -514,7 +670,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_cache_token{token_idx}"
                 assert token_idx is not None
                 return LanguageCacheModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping
                 )
@@ -522,7 +678,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_sliding_cache_token{token_idx}"
                 assert token_idx is not None
                 return LanguageCacheModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, token_idx=token_idx,
                     logit_softcapping=self.cfg.lm_cfg.attn_logit_softcapping,
                     layer_type="sliding_attention"
@@ -531,7 +687,7 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_conv"
                 assert layer_idx is not None
                 return LanguageConvModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
                 )
@@ -539,26 +695,45 @@ class LanguageModel(BaseModel):
                 model_name = f"{self.model_name}_n{num_tokens}_layer{layer_idx}_linear"
                 assert layer_idx is not None
                 return LanguageLinearModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx
                 )
             case "conv_post_final":
                 model_name = f"{self.model_name}_n{num_tokens}_post_layer{layer_idx}_conv_final"
                 assert layer_idx is not None
                 return LanguageConvPostModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
                     final_softcapping=self.cfg.lm_cfg.final_logit_softcapping
                 )
             case "draft_fc":
                 model_name = f"{self.model_name}_n{num_tokens}_draft_fc"
                 return LanguageDraftFCModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens
+                )
+            case "dflash_context":
+                model_name = (
+                    f"{self.model_name}_n{num_tokens}_dflash_context_layer{layer_idx}"
+                )
+                assert layer_idx is not None
+                return LanguageDFlashContextModel(
+                    self.cfg, model_name,
+                    sima_path=self.sima_path, hf_model=self.hf_model,
+                    num_tokens=num_tokens, layer_idx=layer_idx,
+                )
+            case "dflash_state_resolver":
+                model_name = f"{self.model_name}_n{num_tokens}_dflash_state_resolver"
+                return LanguageDFlashStateResolverModel(
+                    self.cfg,
+                    model_name,
+                    sima_path=self.sima_path,
+                    hf_model=self.hf_model,
+                    block_size=num_tokens,
                 )
             case "per_layer":
                 model_name = f"{self.model_name}_n{num_tokens}_per_layer"
                 return LanguagePerLayerModel(
-                    self.cfg, model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+                    self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens,
                 )

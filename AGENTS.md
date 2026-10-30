@@ -1,6 +1,16 @@
 # Agent Guidance
 
-Read [Contributor Guide](docs/contributing.md) before changing LLiMa.
+Use the relevant sections of the [Contributor Guide](docs/contributing.md) for
+setup, graph development, validation commands, and contribution policy.
+
+## Issues and Pull Requests
+
+- Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.md) for defects
+  and the [feature request template](.github/ISSUE_TEMPLATE/feature_request.md)
+  for proposed improvements. Complete the relevant sections and redact secrets
+  from logs and reproduction details.
+- Use the [pull request template](.github/PULL_REQUEST_TEMPLATE.md) for PRs,
+  target `develop`, and link completed issues with `Fixes #<issue>`.
 
 ## Before Editing
 
@@ -60,10 +70,15 @@ update or required integration fix, and document submodule revisions.
 
 ## Validation
 
+Reuse existing coverage first. Add or extend tests only when changed behavior
+or a meaningful regression risk is not already covered. Do not add tests solely
+for formatting, renames, log messages, or to mirror the implementation. Choose
+validation by behavioral risk, not the number of changed lines.
+
 - Pure logic: hermetic tests without network or model downloads.
 - Model-backed compiler changes: configure required cached inputs; unintended
   skips fail validation.
-- ONNX/numerical regression: generate comparison artifacts during the run.
+- Native graph/numerical regression: generate comparison artifacts during the run.
 - MLA/runtime behavior: run affected packaged tests on Modalix.
 - Packaging: build every affected Debian or wheel profile.
 - Skills: run the isolated `sima-cli playbooks install ./skills` validation

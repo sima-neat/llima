@@ -5,7 +5,9 @@ Extends `lm_eval` from EleutherAI/lm-evaluation-harness (https://github.com/Eleu
 """
 
 import dataclasses
+import json
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from loguru import logger
 from sima_lmm.mole.modalixboard import ModalixBoard
 from sima_lmm.mole.modalixlm import HuggingFaceLM, ModalixLM
 from sima_lmm.mole.utils import make_table
+from sima_lmm.mole.perf_runner import PerformanceOptions, run_performance, write_results
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,6 +63,7 @@ class Config:
     max_num_tokens: int
     max_new_tokens: int | None
     input_lengths: tuple[int, ...] | None
+    performance: PerformanceOptions = dataclasses.field(default_factory=PerformanceOptions)
     batch_size: int = dataclasses.field(init=False, default=1)
     random_seed: int = dataclasses.field(init=False, default=42)
 
@@ -79,6 +83,7 @@ def prepare_mole(
     max_num_tokens: int = 1024,
     max_new_tokens: int = 256,
     input_lengths: list[int] | None = None,
+    performance: PerformanceOptions | None = None,
 ) -> Config | None:
     """
     prepare_mole Prepares and validates the configuration for a MOLE evaluation run.
@@ -100,10 +105,42 @@ def prepare_mole(
     Returns:
         A Config object if the setup is successful, otherwise None.
     """
+    performance = performance or PerformanceOptions()
+    try:
+        performance.validate()
+        if do_perf and (max_new_tokens < 1 or max_num_tokens > 65535 or max_num_tokens <= max_new_tokens):
+            raise ValueError("Performance token budgets must be positive and fit within context <= 65535")
+        if do_perf and limit is not None and limit < 1:
+            raise ValueError("Number of performance samples must be positive")
+        if performance.dataset and input_lengths:
+            raise ValueError("Dataset workloads cannot use exact --input_lengths buckets")
+    except ValueError as exc:
+        logger.error(str(exc))
+        return None
+    tasks = tasks or []
+    backend = "modalix" if do_perf else backend.strip().lower()
+    if backend == "modalix":
+        if board is None:
+            logger.error("Modalix evaluation requires a board target")
+            return None
+        try:
+            board.host
+        except ValueError as exc:
+            logger.error(str(exc))
+            return None
+        if do_start_server and not board.model:
+            logger.error("Starting a benchmark server requires --board_model")
+            return None
+    elif backend != "hf":
+        logger.error("Unsupported backend: {}", backend)
+        return None
+
     if not Path(model_id).is_dir():
         hfapi = huggingface_hub.HfApi()
         try:
-            hfapi.model_info(model_id)
+            info = hfapi.model_info(model_id, revision=performance.model_revision)
+            if do_perf:
+                performance = dataclasses.replace(performance, model_revision=info.sha)
         except huggingface_hub.errors.RepositoryNotFoundError as e:
             logger.error(f"Invalid model_id: {model_id}")
             logger.error(traceback.format_exception(e))
@@ -131,54 +168,27 @@ def prepare_mole(
             return None
         normalized_input_lengths = tuple(sorted(input_lengths))
 
-    metadata = {"pretrained": model_id}
-    task_manager = lm_eval.tasks.TaskManager(metadata=metadata)
-    for task in tasks:
-        if task not in task_manager.all_tasks:
-            logger.error("Specified task is invalid: {}", task)
-            return None
+    if tasks:
+        metadata = {"pretrained": model_id}
+        task_manager = lm_eval.tasks.TaskManager(metadata=metadata)
+        for task in tasks:
+            if task not in task_manager.all_tasks:
+                logger.error("Specified task is invalid: {}", task)
+                return None
 
     if output_path is None:
-        output_path = Path("results") / model_id
+        output_path = Path("results") / (Path(model_id).name if Path(model_id).is_dir() else model_id)
         logger.warning(f"You have not specified an output path, will default to: {output_path}")
 
     if isinstance(output_path, str):
         output_path = Path(output_path)
 
-    if do_perf and limit is None:
+    if do_perf and not performance.dataset and limit is None:
         limit = 1
     elif not do_perf and limit:
         logger.warning(
             f"Setting a limit of {limit}, do not use these metrics for any dashboarding!"
         )
-    if do_perf:
-        backend = "modalix"
-    match backend.strip().lower():
-        case "hf":
-            backend = "hf"
-        case "modalix":
-            backend = "modalix"
-            if board is None:
-                logger.error(
-                    f"You have not specified a board to run board inference"
-                )
-                return None
-            if do_start_server:
-                if board.model is None:
-                    logger.error(
-                        "To start the server on the board, the model ID or path to the model on the"
-                        "board needs to be provided"
-                    )
-                    return None
-                if board.address is None:
-                    logger.error(
-                        "To start the server on the board, the hostname or IP needs to be provided"
-                    )
-                    return None
-        case _:
-            logger.error(f"Unsupported backend: {backend}")
-            return None
-
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     return Config(
         model_id=model_id,
@@ -193,6 +203,7 @@ def prepare_mole(
         max_num_tokens=max_num_tokens,
         max_new_tokens=max_new_tokens,
         input_lengths=normalized_input_lengths,
+        performance=performance,
     )
 
 
@@ -206,6 +217,36 @@ def _table_title(config: Config, grouped: bool = False) -> str:
         )
         return f"Modalix backend on {board}{board_model}: {config.model_id} {suffix}"
     return f"HF backend: {config.model_id} {suffix}"
+
+
+@contextmanager
+def _benchmark_model(config: Config):
+    lm = None
+    started_server = False
+    try:
+        if config.backend == "modalix":
+            if config.do_start_server:
+                config.board.start_server(log_path=config.output_path / "server.log")
+                started_server = True
+            lm = ModalixLM(
+                board=config.board, pretrained=config.model_id, batch_size=config.batch_size,
+                max_length=config.max_num_tokens, device="cpu" if config.do_perf else config.device,
+                revision=config.performance.model_revision or "main",
+            )
+        else:
+            lm = HuggingFaceLM(
+                pretrained=config.model_id, batch_size=config.batch_size,
+                max_length=config.max_num_tokens, device=config.device,
+            )
+        yield lm
+    finally:
+        try:
+            if started_server:
+                config.board.stop_server()
+        finally:
+            if config.backend == "modalix" and lm is not None:
+                lm.zmq_socket.close(linger=0)
+                lm.zmq_context.term()
 
 
 def run(config: Config) -> dict[str, Any]:
@@ -229,58 +270,28 @@ def run(config: Config) -> dict[str, Any]:
     task_manager = lm_eval.tasks.TaskManager(metadata=metadata)
     evaluation_tracker = lm_eval.loggers.EvaluationTracker(output_path=str(config.output_path))
 
-    need_exit = False
-    detected_error = False
-    lm = None
     try:
-        if config.backend == "modalix":
-            if config.do_start_server:
-                config.board.start_server()
-            lm = ModalixLM(
-                board=config.board, pretrained=config.model_id, batch_size=config.batch_size,
-                max_length=config.max_num_tokens, device=config.device
+        with _benchmark_model(config) as lm:
+            results = lm_eval.evaluator.simple_evaluate(
+                model=lm,
+                model_args={},
+                tasks=config.tasks,
+                task_manager=task_manager,
+                evaluation_tracker=evaluation_tracker,
+                batch_size=config.batch_size,
+                limit=config.limit,
+                random_seed=config.random_seed,
+                numpy_random_seed=config.random_seed,
+                torch_random_seed=config.random_seed,
+                fewshot_random_seed=config.random_seed,
+                metadata=metadata,
             )
-        else:
-            lm = HuggingFaceLM(
-                pretrained=config.model_id, batch_size=config.batch_size,
-                max_length=config.max_num_tokens, device=config.device
-            )
-
-        # Eval
-        results = lm_eval.evaluator.simple_evaluate(
-            model=lm,
-            model_args={},
-            tasks=config.tasks,
-            task_manager=task_manager,
-            evaluation_tracker=evaluation_tracker,
-            batch_size=config.batch_size,
-            limit=config.limit,
-            random_seed=config.random_seed,
-            numpy_random_seed=config.random_seed,
-            torch_random_seed=config.random_seed,
-            fewshot_random_seed=config.random_seed,
-            metadata=metadata,
-        )
     except KeyboardInterrupt:
         logger.info("User interrupted")
-        need_exit = True
-    except BaseException:
+        raise SystemExit(130)
+    except Exception:
         logger.exception("Unexpected error occurred")
-        need_exit = True
-        detected_error = True
-    finally:
-        if config.backend == "modalix" and config.do_start_server:
-            # Ask the server to stop cleanly so model buffers are released before the next run.
-            if lm is not None:
-                try:
-                    lm.zmq_socket.send_multipart(["stop".encode("utf-8")])
-                    if not config.board.wait_for_server_stop(timeout=30):
-                        logger.warning("Timed out waiting for benchmark server to stop cleanly")
-                except Exception as exc:
-                    logger.warning("Failed to stop benchmark server cleanly: {}", exc)
-            config.board.stop_server()
-        if need_exit:
-            exit(int(detected_error))
+        raise SystemExit(1)
 
     assert results, "Results were not generated!"
     evaluation_tracker.save_results_aggregated(results=results, samples=None)
@@ -299,21 +310,20 @@ def run(config: Config) -> dict[str, Any]:
 
 
 def perf_bench(config: Config):
-    if config.do_start_server:
-        config.board.start_server()
-    lm = ModalixLM(
-        board=config.board, pretrained=config.model_id, batch_size=config.batch_size,
-        max_length=config.max_num_tokens, device=config.device
-    )
-    lm.perf_bench(
-        n_samples=config.limit,
-        max_new_tokens=config.max_new_tokens,
-        input_lengths=config.input_lengths,
-    )
-
-    if config.do_start_server:
-        # Stop the server.
-        lm.zmq_socket.send_multipart(["stop".encode('utf-8')])
-        if not config.board.wait_for_server_stop(timeout=30):
-            logger.warning("Timed out waiting for benchmark server to stop cleanly")
-        config.board.stop_server()
+    output = config.output_path / "performance.json"
+    write_results(output, {"schema_version": 1, "status": "starting", "requests": [], "summary": {}})
+    try:
+        with _benchmark_model(config) as lm:
+            return run_performance(lm, config)
+    except BaseException as exc:
+        # Startup/adapter failures happen before run_performance can write its report.
+        report = json.loads(output.read_text())
+        if report["status"] in ("starting", "complete"):
+            report.update(status="failed", error=str(exc))
+            write_results(output, report)
+        if isinstance(exc, KeyboardInterrupt):
+            raise SystemExit(130) from exc
+        if isinstance(exc, Exception):
+            logger.error("Performance benchmark failed: {}", exc)
+            raise SystemExit(1) from exc
+        raise

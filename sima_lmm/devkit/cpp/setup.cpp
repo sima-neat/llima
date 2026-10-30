@@ -73,7 +73,7 @@ void connect(
     // Configure the llama.cpp log level.
     setup_llama_cpp_logger();
 
-    // Connect to the MLA dispatcher.
+    // Connect to MLA-RT.
     connect_mla_rt(mla_rt_args);
 
     // Read environment variables.

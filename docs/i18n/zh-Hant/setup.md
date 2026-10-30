@@ -21,3 +21,9 @@ Model Compiler 需要安裝在一台符合以下要求的機器上。
 - 請擁有有效的 Hugging Face 帳戶，以便下載開源模型。
 - 某些模型，例如 `google/paligemma`，需要您在 Hugging Face 上接受授權協議。請務必在嘗試下載這些模型之前，先檢閱並接受授權協議。
 - 授權 CLI 存取 Hugging Face 使用一個 [使用者存取權杖](https://huggingface.co/docs/hub/en/security-tokens) 以及 `huggingface-cli`請注意，正在安裝。 `sima-cli` 自動安裝 `huggingface-cli`.
+
+### CI sysroot 選擇
+
+`deps/manifest.json` 宣告 `elxr_version`。共用工作流程會解析相符的
+`SYSROOT_VERSION`，並停用版本退回，選擇韌體完全相符的 DevKit。
+CI 在拋棄式容器中使用 SDK 映像已安裝的工具準備指定的 sysroot，並驗證產生的套件清單。

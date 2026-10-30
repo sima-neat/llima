@@ -9,7 +9,7 @@ to a reusable workflow, while runtime tests run in a dedicated DevKit job.
 | Area | CI entry point | Runner | Tested artifact | Hardware |
 |------|----------------|--------|-----------------|----------|
 | Model compiler | `.github/workflows/model-compiler-tests.yml`, called by `test-model-compiler` in `vulcan-ci.yml` | Host test runner | Exact compiler wheel for the candidate commit | No DevKit |
-| Runtime | `test-devkit` in `.github/workflows/vulcan-ci.yml` | ARM64 Modalix runner | Exact LLiMa and Internals DEBs plus the runtime-test extras archive | Real DevKit and MLASHM dispatcher |
+| Runtime | `test-devkit` in `.github/workflows/vulcan-ci.yml` | ARM64 Modalix runner | Exact LLiMa DEBs plus the runtime-test extras archive | Real DevKit and MLA hardware |
 
 Compiler tests live under `tests/compilation/`. Runtime tests live under
 `tests/runtime/`. Runtime coverage never falls back to host-only execution or
@@ -35,7 +35,7 @@ corresponding resolver output is false.
 
 The compiler workflow validates the exact LLiMa compiler wheel produced for
 the candidate commit. It covers configuration, model ingestion, generated
-ONNX, quantization, and a bounded full compilation pipeline.
+native SDK graphs, quantization, and a bounded full compilation pipeline.
 
 Model inputs are downloaded from the internal Vulcan cache. After preparation,
 Hugging Face and Transformers run in offline mode so test groups cannot
@@ -64,11 +64,17 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 ### Test groups
 
+Use one representative model case per architecture in each applicable suite.
+Reuse the same checkpoint for configuration, ingestion, graph, and integration
+coverage. Do not add separate model cases for parameter sizes, fine-tunes, or
+revisions of the same architecture. Component and precision checks reuse that
+representative; cover configuration variants with small hermetic tests.
+
 #### Fast compiler unit tests
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 126
+- Expected cases: 408
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -85,7 +91,7 @@ offline mode, and reject network connections.
 
 - Location: `tests/compilation/configuration/`
 - Marker: `compiler_config`
-- Expected cases: 26
+- Expected cases: 27
 
 Generates `VlmConfig` objects from cached Hugging Face and GGUF sources and
 compares them with the checked-in JSON contracts under
@@ -103,37 +109,53 @@ This protects:
 
 - Location: `tests/compilation/source_ingestion/`
 - Marker: `compiler_source`
-- Expected cases: 15
+- Expected cases: 5
 
 This group validates:
 
 - GGUF parser detection for Q8_0 and Q4_0 inputs.
-- Dequantization for Q8_0, Q4_0, Q6_K, Q5_K, Q4_K, and Q3_K.
+- Two exhaustive dequantization cases: Q8_0 and Q4_0.
 - Numerical comparison with the BF16 GGUF reference and GGUF library.
 - Resolution of Hugging Face weight names to GGUF weights.
-- Shape agreement between Hugging Face and GGUF weights.
+- Shape agreement between Hugging Face and BF16 GGUF weights.
 
-The comparisons are exhaustive across model tensors. Reference weights are
-shared across quantization variants where possible.
+The two numerical comparisons are exhaustive across model tensors and share
+the BF16 reference weights. Weight-name and shape checks use BF16 once because
+the mapping is independent of quantization format. Fast unit tests retain
+coverage of the other GGUF quantization formats.
 
-#### ONNX generation and validation
+#### Native graph generation and validation
 
-- Location: `tests/compilation/onnx_regression/`
-- Marker: `compiler_onnx_regression`
-- Expected cases: 37
+- Location: `tests/compilation/graph_regression/`
+- Marker: `compiler_graph_regression`
+- Expected cases: 41
+
+The existing 37 cases are required. The 4 SmolVLM2 component checks use one
+representative checkpoint, SmolVLM2-256M, and are informative
+until the published develop compiler includes that architecture.
 
 Every case:
 
-1. Generates candidate ONNX.
-2. Runs `onnx.checker`.
+1. Generates a floating-point native SDK graph (`.fp32.sima`) through the model component.
+2. Loads the graph and validates its input/output types and fixed shapes.
 3. Creates deterministic inputs.
-4. Executes the graph with ONNX Runtime.
-5. Validates output count, dtype, rank, and fixed dimensions.
+4. Executes the graph with AFE's reference executor.
+5. Validates output count, dtype, shape and finite values.
+
+Vision cases cover layer 0, including patch and position embeddings, plus one
+intermediate layer selected deterministically from the case ID. The same
+layers are generated for both revisions and executed independently.
+SmolVLM2 also generates the last vision layer to cover its connector.
 
 Feature branches, except `release*`, also generate the same components with
 the latest published `develop` compiler wheel. `develop`, `main`, `release*`,
 and tag builds validate the candidate only because those refs do not have a
 separate baseline artifact.
+
+Baseline generation uses develop's existing native SDK path; it does not
+require the new `ModelGraph` wrapper. The test model factory supplies the
+legacy constructor path only when the published baseline API requires it;
+no ONNX graph is generated or executed.
 
 Each case declares one regression mode in `tests/compilation/cases.py`:
 
@@ -147,23 +169,30 @@ Use `informative` for new model support that is not yet available from the
 published `develop` compiler. Change it to `required` once baseline support is
 available.
 
-Generated ONNX and NumPy payloads are deleted after the workflow. They are not
-stored in the repository or artifact cache.
+Generated SDK graphs and NumPy payloads are deleted after the workflow. They
+are not stored in the repository or artifact cache.
 
 #### Generated-graph and quantization integration
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 22 standard and 6 high-memory
+- Expected cases: 34 standard and 6 high-memory
 
 This group validates:
 
 - Embedding quantization and dequantization wiring.
-- Staged source-to-ONNX-to-quant generation versus direct generation.
-- GGUF-generated quantized graphs versus Hugging Face or BF16 source graphs.
+- Staged native FP32 graph quantization versus direct quantized generation.
+- Whisper SiMa graph numerical and output-contract comparisons against Hugging Face, including
+  BF16/INT8 quantization, using deterministic synthetic weights.
+- One Q4_0 GGUF pre-layer graph smoke case against a Hugging Face BF16 graph.
 - Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are serial and high-memory. CI runs the 22
+SmolVLM2 cases compare real final-encoder-layer and connector outputs against
+Transformers using the 256M representative, in floating and direct BF16 graph paths.
+They also check aspect-preserving preprocessing, frame order, and one visual
+token block per image.
+
+The speculative-decoding cases are serial and high-memory. CI runs the 34
 standard cases first and the 6 high-memory cases separately.
 
 #### Selected-model full compilation E2E
@@ -243,18 +272,18 @@ python -P -m pytest \
   -vv -ra
 ```
 
-ONNX regression additionally requires separately generated candidate and
-baseline roots and manifests. The authoritative invocation is maintained in
+Native graph regression additionally requires separately generated candidate
+and baseline roots and manifests. The authoritative invocation is maintained in
 `.github/workflows/model-compiler-tests.yml`.
 
 ### Compiler reference-artifact policy
 
 - Checked-in JSON configuration contracts are allowed.
-- Reference ONNX and NumPy output files are not checked in or stored
+- Reference SDK graphs and NumPy output files are not checked in or stored
   externally.
 - Numerical regression compares candidate and baseline artifacts generated
   during the same workflow run.
-- Generated ONNX, quantization, and compilation payloads are temporary.
+- Generated graphs, quantization, and compilation payloads are temporary.
 
 ## DevKit runtime CI
 
@@ -264,9 +293,8 @@ Runtime CI validates installed artifacts through the same public entry points
 used on a Modalix DevKit. It requires:
 
 - ARM64 Modalix hardware.
-- An active `simaai-appcomplex.service`.
-- The MLASHM dispatcher and MLA hardware.
-- Exact LLiMa and Internals packages from the candidate build.
+- MLA hardware initialized by the platform service.
+- Exact LLiMa packages from the candidate build.
 
 Missing models, packages, services, or the wrong architecture are failures,
 not skips or host-side fallbacks.
@@ -298,7 +326,7 @@ LLiMa-specific reasoning fixtures:
 
 - `Qwen2.5-0.5B-Instruct-Autoround-a16w4`
 - `LFM2.5-VL-450M-Autoround-a16w4`
-- `florianvoss/whisper-small-a16w8-layered-encoder`
+- `simaai/whisper-small-a16w8`
 - `Qwen3-0.6B-Autoround-a16w4`
 - `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`
 
@@ -328,13 +356,15 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
 | `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
+| `runtime.gemma4_mtp_helpers` | Packed causal masks at compiled context widths, sliding-window offsets, ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
 
 The embedding generation test requires raw embedding tables on local NVMe
 and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
 `SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
 and `auto`, verifies that automatic offloading saves DRAM, and checks allocation
 cleanup after teardown. The executable also accepts an explicit model directory
-and optionally a speculative draft model directory:
+and optionally a speculative draft model directory. With a draft, it also checks
+that repeating a prompt after speculative decoding returns the same response:
 
 ```bash
 ./lib/sima-lmm/tests/sima_lmm_embedding_offload_generation_test \
@@ -345,15 +375,44 @@ The executables link directly against the in-tree runtime while building, then
 use install RPATHs to load the installed runtime and dispatcher libraries on
 the DevKit.
 
+Gemma4 MTP draft parameters in `vlm_config.json` live under
+`lm_cfg.speculative_decoding_cfg`, using the HF names `backbone_hidden_size`,
+`use_ordered_embeddings`, `num_centroids`, and `centroid_intermediate_top_k`.
+Other speculative models serialize these fields with defaults; normal models
+have a null speculative-decoding configuration. The former
+flat `assistant_*` keys are unsupported: migrate the model JSONs when updating
+the runtime; reuse the compiled model binaries. Rebuild C++ consumers against
+the matching development package because the configuration layout changes.
+
+The manual Gemma4 MTP prefix-cache test takes an individual deployed target and
+assistant directory. It checks exact generated-token parity for cold/warm
+requests, prefill group boundaries, partial prefixes, continuation through the
+committed KV boundary, cancellation recovery, and long-context reuse (4,097
+tokens for an 8K model). Public token-ID requests are checked against direct
+MTP output, including token limits, stop-token overrides, timing dispatch, and
+restoring chat streaming after an error. It also
+asserts the actual prefill dispatch positions from runtime logs, rather than
+relying only on reported cache hits, and prints TTFT for comparison:
+
+```bash
+./lib/sima-lmm/tests/sima_lmm_gemma4_mtp_cache_test \
+  /path/to/deployed-mtp/target /path/to/deployed-mtp/assistant
+```
+
+This test needs a target with at least three prefill groups.
+It is built and packaged with `./build.sh --all`, but is not in the automatic
+CTest suite until a compiled MTP pair is available in the CI fixture manifest.
+TTFT is reported without a timing threshold; dispatch counts establish that
+cached prefill work was skipped even when device timing varies.
+
 ### Python and black-box tests
 
 Pytest validates the installed package and external interfaces:
 
 | Test | Coverage |
 |------|----------|
-| Installed Python lifecycle | Imports the installed extension and connects to and disconnects from the dispatcher |
+| Installed Python lifecycle | Imports the installed extension and connects to and disconnects from MLA-RT |
 | CLI black box | Starts `llima`, submits a real Qwen query, validates the answer, sends `quit`, and verifies teardown |
-| MLA memory cleanup | Runs Qwen four times through `llima run -> quit`, checks `/dev/simaai-mem` after every exit, and verifies that the daemon PID and allocation baseline remain stable |
 | Model manager | Hermetically validates concurrent downloads, transient retries, cancellation, largest-first scheduling, locking, and file-granular resume without accessing the network or dispatcher |
 | OpenAI/Ollama HTTP | Existing recovery and cancellation coverage plus real Qwen3/Gemma4 reasoning separation for streaming, non-streaming, thinking-disabled, and structured tool-call requests |
 | ZMQ black box | CURVE-secured MessagePack request, generated tensor response, and remote server shutdown |
@@ -374,30 +433,14 @@ subsequent execution:
 - Reaps the `llima` process.
 - Returns CMA memory within the configured tolerance.
 
-The MLA memory cleanup regression test performs four sequential Qwen
-`llima run -> quit` cycles without restarting `simaai-appcomplex.service`.
-After every cycle it checks the allocation summary from `/dev/simaai-mem`
-against the initial baseline and reports stale 512 MiB target-2 buffers with
-their owner PIDs. The repeat count, run timeout, cleanup timeout, and log
-directory can be overridden with:
-
-- `SIMA_TEST_LLIMA_MEMORY_REPEAT_COUNT`
-- `SIMA_TEST_LLIMA_MEMORY_RUN_TIMEOUT_SECONDS`
-- `SIMA_TEST_LLIMA_MEMORY_CLEANUP_TIMEOUT_SECONDS`
-- `SIMA_TEST_LLIMA_MEMORY_LOG_DIR`
-
-When a persistent log directory is configured, each test invocation writes to
-its own `run-*` subdirectory so earlier results remain available.
-
 ### Cancellation and test isolation
 
 CTest and pytest run in dedicated process groups. Cancellation sends only
 `SIGINT` to active inference and waits for graceful shutdown; it never
 escalates to `SIGTERM` or `SIGKILL`.
 
-Runtime cases run serially against the same `simaai-appcomplex.service`
-process. They do not restart the service between cases, so retained dispatcher
-or MLA state is visible to subsequent tests.
+Runtime cases run serially against the same MLA hardware. They do not reset the
+platform between cases, so retained MLA state is visible to subsequent tests.
 
 ### Cleanup and retained state
 
@@ -411,17 +454,16 @@ Runtime test dependency installation uses `pip --no-cache-dir`.
 
 The runner deliberately retains:
 
-- Installed LLiMa and Internals Debian packages, which the next run
-  overwrites.
+- Installed LLiMa Debian packages, which the next run overwrites.
 - Downloaded Qwen, LFM2, and Whisper models.
-- The running `simaai-appcomplex.service`.
+- Platform-managed MLA runtime state.
 
 Runtime tests do not upload reports or generated outputs after execution.
 
 ### Running runtime tests on a DevKit
 
-Build and install the candidate LLiMa and Internals packages, then extract the
-extras archive:
+Build and install the candidate LLiMa packages, then extract the extras
+archive:
 
 ```bash
 mkdir -p _work/runtime-tests
@@ -489,20 +531,19 @@ When adding runtime coverage:
 - Required dependencies and fixtures fail loudly when missing.
 - Runtime tests do not skip because a DevKit, service, or model is absent.
 - Compiler case counts are audited and unexpected skips fail the workflow.
-- New compiler support may use informative ONNX comparison until it exists in
-  the published `develop` baseline.
+- New compiler support may use informative native graph comparison until it
+  exists in the published `develop` baseline.
 
 ### Provenance
 
 - Compiler tests install the exact candidate wheel.
-- Runtime tests install the exact candidate LLiMa packages and resolved
-  Internals packages.
+- Runtime tests install the exact candidate LLiMa packages.
 - Build metadata and manifests tie packages and test extras to the candidate
   commit.
 
 ### Execution policy
 
-- Runtime tests execute serially against the dispatcher.
+- Runtime tests execute serially against MLA hardware.
 - High-memory compiler cases execute separately from the standard matrix.
 - Generated compiler payloads and extracted runtime-test workspaces are
   temporary.

@@ -1,4 +1,3 @@
-import copy
 import logging
 import numpy as np
 from dataclasses import dataclass, field
@@ -6,42 +5,36 @@ from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
-    ModelFormat, SPECULATIVE_BUDGET, VisionArchType, VlmConfig, model_file_type,
+    ModelFormat, SPECULATIVE_BUDGET, SpeculativeDecodingMethod, VisionArchType,
+    VlmArchType, VlmConfig, model_file_type,
 )
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.base import (
-    BaseModel, EvalMode, FileGenMode, FileGenPrecision, LoraGenMode, GenConfiguration
-)
+from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
 from sima_lmm.model.language_model import LanguageModel
 from sima_lmm.model.vision_model import VisionModel
 from sima_lmm.preproc.vlm_helper import Chat, VlmHelper
-from sima_utils.logging.sima_logger import sima_log_info, sima_log_warning
+from sima_lmm.logging import sima_log_info
 
 
+def _detect_speculative_method(model_config: dict) -> str:
+    """Detect a draft model's speculative method from its loaded configuration."""
+    if model_config.get("model_type") == "gemma4_assistant":
+        return SpeculativeDecodingMethod.GEMMA4_MTP
 
-class _TrivialContextManager:
-    """
-    Context manager that does nothing.
-    """
-    def __enter__(self):
-        pass
-    def __exit__(self, exc_type, exc_value, traceback):
-        pass
+    architectures = model_config.get("architectures", [])
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if "DFlashDraftModel" in architectures:
+        return SpeculativeDecodingMethod.DFLASH
+    if any("eagle3" in architecture.lower() for architecture in architectures):
+        return SpeculativeDecodingMethod.EAGLE3
 
-
-class _LoadParamsContextManager:
-    """
-    Load model parameters on entry, unload on exit.
-    """
-    def __init__(self, model):
-        self._model = model
-
-    def __enter__(self):
-        self._model.load_all_params()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self._model.unload_all_params()
+    raise ValueError(
+        "Unsupported speculative draft configuration: "
+        f"model_type={model_config.get('model_type')!r}, architectures={architectures!r}. "
+        "Expected a Gemma4 MTP, EAGLE3, or DFlash draft model."
+    )
 
 
 @dataclass
@@ -51,7 +44,7 @@ class VisionLanguageModel(BaseModel):
 
     def __post_init__(self):
         self.language_model = LanguageModel(
-            self.cfg, self.language_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path,
+            self.cfg, self.language_model_name, sima_path=self.sima_path,
             hf_model=self.hf_model, vlm_helper=self.vlm_helper,
         )
 
@@ -59,7 +52,6 @@ class VisionLanguageModel(BaseModel):
     def from_hf_cache(
         model_name: str,
         hf_cache_path: Path | str,
-        onnx_path: Path | str,
         sima_path: Path | str,
         max_num_tokens: int,
         system_prompt: str | None = None,
@@ -67,29 +59,26 @@ class VisionLanguageModel(BaseModel):
         override_language_group_size: int | None = None,
         override_language_future_token_mask_size: int = 1,
         return_logits: bool = False,
-        enable_filter_sharing: bool = False,
         quantize_embeddings: bool = False,
         quantize_kv_cache: bool = False,
         image_resolution: list[int] | None = None,
         target_model: "VisionLanguageModel | None" = None,
+        speculative_block_size: int | None = None,
     ) -> "VisionLanguageModel":
         """Creates a VisionLanguageModel object from cached Hugging Face model.
 
         Args:
-            model_name: Model name. This is used as a file name prefix for the generated onnx
-                and model sdk files.
+            model_name: File name prefix for the generated SiMa artifacts.
             hf_cache_path: Path to the cached Hugging Face model.
-            onnx_path: Path to the generated ONNX files.
             sima_path: Path to the generated SiMa files.
             max_num_tokens: Maximum number of tokens, including both input and output tokens.
             system_prompt: System prompt.
             return_logits: Return logits at the last layer output instead of argmax token IDs.
-            enable_filter_sharing: True if sharing filters between group and single models is
-                enabled.
             quantize_embeddings: True if embedding table is quantized.
             quantize_kv_cache: True if KV cache is quantized.
             target_model: Target VisionLanguageModel when constructing a draft model.
                 Reuses its tokenizer when the draft has none. None for non-draft models.
+            speculative_block_size: DFlash verification width (4, 8 or 16); defaults to 8.
         Returns:
             A VisionLanguageModel object for file generation or evaluation.
         """
@@ -102,6 +91,9 @@ class VisionLanguageModel(BaseModel):
             hf_model = GgufModel(hf_cache_path)
             model_config = hf_model.model_config
 
+        if target_model is not None:
+            speculative_method = _detect_speculative_method(model_config)
+
         vlm_cfg = VlmConfig.from_hf_config(
             model_format, hf_cache_path, model_config, image_resolution=image_resolution
         )
@@ -111,21 +103,39 @@ class VisionLanguageModel(BaseModel):
             override_language_future_token_mask_size
         )
 
-        vlm_cfg.pipeline_cfg.set_enable_filter_sharing(enable_filter_sharing)
         vlm_cfg.pipeline_cfg.set_return_logits(return_logits)
 
         vlm_cfg.pipeline_cfg.set_quantize_embeddings(quantize_embeddings)
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
-        # Mixture-of-Experts models are recognized and their configuration is
-        # parsed, but file generation and devkit execution are not yet ported.
-        if vlm_cfg.lm_cfg.moe_cfg is not None:
-            raise NotImplementedError(
-                "Mixture-of-Experts models are not yet supported: only "
-                "configuration parsing is implemented."
-            )
-
         if target_model is not None:
+            if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:
+                if target_model.cfg.model_type != VlmArchType.VLM_GEMMA4:
+                    raise ValueError("gemma4_mtp speculative decoding requires a Gemma4 target model")
+                if model_config.get("model_type") != "gemma4_assistant":
+                    raise ValueError(
+                        "gemma4_mtp speculative decoding requires a gemma4_assistant draft model"
+                    )
+                if vlm_cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size != target_model.cfg.lm_cfg.hidden_size:
+                    raise ValueError(
+                        "Gemma4 MTP assistant backbone hidden size does not match target hidden size: "
+                        f"assistant={vlm_cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size}, "
+                        f"target={target_model.cfg.lm_cfg.hidden_size}"
+                    )
+                if vlm_cfg.lm_cfg.speculative_decoding_cfg.use_ordered_embeddings:
+                    required_tensors = (
+                        "masked_embedding.centroids.weight",
+                        "masked_embedding.token_ordering",
+                    )
+                    missing_tensors = [
+                        name for name in required_tensors if not hf_model.param_exists(name)
+                    ]
+                    if missing_tensors:
+                        raise ValueError(
+                            "Gemma4 ordered embeddings require checkpoint tensors: "
+                            + ", ".join(missing_tensors)
+                        )
+
             # Some draft models use target model's tokenization scheme.
             tokenizer_files = ("tokenizer_config.json", "tokenizer.json", "tokenizer.model")
             has_tokenizer = any(
@@ -136,10 +146,59 @@ class VisionLanguageModel(BaseModel):
             else:
                 vlm_helper = target_model.vlm_helper
 
-            # Set speculative decoding configs for the draft model
-            vlm_cfg.lm_cfg.set_speculative_decoding_config(
-                dict(is_draft=True, speculative_budget=SPECULATIVE_BUDGET["draft"])
-            )
+            if speculative_method == SpeculativeDecodingMethod.DFLASH:
+                dflash_cfg = model_config["dflash_config"]
+                budget = speculative_block_size or 8
+                if target_model.cfg.pipeline_cfg.input_token_group_size <= budget:
+                    raise ValueError(
+                        "DFlash requires language_group_size > speculative_block_size"
+                    )
+                if (
+                    target_model.cfg.pipeline_cfg.max_num_tokens
+                    % target_model.cfg.pipeline_cfg.input_token_group_size
+                ):
+                    raise ValueError(
+                        "DFlash requires max_num_tokens divisible by language_group_size"
+                    )
+                target_layer_ids = dflash_cfg["target_layer_ids"]
+                mask_token_id = dflash_cfg["mask_token_id"]
+                if not target_layer_ids or len(set(target_layer_ids)) != len(target_layer_ids) or any(
+                    layer < 0 or layer >= target_model.cfg.lm_cfg.num_hidden_layers
+                    for layer in target_layer_ids
+                ):
+                    raise ValueError("DFlash target_layer_ids must be nonempty, unique, and within the target layers")
+                if not 0 <= mask_token_id < target_model.cfg.lm_cfg.token_cfg.vocab_size:
+                    raise ValueError("DFlash mask_token_id must be within the target vocabulary")
+                spec_cfg = dict(
+                    method=speculative_method,
+                    speculative_budget=budget,
+                    target_layer_ids=target_layer_ids,
+                    mask_token_id=mask_token_id,
+                )
+                target_model.cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=False)
+                )
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(**spec_cfg, is_draft=True)
+                )
+                for pipeline_cfg in (
+                    target_model.cfg.pipeline_cfg,
+                    vlm_cfg.pipeline_cfg,
+                ):
+                    if pipeline_cfg.future_token_mask_size == 1:
+                        pipeline_cfg.set_future_token_mask_size(budget)
+            else:
+                if speculative_block_size is not None:
+                    raise ValueError("--speculative_block_size is only valid for DFlash")
+                target_model.configure_speculative_decoding(is_draft=False, method=speculative_method)
+                budget_key = (
+                    "gemma4_mtp_draft"
+                    if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP else "draft"
+                )
+                vlm_cfg.lm_cfg.set_speculative_decoding_config(
+                    dict(method=speculative_method, is_draft=True,
+                         speculative_budget=SPECULATIVE_BUDGET[budget_key])
+                )
 
         else:
             vlm_helper = VlmHelper(vlm_cfg, hf_cache_path)
@@ -148,20 +207,29 @@ class VisionLanguageModel(BaseModel):
             cfg=vlm_cfg,
             hf_model=hf_model,
             model_name=model_name,
-            onnx_path=Path(onnx_path),
             sima_path=Path(sima_path),
             vlm_helper=vlm_helper,
         )
+        if target_model is not None and speculative_method == SpeculativeDecodingMethod.DFLASH:
+            model.language_model.dflash_target_hf_model = target_model.hf_model
         return model
 
     def set_lora_adapter(self, lora_path: Path):
         lora_config = LocalHuggingFaceModel.load_lora_adapter(lora_path)
         self.cfg.lm_cfg.set_lora_adapter(lora_config)
 
-    def configure_speculative_decoding(self, is_draft: bool = False):
-        speculative_budget = SPECULATIVE_BUDGET["draft"] if is_draft else SPECULATIVE_BUDGET["target"]
+    def configure_speculative_decoding(
+        self,
+        is_draft: bool = False,
+        method: str = SpeculativeDecodingMethod.EAGLE3,
+    ):
+        if method == SpeculativeDecodingMethod.GEMMA4_MTP:
+            budget_key = "gemma4_mtp_draft" if is_draft else "gemma4_mtp_target"
+        else:
+            budget_key = "draft" if is_draft else "target"
+        speculative_budget = SPECULATIVE_BUDGET[budget_key]
         self.cfg.lm_cfg.set_speculative_decoding_config(
-            dict(is_draft=is_draft, speculative_budget=speculative_budget)
+            dict(method=method, is_draft=is_draft, speculative_budget=speculative_budget)
         )
 
     def gen_files(
@@ -196,28 +264,21 @@ class VisionLanguageModel(BaseModel):
         elif not (self.sima_devkit_path / "vlm_config.json").is_file():
             self.gen_devkit_files(precision=precision, resume=False)
 
-        if gen_mode == FileGenMode.SOURCE_TO_ONNX:
-            num_processes = 1
-            gen_context = _LoadParamsContextManager(self.hf_model)
-        else:
-            gen_context = _TrivialContextManager()
-
-        with gen_context:
-            if self.cfg.vm_cfg is not None and self.cfg.is_supported_multimodal:
-                # This model includes a vision model
-                vision_model = VisionModel(
-                    self.cfg, self.vision_model_name, onnx_path=self.onnx_path,
-                    sima_path=self.sima_path, hf_model=self.hf_model
-                )
-                vision_model.gen_files(
-                    gen_mode, gen_config=gen_config, log_level=log_level,
-                    num_processes=num_processes, resume=resume
-                )
-
-            self.language_model.gen_files(
+        if self.cfg.vm_cfg is not None and self.cfg.is_supported_multimodal:
+            # This model includes a vision model
+            vision_model = VisionModel(
+                self.cfg, self.vision_model_name,
+                sima_path=self.sima_path, hf_model=self.hf_model
+            )
+            vision_model.gen_files(
                 gen_mode, gen_config=gen_config, log_level=log_level,
                 num_processes=num_processes, resume=resume
             )
+
+        self.language_model.gen_files(
+            gen_mode, gen_config=gen_config, log_level=log_level,
+            num_processes=num_processes, resume=resume
+        )
         sima_log_info("%s files generation completed.", gen_mode)
 
     def evaluate(self, eval_mode: EvalMode, chat: Chat) -> str | np.ndarray:
@@ -286,7 +347,7 @@ class VisionLanguageModel(BaseModel):
                 )
 
             vision_model = VisionModel(
-                self.cfg, self.vision_model_name, onnx_path=self.onnx_path, sima_path=self.sima_path
+                self.cfg, self.vision_model_name, sima_path=self.sima_path
             )
             vision_outputs = vision_model.run_model(eval_mode, [image_tensor])
             vision_proj = vision_outputs[0]

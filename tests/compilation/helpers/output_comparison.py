@@ -25,6 +25,16 @@ def assert_outputs_close(
     for index, (reference_output, actual_output) in enumerate(
         zip(reference, actual, strict=True)
     ):
+        assert actual_output.shape == reference_output.shape, (
+            f"Output {index} shape differs: "
+            f"reference={reference_output.shape}, actual={actual_output.shape}"
+        )
+        assert actual_output.dtype == reference_output.dtype, (
+            f"Output {index} dtype differs: "
+            f"reference={reference_output.dtype}, actual={actual_output.dtype}"
+        )
+        assert np.all(np.isfinite(reference_output)), f"Non-finite reference output {index}"
+        assert np.all(np.isfinite(actual_output)), f"Non-finite actual output {index}"
         tolerance = tolerances[0] if len(tolerances) == 1 else tolerances[index]
         absolute_tolerance = tolerance * float(np.max(np.abs(reference_output)))
         np.testing.assert_allclose(

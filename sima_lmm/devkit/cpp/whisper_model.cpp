@@ -18,9 +18,15 @@
 namespace simaai {
 namespace llima {
 
-WhisperPreprocessor::WhisperPreprocessor(const std::filesystem::path& devkit_dir) {
+WhisperPreprocessor::WhisperPreprocessor(const std::filesystem::path& devkit_dir)
+    : WhisperPreprocessor(DiskFileProvider(devkit_dir).open_stream("preprocessor_config.json")) {}
+
+WhisperPreprocessor::WhisperPreprocessor(std::shared_ptr<FileProvider> files)
+    : WhisperPreprocessor(files->open_stream("devkit/preprocessor_config.json")) {}
+
+WhisperPreprocessor::WhisperPreprocessor(std::unique_ptr<std::istream> config) {
     // Load mel filters.
-    auto json = nlohmann::json::parse(std::ifstream(devkit_dir / "preprocessor_config.json"));
+    auto json = nlohmann::json::parse(*config);
     auto mel_filters_json = json["mel_filters"];
     _mel_filters.resize(mel_filters_json.size(), mel_filters_json[0].size());
     for (uint32_t i = 0; i < mel_filters_json.size(); ++i) {
@@ -241,11 +247,16 @@ const std::map<std::string, std::string> WhisperModel::_TO_LANGUAGE_CODE = {
 };
 
 
-WhisperModel::WhisperModel(std::filesystem::path model_path) : BaseModel(model_path),
-    _preprocessor(_devkit_dir),
+WhisperModel::WhisperModel(std::filesystem::path model_path)
+    : WhisperModel(std::move(model_path), nullptr) {}
+
+WhisperModel::WhisperModel(std::filesystem::path model_path, std::shared_ptr<FileProvider> files)
+    : BaseModel(model_path, std::move(files)),
+    _preprocessor(_files),
     _is_running(false)
 {
-    _tokenizer_ptr = Tokenizer::from_hf_json(_devkit_dir / "tokenizer.json");
+    _tokenizer_ptr = Tokenizer::from_hf_json(_files->get_path("devkit/tokenizer.json"));
+    _files->release("devkit/tokenizer.json");
     _text_streamer = std::make_unique<TextStreamer>(
         _tokenizer_ptr.get(),
         [](const std::string&, double) {},
@@ -456,19 +467,21 @@ void WhisperModel::_initialize() {
 
     // Define and load the models in parallel.
     _define_models();
-    MLAModelWithBuffer::load_all_models(_elf_dir);
+    MLAModelWithBuffer::load_all_models(_elf_dir, _files.get());
 
     // Upload token and position embeddings.
     auto token_embeddings_file_name = (
-        _devkit_dir / fmt::format("{}_token_embeddings.npy", _cfg.model_name)
+        "devkit/" + fmt::format("{}_token_embeddings.npy", _cfg.model_name)
     );
-    auto token_embeddings_tensor = cnpy::npy_load(token_embeddings_file_name);
+    auto token_embeddings_tensor = cnpy::npy_load(_files->get_path(token_embeddings_file_name));
+    _files->release(token_embeddings_file_name);
     get_buffer("token_embeddings").upload(token_embeddings_tensor.data<void>());
 
     auto position_embeddings_file_name = (
-        _devkit_dir / fmt::format("{}_position_embeddings.npy", _cfg.model_name)
+        "devkit/" + fmt::format("{}_position_embeddings.npy", _cfg.model_name)
     );
-    auto position_embeddings_tensor = cnpy::npy_load(position_embeddings_file_name);
+    auto position_embeddings_tensor = cnpy::npy_load(_files->get_path(position_embeddings_file_name));
+    _files->release(position_embeddings_file_name);
     get_buffer("position_embeddings").upload(position_embeddings_tensor.data<void>());
 
     // Populate the future token mask.
@@ -598,7 +611,10 @@ void WhisperModel::_define_models() {
 
     std::vector<uint32_t> missing_encoder_layers;
     for (uint8_t layer_idx = 0; layer_idx < _cfg.encoder_layers; ++layer_idx) {
-        if (!std::filesystem::is_regular_file(_get_elf_path_encoder_layer(layer_idx)))
+        // Deferred providers validate each ELF at serial load time, without
+        // fetching all encoder weights merely to check their presence.
+        if (!_files->pulls_files() &&
+            !std::filesystem::is_regular_file(_get_elf_path_encoder_layer(layer_idx)))
             missing_encoder_layers.emplace_back(layer_idx);
     }
     if (!missing_encoder_layers.empty()) {

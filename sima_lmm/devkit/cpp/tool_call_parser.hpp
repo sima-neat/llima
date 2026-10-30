@@ -23,6 +23,7 @@ enum class ToolCallFormat {
     Qwen,
     Llama,
     Qwen35,
+    GptOss,
 };
 
 using PreservedToolCallTokens = std::vector<std::pair<uint32_t, std::string>>;

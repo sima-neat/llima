@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="${SIMA_MOLE_PYTHON:-python3.12}"
+PYTHON_BIN="${SIMA_MOLE_PYTHON:-python3}"
 DEFAULT_VENV_PATH="${HOME}/sima-mole-venv"
 VENV_PATH="${SIMA_MOLE_VENV_PATH:-}"
 ASSUME_DEFAULT=0
@@ -11,7 +11,7 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [--venv <path>] [--yes]
 
-Install MoLE and its sdk_ext dependencies into a Python virtual environment.
+Install MoLE and its evaluation dependencies into a Python virtual environment.
 
 Options:
   --venv <path>  Virtual environment path (default: ${DEFAULT_VENV_PATH})
@@ -20,7 +20,7 @@ Options:
 
 Environment:
   SIMA_MOLE_VENV_PATH  Virtual environment path
-  SIMA_MOLE_PYTHON     Python interpreter used to create it (default: python3.12)
+  SIMA_MOLE_PYTHON     Python interpreter (default: compatible python3, otherwise python3.12)
 EOF
 }
 
@@ -50,8 +50,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "${SIMA_MOLE_PYTHON:-}" ]] && command -v python3.12 >/dev/null 2>&1 \
+    && ! "${PYTHON_BIN}" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info < (3, 14))' 2>/dev/null; then
+  PYTHON_BIN="python3.12"
+fi
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "ERROR: Python interpreter not found: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+if ! "${PYTHON_BIN}" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info < (3, 14))'; then
+  echo "ERROR: MoLE requires Python 3.11-3.13. Set SIMA_MOLE_PYTHON to a compatible interpreter." >&2
   exit 1
 fi
 
@@ -94,7 +102,7 @@ fi
 
 VENV_PYTHON="${VENV_PATH}/bin/python"
 "${VENV_PYTHON}" -m pip install --upgrade pip
-"${VENV_PYTHON}" -m pip install --upgrade "${WHEEL_PATH}[sdk_ext]"
+"${VENV_PYTHON}" -m pip install --upgrade "${WHEEL_PATH}[mole]"
 # A branch wheel can retain the same public version as an older installation.
 # Reinstall only LLiMa itself without disturbing the resolved MoLE dependencies.
 "${VENV_PYTHON}" -m pip install --force-reinstall --no-deps "${WHEEL_PATH}"

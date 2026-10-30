@@ -105,10 +105,15 @@ struct RopeScalingConfig {
     std::string rope_type;
     std::optional<std::vector<size_t>> mrope_section;
     bool mrope_interleaved = false;
+    // YaRN parameters (rope_type == "yarn"). Defaults match the HF fallbacks.
+    double beta_fast = 32.0;
+    double beta_slow = 1.0;
+    bool truncate = true;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     RopeScalingConfig, factor, low_freq_factor, high_freq_factor, original_max_position_embeddings,
-    attention_factor, long_factor, short_factor, rope_type, mrope_section, mrope_interleaved
+    attention_factor, long_factor, short_factor, rope_type, mrope_section, mrope_interleaved,
+    beta_fast, beta_slow, truncate
 )
 
 
@@ -181,11 +186,33 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 struct SpeculativeDecodingConfig {
+    std::string method = "eagle3";
     bool is_draft = false;
     uint16_t speculative_budget = 16;
+    uint32_t backbone_hidden_size = 0;
+    bool use_ordered_embeddings = false;
+    uint32_t num_centroids = 0;
+    uint32_t centroid_intermediate_top_k = 0;
+
+    std::vector<uint8_t> target_layer_ids = {};
+    int32_t mask_token_id = -1;
+
+    bool is_dflash() const { return method == "dflash"; }
+    bool is_eagle3() const { return method == "eagle3"; }
+    bool is_gemma4_mtp() const { return method == "gemma4_mtp"; }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    SpeculativeDecodingConfig, is_draft, speculative_budget
+    SpeculativeDecodingConfig, method, is_draft, speculative_budget,
+    backbone_hidden_size, use_ordered_embeddings, num_centroids,
+    centroid_intermediate_top_k, target_layer_ids, mask_token_id
+)
+
+struct MixtureOfExpertsConfig {
+    uint16_t num_experts;
+    uint16_t num_experts_per_tok;
+};
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
+    MixtureOfExpertsConfig, num_experts, num_experts_per_tok
 )
 
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
@@ -207,6 +234,15 @@ struct LanguageModelConfig {
     bool rms_norm_unit_offset = false;
     uint32_t draft_vocab_size = 0;
     std::optional<SpeculativeDecodingConfig> speculative_decoding_cfg = std::nullopt;
+    std::string arch = "";
+    std::optional<MixtureOfExpertsConfig> moe_cfg = std::nullopt;
+
+    // Mixture-of-Experts: the post block is replaced by router + experts + weighted-sum.
+    bool is_moe() const { return moe_cfg.has_value(); }
+    // gpt_oss feeds a per-head "sink" logit into the attention softmax as an extra
+    // per-layer input to the (shared) cache model.
+    bool uses_attention_sinks() const { return arch == "gpt_oss"; }
+
     bool is_kv_shared_layer(uint8_t layer_idx) const {
         uint8_t first_shared_layer = num_hidden_layers - num_kv_shared_layers;
         return num_kv_shared_layers > 0 && layer_idx >= first_shared_layer;
@@ -225,8 +261,9 @@ struct LanguageModelConfig {
     }
 
     uint16_t get_single_num_tokens() const {
-        if (speculative_decoding_cfg.has_value()) {
-            return speculative_decoding_cfg.value().speculative_budget;
+        const auto& spec = speculative_decoding_cfg;
+        if (spec && !(spec->is_gemma4_mtp() && spec->is_draft)) {
+            return spec->speculative_budget;
         }
         return 1;
     }
@@ -235,9 +272,29 @@ struct LanguageModelConfig {
         return speculative_decoding_cfg.has_value();
     }
 
+    bool is_dflash() const {
+        return is_spec_decode() && speculative_decoding_cfg->is_dflash();
+    }
+
+    bool is_speculative_draft() const {
+        return is_spec_decode() && speculative_decoding_cfg.value().is_draft;
+    }
+
+    bool is_eagle3_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_eagle3();
+    }
+
+    bool is_gemma4_mtp_draft() const {
+        return is_speculative_draft() && speculative_decoding_cfg.value().is_gemma4_mtp();
+    }
+
+    bool is_gemma4_mtp_target() const {
+        return is_spec_decode() && speculative_decoding_cfg->is_gemma4_mtp()
+            && !speculative_decoding_cfg->is_draft;
+    }
+
     uint32_t get_lm_head_output_size() const {
-        if (speculative_decoding_cfg.has_value()
-            && speculative_decoding_cfg.value().is_draft){
+        if (is_speculative_draft() && !is_dflash() && draft_vocab_size > 0) {
             return draft_vocab_size;
         }
         return token_cfg.vocab_size;
@@ -249,7 +306,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     hidden_size_per_layer_input, num_kv_shared_layers,
     rms_norm_eps, rms_norm_unit_offset,
     linear_attn_cfg,
-    draft_vocab_size, speculative_decoding_cfg
+    draft_vocab_size, speculative_decoding_cfg, arch, moe_cfg
 )
 
 
@@ -277,14 +334,13 @@ struct PipelineConfig {
     std::optional<uint16_t> long_context_future_token_mask_size = std::nullopt;
     bool return_logits;
     bool use_strided_kv_cache = true;
-    bool enable_filter_sharing;
     bool quantize_embeddings = false;
     bool quantize_kv_cache = false;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     PipelineConfig, system_prompt, chat_template, max_num_tokens, input_token_group_size,
     input_token_group_offsets, future_token_mask_size, long_context_future_token_mask_size,
-    return_logits, use_strided_kv_cache, enable_filter_sharing, quantize_embeddings,
+    return_logits, use_strided_kv_cache, quantize_embeddings,
     quantize_kv_cache
 )
 

@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from afe.ir.defines import NodeName, get_expected_tensor_value
+from afe.ir.serializer import load_awesomenet
 from afe.ir.tensor_type import ScalarType
 
 from sima_lmm.config.layer_id import LayerID
@@ -42,7 +43,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguagePreModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_pre_layer{LAYER_INDEX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -60,7 +60,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguageCacheModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_cache_token{TOKEN_INDEX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -78,7 +77,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguagePostModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_post_layer{LAYER_INDEX}",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -94,7 +92,6 @@ def _build_component(case: SpeculativeGraphCase, draft_model):
         model = LanguageDraftFCModel(
             cfg,
             f"{draft_model.model_name}_language_n{NUM_TOKENS}_draft_fc",
-            onnx_path=draft_model.onnx_path,
             sima_path=draft_model.sima_path,
             hf_model=draft_model.hf_model,
             num_tokens=NUM_TOKENS,
@@ -128,14 +125,14 @@ def test_speculative_staged_and_direct_generation_are_equivalent(
     ]
 
     draft_model.gen_files(
-        FileGenMode.SOURCE_TO_ONNX,
+        FileGenMode.SOURCE_TO_FP,
         gen_config=gen_config,
         num_processes=1,
         log_level=logging.WARNING,
         resume=False,
     )
     draft_model.gen_files(
-        FileGenMode.ONNX_TO_QUANT,
+        FileGenMode.FP_TO_QUANT,
         gen_config=gen_config,
         num_processes=1,
         log_level=logging.WARNING,
@@ -169,10 +166,8 @@ def test_speculative_cache_graph_accepts_quantized_kv_and_scales(
     model, _, _ = _build_component(
         SpeculativeGraphCase("cache"), draft_model
     )
-    net = model._build_sima_nodes(
-        f"{draft_model.hf_model.language_model_param_base_name}.token.{TOKEN_INDEX}",
-        quantizable=False,
-    )
+    model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    net = load_awesomenet(model.sdk_file_name.name, str(model.sima_model_sdk_path))
 
     assert get_expected_tensor_value(
         net.nodes[NodeName("cached_keys")].get_type().output
@@ -202,10 +197,8 @@ def test_speculative_embedding_graph_uses_target_rows_and_scales(
     pre_model, _, _ = _build_component(SpeculativeGraphCase("pre"), draft_model)
     post_model, _, _ = _build_component(SpeculativeGraphCase("post"), draft_model)
 
-    pre_net = pre_model._build_sima_nodes(
-        draft_model.hf_model.language_model_param_base_name,
-        quantizable=False,
-    )
+    pre_model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    pre_net = load_awesomenet(pre_model.sdk_file_name.name, str(pre_model.sima_model_sdk_path))
     assert [str(name) for name in pre_net.input_node_names] == [
         "input", "input_scale", "hidden_states", "freq_real", "freq_imag",
     ]
@@ -216,10 +209,8 @@ def test_speculative_embedding_graph_uses_target_rows_and_scales(
         pre_net.nodes[NodeName("input_scale")].get_type().output
     ).scalar == ScalarType.bfloat16
 
-    post_net = post_model._build_sima_nodes(
-        draft_model.hf_model.language_model_param_base_name,
-        quantizable=False,
-    )
+    post_model.gen_files(FileGenMode.SOURCE_TO_QUANT, log_level=logging.WARNING)
+    post_net = load_awesomenet(post_model.sdk_file_name.name, str(post_model.sima_model_sdk_path))
     assert [str(name) for name in post_net.input_node_names] == ["input", "self_attn"]
     assert get_expected_tensor_value(
         post_net.nodes[NodeName("input")].get_type().output

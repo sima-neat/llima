@@ -11,15 +11,15 @@ MoLE (Modalix 言語モデル評価ツールは、モデルの精度とパフォ
 
 ## インストール
 
-MoLEは、ホスト側で実行するベンチマークツールです。SDKのDockerコンテナ内ではなく、ホストマシンにインストールして実行してください。また、Modalixデバイス上でも実行しないでください。Modalixデバイスに必要なのは、LLiMaランタイムと`llima benchmark-server`プロセスだけです。ランタイムのインストール手順については、[Neat Frameworkのインストール](/getting-started/neat-library/)を参照してください。
+SDK Docker コンテナの外で、ホストまたは Modalix DevKit の独立した仮想環境に MoLE をインストールしてください。DevKit での実行には、LLiMa ランタイムのインストールも必要です。ランタイムのインストール手順は [Neat Framework のインストール](/getting-started/neat-library/)を参照してください。
 
-MoLEをホストにインストールするには、`sima-cli`を使用します。
+`sima-cli` を使用して MoLE をインストールします。
 
 ``` console
 host:~$ sima-cli neat install llima/mole
 ```
 
-これにより、MoLE が、`~/sima-mole-venv` にあるホストの仮想環境にインストールされます。
+これにより、MoLE が `~/sima-mole-venv` の仮想環境にインストールされます。
 
 ## 使用方法
 
@@ -29,7 +29,9 @@ host:~$ sima-cli neat install llima/mole
 host:~$ source ~/sima-mole-venv/bin/activate
 ```
 
-MoLE は、2つのサブコマンドを使用して、`llima-benchmark` CLI を介して呼び出されます。`<model_id>` 引数は常に、HuggingFace のモデル ID（例：`meta-llama/Llama-3.2-3B-Instruct`）です。`-b modalix` モードでは、これは単なる表示ラベルではなく、デプロイされたボードモデルをコンパイルするために使用されるトークナイザーと設定に一致する必要があります。これは、ボードがトークンのスコアのみを返し、トークナイザーのメタデータを提供しないためです。
+ホストから Modalix 評価を実行する場合、`--board_ip` は必須です。Modalix DevKit では省略するとローカルのランタイムを使用します。サーバーを起動する場合は `--board_model` を指定してください。ローカルサーバーのログは `<output_dir>/server.log` に保存されます。既存のサーバーに接続し、起動や停止を行わない場合は `--no-board_start_server` を使用してください。
+
+MoLE は `llima-benchmark accuracy` と `llima-benchmark perf` を提供します。Modalix では `<model_id>` に HuggingFace モデル ID、またはデプロイしたモデルと一致するローカルのトークナイザー／設定ディレクトリを指定できます。MoLE はこのトークナイザーでリクエストを準備します。
 
 ### 精度ベンチマーク
 
@@ -50,8 +52,8 @@ MoLE は、2つのサブコマンドを使用して、`llima-benchmark` CLI を�
 | `-b` | 使用するバックエンド：`modalix`（オンボードで実行）または`hf`（ホスト上で参照ベースラインとして実行）。 |
 | `-t` | **必須**。1つ以上の評価タスクが必要です。例：`hellaswag`、`triviaqa`、`piqa`、`winogrande`、`wikitext`。利用可能なすべてのタスクについては、[タスクリスト](https://github.com/EleutherAI/lm-evaluation-harness/blob/v0.4.11/lm_eval/tasks/README.md)を参照してください。 |
 | `-o` | ベンチマーク結果の出力ディレクトリ。 |
-| `--board_ip` | Modalix ボードの IP アドレス。`-b modalix` に必要です。 |
-| `--board_model` | Modalix デバイス上のコンパイルされたモデルディレクトリへのパス（例：`/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`）。`-b modalix` に必要です。 |
+| `--board_ip` | リモートボードの IP アドレスまたはホスト名。ホストからの実行時は必須です。Modalix でのローカル実行時は省略します。 |
+| `--board_model` | DevKit 上のコンパイル済みモデルディレクトリ。サーバーの起動時は必須です。 |
 | `--max_num_tokens` | 最大コンテキスト長。コンパイル時に使用された値と等しいか、それよりも小さい値でなければなりません。 |
 | `-n, --num_samples` | 評価するサンプルの数を指定します。指定しない場合は、すべてのタスクセットを実行します。 |
 | `--board_ssh_user` | Modalix ボードの SSH ユーザー名。オプション。デフォルト値：`sima`。 |
@@ -88,8 +90,8 @@ MoLE は、2つのサブコマンドを使用して、`llima-benchmark` CLI を�
 |----|----|
 | `model_id` | HuggingFace モデル ID（例：`meta-llama/Llama-3.2-3B-Instruct`）。Modalix のパフォーマンス評価を行う場合、これはデプロイされたモデルのトークナイザー/設定と一致する必要があります。 |
 | `-o` | ベンチマーク結果の出力ディレクトリ。 |
-| `--board_ip` | Modalix ボードの IP アドレス。 |
-| `--board_model` | Modalix デバイス上のコンパイルされたモデルディレクトリへのパス（例：`/media/nvme/llima/models/Llama-3.2-3B-Instruct-a16w4`）。 |
+| `--board_ip` | リモートボードの IP アドレスまたはホスト名。ホストからの実行時は必須です。Modalix でのローカル実行時は省略します。 |
+| `--board_model` | DevKit 上のコンパイル済みモデルディレクトリ。サーバーの起動時は必須です。 |
 | `--max_num_tokens` | 最大コンテキスト長。コンパイル時に使用された値と等しいか、それよりも小さい値でなければなりません。 |
 | `--max_new_tokens` | 出力で生成するトークンの最大数。 |
 | `--input_lengths` | ベンチマークに使用する、入力トークンの正確な長さをオプションで指定できます。値は一意である必要があり、各値に`--max_new_tokens`を加えた合計が、`--max_num_tokens`の範囲内に収まる必要があります。指定しない場合、MoLEは、自動的に2の累乗の範囲を生成します。 |
@@ -97,3 +99,9 @@ MoLE は、2つのサブコマンドを使用して、`llima-benchmark` CLI を�
 | `--board_ssh_pass` | Modalix ボードの SSH パスワード。オプションです。設定することで、インタラクティブな操作なしの自動ベンチマークを有効にできます。 |
 
 利用可能なすべてのオプションについて、`llima-benchmark perf -h` を実行してください。
+
+入力長バケットの代わりに `--dataset bfcl-v3|ifeval|alpacaeval|gsm8k|dialogsum` でネイティブのチャット／ツールプロンプトを使用できます。`-n` を省略すると選択したデータセット全体を実行し、`-n 20` は先頭の 20 サンプルを実行します。データセットは自動的にダウンロードしてキャッシュします。BFCL は simple/multiple のケースを対象とし、ツール自体は実行しません。
+
+`--board_model` により通常デコードか投機的デコードかが決まります。比較時は同じデータセットと設定で別々に実行し、`--board_model` と `-o` だけを変更してください。ウォームアップ 1 回を計測から除外し、毎回 KV 状態をリセットします。モデルのネイティブチャットテンプレートと EOS 停止を使用します。データセットの出力上限には最初のトークンを含み、既存のバケットでは最初のトークンと `--max_new_tokens` 回のデコードを計測します。
+
+`-o` はタイミング、トークン数、集計指標、ドラフト寄与率、失敗、ベンチマーク設定、データセットの出典を `performance.json` に保存します。デコード TPS は TTFT を除外し、生成時間には入力準備と通信時間を含みません。これらのワークロードは精度ではなく性能を計測します。
