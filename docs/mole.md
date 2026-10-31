@@ -56,6 +56,7 @@ Evaluates model quality against standard tasks:
 | `--board_model` | Compiled model directory on the DevKit. Required when starting a server. |
 | `--max_num_tokens` | Maximum context length. Must be equal to or smaller than the value used during compilation. |
 | `-n, --num_samples` | Number of samples to evaluate. Runs the full task set if not specified. |
+| `--num_fewshot` | Number of few-shot examples prepended to each prompt. Uses each task's default if not specified. |
 | `--board_ssh_user` | SSH username for the Modalix board. Optional, default: `sima`. \# |
 | `--board_ssh_pass` | SSH password for the Modalix board. Optional. Set to enable non-interactive automated benchmarking. |
 

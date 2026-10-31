@@ -49,6 +49,10 @@ def main():
     acc_parser.add_argument(
         "-t", "--task", type=str, nargs="+", required=True, help="Tasks to be done"
     )
+    acc_parser.add_argument(
+        "--num_fewshot", type=int,
+        help="Number of few-shot examples per prompt. Uses each task's default if not specified"
+    )
 
     perf_parser = subparsers.add_parser(
         "perf", parents=[common_parser], formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -89,6 +93,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         input_lengths=getattr(args, "input_lengths", None),
         performance=performance,
+        num_fewshot=getattr(args, "num_fewshot", None),
     )
     if config is None:
         parser.error("Invalid argument combinations")
