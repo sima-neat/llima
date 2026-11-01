@@ -41,6 +41,10 @@ modalix:~$ llima rm Qwen3-VL-4B-Instruct-GPTQ-a16w4
 
 Use `llima run` as a simple runtime for initial model validation on Modalix.
 
+Tensor buffers use the required `/dev/dma_heap/simaai,mla` endpoint, following
+the kernel's shared MLA allocation policy: DMS, contiguous ordinary Linux RAM,
+then default CMA.
+
 In CLI mode, chat history is enabled by default. Each prompt and response is
 kept as context for the next turn until you clear it with `clear history`. Images
 submitted with a prompt are also retained as part of that history. `clear history`
