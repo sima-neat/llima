@@ -449,6 +449,11 @@ sima-cli playbooks install ./skills
 The install summary must report `detected: 3`, `valid: 3`, and `discarded: 0`.
 The `sima-cli` version must satisfy `min_cli_version` in each `playbook.yml`.
 
+For issues, use the [bug report template](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)
+for defects and the [feature request template](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)
+for proposed improvements. Complete the relevant sections and redact secrets
+from logs and reproduction details.
+
 For pull requests:
 
 - branch from and target current `develop`;
@@ -464,3 +469,14 @@ A contribution is ready when affected tests pass without unintended skips,
 required package and Modalix checks complete or are explicitly unavailable,
 compatibility and docs are addressed, and the PR contains reproducible
 evidence.
+
+## SDK package lock handling
+
+CI SDK host package operations use the shared helper from
+`sima-neat/.github@main`. It retries only recognized dpkg/APT lock contention for up
+to 120 seconds per operation, with owner/process diagnostics on contention.
+Unrelated errors fail immediately; lock files and lock owners are left intact.
+The helper does not manage the target sysroot or DevKit package database.
+For local CI setup scripts, set `SDK_PACKAGE_HELPER` to the absolute path of
+`scripts/sdk-package.sh` in the reviewed shared checkout. See the
+[shared helper contract](https://github.com/sima-neat/.github/tree/main/actions/setup-sdk-package-helper).

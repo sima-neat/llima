@@ -21,3 +21,10 @@ Model Compilerは、以下の要件を満たすマシンにインストールす
 - オープンソースのモデルをダウンロードするには、有効な Hugging Face アカウントが必要です。
 - 一部のモデル（例：`google/paligemma`）では、Hugging Faceでライセンス契約に同意する必要があります。これらのモデルをダウンロードする前に、ライセンスの内容を確認し、同意するようにしてください。
 - CLIに、[ユーザーアクセストークン](https://huggingface.co/docs/hub/en/security-tokens)と`huggingface-cli`を使用して、Hugging Faceへのアクセスを許可します。`sima-cli`をインストールすると、`huggingface-cli`も自動的にインストールされます。
+
+### CI の sysroot 選択
+
+`deps/manifest.json` は `elxr_version` を指定します。共有ワークフローが対応する
+`SYSROOT_VERSION` を解決し、フォールバックを無効にして正確なファームウェアの DevKit を選択します。
+CI は使い捨てコンテナーで SDK イメージにインストール済みのツールを使って対象の sysroot を準備し、
+生成されたパッケージ一覧を検証します。

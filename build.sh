@@ -901,9 +901,16 @@ mkdir -p "$ROOT_DIR/dist"
 rm -f "$ROOT_DIR"/sima-lmm*.deb
 rm -f "$ROOT_DIR/dist"/sima-lmm*.deb
 
+# CPack creates an internal _CPack_Packages tree beside its output DEBs.
+# Keep that scratch tree in the build directory, outside the published dist.
+CPACK_OUTPUT_DIR="$BUILD_DIR/packages"
+mkdir -p "$CPACK_OUTPUT_DIR"
+rm -f "$CPACK_OUTPUT_DIR"/sima-lmm*.deb
+# Remove staging left by older builds that ran CPack directly in dist.
+rm -rf "$ROOT_DIR/dist/_CPack_Packages"
 CPACK_ARGS=(
   --config "$BUILD_DIR/CPackConfig.cmake"
-  -D "CPACK_PACKAGE_DIRECTORY=$ROOT_DIR/dist"
+  -D "CPACK_PACKAGE_DIRECTORY=$CPACK_OUTPUT_DIR"
 )
 
 if [ "${#COMPONENTS[@]}" -eq 0 ]; then
@@ -918,6 +925,7 @@ else
 fi
 
 cpack "${CPACK_ARGS[@]}"
+cp "$CPACK_OUTPUT_DIR"/sima-lmm*.deb "$ROOT_DIR/dist/"
 
 echo "[build] Generated packages:"
 if [ "${#COMPONENTS[@]}" -eq 0 ]; then

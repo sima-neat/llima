@@ -134,6 +134,13 @@ model compilation.
 
 See [Coding Standards](docs/contributing.md#coding-standards) for details.
 
+## Issues
+
+Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.md) for defects
+and the [feature request template](.github/ISSUE_TEMPLATE/feature_request.md)
+for proposed improvements. Complete the relevant sections and redact secrets
+from logs and reproduction details.
+
 ## Pull Requests
 
 Use `.github/PULL_REQUEST_TEMPLATE.md`, link completed issues with
