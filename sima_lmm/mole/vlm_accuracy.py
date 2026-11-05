@@ -77,7 +77,7 @@ def _tasks(config, report: dict, options=None, task_names=None):
     if unknown:
         raise UnsupportedInput(f"Unknown image tasks (use individual upstream task names): {sorted(unknown)}")
     declarations, root = _manifest(options)
-    if declarations and set(declarations) != set(task_names):
+    if options.manifest is not None and set(declarations) != set(task_names):
         raise UnsupportedInput("Accuracy manifest tasks must exactly match the requested tasks")
     tasks = {}
     for name in task_names:

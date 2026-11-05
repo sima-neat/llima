@@ -21,6 +21,23 @@ host:~$ sima-cli neat install llima/mole
 
 This installs MoLE into a virtual environment at `~/sima-mole-venv`.
 
+### Manual installation
+
+Without `sima-cli`, run the bundled installer from the downloaded MoLE package directory:
+
+```bash
+bash ./install_mole.sh --venv ~/sima-mole-venv
+```
+
+For direct wheel installation, activate a Python 3.11–3.13 virtual environment and run the following, replacing the wheel filename with the downloaded version:
+
+```bash
+python -m pip install './sima_lmm-<version>-py3-none-any.whl[mole]'
+python -m pip install --no-deps "lmms-eval==0.7.3" "tenacity>=8.3.0"
+```
+
+The second command enables image benchmarking while reusing MoLE's shared dependencies.
+
 ## Usage
 
 First, activate the MoLE virtual environment:
