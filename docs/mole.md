@@ -2,11 +2,11 @@
 
 ## Overview
 
-MoLE measures text and image-plus-text accuracy and language-model performance on Modalix.
+MoLE (Modalix Language Model Evaluator) is a benchmarking tool for evaluating the accuracy and performance of LLMs and VLMs running on the Modalix platform.
 
 Text accuracy uses [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness). Modalix image-plus-text accuracy uses [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval), reusing upstream tasks, extraction and scoring. Both use `llima-benchmark accuracy`. MoLE supports two backends:
 
-- **hf** — runs evaluation on the host using HuggingFace transformers (baseline reference)
+- **hf** — runs text accuracy evaluation on the host using HuggingFace transformers (baseline reference)
 - **modalix** — runs evaluation on a Modalix board via the `llima benchmark-server`
 
 ## Installation
@@ -34,6 +34,8 @@ For Modalix evaluation from a host, `--board_ip` is required. On a Modalix DevKi
 MoLE provides the `llima-benchmark accuracy` and `llima-benchmark perf` subcommands. For Modalix, `<model_id>` accepts a HuggingFace model ID or a local tokenizer/config directory matching the deployed model. MoLE uses that tokenizer to prepare requests.
 
 ### Accuracy Benchmarking
+
+#### Text accuracy
 
 Evaluates model quality against standard tasks:
 
@@ -73,9 +75,65 @@ To use the HuggingFace backend as a reference baseline:
 
 For all available options, run `llima-benchmark accuracy -h`.
 
-### Image-plus-text accuracy
+#### Image-plus-text accuracy
 
-The same accuracy command supports image tasks on a remote Modalix from a host, or entirely on the DevKit using the existing local server lifecycle. No separate evaluator installation or command is needed. See [Multimodal accuracy](multimodal_accuracy.md) for Qwen3.5-2B invocation, prepared local datasets, reproducibility metadata, result exports and validation status.
+The validated tasks are `realworldqa`, `docvqa_val` and `chartqa`, using Qwen3.5-2B on Modalix. The evaluator is installed with MoLE and uses the deployed VLM's native chat template and image preprocessing.
+
+```bash
+llima-benchmark accuracy /data/qwen3.5-2b-assets -b modalix \
+    -t realworldqa docvqa_val chartqa \
+    --board_ip <devkit-address> --board_model <compiled-model-on-devkit> \
+    --max_num_tokens 4096 -o results/vlm
+```
+
+On the DevKit, omit `--board_ip` and use the compiled model directory as `model_id`. On a host, provide matching tokenizer/processor assets or a HuggingFace repository; model weights are not downloaded. Use matching runtime and MoLE releases.
+
+| Image accuracy option | Description |
+|----|----|
+| `--max_new_tokens` | Override the task's output budget; otherwise retain its upstream default. |
+| `--enable_thinking` | Enable the model's native thinking template; disabled by default. |
+| `--model_revision` | Select the tokenizer/processor repository revision. |
+| `--accuracy_manifest` | Use pinned dataset revisions or prepared local datasets, as below. |
+
+Run text and image tasks separately, using individual task names. Image accuracy supports ordinary VLMs with greedy decoding. Audio/video, multi-turn, visual few-shot and repeated-request tasks are unsupported. Inputs plus the output budget must fit the requested and compiled context; inputs are not truncated. Multiple images retain their task-defined order. Native EOS stops generation; task string stops trim the returned answer.
+
+#### Prepared image datasets
+
+Datasets download automatically. For pinned or offline evaluation, pass `--accuracy_manifest manifest.json`. For example, with `-t chartqa`:
+
+```json
+{
+  "schema_version": 1,
+  "tasks": {
+    "chartqa": {
+      "revision": "<40-character-dataset-commit>",
+      "split": "test",
+      "local_path": "datasets/chartqa"
+    }
+  }
+}
+```
+
+Prepare local datasets with HuggingFace `DatasetDict.save_to_disk()`, preserving upstream columns, images and scoring splits. Paths are relative to the manifest, and its task names must match `-t`. Omit `local_path` to download the pinned revision. For offline runs, use local model assets and set `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1`.
+
+#### Image accuracy results and comparison
+
+The output directory contains:
+
+- `accuracy.json`: aggregate metrics, sample counts, dataset/model/runtime identities and settings.
+- `accuracy-answers.jsonl`: generated answers, image/prompt identities, token counts, finish reasons and errors.
+- `accuracy-samples.jsonl`: upstream per-sample scoring results.
+
+Omitting `-n` runs the full dataset. Failures stop evaluation, preserve partial answers and produce no aggregate metrics. Output-budget truncations are counted and still scored.
+
+To check host/DevKit parity or repeatability, compare two completed runs made with the same artifacts, datasets and settings:
+
+```bash
+llima-benchmark compare-accuracy results/vlm-host results/vlm-local \
+    -o results/vlm-comparison.json
+```
+
+This compares identities, inputs, answers and scores exactly, ignoring execution mode, local paths and timings. Exit codes are `0` for a match, `1` for differences and `2` for invalid input. A matching smoke run does not establish full-dataset accuracy.
 
 ### Performance Benchmarking
 

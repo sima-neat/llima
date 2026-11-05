@@ -19,7 +19,7 @@ runtime API.
 
 [MoLE](docs/mole.md) evaluates text and image-plus-text accuracy from a host or
 directly on a Modalix DevKit. Image tasks reuse upstream lmms-eval scoring;
-see [multimodal accuracy](docs/multimodal_accuracy.md) for setup and validation status.
+see [MoLE image-plus-text accuracy](docs/mole.md#image-plus-text-accuracy) for setup and supported tasks.
 
 ## Packages
 

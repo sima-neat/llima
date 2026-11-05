@@ -47,7 +47,7 @@ multiple images, malformed request recovery and runtime identity against the
 installed candidate packages on Modalix. Set `SIMA_TEST_LLIMA_VLM_MODEL` to the
 packaged Qwen3.5-2B model directory for the initial model validation. Run the
 full dataset evaluation in both modes following
-[Multimodal accuracy](../docs/multimodal_accuracy.md) before publishing support
+[MoLE image-plus-text accuracy](../docs/mole.md#image-plus-text-accuracy) before publishing support
 or accuracy results. Those hardware checks are required even if hermetic tests
 and the package build pass.
 
