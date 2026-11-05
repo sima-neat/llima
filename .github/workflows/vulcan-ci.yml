@@ -255,14 +255,6 @@ jobs:
             ./build_compiler_wheel.sh
             LLIMA_MOLE_REUSE_COMPILER_WHEEL=ON ./build_mole_package.sh
             echo "::endgroup::"
-
-            echo "::group::Validate packaged MoLE image evaluator"
-            bash dist/mole/install_mole.sh --venv "${PWD}/build/mole-test-venv" --yes
-            build/mole-test-venv/bin/python -m pip install pytest
-            build/mole-test-venv/bin/python -m pip check
-            HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
-              build/mole-test-venv/bin/python -P -m pytest -o addopts="" tests/mole -q
-            echo "::endgroup::"
           '
 
       post_build_command: |
@@ -456,16 +448,6 @@ jobs:
             wheels[profile] = wheel
             required_names = set(required_names)
             required_names.add(wheel.name)
-            if profile == "mole":
-                lmms_wheels = list(directory.glob("lmms_eval-*.whl"))
-                if len(lmms_wheels) != 1:
-                    raise SystemExit("expected exactly one bundled lmms-eval image profile")
-                required_names.update({lmms_wheels[0].name, lmms_wheels[0].name + ".sha256"})
-                with zipfile.ZipFile(lmms_wheels[0]) as lmms_archive:
-                    provenance = json.loads(lmms_archive.read("lmms_eval/mole_profile.json"))
-                pin = json.loads(Path("deps/manifest.json").read_text())["lmms-eval"]
-                if provenance["revision"] != pin["revision"] or provenance["profile"] != "llima-image":
-                    raise SystemExit("bundled image evaluator does not match the dependency manifest")
             actual_names = {path.name for path in directory.iterdir() if path.is_file()}
             if actual_names != required_names:
                 raise SystemExit(

@@ -75,7 +75,7 @@ Pass `--accuracy_manifest accuracy-manifest.json` in either mode. Omit `local_pa
 
 The output directory contains:
 
-- `accuracy.json`: aggregate upstream metrics, revisions/splits/fingerprints, selected sample IDs, task configs, scorer source identity, package versions, compiled model file hashes, loaded runtime library hash/platform identity, tokenizer/processor hashes, image resolution/preprocessing configuration, context/output/thinking settings and counts.
+- `accuracy.json`: aggregate upstream metrics, revisions/splits/fingerprints, selected sample IDs, task configs, evaluator version, package versions, compiled model file hashes, loaded runtime library hash/platform identity, tokenizer/processor hashes, image resolution/preprocessing configuration, context/output/thinking settings and counts.
 - `accuracy-answers.jsonl`: attempted requests with sample IDs, ordered text/image descriptors, image hashes/resolutions, raw and final generated answers, generation settings, actual prompt hashes, token counts, finish reasons or errors.
 - `accuracy-samples.jsonl`: upstream per-sample targets, responses, filtered predictions, task metrics and hashes for a completed scoring run. Task-specific internal extraction can occur within upstream scoring; MoLE does not implement a second extractor.
 
@@ -83,11 +83,9 @@ Failures stop the run with a nonzero exit code and preserve partial answers. Fai
 
 Compare host and local runs using identical dataset files/revisions and sample IDs, deployed artifact, runtime identity and generation settings. Check prompt/image hashes, per-sample answers, counts and metrics; investigate any differences. Do not infer VLM accuracy from compilation or text-only results.
 
-## Evaluator dependency assessment
+## Evaluator installation
 
-The MoLE build pins lmms-eval's exact source commit in `deps/manifest.json`, builds it on the packaging host and bundles a pure-Python wheel. `tools/build_lmms_profile.py` preserves every upstream code/task asset and license, records their hashes, and narrows wheel dependency metadata to imports required for image task evaluation. Its local version identifies the commit. Upstream's `v0.7.3` tag currently declares distribution version `0.7.2`; commit and source-tree hashes resolve that ambiguity.
-
-The profile reuses MoLE's Torch, Transformers, datasets, Pillow and text-harness dependencies and includes evaluate, sacrebleu, accelerate, aiohttp, pandas, pytz and tenacity. It excludes unrelated model, audio/video, judge-service and training extras. Missing task-specific optional dependencies fail rather than installing software during evaluation. Import, dependency-consistency and prepared-task scoring checks passed on ARM64 Python 3.12 and on the target Neat 3.0 DevKit with Python 3.13.5. The evaluator stays separate from runtime and compiler dependencies.
+The MoLE installer installs the official `lmms-eval==0.7.3` wheel and `tenacity>=8.3.0` with `pip --no-deps`, reusing MoLE's existing image/scoring dependencies. No custom evaluator wheel is built or bundled. Upstream's unused dependencies remain uninstalled, so `pip check` reports them as missing. Additional tasks may require optional dependencies.
 
 Run the hermetic checks with the candidate MoLE environment:
 
@@ -115,7 +113,7 @@ where applicable. The console shows a maximum of 20 differences.
 The command compares these values exactly:
 
 - Dataset revisions, splits, file hashes, fingerprints and selected sample IDs.
-- Task configuration, scorer source identity and generation settings.
+- Task configuration, evaluator version and generation settings.
 - Compiled artifact, runtime library, platform and tokenizer/processor identities.
 - Ordered text/image descriptors, image hashes, prompt hashes and generated answers.
 - Input/output token counts, finish reasons, sample counts and upstream scores.
@@ -124,7 +122,7 @@ The command compares these values exactly:
 The command ignores execution mode, endpoint, timing, local model/dataset paths,
 evaluator Python version, host architecture and installed Python package lists.
 It removes process memory addresses from task function descriptions. Function
-names and the scorer source hash must still match. It matches answer and scoring
+names and the evaluator version must still match. It matches answer and scoring
 rows by task and document ID. JSONL row order does not affect the result.
 
 Exit codes are `0` for a match, `1` for differences and `2` for invalid input or

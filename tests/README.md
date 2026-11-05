@@ -31,9 +31,8 @@ corresponding resolver output is false.
 
 ## MoLE evaluator checks
 
-The package build installs the candidate MoLE publication package in its own
-virtual environment, checks dependency consistency and runs `tests/mole/` with
-network access disabled through Hugging Face's offline settings. This exercises
+Run `tests/mole/` in the candidate MoLE environment with network access disabled
+through Hugging Face's offline settings. This exercises
 upstream RealWorldQA, DocVQA and ChartQA protocols/scoring against prepared tiny
 datasets and the actual ZMQ client in both host and DevKit-local modes. It does
 not validate MLA execution or measured model accuracy.

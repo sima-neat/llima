@@ -4,7 +4,7 @@
 
 MoLE measures text and image-plus-text accuracy and language-model performance on Modalix.
 
-Text accuracy uses [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness). Modalix image-plus-text accuracy selects the bundled [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) image profile internally, reusing upstream tasks, extraction and scoring. Both use `llima-benchmark accuracy`. MoLE supports two backends:
+Text accuracy uses [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness). Modalix image-plus-text accuracy uses [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval), reusing upstream tasks, extraction and scoring. Both use `llima-benchmark accuracy`. MoLE supports two backends:
 
 - **hf** — runs evaluation on the host using HuggingFace transformers (baseline reference)
 - **modalix** — runs evaluation on a Modalix board via the `llima benchmark-server`

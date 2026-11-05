@@ -52,8 +52,8 @@ def _load(directory: Path) -> dict:
         for field in ("files", "chat_template"):
             if not report["assets"].get(field):
                 raise ValueError(f"Missing asset identity: {field}")
-        if not report["evaluator"].get("source_tree_sha256"):
-            raise ValueError("Missing scorer source identity")
+        if not report["evaluator"].get("version"):
+            raise ValueError("Missing evaluator version")
         if not report["runtime"].get("artifact_sha256") or not report["runtime"].get("runtime", {}).get("library_sha256"):
             raise ValueError("Missing artifact or runtime identity")
         if not isinstance(report["results"].get("results"), dict) or not report["results"]["results"]:

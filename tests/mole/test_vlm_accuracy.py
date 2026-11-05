@@ -1,4 +1,4 @@
-"""Hermetic task/scoring integration with the packaged image-only lmms-eval profile."""
+"""Hermetic task/scoring integration with the installed lmms-eval package."""
 
 import base64
 import io

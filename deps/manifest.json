@@ -3,12 +3,6 @@
     "channel": "develop"
   },
   "package-version": "0.6.0",
-  "lmms-eval": {
-    "repository": "https://github.com/EvolvingLMMs-Lab/lmms-eval.git",
-    "revision": "ac86d61af84f0e188422188c6b875226988c8988",
-    "version": "0.7.2",
-    "tag": "v0.7.3"
-  },
   "platform-version": "3.0.0",
   "sysroot-version": "3.0.0~git202610140145.e5ece50-2121"
 }

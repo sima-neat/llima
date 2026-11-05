@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sima_lmm.mole.multimodal import (
-    MultimodalClient, UnsupportedInput, digest, file_identity, generation_settings, tree_identity,
+    MultimodalClient, UnsupportedInput, file_identity, generation_settings, tree_identity,
 )
 
 
@@ -22,27 +22,8 @@ class AccuracyOptions:
     enable_thinking: bool = False
 
 
-def _profile() -> dict:
-    import lmms_eval
-
-    root = Path(lmms_eval.__file__).parent
-    profile_path = root / "mole_profile.json"
-    if not profile_path.is_file():
-        raise UnsupportedInput(
-            "Image accuracy requires MoLE's bundled lmms-eval image profile; "
-            "install the candidate package with sima-cli neat install llima/mole"
-        )
-    profile = json.loads(profile_path.read_text())
-    if profile.get("profile") != "llima-image":
-        raise UnsupportedInput("Unexpected lmms-eval profile")
-    # Task/scorer identity is verified, including YAML and helper code, rather than version alone.
-    for name, expected in profile["source_files"].items():
-        path = root.parent / name
-        if not path.is_file() or file_identity(path)["sha256"] != expected:
-            raise UnsupportedInput(f"lmms-eval task/scorer asset changed: {name}")
-    return {key: value for key, value in profile.items() if key != "source_files"} | {
-        "source_tree_sha256": digest(json.dumps(profile["source_files"], sort_keys=True).encode())
-    }
+def _evaluator_info() -> dict:
+    return {"name": "lmms-eval", "version": importlib.metadata.version("lmms-eval")}
 
 
 def choose_evaluator(tasks: list[str], text_manager, backend: str) -> str:
@@ -72,7 +53,6 @@ def choose_evaluator(tasks: list[str], text_manager, backend: str) -> str:
     if len(set(kinds)) > 1:
         raise UnsupportedInput("Run text and image tasks in separate accuracy invocations")
     if kinds and kinds[0] == "lmms-eval":
-        _profile()
         from lmms_eval.tasks import TaskManager
 
         manager = TaskManager(model_name="modalix")
@@ -245,7 +225,7 @@ def run_vlm_accuracy(config):
                 write_results(output, report)
 
         try:
-            report["evaluator"] = _profile()
+            report["evaluator"] = _evaluator_info()
             report["evaluator"]["packages"] = dict(sorted(
                 (distribution.metadata["Name"], distribution.version)
                 for distribution in importlib.metadata.distributions() if distribution.metadata["Name"]

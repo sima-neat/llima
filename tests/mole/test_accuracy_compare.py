@@ -20,7 +20,7 @@ def make_run(path):
             "scored": 1, "failed": 0, "unsupported": 0, "not_run": 0, "truncated": 0}},
         "runtime": {"artifact_sha256": "artifact", "runtime": {"library_sha256": "runtime"}},
         "assets": {"files": {"tokenizer.json": "hash"}, "chat_template": "native"},
-        "evaluator": {"source_tree_sha256": "scorer", "python": "3.12", "machine": "x86"},
+        "evaluator": {"name": "lmms-eval", "version": "0.7.3", "python": "3.12", "machine": "x86"},
         "results": {"results": {"chartqa": {"relaxed_overall,none": 1.0}}},
     }
     answer = {"task": "chartqa", "doc_id": 0, "sample_id": "q1", "status": "ok",
@@ -126,7 +126,7 @@ def test_cli_dispatch(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("section,field", [
-    ("runtime", "artifact_sha256"), ("evaluator", "source_tree_sha256"),
+    ("runtime", "artifact_sha256"), ("evaluator", "version"),
     ("assets", "files"), ("results", "results"),
 ])
 def test_missing_identity_is_invalid(tmp_path, section, field):
