@@ -4,9 +4,9 @@ Install matching candidate runtime and MoLE packages using the existing installa
 
 Image accuracy uses the deployed model's native C++ chat template, image preprocessing and vision/language execution. Images travel inline as lossless RGB PNGs, so host paths never become DevKit paths. Generation tasks do not require compilation with `--return_logits`.
 
-## Validation status
+## Task support
 
-The initial targets are `realworldqa`, `docvqa_val` and `chartqa`, starting with a compiled Qwen3.5-2B VLM. Their unchanged upstream protocols/scoring have integration coverage and a six-sample Qwen3.5-2B smoke evaluation on a Neat 3.0 DevKit in both host-driven and DevKit-local modes. Answers, prompt/image hashes, token counts and metrics matched across modes. See [validation evidence](multimodal_accuracy_validation.md). Full-dataset accuracy has not been measured; these smoke scores must not be published as registry accuracy.
+The initial validated tasks are `realworldqa`, `docvqa_val` and `chartqa`, using a compiled Qwen3.5-2B VLM. Validation covers host-driven and DevKit-local execution. Task compatibility does not establish accuracy for every model or deployment configuration.
 
 Other upstream image tasks use the same adapter when their protocols fit, but TextVQA, OCRBench, MMMU, MMBench and MMStar are not yet validated support claims. Use individual upstream task names, rather than groups or wildcards. Run text and image tasks in separate invocations. Text accuracy continues to use lm-evaluation-harness, including existing HF host workflows. Performance benchmarking is separate.
 
