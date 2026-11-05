@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import re
+import time
 from pathlib import Path
 
 import msgpack
@@ -133,17 +134,29 @@ class MultimodalClient:
             raise RuntimeError(metadata["error"])
         if (metadata.get("tensor_dtype") != "utf8" or metadata.get("result_type") != request_type
             or metadata.get("tensor_shape") != [len(frames[1])]):
-            raise RuntimeError("Benchmark server does not support the image/text accuracy protocol")
+            raise RuntimeError("Benchmark server does not support the image/text benchmark protocol")
         return frames[1].decode("utf-8"), metadata
 
-    def info(self) -> dict:
+    def info(self, *, allow_speculative: bool = False) -> dict:
         result, _ = self.request("multimodal_info")
         info = json.loads(result)
         if info.get("protocol_version") != 1 or info.get("decoding") != "greedy":
             raise UnsupportedInput("Unsupported multimodal benchmark server version or decoding mode")
+        if info.get("speculative_decoding") and not allow_speculative:
+            raise UnsupportedInput("Image accuracy requires a non-speculative VLM")
         if self.max_context > info["max_num_tokens"]:
             raise UnsupportedInput("Requested context exceeds compiled model context")
         return info
+
+    def profile(self, messages: list[dict], settings: dict) -> dict:
+        started = time.perf_counter_ns()
+        payload, metadata = self.request(
+            "generate_multimodal_for_perf", json.dumps({"messages": messages}, ensure_ascii=False).encode(),
+            max_num_tokens=self.max_context, max_new_tokens=settings["max_new_tokens"],
+            enable_thinking=self.enable_thinking,
+        )
+        return {**metadata, **json.loads(payload),
+                "zmq_roundtrip_time_ns": time.perf_counter_ns() - started}
 
     def generate(self, messages: list[dict], settings: dict) -> tuple[str, dict]:
         answer, metadata = self.request(

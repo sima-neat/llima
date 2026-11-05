@@ -1,13 +1,17 @@
 import argparse
 from pathlib import Path
 
-from sima_lmm.mole.accuracy_compare import add_comparison_parser, run_comparison
+from sima_lmm.mole.modalixboard import ModalixBoard
+from sima_lmm.mole.perf_runner import PerformanceOptions
+from sima_lmm.mole.vlm_accuracy import AccuracyOptions
+from sima_lmm.mole.mole import perf_bench, prepare_mole, run
+from sima_lmm.mole.workloads import IMAGE_DATASETS
 
 def main():
     parser = argparse.ArgumentParser(description="LLM benchmark tool")
 
     common_parser = argparse.ArgumentParser(add_help=False)
-    common_parser.add_argument("model_id", type=str, help="Model ID")
+    common_parser.add_argument("model_id", type=str, help="Model/tokenizer for text workloads; run label for image workloads")
     common_parser.add_argument(
         "-n", "--num_samples", type=int,
         help="Number of samples to run. Run the full set if not specified"
@@ -43,7 +47,6 @@ def main():
         "--accuracy_manifest", type=Path,
         help="Image task dataset revisions/prepared local datasets (JSON)",
     )
-    acc_parser.add_argument("--model_revision", help="Tokenizer/processor repository revision for image accuracy")
     acc_parser.add_argument(
         "--max_new_tokens", type=int, default=None,
         help="Override upstream image-task output budgets; otherwise retain each task's generation settings",
@@ -72,19 +75,14 @@ def main():
         "--input_lengths", type=int, nargs="+",
         help="Exact input-token lengths to benchmark; omit for automatic buckets"
     )
-    perf_parser.add_argument("--dataset", choices=["bfcl-v3", "ifeval", "alpacaeval", "gsm8k", "dialogsum"],
+    perf_parser.add_argument("--dataset", choices=["bfcl-v3", "ifeval", "alpacaeval", "gsm8k", "dialogsum", *IMAGE_DATASETS],
                              help="Single-turn workload; runs the full dataset unless -n is specified")
-    add_comparison_parser(subparsers)
+    perf_parser.add_argument("--dataset_manifest", type=Path,
+                             help="Image dataset revisions/prepared local datasets (same format as --accuracy_manifest)")
     args = parser.parse_args()
-    if args.command == "compare-accuracy":
-        raise SystemExit(run_comparison(args))
 
-    from sima_lmm.mole.modalixboard import ModalixBoard
-    from sima_lmm.mole.perf_runner import PerformanceOptions
-    from sima_lmm.mole.vlm_accuracy import AccuracyOptions
-    from sima_lmm.mole.mole import perf_bench, prepare_mole, run
-
-    performance = PerformanceOptions(dataset=getattr(args, "dataset", None))
+    performance = PerformanceOptions(dataset=getattr(args, "dataset", None),
+                                     manifest=getattr(args, "dataset_manifest", None))
 
     # Create and validate mole config.
     board = None
@@ -110,7 +108,6 @@ def main():
         performance=performance,
         accuracy=AccuracyOptions(
             manifest=getattr(args, "accuracy_manifest", None),
-            model_revision=getattr(args, "model_revision", None),
             max_new_tokens=args.max_new_tokens if args.command == "accuracy" else None,
             enable_thinking=getattr(args, "enable_thinking", False),
         ),

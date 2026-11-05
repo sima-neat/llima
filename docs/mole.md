@@ -31,7 +31,7 @@ host:~$ source ~/sima-mole-venv/bin/activate
 
 For Modalix evaluation from a host, `--board_ip` is required. On a Modalix DevKit, omit it to use the local runtime. Provide `--board_model` when starting a server; local server logs are saved to `<output_dir>/server.log`. Use `--no-board_start_server` to attach to an existing server without starting or stopping it.
 
-MoLE provides the `llima-benchmark accuracy` and `llima-benchmark perf` subcommands. For Modalix, `<model_id>` accepts a HuggingFace model ID or a local tokenizer/config directory matching the deployed model. MoLE uses that tokenizer to prepare requests.
+MoLE provides the `llima-benchmark accuracy` and `llima-benchmark perf` subcommands. Text workloads use a HuggingFace model ID or local tokenizer/config directory matching the deployed model. Image workloads use the deployed VLM's assets; `<model_id>` labels the run.
 
 ### Accuracy Benchmarking
 
@@ -50,7 +50,7 @@ Evaluates model quality against standard tasks:
 
 | Argument | Description |
 |----|----|
-| `model_id` | HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). For `-b modalix`, this must match the deployed model's tokenizer/config. |
+| `model_id` | HuggingFace model ID or local tokenizer/config directory for text accuracy; a descriptive label for image accuracy. |
 | `-b` | Backend to use: `modalix` (run on board) or `hf` (run on host as reference baseline). |
 | `-t` | **Required.** One or more evaluation tasks. Example tasks: `hellaswag`, `triviaqa`, `piqa`, `winogrande`, `wikitext`. See the [task list](https://github.com/EleutherAI/lm-evaluation-harness/blob/v0.4.11/lm_eval/tasks/README.md) for all available tasks. |
 | `-o` | Output directory for benchmark results. |
@@ -80,19 +80,18 @@ For all available options, run `llima-benchmark accuracy -h`.
 The validated tasks are `realworldqa`, `docvqa_val` and `chartqa`, using Qwen3.5-2B on Modalix. The evaluator is installed with MoLE and uses the deployed VLM's native chat template and image preprocessing.
 
 ```bash
-llima-benchmark accuracy /data/qwen3.5-2b-assets -b modalix \
+llima-benchmark accuracy qwen3.5-2b -b modalix \
     -t realworldqa docvqa_val chartqa \
     --board_ip <devkit-address> --board_model <compiled-model-on-devkit> \
     --max_num_tokens 4096 -o results/vlm
 ```
 
-On the DevKit, omit `--board_ip` and use the compiled model directory as `model_id`. On a host, provide matching tokenizer/processor assets or a HuggingFace repository; model weights are not downloaded. Use matching runtime and MoLE releases.
+On the DevKit, omit `--board_ip`. No host model assets are needed. Use matching runtime and MoLE releases.
 
 | Image accuracy option | Description |
 |----|----|
 | `--max_new_tokens` | Override the task's output budget; otherwise retain its upstream default. |
 | `--enable_thinking` | Enable the model's native thinking template; disabled by default. |
-| `--model_revision` | Select the tokenizer/processor repository revision. |
 | `--accuracy_manifest` | Use pinned dataset revisions or prepared local datasets, as below. |
 
 Run text and image tasks separately, using individual task names. Image accuracy supports ordinary VLMs with greedy decoding. Audio/video, multi-turn, visual few-shot and repeated-request tasks are unsupported. Inputs plus the output budget must fit the requested and compiled context; inputs are not truncated. Multiple images retain their task-defined order. Native EOS stops generation; task string stops trim the returned answer.
@@ -114,26 +113,17 @@ Datasets download automatically. For pinned or offline evaluation, pass `--accur
 }
 ```
 
-Prepare local datasets with HuggingFace `DatasetDict.save_to_disk()`, preserving upstream columns, images and scoring splits. Paths are relative to the manifest, and its task names must match `-t`. Omit `local_path` to download the pinned revision. For offline runs, use local model assets and set `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1`.
+Prepare local datasets with HuggingFace `DatasetDict.save_to_disk()`, preserving upstream columns, images and scoring splits. Paths are relative to the manifest, and its task names must match `-t`. Omit `local_path` to download the pinned revision. For offline runs, set `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1`.
 
-#### Image accuracy results and comparison
+#### Image accuracy results
 
 The output directory contains:
 
-- `accuracy.json`: aggregate metrics, sample counts, dataset/model/runtime identities and settings.
+- `accuracy.json`: aggregate metrics, sample counts, dataset revisions, deployment path, runtime version and settings.
 - `accuracy-answers.jsonl`: generated answers, image/prompt identities, token counts, finish reasons and errors.
 - `accuracy-samples.jsonl`: upstream per-sample scoring results.
 
 Omitting `-n` runs the full dataset. Failures stop evaluation, preserve partial answers and produce no aggregate metrics. Output-budget truncations are counted and still scored.
-
-To check host/DevKit parity or repeatability, compare two completed runs made with the same artifacts, datasets and settings:
-
-```bash
-llima-benchmark compare-accuracy results/vlm-host results/vlm-local \
-    -o results/vlm-comparison.json
-```
-
-This compares identities, inputs, answers and scores exactly, ignoring execution mode, local paths and timings. Exit codes are `0` for a match, `1` for differences and `2` for invalid input. A matching smoke run does not establish full-dataset accuracy.
 
 ### Performance Benchmarking
 
@@ -150,7 +140,7 @@ Measures Time To First Token (TTFT) and Tokens Per Second (TPS) on a Modalix boa
 
 | Argument | Description |
 |----|----|
-| `model_id` | HuggingFace model ID (e.g., `meta-llama/Llama-3.2-3B-Instruct`). For Modalix performance runs, this should match the tokenizer/config for the deployed model. |
+| `model_id` | HuggingFace model ID or local tokenizer/config directory matching the deployed model for text workloads; a descriptive run label for image workloads. |
 | `-o` | Output directory for benchmark results. |
 | `--board_ip` | Remote board IP or host name. Required when running from a host; omit for local Modalix execution. |
 | `--board_model` | Compiled model directory on the DevKit. Required when starting a server. |
@@ -166,4 +156,16 @@ Use `--dataset bfcl-v3|ifeval|alpacaeval|gsm8k|dialogsum` for native chat/tool p
 
 `--board_model` determines ordinary or speculative decoding. Compare models with separate runs using the same dataset and settings, changing only `--board_model` and `-o`. Each run excludes one warmup and resets KV state before every request. The model's native chat template and EOS stopping apply. Dataset output budgets include the first token; existing buckets measure the first token plus `--max_new_tokens` decode steps.
 
-`-o` saves `performance.json` with timings, token counts, aggregate metrics, draft contribution, failures, benchmark settings and dataset sources. Decode TPS excludes TTFT; generation timings exclude input preparation and network transport. These workloads measure performance, not accuracy.
+#### Image-plus-text performance
+
+Use `--dataset realworldqa|docvqa_val|chartqa` to measure ordinary or speculative VLMs with the same upstream image/text prompts used for accuracy:
+
+```bash
+llima-benchmark perf qwen3.5-vlm --dataset chartqa \
+    --board_ip <devkit-address> --board_model <compiled-model-or-speculative-bundle> \
+    --max_num_tokens 4096 --max_new_tokens 256 -o results/vlm-perf
+```
+
+Omitting `-n` runs the full dataset once, after one excluded warmup. `--dataset_manifest` accepts the same pinned/local dataset format as `--accuracy_manifest`; its task name must match `--dataset`. Images retain their dataset resolution and use native runtime preprocessing. No host model assets are needed. Accuracy evaluation remains limited to ordinary decoding.
+
+`-o` saves `performance.json` with per-request timings, token counts, aggregate metrics, draft contribution, failures, benchmark settings and dataset sources. Decode TPS excludes TTFT. Image TTFT includes native image preprocessing and vision encoding; text TTFT starts at language prefill. Both exclude network transport and host dataset preparation. Draft contribution is accepted draft tokens divided by all generated tokens. These workloads measure performance, not accuracy.

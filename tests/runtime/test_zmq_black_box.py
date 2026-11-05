@@ -1,5 +1,6 @@
 import base64
 import json
+import math
 import os
 import platform
 import shutil
@@ -149,8 +150,11 @@ def test_zmq_image_text_generation_and_request_recovery(tmp_path):
         assert not info_metadata.get("error"), info_metadata
         identity = json.loads(body)
         assert identity["protocol_version"] == 1
-        assert len(identity["runtime"]["library_sha256"]) == 64
-        assert identity["files"]["devkit/tokenizer.json"]["sha256"]
+        assert identity["model_path"] == str(model)
+        assert identity["model_name"]
+        assert identity["runtime_version"]
+        assert identity["vlm_config.json"]["model_name"] == identity["model_name"]
+        assert identity["tokenizer_config.json"]
         assert identity.get("preprocessor_config.json") or identity.get("processor_config.json")
         budget = identity["max_num_tokens"]
 
@@ -180,6 +184,26 @@ def test_zmq_image_text_generation_and_request_recovery(tmp_path):
             assert metadata["finish_reason"] in ("stop", "length")
             assert len(metadata["prompt_sha256"]) == 64
             assert isinstance(metadata["raw_answer"], str)
+            prompt = json.dumps({"messages": [{"role": "user", "content": content}]}).encode()
+            for output_budget in (1, 8):
+                profile_metadata, profile_body = request(
+                    "generate_multimodal_for_perf", prompt,
+                    max_num_tokens=budget, max_new_tokens=output_budget, enable_thinking=False,
+                )
+                assert not profile_metadata.get("error"), profile_metadata
+                assert profile_metadata["result_type"] == "generate_multimodal_for_perf"
+                assert profile_metadata["tensor_dtype"] == "utf8"
+                assert profile_metadata["tensor_shape"] == [len(profile_body)]
+                profile = json.loads(profile_body)
+                assert profile["input_tokens"] == profile_metadata["input_tokens"] == metadata["input_tokens"]
+                assert profile["generated_tokens"] == profile_metadata["generated_tokens"]
+                assert 0 < profile["generated_tokens"] <= output_budget
+                assert profile["accepted_draft_tokens"] is None
+                assert len(profile["token_durations"]) == profile["generated_tokens"]
+                assert all(math.isfinite(value) and value > 0 for value in profile["token_durations"])
+                assert profile_metadata["finish_reason"] in ("stop", "length")
+                if profile_metadata["finish_reason"] == "length":
+                    assert profile["generated_tokens"] == output_budget
 
         client.send(b"stop")
         process.wait(timeout=30)

@@ -3,21 +3,19 @@
 import copy
 import importlib.metadata
 import json
-import platform
 import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from sima_lmm.mole.multimodal import (
-    MultimodalClient, UnsupportedInput, file_identity, generation_settings, tree_identity,
+    MultimodalClient, UnsupportedInput, generation_settings, tree_identity,
 )
 
 
 @dataclass(frozen=True)
 class AccuracyOptions:
     manifest: Path | None = None
-    model_revision: str | None = None
     max_new_tokens: int | None = None
     enable_thinking: bool = False
 
@@ -52,18 +50,10 @@ def choose_evaluator(tasks: list[str], text_manager, backend: str) -> str:
         kinds.append("lmms-eval" if cfg.get("doc_to_image") is not None else "lm-eval")
     if len(set(kinds)) > 1:
         raise UnsupportedInput("Run text and image tasks in separate accuracy invocations")
-    if kinds and kinds[0] == "lmms-eval":
-        from lmms_eval.tasks import TaskManager
-
-        manager = TaskManager(model_name="modalix")
-        unknown = set(tasks) - set(manager.all_subtasks)
-        if unknown:
-            raise UnsupportedInput(f"Unknown image tasks (use individual upstream task names): {sorted(unknown)}")
-        return "lmms-eval"
-    return "lm-eval"
+    return kinds[0] if kinds else "lm-eval"
 
 
-def _manifest(options: AccuracyOptions) -> tuple[dict, Path]:
+def _manifest(options) -> tuple[dict, Path]:
     if options.manifest is None:
         return {}, Path.cwd()
     path = options.manifest.resolve()
@@ -75,17 +65,22 @@ def _manifest(options: AccuracyOptions) -> tuple[dict, Path]:
     return manifest["tasks"], path.parent
 
 
-def _tasks(config, report: dict):
+def _tasks(config, report: dict, options=None, task_names=None):
     from huggingface_hub import HfApi
     from lmms_eval.api.task import ConfigurableTask
     from lmms_eval.tasks import TaskManager
 
+    options = options or config.accuracy
+    task_names = config.tasks if task_names is None else task_names
     manager = TaskManager(model_name="modalix")
-    declarations, root = _manifest(config.accuracy)
-    if declarations and set(declarations) != set(config.tasks):
+    unknown = set(task_names) - set(manager.all_subtasks)
+    if unknown:
+        raise UnsupportedInput(f"Unknown image tasks (use individual upstream task names): {sorted(unknown)}")
+    declarations, root = _manifest(options)
+    if declarations and set(declarations) != set(task_names):
         raise UnsupportedInput("Accuracy manifest tasks must exactly match the requested tasks")
     tasks = {}
-    for name in config.tasks:
+    for name in task_names:
         # This pinned upstream API resolves includes/functions before dataset loading.
         task_config = copy.deepcopy(manager._get_config(name))
         if (task_config.get("output_type", "generate_until") != "generate_until"
@@ -127,51 +122,10 @@ def _tasks(config, report: dict):
             raise UnsupportedInput(f"{name}: scoring split is empty")
         source.update(rows=count, fingerprint=task.dataset[split]._fingerprint,
                       selected=min(count, config.limit) if config.limit is not None else count)
-        source["selected_sample_ids"] = []
-        for index in range(source["selected"]):
-            doc = task.dataset_no_image[split][index]
-            sample_id = next((doc[key] for key in ("question_id", "questionId", "id", "image_id")
-                              if key in doc), index)
-            source["selected_sample_ids"].append({"doc_id": index, "sample_id": sample_id})
         # The upstream config may add delimiter stops during initialization.
-        generation_settings(task.config.generation_kwargs, config.accuracy.max_new_tokens)
-        source["task_config"] = task.dump_config()
+        generation_settings(task.config.generation_kwargs, getattr(options, "max_new_tokens", None))
         tasks[name] = task
     return tasks
-
-
-def _assets(config, runtime: dict) -> dict:
-    """Check prepared/remote tokenizer and processor files against the deployed VLM."""
-    from huggingface_hub import snapshot_download
-
-    model = Path(config.model_id)
-    revision = config.accuracy.model_revision
-    if not model.is_dir():
-        from huggingface_hub import HfApi
-
-        revision = HfApi().model_info(config.model_id, revision=revision).sha
-        model = Path(snapshot_download(
-            config.model_id, revision=revision,
-            allow_patterns=["*.json", "*.jinja", "*.model", "*.txt"],
-        ))
-    if (model / "devkit").is_dir():
-        model = model / "devkit"
-    identities = {}
-    for name, expected in runtime["files"].items():
-        filename = Path(name).name
-        if not name.startswith("devkit/") or not (
-            filename.startswith(("tokenizer", "chat_template", "processor", "preprocessor"))
-            or filename in ("vocab.json", "merges.txt", "special_tokens_map.json", "generation_config.json")
-        ):
-            continue
-        local = model / filename
-        if not local.is_file() or file_identity(local) != expected:
-            raise UnsupportedInput(f"Tokenizer/processor asset does not match deployed artifact: {filename}")
-        identities[filename] = expected
-    if "tokenizer.json" not in identities or "tokenizer_config.json" not in identities:
-        raise UnsupportedInput("Image evaluation requires matching tokenizer JSON assets")
-    return {"model_id": config.model_id, "revision": revision, "files": identities,
-            "chat_template": "deployed native template (including compiled override, if any)"}
 
 
 def _counts(report, records):
@@ -197,7 +151,8 @@ def run_vlm_accuracy(config):
 
     from sima_lmm.mole.perf_runner import write_results
 
-    report = {"schema_version": 1, "status": "starting", "evaluator": {}, "datasets": {},
+    report = {"schema_version": 1, "status": "starting", "model_id": config.model_id,
+              "evaluator": {}, "datasets": {},
               "settings": {"max_num_tokens": config.max_num_tokens,
                            "max_new_tokens_override": config.accuracy.max_new_tokens,
                            "enable_thinking": config.accuracy.enable_thinking,
@@ -226,23 +181,15 @@ def run_vlm_accuracy(config):
 
         try:
             report["evaluator"] = _evaluator_info()
-            report["evaluator"]["packages"] = dict(sorted(
-                (distribution.metadata["Name"], distribution.version)
-                for distribution in importlib.metadata.distributions() if distribution.metadata["Name"]
-            ))
-            report["evaluator"].update(python=platform.python_version(), machine=platform.machine())
             random.seed(config.random_seed)
             np.random.seed(config.random_seed)
             torch.manual_seed(config.random_seed)
             tasks = _tasks(config, report)
-            for task in tasks.values():
-                task.set_fewshot_seed(config.random_seed)
             if config.do_start_server:
                 config.board.start_server(log_path=config.output_path / "server.log")
                 started = True
             client = MultimodalClient(config.board, config.max_num_tokens, config.accuracy.enable_thinking)
             report["runtime"] = client.info()
-            report["assets"] = _assets(config, report["runtime"])
             from lmms_eval.evaluator import simple_evaluate
             from sima_lmm.mole.lmms_adapter import ModalixMultimodalLM
 

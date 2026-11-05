@@ -106,7 +106,8 @@ class VisionLanguageModel : public BaseModel<VlmConfig> {
             const Chat& chat,
             std::optional<uint16_t> max_new_tokens,
             std::optional<uint16_t> strict_max_context = std::nullopt,
-            PreprocessedChat* prepared = nullptr
+            PreprocessedChat* prepared = nullptr,
+            GenerationPerformanceResult* performance_result = nullptr
         );
         std::string_view model_type() const { return _cfg.model_type; }
         std::optional<std::vector<uint32_t>> _run_language_model(

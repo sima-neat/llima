@@ -333,6 +333,7 @@ target_compile_definitions(
     ${TARGET_RUNTIME}
     PRIVATE
         SIMA_LMM_DEFAULT_ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/sima_lmm/assets"
+        SIMA_LMM_PACKAGE_VERSION="${SIMA_LMM_PACKAGE_VERSION}"
 )
 
 target_compile_options(
@@ -366,7 +367,6 @@ target_link_libraries(
     PRIVATE
         OpenMP::OpenMP_CXX
         OpenSSL::Crypto
-        ${CMAKE_DL_LIBS}
         PkgConfig::FFTW3
         cnpy-static
         ${SIMA_LMM_HEAP_LIBRARY}

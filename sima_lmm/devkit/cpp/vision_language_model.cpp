@@ -75,7 +75,8 @@ std::optional<std::string> VisionLanguageModel::run_model(
 
 std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_chat_model(
     const Chat& chat, std::optional<uint16_t> max_new_tokens,
-    std::optional<uint16_t> strict_max_context, PreprocessedChat* prepared
+    std::optional<uint16_t> strict_max_context, PreprocessedChat* prepared,
+    GenerationPerformanceResult* performance_result
 ) {
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
@@ -128,22 +129,14 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_chat_model(
             throw std::invalid_argument(
                 "Image/text prompt plus output budget exceeds context; no truncation applied"
             );
-        size_t image_count = 0;
-        for (const auto& message : chat.get_messages()) {
-            const auto& content = message.at("content");
-            if (content.is_array()) {
-                for (const auto& item : content)
-                    image_count += item.at("type") == "image";
-            }
-        }
-        if (preprocessed_data.image_tensors.size() != image_count)
-            throw std::invalid_argument("The chat template did not preserve all image inputs");
         // Each evaluation sample starts from an empty prompt cache.
         _language_model_ptr->clear_cached_token_ids();
+        if (_draft_vlm_ptr != nullptr)
+            _draft_vlm_ptr->_language_model_ptr->clear_cached_token_ids();
         _text_streamer.enable();
     }
     if (strict_max_context.has_value())
-        _logger->info("Accuracy prompt: {} input tokens, {} images",
+        _logger->info("Benchmark prompt: {} input tokens, {} images",
             preprocessed_data.input_token_ids.size(), preprocessed_data.image_tensors.size());
     else
         _logger->info("Formatted prompt: {}", preprocessed_data.formatted_prompt);
@@ -172,7 +165,7 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_chat_model(
 
     auto output_token_ids = _run_language_model(
         preprocessed_data.input_token_ids, max_num_tokens, timer_ttft,
-        nullptr, preprocessed_data.stable_prefix_token_count
+        performance_result, preprocessed_data.stable_prefix_token_count
     );
 
     if (prepared != nullptr)

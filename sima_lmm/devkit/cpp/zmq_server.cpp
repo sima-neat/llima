@@ -1,8 +1,5 @@
 #include <array>
-#include <algorithm>
 #include <fstream>
-#include <sstream>
-#include <dlfcn.h>
 #include <openssl/evp.h>
 
 #include <fmt/ranges.h>
@@ -14,35 +11,17 @@ namespace simaai {
 namespace llima {
 
 namespace {
-std::string sha256(std::istream& stream) {
-    auto context = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>(
-        EVP_MD_CTX_new(), EVP_MD_CTX_free
-    );
-    if (!context || EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1)
-        throw std::runtime_error("Cannot initialize artifact hashing");
-    std::array<char, 1024 * 1024> buffer;
-    while (stream.read(buffer.data(), buffer.size()) || stream.gcount()) {
-        if (EVP_DigestUpdate(context.get(), buffer.data(), stream.gcount()) != 1)
-            throw std::runtime_error("Cannot hash artifact");
-    }
-    if (stream.bad())
-        throw std::runtime_error("Cannot read artifact for hashing");
+std::string sha256(const std::string& text) {
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest;
     unsigned int size = 0;
-    if (EVP_DigestFinal_ex(context.get(), digest.data(), &size) != 1)
-        throw std::runtime_error("Cannot finalize artifact hash");
+    if (EVP_Digest(text.data(), text.size(), digest.data(), &size, EVP_sha256(), nullptr) != 1)
+        throw std::runtime_error("Cannot hash formatted prompt");
     std::string result;
     for (size_t i = 0; i < size; ++i)
         result += fmt::format("{:02x}", digest[i]);
     return result;
 }
 
-std::string hash_file(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-        throw std::runtime_error("Cannot open artifact for hashing: " + path.string());
-    return sha256(file);
-}
 }  // namespace
 
 
@@ -50,46 +29,30 @@ std::string ZMQServer::_multimodal_info() {
     if (_multimodal_identity.has_value())
         return _multimodal_identity.value();
     auto& model = *_vision_language_model_ptr;
-    if (!model.support_image() || _vision_language_draft_model_ptr != nullptr)
-        throw std::invalid_argument("Image accuracy requires a non-speculative VLM");
+    if (!model.support_image())
+        throw std::invalid_argument("Image benchmarking requires a VLM");
     nlohmann::ordered_json info = {
         {"protocol_version", 1}, {"model_type", model._cfg.model_type},
+        {"model_name", model._cfg.model_name}, {"model_path", _model_path.string()},
+        {"runtime_version", SIMA_LMM_PACKAGE_VERSION},
         {"max_num_tokens", model._cfg.pipeline_cfg.max_num_tokens},
         {"decoding", "greedy"}, {"image_transport", "lossless-png"},
-        {"multi_image", true}, {"files", nlohmann::ordered_json::object()}
+        {"multi_image", true},
+        {"speculative_decoding", _vision_language_draft_model_ptr != nullptr},
+        {"speculative_method", model._cfg.lm_cfg.speculative_decoding_cfg
+            ? nlohmann::ordered_json(model._cfg.lm_cfg.speculative_decoding_cfg->method)
+            : nlohmann::ordered_json(nullptr)}
     };
-    std::vector<std::filesystem::path> files;
-    for (const auto& dir : {"devkit", "elf_files"}) {
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(_model_path / dir)) {
-            if (entry.is_regular_file())
-                files.push_back(entry.path());
-        }
-    }
-    std::sort(files.begin(), files.end());
-    for (const auto& file : files) {
-        const auto name = file.lexically_relative(_model_path).generic_string();
-        info["files"][name] = {
-            {"sha256", hash_file(file)}, {"bytes", std::filesystem::file_size(file)}
-        };
-    }
-    std::istringstream artifact_manifest(info["files"].dump());
-    info["artifact_sha256"] = sha256(artifact_manifest);
-    for (const auto& name : {"vlm_config.json", "preprocessor_config.json", "processor_config.json"}) {
+    if (_vision_language_draft_model_ptr != nullptr)
+        info["draft_model_name"] = _vision_language_draft_model_ptr->_cfg.model_name;
+    for (const auto& name : {"vlm_config.json", "preprocessor_config.json", "processor_config.json",
+                             "tokenizer_config.json"}) {
         const auto file = _model_path / "devkit" / name;
         if (std::filesystem::is_regular_file(file)) {
             std::ifstream input(file);
             info[name] = nlohmann::ordered_json::parse(input);
         }
     }
-    Dl_info library{};
-    if (dladdr(reinterpret_cast<void*>(&hash_file), &library) == 0 || !library.dli_fname)
-        throw std::runtime_error("Cannot identify the loaded LLiMa runtime");
-    info["runtime"] = {{"library_sha256", hash_file(library.dli_fname)}};
-    std::ifstream buildinfo("/etc/buildinfo");
-    if (buildinfo)
-        info["runtime"]["platform_buildinfo"] = std::string(
-            std::istreambuf_iterator<char>(buildinfo), std::istreambuf_iterator<char>()
-        );
     _multimodal_identity = info.dump();
     return _multimodal_identity.value();
 }
@@ -97,12 +60,15 @@ std::string ZMQServer::_multimodal_info() {
 
 std::string ZMQServer::_generate_multimodal(
     const ZMQRequestMetadata& metadata, const std::string& payload,
-    ZMQResponseMetadata& response
+    ZMQResponseMetadata& response, bool for_performance
 ) {
     _multimodal_info();  // Validate capabilities before handling any images.
+    const bool speculative = _vision_language_draft_model_ptr != nullptr;
+    if (speculative && !for_performance)
+        throw std::invalid_argument("Image accuracy requires a non-speculative VLM");
     if (!metadata.max_num_tokens || !metadata.max_new_tokens
         || metadata.max_new_tokens.value() == 0 || metadata.stop_token_ids)
-        throw std::invalid_argument("Image accuracy requires context/output limits and native stop tokens");
+        throw std::invalid_argument("Image benchmarking requires context/output limits and native stop tokens");
     const auto request = nlohmann::ordered_json::parse(payload);
     if (!request.is_object() || request.size() != 1 || !request.contains("messages"))
         throw std::invalid_argument("Expected a messages object");
@@ -136,7 +102,7 @@ std::string ZMQServer::_generate_multimodal(
         }
     }
     if (!image_count)
-        throw std::invalid_argument("Image accuracy requires at least one image");
+        throw std::invalid_argument("Image benchmarking requires at least one image");
     auto& model = *_vision_language_model_ptr;
     auto chat = model.create_chat();
     auto effective_messages = messages;
@@ -153,6 +119,8 @@ std::string ZMQServer::_generate_multimodal(
         std::string finish_reason;
         std::string raw;
         std::string answer;
+        double ttft = 0.0;
+        GenerationPerformanceResult performance;
         ReasoningStreamParser parser;
         GenerationState(ReasoningFormat format, bool thinking) : parser(format, thinking) {}
     };
@@ -160,15 +128,22 @@ std::string ZMQServer::_generate_multimodal(
     auto state = std::make_shared<GenerationState>(
         reasoning_format_for_model(model._cfg.model_type), metadata.enable_thinking
     );
-    model.set_info_callback([state](const std::string& event, double) {
-        if (event == "ttft" || event == "tps")
+    model.set_info_callback([state, for_performance, speculative](const std::string& event, double value) {
+        if (event == "ttft" || event == "tps") {
             ++state->tokens;
-        else if (event == "END")
+            if (event == "ttft")
+                state->ttft = value;
+            // Ordinary generation already reports one native timing per output token.
+            if (for_performance && !speculative)
+                state->performance.token_durations.push_back(event == "ttft" ? value : 1.0 / value);
+        } else if (event == "END")
             state->finish_reason = "stop";
         else if (event == "FULL")
             state->finish_reason = "length";
     });
-    model.set_text_callback([state](const std::string& text, bool end, bool from_draft) {
+    model.set_text_callback([state, for_performance](const std::string& text, bool end, bool from_draft) {
+        if (for_performance)
+            return;
         state->raw += text;
         for (const auto& event : state->parser.add(text, end, from_draft)) {
             if (!event.reasoning)
@@ -176,7 +151,8 @@ std::string ZMQServer::_generate_multimodal(
         }
     });
     auto tokens = model._run_chat_model(
-        chat, metadata.max_new_tokens, metadata.max_num_tokens, &prepared
+        chat, metadata.max_new_tokens, metadata.max_num_tokens, &prepared,
+        for_performance && speculative ? &state->performance : nullptr
     );
     if (!tokens)
         throw std::runtime_error("Image generation was interrupted");
@@ -184,8 +160,28 @@ std::string ZMQServer::_generate_multimodal(
     response.generated_tokens = state->tokens;
     response.finish_reason = state->finish_reason;
     response.raw_answer = state->raw;
-    std::istringstream prompt(prepared.formatted_prompt);
-    response.prompt_sha256 = sha256(prompt);
+    response.prompt_sha256 = sha256(prepared.formatted_prompt);
+    if (for_performance) {
+        auto& result = state->performance;
+        if (!speculative)
+            result.generated_tokens = state->tokens;
+        if (result.token_durations.empty() || result.generated_tokens != state->tokens
+            || result.generated_tokens != result.token_durations.size()
+            || result.generated_tokens > metadata.max_new_tokens.value())
+            throw std::runtime_error("Runtime returned an invalid image generation profile");
+        // Gemma MTP's internal first timing covers prefill; the native TTFT event
+        // also includes image preprocessing and encoding, as for ordinary VLMs.
+        result.token_durations.front() = state->ttft;
+        response.accepted_draft_tokens = result.accepted_draft_tokens;
+        return nlohmann::ordered_json{
+            {"token_durations", result.token_durations},
+            {"input_tokens", prepared.input_token_ids.size()},
+            {"generated_tokens", result.generated_tokens},
+            {"accepted_draft_tokens", result.accepted_draft_tokens
+                ? nlohmann::ordered_json(*result.accepted_draft_tokens)
+                : nlohmann::ordered_json(nullptr)}
+        }.dump();
+    }
     return state->answer;
 }
 
@@ -273,11 +269,13 @@ void ZMQServer::run() {
                 );
                 auto request_metadata = handle.get().as<ZMQRequestMetadata>();
                 if (request_metadata.type == "multimodal_info"
-                    || request_metadata.type == "generate_multimodal") {
+                    || request_metadata.type == "generate_multimodal"
+                    || request_metadata.type == "generate_multimodal_for_perf") {
                     auto result = request_metadata.type == "multimodal_info"
                         ? _multimodal_info()
                         : _generate_multimodal(
-                            request_metadata, request_messages[1].to_string(), response_metadata
+                            request_metadata, request_messages[1].to_string(), response_metadata,
+                            request_metadata.type == "generate_multimodal_for_perf"
                         );
                     response_metadata.tensor_dtype = "utf8";
                     response_metadata.tensor_shape = {result.size()};

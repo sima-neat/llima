@@ -125,3 +125,39 @@ def load_workload(dataset: str, limit: int | None = None):
     return rows[:limit], {"name": dataset, "sources": sources,
                          "selection": "all" if limit is None else "category_interleaved" if dataset == "bfcl-v3" else "first_n",
                          "available_samples": len(rows)}
+
+
+IMAGE_DATASETS = ("realworldqa", "docvqa_val", "chartqa")
+
+
+def load_image_workload(config):
+    """Reuse accuracy task prompts and prepared data without running scoring."""
+    from sima_lmm.mole.vlm_accuracy import _tasks
+
+    name = config.performance.dataset
+    if name not in IMAGE_DATASETS:
+        raise ValueError(f"Unknown image workload: {name}")
+    report = {"datasets": {}}
+    task = _tasks(config, report, options=config.performance, task_names=[name])[name]
+    task.set_fewshot_seed(config.random_seed)
+    task.build_all_requests(limit=config.limit)
+
+    def samples():
+        for request in task.instances:
+            yield {"id": f"{name}:{request.doc_id}", "category": name,
+                   "request": request.args, "dataset": task.dataset}
+
+    source = report["datasets"][name]
+    return samples(), {"name": name, "sources": [source],
+                       "selection": "all" if config.limit is None else "first_n",
+                       "available_samples": source["rows"]}
+
+
+def prepare_image_sample(sample):
+    """Encode only the current request's images, preserving upstream order."""
+    from sima_lmm.mole.multimodal import ordered_content
+
+    context, _, doc_to_visual, doc_id, _, split = sample["request"]
+    doc = sample["dataset"][split][doc_id]
+    content, images = ordered_content(context, doc_to_visual(doc))
+    return [{"role": "user", "content": content}], images

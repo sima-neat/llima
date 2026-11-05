@@ -77,7 +77,7 @@ class EXPORT ZMQServer {
         std::string _multimodal_info();
         std::string _generate_multimodal(
             const ZMQRequestMetadata& metadata, const std::string& payload,
-            ZMQResponseMetadata& response
+            ZMQResponseMetadata& response, bool for_performance = false
         );
         std::filesystem::path _model_path;
         std::optional<std::string> _multimodal_identity;

@@ -1008,7 +1008,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         return std::nullopt;
     }
 
-    if (cache_full) {
+    if (cache_full || (!stopped && input_ids.size() >= max_length)) {
         _notify_cache_full();
     } else {
         _notify_stop();

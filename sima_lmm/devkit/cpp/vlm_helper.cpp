@@ -199,7 +199,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         }
 
         // Preprocess images.
-        if (chat.get_images().size() == 0 && num_images > 0) {
+        if (chat.get_images().empty()) {
             // Images are embedded in the messages.
             for (const auto& message: chat.get_messages()) {
                 const auto& content = message.at("content");

@@ -26,6 +26,8 @@ from sima_lmm.mole.modalixlm import HuggingFaceLM, ModalixLM
 from sima_lmm.mole.utils import make_table
 from sima_lmm.mole.perf_runner import PerformanceOptions, run_performance, write_results
 from sima_lmm.mole.vlm_accuracy import AccuracyOptions, choose_evaluator, run_vlm_accuracy
+from sima_lmm.mole.multimodal import MultimodalClient
+from sima_lmm.mole.workloads import IMAGE_DATASETS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,19 +142,6 @@ def prepare_mole(
         logger.error("Unsupported backend: {}", backend)
         return None
 
-    if not Path(model_id).is_dir():
-        hfapi = huggingface_hub.HfApi()
-        try:
-            info = hfapi.model_info(
-                model_id, revision=performance.model_revision if do_perf else accuracy.model_revision
-            )
-            if do_perf:
-                performance = dataclasses.replace(performance, model_revision=info.sha)
-        except huggingface_hub.errors.RepositoryNotFoundError as e:
-            logger.error(f"Invalid model_id: {model_id}")
-            logger.error(traceback.format_exception(e))
-            return None
-
     if not do_perf and not tasks:
         logger.error("No tasks is specified")
         return None
@@ -192,6 +181,17 @@ def prepare_mole(
                 raise ValueError("Image tasks must be unique, with a positive sample limit and context in [1, 65535]")
         except (ValueError, ImportError) as exc:
             logger.error(str(exc))
+            return None
+
+    if evaluator != "lmms-eval" and performance.dataset not in IMAGE_DATASETS and not Path(model_id).is_dir():
+        hfapi = huggingface_hub.HfApi()
+        try:
+            info = hfapi.model_info(model_id, revision=performance.model_revision)
+            if do_perf:
+                performance = dataclasses.replace(performance, model_revision=info.sha)
+        except huggingface_hub.errors.RepositoryNotFoundError as e:
+            logger.error(f"Invalid model_id: {model_id}")
+            logger.error(traceback.format_exception(e))
             return None
 
     if output_path is None:
@@ -248,11 +248,14 @@ def _benchmark_model(config: Config):
             if config.do_start_server:
                 config.board.start_server(log_path=config.output_path / "server.log")
                 started_server = True
-            lm = ModalixLM(
-                board=config.board, pretrained=config.model_id, batch_size=config.batch_size,
-                max_length=config.max_num_tokens, device="cpu" if config.do_perf else config.device,
-                revision=config.performance.model_revision or "main",
-            )
+            if config.do_perf and config.performance.dataset in IMAGE_DATASETS:
+                lm = MultimodalClient(config.board, config.max_num_tokens)
+            else:
+                lm = ModalixLM(
+                    board=config.board, pretrained=config.model_id, batch_size=config.batch_size,
+                    max_length=config.max_num_tokens, device="cpu" if config.do_perf else config.device,
+                    revision=config.performance.model_revision or "main",
+                )
         else:
             lm = HuggingFaceLM(
                 pretrained=config.model_id, batch_size=config.batch_size,
@@ -265,8 +268,11 @@ def _benchmark_model(config: Config):
                 config.board.stop_server()
         finally:
             if config.backend == "modalix" and lm is not None:
-                lm.zmq_socket.close(linger=0)
-                lm.zmq_context.term()
+                if isinstance(lm, MultimodalClient):
+                    lm.close()
+                else:
+                    lm.zmq_socket.close(linger=0)
+                    lm.zmq_context.term()
 
 
 def run(config: Config) -> dict[str, Any]:
