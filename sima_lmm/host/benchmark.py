@@ -1,10 +1,7 @@
 import argparse
 from pathlib import Path
 
-from sima_lmm.mole.modalixboard import ModalixBoard
-from sima_lmm.mole.perf_runner import PerformanceOptions
-from sima_lmm.mole.vlm_accuracy import AccuracyOptions
-from sima_lmm.mole.mole import perf_bench, prepare_mole, run
+from sima_lmm.mole.accuracy_compare import add_comparison_parser, run_comparison
 
 def main():
     parser = argparse.ArgumentParser(description="LLM benchmark tool")
@@ -77,7 +74,16 @@ def main():
     )
     perf_parser.add_argument("--dataset", choices=["bfcl-v3", "ifeval", "alpacaeval", "gsm8k", "dialogsum"],
                              help="Single-turn workload; runs the full dataset unless -n is specified")
+    add_comparison_parser(subparsers)
     args = parser.parse_args()
+    if args.command == "compare-accuracy":
+        raise SystemExit(run_comparison(args))
+
+    from sima_lmm.mole.modalixboard import ModalixBoard
+    from sima_lmm.mole.perf_runner import PerformanceOptions
+    from sima_lmm.mole.vlm_accuracy import AccuracyOptions
+    from sima_lmm.mole.mole import perf_bench, prepare_mole, run
+
     performance = PerformanceOptions(dataset=getattr(args, "dataset", None))
 
     # Create and validate mole config.

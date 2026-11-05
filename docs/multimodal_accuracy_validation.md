@@ -29,4 +29,40 @@ The existing text-only GSM8K path completed one generation sample through lm-eva
 
 The isolated DevKit evaluator installation passed `pip check` and 22 tests. The final host suite, including the real task-manager routing regression, passed 23 tests. The profile uses the pinned upstream evaluator and excludes unrelated audio/video/model backends.
 
-Full-dataset runs, system-installed runtime acceptance and individual validation of TextVQA, OCRBench, MMMU, MMBench and MMStar remain outstanding. Sampling, visual few-shot examples, multiround protocols and audio/video are explicitly unsupported.
+## Full-dataset RealWorldQA validation
+
+Subsequent DevKit-local runs used all 765 samples from the RealWorldQA revision
+and split above, context 4096, non-thinking greedy decoding, a 16-token output
+budget and unchanged upstream scoring. Both models used fixed 448 × 448 native
+image processing. The candidate runtime was installed system-wide as
+`0.6.0+codex.mole.vlm.accuracy.4a2f249`; its library hash matched the value above.
+System-installed single/multi-image request and recovery acceptance also passed.
+
+| Artifact | Correct / scored | Exact-match accuracy | Truncated |
+| --- | --- | --- | --- |
+| Packaged Qwen3.5-2B AutoRound A16W4, revision above | 451 / 765 | 58.95% | 3 |
+| Original Qwen3.5-2B compiled in BF16 | 462 / 765 | 60.39% | 0 |
+
+Both runs answered and scored all selected samples, with zero failed,
+unsupported or not-run samples. Truncated answers remained in scoring. The BF16
+source was `Qwen/Qwen3.5-2B@15852e8c16360a2fea060d615a32b45270f8a8fc`.
+All 119 compiler units declared BF16 precision; embedding and KV-cache
+quantization were disabled. Compilation used Model SDK 3.0.0, Frontend
+`3.0.0.dev0+master.396`, MLC `3.0.0.dev0+master.189` and LLiMa branch source
+at `b65ef8c4fafffa40f96e982fbf717dbcb5177cdb`.
+
+Across all 765 samples, selected IDs, ordered image/text descriptors, generation
+settings, native prompt hashes and input token counts matched. The two-sample
+BF16 pilot also matched the captured native image tensors and the original
+PyTorch BF16 answers. This does not establish numerical equivalence over the
+full dataset. BF16 host/local parity has not been repeated.
+
+These scores are regression baselines for the recorded deployments. They do
+not reproduce Qwen's published evaluation protocol. Release image processing,
+prompt and sampling details remain unverified, and compiler provenance differs
+between the two deployed artifacts. The score difference cannot be attributed
+solely to quantization.
+
+Individual validation of TextVQA, OCRBench, MMMU, MMBench and MMStar remains
+outstanding. Sampling, visual few-shot examples, multiround protocols and
+audio/video are explicitly unsupported.

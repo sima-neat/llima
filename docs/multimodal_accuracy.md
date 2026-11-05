@@ -97,3 +97,38 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
 ```
 
 Runtime tests require installed candidate packages and real Modalix hardware, following [Test Suites](../tests/README.md). The wire/scoring tests do not substitute for image-grounded hardware validation.
+
+## Compare two accuracy runs
+
+Use this command to compare completed VLM accuracy runs:
+
+```bash
+llima-benchmark compare-accuracy results/vlm-host results/vlm-local \
+  --output results/vlm-comparison.json
+```
+
+The command reads the three accuracy export files from each directory. It does
+not start a server or run inference. The output file contains the comparison
+status and all differences. Each difference identifies the field and sample,
+where applicable. The console shows a maximum of 20 differences.
+
+The command compares these values exactly:
+
+- Dataset revisions, splits, file hashes, fingerprints and selected sample IDs.
+- Task configuration, scorer source identity and generation settings.
+- Compiled artifact, runtime library, platform and tokenizer/processor identities.
+- Ordered text/image descriptors, image hashes, prompt hashes and generated answers.
+- Input/output token counts, finish reasons, sample counts and upstream scores.
+- Upstream targets, filtered predictions, document hashes and per-sample metrics.
+
+The command ignores execution mode, endpoint, timing, local model/dataset paths,
+evaluator Python version, host architecture and installed Python package lists.
+It removes process memory addresses from task function descriptions. Function
+names and the scorer source hash must still match. It matches answer and scoring
+rows by task and document ID. JSONL row order does not affect the result.
+
+Exit codes are `0` for a match, `1` for differences and `2` for invalid input or
+an output write error. Incomplete runs, duplicate samples, missing exports and
+inconsistent sample counts are invalid. Completed smoke runs can be compared;
+a match does not establish full-dataset accuracy. No numeric tolerance or
+regression threshold is applied. The command does not modify input exports.
