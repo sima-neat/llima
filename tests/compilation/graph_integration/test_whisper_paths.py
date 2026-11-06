@@ -236,6 +236,12 @@ def test_whisper_sima_matches_huggingface(whisper_source, tmp_path, model_class,
     config = {"precision": FileGenPrecision.A_BF16_W_INT8}
     model.gen_files(FileGenMode.SOURCE_TO_FP, layer_cfg=config, log_level=logging.WARNING)
     net = load_awesomenet("whisper.fp32.sima", str(model.sima_model_sdk_path))
+    if isinstance(model, WhisperDecoderCacheModel):
+        cache_input_names = ["input", "cached_keys"]
+        if model.use_future_token_mask and model.num_tokens == 1:
+            cache_input_names.append("attn_mask")
+        cache_input_names.append("cached_values")
+        assert net.input_node_names == cache_input_names
     input_shapes = {
         name: get_expected_tensor_value(net.nodes[name].get_type().output).shape
         for name in net.input_node_names
@@ -263,6 +269,8 @@ def test_whisper_sima_matches_huggingface(whisper_source, tmp_path, model_class,
         config = {"precision": FileGenPrecision.BF16 if direct else FileGenPrecision.A_BF16_W_INT8}
         model.gen_files(mode, layer_cfg=config, log_level=logging.WARNING)
         net = load_awesomenet("whisper.sima", str(model.sima_model_sdk_path))
+        if isinstance(model, WhisperDecoderCacheModel):
+            assert net.input_node_names == cache_input_names
         quant_inputs = {
             name: value.astype(activation_dtype(not direct)) for name, value in inputs.items()
         }
