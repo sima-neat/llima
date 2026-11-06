@@ -15,17 +15,20 @@ from huggingface_hub.errors import RemoteEntryNotFoundError
 from loguru import logger
 
 from sima_lmm.mole import performance_bench
-from sima_lmm.mole.workloads import load_workload
+from sima_lmm.mole.workloads import IMAGE_DATASETS, load_workload
 
 
 @dataclasses.dataclass(frozen=True)
 class PerformanceOptions:
     dataset: str | None = None
     model_revision: str | None = None
+    manifest: Path | None = None
 
     def validate(self):
-        if self.dataset not in (None, "bfcl-v3", "ifeval", "alpacaeval", "gsm8k", "dialogsum"):
+        if self.dataset not in (None, "bfcl-v3", "ifeval", "alpacaeval", "gsm8k", "dialogsum", *IMAGE_DATASETS):
             raise ValueError("Unsupported performance dataset")
+        if self.manifest is not None and self.dataset not in IMAGE_DATASETS:
+            raise ValueError("--dataset_manifest requires an image/text dataset")
 
 
 def write_results(path: Path, report: dict):
@@ -64,6 +67,7 @@ def _aggregate(records):
 
 def run_performance(lm, config):
     options = config.performance
+    multimodal = options.dataset in IMAGE_DATASETS
     report = {"schema_version": 1, "status": "running", "requests": [], "summary": {},
               "settings": {**dataclasses.asdict(options), "max_num_tokens": config.max_num_tokens,
                            "max_new_tokens": config.max_new_tokens, "num_samples": config.limit,
@@ -84,24 +88,33 @@ def run_performance(lm, config):
     prior_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(1)
-        report["tokenizer"] = lm.pretrained
         mode = None
-        stops = getattr(lm.config, "eos_token_id", None) or lm.tokenizer.eos_token_id
-        generation_config = Path(lm.pretrained) / "generation_config.json"
-        if not Path(lm.pretrained).is_dir():
-            try:
-                generation_config = Path(hf_hub_download(
-                    lm.pretrained, "generation_config.json", revision=lm.revision
-                ))
-            except RemoteEntryNotFoundError:
-                generation_config = None
-        if generation_config is not None and generation_config.is_file():
-            stops = json.loads(generation_config.read_text()).get("eos_token_id", stops)
-        stops = [stops] if isinstance(stops, int) else list(stops or [])
-        report["settings"]["stop_token_ids"] = stops
-        if options.dataset:
-            samples, report["dataset"] = load_workload(options.dataset, config.limit)
+        if multimodal:
+            from sima_lmm.mole.workloads import load_image_workload
+
+            report["model_id"] = config.model_id
+            report["runtime"].update(lm.info(allow_speculative=True))
+            report["timing"]["ttft"] = "native image/text preprocessing, vision encoding and target prefill to first generated token"
+            report["timing"]["generation_time"] = "sum of image-inclusive TTFT and decoding durations; excludes network transport"
+            samples, report["dataset"] = load_image_workload(config)
         else:
+            report["tokenizer"] = lm.pretrained
+            stops = getattr(lm.config, "eos_token_id", None) or lm.tokenizer.eos_token_id
+            generation_config = Path(lm.pretrained) / "generation_config.json"
+            if not Path(lm.pretrained).is_dir():
+                try:
+                    generation_config = Path(hf_hub_download(
+                        lm.pretrained, "generation_config.json", revision=lm.revision
+                    ))
+                except RemoteEntryNotFoundError:
+                    generation_config = None
+            if generation_config is not None and generation_config.is_file():
+                stops = json.loads(generation_config.read_text()).get("eos_token_id", stops)
+            stops = [stops] if isinstance(stops, int) else list(stops or [])
+            report["settings"]["stop_token_ids"] = stops
+        if options.dataset and not multimodal:
+            samples, report["dataset"] = load_workload(options.dataset, config.limit)
+        elif not options.dataset:
             data = performance_bench.create_sample_data(
                 tokenizer=lm.tokenizer, max_toks=config.max_num_tokens,
                 n_samples=config.limit, input_lengths=config.input_lengths,
@@ -112,11 +125,15 @@ def run_performance(lm, config):
             samples = [{"id": f"bucket-{length}-{index}", "category": f"n{length}", "input_ids": tokens}
                        for length, rows in data.items() for index, tokens in enumerate(rows)]
             report["dataset"] = {"name": "lambada-buckets", "repository": "cimec/lambada"}
-        report["selected_sample_ids"] = [sample["id"] for sample in samples]
+        report["selected_sample_ids"] = []
         prepared = []
         for sample in samples:
+            report["selected_sample_ids"].append(sample["id"])
             try:
-                if "input_ids" in sample:
+                if multimodal:
+                    prepared.append((sample, None, config.max_new_tokens))
+                    continue
+                elif "input_ids" in sample:
                     tokens = sample["input_ids"]
                 else:
                     if not lm.tokenizer.chat_template:
@@ -140,21 +157,31 @@ def run_performance(lm, config):
         for phase in ("warmup", "measure"):
             selected = prepared[:1] if phase == "warmup" else prepared
             for sample, tokens, budget in selected:
-                context = torch.tensor([tokens], dtype=torch.int64)
                 record = {"sample_id": sample["id"], "category": sample["category"],
                           "source": sample.get("source"),
-                          "phase": phase, "input_tokens": len(tokens),
+                          "phase": phase,
                           "output_budget": budget, "status": "failed"}
                 try:
-                    # The existing ordinary endpoint returns the first token plus decode steps;
-                    # speculative decoding counts all output tokens in max_num_tokens.
-                    # The unmeasured warmup identifies the mode from its draft counter.
-                    max_length = len(tokens) + (config.max_new_tokens if phase == "warmup"
-                                               else budget - (mode == "ordinary"))
-                    max_length = min(max_length, config.max_num_tokens)
-                    durations = lm._zmq_infer(context, "generate_for_perf", max_num_tokens=max_length,
-                        stop_token_ids=stops).cpu().tolist()[0]
-                    metadata = lm.last_profile_data
+                    if multimodal:
+                        from sima_lmm.mole.workloads import prepare_image_sample
+
+                        messages, record["images"] = prepare_image_sample(sample)
+                        metadata = lm.profile(messages, {"max_new_tokens": budget})
+                        durations = metadata["token_durations"]
+                        record.update(input_tokens=metadata["input_tokens"],
+                                      finish_reason=metadata["finish_reason"],
+                                      prompt_sha256=metadata["prompt_sha256"])
+                    else:
+                        record["input_tokens"] = len(tokens)
+                        context = torch.tensor([tokens], dtype=torch.int64)
+                        # Ordinary text profiling returns the first token plus decode steps.
+                        # The unmeasured warmup identifies the mode from its draft counter.
+                        max_length = len(tokens) + (config.max_new_tokens if phase == "warmup"
+                                                   else budget - (mode == "ordinary"))
+                        max_length = min(max_length, config.max_num_tokens)
+                        durations = lm._zmq_infer(context, "generate_for_perf", max_num_tokens=max_length,
+                            stop_token_ids=stops).cpu().tolist()[0]
+                        metadata = lm.last_profile_data
                     count, accepted = metadata.get("generated_tokens"), metadata.get("accepted_draft_tokens")
                     if not durations or count != len(durations):
                         raise RuntimeError("Runtime must return one timing per generated token")
@@ -163,7 +190,7 @@ def run_performance(lm, config):
                     mode = "speculative" if accepted is not None else "ordinary"
                     report["settings"]["decoding"] = mode
                     record["decoding"] = mode
-                    if phase == "warmup":
+                    if phase == "warmup" and not multimodal:
                         record["output_budget"] = max_length - len(tokens) + (mode == "ordinary")
                     if count > record["output_budget"]:
                         raise RuntimeError("Runtime returned more tokens than the requested output budget")
