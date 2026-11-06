@@ -94,7 +94,19 @@ For all available options, run `llima-benchmark accuracy -h`.
 
 #### Image-plus-text accuracy
 
-The validated tasks are `realworldqa`, `docvqa_val` and `chartqa`, using Qwen3.5-2B on Modalix. The evaluator is installed with MoLE and uses the deployed VLM's native chat template and image preprocessing.
+The evaluator is installed with MoLE and uses the deployed VLM's native chat template, image preprocessing and upstream task scoring. The following tasks have been tested with Qwen3.5-2B on Modalix:
+
+| Task | Focus | Validation |
+|----|----|----|
+| `realworldqa` | Real-world scenes and spatial reasoning | Full dataset |
+| `docvqa_val` | Document reading and OCR | Smoke tests |
+| `chartqa` | Chart reading and numerical reasoning | Smoke tests |
+| `mmstar` | Visual perception and multimodal reasoning | 10-sample smoke test |
+| `ai2d` | Scientific diagram understanding | 10-sample smoke test |
+| `ocrbench` | Text recognition and understanding | 10-sample smoke test |
+| `textvqa_val` | Questions about text in natural images | 10-sample smoke test |
+
+Smoke tests verify inference, scoring and result exports; use full datasets for model comparisons. Other individual `lmms-eval` image-generation tasks can be selected with `-t`, subject to the restrictions below, but have not all been tested.
 
 ```bash
 llima-benchmark accuracy qwen3.5-2b -b modalix \
