@@ -47,6 +47,7 @@ class Config:
         max_new_tokens: Max number of new tokens. Used only for perf benchmarking.
         input_lengths: Exact input-token lengths to benchmark, or None to generate
             automatic buckets.
+        num_fewshot: Number of few-shot examples per prompt, or None for the task default.
         batch_size: The batch size to use for the evaluation, defaults to 1.
         random_seed: The random seed to ensure reproducibility, defaults to 42.
     """
@@ -64,6 +65,7 @@ class Config:
     max_new_tokens: int | None
     input_lengths: tuple[int, ...] | None
     performance: PerformanceOptions = dataclasses.field(default_factory=PerformanceOptions)
+    num_fewshot: int | None = None
     batch_size: int = dataclasses.field(init=False, default=1)
     random_seed: int = dataclasses.field(init=False, default=42)
 
@@ -84,6 +86,7 @@ def prepare_mole(
     max_new_tokens: int = 256,
     input_lengths: list[int] | None = None,
     performance: PerformanceOptions | None = None,
+    num_fewshot: int | None = None,
 ) -> Config | None:
     """
     prepare_mole Prepares and validates the configuration for a MOLE evaluation run.
@@ -101,6 +104,7 @@ def prepare_mole(
         max_new_tokens: Max number of new tokens. Used only for perf benchmarking.
         input_lengths: Exact input-token lengths for performance benchmarking.
             When omitted, power-of-two buckets are generated automatically.
+        num_fewshot: Number of few-shot examples per prompt. Uses the task default if None.
 
     Returns:
         A Config object if the setup is successful, otherwise None.
@@ -167,6 +171,9 @@ def prepare_mole(
             )
             return None
         normalized_input_lengths = tuple(sorted(input_lengths))
+    if num_fewshot is not None and num_fewshot < 0:
+        logger.error("--num_fewshot must be zero or positive")
+        return None
 
     if tasks:
         metadata = {"pretrained": model_id}
@@ -204,6 +211,7 @@ def prepare_mole(
         max_new_tokens=max_new_tokens,
         input_lengths=normalized_input_lengths,
         performance=performance,
+        num_fewshot=num_fewshot,
     )
 
 
@@ -280,6 +288,7 @@ def run(config: Config) -> dict[str, Any]:
                 evaluation_tracker=evaluation_tracker,
                 batch_size=config.batch_size,
                 limit=config.limit,
+                num_fewshot=config.num_fewshot,
                 random_seed=config.random_seed,
                 numpy_random_seed=config.random_seed,
                 torch_random_seed=config.random_seed,
