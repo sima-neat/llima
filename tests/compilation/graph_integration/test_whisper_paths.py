@@ -115,16 +115,16 @@ def _reference_outputs(model, reference, inputs):
     cfg, decoder = model.cfg, reference.decoder
     if isinstance(model, WhisperEncoderModel):
         hidden = inputs["input"][:, 0]
-        if model.layer_idx is None:
-            hidden = reference.encoder(hidden.transpose(1, 2)).last_hidden_state
-        else:
-            if model.layer_idx == 0:
-                hidden = F.gelu(reference.encoder.conv1(hidden.transpose(1, 2)))
-                hidden = F.gelu(reference.encoder.conv2(hidden)).transpose(1, 2)
-                hidden = hidden + reference.encoder.embed_positions.weight
-            hidden = _layer_output(reference.encoder.layers[model.layer_idx](hidden, None))
-            if model.layer_idx == cfg.encoder_layers - 1:
-                hidden = reference.encoder.layer_norm(hidden)
+        if model.layer_idx in (None, 0):
+            activation = reference.encoder.layers[0].activation_fn
+            hidden = activation(reference.encoder.conv1(hidden.transpose(1, 2)))
+            hidden = activation(reference.encoder.conv2(hidden)).transpose(1, 2)
+            hidden = hidden + reference.encoder.embed_positions.weight
+        layers = range(cfg.encoder_layers) if model.layer_idx is None else [model.layer_idx]
+        for idx in layers:
+            hidden = _layer_output(reference.encoder.layers[idx](hidden, None))
+        if model.layer_idx in (None, cfg.encoder_layers - 1):
+            hidden = reference.encoder.layer_norm(hidden)
         outputs = [hidden.unsqueeze(1)]
     elif isinstance(model, WhisperDecoderPreModel):
         hidden = inputs["input"][:, 0]
