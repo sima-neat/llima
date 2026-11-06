@@ -106,7 +106,7 @@ The evaluator is installed with MoLE and uses the deployed VLM's native chat tem
 | `ocrbench` | Text recognition and understanding | 10-sample smoke test |
 | `textvqa_val` | Questions about text in natural images | 10-sample smoke test |
 
-Smoke tests verify inference, scoring and result exports; use full datasets for model comparisons. Other individual `lmms-eval` image-generation tasks can be selected with `-t`, subject to the restrictions below, but have not all been tested.
+Other individual `lmms-eval` image-generation tasks can be selected with `-t`, subject to the restrictions below, but have not all been tested.
 
 ```bash
 llima-benchmark accuracy qwen3.5-2b -b modalix \
