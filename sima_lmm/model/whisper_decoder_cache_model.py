@@ -31,13 +31,17 @@ class WhisperDecoderCacheModel(BaseModel):
         shapes = {
             "input": (1, self.cfg.decoder_attention_heads, self.num_tokens, self.cfg.decoder_head_dim),
             "cached_keys": (1, 1, self.token_idx + self.num_tokens, self.cfg.d_model),
-            "cached_values": (1, 1, self.token_idx + self.num_tokens, self.cfg.d_model),
         }
+        # Match the runtime's positional query, keys, mask, values interface.
         if self.use_future_token_mask and self.num_tokens == 1:
             shapes["attn_mask"] = (1, 1, 1, self.token_idx + 1)
+        shapes["cached_values"] = (1, 1, self.token_idx + self.num_tokens, self.cfg.d_model)
 
         graph = ModelGraph(self, shapes, quantizable)
-        outputs = self._build_nodes(graph, list(graph.inputs.values()))
+        inputs = [graph.inputs[name] for name in ("input", "cached_keys", "cached_values")]
+        if "attn_mask" in graph.inputs:
+            inputs.append(graph.inputs["attn_mask"])
+        outputs = self._build_nodes(graph, inputs)
         graph.save(outputs)
 
     def _build_nodes(self, graph, inputs):

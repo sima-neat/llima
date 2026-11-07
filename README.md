@@ -17,6 +17,10 @@ Compiler tooling for running compiled GenAI model directories on SiMa
 hardware. The Python layer supports the CLI; it is not a separate public
 runtime API.
 
+[MoLE](docs/mole.md) evaluates text and image-plus-text accuracy from a host or
+directly on a Modalix DevKit. Image tasks reuse upstream lmms-eval scoring;
+see [MoLE image-plus-text accuracy](docs/mole.md#image-plus-text-accuracy) for setup and supported tasks.
+
 ## Packages
 
 The Modalix DevKit runtime is delivered as three Debian packages:

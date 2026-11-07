@@ -54,10 +54,14 @@ def test_whisper_finds_generation_config_in_cache_root(tmp_path):
     )
 
     config = WhisperConfig.from_hf_config(
-        str(tmp_path), {"architectures": ["WhisperForConditionalGeneration"]}
+        str(tmp_path), {
+            "architectures": ["WhisperForConditionalGeneration"],
+            "activation_function": "gelu",
+        }
     )
 
     assert config.num_languages == 2
+    assert config.activation_function == "gelu_pytorch_tanh"
 
 
 @pytest.mark.parametrize(
