@@ -60,6 +60,10 @@ For all available options, run `llima run -h`.
 
 To disable automatic embedding offloading and keep the tables in DRAM, run
 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
+To force offloading on other storage, use
+`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=on llima run <model>`. This requires raw embedding
+`.bin` files in the model's `devkit/` directory; slower storage can reduce generation speed.
+The default, `auto`, enables offloading only on verified local PCIe NVMe storage.
 
 **Examples**
 

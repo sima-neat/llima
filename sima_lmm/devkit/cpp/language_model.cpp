@@ -1624,9 +1624,10 @@ void LanguageModel::_initialize() {
     if (!draft_model && mode != EmbeddingOffloadMode::Off) {
         const auto normal = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
         const auto per_layer = _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin");
-        const bool nvme = embedding_file_on_nvme(normal)
-            && (!_uses_per_layer_inputs() || embedding_file_on_nvme(per_layer));
-        if (nvme) {
+        const bool offload_enabled = mode == EmbeddingOffloadMode::On
+            || (embedding_file_on_nvme(normal)
+                && (!_uses_per_layer_inputs() || embedding_file_on_nvme(per_layer)));
+        if (offload_enabled) {
             auto offload = std::make_shared<EmbeddingOffload>();
             const size_t elem = _cfg.pipeline_cfg.quantize_embeddings ? 1 : 2;
             const size_t vocab = _cfg.lm_cfg.token_cfg.vocab_size;
@@ -1636,7 +1637,8 @@ void LanguageModel::_initialize() {
                     static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers) * _cfg.lm_cfg.hidden_size_per_layer_input * elem);
             }
             _embedding_offload = std::move(offload);
-            _logger->info("Embedding offload enabled (local NVMe, scales remain in DRAM)");
+            _logger->info("Embedding offload enabled ({}, scales remain in DRAM)",
+                mode == EmbeddingOffloadMode::On ? "forced" : "local NVMe");
         } else {
             _logger->info("Embedding offload auto: resident DRAM (storage is not verified local NVMe or raw tables are unavailable)");
         }

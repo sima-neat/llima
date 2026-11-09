@@ -59,6 +59,8 @@ int main(int argc, char** argv) {
         require(embedding_offload_mode() == EmbeddingOffloadMode::Auto, "auto mode");
         setenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD", "off", 1);
         require(embedding_offload_mode() == EmbeddingOffloadMode::Off, "off mode");
+        setenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD", "on", 1);
+        require(embedding_offload_mode() == EmbeddingOffloadMode::On, "on mode");
         setenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD", "typo", 1);
         rejects([] { embedding_offload_mode(); });
         const auto disk = root / "nvme0n1";
