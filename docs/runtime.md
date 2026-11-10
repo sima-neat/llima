@@ -58,12 +58,12 @@ modalix:~$ llima run <model> [options]
 
 For all available options, run `llima run -h`.
 
-To disable automatic embedding offloading and keep the tables in DRAM, run
-`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`.
-To force offloading on other storage, use
-`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=on llima run <model>`. This requires raw embedding
-`.bin` files in the model's `devkit/` directory; slower storage can reduce generation speed.
-The default, `auto`, enables offloading only on verified local PCIe NVMe storage.
+Embedding tables are offloaded by default (`auto`) when raw `.bin` files are
+available in the model's `devkit/` directory; otherwise they remain in DRAM.
+Non-NVMe storage produces a warning because slower reads may reduce performance.
+Use `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>` to keep the tables in
+DRAM, or `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=on llima run <model>` to require
+offloading and fail if the raw files are missing or invalid.
 
 **Examples**
 

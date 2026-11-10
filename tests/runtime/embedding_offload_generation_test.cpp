@@ -5,7 +5,6 @@
 #include <unordered_set>
 #include <nlohmann/json.hpp>
 
-#include "embedding_offload.hpp"
 #include "runtime_test_utils.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"
@@ -44,8 +43,6 @@ int main(int argc, char** argv) {
         uint64_t table_bytes = 0;
         for (const auto& entry : std::filesystem::directory_iterator(dir / "devkit")) {
             if (!entry.path().filename().string().ends_with("_embeddings.bin")) continue;
-            if (!embedding_file_on_nvme(entry.path()))
-                throw std::runtime_error("Embedding generation test requires raw tables on local NVMe");
             table_bytes += entry.file_size();
         }
         if (!table_bytes) throw std::runtime_error("No raw embedding tables found");

@@ -1625,8 +1625,8 @@ void LanguageModel::_initialize() {
         const auto normal = _devkit_dir / (_cfg.language_model_name + "_embeddings.bin");
         const auto per_layer = _devkit_dir / (_cfg.language_model_name + "_per_layer_embeddings.bin");
         const bool offload_enabled = mode == EmbeddingOffloadMode::On
-            || (embedding_file_on_nvme(normal)
-                && (!_uses_per_layer_inputs() || embedding_file_on_nvme(per_layer)));
+            || (std::filesystem::is_regular_file(normal)
+                && (!_uses_per_layer_inputs() || std::filesystem::is_regular_file(per_layer)));
         if (offload_enabled) {
             auto offload = std::make_shared<EmbeddingOffload>();
             const size_t elem = _cfg.pipeline_cfg.quantize_embeddings ? 1 : 2;
@@ -1637,10 +1637,14 @@ void LanguageModel::_initialize() {
                     static_cast<size_t>(_cfg.lm_cfg.num_hidden_layers) * _cfg.lm_cfg.hidden_size_per_layer_input * elem);
             }
             _embedding_offload = std::move(offload);
-            _logger->info("Embedding offload enabled ({}, scales remain in DRAM)",
-                mode == EmbeddingOffloadMode::On ? "forced" : "local NVMe");
+            _logger->info("Embedding offload enabled (scales remain in DRAM)");
+            if (!embedding_file_on_nvme(normal)
+                || (_uses_per_layer_inputs() && !embedding_file_on_nvme(per_layer))) {
+                _logger->warn("Embedding offload is enabled on non-NVMe storage; performance may be reduced. "
+                    "Set SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off to keep embeddings in DRAM.");
+            }
         } else {
-            _logger->info("Embedding offload auto: resident DRAM (storage is not verified local NVMe or raw tables are unavailable)");
+            _logger->info("Embedding offload auto: resident DRAM (raw tables are unavailable)");
         }
     } else if (!draft_model) {
         _logger->info("Embedding offload disabled: resident DRAM");

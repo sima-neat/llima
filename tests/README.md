@@ -380,7 +380,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
 | `runtime.gemma4_mtp_helpers` | Packed causal masks at compiled context widths, sliding-window offsets, ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
 
-The embedding generation test requires raw embedding tables on local NVMe
+The embedding generation test requires raw embedding tables on accessible storage
 and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
 `SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
 and `auto`, verifies that automatic offloading saves DRAM, and checks allocation
