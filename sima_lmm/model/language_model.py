@@ -1,8 +1,10 @@
 import logging
 import numpy as np
+import shutil
 import time
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from ml_dtypes import bfloat16
 from afe.ir.quantization_conv import block_quantize_weight_tensor
@@ -11,7 +13,9 @@ from sima_lmm.logging import sima_log_info, sima_log_warning
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
+from sima_lmm.model.base import (
+    BaseModel, EvalMode, FileGenMode, GenConfiguration, LayerConfiguration
+)
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_moe_router_model import LanguageMoeRouterModel
@@ -33,6 +37,10 @@ from sima_lmm.config.vlm_config import (
     PipelineConfig,
     VlmArchType,
 )
+
+# Transformer-layer parts whose models of all layers share one program (see
+# LanguageModel._assign_weight_patch_templates).
+_WEIGHT_PATCH_PARTS = frozenset({"group_pre", "single_pre", "group_post", "single_post"})
 
 
 def quantize_embedding_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -85,6 +93,7 @@ class LanguageModel(BaseModel):
         log_level: int = logging.NOTSET,
         num_processes: int = 1,
         resume: bool = False,
+        weight_patching: bool = False,
     ):
         """
         Generates files based on the provided file generation mode.
@@ -98,7 +107,11 @@ class LanguageModel(BaseModel):
                 will not be processed.
                 The lora dict is a map from layer ID to lora graph mode for each layer.
             log_level: Logging level.
+            num_processes: Number of concurrent processes.
             resume: Generate the files if missing.
+            weight_patching: When compiling, build the ELFs of transformer layers from the ELF of
+                one compiled layer with the same part, token count, precision and lora mode
+                (see _assign_weight_patch_templates).
         """
         # Create a list of all models to compile
         model_list = list()
@@ -106,6 +119,7 @@ class LanguageModel(BaseModel):
         single_model_num_tokens = self.cfg.lm_cfg.single_model_num_tokens
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
+        layer_ids: list[LayerID] = []
 
         for layer_id, curr_precision in precision.items():
             part_model = None
@@ -219,6 +233,7 @@ class LanguageModel(BaseModel):
             if lora_mode:
                 curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
+            layer_ids.append(layer_id)
 
         speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
         if (
@@ -243,8 +258,63 @@ class LanguageModel(BaseModel):
                     )
                 )
 
+        patch_dirs = []
+        if weight_patching and gen_mode == FileGenMode.MODEL_SDK_COMPILE:
+            patch_dirs = self._assign_weight_patch_templates(model_list, layer_ids)
+
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
+        if patch_dirs:
+            _report_weight_patching(patch_dirs)
+        # The templates are only needed while compiling; each holds a full ELF.
+        for patch_dir in patch_dirs:
+            shutil.rmtree(patch_dir, ignore_errors=True)
+        if patch_dirs and not any(patch_dirs[0].parent.iterdir()):
+            patch_dirs[0].parent.rmdir()
+
+    def _assign_weight_patch_templates(
+        self,
+        model_list: list[tuple[BaseModel, LayerConfiguration]],
+        layer_ids: list[LayerID],
+    ) -> list[Path]:
+        """Groups the transformer-layer models that compile to the same program and picks a template.
+
+        Every pre/post model with the same part (e.g. group_pre), precision and lora mode has the
+        same graph and differs only in its weights. The model with the lowest layer index above 0
+        records a weight patch template; the others in the group are built from it. Layer 0 and
+        the last layer can differ (embedding input, final norm and lm_head); the compiler then
+        detects the program mismatch and compiles them in full.
+
+        Args:
+            model_list: Models to compile with their layer configurations; updated in place.
+            layer_ids: Layer ID of each entry in model_list.
+
+        Returns:
+            The template directories.
+        """
+        groups: dict[tuple, list[tuple[LayerID, BaseModel]]] = {}
+        for (model, layer_cfg), layer_id in zip(model_list, layer_ids):
+            if layer_id.part not in _WEIGHT_PATCH_PARTS or layer_id.expert_idx >= 0:
+                continue
+            key = (layer_id.part, layer_cfg["precision"], layer_cfg.get("lora"))
+            groups.setdefault(key, []).append((layer_id, model))
+
+        patch_dirs = []
+        for (part, curr_precision, curr_lora), members in groups.items():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda member: (member[0].part_idx == 0, member[0].part_idx))
+            lora_name = "none" if curr_lora is None else curr_lora.name.lower()
+            patch_dir = (
+                Path(self.sima_path).resolve() / "weight_patch"
+                / f"{part}_{curr_precision.name.lower()}_{lora_name}"
+            )
+            shutil.rmtree(patch_dir, ignore_errors=True)
+            members[0][1].weight_patch_record_dir = patch_dir
+            for _, model in members[1:]:
+                model.weight_patch_template_dir = patch_dir
+            patch_dirs.append(patch_dir)
+        return patch_dirs
 
     def run_model(
         self,
@@ -737,3 +807,20 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens,
                 )
+
+
+def _report_weight_patching(patch_dirs: list[Path]):
+    """Prints how many models were built from a weight patch template and why others were not."""
+    from mlc.compiler.weight_patching import read_patch_results
+
+    results = {}
+    for patch_dir in patch_dirs:
+        results.update(read_patch_results(patch_dir))
+    full = {name: result for name, result in results.items() if result != "patched"}
+    print(
+        f"[compile] Weight patching: {len(results) - len(full)} of {len(results)} models built "
+        "from a template, the others compiled in full",
+        flush=True,
+    )
+    for name, result in full.items():
+        print(f"[compile]   {name}: {result}", flush=True)

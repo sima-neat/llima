@@ -53,6 +53,7 @@ def gen_files(
     quantize_embeddings: bool, quantize_kv_cache: bool, return_logits: bool,
     log_level: int, image_resolution: list[int] | None, draft_model_path: Path | None,
     draft_output_path: Path | None, speculative_block_size: int | None = None,
+    weight_patching: bool = False,
 ):
     enable_verbose_error_messages()
     models = list()
@@ -127,7 +128,7 @@ def gen_files(
         for mode in modes:
             model.gen_files(
                 mode, gen_config=gen_config, log_level=log_level, num_processes=num_processes,
-                resume=resume
+                resume=resume, weight_patching=weight_patching
             )
             print(f"Generated mode={mode.name} files for {model.model_name}", flush=True)
 
@@ -315,6 +316,12 @@ def main():
         help="Only compile files that are missing"
     )
     group.add_argument(
+        "--weight_patching", action=argparse.BooleanOptionalAction, default=False,
+        help="Compile one transformer layer per part and precision, and build the other layers' "
+             "ELFs from it by writing in their weights. Output is identical to a full compile; "
+             "layers whose compiled program differs are compiled in full."
+    )
+    group.add_argument(
         "-c", "--configuration_file", type=Path,
         help="Configuration file with layer-specific compilation options"
     )
@@ -430,6 +437,7 @@ def main():
             args.quantize_kv_cache, return_logits, log_level, image_resolution,
             args.draft_model_path, draft_output_path,
             args.speculative_block_size,
+            args.weight_patching,
         )
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
         _abort(str(exc))

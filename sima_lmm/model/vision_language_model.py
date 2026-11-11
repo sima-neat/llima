@@ -240,6 +240,7 @@ class VisionLanguageModel(BaseModel):
         log_level: int = logging.NOTSET,
         num_processes: int = 1,
         resume: bool = False,
+        weight_patching: bool = False,
     ):
         """
         Generates files based on the provided file generation mode.
@@ -253,7 +254,10 @@ class VisionLanguageModel(BaseModel):
                 will not be processed.
                 The lora dict is a map from layer ID to lora graph mode for each layer.
             log_level: Logging level.
+            num_processes: Number of concurrent processes.
             resume: Generate the files only if it does not exist.
+            weight_patching: Build transformer-layer ELFs from one compiled layer per group
+                (see LanguageModel.gen_files).
         """
         sima_log_info("Generating %s files...", gen_mode)
 
@@ -277,7 +281,7 @@ class VisionLanguageModel(BaseModel):
 
         self.language_model.gen_files(
             gen_mode, gen_config=gen_config, log_level=log_level,
-            num_processes=num_processes, resume=resume
+            num_processes=num_processes, resume=resume, weight_patching=weight_patching
         )
         sima_log_info("%s files generation completed.", gen_mode)
 

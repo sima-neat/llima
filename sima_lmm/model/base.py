@@ -7,7 +7,7 @@ import shutil
 from typing import ClassVar, NotRequired, TypedDict
 
 from abc import ABC
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
@@ -152,12 +152,19 @@ class BaseModel(ABC):
         hf_model: LocalHuggingFaceModel or GgufModel object
             for obtaining source parameters.
         weight_prefix: The prefix of weight tensor names in the source model.
+        weight_patch_record_dir: If set, the MLA compile is recorded as a weight patch template
+            into this directory (n2a_compiler mlc/compiler/weight_patching.py).
+        weight_patch_template_dir: If set, the MLA ELF is built from the weight patch template in
+            this directory when the compiled program matches it; otherwise it compiles in full.
+            gen_files_from_model_list compiles the model that records this directory first.
     """
     cfg: BaseConfig
     model_name: str
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
+    weight_patch_record_dir: Path | None = field(default=None, kw_only=True)
+    weight_patch_template_dir: Path | None = field(default=None, kw_only=True)
     enable_filter_sharing: ClassVar[bool] = True
 
     def gen_files(
@@ -368,7 +375,9 @@ class BaseModel(ABC):
             tessellate_parameters=tessellate_parameters,
             retained_temporary_directory_name=retained_temporary_directory_name,
             enable_filter_sharing=self.enable_filter_sharing,
-            layout_search_effort_level=layout_search_effort_level, deployable=False
+            layout_search_effort_level=layout_search_effort_level, deployable=False,
+            weight_patch_record_dir=_optional_str(self.weight_patch_record_dir),
+            weight_patch_template_dir=_optional_str(self.weight_patch_template_dir),
         )
         return model
 
@@ -667,28 +676,49 @@ class BaseModel(ABC):
             with ProcessPoolExecutor(
                 max_workers=num_processes, mp_context=multiprocessing.get_context("spawn")
             ) as executor:
-                results = {}
+                results: dict[Future, tuple["BaseModel", Path]] = {}
                 generated_file_name = None
+                ready, waiting = _order_by_weight_patch_dependency(model_list)
+                completed = 0
+
+                def submit(model: "BaseModel", layer_cfg: LayerConfiguration) -> Future:
+                    nonlocal generated_file_name
+                    generated_file_name = model.get_gen_file_name(gen_mode)
+                    future = executor.submit(
+                        model.gen_files, gen_mode, layer_cfg=layer_cfg,
+                        log_level=logging.NOTSET, resume=resume
+                    )
+                    results[future] = (model, generated_file_name)
+                    return future
+
                 try:
-                    for model, layer_cfg in model_list:
-                        generated_file_name = model.get_gen_file_name(gen_mode)
-                        future = executor.submit(
-                            model.gen_files, gen_mode, layer_cfg=layer_cfg,
-                            log_level=logging.NOTSET, resume=resume
-                        )
-                        results[future] = (model.model_name, generated_file_name)
+                    for model, layer_cfg in ready:
+                        submit(model, layer_cfg)
                     # Include every spawned worker in the manager's exit watch set.
                     executor._executor_manager_thread_wakeup.wakeup()
                     with ScopedLogLevel(log_level):
-                        for completed, future in enumerate(as_completed(results), start=1):
-                            model_name, generated_file_name = results[future]
-                            created = future.result()
-                            if created:
-                                sima_log_info("Created %s.", generated_file_name)
-                            else:
-                                sima_log_info("Skipped %s.", generated_file_name)
-                            action = "Completed" if created else "Skipped"
-                            print(f"[{stage} {completed}/{total}] {action} {model_name}", flush=True)
+                        pending = set(results)
+                        while pending:
+                            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                            for future in done:
+                                model, generated_file_name = results[future]
+                                created = future.result()
+                                completed += 1
+                                if created:
+                                    sima_log_info("Created %s.", generated_file_name)
+                                else:
+                                    sima_log_info("Skipped %s.", generated_file_name)
+                                action = "Completed" if created else "Skipped"
+                                print(
+                                    f"[{stage} {completed}/{total}] {action} {model.model_name}",
+                                    flush=True,
+                                )
+                                # Models patched from this model's template can start now.
+                                dependents = waiting.pop(_patch_record_dir(model), [])
+                                for dependent in dependents:
+                                    pending.add(submit(*dependent))
+                                if dependents:
+                                    executor._executor_manager_thread_wakeup.wakeup()
                 except BaseException as exc:
                     # Python 3.11/3.12 have no public executor worker-termination API.
                     # Stop active work before the context manager waits for shutdown.
@@ -708,8 +738,10 @@ class BaseModel(ABC):
                     sima_log_exception(msg)
                     raise
         else:
+            ready, waiting = _order_by_weight_patch_dependency(model_list)
+            ordered = ready + [dep for deps in waiting.values() for dep in deps]
             with ScopedLogLevel(log_level):
-                for completed, (model, layer_cfg) in enumerate(model_list, start=1):
+                for completed, (model, layer_cfg) in enumerate(ordered, start=1):
                     try:
                         created = model.gen_files(
                             gen_mode, layer_cfg=layer_cfg, log_level=log_level, resume=resume
@@ -724,3 +756,36 @@ class BaseModel(ABC):
                         msg = f"Error occured when creating {model.get_gen_file_name(gen_mode)}."
                         sima_log_exception(msg)
                         raise
+
+
+def _optional_str(path: Path | None) -> str | None:
+    return None if path is None else str(path)
+
+
+def _order_by_weight_patch_dependency(
+    model_list: list[tuple["BaseModel", LayerConfiguration]],
+) -> tuple[
+    list[tuple["BaseModel", LayerConfiguration]],
+    dict[Path, list[tuple["BaseModel", LayerConfiguration]]],
+]:
+    """Split models into those that can start now and those that wait for a weight patch template.
+
+    Returns:
+        The models to start now, template-recording models first, and per template directory
+        the models to start once the model recording it has finished.
+    """
+    recorded = {_patch_record_dir(m) for m, _ in model_list} - {None}
+    ready, waiting = [], {}
+    for entry in model_list:
+        template_dir = getattr(entry[0], "weight_patch_template_dir", None)
+        if template_dir is not None and template_dir in recorded:
+            waiting.setdefault(template_dir, []).append(entry)
+        else:
+            ready.append(entry)
+    ready.sort(key=lambda entry: _patch_record_dir(entry[0]) is None)
+    return ready, waiting
+
+
+def _patch_record_dir(model: "BaseModel") -> Path | None:
+    # Model lists may hold other job types (e.g. in tests) that do not use weight patching.
+    return getattr(model, "weight_patch_record_dir", None)
