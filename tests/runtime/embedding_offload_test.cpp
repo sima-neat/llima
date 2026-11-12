@@ -59,6 +59,8 @@ int main(int argc, char** argv) {
         require(embedding_offload_mode() == EmbeddingOffloadMode::Auto, "auto mode");
         setenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD", "off", 1);
         require(embedding_offload_mode() == EmbeddingOffloadMode::Off, "off mode");
+        setenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD", "on", 1);
+        require(embedding_offload_mode() == EmbeddingOffloadMode::On, "on mode");
         setenv("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD", "typo", 1);
         rejects([] { embedding_offload_mode(); });
         const auto disk = root / "nvme0n1";
@@ -82,15 +84,15 @@ int main(int argc, char** argv) {
         std::filesystem::create_directory_symlink(root / "mmc", mmc / "device/subsystem");
         require(!embedding_device_on_nvme(mmc), "eMMC detection");
         std::ofstream(disk / "device/transport") << "tcp\n";
-        require(!embedding_device_on_nvme(disk), "Network NVMe must not enable offloading");
+        require(!embedding_device_on_nvme(disk), "Network NVMe is not local PCIe NVMe");
         std::filesystem::remove(disk / "device/subsystem");
         require(!embedding_device_on_nvme(disk), "NVMe-looking name is insufficient");
-        require(!embedding_device_on_nvme(root / "absent"), "Unknown storage must not enable auto");
+        require(!embedding_device_on_nvme(root / "absent"), "Unknown storage is not verified NVMe");
         require(!embedding_file_on_nvme(root / "absent"), "Missing file detection");
         // Optional DevKit checks: one NVMe file followed by non-NVMe files.
         if (argc > 1) require(embedding_file_on_nvme(argv[1]), "Expected real NVMe file");
         for (int i = 2; i < argc; ++i)
-            require(!embedding_file_on_nvme(argv[i]), "Unexpected offload on non-NVMe file");
+            require(!embedding_file_on_nvme(argv[i]), "Unexpected NVMe detection on non-NVMe file");
         std::filesystem::remove_all(root);
         std::cout << "Embedding offload unit tests passed\n";
     } catch (const std::exception& error) {

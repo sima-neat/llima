@@ -10,7 +10,7 @@
 
 namespace simaai::llima {
 
-enum class EmbeddingOffloadMode { Auto, Off };
+enum class EmbeddingOffloadMode { Auto, Off, On };
 EmbeddingOffloadMode embedding_offload_mode();
 bool embedding_file_on_nvme(const std::filesystem::path& path);
 bool embedding_device_on_nvme(const std::filesystem::path& device);
