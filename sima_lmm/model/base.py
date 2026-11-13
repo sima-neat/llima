@@ -679,6 +679,13 @@ class BaseModel(ABC):
                 results: dict[Future, tuple["BaseModel", Path]] = {}
                 generated_file_name = None
                 ready, waiting = _order_by_weight_patch_dependency(model_list)
+                caps = {
+                    template_dir: _patched_concurrency_cap(len(dependents), num_processes)
+                    for template_dir, dependents in waiting.items()
+                }
+                # Dependents of finished templates that wait for a slot under their group's cap.
+                released: dict[Path, list[tuple["BaseModel", LayerConfiguration]]] = {}
+                running: dict[Path, int] = dict.fromkeys(caps, 0)
                 completed = 0
 
                 def submit(model: "BaseModel", layer_cfg: LayerConfiguration) -> Future:
@@ -713,11 +720,22 @@ class BaseModel(ABC):
                                     f"[{stage} {completed}/{total}] {action} {model.model_name}",
                                     flush=True,
                                 )
-                                # Models patched from this model's template can start now.
-                                dependents = waiting.pop(_patch_record_dir(model), [])
-                                for dependent in dependents:
-                                    pending.add(submit(*dependent))
-                                if dependents:
+                                # Models patched from this model's template can start now, at
+                                # most caps[template_dir] of them at a time.
+                                group = getattr(model, "weight_patch_template_dir", None)
+                                if group in running:
+                                    running[group] -= 1
+                                recorded = _patch_record_dir(model)
+                                if recorded in waiting:
+                                    released[recorded] = waiting.pop(recorded)
+                                started = False
+                                for template_dir in (group, recorded):
+                                    queue = released.get(template_dir)
+                                    while queue and running[template_dir] < caps[template_dir]:
+                                        running[template_dir] += 1
+                                        pending.add(submit(*queue.pop(0)))
+                                        started = True
+                                if started:
                                     executor._executor_manager_thread_wakeup.wakeup()
                 except BaseException as exc:
                     # Python 3.11/3.12 have no public executor worker-termination API.
@@ -784,6 +802,28 @@ def _order_by_weight_patch_dependency(
             ready.append(entry)
     ready.sort(key=lambda entry: _patch_record_dir(entry[0]) is None)
     return ready, waiting
+
+
+def _patched_concurrency_cap(num_dependents: int, num_processes: int) -> int:
+    """How many models patched from one template may run at once.
+
+    The dependents of a template all become ready when it finishes, and for the largest group they
+    are then the only work left. Running them num_processes at a time makes their memory peaks
+    coincide: on Llama 3.1 8B BF16 at -j20, the 30 prefill-MLP units (about 7 GB each, mostly the
+    simulator check, measured as PSS) peaked at 141 GB against 119 GB for a compile without
+    patching. Spreading them evenly over the minimum number of waves the workers allow keeps the
+    number of waves, and so the wall time, while lowering how many run at once (15 instead of 20
+    for 30 units at -j20).
+
+    This is not a memory model: it does not look at other work running at the same time or at the
+    size of each model.
+
+    Args:
+        num_dependents: Number of models patched from the template.
+        num_processes: Number of concurrent compiler processes.
+    """
+    waves = -(-num_dependents // num_processes)
+    return -(-num_dependents // waves)
 
 
 def _patch_record_dir(model: "BaseModel") -> Path | None:

@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import numpy as np
 import shutil
@@ -279,11 +280,14 @@ class LanguageModel(BaseModel):
     ) -> list[Path]:
         """Groups the transformer-layer models that compile to the same program and picks a template.
 
-        Every pre/post model with the same part (e.g. group_pre), precision and lora mode has the
-        same graph and differs only in its weights. The model with the lowest layer index above 0
-        records a weight patch template; the others in the group are built from it. Layer 0 and
-        the last layer can differ (embedding input, final norm and lm_head); the compiler then
-        detects the program mismatch and compiles them in full.
+        Pre/post models with the same part (e.g. group_pre), precision, lora mode and quantized
+        graph structure (see _graph_fingerprint) compile to the same program and differ only in
+        their weights. The model with the lowest layer index above 0 records a weight patch
+        template; the others in the group are built from it. A model whose graph differs, such as
+        layer 0 with a quantized embedding input or the last layer with the lm_head, is in a group
+        of its own and compiles in full right away instead of waiting for a template. If two
+        graphs look alike but still compile to different programs, the compiler detects it and
+        compiles the model in full.
 
         Args:
             model_list: Models to compile with their layer configurations; updated in place.
@@ -296,18 +300,22 @@ class LanguageModel(BaseModel):
         for (model, layer_cfg), layer_id in zip(model_list, layer_ids):
             if layer_id.part not in _WEIGHT_PATCH_PARTS or layer_id.expert_idx >= 0:
                 continue
-            key = (layer_id.part, layer_cfg["precision"], layer_cfg.get("lora"))
+            key = (
+                layer_id.part, layer_cfg["precision"], layer_cfg.get("lora"),
+                _graph_fingerprint(model),
+            )
             groups.setdefault(key, []).append((layer_id, model))
 
         patch_dirs = []
-        for (part, curr_precision, curr_lora), members in groups.items():
+        for (part, curr_precision, curr_lora, fingerprint), members in groups.items():
             if len(members) < 2:
                 continue
             members.sort(key=lambda member: (member[0].part_idx == 0, member[0].part_idx))
             lora_name = "none" if curr_lora is None else curr_lora.name.lower()
+            graph = "" if fingerprint is None else f"_{fingerprint[:12]}"
             patch_dir = (
                 Path(self.sima_path).resolve() / "weight_patch"
-                / f"{part}_{curr_precision.name.lower()}_{lora_name}"
+                / f"{part}_{curr_precision.name.lower()}_{lora_name}{graph}"
             )
             shutil.rmtree(patch_dir, ignore_errors=True)
             members[0][1].weight_patch_record_dir = patch_dir
@@ -807,6 +815,25 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens,
                 )
+
+
+def _graph_fingerprint(model: BaseModel) -> str | None:
+    """MD5 of the model's quantized graph description with its layer-specific names masked.
+
+    Models of different layers whose fingerprints match have the same graph structure. Reads the
+    .sima.json written by quantization; returns None if it does not exist or the model has no
+    layer-specific names, so that the model is grouped by part, precision and lora mode only.
+
+    Args:
+        model: A pre/post model of one transformer layer.
+    """
+    graph_file = Path(f"{model.get_gen_file_name(FileGenMode.FP_TO_QUANT)}.json")
+    layer_base_name = getattr(model, "_layer_base_name", None)
+    if not graph_file.is_file() or not layer_base_name:
+        return None
+    text = graph_file.read_text()
+    text = text.replace(model.model_name, "<model>").replace(layer_base_name, "<layer>")
+    return hashlib.md5(text.encode()).hexdigest()
 
 
 def _report_weight_patching(patch_dirs: list[Path]):
