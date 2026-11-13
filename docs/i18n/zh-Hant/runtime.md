@@ -45,7 +45,12 @@ modalix:~$ llima run <model> [options]
 
 若要查看所有可用的選項，請執行 `llima run -h`。
 
-若要停用自動嵌入卸載並將表格保留在 DRAM 中，請執行 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`。
+在預設模式（`auto`）下，若原始 `.bin` 檔案位於模型的 `devkit/` 目錄中，
+就會卸載嵌入表格。若沒有這些檔案，表格會保留在 DRAM 中。
+使用非 NVMe 儲存裝置時會顯示警告，因為讀取速度較慢可能會降低效能。
+若要將表格保留在 DRAM 中，請執行 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`。
+若要強制卸載，請執行 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=on llima run <model>`。
+在此模式下，若原始檔案不存在或無效，指令就會失敗。
 
 **範例**
 
