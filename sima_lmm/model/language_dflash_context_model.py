@@ -12,10 +12,7 @@ class LanguageDFlashContextModel(LanguagePreModel):
     def generate_graph(self, layer_cfg: LayerConfiguration, quantizable: bool):
         merged_lora = layer_cfg.get("lora", LoraGenMode.LORA_DISABLED) == LoraGenMode.LORA_MERGED
         input_shape = (1, 1, self.num_tokens, self.cfg.lm_cfg.hidden_size)
-        freq_shape = (
-            1, 1, self.num_tokens,
-            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(self.layer_type) // 2,
-        )
+        freq_shape = (1, 1, self.num_tokens, self._head_dim)
         graph = ModelGraph(self, {
             "input": input_shape, "freq_real": freq_shape, "freq_imag": freq_shape,
         }, quantizable)

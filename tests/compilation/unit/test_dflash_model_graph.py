@@ -131,8 +131,8 @@ def test_dflash_group_and_resolver_accepted_prefixes(tmp_path, tokens, quantizab
 def test_dflash_draft_graph_contracts(tmp_path, tokens, quantizable):
     rng = np.random.default_rng(1)
     hidden = rng.normal(0, 0.1, (1, 1, tokens, 32)).astype(np.float32)
-    values = {"input": hidden, "freq_real": np.ones((1, 1, tokens, 8), np.float32),
-              "freq_imag": np.zeros((1, 1, tokens, 8), np.float32)}
+    values = {"input": hidden, "freq_real": np.ones((1, 1, tokens, 16), np.float32),
+              "freq_imag": np.zeros((1, 1, tokens, 16), np.float32)}
     pre = _model(LanguagePreModel, tmp_path, tokens)
     net = _net(pre, quantizable)
     assert list(net.input_node_names) == list(values)  # No EAGLE3 hidden_states input.
