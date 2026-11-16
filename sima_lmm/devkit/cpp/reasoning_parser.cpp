@@ -91,6 +91,12 @@ ReasoningStreamParser::ReasoningStreamParser(
         _end_marker = gptoss_channel;
         _channel_headers = true;
         _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
+    } else if (format == ReasoningFormat::Gemma4 && !enabled) {
+        // With thinking off the template gives each new model turn an empty thought channel, but after tool results
+        // the turn goes on and Gemma 4 opens one itself: hide it (any text in it), as LFM2's reasoning.
+        _start_marker = "<|channel>";
+        _end_marker = gemma_reasoning_close;
+        _mode = Mode::AwaitingHiddenStart;
     } else if (!enabled || format == ReasoningFormat::None) {
         _mode = Mode::Content;
     } else if (format == ReasoningFormat::Qwen) {

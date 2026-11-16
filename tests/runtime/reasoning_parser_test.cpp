@@ -104,6 +104,30 @@ void test_gemma_generated_and_prompt_opened_boundaries() {
     assert_no_markers(continued);
 }
 
+// With thinking off, Gemma 4 still opens a thought channel itself after tool results: hidden, with whatever is in
+// it; an answer without one (a tool call included) comes through as it is.
+void test_gemma_hides_its_own_thought_when_thinking_is_off() {
+    ReasoningStreamParser after_tools(ReasoningFormat::Gemma4, false);
+    ParsedText parsed;
+    append_events(parsed, after_tools.add("<|chan"));
+    append_events(parsed, after_tools.add("nel>thought\n"));
+    append_events(parsed, after_tools.add("<channel|>The file is saved.", true));
+    assert(parsed.reasoning.empty());
+    assert(parsed.content == "The file is saved.");
+    assert_no_markers(parsed);
+
+    ReasoningStreamParser with_text(ReasoningFormat::Gemma4, false);
+    ParsedText hidden;
+    append_events(hidden, with_text.add("<|channel>thought\nlet me check<channel|>Done.", true));
+    assert(hidden.reasoning.empty());
+    assert(hidden.content == "Done.");
+
+    ReasoningStreamParser call(ReasoningFormat::Gemma4, false);
+    ParsedText calling;
+    append_events(calling, call.add("<|tool_call>call:x{}<tool_call|>", true));
+    assert(calling.content == "<|tool_call>call:x{}<tool_call|>");
+}
+
 // gpt-oss tags every message with a channel header. Reasoning ends at any header,
 // and the role name that precedes it must not reach the output.
 void test_gptoss_analysis_to_final() {
@@ -194,6 +218,7 @@ int main() {
     test_qwen_generated_open_and_split_close();
     test_qwen_prompt_opened_and_truncated();
     test_gemma_generated_and_prompt_opened_boundaries();
+    test_gemma_hides_its_own_thought_when_thinking_is_off();
     test_gptoss_analysis_to_final();
     test_gptoss_commentary_is_hidden_but_final_survives();
     test_gptoss_tool_call_commentary_is_shown();
