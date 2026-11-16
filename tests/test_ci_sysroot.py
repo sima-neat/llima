@@ -37,23 +37,23 @@ class PlatformPolicyContracts(unittest.TestCase):
         return path
 
     def test_current_declaration_requires_matching_derived_receipt(self):
-        policy.validate_request(ROOT / "deps/manifest.json", '3.0.0')
-        self.assertEqual(policy.declaration(ROOT / "deps/manifest.json"), '3.0.0_master_B2499')
+        policy.validate_request(ROOT / "deps/manifest.json", '3.0.1')
+        self.assertEqual(policy.declaration(ROOT / "deps/manifest.json"), '3.0.1_master_B2796')
         with self.assertRaises(ValueError):
-            policy.validate_request(ROOT / "deps/manifest.json", '3.0.0~pre2499')
+            policy.validate_request(ROOT / "deps/manifest.json", '3.0.1~pre2796')
 
     def test_official_release_checks_cache_without_running_update(self):
         root = self.root / 'sysroot'
         inventory = root / 'var/lib/sima-sdk/sysroot-packages.tsv'
         inventory.parent.mkdir(parents=True)
-        inventory.write_text('simaai-palette-modalix\tarm64\t3.0.0\t/usr\n'
-                             'simaai-base-files-modalix\tall\t3.0.0\t/etc\n')
+        inventory.write_text('simaai-palette-modalix\tarm64\t3.0.1\t/usr\n'
+                             'simaai-base-files-modalix\tall\t3.0.1\t/etc\n')
         (root / 'usr/include').mkdir(parents=True)
         (root / 'etc').mkdir()
         firmware = root / 'etc/packageinfo'
-        firmware.write_text('SIMA_PACKAGE_VERSION = 3.0.0_master_B2499\n')
+        firmware.write_text('SIMA_PACKAGE_VERSION = 3.0.1_master_B2796\n')
         release = self.root / 'sdk-release'
-        release.write_text('Platform Version = 3.0.0\nPlatform Base = 3.0.0\nPlatform Channel = release\n')
+        release.write_text('Platform Version = 3.0.1\nPlatform Base = 3.0.1\nPlatform Channel = release\n')
         marker = self.root / 'calls'
         tool = self.root / 'sysroot-command'
         bindir = self.root / 'bin'; bindir.mkdir()
@@ -64,7 +64,7 @@ class PlatformPolicyContracts(unittest.TestCase):
                'SYSROOT': str(root), 'SDK_RELEASE_FILE': str(release),
                'LLIMA_DISPOSABLE_CI': '1', 'INVOCATION': str(marker)}
         def run():
-            return subprocess.run(['bash', str(ROOT / 'scripts/ci/prepare_sysroot.sh'), '3.0.0'],
+            return subprocess.run(['bash', str(ROOT / 'scripts/ci/prepare_sysroot.sh'), '3.0.1'],
                                   env=env, text=True, capture_output=True)
         result = run()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -72,10 +72,10 @@ class PlatformPolicyContracts(unittest.TestCase):
         for change in ('firmware', 'inventory', 'overlay', 'receipt'):
             before = firmware.read_text(), inventory.read_text(), release.read_text()
             overlay = inventory.parent / 'sysroot-overlay'
-            if change == 'firmware': firmware.write_text('SIMA_PACKAGE_VERSION = 3.0.0_master_B2372\n')
-            if change == 'inventory': inventory.write_text(inventory.read_text().replace('3.0.0', '3.0.1'))
+            if change == 'firmware': firmware.write_text('SIMA_PACKAGE_VERSION = 3.0.1_master_B2372\n')
+            if change == 'inventory': inventory.write_text(inventory.read_text().replace('3.0.1', '3.0.0'))
             if change == 'overlay': overlay.mkdir()
-            if change == 'receipt': release.write_text(release.read_text() + 'Platform Base = 3.0.0\n')
+            if change == 'receipt': release.write_text(release.read_text() + 'Platform Base = 3.0.1\n')
             marker.unlink(missing_ok=True)
             with self.subTest(change=change):
                 self.assertNotEqual(run().returncode, 0)
