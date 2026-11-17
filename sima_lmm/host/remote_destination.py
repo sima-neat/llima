@@ -87,8 +87,8 @@ class RemoteSession:
     command, including one with options such as -p or -i, the pre-flight opens
     a master connection that rsync reuses, so a password or host-key prompt
     happens only once, before any slow local work. Any other remote shell, or
-    an ssh command that already sets its own Control* options, is used
-    unchanged for both steps.
+    an ssh command that already sets its own control socket or Control* options,
+    is used unchanged for both steps.
     """
 
     def __init__(self, host: str):
@@ -97,7 +97,7 @@ class RemoteSession:
         self._base = shlex.split(os.environ.get("RSYNC_RSH", "")) or ["ssh"]
         self._master_opts = []
         if os.path.basename(self._base[0]) == "ssh" and not any(
-            "Control" in arg for arg in self._base[1:]
+            arg.startswith("-S") or "control" in arg.lower() for arg in self._base[1:]
         ):
             self._control_dir = tempfile.mkdtemp(prefix="llima-deploy-")
             self._base += ["-o", f"ControlPath={self._control_dir}/%C"]
@@ -121,7 +121,7 @@ class RemoteSession:
                 f"test -d {_remote_path_arg(required_dir)} || exit {_EXIT_REQUIRED_DIR_MISSING}"
             )
         script += [
-            f"mkdir -p {path_arg} || exit {_EXIT_MKDIR_FAILED}",
+            f"mkdir -p -- {path_arg} || exit {_EXIT_MKDIR_FAILED}",
             f"test -w {path_arg} || exit {_EXIT_NOT_WRITABLE}",
         ]
         cmd = [*self._base, *self._master_opts, self.host, "\n".join(script)]

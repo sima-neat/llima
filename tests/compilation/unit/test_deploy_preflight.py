@@ -102,7 +102,7 @@ def test_preflight_runs_before_extraction_and_rsync_shares_connection(
     assert preflight[0][0] == "ssh"
     assert "ControlMaster=auto" in preflight[0]
     assert "sima@devkit" in preflight[0]
-    assert "mkdir -p /media/nvme/llama" in preflight[0][-1]
+    assert "mkdir -p -- /media/nvme/llama" in preflight[0][-1]
 
     assert len(deploy_calls) == 1
     src, dst, rsh = deploy_calls[0]
@@ -184,7 +184,15 @@ def test_rsync_rsh_ssh_options_share_connection(
 
 
 @pytest.mark.parametrize(
-    "rsync_rsh", ["sshpass -p secret ssh", "ssh -o ControlPath=/tmp/user-master"]
+    "rsync_rsh", [
+        "sshpass -p secret ssh",
+        "ssh -o ControlPath=/tmp/user-master",
+        "ssh -S /tmp/user-master",
+        "ssh -S/tmp/user-master",
+        "ssh -o controlpath=/tmp/user-master",
+        "ssh -ocontrolpath=/tmp/user-master",
+        "ssh -o cOnTrOlMaStEr=auto",
+    ]
 )
 def test_rsync_rsh_without_sharing_is_used_unchanged(
     tmp_path: Path, fake_run: FakeRun, deploy_calls: list, monkeypatch, rsync_rsh: str
@@ -197,6 +205,21 @@ def test_rsync_rsh_without_sharing_is_used_unchanged(
     assert fake_run.preflight_calls[0][:-2] == rsync_rsh.split()
     assert deploy_calls[0][2] == rsync_rsh
     assert fake_run.exit_calls == []
+
+
+@pytest.mark.parametrize("path", ["-model", "-model with spaces"])
+def test_preflight_accepts_leading_dash_destination(tmp_path: Path, monkeypatch, path: str) -> None:
+    monkeypatch.setenv("RSYNC_RSH", "ssh -o ControlPath=none")
+    real_run = subprocess.run
+
+    def run_locally(cmd, **kwargs):
+        return real_run(["sh", "-c", cmd[-1]], cwd=tmp_path, **kwargs)
+
+    monkeypatch.setattr(remote_destination.subprocess, "run", run_locally)
+    with remote_destination.RemoteSession("devkit") as session:
+        session.preflight(path)
+
+    assert (tmp_path / path).is_dir()
 
 
 def test_local_destination_skips_ssh(
@@ -224,8 +247,8 @@ def test_speculative_preflight_checks_each_model_directory(
 
     scripts = [cmd[-1] for cmd in fake_run.preflight_calls]
     assert len(scripts) == 2
-    assert "mkdir -p /models/spec/target" in scripts[0]
-    assert "mkdir -p /models/spec/draft" in scripts[1]
+    assert "mkdir -p -- /models/spec/target" in scripts[0]
+    assert "mkdir -p -- /models/spec/draft" in scripts[1]
     assert [dst for _, dst, _ in deploy_calls] == [
         "devkit:/models/spec/target", "devkit:/models/spec/draft"
     ]
@@ -237,8 +260,8 @@ def test_home_relative_paths_keep_tilde_expansion(fake_run: FakeRun) -> None:
         session.preflight("~alice/models/my model")
 
     scripts = [cmd[-1] for cmd in fake_run.preflight_calls]
-    assert "mkdir -p \"$HOME\"/'models/my model'" in scripts[0]
-    assert "mkdir -p ~alice/'models/my model'" in scripts[1]
+    assert "mkdir -p -- \"$HOME\"/'models/my model'" in scripts[0]
+    assert "mkdir -p -- ~alice/'models/my model'" in scripts[1]
 
 
 def test_lora_preflight_requires_elf_files(tmp_path: Path, fake_run: FakeRun, monkeypatch) -> None:
@@ -252,7 +275,7 @@ def test_lora_preflight_requires_elf_files(tmp_path: Path, fake_run: FakeRun, mo
 
     script = fake_run.preflight_calls[0][-1]
     assert script.splitlines()[0] == "test -d /models/llama/elf_files || exit 5"
-    assert "mkdir -p /models/llama/npy_files" in script
+    assert "mkdir -p -- /models/llama/npy_files" in script
     assert copies[0][1] == "devkit:/models/llama/npy_files"
 
     fake_run.result = (5, "", "")
@@ -274,5 +297,5 @@ def test_lora_remote_root_destination_keeps_root(
 
     script = fake_run.preflight_calls[0][-1]
     assert script.splitlines()[0] == "test -d /elf_files || exit 5"
-    assert "mkdir -p /npy_files" in script
+    assert "mkdir -p -- /npy_files" in script
     assert copies[0][1] == "devkit:/npy_files"
