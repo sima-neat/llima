@@ -104,8 +104,7 @@ void test_gemma_generated_and_prompt_opened_boundaries() {
     assert_no_markers(continued);
 }
 
-// With thinking off, Gemma 4 still opens a thought channel itself after tool results: hidden, with whatever is in
-// it; an answer without one (a tool call included) comes through as it is.
+// Gemma 4 can emit thought channels after tool results even when thinking is disabled.
 void test_gemma_hides_its_own_thought_when_thinking_is_off() {
     ReasoningStreamParser after_tools(ReasoningFormat::Gemma4, false);
     ParsedText parsed;
@@ -126,6 +125,26 @@ void test_gemma_hides_its_own_thought_when_thinking_is_off() {
     ParsedText calling;
     append_events(calling, call.add("<|tool_call>call:x{}<tool_call|>", true));
     assert(calling.content == "<|tool_call>call:x{}<tool_call|>");
+
+    // Ordinary output is preserved exactly, however it is chunked.
+    const auto run = [](const std::vector<std::string>& chunks) {
+        ReasoningStreamParser parser(ReasoningFormat::Gemma4, false);
+        ParsedText out;
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            append_events(out, parser.add(chunks[i], i + 1 == chunks.size()));
+        }
+        assert(out.reasoning.empty());
+        return out.content;
+    };
+    assert(run({"\n    return 42;"}) == "\n    return 42;");
+    assert(run({"\n  ", "return 42;"}) == "\n  return 42;");
+    assert(run({" \n\t"}) == " \n\t");
+    assert(run({"<"}) == "<");
+    assert(run({"\n<|chan"}) == "\n<|chan");
+    assert(run({"<|tool_call>call:x{}<tool_call|>"}) == "<|tool_call>call:x{}<tool_call|>");
+    // A thought channel preceded by whitespace is still hidden.
+    assert(run({"\n ", "<|channel>thought\n<channel|>Done."}) == "Done.");
+    assert(run({"\n<|channel>thought\nhmm<channel|>Done."}) == "Done.");
 }
 
 // gpt-oss tags every message with a channel header. Reasoning ends at any header,

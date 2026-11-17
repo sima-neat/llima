@@ -92,8 +92,7 @@ ReasoningStreamParser::ReasoningStreamParser(
         _channel_headers = true;
         _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
     } else if (format == ReasoningFormat::Gemma4 && !enabled) {
-        // With thinking off the template gives each new model turn an empty thought channel, but after tool results
-        // the turn goes on and Gemma 4 opens one itself: hide it (any text in it), as LFM2's reasoning.
+        // Gemma 4 can emit thought channels after tool results even when thinking is disabled.
         _start_marker = "<|channel>";
         _end_marker = gemma_reasoning_close;
         _mode = Mode::AwaitingHiddenStart;
@@ -123,8 +122,10 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
     _pending.append(text);
 
     while (_mode != Mode::Done) {
+        // A hidden start is optional: keep leading whitespace until a marker is confirmed.
         if (
-            _mode == Mode::AwaitingStart || _mode == Mode::AwaitingHiddenStart ||
+            _mode == Mode::AwaitingStart ||
+            (_mode == Mode::AwaitingHiddenStart && _channel_headers) ||
             (_mode == Mode::Reasoning && _optional_start)
         ) {
             const auto first_non_whitespace = _pending.find_first_not_of(" \t\r\n");
@@ -161,17 +162,22 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
                 _pending_from_draft = from_draft;
                 continue;
             }
-            if (_pending.starts_with(_start_marker)) {
-                _pending.erase(0, _start_marker.size());
+            const bool keep_whitespace = hide_reasoning && !_channel_headers;
+            const size_t skipped = keep_whitespace
+                ? std::min(_pending.find_first_not_of(" \t\r\n"), _pending.size()) : 0;
+            const std::string_view candidate = std::string_view(_pending).substr(skipped);
+            if (candidate.starts_with(_start_marker)) {
+                _pending.erase(0, skipped + _start_marker.size());
                 _pending_from_draft = from_draft;
                 _mode = hide_reasoning ? Mode::HiddenReasoning : Mode::Reasoning;
                 continue;
             }
-            if (_start_marker.starts_with(_pending)) {
-                if (done) {
-                    _pending.clear();
-                    _mode = Mode::Done;
-                }
+            if (_start_marker.starts_with(candidate)) {
+                if (!done) break;
+                // Generation ended before a marker was confirmed: it was ordinary text.
+                if (keep_whitespace) emit(events, std::move(_pending), false, _pending_from_draft);
+                _pending.clear();
+                _mode = Mode::Done;
                 break;
             }
             _mode = Mode::Content;
