@@ -192,7 +192,11 @@ def test_olmoe_normalizes_qk_before_head_split(tmp_path, quantizable):
             params[f"{BASE}.self_attn.{name}_norm.weight"] = np.ones(channels, np.float32)
     model = _model(LanguagePreModel, cfg, params, tmp_path, num_tokens=1, layer_idx=0)
     x = np.arange(1, HIDDEN + 1, dtype=np.float32).reshape(1, 1, 1, HIDDEN)
-    values = {"input": x, "freq_real": np.ones((1, 1, 1, 8), np.float32), "freq_imag": np.zeros((1, 1, 1, 8), np.float32)}
+    values = {
+        "input": x,
+        "freq_real": np.ones((1, 1, 1, 16), np.float32),
+        "freq_imag": np.zeros((1, 1, 1, 16), np.float32),
+    }
     outputs, _ = _run(model, values, quantizable)
     expected_q = (x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + 1e-5)).reshape(1, 1, 1, 2, 16).transpose(0, 3, 2, 1, 4).reshape(1, 2, 1, 16) * 0.25
     np.testing.assert_allclose(outputs[0], expected_q, rtol=0.025, atol=0.001)

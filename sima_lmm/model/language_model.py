@@ -556,6 +556,7 @@ class LanguageModel(BaseModel):
         return ws_model.run_model(eval_mode, expert_outs + [residual])
 
     def calc_freq_real_imag(self, use_swa: bool) -> tuple[np.ndarray, np.ndarray]:
+        layer_type = "sliding_attention" if use_swa else "full_attention"
         if use_swa:
             theta = self.cfg.lm_cfg.rope_cfg.rope_local_base_freq
             # A distinct local base freq (Gemma3) means an unscaled local rope; when it
@@ -567,12 +568,14 @@ class LanguageModel(BaseModel):
         else:
             theta = self.cfg.lm_cfg.rope_cfg.rope_theta
             rope_type = self.cfg.lm_cfg.rope_cfg.rope_scaling.rope_type
-        rope_dimension_count = self.cfg.lm_cfg.rope_cfg.rope_dimension_count
         scaling_cfg = asdict(self.cfg.lm_cfg.rope_cfg.rope_scaling)
         max_num_tokens = self.cfg.pipeline_cfg.max_num_tokens
         idx_base = 1 if self.cfg.model_type == VlmArchType.VLM_PALIGEMMA else 0
         return calc_freq_real_imag(
-            max_num_tokens, rope_type, theta, rope_dimension_count, scaling_cfg, idx_base
+            max_num_tokens, rope_type, theta,
+            self.cfg.lm_cfg.rope_cfg.get_rope_dimension_count(layer_type),
+            self.cfg.lm_cfg.attn_cfg.get_head_dim(layer_type),
+            scaling_cfg, idx_base
         )
 
     def get_embeddings_tensor(

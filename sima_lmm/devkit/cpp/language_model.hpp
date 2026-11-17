@@ -368,7 +368,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         virtual void _initialize() override;
         virtual void _finalize() override;
-        void _define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count);
+        void _define_buffer_freq_table(const std::string& name, uint32_t layer_head_dim);
         bool _has_linear_attention_layers() const;
         const LinearAttentionConfig& _linear_attn_cfg() const;
         virtual void _define_buffers() override;

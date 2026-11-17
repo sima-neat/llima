@@ -89,8 +89,8 @@ def _norm(x):
 def test_mtp_pre_projects_combined_state_without_eagle_input(tmp_path, tokens, quantizable):
     model, params = _model(LanguagePreModel, tmp_path, tokens)
     x = np.random.default_rng(0).normal(0, 0.1, (1, 1, tokens, 128)).astype(np.float32)
-    values = {"input": x, "freq_real": np.ones((1, 1, tokens, 8), np.float32),
-              "freq_imag": np.zeros((1, 1, tokens, 8), np.float32)}
+    values = {"input": x, "freq_real": np.ones((1, 1, tokens, 16), np.float32),
+              "freq_imag": np.zeros((1, 1, tokens, 16), np.float32)}
     outputs, net = _run(model, values, quantizable)
     assert list(net.input_node_names) == list(values)
     assert len(outputs) == 1  # The assistant shares the target's KV cache.

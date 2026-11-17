@@ -10,6 +10,7 @@ from afe.ir.defines import Status, TensorValue, TupleValue, get_expected_tensor_
 from afe.ir.execute import create_node_executor, create_node_quant_executor
 from afe.ir.operations import BatchMatmulOp, ConvAddActivationOp, StridedSliceOp
 from afe.ir.serializer import load_awesomenet
+from afe.ir.sima_builder import SimaBuilder
 from afe.ir.tensor_type import ScalarType, TensorType
 from sima_lmm.model.model_graph import ModelGraph, tensor_type, activation_dtype, activation_type
 
@@ -227,6 +228,41 @@ def test_slice_keeps_integer_channels_on_native_path(quantizable):
     for output in outputs:
         assert isinstance(output.ir.operation, StridedSliceOp)
         assert tensor_type(output) == TensorType(ScalarType.int8, (1, 1, 2, 40))
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize(
+    "perm",
+    [
+        list(range(32, 64)) + list(range(32)),
+        [int(p) for p in np.random.default_rng(5).permutation(64)],
+    ],
+    ids=["rotate_half", "unaligned"],
+)
+def test_channel_permute_reorders_channels(quantizable, perm):
+    shape = (1, 1, 3, 64)
+    graph = ModelGraph(_source(), {"x": shape}, quantizable)
+    output = graph.channel_permute(graph.inputs["x"], perm)
+    assert type(output.ir.operation).__name__ == "ChannelPermuteOp"
+    x = np.arange(np.prod(shape)).reshape(shape).astype(activation_dtype(quantizable))
+    execute = (
+        create_node_executor(False) if quantizable else create_node_quant_executor(False, False)
+    )
+    actual, = graph.finish([output]).run({"x": x}, node_callable=execute)
+    np.testing.assert_array_equal(actual, x[..., perm].astype(np.float32))
+
+
+def test_channel_permute_rejects_non_permutation():
+    graph = ModelGraph(_source(), {"x": (1, 1, 2, 4)}, True)
+    with pytest.raises(ValueError, match="must reorder range"):
+        graph.channel_permute(graph.inputs["x"], [0, 1, 1, 3])
+
+
+def test_channel_permute_requires_sdk_channel_permute_op(monkeypatch):
+    monkeypatch.delattr(SimaBuilder, "create_channel_permute_node", raising=False)
+    graph = ModelGraph(_source(), {"x": (1, 1, 2, 4)}, True)
+    with pytest.raises(RuntimeError, match="ChannelPermuteOp"):
+        graph.channel_permute(graph.inputs["x"], [1, 0, 3, 2])
 
 
 def test_model_graph_requires_an_output():

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <iostream>
 #include <numbers>
@@ -69,9 +70,26 @@ static Eigen::ArrayXf calc_rope_scaling_longrope(
     }
 }
 
-// rope_dimension_count controls the active width of the rotary table.
-// Proportional RoPE spaces the active frequencies over the full layer head dim;
-// other RoPE variants space them over the active rotary dim itself.
+// Channel layout of a rotation over layer_head_dim channels: {half_rope_dim, imag_start}.
+// The rotation pairs channel i with channel imag_start + i for i < half_rope_dim and leaves
+// every other channel unchanged. Partial RoPE rotates a prefix of the head and passes the
+// tail through; proportional RoPE (Gemma4 full-attention layers) keeps the imaginary half at
+// layer_head_dim / 2, so an unrotated segment sits between the halves.
+//
+// The frequency tables the language pre models consume are laid out to match: each frequency
+// appears on both channels of its pair, with the sin of the real channel i negated, and
+// unrotated channels hold the neutral rotation of cos 1 and sin 0. This is the runtime side of
+// that contract; the compiler builds the same layout in sima_lmm/utils.py rope_channel_layout
+// and consumes it in language_pre_model.py.
+static std::pair<uint16_t, uint16_t> rope_channel_layout(
+    uint16_t rope_dimension_count, uint16_t layer_head_dim, bool proportional
+) {
+    const uint16_t half_rope_dim = rope_dimension_count / 2;
+    const uint16_t imag_start = proportional ? layer_head_dim / 2 : half_rope_dim;
+    assert(imag_start + half_rope_dim <= layer_head_dim);
+    return {half_rope_dim, imag_start};
+}
+
 // YaRN attention factor (mscale): scales cos/sin so attention magnitude is preserved
 // after frequency interpolation. Matches HF get_mscale in _compute_yarn_parameters.
 static double get_yarn_attention_factor(double factor) {
@@ -120,6 +138,10 @@ static Eigen::ArrayXf calc_rope_scaling_yarn(
 }
 
 
+// rope_dimension_count controls the active width of the rotary table.
+// Proportional RoPE spaces the active frequencies over the full layer head dim;
+// other RoPE variants space them over the active rotary dim itself.
+// The result is layer_head_dim wide per token, in the layout rope_channel_layout describes.
 RopeTable calc_freq_real_imag(
     uint16_t max_num_tokens,
     const std::string& rope_type,
@@ -130,11 +152,13 @@ RopeTable calc_freq_real_imag(
 ) {
     assert(rope_dimension_count % 2 == 0);
     assert(layer_head_dim % 2 == 0);
-    uint16_t freq_dim = rope_dimension_count / 2;
+    const auto [half_rope_dim, imag_start] = rope_channel_layout(
+        rope_dimension_count, layer_head_dim, rope_type == "proportional"
+    );
     uint16_t frequency_denominator = (
         rope_type == "proportional" ? layer_head_dim : rope_dimension_count
     );
-    auto inv_freq_seq = Eigen::ArrayXd::LinSpaced(freq_dim, 0, rope_dimension_count - 2);
+    auto inv_freq_seq = Eigen::ArrayXd::LinSpaced(half_rope_dim, 0, rope_dimension_count - 2);
     Eigen::ArrayXf inv_freq = Eigen::pow(theta, inv_freq_seq / frequency_denominator).inverse().cast<float>();
     Eigen::ArrayXf scaled_inv_freq;
     // YaRN scales cos/sin by an attention factor (mscale); 1.0 for every other type.
@@ -157,12 +181,12 @@ RopeTable calc_freq_real_imag(
         throw std::runtime_error(fmt::format("{} rope type is not supported", rope_type));
     }
 
-    auto num_scaled_freq = scaled_inv_freq.size();
+    const auto num_scaled_freq = std::min<Eigen::Index>(scaled_inv_freq.size(), half_rope_dim);
     auto token_idx_seq = Eigen::ArrayXf::LinSpaced(max_num_tokens, 0, max_num_tokens - 1);
 
     // Use row major type.
     MatrixXXf scaled_inv_freq_span = (
-        token_idx_seq.matrix() * scaled_inv_freq.matrix().transpose()
+        token_idx_seq.matrix() * scaled_inv_freq.head(num_scaled_freq).matrix().transpose()
     );
     MatrixXXf re_float = scaled_inv_freq_span.array().cos().matrix();
     MatrixXXf im_float = scaled_inv_freq_span.array().sin().matrix();
@@ -174,23 +198,26 @@ RopeTable calc_freq_real_imag(
         re_float *= yarn_attention_factor;
         im_float *= yarn_attention_factor;
     }
-    MatrixXXbf re = re_float.cast<Eigen::bfloat16>();
-    MatrixXXbf im = im_float.cast<Eigen::bfloat16>();
 
-    std::vector<Eigen::bfloat16> re_vec(max_num_tokens * freq_dim);
-    std::vector<Eigen::bfloat16> im_vec(max_num_tokens * freq_dim);
-    if (num_scaled_freq < freq_dim) {
-        // Unscaled dimensions must use identity rotation (cos=1, sin=0), not zero.
-        MatrixXXbf padded_re = MatrixXXbf::Ones(max_num_tokens, freq_dim);
-        MatrixXXbf padded_im = MatrixXXbf::Zero(max_num_tokens, freq_dim);
-        padded_re.block(0, 0, max_num_tokens, num_scaled_freq) = re;
-        padded_im.block(0, 0, max_num_tokens, num_scaled_freq) = im;
-        std::copy_n(padded_re.data(), re_vec.size(), re_vec.data());
-        std::copy_n(padded_im.data(), im_vec.size(), im_vec.data());
-    } else {
-        std::copy_n(re.data(), re_vec.size(), re_vec.data());
-        std::copy_n(im.data(), im_vec.size(), im_vec.data());
+    // Each frequency lands on both channels of its rotation pair. The pre model multiplies sin
+    // by a pure channel swap of the data, so the sin of the real channel carries the minus sign
+    // of the rotation: out[i] = x[i] * cos - x[imag_start + i] * sin. Channels the rotation
+    // does not reach keep the neutral rotation of cos 1 and sin 0: the tail of a partial
+    // rotation, the middle segment of a proportional one, and any frequency the scaling dropped.
+    MatrixXXbf re = MatrixXXbf::Ones(max_num_tokens, layer_head_dim);
+    MatrixXXbf im = MatrixXXbf::Zero(max_num_tokens, layer_head_dim);
+    for (const uint16_t start : {uint16_t(0), imag_start}) {
+        const float sign = start == 0 ? -1.0f : 1.0f;
+        re.block(0, start, max_num_tokens, num_scaled_freq) = re_float.cast<Eigen::bfloat16>();
+        im.block(0, start, max_num_tokens, num_scaled_freq) = (
+            (sign * im_float).cast<Eigen::bfloat16>()
+        );
     }
+
+    std::vector<Eigen::bfloat16> re_vec(static_cast<size_t>(max_num_tokens) * layer_head_dim);
+    std::vector<Eigen::bfloat16> im_vec(static_cast<size_t>(max_num_tokens) * layer_head_dim);
+    std::copy_n(re.data(), re_vec.size(), re_vec.data());
+    std::copy_n(im.data(), im_vec.size(), im_vec.data());
     return {std::move(re_vec), std::move(im_vec)};
 }
 
@@ -201,11 +228,22 @@ RopeTable calc_mrope_with_image(
     uint32_t image_token_id,
     std::span<const uint32_t> input_token_ids
 ) {
-    // Map the pre-calculated rope table in std::vector back to Eigen array.
+    // Map the pre-calculated rope table in std::vector back to Eigen array. The table is
+    // layer_head_dim wide, so every mrope section lives twice in it: once at the real half and
+    // once at the imaginary half.  See rope_channel_layout.
     const auto& max_num_tokens = vlm_cfg.pipeline_cfg.max_num_tokens;
-    uint16_t freq_dim = master_rope_table.re.size() / max_num_tokens;
-    Eigen::Map<const ArrayXXbf> master_re(master_rope_table.re.data(), max_num_tokens, freq_dim);
-    Eigen::Map<const ArrayXXbf> master_im(master_rope_table.im.data(), max_num_tokens, freq_dim);
+    const auto& rope_cfg = vlm_cfg.lm_cfg.rope_cfg;
+    uint16_t table_width = master_rope_table.re.size() / max_num_tokens;
+    const auto layer_head_dim = vlm_cfg.lm_cfg.attn_cfg.get_head_dim("full_attention");
+    const auto [half_rope_dim, imag_start] = rope_channel_layout(
+        static_cast<uint16_t>(rope_cfg.get_rope_dimension_count("full_attention")),
+        static_cast<uint16_t>(layer_head_dim),
+        rope_cfg.rope_scaling.rope_type == "proportional"
+    );
+    assert(table_width == layer_head_dim);
+    const std::array<uint16_t, 2> halves{0, imag_start};
+    Eigen::Map<const ArrayXXbf> master_re(master_rope_table.re.data(), max_num_tokens, table_width);
+    Eigen::Map<const ArrayXXbf> master_im(master_rope_table.im.data(), max_num_tokens, table_width);
 
     // Since image size is fixed at the compile time, so the number of patches (or grids) per each
     // side is fixed.
@@ -222,12 +260,17 @@ RopeTable calc_mrope_with_image(
     const auto& mrope_sections = rope_scaling.mrope_section.value();
     const auto& mrope_interleaved = rope_scaling.mrope_interleaved;
 
-    // Construct the updated rope table.
+    // Construct the updated rope table.  Channels the mrope sections do not reach keep the
+    // neutral rotation of cos 1 and sin 0, as calc_freq_real_imag leaves them.
     RopeTable updated_rope_table;
-    updated_rope_table.re.resize(max_num_tokens * freq_dim);
-    updated_rope_table.im.resize(max_num_tokens * freq_dim);
-    Eigen::Map<ArrayXXbf> updated_re(updated_rope_table.re.data(), max_num_tokens, freq_dim);
-    Eigen::Map<ArrayXXbf> updated_im(updated_rope_table.im.data(), max_num_tokens, freq_dim);
+    updated_rope_table.re.assign(
+        static_cast<size_t>(max_num_tokens) * table_width, Eigen::bfloat16{1.0f}
+    );
+    updated_rope_table.im.assign(
+        static_cast<size_t>(max_num_tokens) * table_width, Eigen::bfloat16{0.0f}
+    );
+    Eigen::Map<ArrayXXbf> updated_re(updated_rope_table.re.data(), max_num_tokens, table_width);
+    Eigen::Map<ArrayXXbf> updated_im(updated_rope_table.im.data(), max_num_tokens, table_width);
 
     size_t pos_idx = 0;
     size_t token_idx = 0;
@@ -248,11 +291,11 @@ RopeTable calc_mrope_with_image(
             num_text_tokens = std::distance(input_token_ids.begin(), it) - token_idx;
         }
         if (num_text_tokens > 0) {
-            updated_re.block(token_idx, 0, num_text_tokens, freq_dim) = (
-                master_re.block(pos_idx, 0, num_text_tokens, freq_dim)
+            updated_re.block(token_idx, 0, num_text_tokens, table_width) = (
+                master_re.block(pos_idx, 0, num_text_tokens, table_width)
             );
-            updated_im.block(token_idx, 0, num_text_tokens, freq_dim) = (
-                master_im.block(pos_idx, 0, num_text_tokens, freq_dim)
+            updated_im.block(token_idx, 0, num_text_tokens, table_width) = (
+                master_im.block(pos_idx, 0, num_text_tokens, table_width)
             );
 
             if (it == input_token_ids.end())
@@ -281,12 +324,22 @@ RopeTable calc_mrope_with_image(
                 for (size_t j = 0; j < num_grids_w; ++j) {
                     // Temporal.
                     updated_re.row(curr_token_idx) = master_re.row(pos_idx);
-                    // Height.
-                    updated_re(curr_token_idx, Eigen::seqN(1, mrope_sections[1], Eigen::fix<3>)) =
-                        master_re(pos_idx + i, Eigen::seqN(1, mrope_sections[1], Eigen::fix<3>));
-                    // Width.
-                    updated_re(curr_token_idx, Eigen::seqN(2, mrope_sections[2], Eigen::fix<3>)) =
-                        master_re(pos_idx + j, Eigen::seqN(2, mrope_sections[2], Eigen::fix<3>));
+                    for (const size_t base : halves) {
+                        // Height.
+                        updated_re(
+                            curr_token_idx,
+                            Eigen::seqN(base + 1, mrope_sections[1], Eigen::fix<3>)
+                        ) = master_re(
+                            pos_idx + i, Eigen::seqN(base + 1, mrope_sections[1], Eigen::fix<3>)
+                        );
+                        // Width.
+                        updated_re(
+                            curr_token_idx,
+                            Eigen::seqN(base + 2, mrope_sections[2], Eigen::fix<3>)
+                        ) = master_re(
+                            pos_idx + j, Eigen::seqN(base + 2, mrope_sections[2], Eigen::fix<3>)
+                        );
+                    }
                     ++curr_token_idx;
                 }
             }
@@ -295,12 +348,22 @@ RopeTable calc_mrope_with_image(
                 for (size_t j = 0; j < num_grids_w; ++j) {
                     // Temporal.
                     updated_im.row(curr_token_idx) = master_im.row(pos_idx);
-                    // Height.
-                    updated_im(curr_token_idx, Eigen::seqN(1, mrope_sections[1], Eigen::fix<3>)) =
-                        master_im(pos_idx + i, Eigen::seqN(1, mrope_sections[1], Eigen::fix<3>));
-                    // Width.
-                    updated_im(curr_token_idx, Eigen::seqN(2, mrope_sections[2], Eigen::fix<3>)) =
-                        master_im(pos_idx + j, Eigen::seqN(2, mrope_sections[2], Eigen::fix<3>));
+                    for (const size_t base : halves) {
+                        // Height.
+                        updated_im(
+                            curr_token_idx,
+                            Eigen::seqN(base + 1, mrope_sections[1], Eigen::fix<3>)
+                        ) = master_im(
+                            pos_idx + i, Eigen::seqN(base + 1, mrope_sections[1], Eigen::fix<3>)
+                        );
+                        // Width.
+                        updated_im(
+                            curr_token_idx,
+                            Eigen::seqN(base + 2, mrope_sections[2], Eigen::fix<3>)
+                        ) = master_im(
+                            pos_idx + j, Eigen::seqN(base + 2, mrope_sections[2], Eigen::fix<3>)
+                        );
+                    }
                     ++curr_token_idx;
                 }
             }
@@ -311,36 +374,52 @@ RopeTable calc_mrope_with_image(
             size_t curr_token_idx = token_idx;
             for (size_t i = 0; i < num_grids_h; ++i) {
                 for (size_t j = 0; j < num_grids_w; ++j) {
-                    // Temporal.
-                    updated_re.block(curr_token_idx, temporal_offset, 1, mrope_sections[0]) = (
-                        master_re.block(pos_idx, temporal_offset, 1, mrope_sections[0])
-                    );
-                    // Height.
-                    updated_re.block(curr_token_idx, height_offset, 1, mrope_sections[1]) = (
-                        master_re.block(pos_idx + i, height_offset, 1, mrope_sections[1])
-                    );
-                    // Width.
-                    updated_re.block(curr_token_idx, width_offset, 1, mrope_sections[2]) = (
-                        master_re.block(pos_idx + j, width_offset, 1, mrope_sections[2])
-                    );
+                    for (const size_t base : halves) {
+                        // Temporal.
+                        updated_re.block(
+                            curr_token_idx, base + temporal_offset, 1, mrope_sections[0]
+                        ) = master_re.block(
+                            pos_idx, base + temporal_offset, 1, mrope_sections[0]
+                        );
+                        // Height.
+                        updated_re.block(
+                            curr_token_idx, base + height_offset, 1, mrope_sections[1]
+                        ) = master_re.block(
+                            pos_idx + i, base + height_offset, 1, mrope_sections[1]
+                        );
+                        // Width.
+                        updated_re.block(
+                            curr_token_idx, base + width_offset, 1, mrope_sections[2]
+                        ) = master_re.block(
+                            pos_idx + j, base + width_offset, 1, mrope_sections[2]
+                        );
+                    }
                     ++curr_token_idx;
                 }
             }
             curr_token_idx = token_idx;
             for (size_t i = 0; i < num_grids_h; ++i) {
                 for (size_t j = 0; j < num_grids_w; ++j) {
-                    // Temporal.
-                    updated_im.block(curr_token_idx, temporal_offset, 1, mrope_sections[0]) = (
-                        master_im.block(pos_idx, temporal_offset, 1, mrope_sections[0])
-                    );
-                    // Height.
-                    updated_im.block(curr_token_idx, height_offset, 1, mrope_sections[1]) = (
-                        master_im.block(pos_idx + i, height_offset, 1, mrope_sections[1])
-                    );
-                    // Width.
-                    updated_im.block(curr_token_idx, width_offset, 1, mrope_sections[2]) = (
-                        master_im.block(pos_idx + j, width_offset, 1, mrope_sections[2])
-                    );
+                    for (const size_t base : halves) {
+                        // Temporal.
+                        updated_im.block(
+                            curr_token_idx, base + temporal_offset, 1, mrope_sections[0]
+                        ) = master_im.block(
+                            pos_idx, base + temporal_offset, 1, mrope_sections[0]
+                        );
+                        // Height.
+                        updated_im.block(
+                            curr_token_idx, base + height_offset, 1, mrope_sections[1]
+                        ) = master_im.block(
+                            pos_idx + i, base + height_offset, 1, mrope_sections[1]
+                        );
+                        // Width.
+                        updated_im.block(
+                            curr_token_idx, base + width_offset, 1, mrope_sections[2]
+                        ) = master_im.block(
+                            pos_idx + j, base + width_offset, 1, mrope_sections[2]
+                        );
+                    }
                     ++curr_token_idx;
                 }
             }
