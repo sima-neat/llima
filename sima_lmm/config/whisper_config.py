@@ -20,7 +20,7 @@ class WhisperConfig(BaseConfig):
     num_mel_bins: int = 80
     suppress_tokens: list[int] = field(default_factory=list)
     vocab_size: int = 51865
-    activation_function: str = "gelu"
+    activation_function: str = "gelu_pytorch_tanh"
     num_languages: int = 99
     language_token_ids: list[int] = field(default_factory=list)
     language_codes: list[str] = field(default_factory=list)
@@ -41,6 +41,9 @@ class WhisperConfig(BaseConfig):
             name: value
             for name, value in model_cfg.items() if name in field_names
         }
+        # Avoid the BF16 Erf approximation when compiling Whisper GELU.
+        if filtered_model_cfg.get("activation_function", "gelu") == "gelu":
+            filtered_model_cfg["activation_function"] = "gelu_pytorch_tanh"
         generation_cfg_file = find_file(
             directory=Path(model_path), filename="generation_config.json", resolve=False
         )

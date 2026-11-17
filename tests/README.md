@@ -29,6 +29,28 @@ controls the two expensive test jobs. Latest-tag promotion requires successful
 artifact publication and accepts an intentional test skip only when the
 corresponding resolver output is false.
 
+## MoLE evaluator checks
+
+Run `tests/mole/` in the candidate MoLE environment with network access disabled
+through Hugging Face's offline settings. This exercises
+upstream RealWorldQA, DocVQA and ChartQA protocols/scoring against prepared tiny
+datasets and the actual ZMQ client in both host and DevKit-local modes. It does
+not validate MLA execution or measured model accuracy.
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+  python -P -m pytest -o addopts='' tests/mole -q
+```
+
+The runtime suite's `test_zmq_black_box.py` also checks image/text generation,
+multiple images, malformed request recovery and runtime identity against the
+installed candidate packages on Modalix. Set `SIMA_TEST_LLIMA_VLM_MODEL` to the
+packaged Qwen3.5-2B model directory for the initial model validation. Run the
+full dataset evaluation in both modes following
+[MoLE image-plus-text accuracy](../docs/mole.md#image-plus-text-accuracy) before publishing support
+or accuracy results. Those hardware checks are required even if hermetic tests
+and the package build pass.
+
 ## Model compiler CI
 
 ### Purpose
@@ -64,11 +86,17 @@ export LLIMA_HF_MODELS_PATH=/path/to/llima-model-inputs
 
 ### Test groups
 
+Use one representative model case per architecture in each applicable suite.
+Reuse the same checkpoint for configuration, ingestion, graph, and integration
+coverage. Do not add separate model cases for parameter sizes, fine-tunes, or
+revisions of the same architecture. Component and precision checks reuse that
+representative; cover configuration variants with small hermetic tests.
+
 #### Fast compiler unit tests
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 430
+- Expected cases: 440
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -85,7 +113,7 @@ offline mode, and reject network connections.
 
 - Location: `tests/compilation/configuration/`
 - Marker: `compiler_config`
-- Expected cases: 26
+- Expected cases: 27
 
 Generates `VlmConfig` objects from cached Hugging Face and GGUF sources and
 compares them with the checked-in JSON contracts under
@@ -122,9 +150,11 @@ coverage of the other GGUF quantization formats.
 
 - Location: `tests/compilation/graph_regression/`
 - Marker: `compiler_graph_regression`
-- Expected cases: 37
+- Expected cases: 41
 
-All current cases are required.
+The existing 37 cases are required. The 4 SmolVLM2 component checks use one
+representative checkpoint, SmolVLM2-256M, and are informative
+until the published develop compiler includes that architecture.
 
 Every case:
 
@@ -137,6 +167,7 @@ Every case:
 Vision cases cover layer 0, including patch and position embeddings, plus one
 intermediate layer selected deterministically from the case ID. The same
 layers are generated for both revisions and executed independently.
+SmolVLM2 also generates the last vision layer to cover its connector.
 
 Feature branches, except `release*`, also generate the same components with
 the latest published `develop` compiler wheel. `develop`, `main`, `release*`,
@@ -167,7 +198,7 @@ are not stored in the repository or artifact cache.
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 31 standard and 6 high-memory
+- Expected cases: 34 standard and 6 high-memory
 
 This group validates:
 
@@ -178,7 +209,12 @@ This group validates:
 - One Q4_0 GGUF pre-layer graph smoke case against a Hugging Face BF16 graph.
 - Speculative pre, cache, post, and draft-FC graph generation.
 
-The speculative-decoding cases are serial and high-memory. CI runs the 31
+SmolVLM2 cases compare real final-encoder-layer and connector outputs against
+Transformers using the 256M representative, in floating and direct BF16 graph paths.
+They also check aspect-preserving preprocessing, frame order, and one visual
+token block per image.
+
+The speculative-decoding cases are serial and high-memory. CI runs the 34
 standard cases first and the 6 high-memory cases separately.
 
 #### Selected-model full compilation E2E
@@ -344,7 +380,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
 | `runtime.gemma4_mtp_helpers` | Packed causal masks at compiled context widths, sliding-window offsets, ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
 
-The embedding generation test requires raw embedding tables on local NVMe
+The embedding generation test requires raw embedding tables on accessible storage
 and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
 `SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
 and `auto`, verifies that automatic offloading saves DRAM, and checks allocation

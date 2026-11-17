@@ -129,14 +129,14 @@ with zipfile.ZipFile(sys.argv[1]) as wheel:
         name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")
     )
     metadata = wheel.read(metadata_name).decode("utf-8")
-    sdk_ext_lines = [
+    mole_lines = [
         line for line in metadata.splitlines()
-        if line.startswith("Requires-Dist:") and 'extra == "sdk-ext"' in line
+        if line.startswith("Requires-Dist:") and 'extra == "mole"' in line
     ]
-    if not sdk_ext_lines:
-        raise SystemExit("ERROR: Wheel does not define sdk_ext dependencies.")
-    if any("sima-frontend" in line.lower() for line in sdk_ext_lines):
-        raise SystemExit("ERROR: sdk_ext unexpectedly depends on sima-frontend.")
+    if not mole_lines:
+        raise SystemExit("ERROR: Wheel does not define mole dependencies.")
+    if any("sima-frontend" in line.lower() for line in mole_lines):
+        raise SystemExit("ERROR: mole unexpectedly depends on sima-frontend.")
 PY
 
 WHEEL_VERSION="$("${PYTHON_BIN}" - "${SOURCE_WHEEL}" <<'PY'
@@ -193,7 +193,7 @@ metadata.update(
             "type": "python-wheel",
             "repository": "llima",
             "package_path": "mole",
-            "profile": "mole-sdk-ext",
+            "profile": "mole",
             "wheel": wheel_name,
         },
         "repository": repository,

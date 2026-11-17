@@ -35,6 +35,10 @@ for native graphs and preserve staged/direct quantization where applicable.
 Align reference tensor layouts as documented in the relevant architecture
 reference. Reject ambiguous configuration or tensor layouts.
 
+Use one representative model case per architecture across model-backed test
+suites. Reuse its checkpoint; do not multiply model cases by size, fine-tune,
+or revision. Cover parameter variants with hermetic tests.
+
 Preserve checkpoint, revision, format, precision, and image shape. Validate HF
 and GGUF independently. Never equate host loading or CPU/reference execution
 with complete runtime support; label mirror/derivative evidence as provisional.

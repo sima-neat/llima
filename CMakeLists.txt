@@ -333,6 +333,7 @@ target_compile_definitions(
     ${TARGET_RUNTIME}
     PRIVATE
         SIMA_LMM_DEFAULT_ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/sima_lmm/assets"
+        SIMA_LMM_PACKAGE_VERSION="${SIMA_LMM_PACKAGE_VERSION}"
 )
 
 target_compile_options(
