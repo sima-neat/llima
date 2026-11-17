@@ -20,7 +20,8 @@ EmbeddingOffloadMode embedding_offload_mode() {
     const std::string mode = value ? value : "auto";
     if (mode == "auto") return EmbeddingOffloadMode::Auto;
     if (mode == "off") return EmbeddingOffloadMode::Off;
-    throw std::runtime_error("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD must be auto or off");
+    if (mode == "on") return EmbeddingOffloadMode::On;
+    throw std::runtime_error("SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD must be auto, off or on");
 }
 
 bool embedding_device_on_nvme(const std::filesystem::path& device) {

@@ -98,12 +98,12 @@ class PlatformPackageBoundaryTest(unittest.TestCase):
         manifest = json.loads(read("deps/manifest.json"))
         workflow = read(".github/workflows/vulcan-ci.yml")
 
-        self.assertEqual(manifest["platform-version"], "3.0.0")
+        self.assertEqual(manifest["platform-version"], "3.0.1")
         self.assertNotIn("sysroot-version", manifest)
-        self.assertEqual(manifest["elxr_version"], "3.0.0_master_B2499")
+        self.assertEqual(manifest["elxr_version"], "3.0.1_master_B2796")
         self.assertRegex(
             manifest["elxr_version"],
-            r"^3[.]0[.]0_(?:master|develop)_B[1-9][0-9]*$",
+            r"^3[.]0[.]1_(?:master|develop)_B[1-9][0-9]*$",
         )
         self.assertIn("needs.resolve-sysroot.outputs.sysroot_version", workflow)
         self.assertIn('/workspace/scripts/ci/prepare_sysroot.sh "${sysroot_version}"', workflow)
