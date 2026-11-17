@@ -114,9 +114,9 @@ jobs:
 
   resolve-sysroot:
     name: Resolve Sysroot
-    uses: sima-neat/.github/.github/workflows/resolve-sysroot.yml@e68cb51d6cb52320b4c1b93dc3c652c63b6fd357
+    uses: sima-neat/.github/.github/workflows/resolve-sysroot.yml@main
     with:
-      shared_workflow_ref: e68cb51d6cb52320b4c1b93dc3c652c63b6fd357
+      shared_workflow_ref: main
 
   resolve-vulcan-config:
     name: Resolve Vulcan Config
@@ -133,9 +133,9 @@ jobs:
   resolve-test-runner:
     name: Resolve Test Runner
     needs: [resolve-vulcan-config]
-    uses: sima-neat/.github/.github/workflows/vulcan-resolve-modalix-runner.yml@e68cb51d6cb52320b4c1b93dc3c652c63b6fd357
+    uses: sima-neat/.github/.github/workflows/vulcan-resolve-modalix-runner.yml@main
     with:
-      shared_workflow_ref: e68cb51d6cb52320b4c1b93dc3c652c63b6fd357
+      shared_workflow_ref: main
       allow-version-fallback: false
       runner-labels: >-
         ["self-hosted", "Linux", "ARM64", "modalix", "modalix-som-16gig", "vulcan-${{ needs.resolve-vulcan-config.outputs.vulcan_env == 'prod' && 'production' || needs.resolve-vulcan-config.outputs.vulcan_env }}"]
