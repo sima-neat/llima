@@ -120,6 +120,13 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
 
     if (_pending.empty()) _pending_from_draft = from_draft;
     _pending.append(text);
+    if (_mode == Mode::AwaitingHiddenStart && !_channel_headers && !text.empty()) {
+        if (!_pending_runs.empty() && _pending_runs.back().second == from_draft) {
+            _pending_runs.back().first += text.size();
+        } else {
+            _pending_runs.emplace_back(text.size(), from_draft);
+        }
+    }
 
     while (_mode != Mode::Done) {
         // A hidden start is optional: keep leading whitespace until a marker is confirmed.
@@ -168,6 +175,7 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
             const std::string_view candidate = std::string_view(_pending).substr(skipped);
             if (candidate.starts_with(_start_marker)) {
                 _pending.erase(0, skipped + _start_marker.size());
+                _pending_runs.clear();
                 _pending_from_draft = from_draft;
                 _mode = hide_reasoning ? Mode::HiddenReasoning : Mode::Reasoning;
                 continue;
@@ -175,11 +183,12 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
             if (_start_marker.starts_with(candidate)) {
                 if (!done) break;
                 // Generation ended before a marker was confirmed: it was ordinary text.
-                if (keep_whitespace) emit(events, std::move(_pending), false, _pending_from_draft);
+                if (keep_whitespace) flush_pending_as_content(events);
                 _pending.clear();
                 _mode = Mode::Done;
                 break;
             }
+            if (keep_whitespace) flush_pending_as_content(events);
             _mode = Mode::Content;
             continue;
         }
@@ -260,6 +269,18 @@ void ReasoningStreamParser::emit(
 ) {
     if (text.empty()) return;
     events.push_back({std::move(text), reasoning, from_draft});
+}
+
+void ReasoningStreamParser::flush_pending_as_content(std::vector<Event>& events) {
+    size_t offset = 0;
+    for (const auto& [size, from_draft] : _pending_runs) {
+        const size_t take = std::min(size, _pending.size() - offset);
+        emit(events, _pending.substr(offset, take), false, from_draft);
+        offset += take;
+    }
+    emit(events, _pending.substr(offset), false, _pending_from_draft);
+    _pending.clear();
+    _pending_runs.clear();
 }
 
 size_t ReasoningStreamParser::partial_marker_size(std::string_view marker) const {

@@ -145,6 +145,22 @@ void test_gemma_hides_its_own_thought_when_thinking_is_off() {
     // A thought channel preceded by whitespace is still hidden.
     assert(run({"\n ", "<|channel>thought\n<channel|>Done."}) == "Done.");
     assert(run({"\n<|channel>thought\nhmm<channel|>Done."}) == "Done.");
+
+    // Buffered whitespace keeps the origin of the chunk it came from.
+    ReasoningStreamParser mixed(ReasoningFormat::Gemma4, false);
+    ParsedText origins;
+    append_events(origins, mixed.add("\n  ", false, false));
+    append_events(origins, mixed.add("answer", true, true));
+    assert(origins.content == "\n  answer");
+    assert(origins.content_provenance == std::vector<bool>({false, true}));
+
+    ReasoningStreamParser reversed(ReasoningFormat::Gemma4, false);
+    ParsedText reversed_origins;
+    append_events(reversed_origins, reversed.add("\n", false, true));
+    append_events(reversed_origins, reversed.add("  ", false, false));
+    append_events(reversed_origins, reversed.add("<", true, true));
+    assert(reversed_origins.content == "\n  <");
+    assert(reversed_origins.content_provenance == std::vector<bool>({true, false, true}));
 }
 
 // gpt-oss tags every message with a channel header. Reasoning ends at any header,

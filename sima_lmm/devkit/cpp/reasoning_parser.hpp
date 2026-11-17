@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace simaai {
@@ -57,6 +58,8 @@ class ReasoningStreamParser {
             bool from_draft
         );
         size_t partial_marker_size(std::string_view marker) const;
+        // Passes the whole pending text through as content, keeping each chunk's origin.
+        void flush_pending_as_content(std::vector<Event>& events);
 
         std::string_view _start_marker;
         std::string_view _end_marker;
@@ -66,6 +69,8 @@ class ReasoningStreamParser {
         bool _channel_headers = false;
         std::string _pending;
         bool _pending_from_draft = false;
+        // Origin of each run of pending text while an optional hidden start is undecided.
+        std::vector<std::pair<size_t, bool>> _pending_runs;
 };
 
 } // namespace llima
