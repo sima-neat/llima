@@ -104,6 +104,65 @@ void test_gemma_generated_and_prompt_opened_boundaries() {
     assert_no_markers(continued);
 }
 
+// Gemma 4 can emit thought channels after tool results even when thinking is disabled.
+void test_gemma_hides_its_own_thought_when_thinking_is_off() {
+    ReasoningStreamParser after_tools(ReasoningFormat::Gemma4, false);
+    ParsedText parsed;
+    append_events(parsed, after_tools.add("<|chan"));
+    append_events(parsed, after_tools.add("nel>thought\n"));
+    append_events(parsed, after_tools.add("<channel|>The file is saved.", true));
+    assert(parsed.reasoning.empty());
+    assert(parsed.content == "The file is saved.");
+    assert_no_markers(parsed);
+
+    ReasoningStreamParser with_text(ReasoningFormat::Gemma4, false);
+    ParsedText hidden;
+    append_events(hidden, with_text.add("<|channel>thought\nlet me check<channel|>Done.", true));
+    assert(hidden.reasoning.empty());
+    assert(hidden.content == "Done.");
+
+    ReasoningStreamParser call(ReasoningFormat::Gemma4, false);
+    ParsedText calling;
+    append_events(calling, call.add("<|tool_call>call:x{}<tool_call|>", true));
+    assert(calling.content == "<|tool_call>call:x{}<tool_call|>");
+
+    // Ordinary output is preserved exactly, however it is chunked.
+    const auto run = [](const std::vector<std::string>& chunks) {
+        ReasoningStreamParser parser(ReasoningFormat::Gemma4, false);
+        ParsedText out;
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            append_events(out, parser.add(chunks[i], i + 1 == chunks.size()));
+        }
+        assert(out.reasoning.empty());
+        return out.content;
+    };
+    assert(run({"\n    return 42;"}) == "\n    return 42;");
+    assert(run({"\n  ", "return 42;"}) == "\n  return 42;");
+    assert(run({" \n\t"}) == " \n\t");
+    assert(run({"<"}) == "<");
+    assert(run({"\n<|chan"}) == "\n<|chan");
+    assert(run({"<|tool_call>call:x{}<tool_call|>"}) == "<|tool_call>call:x{}<tool_call|>");
+    // A thought channel preceded by whitespace is still hidden.
+    assert(run({"\n ", "<|channel>thought\n<channel|>Done."}) == "Done.");
+    assert(run({"\n<|channel>thought\nhmm<channel|>Done."}) == "Done.");
+
+    // Buffered whitespace keeps the origin of the chunk it came from.
+    ReasoningStreamParser mixed(ReasoningFormat::Gemma4, false);
+    ParsedText origins;
+    append_events(origins, mixed.add("\n  ", false, false));
+    append_events(origins, mixed.add("answer", true, true));
+    assert(origins.content == "\n  answer");
+    assert(origins.content_provenance == std::vector<bool>({false, true}));
+
+    ReasoningStreamParser reversed(ReasoningFormat::Gemma4, false);
+    ParsedText reversed_origins;
+    append_events(reversed_origins, reversed.add("\n", false, true));
+    append_events(reversed_origins, reversed.add("  ", false, false));
+    append_events(reversed_origins, reversed.add("<", true, true));
+    assert(reversed_origins.content == "\n  <");
+    assert(reversed_origins.content_provenance == std::vector<bool>({true, false, true}));
+}
+
 // gpt-oss tags every message with a channel header. Reasoning ends at any header,
 // and the role name that precedes it must not reach the output.
 void test_gptoss_analysis_to_final() {
@@ -194,6 +253,7 @@ int main() {
     test_qwen_generated_open_and_split_close();
     test_qwen_prompt_opened_and_truncated();
     test_gemma_generated_and_prompt_opened_boundaries();
+    test_gemma_hides_its_own_thought_when_thinking_is_off();
     test_gptoss_analysis_to_final();
     test_gptoss_commentary_is_hidden_but_final_survives();
     test_gptoss_tool_call_commentary_is_shown();

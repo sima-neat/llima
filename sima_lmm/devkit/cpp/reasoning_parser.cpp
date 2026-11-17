@@ -91,6 +91,11 @@ ReasoningStreamParser::ReasoningStreamParser(
         _end_marker = gptoss_channel;
         _channel_headers = true;
         _mode = enabled ? Mode::AwaitingStart : Mode::AwaitingHiddenStart;
+    } else if (format == ReasoningFormat::Gemma4 && !enabled) {
+        // Gemma 4 can emit thought channels after tool results even when thinking is disabled.
+        _start_marker = "<|channel>";
+        _end_marker = gemma_reasoning_close;
+        _mode = Mode::AwaitingHiddenStart;
     } else if (!enabled || format == ReasoningFormat::None) {
         _mode = Mode::Content;
     } else if (format == ReasoningFormat::Qwen) {
@@ -115,10 +120,19 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
 
     if (_pending.empty()) _pending_from_draft = from_draft;
     _pending.append(text);
+    if (_mode == Mode::AwaitingHiddenStart && !_channel_headers && !text.empty()) {
+        if (!_pending_runs.empty() && _pending_runs.back().second == from_draft) {
+            _pending_runs.back().first += text.size();
+        } else {
+            _pending_runs.emplace_back(text.size(), from_draft);
+        }
+    }
 
     while (_mode != Mode::Done) {
+        // A hidden start is optional: keep leading whitespace until a marker is confirmed.
         if (
-            _mode == Mode::AwaitingStart || _mode == Mode::AwaitingHiddenStart ||
+            _mode == Mode::AwaitingStart ||
+            (_mode == Mode::AwaitingHiddenStart && _channel_headers) ||
             (_mode == Mode::Reasoning && _optional_start)
         ) {
             const auto first_non_whitespace = _pending.find_first_not_of(" \t\r\n");
@@ -155,19 +169,26 @@ std::vector<ReasoningStreamParser::Event> ReasoningStreamParser::add(
                 _pending_from_draft = from_draft;
                 continue;
             }
-            if (_pending.starts_with(_start_marker)) {
-                _pending.erase(0, _start_marker.size());
+            const bool keep_whitespace = hide_reasoning && !_channel_headers;
+            const size_t skipped = keep_whitespace
+                ? std::min(_pending.find_first_not_of(" \t\r\n"), _pending.size()) : 0;
+            const std::string_view candidate = std::string_view(_pending).substr(skipped);
+            if (candidate.starts_with(_start_marker)) {
+                _pending.erase(0, skipped + _start_marker.size());
+                _pending_runs.clear();
                 _pending_from_draft = from_draft;
                 _mode = hide_reasoning ? Mode::HiddenReasoning : Mode::Reasoning;
                 continue;
             }
-            if (_start_marker.starts_with(_pending)) {
-                if (done) {
-                    _pending.clear();
-                    _mode = Mode::Done;
-                }
+            if (_start_marker.starts_with(candidate)) {
+                if (!done) break;
+                // Generation ended before a marker was confirmed: it was ordinary text.
+                if (keep_whitespace) flush_pending_as_content(events);
+                _pending.clear();
+                _mode = Mode::Done;
                 break;
             }
+            if (keep_whitespace) flush_pending_as_content(events);
             _mode = Mode::Content;
             continue;
         }
@@ -248,6 +269,18 @@ void ReasoningStreamParser::emit(
 ) {
     if (text.empty()) return;
     events.push_back({std::move(text), reasoning, from_draft});
+}
+
+void ReasoningStreamParser::flush_pending_as_content(std::vector<Event>& events) {
+    size_t offset = 0;
+    for (const auto& [size, from_draft] : _pending_runs) {
+        const size_t take = std::min(size, _pending.size() - offset);
+        emit(events, _pending.substr(offset, take), false, from_draft);
+        offset += take;
+    }
+    emit(events, _pending.substr(offset), false, _pending_from_draft);
+    _pending.clear();
+    _pending_runs.clear();
 }
 
 size_t ReasoningStreamParser::partial_marker_size(std::string_view marker) const {

@@ -92,8 +92,11 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_chat_model(
         );
     }
     // gpt_oss always emits harmony channel tokens; preserve them even with
-    // thinking off so the parser can strip to the final channel.
-    if (chat.get_enable_thinking() || reasoning_format == ReasoningFormat::GptOss) {
+    // thinking off so the parser can strip to the final channel. Gemma 4 opens a
+    // thought channel itself after tool results even with thinking off, and the
+    // parser hides it only if its markers come through.
+    if (chat.get_enable_thinking() || reasoning_format == ReasoningFormat::GptOss ||
+        reasoning_format == ReasoningFormat::Gemma4) {
         for (const auto marker : reasoning_special_tokens(reasoning_format)) {
             try {
                 preserved_tokens.emplace_back(
