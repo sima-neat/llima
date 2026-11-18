@@ -524,6 +524,29 @@ void test_preserves_stream_content_provenance() {
     }
 }
 
+// The compact Qwen case in test_preserves_argument_order has no whitespace inside the tags.
+// This input is constructed, not recorded. It follows the shape seen in answers from the CI
+// text model, Qwen2.5-0.5B-Instruct-Autoround-a16w4, that came back unparsed over HTTP on a
+// Modalix DevKit: the JSON on its own line, with spaces after the separators.
+void test_parses_newline_wrapped_qwen_tool_call() {
+    const auto calls = try_parse_tool_calls(
+        ToolCallFormat::Qwen,
+        R"(<tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris", "unit": "celsius"}}
+</tool_call>)",
+        {"get_weather", "get_time"}
+    );
+    expect(!calls.is_null(), "a newline-wrapped Qwen tool call must parse");
+    if (calls.is_null()) return;
+    expect(calls.size() == 1, "a newline-wrapped Qwen tool call must parse to one call");
+    if (calls.size() != 1) return;
+    expect(calls.at(0).at("function").at("name") == "get_weather",
+           "a newline-wrapped Qwen tool call must keep its function name");
+    const auto arguments = arguments_from(calls);
+    expect(arguments.at("city") == "Paris" && arguments.at("unit") == "celsius",
+           "a newline-wrapped Qwen tool call must keep its arguments");
+}
+
 } // namespace
 
 int main() {
@@ -539,6 +562,7 @@ int main() {
     test_streams_non_tool_gemma_json_without_waiting_for_end();
     test_preserves_stream_content_provenance();
     test_gptoss_harmony_pipeline();
+    test_parses_newline_wrapped_qwen_tool_call();
 
     if (failures != 0) {
         std::cerr << failures << " tool-call parser assertion(s) failed\n";
