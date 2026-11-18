@@ -1,0 +1,5 @@
+add_executable(sima_lmm_lfm2_audio_server server.cpp)
+target_link_libraries(sima_lmm_lfm2_audio_server PRIVATE sima_lmm_runtime OpenSSL::Crypto)
+set_target_properties(sima_lmm_lfm2_audio_server PROPERTIES INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+install(TARGETS sima_lmm_lfm2_audio_server RUNTIME DESTINATION bin COMPONENT extras)
+install(DIRECTORY web/ DESTINATION share/sima-lmm/lfm2_audio COMPONENT extras)

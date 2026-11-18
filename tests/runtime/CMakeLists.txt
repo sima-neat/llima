@@ -6,6 +6,21 @@ target_include_directories(sima_lmm_embedding_offload_test PRIVATE "${PROJECT_SO
 target_link_libraries(sima_lmm_embedding_offload_test PRIVATE OpenMP::OpenMP_CXX)
 add_test(NAME runtime.embedding_offload COMMAND sima_lmm_embedding_offload_test)
 set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
+add_executable(sima_lmm_audio_generation_test audio_generation_test.cpp
+    "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/audio_generation.cpp")
+target_include_directories(sima_lmm_audio_generation_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+target_link_libraries(sima_lmm_audio_generation_test PRIVATE PkgConfig::FFTW3)
+target_compile_options(sima_lmm_audio_generation_test PRIVATE -UNDEBUG)
+add_test(NAME runtime.audio_generation COMMAND sima_lmm_audio_generation_test)
+set_tests_properties(runtime.audio_generation PROPERTIES LABELS "runtime;unit;audio" TIMEOUT 30)
+add_executable(sima_lmm_lfm2_audio_smoke lfm2_audio_smoke.cpp)
+target_include_directories(sima_lmm_lfm2_audio_smoke PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+target_link_libraries(sima_lmm_lfm2_audio_smoke PRIVATE sima_lmm_runtime)
+set_target_properties(sima_lmm_lfm2_audio_smoke PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+add_executable(sima_lmm_audio_component_test audio_component_test.cpp)
+target_include_directories(sima_lmm_audio_component_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+target_link_libraries(sima_lmm_audio_component_test PRIVATE sima_lmm_runtime)
+set_target_properties(sima_lmm_audio_component_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 add_test(NAME runtime.embedding_offload_generation COMMAND sima_lmm_embedding_offload_generation_test)
 set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
 
@@ -177,6 +192,9 @@ install(
     TARGETS
         sima_lmm_embedding_offload_generation_test
         sima_lmm_embedding_offload_test
+        sima_lmm_audio_generation_test
+        sima_lmm_lfm2_audio_smoke
+        sima_lmm_audio_component_test
         sima_lmm_mla_rt_lifecycle_test
         sima_lmm_text_generation_test
         sima_lmm_vision_generation_test
@@ -200,6 +218,12 @@ install(
         CMakeLists.txt
         embedding_offload_generation_test.cpp
         embedding_offload_test.cpp
+        audio_generation_test.cpp
+        lfm2_audio_smoke.cpp
+        audio_component_test.cpp
+        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/lfm2_audio_model.hpp"
+        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/audio_generation.hpp"
+        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/audio_generation.cpp"
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.hpp"
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp"
         asr_transcription_test.cpp

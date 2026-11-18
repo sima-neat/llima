@@ -274,9 +274,20 @@ class LocalHuggingFaceModel:
         if not directory.is_dir():
             raise NotADirectoryError(f"Expected a Hugging Face model directory: {directory}")
         # Load model config
-        config_file = find_file(directory=directory, filename="config.json", resolve=False)
+        config_file = directory / "config.json"
+        if not config_file.is_file():
+            config_file = find_file(directory=directory, filename="config.json", resolve=False)
         if config_file is None or not config_file.is_file():
             raise FileNotFoundError(f"Model config.json not found in {directory}")
+        with config_file.open(encoding="utf-8") as stream:
+            source_config = json.load(stream)
+        if "Lfm2AudioForConditionalGeneration" in source_config.get("architectures", []):
+            raise NotImplementedError(
+                "LFM2 Audio requires the explicit experimental component compiler: "
+                "scripts/gen_models--liquidai--lfm2_audio.py. "
+                "The standard llima-compile/runtime entry points do not register "
+                "this audio architecture. See docs/lfm2_audio_development.md."
+            )
         hf_config = AutoConfig.from_pretrained(config_file.parent)
         config = hf_config.to_dict()
 

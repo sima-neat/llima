@@ -1,0 +1,282 @@
+# LFM2.5 Audio development target
+
+The explicit compiler covers the language backbone, FastConformer encoder,
+adapter, depth transformer and default LFM2 audio detokenizer. A private C++
+runtime implements persistent caches, the eight-codebook loop and sequential/
+interleaved generation. This is an experimental contributor workflow; the
+ordinary `llima-compile`, `llima run` and GenAI server paths do not register it.
+
+## Source and precision
+
+- Checkpoint: `LiquidAI/LFM2.5-Audio-1.5B`, revision
+  `95d7e5a0ca706151aa7b7989275a902007a04cbe`.
+- Reference: [liquid-audio](https://github.com/Liquid4All/liquid-audio/tree/19e65845923a7f136442c95137884ec61eb386aa).
+- MLA compute: BF16 activations and INT8 quantizable weights, `A_BF16_W_INT8`.
+- KV state is BF16. CPU embedding tables retain the original checkpoint dtype;
+  normalization parameters, constants and scales follow compiler precision rules.
+  This does not mean every stored tensor occupies eight bits.
+
+Use an unquantized single-file snapshot containing the root `config.json`,
+`model.safetensors`, tokenizer JSON assets, `chat_template.jinja`, and
+`audio_detokenizer/{config.json,model.safetensors}`. Sharded, pre-quantized, GGUF
+audio checkpoints and the optional older Mimi decoder are outside this target.
+The adapter exposes separate component views without relabeling the whole audio
+architecture as a text LLM. Depth Q/K weights and norm scales are permuted
+together for rotary ordering. Decoder embeddings are averaged; generation
+embeddings are summed over eight codebooks.
+
+## Compile and package
+
+From the checkout in the Model Compiler environment:
+
+```bash
+source /sdk-extensions/model-compiler/bin/activate
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+python scripts/gen_models--liquidai--lfm2_audio.py /path/to/snapshot \
+  -o /path/to/audio-build
+```
+
+The default plan contains 104 units. The output includes quantized SDK graphs,
+MPK archives and `audio_compile_manifest.json`, with source hashes, compiler
+versions, graph signatures, tensor interfaces and archive hashes.
+`complete_compute_build` becomes true after every planned unit compiles;
+compilation alone does not establish runtime or speech quality.
+
+Use `--resume` after interruption. Matching completed archives are reused.
+Floating SDK intermediates are removed after successful compilation unless
+`--keep-fp32` is set. Diagnostics include `--component encoder`,
+`--unit 'encoder_n32_layer*'`, `--list` and `--stage export|quantize|compile|all`.
+
+Defaults: 1,024-token language context, 16-token prefill, 256 input mel frames,
+12 output code frames per decoder chunk. The encoder bucket accepts about
+2.55 seconds of 16 kHz PCM. Longer utterances require a larger `--audio-frames`
+build; splitting a bidirectional encoder input is not an equivalent workaround.
+Other sizing flags are `--context-length`, `--group-size`, `--decoder-frames`.
+
+After the complete build:
+
+```bash
+python -m sima_lmm.host.prepare_lfm2_audio_runtime \
+  /path/to/snapshot /path/to/audio-build
+```
+
+Packaging verifies source/graph/configuration identity, archive hashes and one
+MLA segment per unit without A65 fallback, then writes `audio-build/runtime/`.
+It extracts MLA ELFs and exports host tables and tokenizer assets. The runtime
+uses recorded raw BF16 interfaces, bypassing MPK cast wrappers.
+
+The encoder preserves physical input boundaries through explicit stage masks.
+Its fixed relative-position projection is folded offline, and relative shift
+uses static row selection. This avoids the compiler's constant-only projection
+layout failure while retaining the tested floating computation. Inference batch
+normalization uses a depthwise 1x1 affine convolution: the current compiler's
+constant-vector multiplication produced incorrect channel scales on Modalix.
+
+## Native execution
+
+Build in the Neat SDK:
+
+```bash
+./build.sh --core --dev --no-dist --jobs 1 --build-dir /path/to/runtime-build \
+  -- -DSIMA_LMM_BUILD_PYTHON=OFF -DSIMA_LMM_BUILD_TESTS=ON
+```
+
+On Modalix, use the isolated build library if necessary instead of replacing
+the installed runtime:
+
+```bash
+LD_LIBRARY_PATH=/path/to/runtime-build:$LD_LIBRARY_PATH \
+  /path/to/runtime-build/tests/runtime/sima_lmm_lfm2_audio_smoke \
+  /path/to/audio-build/runtime "Say hello." /tmp/audio-output.f32 32
+```
+
+Output is raw mono float32 PCM at 24 kHz. The optional next argument supplies
+raw mono float32 input PCM at 16 kHz; use `-` when no input is supplied. A
+task argument accepts `interleaved` (default), `asr` or `tts`. ASR and TTS use
+sequential generation and the pinned source's fixed system prompts. TTS selects
+the UK male voice, temperature 0.8 and top-k 64; other tasks use greedy sampling.
+The runner uses the saved Jinja template through Minja and the saved tokenizer.
+It reports text, code frames, samples and elapsed time. The step limit is a
+generation limit, not an audio-duration limit.
+
+For example, append `64 /tmp/clip-16k.f32 asr` after the output filename for
+transcription, or `128 - tts` for text-to-speech. ASR prints its text and leaves
+the output PCM file empty.
+
+An optional repeat count follows the task, for example `128 - tts 6`. Each
+request resets session state and the sampling seed while retaining loaded
+weights. Only the last request's PCM file is retained. `metrics_json` records
+first output event, first visible text, first complete audio-code frame, PCM
+availability and per-stage times. Requests start before audio preprocessing and
+prompt preparation; constructor, input-file reads, HTTP and network time are
+excluded. The legacy `elapsed_seconds` covers generation plus waveform decoding
+and excludes audio preprocessing/encoding and prompt preparation.
+
+Temporal, depth and decoder caches are separate. Depth resets for every frame.
+The decoder keeps 29 previous attention entries, absolute rotary positions,
+convolution tails and waveform overlap state. A response reset clears session
+state. This is a single-session contributor runtime; it does not add an
+audio-output GenAI task or real-time guarantees. The optional example below
+provides HTTP streaming and browser-side input resampling.
+
+## Browser microphone and speaker server
+
+Build the optional example in the Neat SDK by adding
+`-DSIMA_LMM_BUILD_AUDIO_SERVER=ON` to the build command above. On Modalix:
+
+```bash
+LD_LIBRARY_PATH=/path/to/runtime-build:$LD_LIBRARY_PATH \
+  /path/to/runtime-build/examples/lfm2_audio/sima_lmm_lfm2_audio_server \
+  /path/to/audio-build/runtime /path/to/llima/examples/lfm2_audio/web \
+  8096 127.0.0.1
+```
+
+The `extras` install component includes the executable in `bin/` and web assets
+in `share/sima-lmm/lfm2_audio/`. It uses the native audio backend directly;
+the normal `llima run` and Neat GenAIServer remain separate interfaces.
+
+On the computer with your microphone and speakers, keep this tunnel running:
+
+```bash
+ssh -N -L 8096:127.0.0.1:8096 sima@DEVKIT
+```
+
+Open `http://localhost:8096`. Allow microphone access, click **Record question**,
+say a short question, and click **Send recording**. Recording stops automatically
+at 2.5 seconds for the default bucket. Browser input is resampled to mono 16 kHz;
+the reply plays at 24 kHz. You can use the computer's built-in microphone and
+speakers or a headset; USB audio devices on Modalix are unnecessary. Browser
+microphone access requires a secure context, which localhost provides; opening
+the DevKit's plain HTTP LAN address does not provide that context. See
+[the browser microphone contract](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia).
+
+Weights remain loaded between requests; conversation state resets for each
+request. One generation runs at a time, with HTTP 409 for a concurrent request.
+**Stop reply** cancels the current request and playback. Playback starts when a
+decoder chunk is ready; codes alone are not playable audio. The page reports
+server text/PCM/completion times and browser PCM arrival/scheduled playback
+times. Recording time is excluded, and playback may continue after generation
+finishes. The first request includes lazy model loading.
+
+The experimental HTTP contract is:
+
+- `GET /api/health`: model, input limit, sample rates and busy state.
+- `POST /api/speech?id=REQUEST_ID`: raw mono little-endian float32 PCM at 16 kHz,
+  `Content-Type: application/octet-stream`; optional `task=asr` selects transcription.
+- `POST /api/text?id=REQUEST_ID`: JSON with `text`, optional `task` (`interleaved`
+  or `tts`) and `max_steps` (1–512, default 320).
+- `POST /api/stop?id=REQUEST_ID`: cancels only the matching active request.
+
+Generation responses are newline-delimited JSON events: `start`, cumulative
+`text`, `audio` (base64 `pcm_s16le`, 24 kHz mono), and `done` with timings. Errors
+after streaming starts use an `error` event. Input lengths and values are
+validated; oversized clips are rejected rather than split or truncated. The
+server binds localhost by default and disables cross-origin browser requests.
+It is an experimental single-user example without authentication or TLS.
+
+For repeatable protocol and device checks, provide a short speech fixture and
+write reports outside the checkout:
+
+```bash
+python3 examples/lfm2_audio/validate_server.py http://localhost:8096 \
+  /path/to/mono-16k.f32 --output /path/to/server-validation
+```
+
+This checks invalid input, contention, matching-request cancellation, subsequent
+requests and deterministic state reset. It saves streamed replies as WAV files.
+Run it while the demo is idle. Actual microphone and speaker quality should also
+be checked interactively with the browser.
+
+Resume fingerprints include module helpers and tensor aliases/rotary settings.
+Archives made with the earlier development signature are intentionally not
+reused by the current compiler. This does not change their existing executables;
+fresh packaging with current source requires a current compile manifest.
+
+## Validation and limits
+
+The fast compiler suite has 490 cases. Added hermetic cases cover ingestion,
+BF16 loading, depth rotary conversion, projection bias/slicing and subsampling
+boundaries. Four checkpoint-backed integration cases cover conv-cache updates,
+attention prefill, final normalization and the depth-head epsilon. Additional
+pinned-source checks:
+
+| Floating check | Maximum absolute difference |
+| --- | --- |
+| Selected language blocks | 1.04e-5 |
+| Conformer block, full/padded lengths | 5.73e-5 |
+| Encoder subsampling | 1.84e-4 |
+| Adapter | 3.58e-7 |
+| Depth block, eight cached positions and resets | 2.69e-7 |
+| Complete eight-layer decoder, two 72-step chunks | 8.70e-5 |
+| CPU inverse FFT/overlap-add, 1/6/17 frames | 3.52e-8 |
+
+These selected FP32 comparisons do not establish full-model W8 speech quality.
+The native frontend reproduces the Slaney filterbank exactly; tested noise/tone
+features differed by at most 1.06e-4. Exact silence differs by up to 0.161 because
+the source's FP32 reduction roundoff is amplified by its normalization epsilon.
+Do not claim bitwise frontend equivalence. Reference-generated mel features can
+be supplied to `encode_mel`.
+
+`sima_lmm_audio_generation_test` checks sampling, generation modes and waveform
+chunking. `sima_lmm_audio_component_test` accepts a generated fixture JSON to
+save actual MLA outputs for comparison with quantized SDK outputs. Full-model
+ASR/TTS/speech-to-speech quality, long sessions and sustained throughput still
+require explicit evaluation before ready-to-use support is advertised.
+
+## Local compile and Modalix validation, 2026-11-18
+
+The default 104-unit build completed with `A_BF16_W_INT8`: 49 backbone,
+19 encoder, 22 depth and 14 detokenizer units. Every archive contained one MLA
+segment and no A65 neural fallback. All 104 executable paths were observed in
+successful native runs across the following smoke tests:
+
+- Interleaved text/audio: returned `Hello! How can I help you today?` and
+  42,240 waveform samples at 24 kHz from a bounded 32-step run.
+- Sequential ASR: consumed 1.76 seconds of resampled generated speech and
+  returned `Hello! How are`.
+- Sequential TTS: `Hello from Modalix.` generated 38,400 samples. An existing
+  Whisper service transcribed the result as `Hello from Modellix.`. This is a
+  small intelligibility check, not a speech-quality or WER benchmark.
+
+Selected backbone, subsampling, rewritten Conformer and depth interfaces matched
+the quantized SDK outputs bit for bit on Modalix, including physical K/V strides
+and a partial-length subsampling input. The compiler wheel, native core/dev
+packages and runtime test targets built; packaged audio-generation tests passed
+on the board. The normal CLI/server registration boundary above still applies.
+
+## Exploratory native latency, 2026-11-18
+
+Local NVMe execution used one initial request followed by five requests with
+weights resident in the same process. Existing model services remained running.
+The following are medians of the five resident requests, not sustained or
+isolated-service benchmarks:
+
+| Task | Prompt tokens | First visible text | First audio-code frame | Full request |
+| --- | --- | --- | --- | --- |
+| ASR, 1.76-second input | 42 | 451 ms | N/A | 605 ms |
+| Interleaved text/audio | 28 | 449 ms | 708 ms | 3,436 ms |
+| TTS, UK male voice | 31 | N/A | 618 ms | 2,003 ms |
+
+TTS's first output was an audio-start control token at 551 ms. The initial
+requests had first-visible-text times of 3,201 ms for ASR and 2,563 ms for
+interleaved generation; initial TTS audio codes arrived at 2,722 ms. Those
+requests included lazy MLA model loading. Constructor time was an additional
+826–841 ms, and filesystem caches may have been warm.
+
+The current runner buffers all audio codes before waveform decoding. First PCM
+therefore arrived at 2,002 ms for the 1.6-second TTS output and 3,435 ms for the
+3.04-second interleaved output. Audio codes are not playable PCM. These timings
+do not include transport or playback, and prefill currently uses only 16-token
+and single-token graphs.
+
+Speech-in/speech-out was also measured directly, without a text prompt or
+separate ASR/TTS pipeline. A complete 1.44-second synthetic question, `Two plus
+two?`, produced `Two plus two equals four. Anything else I can help with?` and
+10.96 seconds of output audio. Five resident requests had a median complete
+request time of 10,215 ms (range 10,205–10,218 ms), including 28.5 ms for input
+preprocessing/encoding and 138.8 ms for waveform decoding. First visible text
+arrived at 481 ms, first audio codes at 740 ms, and buffered PCM at 10,214 ms.
+The initial request took 13,629 ms, plus 825 ms for construction. Recording,
+transport and playback are excluded. A separate 1.76-second partial greeting
+produced a clarification request and 9.92 seconds of audio in 9,604 ms; both
+cases are timing checks, not dataset-level quality results.
