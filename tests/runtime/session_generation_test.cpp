@@ -39,12 +39,22 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
                                                helper.get_pad_token_id(), draft_stream);
     };
     auto draft = make_draft();
-    const auto a = helper.get_tokenizer()->encode("Name one planet.", true);
-    const auto b = helper.get_tokenizer()->encode("Name one color.", true);
+    auto prepare = [&](const std::string& query) {
+        Chat chat(helper);
+        chat.clear_system_prompt();
+        chat.set_enable_thinking(false);
+        chat.add_query(query);
+        return helper.preprocess(chat).input_token_ids;
+    };
+    const auto a = prepare("Name one planet.");
+    const auto b = prepare("Name one color.");
+    const auto limit_for = [&](const auto& prompt) {
+        return static_cast<uint16_t>(prompt.size() + cfg.lm_cfg.get_single_num_tokens() + 12);
+    };
     auto generate = [&](SessionId id, const std::vector<uint32_t>& prompt, bool direct_mtp = false) {
         target.select_session(id);
         target.create_input_buffers(prompt);
-        const uint16_t limit = static_cast<uint16_t>(prompt.size() + 12);
+        const auto limit = limit_for(prompt);
         auto result = direct_mtp
             ? target.run_model_gemma4_mtp(*draft, prompt, limit)
             : target.run_model_speculative_decoding(*draft, prompt, limit);
@@ -67,21 +77,27 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
     require(draft->get_kv_cache_len() == sentinel && target.get_kv_cache_len() == 0,
             "A failed direct request did not preserve the public draft or clear the target");
     require(generate(session, b, mtp) == gold_b, "Direct speculative recovery changed tokens");
+    std::atomic<bool> cancelled_on_first_token = false;
     target_stream.set_info_callback([&](const std::string& key, double) {
-        if (key == "tps") target.stop_model();
+        if (key == "ttft") {
+            target.stop_model();
+            cancelled_on_first_token = true;
+        }
     });
     target_stream.enable();
     target.create_input_buffers(a);
-    const auto interrupted = target.run_model_speculative_decoding(*draft, a, a.size() + 12);
+    const auto interrupted = target.run_model_speculative_decoding(*draft, a, limit_for(a));
     target_stream.disable();
     target_stream.set_info_callback([](const std::string&, double) {});
-    require(!interrupted && draft->get_kv_cache_len() == sentinel && target.get_kv_cache_len() == 0,
-            "Cancelled speculative request corrupted the public draft or retained the target cache");
+    require(cancelled_on_first_token, "The direct speculative request did not emit a first-token event");
+    require(!interrupted, "Direct speculative generation returned tokens after cancellation");
+    require(draft->get_kv_cache_len() == sentinel, "Cancellation changed the public draft cache");
+    require(target.get_kv_cache_len() == 0, "Cancellation retained the target cache");
     require(generate(session, b, mtp) == gold_b, "Cancellation changed the next direct request");
     target.release_session(session);
     require(target.get_kv_cache_len() > 0, "Expected the original target session to retain its prefix");
     const auto previous_length = target.get_kv_cache_len();
-    rejected([&] { target.run_model_speculative_decoding(target, a, a.size() + 12); },
+    rejected([&] { target.run_model_speculative_decoding(target, a, limit_for(a)); },
              "Direct speculative generation accepted the target as its own draft");
     require(target.get_kv_cache_len() == previous_length && draft->get_kv_cache_len() == sentinel,
             "Rejecting an incompatible draft changed a session cache");
