@@ -19,13 +19,18 @@ struct RuntimeBufferImport {
     uint64_t epoch;
     ~RuntimeBufferImport();
 };
+// A submitted run retains the DMA imports for exactly the relocation ports it selected.
+struct RuntimeRelocation {
+    std::vector<mla_tensor> ports;
+    std::vector<std::shared_ptr<RuntimeBufferImport>> imports;
+};
 struct RuntimeProgram {
     RuntimeContext* context;
     size_t index;
     ~RuntimeProgram();
-    std::map<std::string, std::shared_ptr<MLABuffer>> neutral_reloc;
-    std::map<std::string, MLABuffer*> active_reloc; // Empty selects the neutral adapter.
-    std::vector<std::shared_ptr<RuntimeBufferImport>> reloc_imports;
+    void activate_relocation(const std::shared_ptr<const RuntimeRelocation>& desired);
+    std::shared_ptr<const RuntimeRelocation> neutral_reloc;
+    std::shared_ptr<const RuntimeRelocation> active_reloc; // Null selects the base model.
 };
 
 class RuntimeContext {

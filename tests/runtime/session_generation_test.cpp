@@ -63,6 +63,15 @@ int main(int argc, char** argv) {
         };
         first->reset_session(0);
         const auto gold_a = generate(0, a);
+        if (draft) {
+            draft->reset_session(0);
+            require(generate(0, a) == gold_a,
+                    "Resetting the draft's public session corrupted a paired target cache");
+            const auto branch_after_reset = generate(0, b);
+            first->reset_session(0);
+            require(branch_after_reset == generate(0, b),
+                    "Resetting the draft's public session corrupted a branched prompt");
+        }
         first->reset_session(0);
         const auto gold_b = generate(0, b);
         require(!gold_a.empty() && !gold_b.empty(), "Fresh references are empty");
@@ -72,6 +81,8 @@ int main(int argc, char** argv) {
         const auto workspace = first->workspace_memory_bytes();
         const SessionId sa = 0;
         const auto sb = first->create_session();
+        require(first->session_memory_bytes(sb) == 0,
+                "Unused session allocated device buffers or recurrent checkpoint snapshots");
         require(generate(sa, a) == gold_a, "Session A differs from fresh reference");
         require(generate(sb, b) == gold_b, "Session B differs from fresh reference");
         require(generate(sa, a) == gold_a, "Session A repeat uses another session's state");
@@ -96,8 +107,14 @@ int main(int argc, char** argv) {
         std::atomic<bool> busy_rejected = false;
         first->set_info_callback([&](const std::string& key, double) {
             if (key != "ttft") return;
-            try { first->reset_session(sa); }
-            catch (const std::logic_error&) { busy_rejected = true; }
+            const auto busy = [](auto&& action) {
+                try { action(); } catch (const std::logic_error&) { return true; }
+                return false;
+            };
+            busy_rejected = busy([&] { first->reset_session(sa); })
+                         && busy([&] { first->unset_reloc(sa); })
+                         && busy([&] { first->set_reloc(sa, "unused"); })
+                         && busy([&] { first->workspace_memory_bytes(); });
             first->stop_model();
         });
         auto cancel_chat = first->create_chat();
@@ -106,7 +123,7 @@ int main(int argc, char** argv) {
         cancel_chat.add_query("Write a long detailed story about a journey through space.");
         const auto cancelled = first->run_model(sa, cancel_chat, 512);
         first->wait_for_streamer_completion();
-        require(busy_rejected, "Reset during active generation was not rejected");
+        require(busy_rejected, "A busy workspace operation was not rejected from the callback");
         require(!cancelled.has_value(), "Cancelled request returned a completed response");
         first->set_info_callback([](const std::string&, double) {});
         require(generate(sa, a) == gold_a, "Cancellation recovery differs from fresh reference");
@@ -115,6 +132,25 @@ int main(int argc, char** argv) {
         first->wait_for_streamer_completion();
         require(generate(sa, b) == gold_b, "Exception recovery differs from fresh reference");
         std::cout << json{{"case", "cancel_exception_recovery"}, {"runtime_ok", true}}.dump() << '\n';
+
+        if (draft && cfg.lm_cfg.is_dflash()) {
+            GenerationOptions block_options;
+            block_options.max_new_tokens = 128;
+            block_options.stop_token_ids = std::set<uint32_t>{};
+            bool stopped_after_verification = false;
+            bool signalled_full = false;
+            block_options.info_callback = [&](const std::string& key, double) {
+                if (key == "tps" && !stopped_after_verification) {
+                    stopped_after_verification = true;
+                    first->stop_model();
+                }
+                if (key == "FULL") signalled_full = true;
+            };
+            const auto interrupted = first->run_model(sa, cancel_chat, block_options);
+            require(!interrupted && stopped_after_verification && !signalled_full,
+                    "DFlash reported successful completion or a full cache after cancellation");
+            require(generate(sa, a) == gold_a, "DFlash block cancellation left stale state");
+        }
 
         std::atomic<unsigned> default_chunks = 0;
         std::atomic<unsigned> request_chunks = 0;
@@ -136,6 +172,17 @@ int main(int argc, char** argv) {
         };
         rejected([&] { first->run_model(sa, option_chat, options); }, "Callback exception was swallowed");
         require(generate(sa, a) == gold_a, "Callback exception left the next request corrupted");
+
+        unsigned completions = 0;
+        options.info_callback = [&](const std::string& key, double) {
+            if (key == "END" || key == "FULL") {
+                ++completions;
+                first->stop_model();
+            }
+        };
+        require(!first->run_model(sa, option_chat, options),
+                "Cancellation from the terminal callback arrived after result assembly");
+        require(completions == 1, "Streaming completion was delivered more than once");
 
         const auto timing = first->run_model_for_ttnt(sa, a);
         require(timing.generated_tokens > 1, "Nested prefill leaked its output limit into decode");

@@ -19,6 +19,7 @@ namespace llima {
 class FileProvider;  // forward declaration; full type in file_provider.hpp
 class LanguageModel;
 struct RuntimeProgram;
+struct RuntimeRelocation;
 class LanguageExecutor;
 
 void connect_mla_rt(const std::vector<std::string>& args);
@@ -83,7 +84,9 @@ class MLAModelWithBuffer {
         }
 
     private:
-        void _apply_reloc(const std::map<std::string, MLABuffer*>& reloc_buffers);
+        std::shared_ptr<const RuntimeRelocation> _prepare_reloc(
+            const std::map<std::string, MLABuffer*>& buffers);
+        void _refresh_reloc();
         void _record_buffer_bindings(
             std::map<std::string, std::vector<MLABuffer**>>& bindings
         );
@@ -107,6 +110,7 @@ class MLAModelWithBuffer {
         std::vector<MLABufferSlice> _ifms;
         std::vector<MLABufferSlice> _ofms;
         std::map<std::string, MLABuffer*> _reloc_buffers;
+        std::shared_ptr<const RuntimeRelocation> _relocation;
 
         static inline bool _profile = false;
         static inline bool _print_inouts = false;

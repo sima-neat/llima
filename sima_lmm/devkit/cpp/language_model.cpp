@@ -106,6 +106,14 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer,
     std::shared_ptr<FileProvider> file_provider
+) : LanguageModel(std::move(model_path), std::move(stop_token_ids), image_token_id, pad_token_id,
+                  text_streamer, std::move(file_provider), false) {}
+
+LanguageModel::LanguageModel(
+    std::filesystem::path model_path, std::set<uint32_t> stop_token_ids,
+    std::optional<uint32_t> image_token_id, std::optional<uint32_t> pad_token_id,
+    TextStreamer& text_streamer, std::shared_ptr<FileProvider> file_provider,
+    bool defer_session_buffers
 ) : _resources(LanguageResources::acquire(model_path, std::move(file_provider))),
     _cfg(_resources->cfg),
     _elf_dir(_resources->package->elf_dir),
@@ -113,7 +121,7 @@ LanguageModel::LanguageModel(
     _files(_resources->package->files),
     _logger(_resources->package->logger),
     _sessions(std::make_unique<SessionManager>()),
-    _session(&_sessions->get(0)),
+    _session(_sessions->get(0)),
     _workspace(std::make_unique<LanguageWorkspace>()),
     _run(std::make_unique<LanguageRunState>(std::move(stop_token_ids),
         _cfg.pipeline_cfg.max_num_tokens, text_streamer)),
@@ -167,7 +175,7 @@ LanguageModel::LanguageModel(
         _workspace->eagle3_position_ids.assign(topk, 0);
     }
 
-    _initialize();
+    _initialize(defer_session_buffers);
 }
 
 
@@ -725,48 +733,16 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
         _workspace->per_layer_model_map.at({num_tokens, 0, 0}).add_to_queue(&inputs);
     }
 
-    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
-
-        std::map<uint8_t, MLABufferSlice> ifm_map;
-        if (layer_idx == 0) {
-            ifm_map.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(0),
-                std::forward_as_tuple(
-                    normal_input_buf,
-                    std::vector<uint32_t>{normal_input_row, 0},
-                    std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
-                )
-            );
+    for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
+        LanguageExecutor::Overrides inputs;
+        if (layer == 0) {
+            inputs.emplace(0, MLABufferSlice{normal_input_buf, {normal_input_row, 0},
+                                             {1, _cfg.lm_cfg.hidden_size}});
         }
-        if (
-            _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-            || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-        ) {
-            LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx,
-                normal_scale_buf, normal_input_row, {.input = &ifm_map, .post_input = &ifm_map});
-        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-            LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
-            LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx,
-                normal_scale_buf, normal_input_row,
-                {.input = &ifm_map, .output = nullptr});
-
-            if (layer_idx != (_cfg.lm_cfg.num_hidden_layers - 1)) {
-                continue;
-            }
-
-            ifm_map.clear();
-            _workspace->conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
-        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
-            LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx,
-                normal_scale_buf, normal_input_row,
-                {.input = &ifm_map, .output = nullptr});
-        } else {
-            throw std::runtime_error(
-                std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
-            );
-        }
+        const auto output = layer + 1 == _cfg.lm_cfg.num_hidden_layers
+            ? LanguageExecutor::LayerOutput::LogitsRow : LanguageExecutor::LayerOutput::AllRows;
+        LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer, normal_scale_buf,
+                                      normal_input_row, {.input = &inputs, .post_input = &inputs}, output);
     }
 
     MLAModelWithBuffer::run_queue();
@@ -893,17 +869,15 @@ uint32_t LanguageModel::run_model_once(
     uint32_t normal_input_num_tokens;
     if (use_input_tokens) {
         normal_input_buf = &get_buffer("input_embeds");
-        if (_cfg.pipeline_cfg.quantize_embeddings) {
-    normal_scale_buf = &get_buffer("input_embedding_scales");
-}
+        if (_cfg.pipeline_cfg.quantize_embeddings)
+            normal_scale_buf = &get_buffer("input_embedding_scales");
         if (_resources->embedding_offload) _prepare_offloaded_prompt(num_tokens, token_idx);
         normal_input_row = _resources->embedding_offload && _workspace->offload_chunk_staging ? 0 : token_idx;
         normal_input_num_tokens = num_tokens;
     } else {
         normal_input_buf = &get_buffer(_resources->embedding_offload ? "offload_decode_embeds" : "embeddings");
-        if (_cfg.pipeline_cfg.quantize_embeddings) {
-    normal_scale_buf = &get_buffer(_resources->embedding_offload ? "offload_decode_scales" : "embedding_scales");
-}
+        if (_cfg.pipeline_cfg.quantize_embeddings)
+            normal_scale_buf = &get_buffer(_resources->embedding_offload ? "offload_decode_scales" : "embedding_scales");
         normal_input_row = _resources->embedding_offload ? 0 : token_id;
         normal_input_num_tokens = 1;
         if (_resources->embedding_offload) _gather_embedding_rows({&token_id, 1}, *normal_input_buf, normal_scale_buf);
@@ -929,129 +903,30 @@ uint32_t LanguageModel::run_model_once(
         && num_tokens == _cfg.pipeline_cfg.input_token_group_size
     );
     MLABuffer* dflash_layer_input = nullptr;
+    const auto final_output = num_input_tokens > next_token_idx
+        ? LanguageExecutor::LayerOutput::CacheOnly : LanguageExecutor::LayerOutput::LogitsRow;
+    const uint16_t last_row = next_token_idx - token_idx - 1;
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        LanguageModelMapKey model_key(num_tokens, layer_idx, 0);
-
-        std::map<uint8_t, MLABufferSlice> ifm_map;
+        const bool last_layer = layer_idx + 1 == _cfg.lm_cfg.num_hidden_layers;
+        LanguageExecutor::Overrides inputs;
         if (layer_idx == 0) {
-            ifm_map.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(0),
-                std::forward_as_tuple(
-                    normal_input_buf,
-                    std::vector<uint32_t>{normal_input_row, 0},
-                    std::vector<uint32_t>{normal_input_num_tokens, _cfg.lm_cfg.hidden_size}
-                )
-            );
-        } else if (dflash_layer_input != nullptr) {
-            ifm_map.emplace(
-                0,
-                MLABufferSlice{
-                    dflash_layer_input,
-                    {0, 0},
-                    {num_tokens, _cfg.lm_cfg.hidden_size}
-                }
-            );
+            inputs.emplace(0, MLABufferSlice{normal_input_buf, {normal_input_row, 0},
+                                             {normal_input_num_tokens, _cfg.lm_cfg.hidden_size}});
+        } else if (dflash_layer_input) {
+            inputs.emplace(0, MLABufferSlice{dflash_layer_input, {0, 0},
+                                             {num_tokens, _cfg.lm_cfg.hidden_size}});
         }
 
-        MLABuffer* dflash_capture_buffer = nullptr;
-        std::map<uint8_t, MLABufferSlice> ofm_map;
-        if (direct_dflash_capture && layer_idx < _cfg.lm_cfg.num_hidden_layers - 1) {
-            dflash_capture_buffer = _get_dflash_hidden_buffer(num_tokens, layer_idx);
-            if (dflash_capture_buffer != nullptr) {
-                ofm_map.emplace(
-                    0,
-                    MLABufferSlice{
-                        dflash_capture_buffer,
-                        {0, 0},
-                        {num_tokens, _cfg.lm_cfg.hidden_size}
-                    }
-                );
-            }
+        MLABuffer* dflash_capture_buffer = direct_dflash_capture && !last_layer
+            ? _get_dflash_hidden_buffer(num_tokens, layer_idx) : nullptr;
+        LanguageExecutor::Overrides outputs;
+        if (dflash_capture_buffer) {
+            outputs.emplace(0, MLABufferSlice{dflash_capture_buffer, {0, 0},
+                                              {num_tokens, _cfg.lm_cfg.hidden_size}});
         }
-        auto* output_overrides = ofm_map.empty() ? nullptr : &ofm_map;
-        if (
-            _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-            || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
-        ) {
-            auto pre_inputs = ifm_map;
-            if (num_input_tokens > next_token_idx && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1) {
-                LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx,
-                    normal_scale_buf, normal_input_row, {.input = &pre_inputs},
-                    LanguageExecutor::LayerStage::PrefillPreOnly);
-                break;
-            }
-
-            const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-                && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-            const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-            // Using the single post for the target's final layer is valid only when the
-            // draft does not require that layer's hidden states. If it does, use the
-            // group post for the final layer so all group hidden states remain available.
-            const bool use_single_post_for_target_group = (
-                _cfg.lm_cfg.is_spec_decode()
-                && !is_draft
-                && num_tokens != single_num_tokens
-                && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
-            );
-
-            // Non-spec uses n1 for the final row. Target speculative prefill reuses
-            // the compiled verification width with a contiguous window containing that row.
-            if (num_tokens > 1 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
-                && !_cfg.lm_cfg.is_spec_decode()) {
-                ifm_map = LanguageExecutor::post_rows(*this, num_tokens, layer_idx, token_idx,
-                    num_input_tokens - 1 - token_idx, 1);
-            }
-            if (use_single_post_for_target_group) {
-                const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
-                const uint32_t slice_start = last_valid_row >= single_num_tokens - 1
-                    ? last_valid_row - (single_num_tokens - 1) : 0;
-                ifm_map = LanguageExecutor::post_rows(*this, num_tokens, layer_idx, token_idx,
-                    slice_start, single_num_tokens, dflash_layer_input);
-            }
-
-            LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx,
-                normal_scale_buf, normal_input_row,
-                {.input = &pre_inputs, .post_input = &ifm_map, .output = output_overrides});
-
-        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-            LanguageModelMapKey conv_model_key(num_tokens, layer_idx, 0);
-            LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx,
-                normal_scale_buf, normal_input_row,
-                {.input = &ifm_map, .output = output_overrides});
-
-            if (
-                num_input_tokens > next_token_idx
-                || layer_idx != (_cfg.lm_cfg.num_hidden_layers - 1)
-            ) {
-                continue;
-            }
-
-            ifm_map.clear();
-            if (num_tokens > 1) {
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(0),
-                    std::forward_as_tuple(
-                        nullptr,
-                        std::vector<uint32_t>{
-                            static_cast<uint32_t>(num_input_tokens - 1 - token_idx), 0
-                        },
-                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
-                    )
-                );
-            }
-            _workspace->conv_final_model_map.at(conv_model_key).add_to_queue(&ifm_map);
-        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
-            LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx,
-                normal_scale_buf, normal_input_row,
-                {.input = &ifm_map, .output = output_overrides});
-        } else {
-            throw std::runtime_error(
-                std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
-            );
-        }
-
+        LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, normal_scale_buf,
+            normal_input_row, {.input = &inputs, .post_input = &inputs, .output = &outputs},
+            last_layer ? final_output : LanguageExecutor::LayerOutput::AllRows, last_row);
         dflash_layer_input = dflash_capture_buffer;
 
         if (
@@ -1127,20 +1002,9 @@ uint32_t LanguageModel::run_model_once(
     uint32_t next_token_id;
     if (num_input_tokens <= next_token_idx) {
         if (_cfg.lm_cfg.is_spec_decode()) {
-            const bool is_draft = _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-            const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-            const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
-            const bool used_single_post_for_target_group = (
-                !is_draft && num_tokens != single_num_tokens
-            );
-            const uint32_t slice_start = (
-                used_single_post_for_target_group
-                && last_valid_row >= single_num_tokens - 1
-            ) ? last_valid_row - (single_num_tokens - 1) : 0;
-            const uint32_t row = last_valid_row - slice_start;
-            const uint16_t logits_num_tokens = used_single_post_for_target_group
-                ? single_num_tokens
-                : num_tokens;
+            const auto window = LanguageExecutor::logits_window(_cfg.lm_cfg, num_tokens, last_row);
+            const uint32_t row = last_row - window.first;
+            const uint16_t logits_num_tokens = window.width;
             const uint32_t vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
 
             if (_cfg.lm_cfg.lm_head_num_splits == 1) {
@@ -1578,21 +1442,61 @@ void LanguageModel::set_image_identity(std::string identity) {
 }
 
 void LanguageModel::bind_session_adapter() {
-    // Select wrapper-local bindings; execution restores them on shared native programs.
+    std::lock_guard lock(RuntimeContext::instance().execution_mutex);
+    _bind_adapter(_session->adapter);
+}
+
+void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter) {
+    if (_workspace->bound_adapter == adapter) return;
+    using Buffers = std::map<std::string, MLABuffer*>;
+    struct Change {
+        MLAModelWithBuffer& model;
+        Buffers buffers;
+        std::shared_ptr<const RuntimeRelocation> next;
+        std::shared_ptr<const RuntimeRelocation> previous;
+    };
+    std::vector<Change> changes;
+    const Buffers empty;
+    size_t matched = 0;
     for (const auto& [kind, models] : std::initializer_list<std::pair<std::string, LanguageModelMap*>>{
         {"pre", &_workspace->pre_model_map}, {"post", &_workspace->post_model_map},
         {"router", &_workspace->router_model_map}, {"expert", &_workspace->expert_model_map}}) {
         for (auto& [key, model] : *models) {
-            if (_session->adapter) {
-                const auto found = _session->adapter->bindings.find({kind, key});
-                if (found != _session->adapter->bindings.end()) {
-                    model.update_reloc(found->second);
-                    continue;
+            const Buffers* desired = &empty;
+            if (adapter) {
+                const auto found = adapter->bindings.find({kind, key});
+                if (found != adapter->bindings.end()) {
+                    desired = &found->second;
+                    ++matched;
                 }
             }
-            model.reset_reloc();
+            if (model._reloc_buffers != *desired)
+                changes.push_back({model, *desired, model._prepare_reloc(*desired), model._program->active_reloc});
         }
     }
+    if (adapter && matched != adapter->bindings.size())
+        throw std::invalid_argument("LoRA names a graph not present in the model");
+
+    // All ELF keys and ports are valid. Publish wrapper bindings only after every
+    // native update succeeds. A failed driver call leaves existing requests retryable.
+    size_t applied = 0;
+    try {
+        for (auto& change : changes) {
+            change.model._program->activate_relocation(change.next);
+            ++applied;
+        }
+    } catch (...) {
+        while (applied > 0) {
+            auto& change = changes[--applied];
+            change.model._program->activate_relocation(change.previous);
+        }
+        throw;
+    }
+    for (auto& change : changes) {
+        change.model._reloc_buffers.swap(change.buffers);
+        change.model._relocation = std::move(change.next);
+    }
+    _workspace->bound_adapter = adapter;
 }
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
@@ -1600,10 +1504,13 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
     if (_files->pulls_files())
         throw std::runtime_error("LoRA requires a local model directory; the asset provider cannot list npy_files");
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
-    auto found = _resources->adapters.find(reloc_name);
-    if (found == _resources->adapters.end()) {
-        auto adapter = std::make_shared<LanguageAdapter>();
-        const auto directory = _devkit_dir / "../npy_files" / reloc_name;
+    std::erase_if(_resources->adapters, [](const auto& entry) { return entry.second.expired(); });
+    std::optional<std::string> name(reloc_name);
+    const auto found = _resources->adapters.find(reloc_name);
+    auto adapter = found == _resources->adapters.end() ? nullptr : found->second.lock();
+    if (!adapter) {
+        adapter = std::make_shared<LanguageAdapter>();
+        const auto directory = _devkit_dir.parent_path() / "npy_files" / reloc_name;
         const std::regex pattern(R"(_n(\d+)_(pre|post|router)_layer(\d+)(?:_expert(\d+))?_)");
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
             if (entry.path().extension() != ".npy") continue;
@@ -1611,34 +1518,42 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
             const auto filename = entry.path().filename().string();
             if (!std::regex_search(filename, match, pattern))
                 throw std::runtime_error("Invalid file name for relocation: " + filename);
-            const auto width = static_cast<uint16_t>(std::stoi(match[1]));
+            const auto width = std::stoul(match[1]);
+            const auto layer = std::stoul(match[3]);
+            const auto expert = match[4].matched ? std::stoul(match[4]) : 0;
+            if (width > UINT16_MAX || layer > UINT8_MAX || expert > UINT16_MAX)
+                throw std::invalid_argument("Relocation graph index out of range: " + filename);
             if (!_use_group_token_models && width > 1) continue;
-            const auto layer = static_cast<uint8_t>(std::stoi(match[3]));
-            const auto expert = static_cast<uint16_t>(match[4].matched ? std::stoi(match[4]) : 0);
             const std::string kind = match[4].matched ? "expert" : match[2].str();
             const auto tensor = cnpy::npy_load(_files->get_path("npy_files/" + reloc_name + "/" + filename));
-            const auto name = entry.path().stem().string();
-            auto [buffer, inserted] = adapter->buffers.try_emplace(name, name, tensor.shape, "int8", true);
+            if (tensor.word_size != 1 || tensor.fortran_order || tensor.num_vals == 0)
+                throw std::invalid_argument("LoRA tensor must contain contiguous row-major bytes: " + filename);
+            const auto key = entry.path().stem().string();
+            auto [buffer, inserted] = adapter->buffers.try_emplace(key, key, tensor.shape, "int8", true);
             buffer->second.allocate();
             buffer->second.upload(tensor.data<void>());
-            adapter->bindings[{kind, {width, layer, expert}}].emplace(name, &buffer->second);
+            adapter->bindings[{kind, {width, layer, expert}}].emplace(key, &buffer->second);
         }
-        if (adapter->bindings.empty()) throw std::runtime_error("No LoRA relocation tensors found in " + directory.string());
-        found = _resources->adapters.emplace(reloc_name, std::move(adapter)).first;
+        if (adapter->bindings.empty())
+            throw std::runtime_error("No LoRA relocation tensors found in " + directory.string());
     }
-    _session->adapter = found->second;
-    _session->reloc_name = reloc_name;
+    auto& cached = _resources->adapters[reloc_name];
+    _bind_adapter(adapter);
+    cached = adapter;
+    _session->adapter = std::move(adapter);
+    _session->reloc_name = std::move(name);
     _session->invalidate_reuse();
-    bind_session_adapter();
+    if (_session->draft) _session->draft->invalidate_reuse();
 }
 
 void LanguageModel::unset_reloc() {
     if (!_session->adapter) return;
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
+    _bind_adapter(nullptr);
     _session->adapter.reset();
     _session->reloc_name.reset();
     _session->invalidate_reuse();
-    bind_session_adapter();
+    if (_session->draft) _session->draft->invalidate_reuse();
 }
 
 uint16_t LanguageModel::set_max_num_tokens(std::optional<uint16_t> max_num_tokens) {

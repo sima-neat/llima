@@ -248,8 +248,20 @@ target_link_libraries(sima_lmm_session_generation_test PRIVATE sima_lmm_runtime)
 set_target_properties(sima_lmm_session_generation_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 add_test(NAME runtime.session_generation COMMAND sima_lmm_session_generation_test)
 set_tests_properties(runtime.session_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
+add_test(NAME runtime.speculative_session_generation
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/run_speculative_session_test.py $<TARGET_FILE:sima_lmm_session_generation_test>)
+set_tests_properties(runtime.speculative_session_generation PROPERTIES
+    LABELS "devkit;runtime;genai;speculative;long" RESOURCE_LOCK mla TIMEOUT 900 SKIP_RETURN_CODE 77)
+install(FILES run_speculative_session_test.py DESTINATION lib/sima-lmm/tests COMPONENT extras)
 install(TARGETS sima_lmm_session_generation_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
 install(FILES session_generation_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
+
+add_executable(sima_lmm_lora_session_test lora_session_test.cpp)
+target_link_libraries(sima_lmm_lora_session_test PRIVATE sima_lmm_runtime cnpy-static)
+set_target_properties(sima_lmm_lora_session_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+add_test(NAME runtime.lora_session COMMAND sima_lmm_lora_session_test)
+set_tests_properties(runtime.lora_session PROPERTIES LABELS "devkit;runtime;genai;lora" RESOURCE_LOCK mla TIMEOUT 600)
+install(TARGETS sima_lmm_lora_session_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
 
 # This regression uses a private header, so only its binary is shipped in extras.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime_program_lifetime_test.cpp")

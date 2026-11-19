@@ -90,5 +90,9 @@ set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;run
 
 add_test(runtime.session_generation "./sima_lmm_session_generation_test")
 set_tests_properties(runtime.session_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
+add_test(runtime.speculative_session_generation "python3" "./run_speculative_session_test.py" "./sima_lmm_session_generation_test")
+set_tests_properties(runtime.speculative_session_generation PROPERTIES LABELS "devkit;runtime;genai;speculative;long" RESOURCE_LOCK mla TIMEOUT 900 SKIP_RETURN_CODE 77)
+add_test(runtime.lora_session "./sima_lmm_lora_session_test")
+set_tests_properties(runtime.lora_session PROPERTIES LABELS "devkit;runtime;genai;lora" RESOURCE_LOCK mla TIMEOUT 600)
 add_test(runtime.program_lifetime "./sima_lmm_runtime_program_lifetime_test")
 set_tests_properties(runtime.program_lifetime PROPERTIES LABELS "devkit;runtime" RESOURCE_LOCK mla TIMEOUT 120)

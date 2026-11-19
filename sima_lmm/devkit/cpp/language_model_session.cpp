@@ -8,14 +8,9 @@ namespace simaai::llima {
 
 void LanguageSession::init_layout(const LanguageSession& prototype) {
     checkpoint_boundaries = prototype.checkpoint_boundaries;
-    cached_states = prototype.cached_states;
-    // Checkpoint contents have no identity until the new session records their positions.
-    for (auto& state : cached_states) {
-        for (auto& layer : state.checkpoints) {
-            for (auto& snapshot : layer)
-                std::fill(snapshot.begin(), snapshot.end(), 0);
-        }
-    }
+    cached_states.reserve(prototype.cached_states.size());
+    for (const auto& state : prototype.cached_states)
+        cached_states.emplace_back(state.layout);
 }
 
 void LanguageSession::allocate(const LanguageResources& resources) {
@@ -55,25 +50,21 @@ void LanguageSession::invalidate_reuse() {
 }
 
 SessionManager::SessionManager() {
-    _sessions.try_emplace(0);
+    _sessions.emplace(0, std::make_shared<LanguageSession>());
 }
 
-const LanguageSession& SessionManager::get(SessionId id) const {
+const std::shared_ptr<LanguageSession>& SessionManager::get(SessionId id) const {
     const auto found = _sessions.find(id);
     if (found == _sessions.end())
         throw std::invalid_argument("Unknown language session");
     return found->second;
 }
 
-LanguageSession& SessionManager::get(SessionId id) {
-    return const_cast<LanguageSession&>(std::as_const(*this).get(id));
-}
-
 SessionId SessionManager::create(const LanguageSession& prototype) {
     if (_sessions.size() >= _limit)
         throw std::runtime_error("Language session limit reached");
-    LanguageSession session;
-    session.init_layout(prototype);
+    auto session = std::make_shared<LanguageSession>();
+    session->init_layout(prototype);
     const auto id = _next;
     _sessions.emplace(id, std::move(session));
     ++_next;
@@ -103,46 +94,85 @@ void SessionManager::set_limit(size_t limit) {
 }
 
 SessionId LanguageModel::create_session() {
-    if (_run->depth != 0 || _run->is_running)
+    if (_run->is_running)
         throw std::logic_error("Cannot create a session during generation");
-    return _sessions->create(_sessions->get(0));
+    return _sessions->create(*_sessions->get(0));
 }
 
 void LanguageModel::select_session(SessionId id) {
-    _select_session(_sessions->get(id));
+    _select_request_sessions(id, nullptr);
+}
+
+void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft) {
+    if (_run->is_running || (draft && draft->_run->is_running))
+        throw std::logic_error("Cannot select a session during generation");
+
+    const auto& target_session = _sessions->get(id);
+    auto draft_session = target_session->draft;
+    if (draft && !draft_session) {
+        draft_session = std::make_shared<LanguageSession>();
+        draft_session->init_layout(*draft->_sessions->get(0));
+    }
+
+    // Complete old submissions and allocate both sides before changing either workspace.
+    if (_session != target_session || (draft && draft->_session != draft_session)) {
+        MLAModelWithBuffer::run_queue();
+        target_session->allocate(*_resources);
+        if (draft)
+            draft_session->allocate(*draft->_resources);
+        _bind_session(target_session);
+        if (draft) {
+            draft->_bind_session(draft_session);
+            target_session->draft = std::move(draft_session);
+        }
+    }
     _sessions->active = id;
 }
 
-void LanguageModel::_select_session(LanguageSession& selected) {
-    if (_run->depth != 0 || _run->is_running)
-        throw std::logic_error("Cannot select a session during generation");
-    if (_session == &selected)
+void LanguageModel::_bind_session(const std::shared_ptr<LanguageSession>& selected) {
+    if (_session == selected)
         return;
-    MLAModelWithBuffer::run_queue();
-    selected.allocate(*_resources);
     for (auto& [name, slots] : _workspace->session_bindings) {
-        auto* buffer = &selected.buffers.at(name);
+        auto* buffer = selected ? &selected->buffers.at(name) : nullptr;
         for (auto* slot : slots)
             *slot = buffer;
     }
-    _session = &selected;
+    _session = selected;
     _workspace->dflash_resolved_prefix = 0;
     _workspace->gemma4_mtp_prefill_hidden_state.reset();
     _workspace->eagle3_tree_mask.reset();
 }
 
+void LanguageModel::_detach_draft_sessions(LanguageModel* draft) {
+    for (auto id : _sessions->ids()) {
+        auto& session = *_sessions->get(id);
+        if (draft && session.draft && draft->_session == session.draft)
+            draft->_bind_session(nullptr);
+        session.draft.reset();
+        session.invalidate_reuse();
+    }
+}
+
+void LanguageModel::_release_paired_session(SessionId id, LanguageModel* draft) {
+    const auto& session = _sessions->get(id);
+    if (id != 0 && draft && session->draft && draft->_session == session->draft)
+        draft->_bind_session(nullptr);
+    release_session(id);
+}
+
 void LanguageModel::reset_session(SessionId id) {
-    if (_run->depth != 0 || _run->is_running)
+    if (_run->is_running)
         throw std::logic_error("Cannot reset a session during generation");
     MLAModelWithBuffer::run_queue();
-    _sessions->get(id).reset();
+    _sessions->get(id)->reset();
 }
 
 void LanguageModel::release_session(SessionId id) {
-    if (_run->depth != 0 || _run->is_running)
+    if (_run->is_running)
         throw std::logic_error("Cannot release a session during generation");
     if (_sessions->active == id && id != 0)
         select_session(0);
+    bind_session_adapter();
     _sessions->release(id);
 }
 
@@ -173,7 +203,7 @@ size_t LanguageSession::memory_bytes() const {
 }
 
 size_t LanguageModel::session_memory_bytes(SessionId id) const {
-    return _sessions->get(id).memory_bytes();
+    return _sessions->get(id)->memory_bytes();
 }
 
 void LanguageModel::_init_session_layout() {
@@ -204,20 +234,10 @@ void LanguageModel::_init_session_layout() {
 
     const auto add_state = [&](std::string prefix, uint16_t tail_len, uint32_t num_elems,
                                std::vector<uint8_t> layers, bool single_output = false) {
-        CachedState state;
-        state.buffer_name_prefix = std::move(prefix);
-        state.tail_len = tail_len;
-        state.num_elems = num_elems;
-        state.elem_size = sizeof(Eigen::bfloat16);
-        state.tail_bytes = static_cast<size_t>(tail_len * num_elems * state.elem_size);
-        state.layer_indices = std::move(layers);
-        state.prefill_single_output = single_output;
-        state.checkpoints.resize(state.layer_indices.size());
-        for (auto& checkpoints : state.checkpoints) {
-            checkpoints.resize(_session->state_checkpoint_positions.size(),
-                               std::vector<uint8_t>(state.tail_bytes));
-        }
-        _session->cached_states.push_back(std::move(state));
+        const size_t element_size = sizeof(Eigen::bfloat16);
+        _session->cached_states.emplace_back(CheckpointLayout{
+            std::move(layers), std::move(prefix), tail_len, num_elems, element_size,
+            static_cast<size_t>(tail_len) * num_elems * element_size, single_output});
     };
     if (!conv_layers.empty()) {
         add_state("conv_cache_history_l", std::max<uint16_t>(1, _cfg.lm_cfg.conv_L_cache - 1),
@@ -288,8 +308,8 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
     }
     if (!_session->state_checkpoint_positions[checkpoint_slot]) {
         for (const auto& state: _session->cached_states) {
-            for (const auto& layer_idx: state.layer_indices) {
-                get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx)).clear();
+            for (const auto& layer_idx: state.layout.layer_indices) {
+                get_buffer(fmt::format("{}{}", state.layout.buffer_name_prefix, layer_idx)).clear();
             }
         }
         return 0;
@@ -297,18 +317,18 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
     const auto restored_token_count = _session->state_checkpoint_positions[checkpoint_slot];
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
     for (auto& state: _session->cached_states) {
-        const uint32_t restore_row_offset = state.prefill_single_output ? 0 : tail_begin;
+        const uint32_t restore_row_offset = state.layout.prefill_single_output ? 0 : tail_begin;
         const size_t dst_offset = static_cast<size_t>(
-            restore_row_offset * state.num_elems * state.elem_size
+            restore_row_offset * state.layout.num_elems * state.layout.elem_size
         );
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
+        for (size_t layer_slot = 0; layer_slot < state.layout.layer_indices.size(); ++layer_slot) {
+            auto layer_idx = state.layout.layer_indices[layer_slot];
             auto& checkpoints = state.checkpoints[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
+            auto& buf = get_buffer(fmt::format("{}{}", state.layout.buffer_name_prefix, layer_idx));
             buf.upload_raw(
                 checkpoints[checkpoint_slot].data(),
                 dst_offset,
-                state.tail_bytes
+                state.layout.tail_bytes
             );
         }
     }
@@ -361,24 +381,21 @@ void LanguageModel::_save_state_checkpoint(
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
 
     for (auto& state: _session->cached_states) {
-        const uint32_t tail_row_offset = state.prefill_single_output
+        const uint32_t tail_row_offset = state.layout.prefill_single_output
             ? 0
             : (
                 num_tokens > 1
                     ? static_cast<uint32_t>(valid_tokens - 1)
                     : tail_begin
             );
-        const size_t src_offset_bytes = tail_row_offset * state.num_elems * state.elem_size;
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
-            buf.invalidate_cache(src_offset_bytes, state.tail_bytes);
+        const size_t src_offset_bytes = tail_row_offset * state.layout.num_elems * state.layout.elem_size;
+        for (size_t layer_slot = 0; layer_slot < state.layout.layer_indices.size(); ++layer_slot) {
+            auto layer_idx = state.layout.layer_indices[layer_slot];
+            auto& buf = get_buffer(fmt::format("{}{}", state.layout.buffer_name_prefix, layer_idx));
+            buf.invalidate_cache(src_offset_bytes, state.layout.tail_bytes);
             auto* ptr = static_cast<const uint8_t*>(buf.get_virtual_addr());
-            std::memcpy(
-                state.checkpoints[layer_slot][*checkpoint_slot].data(),
-                ptr + src_offset_bytes,
-                state.tail_bytes
-            );
+            auto& snapshot = state.checkpoints[layer_slot][*checkpoint_slot];
+            snapshot.assign(ptr + src_offset_bytes, ptr + src_offset_bytes + state.layout.tail_bytes);
         }
     }
     _session->state_checkpoint_positions[*checkpoint_slot] = token_count;
@@ -390,27 +407,26 @@ void LanguageModel::_move_state_tail_for_decode(uint16_t valid_tokens) {
     //  where the decode MLAModel expects it.
     const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
     for (auto& state: _session->cached_states) {
-        if (state.prefill_single_output) {
-    continue;
-}
-        const size_t src_offset_bytes = (valid_tokens - 1) * state.num_elems * state.elem_size;
-        const size_t dst_offset_bytes = tail_begin * state.num_elems * state.elem_size;
-        for (size_t layer_slot = 0; layer_slot < state.layer_indices.size(); ++layer_slot) {
-            auto layer_idx = state.layer_indices[layer_slot];
-            auto& buf = get_buffer(fmt::format("{}{}", state.buffer_name_prefix, layer_idx));
+        if (state.layout.prefill_single_output)
+            continue;
+        const size_t src_offset_bytes = (valid_tokens - 1) * state.layout.num_elems * state.layout.elem_size;
+        const size_t dst_offset_bytes = tail_begin * state.layout.num_elems * state.layout.elem_size;
+        for (size_t layer_slot = 0; layer_slot < state.layout.layer_indices.size(); ++layer_slot) {
+            auto layer_idx = state.layout.layer_indices[layer_slot];
+            auto& buf = get_buffer(fmt::format("{}{}", state.layout.buffer_name_prefix, layer_idx));
             const size_t access_begin = std::min(src_offset_bytes, dst_offset_bytes);
             const size_t access_end = std::max(
-                src_offset_bytes + state.tail_bytes,
-                dst_offset_bytes + state.tail_bytes
+                src_offset_bytes + state.layout.tail_bytes,
+                dst_offset_bytes + state.layout.tail_bytes
             );
             buf.invalidate_cache(access_begin, access_end - access_begin);
             auto* ptr = static_cast<uint8_t*>(buf.get_virtual_addr());
             std::memmove(
                 ptr + dst_offset_bytes,
                 ptr + src_offset_bytes,
-                state.tail_bytes
+                state.layout.tail_bytes
             );
-            buf.flush_cache(dst_offset_bytes, state.tail_bytes);
+            buf.flush_cache(dst_offset_bytes, state.layout.tail_bytes);
         }
     }
 }

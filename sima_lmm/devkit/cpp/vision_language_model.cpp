@@ -48,9 +48,6 @@ struct LanguageRunnerState {
     std::shared_ptr<LanguageRunnerState> draft;
     // Cancellation reads this lease without taking the request mutex.
     std::atomic<std::shared_ptr<LanguageRunnerState>> active_draft;
-    std::weak_ptr<LanguageSession> default_draft_context;
-    // Keep borrowed bindings alive without locking another runner during teardown.
-    std::shared_ptr<LanguageSession> selected_draft_context;
 };
 
 // Locks and leases both workspaces before preparing prompt/image data.
@@ -60,6 +57,7 @@ class VisionLanguageRequest {
                           bool streaming = true, const GenerationOptions* options = nullptr);
     ~VisionLanguageRequest();
     void clear_images();
+    void complete() { _execution->complete(); }
     bool cancelled() const;
 
   private:
@@ -67,17 +65,15 @@ class VisionLanguageRequest {
     std::shared_ptr<LanguageRunnerState> _draft;
     std::unique_lock<std::mutex> _target_lock;
     std::unique_lock<std::mutex> _draft_lock;
-    bool _streaming;
     bool _was_enabled;
     std::pair<TextStreamer::InfoCallback, TextStreamer::TextCallback> _callbacks;
-    std::unique_ptr<LanguageExecutor::Run> _execution;
+    std::optional<LanguageExecutor::Run> _execution;
 };
 
 VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState> state,
                                              SessionId session, bool streaming,
                                              const GenerationOptions* options)
-    : _target(std::move(state)), _target_lock(_target->run_mutex, std::defer_lock),
-      _streaming(streaming) {
+    : _target(std::move(state)), _target_lock(_target->run_mutex, std::defer_lock) {
     for (;;) {
         _target_lock.lock();
         _draft = _target->draft;
@@ -91,35 +87,11 @@ VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState
         _draft_lock.unlock();
         _target_lock.unlock();
     }
-    const auto previous_target = _target->language_model_ptr->active_session();
-    auto* previous_draft = _draft ? _draft->language_model_ptr->_session : nullptr;
-    const auto previous_context = _draft ? _draft->selected_draft_context : nullptr;
     _callbacks = _target->text_streamer.callbacks();
     _was_enabled = _target->text_streamer.enabled();
     try {
-        _target->language_model_ptr->select_session(session);
-        _target->selected_draft_context.reset();
-        if (_draft) {
-            auto& context = _target->language_model_ptr->_sessions->get(session).draft;
-            if (!context) {
-                auto& initial = _draft->language_model_ptr->_sessions->get(0);
-                if (_draft->default_draft_context.expired()) {
-                    initial.reset();
-                    // Lease the existing cache; the owner keeps its tokenizer and buffers alive.
-                    context = std::shared_ptr<LanguageSession>(
-                        &initial, [owner = _draft](auto*) mutable { owner.reset(); });
-                    _draft->default_draft_context = context;
-                } else {
-                    auto created = std::make_shared<LanguageSession>();
-                    created->init_layout(initial);
-                    context = std::move(created);
-                }
-            }
-            _draft->language_model_ptr->_select_session(*context);
-            // The default context already belongs to the runner; retaining its alias would cycle.
-            _draft->selected_draft_context =
-                context.get() == &_draft->language_model_ptr->_sessions->get(0) ? nullptr : context;
-        }
+        _target->language_model_ptr->_select_request_sessions(
+            session, _draft ? _draft->language_model_ptr.get() : nullptr);
         if (options) {
             if (options->info_callback)
                 _target->text_streamer.set_info_callback(*options->info_callback);
@@ -129,7 +101,7 @@ VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState
         if (!streaming)
             _target->text_streamer.disable();
         _target->active_draft.store(_draft);
-        _execution = std::make_unique<LanguageExecutor::Run>(
+        _execution.emplace(
             *_target->language_model_ptr, _draft ? _draft->language_model_ptr.get() : nullptr);
     } catch (...) {
         _target->active_draft.store(nullptr);
@@ -139,11 +111,6 @@ VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState
             _target->text_streamer.enable();
         else
             _target->text_streamer.disable();
-        _target->language_model_ptr->select_session(previous_target);
-        if (_draft) {
-            _draft->language_model_ptr->_select_session(*previous_draft);
-            _draft->selected_draft_context = previous_context;
-        }
         throw;
     }
 }
@@ -159,8 +126,6 @@ void VisionLanguageRequest::clear_images() {
 }
 
 VisionLanguageRequest::~VisionLanguageRequest() {
-    if (!_streaming)
-        _target->text_streamer.disable();
     _execution.reset();
     _target->text_streamer.set_info_callback(std::move(_callbacks.first));
     _target->text_streamer.set_text_callback(std::move(_callbacks.second));
@@ -170,6 +135,15 @@ VisionLanguageRequest::~VisionLanguageRequest() {
     else
         _target->text_streamer.disable();
 }
+
+namespace {
+std::unique_lock<std::mutex> idle_lock(std::mutex& mutex) {
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+        throw std::logic_error("Session settings cannot change during a request");
+    return lock;
+}
+} // namespace
 
 namespace {
 std::string image_digest(const std::vector<Eigen::bfloat16>& tensor) {
@@ -211,15 +185,15 @@ void VisionLanguageModel::set_reloc(const std::string& name) { set_reloc(0, name
 void VisionLanguageModel::unset_reloc() { unset_reloc(0); }
 
 void VisionLanguageModel::set_reloc(SessionId session, const std::string& name) {
-    VisionLanguageRequest request(_state, session, false);
+    auto lock = idle_lock(_state->run_mutex);
+    _state->language_model_ptr->select_session(session);
     _state->language_model_ptr->set_reloc(name);
-    if (auto draft = _state->active_draft.load()) draft->language_model_ptr->invalidate_prompt_reuse();
 }
 
 void VisionLanguageModel::unset_reloc(SessionId session) {
-    VisionLanguageRequest request(_state, session, false);
+    auto lock = idle_lock(_state->run_mutex);
+    _state->language_model_ptr->select_session(session);
     _state->language_model_ptr->unset_reloc();
-    if (auto draft = _state->active_draft.load()) draft->language_model_ptr->invalidate_prompt_reuse();
 }
 
 void VisionLanguageModel::set_enable_thinking(bool enable_thinking) {
@@ -256,14 +230,15 @@ VisionLanguageModel::VisionLanguageModel(
         // (fetch -> load -> evict), one ELF on disk at a time.
         _vision_model = std::make_unique<VisionModel>(model_path, _state->_files);
     }
-    _state->language_model_ptr = std::make_unique<LanguageModel>(
+    _state->language_model_ptr.reset(new LanguageModel(
         model_path,
         _state->vlm_helper.get_stop_token_ids(),
         _state->vlm_helper.get_image_token_id(),
         _state->vlm_helper.get_pad_token_id(),
         _state->text_streamer,
-        _state->_files
-    );
+        _state->_files,
+        _state->_cfg.lm_cfg.is_speculative_draft()
+    ));
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
     // run_model path.
@@ -355,7 +330,10 @@ std::optional<std::string> VisionLanguageModel::run_model(
 ) {
     VisionLanguageRequest request(_state, session, true, &options);
     if (options.stop_token_ids) _state->language_model_ptr->set_stop_token_ids(options.stop_token_ids);
-    if (request.cancelled()) return std::nullopt;
+    if (request.cancelled()) {
+        request.complete();
+        return std::nullopt;
+    }
     std::vector<std::pair<uint32_t, std::string>> preserved_tokens;
     auto* tokenizer = _state->vlm_helper.get_tokenizer();
     if (chat.has_tools()) {
@@ -416,7 +394,10 @@ std::optional<std::string> VisionLanguageModel::run_model(
     _state->resources->logger->info("Formatted prompt: {}", preprocessed_data.formatted_prompt);
     _state->resources->logger->info("Preprocess time: {:.2f}s", timer_preprocess.stop());
 
-    if (request.cancelled()) return std::nullopt;
+    if (request.cancelled()) {
+        request.complete();
+        return std::nullopt;
+    }
 
     // Create buffers for the input embeds and deepstack features (for qwen3) and ofm maps for
     // vision models.
@@ -428,7 +409,10 @@ std::optional<std::string> VisionLanguageModel::run_model(
     // input embeddings for the language models.
     ChronoTimer timer_image_encode(true);
     for (size_t i = 0; i < preprocessed_data.image_tensors.size(); ++i) {
-        if (request.cancelled()) return std::nullopt;
+        if (request.cancelled()) {
+            request.complete();
+            return std::nullopt;
+        }
         _vision_model->run_model(preprocessed_data.image_tensors[i], &vision_ofm_maps[i]);
     }
     for (size_t i = 0; i < options.encoded_images.size(); ++i) {
@@ -458,7 +442,8 @@ std::optional<std::string> VisionLanguageModel::run_model(
         nullptr, preprocessed_data.stable_prefix_token_count
     );
 
-    if (output_token_ids.has_value())
+    request.complete();
+    if (output_token_ids.has_value() && !request.cancelled())
         return _state->vlm_helper.get_tokenizer()->decode(output_token_ids.value(), true);
     return std::nullopt;
 }
@@ -610,14 +595,6 @@ void VisionLanguageModel::stop_model() {
 }
 
 
-namespace {
-std::unique_lock<std::mutex> idle_lock(std::mutex& mutex) {
-    std::unique_lock lock(mutex, std::try_to_lock);
-    if (!lock.owns_lock())
-        throw std::logic_error("Session settings cannot change during a request");
-    return lock;
-}
-} // namespace
 
 void VisionLanguageModel::set_draft_vlm(VisionLanguageModel* draft) {
     auto lock = idle_lock(_state->run_mutex);
@@ -635,15 +612,7 @@ void VisionLanguageModel::set_draft_vlm(VisionLanguageModel* draft) {
         next_lock = idle_lock(next->run_mutex);
         _state->language_model_ptr->attach_draft(*next->language_model_ptr);
     }
-    if (previous) {
-        previous->language_model_ptr->select_session(previous->language_model_ptr->active_session());
-        previous->selected_draft_context.reset();
-    }
-    for (auto id : _state->language_model_ptr->session_ids()) {
-        auto& session = _state->language_model_ptr->_sessions->get(id);
-        session.draft.reset();
-        session.invalidate_reuse();
-    }
+    _state->language_model_ptr->_detach_draft_sessions(previous ? previous->language_model_ptr.get() : nullptr);
     _state->draft = next;
 }
 
@@ -663,15 +632,10 @@ void VisionLanguageModel::reset_session(SessionId id) {
 void VisionLanguageModel::release_session(SessionId id) {
     auto lock = idle_lock(_state->run_mutex);
     std::unique_lock<std::mutex> draft_lock;
-    if (const auto& draft = _state->draft) {
+    const auto& draft = _state->draft;
+    if (draft)
         draft_lock = idle_lock(draft->run_mutex);
-        const auto& context = _state->language_model_ptr->_sessions->get(id).draft;
-        if (context && draft->language_model_ptr->_session == context.get()) {
-            draft->language_model_ptr->select_session(draft->language_model_ptr->active_session());
-            draft->selected_draft_context.reset();
-        }
-    }
-    _state->language_model_ptr->release_session(id);
+    _state->language_model_ptr->_release_paired_session(id, draft ? draft->language_model_ptr.get() : nullptr);
 }
 
 void VisionLanguageModel::set_session_limit(size_t limit) {
@@ -687,6 +651,7 @@ size_t VisionLanguageModel::shared_resource_bytes() const {
     return _state->language_model_ptr->shared_resource_bytes();
 }
 size_t VisionLanguageModel::workspace_memory_bytes() const {
+    auto lock = idle_lock(_state->run_mutex);
     return _state->language_model_ptr->workspace_memory_bytes();
 }
 

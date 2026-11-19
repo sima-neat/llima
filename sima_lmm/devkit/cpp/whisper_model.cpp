@@ -362,6 +362,14 @@ WhisperModel::WhisperModel(std::filesystem::path model_path, std::shared_ptr<Fil
 }
 
 
+struct WhisperDecodeResult {
+    std::vector<uint32_t> tokens;
+    std::string language;
+    std::string task;
+    float no_speech_prob;
+    std::optional<float> avg_logprob;
+};
+
 namespace {
 class WhisperRequest {
 public:
@@ -379,10 +387,18 @@ public:
             throw;
         }
     }
-    void complete() { _workspace.text_streamer->finish(); }
+    WhisperModel::TranscriptionResult complete(WhisperDecodeResult result) {
+        // The worker and final transcript share the tokenizer's mutable decode buffer.
+        _workspace.text_streamer->finish();
+        auto text = result.tokens.empty() ? std::string{} : _workspace.tokenizer_ptr->decode(result.tokens, true);
+        return {std::move(text), std::move(result.language), std::move(result.task),
+                result.no_speech_prob, result.avg_logprob};
+    }
     ~WhisperRequest() {
-        if (std::uncaught_exceptions() > _exceptions) MLAModelWithBuffer::discard_queue();
-        try { complete(); } catch (...) {}
+        if (std::uncaught_exceptions() > _exceptions) {
+            MLAModelWithBuffer::discard_queue();
+            try { _workspace.text_streamer->finish(); } catch (...) {}
+        }
         restore();
     }
 private:
@@ -417,9 +433,7 @@ WhisperModel::TranscriptionResult WhisperModel::run_model(
     WhisperRequest request(*_workspace, options);
     _logger->info("Audio file: {}", audio_file);
     auto mel = _workspace->preprocessor.preprocess(audio_file);
-    auto result = _run_model(mel, options.language, options.task);
-    request.complete();
-    return result;
+    return request.complete(_run_model(mel, options.language, options.task));
 }
 
 WhisperModel::TranscriptionResult WhisperModel::run_model_from_pcm(
@@ -427,13 +441,11 @@ WhisperModel::TranscriptionResult WhisperModel::run_model_from_pcm(
 ) {
     WhisperRequest request(*_workspace, options);
     auto mel = _workspace->preprocessor.preprocess_pcm(pcm, sample_rate);
-    auto result = _run_model(mel, options.language, options.task);
-    request.complete();
-    return result;
+    return request.complete(_run_model(mel, options.language, options.task));
 }
 
 
-WhisperModel::TranscriptionResult WhisperModel::_run_model(
+WhisperDecodeResult WhisperModel::_run_model(
     const ArrayXXbf& mel,
     const std::string& language,
     const std::string& task
@@ -441,7 +453,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     // Keep CPU preprocessing and callback completion outside the MLA transaction.
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
     if (!_workspace->is_running.load(std::memory_order_relaxed))
-        return {"", language, task, 0.0f, std::nullopt};
+        return {{}, language, task, 0.0f, std::nullopt};
 
     ChronoTimer timer_ttft(true);
     _logger->info("Language: {}", language);
@@ -450,7 +462,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     get_buffer("encoder_ifm").upload(mel.data());
     _run_encoder();
     if (!_workspace->is_running.load(std::memory_order_relaxed))
-        return {"", language, task, 0.0f, std::nullopt};
+        return {{}, language, task, 0.0f, std::nullopt};
 
     auto language_detect_result = _run_language_detect();
 
@@ -508,19 +520,11 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     const double ttft = timer_ttft.stop();
     _logger->info("Time to the first token: {:d} in {:.5f}s", new_tokens.back(), ttft);
     _workspace->text_streamer->push(DecodeCallbackType::TTFT, new_tokens.back(), ttft);
-    if (new_tokens.back() == _workspace->stop_token_id) {
-        return {_workspace->tokenizer_ptr->decode(new_tokens, true), resolved_language,
-                resolved_task, language_detect_result.no_speech_prob,
-                _cfg.log_probe_enabled
-                    ? std::optional<float>{logprob_sum / logprob_count}
-                    : std::optional<float>{}};
-    }
-
     // Run decoder pre/cache/post models to generate other tokens.
     ChronoTimer timer_tps(true);
     for (
         uint32_t token_idx = _workspace->input_token_ids.size();
-        token_idx < _cfg.max_target_positions;
+        new_tokens.back() != _workspace->stop_token_id && token_idx < _cfg.max_target_positions;
         ++token_idx
     ) {
         if (!_workspace->is_running.load(std::memory_order_relaxed))
@@ -568,9 +572,9 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     if (_cfg.log_probe_enabled)
         avg_logprob = logprob_count > 0 ? logprob_sum / logprob_count : 0.0f;
     return {
-        _workspace->tokenizer_ptr->decode(new_tokens, true),
-        resolved_language,
-        resolved_task,
+        std::move(new_tokens),
+        std::move(resolved_language),
+        std::move(resolved_task),
         language_detect_result.no_speech_prob,
         avg_logprob
     };

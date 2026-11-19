@@ -189,13 +189,8 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     auto& token_embeds_buf = *embedding.values;
     auto* token_embedding_scales_buf = embedding.scales;
 
-    // Bind the compact wrappers to this forward pass before enqueueing them.
     const uint8_t  layer_idx = 0;
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
-    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-    const auto attn_models = _bind_attn_models(
-        num_tokens, token_idx, layer_idx, token_embedding_scales_buf
-    );
     auto& fc_output_buf = get_buffer(fmt::format("fc_n{}_output", num_tokens));
 
     if (is_prefill) {
@@ -251,8 +246,8 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     // (same buffer pre_model used as IFM[1]); IFM[1] is statically wired.
     std::map<uint8_t, MLABufferSlice> post_ifm_map;
     post_ifm_map.emplace(0, MLABufferSlice{&fc_output_buf});
-    LanguageExecutor::queue_attention(attn_models,
-        {.input = &pre_ifm_map, .post_input = &post_ifm_map});
+    LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, token_embedding_scales_buf,
+                                  0, {.input = &pre_ifm_map, .post_input = &post_ifm_map});
 
     // Download both outputs: hidden_states (n{N}_buffer5) and logits
     // (n{N}_buffer4, lm_head fused into post_model; single split for draft).
@@ -394,10 +389,6 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             continue;
         }
 
-        const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
-        const auto attn_models = _bind_attn_models(
-            num_tokens, token_idx, layer_idx, input_embedding_scales_buf
-        );
 
         // Slot 0 (input_embeds for layer 0) is shared between pre and post —
         // both have empty-placeholder bindings, so build the override once.
@@ -448,8 +439,8 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             )
         );
 
-        LanguageExecutor::queue_attention(attn_models,
-            {.input = &pre_ifm_map, .post_input = &ifm_map});
+        LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_embedding_scales_buf,
+                                      0, {.input = &pre_ifm_map, .post_input = &ifm_map});
 
         // post_model.ofms[0] writes n{N}_buffer1 (next layer's IFM[0]), so
         // reading it here yields this layer's output.

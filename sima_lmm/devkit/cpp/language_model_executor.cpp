@@ -133,87 +133,117 @@ LanguageExecutor::Overrides LanguageExecutor::post_rows(LanguageModel& model, ui
     return inputs;
 }
 
-void LanguageExecutor::queue_attention(const LanguageModel::BoundAttentionModels& models,
-                                       LayerBindings bindings) {
-    models.pre->add_to_queue(bindings.input);
-    models.cache->add_to_queue(bindings.cache);
-    models.post->add_to_queue(bindings.post_input, bindings.output);
+LanguageExecutor::LogitsWindow LanguageExecutor::logits_window(const LanguageModelConfig& cfg,
+                                                              uint16_t width, uint16_t row) {
+    const uint16_t post_width = cfg.is_speculative_draft() || width == 1 ? width : cfg.get_single_num_tokens();
+    const uint16_t first = row >= post_width ? row + 1 - post_width : 0;
+    return {first, post_width};
+}
+
+void LanguageExecutor::queue_attention(AttentionPrograms models, LayerBindings bindings) {
+    models.pre.add_to_queue(bindings.input);
+    models.cache.add_to_queue(bindings.cache);
+    models.post.add_to_queue(bindings.post_input, bindings.output);
 }
 
 void LanguageExecutor::queue_layer(LanguageModel& model, uint16_t width, uint16_t position,
                                    uint8_t layer, MLABuffer* scales, uint32_t scale_row,
-                                   LayerBindings bindings, LayerStage stage) {
-    const auto& type = model._cfg.lm_cfg.layer_types[layer];
+                                   LayerBindings bindings, LayerOutput output, uint16_t logit_row) {
+    const auto& cfg = model._cfg.lm_cfg;
+    const auto& type = cfg.layer_types[layer];
     if (type == "full_attention" || type == "sliding_attention") {
-        const auto models = model._bind_attn_models(width, position, layer, scales, scale_row);
-        if (stage == LayerStage::PrefillPreOnly) {
-            models.pre->add_to_queue(bindings.input);
-        } else if (model._cfg.lm_cfg.is_moe()) {
-            models.pre->add_to_queue(bindings.input);
-            models.cache->add_to_queue(bindings.cache);
+        auto programs = bind_attention(model, width, position, layer, scales, scale_row);
+        if (output == LayerOutput::CacheOnly) {
+            programs.pre.add_to_queue(bindings.input);
+            return;
+        }
+
+        // The final post consumes one row for ordinary generation or a contiguous
+        // verification-width window containing the requested row for speculative targets.
+        Overrides sliced_inputs;
+        if (output == LayerOutput::LogitsRow) {
+            const auto window = logits_window(cfg, width, logit_row);
+            if (window.width != width) {
+                MLABuffer* hidden = nullptr;
+                if (bindings.post_input && bindings.post_input->contains(0))
+                    hidden = bindings.post_input->at(0).get_buf_ptr();
+                sliced_inputs = post_rows(model, width, layer, position, window.first, window.width, hidden);
+                bindings.post_input = &sliced_inputs;
+            }
+        }
+        if (cfg.is_moe()) {
+            programs.pre.add_to_queue(bindings.input);
+            programs.cache.add_to_queue(bindings.cache);
             model._run_moe_post(bindings.post_input, width, layer);
         } else {
-            queue_attention(models, bindings);
+            queue_attention(programs, bindings);
         }
-    } else if (type == "linear_attention" || type == "conv") {
-        const LanguageModelMapKey key{width, layer, 0};
-        auto& program = type == "linear_attention" ? model._workspace->linear_model_map.at(key)
-                                                   : model._workspace->conv_model_map.at(key);
-        if (model._cfg.pipeline_cfg.quantize_embeddings && layer == 0)
-            program._bind_ifm(1, scales, {scale_row, 0});
-        program.add_to_queue(bindings.input, bindings.output);
-    } else {
+        return;
+    }
+
+    if (type != "linear_attention" && type != "conv")
         throw std::runtime_error("Unsupported layer type: " + type);
+    const LanguageModelMapKey key{width, layer, 0};
+    auto& program = type == "linear_attention" ? model._workspace->linear_model_map.at(key)
+                                               : model._workspace->conv_model_map.at(key);
+    if (model._cfg.pipeline_cfg.quantize_embeddings && layer == 0)
+        program._bind_ifm(1, scales, {scale_row, 0});
+    program.add_to_queue(bindings.input, bindings.output);
+    if (type == "conv" && output == LayerOutput::LogitsRow) {
+        Overrides row;
+        if (width > 1)
+            row.emplace(0, MLABufferSlice{nullptr, {logit_row, 0}, {1, cfg.hidden_size}});
+        model._workspace->conv_final_model_map.at(key).add_to_queue(&row);
     }
 }
 
-LanguageModel::BoundAttentionModels
-LanguageModel::_bind_attn_models(uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx,
-                                 MLABuffer* embedding_scale_buf, uint32_t embedding_scale_row) {
+LanguageExecutor::AttentionPrograms LanguageExecutor::bind_attention(
+    LanguageModel& model, uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx,
+    MLABuffer* embedding_scale_buf, uint32_t embedding_scale_row) {
+    const auto& cfg = model._cfg;
     const LanguageModelMapKey pre_post_key{num_tokens, layer_idx, 0};
-    const LanguageModelMapKey cache_key = _get_cache_model_key(num_tokens, token_idx, layer_idx);
-    auto& pre_model = _workspace->pre_model_map.at(pre_post_key);
-    auto& cache_model = _workspace->cache_model_map.at(cache_key);
+    const LanguageModelMapKey cache_key = model._get_cache_model_key(num_tokens, token_idx, layer_idx);
+    auto& pre_model = model._workspace->pre_model_map.at(pre_post_key);
+    auto& cache_model = model._workspace->cache_model_map.at(cache_key);
     // MoE has no post model; bind these inputs to the router (it consumes the raw hidden).
-    auto& post_model = _cfg.lm_cfg.is_moe() ? _workspace->router_model_map.at(pre_post_key)
-                                            : _workspace->post_model_map.at(pre_post_key);
+    auto& post_model = cfg.lm_cfg.is_moe() ? model._workspace->router_model_map.at(pre_post_key)
+                                            : model._workspace->post_model_map.at(pre_post_key);
 
-    const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const auto& binding_buffers = _workspace->attention_binding_buffers.at(layer_idx);
-    const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
+    const auto& layer_type = cfg.lm_cfg.layer_types[layer_idx];
+    const auto& binding_buffers = model._workspace->attention_binding_buffers.at(layer_idx);
+    const uint16_t single_num_tokens = cfg.lm_cfg.get_single_num_tokens();
     const bool is_single_model = num_tokens == single_num_tokens;
 
     const uint16_t cache_token_idx_begin =
-        _get_cache_token_idx_begin(num_tokens, token_idx, layer_type);
+        model._get_cache_token_idx_begin(num_tokens, token_idx, layer_type);
 
-    const bool is_draft = _cfg.lm_cfg.is_speculative_draft();
-    const bool is_eagle3_draft = _cfg.lm_cfg.is_eagle3_draft();
-    const bool is_gemma4_mtp_draft = _cfg.lm_cfg.is_gemma4_mtp_draft();
-    LanguageExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
+    const bool is_eagle3_draft = cfg.lm_cfg.is_eagle3_draft();
+    const bool is_gemma4_mtp_draft = cfg.lm_cfg.is_gemma4_mtp_draft();
+    bind_attention_inputs(model, pre_model, post_model, layer_idx,
                                             embedding_scale_buf, embedding_scale_row, token_idx);
 
-    if (is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
+    if (is_gemma4_mtp_draft && cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
         throw std::runtime_error("Gemma4 MTP shared-KV binding must use run_model_gemma4_mtp");
     }
 
-    LanguageExecutor::bind_kv_outputs(*this, pre_model, layer_idx, token_idx);
+    bind_kv_outputs(model, pre_model, layer_idx, token_idx);
 
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     const bool use_sliding_cache = std::get<1>(cache_key) != 0;
     const char* cache_layer_type = use_sliding_cache ? "sliding_attention" : "full_attention";
     const uint16_t cache_mask_size =
-        _get_cache_mask_size(cache_layer_type, eff_num_cached_tokens, !is_single_model);
+        model._get_cache_mask_size(cache_layer_type, eff_num_cached_tokens, !is_single_model);
     const bool use_single_future_token_mask = is_single_model && cache_mask_size > 1;
     const bool use_group_future_token_mask = (!is_single_model && cache_mask_size > num_tokens);
     // IFM 0 is the query buffer. Its pointer, begin, and shape are invariant
     // for a compact cache key, so only the layer-owned cache inputs are rebound.
     uint8_t cache_ifm_idx = 1;
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
+    if (cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.key, {0, cache_token_idx_begin, 0});
     } else {
         cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.key, {cache_token_idx_begin, 0});
     }
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
+    if (cfg.pipeline_cfg.quantize_kv_cache) {
         cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.key_scale,
                               {0, cache_token_idx_begin, 0});
     }
@@ -221,30 +251,30 @@ LanguageModel::_bind_attn_models(uint16_t num_tokens, uint16_t token_idx, uint8_
         // Group-mask buffer, begin, and shape are fixed by the compact key.
         ++cache_ifm_idx;
     } else if (use_single_future_token_mask) {
-        auto& mask = get_buffer("future_token_mask");
-        if (_cfg.lm_cfg.is_dflash()) {
+        auto& mask = model.get_buffer("future_token_mask");
+        if (cfg.lm_cfg.is_dflash()) {
             // DFlash uploads the compact [B, aligned_context] mask layout.
             cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, 0});
-        } else if (_cfg.lm_cfg.is_spec_decode()) {
+        } else if (cfg.lm_cfg.is_spec_decode()) {
             cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, cache_token_idx_begin});
         } else {
             cache_model._bind_ifm(
                 cache_ifm_idx++, &mask,
-                {static_cast<uint32_t>(_cfg.pipeline_cfg.max_num_tokens - eff_num_cached_tokens)});
+                {static_cast<uint32_t>(cfg.pipeline_cfg.max_num_tokens - eff_num_cached_tokens)});
         }
     }
     // gpt_oss sinks: cache model is layer-shared, so bind this layer's sinks before cached_values.
-    if (_cfg.lm_cfg.uses_attention_sinks()) {
-        auto& sinks_buf = get_buffer(fmt::format("sinks_l{}", layer_idx));
+    if (cfg.lm_cfg.uses_attention_sinks()) {
+        auto& sinks_buf = model.get_buffer(fmt::format("sinks_l{}", layer_idx));
         cache_model._bind_ifm(cache_ifm_idx++, &sinks_buf, {0, 0});
     }
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
+    if (cfg.pipeline_cfg.use_strided_kv_cache) {
         cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.value,
                               {0, cache_token_idx_begin, 0});
     } else {
         cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.value, {cache_token_idx_begin, 0});
     }
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
+    if (cfg.pipeline_cfg.quantize_kv_cache) {
         cache_model._bind_ifm(cache_ifm_idx, binding_buffers.value_scale,
                               {0, cache_token_idx_begin, 0});
     }
@@ -252,16 +282,16 @@ LanguageModel::_bind_attn_models(uint16_t num_tokens, uint16_t token_idx, uint8_
     // Per-layer post input is invariant because post wrappers remain per layer.
     const uint8_t post_ifm_idx =
         (2 +
-         static_cast<uint8_t>(_cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 &&
+         static_cast<uint8_t>(cfg.pipeline_cfg.quantize_embeddings && layer_idx == 0 &&
                               !is_gemma4_mtp_draft && !is_eagle3_draft) +
-         static_cast<uint8_t>(_uses_per_layer_inputs()) +
-         static_cast<uint8_t>(_cfg.lm_cfg.attn_cfg.attn_output_gate));
-    if (_cfg.vm_cfg.has_value() &&
-        layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size() && num_tokens > 1) {
-        auto& deepstack = get_buffer(fmt::format("deepstack_feature_l{}_cache", layer_idx));
+         static_cast<uint8_t>(model._uses_per_layer_inputs()) +
+         static_cast<uint8_t>(cfg.lm_cfg.attn_cfg.attn_output_gate));
+    if (cfg.vm_cfg.has_value() &&
+        layer_idx < cfg.vm_cfg.value().deepstack_visual_indexes.size() && num_tokens > 1) {
+        auto& deepstack = model.get_buffer(fmt::format("deepstack_feature_l{}_cache", layer_idx));
         post_model._bind_ifm(post_ifm_idx, &deepstack, {token_idx, 0});
     }
-    return {&pre_model, &cache_model, &post_model};
+    return {pre_model, cache_model, post_model};
 }
 
 void LanguageModel::_gather_embedding_rows(std::span<const uint32_t> ids, MLABuffer& destination,
@@ -472,7 +502,7 @@ std::unique_lock<std::recursive_mutex> LanguageExecutor::lock_execution() {
 LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft)
     : _target(target), _draft(draft), _limit(target._run->max_num_tokens),
       _stop_ids(target._run->stop_token_ids), _exceptions(std::uncaught_exceptions()),
-      _outer(target._run->depth++ == 0) {
+      _outer(!target._run->is_running.load(std::memory_order_relaxed)) {
     if (!_outer)
         return;
     try {
@@ -488,7 +518,6 @@ LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft)
         if (draft)
             draft->bind_session_adapter();
     } catch (...) {
-        --target._run->depth;
         target._run->is_running = false;
         if (draft)
             draft->_run->is_running = false;
@@ -501,7 +530,10 @@ LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft)
 }
 
 void LanguageExecutor::Run::complete() {
-    _target._run->text_streamer.finish();
+    if (_outer && !_stream_finished) {
+        _stream_finished = true;
+        _target._run->text_streamer.finish();
+    }
 }
 
 LanguageExecutor::Run::~Run() {
@@ -530,7 +562,6 @@ LanguageExecutor::Run::~Run() {
         if (_draft)
             _draft->_run->is_running = false;
     }
-    --_target._run->depth;
 }
 
 } // namespace simaai::llima

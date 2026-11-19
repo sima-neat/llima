@@ -38,6 +38,7 @@ namespace llima {
 
 struct WhisperPreprocessResources;
 struct WhisperWorkspace;
+struct WhisperDecodeResult;
 
 class WhisperPreprocessor {
     public:
@@ -134,7 +135,7 @@ class WhisperModel {
 
         void _initialize();
         void _finalize();
-        TranscriptionResult _run_model(
+        WhisperDecodeResult _run_model(
             const ArrayXXbf& mel,
             const std::string& language,
             const std::string& task

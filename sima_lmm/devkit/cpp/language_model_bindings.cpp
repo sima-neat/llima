@@ -54,12 +54,19 @@ bool LanguageModel::has_buffer(const std::string& name) const {
            _resources->buffers.contains(name);
 }
 
-void LanguageModel::_initialize() {
+void LanguageModel::_initialize(bool defer_session_buffers) {
     _logger->info("Language model initialize starting ...");
     _resources->prepare_embeddings();
     _define_buffers();
-    for (auto* buffers : {&_resources->buffers, &_session->buffers, &_workspace->buffers}) {
+    for (auto* buffers : {&_resources->buffers, &_workspace->buffers}) {
         for (auto& [name, buffer] : *buffers) buffer.try_allocate();
+    }
+
+    if (!defer_session_buffers) {
+        for (auto& [name, buffer] : _session->buffers) {
+            buffer.allocate();
+            buffer.clear();
+        }
     }
 
     // Define and load the models in parallel.
@@ -100,22 +107,11 @@ void LanguageModel::_initialize() {
             );
         }
     }
-    // Clear the KV caches and caches states.
-    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
-            get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
-        } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
-            get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)).clear();
-            get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).clear();
-            get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)).clear();
-        } else if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
-            get_buffer(fmt::format("cache_key_l{}", layer_idx)).clear();
-            get_buffer(fmt::format("cache_val_l{}", layer_idx)).clear();
-            if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                get_buffer(fmt::format("cache_key_scale_l{}", layer_idx)).clear();
-                get_buffer(fmt::format("cache_val_scale_l{}", layer_idx)).clear();
-            }
-        }
+    if (defer_session_buffers) {
+        // Program definitions used the default session's descriptors to record their binding slots.
+        // The first request supplies the actual storage, including for the assistant's public session.
+        _bind_session(nullptr);
+        _sessions->get(0)->buffers.clear();
     }
 
     _logger->info("Language model initialize completed");

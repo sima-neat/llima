@@ -425,7 +425,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             );
         }
 
-        LanguageExecutor::queue_attention({&pre_model, &cache_model, &post_model},
+        LanguageExecutor::queue_attention({pre_model, cache_model, post_model},
             {.input = &ifm_map, .cache = &cache_ifm_map, .post_input = &ifm_map});
     }
 
@@ -569,7 +569,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
             ifm_map_ptr = &layer0_ifm_map;
         }
 
-        LanguageExecutor::queue_attention({&pre_model, &cache_model, &post_model},
+        LanguageExecutor::queue_attention({pre_model, cache_model, post_model},
             {.input = ifm_map_ptr, .cache = &cache_ifm_map, .post_input = ifm_map_ptr});
     }
 

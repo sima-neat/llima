@@ -33,6 +33,7 @@ namespace llima {
 
 struct EmbeddingOffload;
 struct LanguageResources;
+struct LanguageAdapter;
 struct LanguageSession;
 struct LanguageWorkspace;
 struct LanguageRunState;
@@ -282,6 +283,11 @@ class LanguageModel {
         void set_kv_cache_len(uint16_t len);
 
     private:
+        // The facade binds draft caches only when selecting a private or public session.
+        LanguageModel(std::filesystem::path model_path, std::set<uint32_t> stop_token_ids,
+                      std::optional<uint32_t> image_token_id, std::optional<uint32_t> pad_token_id,
+                      TextStreamer& text_streamer, std::shared_ptr<FileProvider> files,
+                      bool defer_session_buffers);
         friend struct LanguageResources;
         friend struct LanguageSession;
         friend struct LanguageWorkspace;
@@ -290,6 +296,7 @@ class LanguageModel {
         friend class LanguageExecutor;
         void invalidate_prompt_reuse();
         void bind_session_adapter();
+        void _bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter);
         void set_image_identity(std::string identity);
 
         friend class SessionManager;
@@ -300,7 +307,7 @@ class LanguageModel {
         const std::shared_ptr<FileProvider>& _files;
         std::shared_ptr<spdlog::logger> _logger;
         std::unique_ptr<SessionManager> _sessions;
-        LanguageSession* _session;
+        std::shared_ptr<LanguageSession> _session;
         std::unique_ptr<LanguageWorkspace> _workspace;
         std::unique_ptr<LanguageRunState> _run;
 
@@ -312,7 +319,10 @@ class LanguageModel {
                                     const std::string& dtype = "bfloat16", bool align_last_dim = true);
         MLABuffer& get_buffer(const std::string& name);
         bool has_buffer(const std::string& name) const;
-        void _select_session(LanguageSession& selected);
+        void _bind_session(const std::shared_ptr<LanguageSession>& selected);
+        void _select_request_sessions(SessionId id, LanguageModel* draft);
+        void _detach_draft_sessions(LanguageModel* draft);
+        void _release_paired_session(SessionId id, LanguageModel* draft);
         void _init_attention_bindings();
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,
@@ -361,7 +371,7 @@ class LanguageModel {
             std::optional<ChronoTimer> timer_ttft,
             GenerationPerformanceResult* performance_result
         );
-        struct CachedState {
+        struct CheckpointLayout {
             // Hidden-layer indices belonging to this stateful family.
             std::vector<uint8_t> layer_indices;
             // MLA buffer name prefix; full name is `{prefix}{layer_idx}`.
@@ -376,8 +386,14 @@ class LanguageModel {
             size_t tail_bytes;
             // Group prefill models output only one final state row, not per-token state history.
             bool prefill_single_output = false;
-            // Tail snapshots indexed as [layer_slot][checkpoint_slot][byte_offset].
-            std::vector<std::vector<std::vector<uint8_t>>> checkpoints;
+        };
+        static constexpr size_t checkpoint_slot_count = 4;
+        struct CachedState {
+            explicit CachedState(const CheckpointLayout& description)
+                : layout(description), checkpoints(layout.layer_indices.size()) {}
+            CheckpointLayout layout;
+            // Each occupied slot owns the snapshot for one layer at one sequence position.
+            std::vector<std::array<std::vector<uint8_t>, checkpoint_slot_count>> checkpoints;
         };
         struct AttentionBindingBuffers {
             MLABuffer* key = nullptr;
@@ -385,13 +401,8 @@ class LanguageModel {
             MLABuffer* key_scale = nullptr;
             MLABuffer* value_scale = nullptr;
         };
-        struct BoundAttentionModels {
-            MLAModelWithBuffer* pre;
-            MLAModelWithBuffer* cache;
-            MLAModelWithBuffer* post;
-        };
 
-        void _initialize();
+        void _initialize(bool defer_session_buffers);
         void _finalize();
         void _define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count);
         bool _has_linear_attention_layers() const;
@@ -423,13 +434,6 @@ class LanguageModel {
         uint16_t _get_cache_token_idx_begin(
             uint16_t num_tokens, uint16_t token_idx, const std::string& layer_type
         ) const;
-        BoundAttentionModels _bind_attn_models(
-            uint16_t num_tokens,
-            uint16_t token_idx,
-            uint8_t layer_idx,
-            MLABuffer* embedding_scale_buf = nullptr,
-            uint32_t embedding_scale_row = 0
-        );
         void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_linear_models_iter(uint16_t num_tokens, uint8_t layer_idx);

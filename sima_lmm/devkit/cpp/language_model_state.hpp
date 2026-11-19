@@ -28,7 +28,7 @@ struct LanguageResources {
     void load();
     void load_per_layer_embeddings();
     bool ready = false;
-    std::map<std::string, std::shared_ptr<LanguageAdapter>> adapters;
+    std::map<std::string, std::weak_ptr<LanguageAdapter>> adapters;
     struct BufferSpec {
         std::vector<size_t> shape;
         std::string dtype;
@@ -65,7 +65,7 @@ struct LanguageSession {
     uint16_t kv_cache_len = 0; // tokens in KV cache;
     std::vector<uint16_t> checkpoint_boundaries;
     std::vector<LanguageModel::CachedState> cached_states;
-    std::array<uint16_t, 4> state_checkpoint_positions{};
+    std::array<uint16_t, LanguageModel::checkpoint_slot_count> state_checkpoint_positions{};
     std::optional<std::string> reloc_name;
     std::shared_ptr<LanguageAdapter> adapter;
     std::string image_identity;
@@ -75,8 +75,7 @@ struct LanguageSession {
 class SessionManager {
   public:
     SessionManager();
-    LanguageSession& get(SessionId id);
-    const LanguageSession& get(SessionId id) const;
+    const std::shared_ptr<LanguageSession>& get(SessionId id) const;
     SessionId create(const LanguageSession& prototype);
     void release(SessionId id);
     void set_limit(size_t limit);
@@ -87,7 +86,7 @@ class SessionManager {
   private:
     size_t _limit = 4;
     SessionId _next = 1;
-    std::map<SessionId, LanguageSession> _sessions;
+    std::map<SessionId, std::shared_ptr<LanguageSession>> _sessions;
 };
 
 struct LanguageModel::DFlashScratch {
@@ -100,6 +99,7 @@ struct LanguageModel::DFlashScratch {
 };
 
 struct LanguageWorkspace {
+    std::shared_ptr<LanguageAdapter> bound_adapter;
     std::weak_ptr<LanguageResources> paired_draft;
     std::vector<uint8_t> mtp_shared_kv_layers;
     LanguageModel::DFlashScratch dflash;
@@ -150,7 +150,6 @@ struct LanguageRunState {
     TextStreamer& text_streamer;
     std::atomic<bool> is_running; // Request activity; cancellation is never inferred from this flag.
     std::atomic<bool> cancelled = false;
-    std::atomic<unsigned> depth = 0;
 };
 
 } // namespace simaai::llima

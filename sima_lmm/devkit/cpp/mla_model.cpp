@@ -28,6 +28,7 @@ namespace {
 
 struct QueuedRun {
     std::shared_ptr<RuntimeProgram> program;
+    std::shared_ptr<const RuntimeRelocation> relocation;
     std::vector<std::shared_ptr<RuntimeBufferImport>> imports;
     std::size_t model_index = 0;
     std::vector<mla_tensor> ifms;
@@ -218,6 +219,20 @@ MLABufferSlice materialize_view(
 
 } // namespace
 
+// MLA relocations apply to the native model until replaced. Only change them
+// while the model is idle and retain the imports until a later binding takes over.
+void RuntimeProgram::activate_relocation(const std::shared_ptr<const RuntimeRelocation>& desired) {
+    if (active_reloc == desired) return;
+    const auto& binding = desired ? desired : neutral_reloc;
+    const int rc = mla_update_model_reloc(model_for(index),
+                                          static_cast<int>(binding->ports.size()),
+                                          binding->ports.data());
+    if (rc != 0)
+        throw std::runtime_error(fmt::format("MLA-RT relocation failed for {}: rc={}",
+                                             path_for(index), rc));
+    active_reloc = desired;
+}
+
 RuntimeContext& RuntimeContext::instance() {
     static RuntimeContext context;
     return context;
@@ -341,8 +356,8 @@ void disconnect_mla_rt() {
     queued_run_count = 0;
     for (const auto& weak : state.programs) {
         if (auto program = weak.lock()) {
-            program->active_reloc.clear();
-            program->reloc_imports.clear();
+            program->active_reloc.reset();
+            program->neutral_reloc.reset();
         }
     }
     state.imported_buffers.clear();
@@ -385,8 +400,7 @@ void MLAModelWithBuffer::free() {
     if (state.programs[_model_idx].use_count() > 1) return;
     mla_free_model(state.models[_model_idx]);
     state.models[_model_idx] = nullptr;
-    _program->active_reloc.clear();
-    _program->reloc_imports.clear();
+    _program->active_reloc.reset();
 }
 
 void MLAModelWithBuffer::run(
@@ -396,7 +410,8 @@ void MLAModelWithBuffer::run(
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
     load();
-    _apply_reloc(_reloc_buffers);
+    _refresh_reloc();
+    _program->activate_relocation(_relocation);
     _debug_inouts("ifm", ifm_map_ptr);
 
     std::vector<mla_tensor> ifms;
@@ -445,12 +460,13 @@ void MLAModelWithBuffer::add_to_queue(
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
     load();
-    _apply_reloc(_reloc_buffers);
+    _refresh_reloc();
     const std::size_t slot = queued_run_count;
     if (slot == queued_runs.size()) queued_runs.emplace_back();
     auto& queued = queued_runs[slot];
     queued.model_index = _model_idx;
     queued.program = _program;
+    queued.relocation = _relocation;
     queued.imports.clear();
     make_bindings(_ifms, ifm_map_ptr, "IFM", queued.ifms, &queued.imports);
     make_bindings(_ofms, ofm_map_ptr, "OFM", queued.ofms, &queued.imports);
@@ -491,6 +507,17 @@ void MLAModelWithBuffer::run_queue() {
                 );
                 break;
             }
+            if (queued.program->active_reloc != queued.relocation) {
+                // The driver rejects relocation changes on a model with pending
+                // jobs. Finish this batch before starting the next adapter.
+                if (!inflight.empty()) break;
+                try {
+                    queued.program->activate_relocation(queued.relocation);
+                } catch (const std::exception& error) {
+                    first_error = error.what();
+                    break;
+                }
+            }
             mla_job_h job = nullptr;
             int rc = mla_submit_async(
                 model,
@@ -525,6 +552,7 @@ void MLAModelWithBuffer::run_queue() {
     }
     // Every submitted job has been reaped; retain vector capacity, release ownership.
     for (size_t i = 0; i < run_count; ++i) {
+        queued_runs[i].relocation.reset();
         queued_runs[i].imports.clear();
         queued_runs[i].program.reset();
     }
@@ -540,77 +568,60 @@ void MLAModelWithBuffer::run_queue() {
     }
 }
 
-void MLAModelWithBuffer::update_reloc(
-    const std::map<std::string, MLABuffer*>& reloc_buffers
+std::shared_ptr<const RuntimeRelocation> MLAModelWithBuffer::_prepare_reloc(
+    const std::map<std::string, MLABuffer*>& buffers
 ) {
-    if (reloc_buffers.empty()) return;
-    auto desired = reloc_buffers;
-    std::lock_guard execution_lock(runtime_state().execution_mutex);
+    if (buffers.empty()) return {};
     load();
-    _apply_reloc(desired);
+    auto& state = runtime_state();
+    const auto lengths = mla_get_ifm_ofm_len_vector(model_for(_model_idx)).reloc_len_array;
+    if (lengths.size() != buffers.size())
+        throw std::invalid_argument(fmt::format("Relocation count for {} is {}, model expects {}",
+                                                path_for(_model_idx), buffers.size(), lengths.size()));
+    auto binding = std::make_shared<RuntimeRelocation>();
+    auto neutral = _program->neutral_reloc ? nullptr : std::make_shared<RuntimeRelocation>();
+    auto add_port = [&](RuntimeRelocation& reloc, MLABuffer& buffer, size_t size) {
+        const auto id = imported_buffer_id(&buffer);
+        reloc.ports.push_back({id, 0, buffer.get_buf_addr_offset(), size});
+        reloc.imports.push_back(state.imported_buffers.at(buffer.get_allocation_generation()));
+    };
+    for (const auto& [name, buffer] : buffers) {
+        const auto size = lengths[binding->ports.size()];
+        if (!buffer || size <= 0 || buffer->get_allocation_size() < static_cast<size_t>(size))
+            throw std::invalid_argument(fmt::format("Relocation {} for {} needs {} bytes",
+                                                    name, path_for(_model_idx), size));
+        add_port(*binding, *buffer, size);
+        if (neutral) {
+            MLABuffer zero(name + "_neutral", {static_cast<size_t>(size)}, "int8", false);
+            zero.allocate();
+            zero.clear();
+            add_port(*neutral, zero, size);
+        }
+    }
+    if (neutral) _program->neutral_reloc = std::move(neutral);
+    return binding;
+}
+
+void MLAModelWithBuffer::_refresh_reloc() {
+    if (_relocation && _relocation->imports.front()->epoch != runtime_state().epoch)
+        _relocation = _prepare_reloc(_reloc_buffers);
+}
+
+void MLAModelWithBuffer::update_reloc(const std::map<std::string, MLABuffer*>& buffers) {
+    if (buffers.empty()) return;
+    std::lock_guard lock(runtime_state().execution_mutex);
+    auto desired = buffers;
+    auto binding = _prepare_reloc(desired);
+    _program->activate_relocation(binding);
     _reloc_buffers.swap(desired);
+    _relocation = std::move(binding);
 }
 
 void MLAModelWithBuffer::reset_reloc() {
-    std::lock_guard execution_lock(runtime_state().execution_mutex);
-    _apply_reloc({});
+    std::lock_guard lock(runtime_state().execution_mutex);
+    _program->activate_relocation(nullptr);
     _reloc_buffers.clear();
-}
-
-void MLAModelWithBuffer::_apply_reloc(
-    const std::map<std::string, MLABuffer*>& requested
-) {
-    if (_program->active_reloc == requested) return;
-    std::map<std::string, MLABuffer*> neutral;
-    if (requested.empty()) {
-        for (const auto& [name, buffer] : _program->neutral_reloc)
-            neutral.emplace(name, buffer.get());
-    }
-    const auto& reloc_buffers = requested.empty() ? neutral : requested;
-    auto& state = runtime_state();
-    mla_model_p model = model_for(_model_idx);
-    const auto lengths = mla_get_ifm_ofm_len_vector(model).reloc_len_array;
-    if (lengths.size() != reloc_buffers.size()) {
-        throw std::invalid_argument(fmt::format(
-            "Relocation count for {} is {}, model expects {}",
-            path_for(_model_idx), reloc_buffers.size(), lengths.size()
-        ));
-    }
-    // Bind adapters by internal_buf_id, not physical address. A reusable-CMA
-    // memory profile refuses the raw-phys attach path outright (the DMS pool is
-    // System RAM), so import each adapter's DMA-BUF and pass its buf_id, exactly
-    // as the IFM/OFM run path does in make_bindings(). Reloc ports are ordered
-    // by adapter buffer name, which matches the model's reloc section order.
-    if (_program->neutral_reloc.empty()) {
-        std::map<std::string, std::shared_ptr<MLABuffer>> neutral;
-        for (const auto& [name, buffer] : reloc_buffers) {
-            auto zero = std::make_shared<MLABuffer>(name + "_neutral", buffer->get_shape(), "int8", true);
-            zero->allocate();
-            zero->clear();
-            neutral.emplace(name, std::move(zero));
-        }
-        _program->neutral_reloc = std::move(neutral);
-    }
-    std::vector<std::shared_ptr<RuntimeBufferImport>> imports;
-    std::vector<mla_tensor> relocs;
-    relocs.reserve(reloc_buffers.size());
-    for (const auto& [name, buffer] : reloc_buffers) {
-        (void)name;
-        const uint64_t offset = buffer->get_buf_addr_offset();
-        const uint64_t length = buffer->get_allocation_size() - offset;
-        relocs.push_back({imported_buffer_id(buffer), 0, offset, length});
-        imports.push_back(state.imported_buffers.at(buffer->get_allocation_generation()));
-    }
-    const int rc = mla_update_model_reloc(
-        model, static_cast<int>(relocs.size()), relocs.data()
-    );
-    if (rc != 0) {
-        throw std::runtime_error(fmt::format(
-            "MLA-RT relocation failed for {}: rc={}", path_for(_model_idx), rc
-        ));
-    }
-    _program->active_reloc = requested;
-    _program->reloc_imports = std::move(imports);
+    _relocation.reset();
 }
 
 void MLAModelWithBuffer::load_all_models(std::optional<std::filesystem::path> relative_dir) {

@@ -149,10 +149,10 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
   for (auto &state : _session->cached_states) {
     std::string source_prefix;
     std::vector<uint32_t> source_begin;
-    if (state.buffer_name_prefix == "linear_conv_cache_history_l") {
+    if (state.layout.buffer_name_prefix == "linear_conv_cache_history_l") {
       source_prefix = "linear_conv_prefix_states_l";
       source_begin = {prefix_index, 0};
-    } else if (state.buffer_name_prefix == "linear_delta_state_history_l") {
+    } else if (state.layout.buffer_name_prefix == "linear_delta_state_history_l") {
       source_prefix = prefix_tokens == 1
                           ? "linear_delta_state_history_alt_l"
                           : "linear_delta_resolver_output_l";
@@ -162,17 +162,16 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
           "Unsupported state family in DFlash checkpoint capture");
     }
 
-    for (size_t layer_slot = 0; layer_slot < state.layer_indices.size();
+    for (size_t layer_slot = 0; layer_slot < state.layout.layer_indices.size();
          ++layer_slot) {
-      const auto layer_idx = state.layer_indices[layer_slot];
+      const auto layer_idx = state.layout.layer_indices[layer_slot];
       auto &source = get_buffer(fmt::format("{}{}", source_prefix, layer_idx));
       const size_t source_offset = source.get_buf_addr_offset(source_begin);
-      source.invalidate_cache(source_offset, state.tail_bytes);
+      source.invalidate_cache(source_offset, state.layout.tail_bytes);
       auto *source_ptr = reinterpret_cast<const uint8_t *>(
           source.get_virtual_addr());
-      std::memcpy(
-          state.checkpoints[layer_slot][*checkpoint_slot].data(),
-          source_ptr + source_offset, state.tail_bytes);
+      auto &snapshot = state.checkpoints[layer_slot][*checkpoint_slot];
+      snapshot.assign(source_ptr + source_offset, source_ptr + source_offset + state.layout.tail_bytes);
     }
   }
   _session->state_checkpoint_positions[*checkpoint_slot] = token_count;
@@ -410,6 +409,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     return std::nullopt;
   }
 
+  const auto cancelled = [this] { return _run->cancelled.load(std::memory_order_relaxed); };
   // A prior DFlash request may leave the verification model bound to its
   // accepted scratch tail. Prefill restores or clears the persistent state.
   _bind_dflash_linear_conv_state(0);
@@ -449,7 +449,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     const uint16_t valid =
         std::min<uint16_t>(prefill_width, prompt_len - offset);
     anchor = run_model_once(prefill_width, offset, prompt_len, 0);
-    if (_run->cancelled.load(std::memory_order_relaxed)) {
+    if (cancelled()) {
       _notify_interrupt();
       return std::nullopt;
     }
@@ -458,6 +458,10 @@ LanguageModel::_run_model_dflash_speculative_decoding(
         _has_linear_attention_layers()) {
       _move_state_tail_for_decode(valid);
     }
+  }
+  if (cancelled()) {
+    _notify_interrupt();
+    return std::nullopt;
   }
   _session->kv_cache_len = prompt_len;
   draft_lm._session->kv_cache_len = prompt_len;
@@ -479,7 +483,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   scratch.verify_input.resize(block_size);
   scratch.emitted.reserve(block_size);
 
-  while (!stopped && !_run->cancelled.load(std::memory_order_relaxed) &&
+  while (!stopped && !cancelled() &&
          output.size() + prompt_len < max_length) {
     if (_session->kv_cache_len + block_size > _cfg.pipeline_cfg.max_num_tokens) {
       // A fixed-width DFlash package cannot safely run a partial final block.
@@ -490,7 +494,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     const uint16_t verify_start = _session->kv_cache_len;
     const auto &proposals =
         draft_lm._run_dflash_draft(*this, anchor, verify_start, scratch);
-    if (_run->cancelled.load(std::memory_order_relaxed)) {
+    if (cancelled()) {
       break;
     }
     auto &verify_input = scratch.verify_input;
@@ -498,7 +502,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     std::copy(proposals.begin(), proposals.end(), verify_input.begin() + 1);
     const auto [accepted, bonus_token] =
         _run_dflash_target_verify(verify_input, verify_start, scratch);
-    if (_run->cancelled.load(std::memory_order_relaxed)) {
+    if (cancelled()) {
       break;
     }
     auto &emitted = scratch.emitted;
@@ -525,47 +529,49 @@ LanguageModel::_run_model_dflash_speculative_decoding(
         }
       }
     }
+    if (cancelled())
+      break;
     _commit_dflash_linear_state(committed_rows);
     _session->kv_cache_len = verify_start + committed_rows;
     draft_lm._session->kv_cache_len = verify_start;
     draft_lm._append_dflash_context(*this, block_size, verify_start,
                                     committed_rows);
     const double duration = iteration_timer.stop();
-    for (size_t index = 0; index < produced; ++index) {
+    for (size_t index = 0; index < produced && !cancelled(); ++index) {
       const auto token = emitted[index];
       output.push_back(token);
       _notify_new_token(token, duration / produced, index < accepted);
       if (performance_result != nullptr) {
         performance_result->token_durations.push_back(duration / produced);
         ++performance_result->generated_tokens;
+        if (index < accepted)
+          ++performance_result->accepted_draft_tokens.value();
       }
     }
+    if (cancelled())
+      break;
     for (auto* model : {this, &draft_lm}) {
       model->_session->cached_token_ids.insert(model->_session->cached_token_ids.end(), verify_input.begin(),
                                       verify_input.begin() + committed_rows);
     }
     _session->cached_first_generated_token = emitted[produced - 1];
     draft_lm._session->cached_first_generated_token = _session->cached_first_generated_token;
-    if (performance_result != nullptr) {
-      performance_result->accepted_draft_tokens.value() +=
-          std::min<size_t>(accepted, produced);
-    }
     anchor = emitted[produced - 1];
     if (produced < emitted.size()) {
       cache_full = true;
     }
   }
 
+  if (cancelled()) {
+    _notify_interrupt();
+    return std::nullopt;
+  }
   if (stopped) {
     _notify_stop();
   } else if (cache_full || prompt_len + output.size() >= max_length) {
     _notify_cache_full();
-  } else if (_run->cancelled.load(std::memory_order_relaxed)) {
-    _notify_interrupt();
   }
-  const bool completed = !_run->cancelled.load(std::memory_order_relaxed);
-  return completed ? std::optional<std::vector<uint32_t>>(std::move(output))
-                   : std::nullopt;
+  return output;
 }
 
 } // namespace llima
