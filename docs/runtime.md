@@ -98,7 +98,9 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 Whisper accepts preceding text as context, as OpenAI Whisper does with `prompt`
 (`initial_prompt` in the open-source package). Use it to steer spelling and
 vocabulary, such as product names and acronyms. Context makes these words more
-likely but does not guarantee them.
+likely but does not guarantee them. Keep it to the terms that matter: long or
+repetitive context can make Whisper repeat it or skip the speech, as upstream
+Whisper does.
 
 In web mode, `/v1/audio/transcriptions` and `/v1/audio/translations` accept
 `prompt` or `initial_prompt`:
