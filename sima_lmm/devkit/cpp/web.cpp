@@ -37,7 +37,6 @@ WEB::WEB(
 {
     if (_singleton_ptr)
         throw std::runtime_error("Only one WEB instance can be created");
-    _singleton_ptr = this;
 
     if (whisper_model_path.has_value()) {
         _whisper_model_ptr = std::make_unique<WhisperModel>(whisper_model_path.value());
@@ -54,6 +53,8 @@ WEB::WEB(
     auto llima_logger = spdlog::get("llima");
     _logger = llima_logger? llima_logger->clone("WEB") : spdlog::default_logger();
 
+    // Register only after model loading and prompt validation, which can throw.
+    _singleton_ptr = this;
     struct sigaction new_sigint_action;
     new_sigint_action.sa_handler = [](int sig) {
         assert(sig == SIGINT);
