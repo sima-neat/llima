@@ -373,7 +373,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.dispatcher_lifecycle` | Connect and disconnect through the installed dispatcher stack |
 | `runtime.text_generation` | Qwen text generation on MLA |
 | `runtime.vision_generation` | LFM2 image-conditioned generation using the installed sample image |
-| `runtime.asr_transcription` | Whisper transcription using the installed sample audio, including prompts, prompt truncation and special-token rejection |
+| `runtime.asr_transcription` | Whisper transcription using the installed sample audio, including prompts, prompt truncation, special-token rejection and audio longer than 30 s |
 | `runtime.tool_call_parser` | Tool-call parsing safety and streaming provenance without model inference |
 | `runtime.reasoning_parser` | Qwen/Gemma reasoning boundary parsing and streaming provenance without model inference |
 | `runtime.embedding_offload` | Exact row gathers, duplicate IDs, padded destinations, truncated files, invalid modes, and NVMe backing-device detection with synthetic fixtures |

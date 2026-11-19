@@ -547,6 +547,14 @@ void WEB::_handle_audio_transcriptions(
             prompt = form_value(req, "initial_prompt");
         if (prompt)
             options.prompt = *prompt;
+        if (auto condition = form_value(req, "condition_on_previous_text")) {
+            if (*condition == "true" || *condition == "1" || *condition == "True")
+                options.condition_on_previous_text = true;
+            else if (*condition == "false" || *condition == "0" || *condition == "False")
+                options.condition_on_previous_text = false;
+            else
+                throw std::invalid_argument("condition_on_previous_text must be true or false");
+        }
         // Reject an invalid prompt before barge-in and before a stream commits to HTTP 200.
         _whisper_model_ptr->validate_prompt(options.prompt);
 

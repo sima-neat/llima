@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <spdlog/common.h>
 
@@ -31,6 +32,13 @@ std::string normalize_transcript(const std::string& value) {
         }
     }
     return normalized;
+}
+
+size_t count_occurrences(const std::string& text, const std::string& phrase) {
+    size_t count = 0;
+    for (auto pos = text.find(phrase); pos != std::string::npos; pos = text.find(phrase, pos + 1))
+        ++count;
+    return count;
 }
 
 }  // namespace
@@ -62,6 +70,8 @@ int main() {
         std::string prompted_text;
         std::string long_prompt_text;
         std::string prefixed_long_prompt_text;
+        std::string long_audio_text;
+        std::string unconditioned_long_audio_text;
         std::string repeated_text;
         bool rejected_special_tokens = false;
         {
@@ -85,6 +95,19 @@ int main() {
             ).text;
             prefixed_long_prompt_text = model.run_model(
                 audio, TranscriptionOptions{.prompt = prefixed_long_prompt}
+            ).text;
+            // The sample at 0 s and again at 31 s spans two 30 s windows.
+            constexpr uint32_t sample_rate = simaai::llima::WhisperPreprocessor::SAMPLE_RATE;
+            const auto sample =
+                simaai::llima::WhisperPreprocessor(model_dir / "devkit").load_audio(audio);
+            std::vector<float> long_audio(31 * sample_rate + sample.size(), 0.0F);
+            std::copy_n(sample.data(), sample.size(), long_audio.begin());
+            std::copy_n(sample.data(), sample.size(), long_audio.begin() + 31 * sample_rate);
+            long_audio_text = model.run_model_from_pcm(
+                long_audio, sample_rate, TranscriptionOptions{}
+            ).text;
+            unconditioned_long_audio_text = model.run_model_from_pcm(
+                long_audio, sample_rate, TranscriptionOptions{.condition_on_previous_text = false}
             ).text;
             try {
                 model.run_model(audio, TranscriptionOptions{.prompt = "<|en|> sky"});
@@ -122,6 +145,12 @@ int main() {
         }
         if (prefixed_long_prompt_text != long_prompt_text) {
             throw std::runtime_error("ASR prompt truncation did not keep the last prompt tokens");
+        }
+        std::cout << "LLIMA_ASR long_audio_text=" << long_audio_text << '\n';
+        for (const auto& text : {long_audio_text, unconditioned_long_audio_text}) {
+            if (count_occurrences(normalize_transcript(text), "why is the sky blue") != 2) {
+                throw std::runtime_error("Unexpected long-form ASR transcript: " + text);
+            }
         }
         if (!rejected_special_tokens) {
             throw std::runtime_error("ASR prompt with special tokens was not rejected");

@@ -113,12 +113,28 @@ $ curl http://<modalix-ip>:9998/v1/audio/transcriptions \
 
 A request prompt, including an empty one, replaces the `--stt_prompt` default.
 The runtime keeps the last 223 prompt tokens, and each one adds a decoder step
-before the first transcribed token. Prompts must not contain Whisper special
+before the first transcribed token of each 30-second window. Prompts must not contain Whisper special
 tokens such as `<|en|>`; an invalid `--stt_prompt` stops `llima run` at startup
 and an invalid request prompt returns HTTP 400. Options that cannot be honored
 also return HTTP 400:
 `response_format` other than `json`, nonzero `temperature`,
 `timestamp_granularities[]`, `chunking_strategy` and `include[]`.
+
+## Long Audio
+
+Audio longer than 30 seconds is transcribed in consecutive 30-second windows,
+and the text of all windows is returned together. Audio up to 2 hours is
+accepted. Longer audio returns HTTP 400, or an error event when streaming. Streaming sends text as each
+window is decoded. Windows are fixed, so a word that spans a window boundary can
+be split or dropped.
+
+As in OpenAI Whisper, each window also receives the most recent text of the
+preceding windows as context, after the prompt and within the same 223-token
+limit. The prompt applies to every window, so a prompt near the limit leaves
+little room for preceding text. If a window stops at the decoder token limit,
+usually because the model is repeating itself, the preceding text is dropped and
+later windows start again from the prompt alone. To always use only the prompt
+as context, send `condition_on_previous_text=false`.
 
 
 ## Build an Application with Neat
