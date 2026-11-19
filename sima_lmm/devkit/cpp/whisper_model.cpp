@@ -66,9 +66,13 @@ WhisperPreprocessor::~WhisperPreprocessor() {
 ArrayXXbf WhisperPreprocessor::preprocess(
     const std::filesystem::path& audio_file_name
 ) {
-    auto audio_tensor = _load_audio_ffmpeg(audio_file_name);
-    auto log_spec = _log_mel_spectrogram(audio_tensor);
-    return log_spec;
+    auto audio = _load_audio_ffmpeg(audio_file_name);
+    return preprocess_pcm({audio.data(), static_cast<size_t>(audio.size())}, SAMPLE_RATE);
+}
+
+
+ArrayXf WhisperPreprocessor::load_audio(const std::filesystem::path& audio_file_name) {
+    return _load_audio_ffmpeg(audio_file_name);
 }
 
 
@@ -144,12 +148,10 @@ ArrayXf WhisperPreprocessor::_load_audio_ffmpeg(
     ScopedPtr<AVFrame> frame(av_frame_alloc());
     if (!packet || !frame) throw std::runtime_error("LibAv: Allocation failed");
 
-    std::vector<int16_t> samples(N_SAMPLES, 0);
-    size_t total = 0;
+    std::vector<int16_t> samples;
     std::vector<int16_t> pcm_buf;
 
     auto process_data = [&](const uint8_t** in_data, int in_count) {
-        if (total >= N_SAMPLES) return;
         int delay = swr_get_delay(swr_ctx.get(), codec_ctx->sample_rate);
         int out_count = av_rescale_rnd(delay + in_count, 16000, codec_ctx->sample_rate, AV_ROUND_UP);
         
@@ -161,9 +163,12 @@ ArrayXf WhisperPreprocessor::_load_audio_ffmpeg(
             
             int ret = swr_convert(swr_ctx.get(), out_ptrs, out_count, in_data, in_count);
             if (ret > 0) {
-                size_t copy_len = std::min((size_t)ret, N_SAMPLES - total);
-                std::memcpy(samples.data() + total, pcm_buf.data(), copy_len * sizeof(int16_t));
-                total += copy_len;
+                if (samples.size() + ret > MAX_AUDIO_SAMPLES) {
+                    throw std::invalid_argument(fmt::format(
+                        "Audio longer than {} s is not supported", MAX_AUDIO_SECONDS
+                    ));
+                }
+                samples.insert(samples.end(), pcm_buf.begin(), pcm_buf.begin() + ret);
             }
         }
     };
@@ -177,14 +182,13 @@ ArrayXf WhisperPreprocessor::_load_audio_ffmpeg(
             }
         }
         av_packet_unref(packet.get());
-        if (total >= N_SAMPLES) break;
     }
 
     // Flush resampler
-    if (total < N_SAMPLES) process_data(nullptr, 0);
+    process_data(nullptr, 0);
 
     // 6. Return
-    Eigen::Map<ArrayXi16> map(samples.data(), N_SAMPLES);
+    Eigen::Map<ArrayXi16> map(samples.data(), samples.size());
     return map.cast<float>() * (1.0f / 32768.0f);
 }
 
@@ -276,11 +280,23 @@ WhisperModel::TranscriptionResult WhisperModel::run_model(
     const std::string& language,
     const std::string& task
 ) {
+    return run_model(audio_file_name, TranscriptionOptions{language, task});
+}
+
+
+WhisperModel::TranscriptionResult WhisperModel::run_model(
+    const std::filesystem::path& audio_file_name,
+    const TranscriptionOptions& options
+) {
     std::lock_guard<std::mutex> lock(_mutex);
     _logger->info("Audio file: {}", audio_file_name);
 
-    ArrayXXbf audio_tensor = _preprocessor.preprocess(audio_file_name);
-    return _run_model(audio_tensor, language, task);
+    ArrayXf audio = _preprocessor.load_audio(audio_file_name);
+    return _transcribe(
+        {audio.data(), static_cast<size_t>(audio.size())},
+        WhisperPreprocessor::SAMPLE_RATE,
+        options
+    );
 }
 
 
@@ -290,16 +306,24 @@ WhisperModel::TranscriptionResult WhisperModel::run_model_from_pcm(
     const std::string& language,
     const std::string& task
 ) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    ArrayXXbf mel = _preprocessor.preprocess_pcm(pcm, sample_rate);
-    return _run_model(mel, language, task);
+    return run_model_from_pcm(pcm, sample_rate, TranscriptionOptions{language, task});
 }
 
 
-WhisperModel::TranscriptionResult WhisperModel::_run_model(
-    const ArrayXXbf& mel,
-    const std::string& language,
-    const std::string& task
+WhisperModel::TranscriptionResult WhisperModel::run_model_from_pcm(
+    std::span<const float> pcm,
+    uint32_t sample_rate,
+    const TranscriptionOptions& options
+) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _transcribe(pcm, sample_rate, options);
+}
+
+
+WhisperModel::TranscriptionResult WhisperModel::_transcribe(
+    std::span<const float> pcm,
+    uint32_t sample_rate,
+    const TranscriptionOptions& options
 ) {
     _is_running.store(true, std::memory_order_relaxed);
     struct RunningGuard {
@@ -309,32 +333,137 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
         }
     } running_guard{_is_running};
 
+    _logger->info("Language: {}", options.language);
+    const auto prompt_ids = _encode_prompt(options.prompt);
+    if (pcm.size() > WhisperPreprocessor::MAX_AUDIO_SAMPLES) {
+        throw std::invalid_argument(fmt::format(
+            "Audio longer than {} s is not supported", WhisperPreprocessor::MAX_AUDIO_SECONDS
+        ));
+    }
+
+    // Audio longer than one encoder input runs as consecutive fixed windows. A trailing
+    // remainder under 100 ms, such as resampler rounding, cannot hold speech and is skipped.
+    constexpr size_t window_samples = WhisperPreprocessor::N_SAMPLES;
+    constexpr size_t min_window_samples = WhisperPreprocessor::SAMPLE_RATE / 10;
+    size_t num_windows = pcm.size() / window_samples;
+    if (num_windows == 0 || pcm.size() % window_samples >= min_window_samples)
+        ++num_windows;
+    if (num_windows > 1)
+        _logger->info("Whisper long-form audio: {} windows", num_windows);
+
+    const size_t max_context_tokens = _cfg.max_target_positions / 2 - 1;
+    std::vector<uint32_t> text_ids;
+    // Text before this index is not carried into later windows.
+    size_t context_begin = 0;
+    std::string language = options.language;
+    TranscriptionResult result{.no_speech_prob = 1.0f};
+    float logprob_sum = 0.0f;
+    uint32_t logprob_count = 0;
+    try {
+        for (size_t window_idx = 0; window_idx < num_windows; ++window_idx) {
+            if (window_idx > 0 && !_is_running.load(std::memory_order_relaxed))
+                break;
+
+            // The prompt applies to every window, and preceding text fills the remaining context.
+            std::vector<uint32_t> context_ids = prompt_ids;
+            if (options.condition_on_previous_text) {
+                const size_t budget = max_context_tokens - prompt_ids.size();
+                const size_t begin = std::max(
+                    context_begin, text_ids.size() - std::min(budget, text_ids.size())
+                );
+                context_ids.insert(context_ids.end(), text_ids.begin() + begin, text_ids.end());
+            }
+
+            const size_t offset = window_idx * window_samples;
+            const auto window = pcm.subspan(offset, std::min(window_samples, pcm.size() - offset));
+            auto window_result = _run_window(
+                _preprocessor.preprocess_pcm(window, sample_rate),
+                language,
+                options.task,
+                context_ids,
+                window_idx == 0
+            );
+            if (window_idx == 0) {
+                // Later windows keep the language detected in the first one.
+                language = window_result.language;
+                result.language = window_result.language;
+                result.task = window_result.task;
+            }
+            result.no_speech_prob = std::min(result.no_speech_prob, window_result.no_speech_prob);
+            logprob_sum += window_result.logprob_sum;
+            logprob_count += window_result.logprob_count;
+            text_ids.insert(
+                text_ids.end(), window_result.tokens.begin(), window_result.tokens.end()
+            );
+            // A window cut off at the token limit is often a repetition loop; don't carry it on.
+            if (!window_result.finished)
+                context_begin = text_ids.size();
+        }
+    } catch (...) {
+        // End the stream so streamed text is flushed and the next request starts clean.
+        _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
+        _text_streamer->wait_streaming();
+        throw;
+    }
+    _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
+    _text_streamer->wait_streaming();
+
+    result.text = _tokenizer_ptr->decode(text_ids, true);
+    if (_cfg.log_probe_enabled)
+        result.avg_logprob = logprob_count > 0 ? logprob_sum / logprob_count : 0.0f;
+    return result;
+}
+
+
+WhisperModel::WindowResult WhisperModel::_run_window(
+    const ArrayXXbf& mel,
+    const std::string& language,
+    const std::string& task,
+    const std::vector<uint32_t>& prompt_ids,
+    bool first_window
+) {
     ChronoTimer timer_ttft(true);
-    _logger->info("Language: {}", language);
 
     // Upload audio_tensor and run the encoder model.
     get_buffer("encoder_ifm").upload(mel.data());
     _run_encoder();
 
     auto language_detect_result = _run_language_detect();
+    WindowResult result{
+        .finished = false,
+        .no_speech_prob = language_detect_result.no_speech_prob,
+        .logprob_sum = 0.0f,
+        .logprob_count = 0
+    };
 
     // Update language token id.
-    std::string resolved_language;
     if (_is_auto_language(language)) {
         auto detected_language_index = language_detect_result.language_index;
         auto detected_language_token = _language_token_from_index(detected_language_index);
         _set_language_token(detected_language_token);
-        resolved_language = _language_code_from_token(detected_language_token);
+        result.language = _language_code_from_token(detected_language_token);
         _logger->info(
             "Detected language: {} token={} index={}",
-            resolved_language,
+            result.language,
             detected_language_token,
             detected_language_index
         );
     } else {
-        resolved_language = _update_language(language);
+        result.language = _update_language(language);
     }
-    auto resolved_task = _update_task(task);
+    result.task = _update_task(task);
+
+    // A prompt precedes the start sequence as <|startofprev|> context, as in OpenAI Whisper.
+    std::vector<uint32_t> decoder_input_ids;
+    if (!prompt_ids.empty()) {
+        decoder_input_ids.reserve(1 + prompt_ids.size() + _input_token_ids.size());
+        _logger->info("Whisper prompt tokens: {}", prompt_ids.size());
+        decoder_input_ids.emplace_back(_tokenizer_ptr->token_to_id("<|startofprev|>"));
+        decoder_input_ids.insert(decoder_input_ids.end(), prompt_ids.begin(), prompt_ids.end());
+    }
+    decoder_input_ids.insert(
+        decoder_input_ids.end(), _input_token_ids.begin(), _input_token_ids.end()
+    );
 
     // Upload the decoder input embeds.
     const uint8_t* token_embeddings_ptr = reinterpret_cast<const uint8_t*>(
@@ -344,7 +473,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     auto& decoder_init_buf = get_buffer("decoder_init");
     for (uint32_t i = 0; i < _input_token_ids.size(); ++i) {
         decoder_init_buf.upload_raw(
-            token_embeddings_ptr + _input_token_ids[i] * token_embed_size,
+            token_embeddings_ptr + decoder_input_ids[i] * token_embed_size,
             i * token_embed_size,
             token_embed_size
         );
@@ -352,96 +481,65 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
 
     auto& new_token_buf = get_buffer("new_token");
     uint32_t* new_token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());
-    std::vector<uint32_t> new_tokens;
-    float logprob_sum = 0.0f;
-    uint32_t logprob_count = 0;
+    auto read_new_token = [&]() {
+        new_token_buf.invalidate_cache();
+        const uint32_t token = new_token_ptr[0];
+        if (_cfg.log_probe_enabled) {
+            auto& logits_buf = get_buffer("decoder_logits");
+            logits_buf.invalidate_cache();
+            result.logprob_sum += _compute_token_logprob(logits_buf, token);
+            ++result.logprob_count;
+        }
+        return token;
+    };
 
-    // Run decoder init model to generate the first token.
+    // The init model consumes the first input tokens and single-token steps consume the rest
+    // of a prompted input, all in one queue. Only the prediction after the last one is kept.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
         _decoder_init_model_map.at(layer_idx).add_to_queue();
     }
-    MLAModelWithBuffer::run_queue();
-    new_token_buf.invalidate_cache();
-    new_tokens.emplace_back(new_token_ptr[0]);
-    if (_cfg.log_probe_enabled) {
-        auto& logits_buf = get_buffer("decoder_logits");
-        logits_buf.invalidate_cache();
-        logprob_sum += _compute_token_logprob(logits_buf, new_tokens.back());
-        ++logprob_count;
+    for (
+        uint32_t token_idx = _input_token_ids.size();
+        token_idx < decoder_input_ids.size();
+        ++token_idx
+    ) {
+        _queue_decoder_step(token_idx, decoder_input_ids[token_idx]);
     }
+    MLAModelWithBuffer::run_queue();
+    uint32_t token = read_new_token();
     const double ttft = timer_ttft.stop();
-    _logger->info("Time to the first token: {:d} in {:.5f}s", new_tokens.back(), ttft);
-    _text_streamer->push(DecodeCallbackType::TTFT, new_tokens.back(), ttft);
-    if (new_tokens.back() == _stop_token_id) {
-        _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
-        _text_streamer->wait_streaming();
-        return {_tokenizer_ptr->decode(new_tokens, true), resolved_language,
-                resolved_task, language_detect_result.no_speech_prob,
-                _cfg.log_probe_enabled
-                    ? std::optional<float>{logprob_sum / logprob_count}
-                    : std::optional<float>{}};
+    if (first_window) {
+        _logger->info("Time to the first token: {:d} in {:.5f}s", token, ttft);
+        _text_streamer->push(DecodeCallbackType::TTFT, token, ttft);
+    } else {
+        _logger->info("Got window token {:d} in {:.5f}s", token, ttft);
+        if (token != _stop_token_id)
+            _text_streamer->push(DecodeCallbackType::TPS, token, ttft);
     }
 
     // Run decoder pre/cache/post models to generate other tokens.
     ChronoTimer timer_tps(true);
     for (
-        uint32_t token_idx = _input_token_ids.size();
-        token_idx < _cfg.max_target_positions;
+        uint32_t token_idx = decoder_input_ids.size();
+        token != _stop_token_id;
         ++token_idx
     ) {
-        if (!_is_running.load(std::memory_order_relaxed))
-            break;
+        if (token < _stop_token_id)
+            result.tokens.emplace_back(token);
+        if (token_idx >= _cfg.max_target_positions || !_is_running.load(std::memory_order_relaxed))
+            return result;
 
-        for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
-            WhisperDecoderModelMapKey model_key{layer_idx, token_idx};
-
-            std::map<uint8_t, MLABufferSlice> ifm_map;
-            if (layer_idx == 0) {
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(0),
-                    std::forward_as_tuple(
-                        &get_buffer("token_embeddings"),
-                        std::vector<uint32_t>{new_tokens.back(), 0},
-                        std::vector<uint32_t>{1, _cfg.d_model}
-                    )
-                );
-            }
-            _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
-            _decoder_cache_model_map.at(model_key).add_to_queue();
-            _decoder_post_model_map.at(model_key).add_to_queue();
-        }
-
+        _queue_decoder_step(token_idx, token);
         MLAModelWithBuffer::run_queue();
-        new_token_buf.invalidate_cache();
-        new_tokens.emplace_back(new_token_ptr[0]);
-        if (_cfg.log_probe_enabled) {
-            auto& logits_buf = get_buffer("decoder_logits");
-            logits_buf.invalidate_cache();
-            logprob_sum +=
-                _compute_token_logprob(logits_buf, new_tokens.back());
-            ++logprob_count;
-        }
+        token = read_new_token();
         const double ttnt = timer_tps.stop(true);
-        _logger->info("Got token {:d} in {:.5f}s", new_tokens.back(), ttnt);
+        _logger->info("Got token {:d} in {:.5f}s", token, ttnt);
 
-        if (new_tokens.back() == _stop_token_id)
-            break;
-
-        _text_streamer->push(DecodeCallbackType::TPS, new_tokens.back(), ttnt);
+        if (token != _stop_token_id)
+            _text_streamer->push(DecodeCallbackType::TPS, token, ttnt);
     }
-    _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
-    _text_streamer->wait_streaming();
-    std::optional<float> avg_logprob = std::nullopt;
-    if (_cfg.log_probe_enabled)
-        avg_logprob = logprob_count > 0 ? logprob_sum / logprob_count : 0.0f;
-    return {
-        _tokenizer_ptr->decode(new_tokens, true),
-        resolved_language,
-        resolved_task,
-        language_detect_result.no_speech_prob,
-        avg_logprob
-    };
+    result.finished = true;
+    return result;
 }
 
 
@@ -890,6 +988,50 @@ void WhisperModel::_run_encoder() {
         encoder_layer_model.add_to_queue();
     }
     MLAModelWithBuffer::run_queue();
+}
+
+
+std::vector<uint32_t> WhisperModel::_encode_prompt(const std::string& prompt) const {
+    constexpr const char* whitespace = " \t\n\v\f\r";
+    const auto begin = prompt.find_first_not_of(whitespace);
+    if (begin == std::string::npos)
+        return {};
+    const auto end = prompt.find_last_not_of(whitespace);
+
+    // Match OpenAI Whisper: encode the stripped text after a space and keep the most recent
+    // tokens that fit in half of the decoder context together with <|startofprev|>.
+    auto prompt_ids = _tokenizer_ptr->encode(" " + prompt.substr(begin, end - begin + 1), false);
+    // Whisper vocabularies place all special and timestamp tokens from <|endoftext|> onward.
+    if (std::ranges::any_of(prompt_ids, [this](uint32_t id) { return id >= _stop_token_id; })) {
+        throw std::invalid_argument("Whisper prompt must not contain special tokens");
+    }
+    const size_t max_prompt_tokens = _cfg.max_target_positions / 2 - 1;
+    if (prompt_ids.size() > max_prompt_tokens)
+        prompt_ids.erase(prompt_ids.begin(), prompt_ids.end() - max_prompt_tokens);
+    return prompt_ids;
+}
+
+
+void WhisperModel::_queue_decoder_step(uint32_t token_idx, uint32_t token_id) {
+    for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
+        WhisperDecoderModelMapKey model_key{layer_idx, token_idx};
+
+        std::map<uint8_t, MLABufferSlice> ifm_map;
+        if (layer_idx == 0) {
+            ifm_map.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(0),
+                std::forward_as_tuple(
+                    &get_buffer("token_embeddings"),
+                    std::vector<uint32_t>{token_id, 0},
+                    std::vector<uint32_t>{1, _cfg.d_model}
+                )
+            );
+        }
+        _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
+        _decoder_cache_model_map.at(model_key).add_to_queue();
+        _decoder_post_model_map.at(model_key).add_to_queue();
+    }
 }
 
 

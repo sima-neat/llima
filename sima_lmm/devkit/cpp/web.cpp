@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <fstream>
 #include <variant>
 #include <vector>
@@ -26,18 +27,22 @@ WEB::WEB(
     std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
-    bool enable_thinking
+    bool enable_thinking,
+    std::optional<std::string> stt_prompt
 ) : _vision_language_model_ptr(
         std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
     ),
+    _default_stt_prompt(stt_prompt.value_or("")),
     _enable_thinking(enable_thinking)
 {
     if (_singleton_ptr)
         throw std::runtime_error("Only one WEB instance can be created");
-    _singleton_ptr = this;
+    if (!_default_stt_prompt.empty() && !whisper_model_path.has_value())
+        throw std::invalid_argument("stt_prompt requires a Whisper model");
 
     if (whisper_model_path.has_value()) {
         _whisper_model_ptr = std::make_unique<WhisperModel>(whisper_model_path.value());
+        _whisper_model_ptr->validate_prompt(_default_stt_prompt);
     }
 
     if (draft_model_path.has_value()) {
@@ -50,6 +55,8 @@ WEB::WEB(
     auto llima_logger = spdlog::get("llima");
     _logger = llima_logger? llima_logger->clone("WEB") : spdlog::default_logger();
 
+    // Register only after model loading and prompt validation, which can throw.
+    _singleton_ptr = this;
     struct sigaction new_sigint_action;
     new_sigint_action.sa_handler = [](int sig) {
         assert(sig == SIGINT);
@@ -473,6 +480,40 @@ void WEB::_handle_chat_completions(
     }
 }
 
+namespace {
+
+// Older cpp-httplib stores plain multipart fields in params.
+std::optional<std::string> form_value(const httplib::Request& req, const std::string& name) {
+    if (req.has_param(name))
+        return req.get_param_value(name);
+    if (req.has_file(name))
+        return req.get_file_value(name).content;
+    return std::nullopt;
+}
+
+// Reject OpenAI audio options that Whisper decoding cannot honor instead of ignoring them.
+std::optional<std::string> unsupported_audio_option(const httplib::Request& req) {
+    if (auto format = form_value(req, "response_format"); format && *format != "json")
+        return "Unsupported response_format '" + *format + "'; only json is supported";
+    if (auto temperature = form_value(req, "temperature")) {
+        char* end = nullptr;
+        const double value = std::strtod(temperature->c_str(), &end);
+        if (end == temperature->c_str() || *end != '\0' || value != 0.0) {
+            return "Unsupported temperature '" + *temperature
+                + "'; only 0 (greedy decoding) is supported";
+        }
+    }
+    for (const char* name : {"timestamp_granularities[]", "chunking_strategy", "include[]"}) {
+        if (form_value(req, name))
+            return std::string{"Unsupported option '"} + name + "'";
+    }
+    if (form_value(req, "prompt") && form_value(req, "initial_prompt"))
+        return "Use either prompt or initial_prompt, not both";
+    return std::nullopt;
+}
+
+}  // namespace
+
 void WEB::_handle_audio_transcriptions(
     const httplib::Request& req,
     httplib::Response& res,
@@ -485,6 +526,37 @@ void WEB::_handle_audio_transcriptions(
             res.set_content(R"({"error": "No 'file' part"})", "application/json");
             return;
         }
+        if (auto error = unsupported_audio_option(req)) {
+            res.status = 400;
+            res.set_content(nlohmann::json({{"error", *error}}).dump(), "application/json");
+            return;
+        }
+
+        if (!_whisper_model_ptr) {
+            res.status = 503;
+            res.set_content(R"({"error": "Whisper model not loaded"})", "application/json");
+            return;
+        }
+
+        // A request prompt, even an empty one, replaces the default prompt.
+        WhisperModel::TranscriptionOptions options{.task = task, .prompt = _default_stt_prompt};
+        if (auto language = form_value(req, "language"); language && !language->empty())
+            options.language = *language;
+        auto prompt = form_value(req, "prompt");
+        if (!prompt)
+            prompt = form_value(req, "initial_prompt");
+        if (prompt)
+            options.prompt = *prompt;
+        if (auto condition = form_value(req, "condition_on_previous_text")) {
+            if (*condition == "true" || *condition == "1" || *condition == "True")
+                options.condition_on_previous_text = true;
+            else if (*condition == "false" || *condition == "0" || *condition == "False")
+                options.condition_on_previous_text = false;
+            else
+                throw std::invalid_argument("condition_on_previous_text must be true or false");
+        }
+        // Reject an invalid prompt before barge-in and before a stream commits to HTTP 200.
+        _whisper_model_ptr->validate_prompt(options.prompt);
 
         // Barge-in check
         _stop_and_detach_vlm_thread();
@@ -495,39 +567,13 @@ void WEB::_handle_audio_transcriptions(
         output_file.write(file.content.c_str(), file.content.size());
         output_file.close();
 
-        // Get language from form data
-        std::string language = "auto";
-        // Older cpp-httplib stores plain multipart fields in params.
-        if (req.has_param("language")) {
-            language = req.get_param_value("language");
-        } else if (req.has_file("language")) {
-            const auto lang_file = req.get_file_value("language");
-            if (!lang_file.content.empty()) {
-                language = lang_file.content;
-            }
-        }
-
-        if (!_whisper_model_ptr) {
-            res.status = 503;
-            res.set_content(R"({"error": "Whisper model not loaded"})", "application/json");
+        const auto stream_value = form_value(req, "stream").value_or("false");
+        if (stream_value == "true" || stream_value == "1" || stream_value == "True") {
+            _execute_streaming_audio_transcription(res, options);
             return;
         }
 
-        bool stream = false;
-        if (req.has_param("stream")) {
-            auto value = req.get_param_value("stream");
-            stream = value == "true" || value == "1" || value == "True";
-        } else if (req.has_file("stream")) {
-            auto value = req.get_file_value("stream").content;
-            stream = value == "true" || value == "1" || value == "True";
-        }
-
-        if (stream) {
-            _execute_streaming_audio_transcription(res, language, task);
-            return;
-        }
-
-        auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+        auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, options);
         nlohmann::json response = {
             {"text", result.text},
             {"language", result.language},
@@ -538,6 +584,9 @@ void WEB::_handle_audio_transcriptions(
             response["avg_logprob"] = result.avg_logprob.value();
         res.set_content(response.dump(), "application/json");
 
+    } catch (const std::invalid_argument& e) {
+        res.status = 400;
+        res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
     } catch (const std::exception& e) {
         _logger->error("Error in transcription: {}", e.what());
         res.status = 500;
@@ -547,8 +596,7 @@ void WEB::_handle_audio_transcriptions(
 
 void WEB::_execute_streaming_audio_transcription(
     httplib::Response& res,
-    const std::string& language,
-    const std::string& task
+    const WhisperModel::TranscriptionOptions& options
 ) {
     res.set_header("Content-Type", "text/event-stream");
     res.set_header("Cache-Control", "no-cache");
@@ -556,8 +604,9 @@ void WEB::_execute_streaming_audio_transcription(
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, language, task](size_t offset, httplib::DataSink &sink) {
+        [this, options](size_t offset, httplib::DataSink &sink) {
             (void)offset;
+            const std::string& task = options.task;
             std::optional<double> ttft_value;
             std::optional<double> tps_value;
             std::optional<std::string> finish_reason;
@@ -594,7 +643,7 @@ void WEB::_execute_streaming_audio_transcription(
             try {
                 _whisper_model_ptr->set_info_callback(info_callback);
                 _whisper_model_ptr->set_text_callback(text_callback);
-                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, options);
                 std::string chunk = _format_audio_sse_chunk(
                     "", task, true, finish_reason.value_or("stop"), ttft_value, tps_value,
                     result.language, result.task, result.no_speech_prob, result.avg_logprob

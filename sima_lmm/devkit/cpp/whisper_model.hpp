@@ -39,6 +39,8 @@ class WhisperPreprocessor {
         ~WhisperPreprocessor();
 
         ArrayXXbf preprocess(const std::filesystem::path& audio_file_name);
+        // Decode the whole file as 16 kHz mono PCM.
+        ArrayXf load_audio(const std::filesystem::path& audio_file_name);
         ArrayXXbf preprocess_pcm(std::span<const float> pcm, uint32_t sample_rate);
 
         static constexpr uint32_t SAMPLE_RATE = 16000;
@@ -47,6 +49,9 @@ class WhisperPreprocessor {
         static constexpr uint32_t CHUNK_LENGTH = 30;
         static constexpr uint32_t N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE;
         static constexpr uint32_t N_FRAMES = N_SAMPLES / HOP_LENGTH;
+        // Longer audio is rejected with std::invalid_argument to bound memory and model time.
+        static constexpr uint32_t MAX_AUDIO_SECONDS = 2 * 60 * 60;
+        static constexpr size_t MAX_AUDIO_SAMPLES = size_t{MAX_AUDIO_SECONDS} * SAMPLE_RATE;
 
     private:
         explicit WhisperPreprocessor(std::unique_ptr<std::istream> config);
@@ -76,6 +81,16 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             std::optional<float> avg_logprob;
         };
 
+        struct TranscriptionOptions {
+            std::string language = "auto";
+            std::string task = "transcribe";
+            // Preceding-context text, as OpenAI's `prompt`; empty disables it.
+            std::string prompt;
+            // Audio longer than 30 s runs as consecutive windows. When set, each window also
+            // gets the text of the preceding windows as context, as in OpenAI Whisper.
+            bool condition_on_previous_text = true;
+        };
+
         WhisperModel(std::filesystem::path model_path);
         WhisperModel(std::filesystem::path model_path, std::shared_ptr<FileProvider> files);
         virtual ~WhisperModel() { _finalize(); };
@@ -91,6 +106,17 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             const std::string& language,
             const std::string& task = "transcribe"
         );
+        TranscriptionResult run_model(
+            const std::filesystem::path& audio_file_name,
+            const TranscriptionOptions& options
+        );
+        TranscriptionResult run_model_from_pcm(
+            std::span<const float> pcm,
+            uint32_t sample_rate,
+            const TranscriptionOptions& options
+        );
+        // Throws std::invalid_argument when the prompt cannot be used as decoder context.
+        void validate_prompt(const std::string& prompt) const { (void)_encode_prompt(prompt); }
         void set_info_callback(TextStreamer::InfoCallback callback) {
             _text_streamer->set_info_callback(callback);
         }
@@ -108,10 +134,27 @@ class WhisperModel : public BaseModel<WhisperConfig> {
     private:
         virtual void _initialize() override;
         virtual void _finalize() override;
-        TranscriptionResult _run_model(
+        struct WindowResult {
+            std::vector<uint32_t> tokens;
+            // False when the window stopped at the token limit or was cancelled.
+            bool finished;
+            std::string language;
+            std::string task;
+            float no_speech_prob;
+            float logprob_sum;
+            uint32_t logprob_count;
+        };
+        TranscriptionResult _transcribe(
+            std::span<const float> pcm,
+            uint32_t sample_rate,
+            const TranscriptionOptions& options
+        );
+        WindowResult _run_window(
             const ArrayXXbf& mel,
             const std::string& language,
-            const std::string& task
+            const std::string& task,
+            const std::vector<uint32_t>& prompt_ids,
+            bool first_window
         );
 
         virtual void _define_buffers() override;
@@ -131,6 +174,8 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::filesystem::path _get_elf_path_decoder_post(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_language_detect() const;
         void _run_encoder();
+        std::vector<uint32_t> _encode_prompt(const std::string& prompt) const;
+        void _queue_decoder_step(uint32_t token_idx, uint32_t token_id);
         bool _is_auto_language(const std::string& language) const;
         struct LanguageDetectResult {
             uint32_t language_index;

@@ -18,6 +18,7 @@ clear history      : clear prompts, responses and images; keep system prompt.
 print history      : print chat history.
 set audio <fn>     : set the audio file to be transcribed as query.
 set language <lang>: set transcription language; omit <lang> or use auto to detect it.
+set prompt <text>  : set transcription context such as domain terms; omit <text> to clear it.
 set lora           : set the model to use LoRA weights from a npy_files folder.
 unset lora         : revert LoRA model to baseline model.
 enable-thinking    : enable thinking mode and clear chat history.
@@ -33,17 +34,21 @@ CLI::CLI(
     std::optional<std::filesystem::path> whisper_model_path,
     std::optional<std::filesystem::path> draft_model_path,
     std::optional<std::string> system_prompt,
-    std::optional<std::string> chat_template
+    std::optional<std::string> chat_template,
+    std::optional<std::string> stt_prompt
 ) : _vision_language_model_ptr(
         std::make_unique<VisionLanguageModel>(vlm_model_path, system_prompt, chat_template)
-    )
+    ),
+    _default_stt_prompt(stt_prompt.value_or(""))
 {
     if (_singleton_ptr)
         throw std::runtime_error("Only one CLI instance can be created");
-    _singleton_ptr = this;
+    if (!_default_stt_prompt.empty() && !whisper_model_path.has_value())
+        throw std::invalid_argument("stt_prompt requires a Whisper model");
 
     if (whisper_model_path.has_value()) {
         _whisper_model_ptr = std::make_unique<WhisperModel>(whisper_model_path.value());
+        _whisper_model_ptr->validate_prompt(_default_stt_prompt);
     }
 
     if (draft_model_path.has_value()) {
@@ -58,6 +63,8 @@ CLI::CLI(
     auto llima_logger = spdlog::get("llima");
     _logger = llima_logger? llima_logger->clone("CLI") : spdlog::default_logger();
 
+    // Register only after model loading and prompt validation, which can throw.
+    _singleton_ptr = this;
     struct sigaction new_sigint_action;
     new_sigint_action.sa_handler = [](int sig) {
         assert(sig == SIGINT);
@@ -79,6 +86,7 @@ CLI::~CLI() {
 
 void CLI::run() {
     std::string language = "en";
+    std::string stt_prompt = _default_stt_prompt;
     auto chat = _vision_language_model_ptr->create_chat();
     const bool highlight_draft = []() {
         const char* value = std::getenv("SIMA_LLIMA_ENABLE_DRAFT_HIGHLIGHT");
@@ -149,6 +157,13 @@ void CLI::run() {
             constexpr auto pos = std::string("set language ").length();
             language = command.substr(pos);
             continue;
+        } else if (command == "set prompt") {
+            stt_prompt.clear();
+            continue;
+        } else if (command.starts_with("set prompt ")) {
+            constexpr auto pos = std::string("set prompt ").length();
+            stt_prompt = command.substr(pos);
+            continue;
         } else if (command.starts_with("add image ")) {
             constexpr auto pos = std::string("add image ").length();
             std::filesystem::path image_file_name = command.substr(pos);
@@ -204,7 +219,16 @@ void CLI::run() {
                     model->set_text_callback([](const std::string&, bool, bool) {});
                 }
             } callback_guard{_whisper_model_ptr.get()};
-            auto result = _whisper_model_ptr->run_model(audio_file_name, language);
+            WhisperModel::TranscriptionResult result;
+            try {
+                result = _whisper_model_ptr->run_model(
+                    audio_file_name,
+                    WhisperModel::TranscriptionOptions{.language = language, .prompt = stt_prompt}
+                );
+            } catch (const std::exception& ex) {
+                std::cout << std::endl << "Transcription failed: " << ex.what() << std::endl;
+                continue;
+            }
             chat.add_query(result.text);
         } else {
             std::cout << "Query: " << command << std::endl;

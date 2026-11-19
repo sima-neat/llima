@@ -35,7 +35,8 @@ class EXPORT WEB {
             std::optional<std::filesystem::path> draft_model_path,
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template,
-            bool enable_thinking = false
+            bool enable_thinking = false,
+            std::optional<std::string> stt_prompt = std::nullopt
         );
         ~WEB();
 
@@ -123,12 +124,12 @@ class EXPORT WEB {
         );
         void _execute_streaming_audio_transcription(
             httplib::Response& res,
-            const std::string& language,
-            const std::string& task
+            const WhisperModel::TranscriptionOptions& options
         );
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
+        std::string _default_stt_prompt;
         bool _enable_thinking;
         std::jthread _vlm_thread;
 
