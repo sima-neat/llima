@@ -34,6 +34,7 @@ set(TARGET_BIND cpp_ext)
 set(TARGET_RUNTIME sima_lmm_runtime)
 option(SIMA_LMM_BUILD_PYTHON "Build the Python nanobind extension." ON)
 option(SIMA_LMM_BUILD_TESTS "Build DevKit runtime test targets." OFF)
+option(SIMA_LMM_BUILD_AUDIO_SERVER "Build the experimental LFM2 audio HTTP example." OFF)
 set(SYSROOT "" CACHE PATH "Optional target sysroot prefix")
 set(
     SIMA_LMM_PYTHON_EXTENSION_INSTALL_DIR
@@ -505,6 +506,10 @@ install(
 if(SIMA_LMM_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/runtime)
+endif()
+
+if(SIMA_LMM_BUILD_AUDIO_SERVER)
+    add_subdirectory(examples/lfm2_audio)
 endif()
 
 if(SIMA_LMM_INSTALL_PYTHON_PACKAGE)

@@ -101,6 +101,10 @@ LLiMa expects a compiled runtime model directory produced by Model Compiler. The
 directory must contain runtime configuration and compiled ELF files required by
 the DevKit runtime.
 
+The experimental [LFM2.5 Audio workflow](docs/lfm2_audio_development.md) uses an
+explicit component compiler and audio runner; it is not registered with the
+standard `llima run` or GenAI server entry points.
+
 The LLiMa model zoo is hosted on Hugging Face:
 
 https://huggingface.co/simaai

@@ -25,6 +25,11 @@ The input format alone does not establish compatibility. The model
 architecture, size, tokenizer, and any multimodal components must also be
 supported.
 
+LFM2.5 Audio has an explicit experimental component compiler and native audio
+runner. The standard CLI does not register this audio architecture. See the
+[LFM2 Audio development guide](lfm2_audio_development.md) for the BF16/INT8
+workflow and validation limits.
+
 ### Start with a SiMa.ai pre-quantized model
 
 :::tip Recommended input
