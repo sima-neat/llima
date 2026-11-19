@@ -123,10 +123,12 @@ also return HTTP 400:
 ## Long Audio
 
 Audio longer than 30 seconds is transcribed in consecutive 30-second windows,
-and the text of all windows is returned together. Audio up to 2 hours is
-accepted. Longer audio returns HTTP 400, or an error event when streaming. Streaming sends text as each
+and the text of all windows is returned together. Streaming sends text as each
 window is decoded. Windows are fixed, so a word that spans a window boundary can
-be split or dropped.
+be split or dropped. A final remainder shorter than 100 ms, such as a few extra
+samples on a 30-second recording, is not transcribed, because Whisper tends to
+produce invented text for an almost empty window. Audio up to 2 hours is
+accepted; longer audio returns HTTP 400, or an error event when streaming.
 
 As in OpenAI Whisper, each window also receives the most recent text of the
 preceding windows as context, after the prompt and within the same 223-token
