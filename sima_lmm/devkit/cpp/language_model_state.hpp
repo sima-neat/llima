@@ -7,15 +7,10 @@
 
 namespace simaai::llima {
 
-struct AdapterModelKey {
-    std::string kind;
-    LanguageModelMapKey model;
-    auto operator<=>(const AdapterModelKey&) const = default;
-};
 struct LanguageAdapter {
     std::string name;
     std::map<std::string, MLABuffer> buffers;
-    std::map<AdapterModelKey, std::map<std::string, MLABuffer*>> bindings;
+    std::map<size_t, std::map<std::string, MLABuffer*>> bindings; // Runtime program index -> sections.
 };
 
 struct LanguageResources {

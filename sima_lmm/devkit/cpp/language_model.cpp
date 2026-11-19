@@ -1,5 +1,6 @@
 #include "embedding_offload.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -27,6 +28,14 @@ namespace simaai {
 namespace llima {
 
 namespace {
+
+auto adapter_model_maps(LanguageWorkspace& workspace) {
+    return std::array{
+        &workspace.pre_model_map, &workspace.post_model_map, &workspace.router_model_map,
+        &workspace.expert_model_map, &workspace.conv_model_map, &workspace.conv_final_model_map,
+        &workspace.linear_model_map
+    };
+}
 
 LogLikelihoodResult score_logits(
     std::span<const Eigen::bfloat16> logits, uint32_t target_token_id
@@ -1415,12 +1424,12 @@ void LanguageModel::compact_kv_after_accept(
              && layer_types[layer_idx] != "sliding_attention")
             || _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
         ) {
-    continue;
-}
+            continue;
+        }
 
         for (const std::string& kind : {"cache_key_l", "cache_val_l"}) {
-    compact_buffer(fmt::format("{}{}", kind, layer_idx));
-}
+            compact_buffer(fmt::format("{}{}", kind, layer_idx));
+        }
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
             for (const std::string& kind : {"cache_key_scale_l", "cache_val_scale_l"}) {
                 compact_buffer(fmt::format("{}{}", kind, layer_idx));
@@ -1457,27 +1466,21 @@ void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapte
     };
     std::vector<Change> changes;
     const Buffers empty;
-    size_t matched = 0;
-    for (const auto& [kind, models] : std::initializer_list<std::pair<std::string, LanguageModelMap*>>{
-        {"pre", &_workspace->pre_model_map}, {"post", &_workspace->post_model_map},
-        {"router", &_workspace->router_model_map}, {"expert", &_workspace->expert_model_map}}) {
+    std::map<size_t, std::shared_ptr<const RuntimeRelocation>> prepared;
+    for (auto* models : adapter_model_maps(*_workspace)) {
         for (auto& [key, model] : *models) {
             const Buffers* desired = &empty;
             if (adapter) {
-                const auto found = adapter->bindings.find({kind, key});
-                if (found != adapter->bindings.end()) {
-                    desired = &found->second;
-                    ++matched;
-                }
+                const auto found = adapter->bindings.find(model._model_idx);
+                if (found != adapter->bindings.end()) desired = &found->second;
             }
-            if (model._reloc_buffers != *desired)
-                changes.push_back({model, *desired, {}, model._program->active_reloc});
+            if (model._reloc_buffers == *desired) continue;
+            // A grouped final post can share its ELF with the single-token path.
+            auto [slot, first] = prepared.try_emplace(model._model_idx);
+            if (first) slot->second = model._prepare_reloc(*desired, true);
+            changes.push_back({model, *desired, slot->second, model._program->active_reloc});
         }
     }
-    if (adapter && matched != adapter->bindings.size())
-        throw std::invalid_argument("LoRA names a graph not present in the model");
-    for (auto& change : changes)
-        change.next = change.model._prepare_reloc(change.buffers, true);
 
     // All ELF keys and ports are valid. Publish wrapper bindings only after every
     // native update succeeds. A failed driver call leaves existing requests retryable.
@@ -1521,20 +1524,31 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
         adapter = std::make_shared<LanguageAdapter>();
         adapter->name = reloc_name;
         const auto directory = _devkit_dir.parent_path() / "npy_files" / reloc_name;
-        const std::regex pattern(R"(_n(\d+)_(pre|post|router)_layer(\d+)(?:_expert(\d+))?_)");
+        std::map<std::string, size_t> active_graphs;
+        const auto& paths = RuntimeContext::instance().paths;
+        for (auto* models : adapter_model_maps(*_workspace)) {
+            for (const auto& [key, model] : *models)
+                active_graphs.emplace(paths.at(model._model_idx).filename().string(), model._model_idx);
+        }
+        // Compiler weight-map names identify the ELF before the relocation section.
+        static const std::regex graph_pattern(
+            R"((_n(\d+)_(?:pre_layer\d+|post_layer\d+(?:_expert\d+|_conv_final)?|router_layer\d+|layer\d+_(?:conv|linear)))(?!_expert|_conv_final)(?=[_.]))");
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
             if (entry.path().extension() != ".npy") continue;
             std::smatch match;
             const auto filename = entry.path().filename().string();
-            if (!std::regex_search(filename, match, pattern))
-                throw std::runtime_error("Invalid file name for relocation: " + filename);
-            const auto width = std::stoul(match[1]);
-            const auto layer = std::stoul(match[3]);
-            const auto expert = match[4].matched ? std::stoul(match[4]) : 0;
-            if (width > UINT16_MAX || layer > UINT8_MAX || expert > UINT16_MAX)
-                throw std::invalid_argument("Relocation graph index out of range: " + filename);
-            if (!_use_group_token_models && width > 1) continue;
-            const std::string kind = match[4].matched ? "expert" : match[2].str();
+            if (!std::regex_search(filename, match, graph_pattern))
+                throw std::invalid_argument("Invalid file name for relocation: " + filename);
+            const auto elf = _cfg.language_model_name + match[1].str() + "_stage1_mla.elf";
+            const auto graph = active_graphs.find(elf);
+            if (graph == active_graphs.end()) {
+                const auto width = std::stoul(match[2]);
+                // Packages may retain compiled group graphs which this configuration skips.
+                if (width > 1 && width != _cfg.lm_cfg.get_single_num_tokens()
+                    && (!_use_group_token_models || width == _cfg.pipeline_cfg.input_token_group_size)
+                    && _files->exists("elf_files/" + elf)) continue;
+                throw std::invalid_argument("LoRA names a graph not present in the model: " + filename);
+            }
             const auto tensor = cnpy::npy_load(_files->get_path("npy_files/" + reloc_name + "/" + filename));
             if (tensor.word_size != 1 || tensor.fortran_order || tensor.num_vals == 0)
                 throw std::invalid_argument("LoRA tensor must contain contiguous row-major bytes: " + filename);
@@ -1544,7 +1558,7 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
                 key, key, std::vector<size_t>{tensor.num_bytes()}, "int8", false);
             buffer->second.allocate();
             buffer->second.upload(tensor.data<void>());
-            adapter->bindings[{kind, {width, layer, expert}}].emplace(key, &buffer->second);
+            adapter->bindings[graph->second].emplace(key, &buffer->second);
         }
         if (adapter->bindings.empty())
             throw std::runtime_error("No LoRA relocation tensors found in " + directory.string());
