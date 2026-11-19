@@ -156,10 +156,10 @@ def prepare_mole(
         if any(length <= 0 for length in input_lengths):
             logger.error("--input_lengths values must be positive")
             return None
-        if any(length + max_new_tokens > max_num_tokens for length in input_lengths):
+        if any(length + 1 + max_new_tokens > max_num_tokens for length in input_lengths):
             logger.error(
-                "Every --input_lengths value plus --max_new_tokens must be less than "
-                "or equal to --max_num_tokens"
+                "Each input length, the first generated token, and --max_new_tokens decode "
+                "steps must fit within --max_num_tokens"
             )
             return None
         normalized_input_lengths = tuple(sorted(input_lengths))

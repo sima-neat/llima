@@ -383,12 +383,12 @@ void ZMQServer::run() {
                             };
                         }
                     } else if (request_metadata.type == "generate_for_perf") {
-                        // Given a list of input token ids, return the list of time to generate the next
-                        // token. The first item of the list is the TTFT.
+                        // The first duration is TTFT. Its token counts toward max_num_tokens.
                         auto result = _vision_language_model_ptr->run_model_for_ttnt(
                             input_token_ids, request_metadata.max_num_tokens,
                             request_metadata.stop_token_ids
                         );
+                        response_metadata.result_type = "token_durations";
                         response_metadata.tensor_dtype = "float64";
                         response_metadata.tensor_shape = {1, result.token_durations.size()};
                         response_metadata.generated_tokens = result.generated_tokens;

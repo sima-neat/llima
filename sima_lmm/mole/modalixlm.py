@@ -294,9 +294,11 @@ class ModalixLM(HFLM):
             case _:
                 raise RuntimeError(f"Unexpected dtype: {response_metadata['tensor_dtype']}")
         out_shape = response_metadata["tensor_shape"]
-        out_tensor = torch.frombuffer(bytearray(response_messages[1]), dtype=out_dtype).view(
-            *out_shape
-        )
+        payload = response_messages[1]
+        if not payload and 0 in out_shape:
+            out_tensor = torch.empty(out_shape, dtype=out_dtype)
+        else:
+            out_tensor = torch.frombuffer(bytearray(payload), dtype=out_dtype).view(*out_shape)
         out_tensor = out_tensor.to(device=device)
 
         roundtrip_time_ns = zmq_t1 - zmq_t0
