@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -170,6 +171,7 @@ struct Lfm2AudioModel::Impl {
     std::vector<std::array<uint32_t, 8>> pending_codes;
     std::recursive_mutex mutex;
     bool waveform_closed = false;
+    AudioDecodeTimings decode_profile;
 
     Impl(const std::filesystem::path& path) : directory(path) {
         std::ifstream file(directory / "audio_runtime.json");
@@ -308,7 +310,9 @@ struct Lfm2AudioModel::Impl {
                 auto tail = conv.output(1);
                 tail.buffer->invalidate_cache();
                 const auto* raw = static_cast<const Eigen::bfloat16*>(tail.buffer->get_virtual_addr());
-                family.tails[index]->upload(raw + (length - 1) * family.width);
+                // Padded prefill must retain the last two real input rows,
+                // rather than advancing convolution state through padding.
+                family.tails[index]->upload(raw + (valid - 1) * family.width);
                 current = conv.output();
                 if (index + 1 == family.layers.size()) {
                     auto& final = unit(layer + "_final");
@@ -356,20 +360,31 @@ void Lfm2AudioModel::reset() {
     auto& self = *_impl; std::lock_guard lock(self.mutex);
     for (auto* family : {&self.backbone, &self.depth, &self.decoder}) self.reset_family(*family);
     self.last_hidden = {}; self.pending_codes.clear(); self.waveform->reset(); self.waveform_closed = false;
+    self.decode_profile = {};
 }
 
 std::vector<float> Lfm2AudioModel::forward(std::span<const float> embeddings) {
     auto& self = *_impl; std::lock_guard lock(self.mutex);
     const size_t width = hidden_size(), group = self.config.at("options").at("group_size");
     if (embeddings.empty() || embeddings.size() % width) throw std::invalid_argument("Invalid audio backbone input");
-    size_t offset = 0, last_length = 0;
+    size_t offset = 0, last_valid = 0;
     while (offset < embeddings.size()) {
-        last_length = (embeddings.size() - offset) / width >= group ? group : 1;
-        self.last_hidden = self.run_family(self.backbone, embeddings.subspan(offset, last_length * width), last_length, last_length);
-        offset += last_length * width;
+        const size_t remaining = (embeddings.size() - offset) / width;
+        const size_t length = remaining >= group ||
+            (remaining > 1 && self.backbone.cached + group <= self.backbone.capacity) ? group : 1;
+        last_valid = std::min(remaining, length);
+        auto input = embeddings.subspan(offset, last_valid * width);
+        std::vector<float> padded;
+        if (last_valid < length) {
+            padded.resize(length * width, 0.f);
+            std::copy(input.begin(), input.end(), padded.begin());
+            input = padded;
+        }
+        self.last_hidden = self.run_family(self.backbone, input, length, last_valid);
+        offset += last_valid * width;
     }
-    auto values = read_rows(self.last_hidden, last_length - 1, 1, width);
-    self.last_hidden.begin[2] = last_length - 1;
+    auto values = read_rows(self.last_hidden, last_valid - 1, 1, width);
+    self.last_hidden.begin[2] = last_valid - 1;
     self.last_hidden.shape[2] = 1;
     return values;
 }
@@ -527,18 +542,29 @@ std::vector<float> Lfm2AudioModel::decode_codes(std::span<const std::array<uint3
                 input[(frame * 6 + repeat) * width + column] = mean[column] / 8.f;
             }
         }
+        const auto network_started = std::chrono::steady_clock::now();
         auto hidden = self.run_family(self.decoder, input, chunk * 6, count * 6);
         auto& spectrum = self.unit("detokenizer_n" + std::to_string(chunk * 6) + "_spectrum");
         spectrum.run({{"hidden", hidden}});
         auto spectral = read_rows(spectrum.output(), 0, count * 6, 1282);
+        const auto waveform_started = std::chrono::steady_clock::now();
         auto samples = self.waveform->push(spectral); waveform.insert(waveform.end(), samples.begin(), samples.end());
+        self.decode_profile.network_ms += std::chrono::duration<double, std::milli>(waveform_started-network_started).count();
+        self.decode_profile.waveform_cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-waveform_started).count();
         self.pending_codes.erase(self.pending_codes.begin(), self.pending_codes.begin() + count);
     }
     if (finish) {
+        const auto waveform_started = std::chrono::steady_clock::now();
         auto tail = self.waveform->finish(); waveform.insert(waveform.end(), tail.begin(), tail.end());
+        self.decode_profile.waveform_cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-waveform_started).count();
         self.waveform_closed = true;
     }
     return waveform;
+}
+
+AudioDecodeTimings Lfm2AudioModel::decode_timings() const {
+    std::lock_guard lock(_impl->mutex);
+    return _impl->decode_profile;
 }
 
 } // namespace simaai::llima

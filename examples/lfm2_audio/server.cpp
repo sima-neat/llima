@@ -43,13 +43,54 @@ std::string pcm_base64(std::span<const float> samples) {
     return output;
 }
 
+// Per-request timing of the actual native backend. Keep a short trace so
+// first-audio latency can be separated from overall generation throughput.
+struct ProfiledBackend : AudioGenerationBackend {
+    Lfm2AudioModel& model;
+    Clock::time_point started;
+    Json trace = Json::array();
+    double forward_ms = 0., text_head_ms = 0., depth_ms = 0., reset_ms = 0.;
+    size_t forward_calls = 0;
+    explicit ProfiledBackend(Lfm2AudioModel& value) : model(value) {}
+    size_t hidden_size() const override { return model.hidden_size(); }
+    void record(const char* name, Clock::time_point begin, size_t tokens = 0) {
+        if (trace.size() < 64) trace.push_back({{"stage", name}, {"tokens", tokens},
+            {"duration_ms", std::chrono::duration<double, std::milli>(Clock::now()-begin).count()},
+            {"finished_ms", std::chrono::duration<double, std::milli>(Clock::now()-started).count()}});
+    }
+    void reset() override {
+        const auto begin = Clock::now(); model.reset();
+        reset_ms = std::chrono::duration<double, std::milli>(Clock::now()-begin).count();
+        record("reset", begin);
+    }
+    std::vector<float> forward(std::span<const float> values) override {
+        const auto begin = Clock::now(); auto output = model.forward(values);
+        forward_ms += std::chrono::duration<double, std::milli>(Clock::now()-begin).count();
+        record(forward_calls++ ? "backbone" : "prefill", begin, values.size()/hidden_size());
+        return output;
+    }
+    std::vector<float> text_logits(std::span<const float> values) override {
+        const auto begin = Clock::now(); auto output = model.text_logits(values);
+        text_head_ms += std::chrono::duration<double, std::milli>(Clock::now()-begin).count();
+        record("text_head", begin); return output;
+    }
+    std::array<uint32_t,8> audio_codes(std::span<const float> values, const AudioSamplingOptions& options, std::mt19937_64& random) override {
+        const auto begin = Clock::now(); auto output = model.audio_codes(values, options, random);
+        depth_ms += std::chrono::duration<double, std::milli>(Clock::now()-begin).count();
+        record("depth", begin); return output;
+    }
+    std::vector<float> text_embedding(uint32_t token) override { return model.text_embedding(token); }
+    std::vector<float> audio_embedding(const std::array<uint32_t,8>& codes) override { return model.audio_embedding(codes); }
+};
+
 struct Request {
     std::string id, task = "interleaved", text;
     uint32_t max_steps = 320;
     std::vector<float> pcm;
     std::atomic<bool> cancelled{false};
+    ProfiledBackend backend;
     AudioGenerationEngine engine;
-    explicit Request(Lfm2AudioModel& model) : engine(model) {}
+    explicit Request(Lfm2AudioModel& model) : backend(model), engine(backend) {}
     void stop() { cancelled.store(true); engine.stop(); }
 };
 
@@ -77,6 +118,7 @@ int main(int argc, char** argv) {
         server.set_payload_max_length(std::max(size_t(65536), max_samples * sizeof(float)));
         server.set_read_timeout(10, 0);
         server.set_write_timeout(5, 0);
+        server.set_tcp_nodelay(true);
         if (!server.set_mount_point("/", argv[2])) throw std::invalid_argument("Web directory does not exist");
         std::mutex state_mutex;
         std::shared_ptr<Request> active;
@@ -147,6 +189,7 @@ int main(int argc, char** argv) {
             response.set_chunked_content_provider("application/x-ndjson",
                 [&, job](size_t, httplib::DataSink& sink) {
                     const auto start = Clock::now();
+                    job->backend.started = start;
                     auto elapsed = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - start).count(); };
                     auto send = [&](const Json& event) {
                         const auto line = event.dump(-1, ' ', false, Json::error_handler_t::replace) + '\n';
@@ -158,7 +201,9 @@ int main(int argc, char** argv) {
                             ? "Perform TTS. Use the UK male voice." : "Respond with interleaved text and audio.";
                         std::vector<AudioPromptMessage> messages{{"system", system, {}}, {"user", job->text, {}}};
                         if (!job->pcm.empty()) messages.back().audio_embeddings = model.encode_pcm(job->pcm);
+                        const auto encoded_ms = elapsed();
                         auto prompt = model.make_prompt(messages);
+                        const auto prepared_ms = elapsed();
                         if (prompt.size() / model.hidden_size() + job->max_steps > context) {
                             throw std::invalid_argument("Prompt and generation limit exceed the compiled context");
                         }
@@ -196,9 +241,17 @@ int main(int argc, char** argv) {
                             {"request_ms", elapsed()}, {"audio_frames", frames}, {"samples", samples},
                             {"output_audio_seconds", samples / 24000.}, {"text", model.decode_text(text)},
                             {"input_audio_seconds", job->pcm.size() / 16000.}, {"waveform_delivery", "streamed"}};
+                        metrics["audio_encode_ms"] = encoded_ms;
+                        metrics["prompt_prepare_ms"] = prepared_ms - encoded_ms;
+                        metrics["backend_profile"] = {{"forward_ms", job->backend.forward_ms},
+                            {"text_head_ms", job->backend.text_head_ms}, {"depth_ms", job->backend.depth_ms},
+                            {"reset_ms", job->backend.reset_ms}, {"first_steps", job->backend.trace}};
                         metrics["ttft_visible_ms"] = first_text ? Json(*first_text) : Json(nullptr);
                         metrics["first_audio_codes_ms"] = first_codes ? Json(*first_codes) : Json(nullptr);
                         metrics["first_pcm_ms"] = first_pcm ? Json(*first_pcm) : Json(nullptr);
+                        const auto decoding = model.decode_timings();
+                        metrics["decoder_network_ms"] = decoding.network_ms;
+                        metrics["inverse_fft_overlap_cpu_ms"] = decoding.waveform_cpu_ms;
                         std::cout << "metrics_json=" << metrics.dump() << std::endl;
                         if (!connected || !send(metrics)) return false;
                     } catch (const std::exception& exception) {

@@ -53,6 +53,19 @@ Defaults: 1,024-token language context, 16-token prefill, 256 input mel frames,
 build; splitting a bidirectional encoder input is not an equivalent workaround.
 Other sizing flags are `--context-length`, `--group-size`, `--decoder-frames`.
 
+For per-frame PCM output, compile with `--decoder-frames 1`:
+
+```bash
+python scripts/gen_models--liquidai--lfm2_audio.py /path/to/snapshot \
+  -o /path/to/audio-streaming-build --decoder-frames 1
+```
+
+Package that build with `prepare_lfm2_audio_runtime` as below. The default
+12-frame decoder waits for 12 generated audio-code frames before emitting PCM;
+changing only the server cannot remove that buffering. The one-frame plan still
+contains 104 units; its 14 detokenizer units process six neural timesteps per
+audio-code frame.
+
 After the complete build:
 
 ```bash
@@ -113,6 +126,11 @@ excluded. The legacy `elapsed_seconds` covers generation plus waveform decoding
 and excludes audio preprocessing/encoding and prompt preparation.
 
 Temporal, depth and decoder caches are separate. Depth resets for every frame.
+Partial prompt tails use a zero-padded prefill group, with attention masks,
+cache positions and convolution tails advanced only through real tokens. The
+last real row supplies the returned hidden state. Single-token generation stays
+on the single-token graph; near cache capacity, a partial tail falls back to
+single-token calls when a full physical group would not fit.
 The decoder keeps 29 previous attention entries, absolute rotary positions,
 convolution tails and waveform overlap state. A response reset clears session
 state. This is a single-session contributor runtime; it does not add an
@@ -173,6 +191,13 @@ after streaming starts use an `error` event. Input lengths and values are
 validated; oversized clips are rejected rather than split or truncated. The
 server binds localhost by default and disables cross-origin browser requests.
 It is an experimental single-user example without authentication or TLS.
+
+The final event also separates `audio_encode_ms`, `prompt_prepare_ms`, backend
+prefill/backbone/text-head/depth timings, `decoder_network_ms` and
+`inverse_fft_overlap_cpu_ms`. The bounded `backend_profile.first_steps` trace
+records at most 64 backend calls. Decoder/FFT timings accumulate across the
+request; first-PCM time is measured separately. TCP_NODELAY is enabled for
+streamed responses.
 
 For repeatable protocol and device checks, provide a short speech fixture and
 write reports outside the checkout:
@@ -263,11 +288,11 @@ interleaved generation; initial TTS audio codes arrived at 2,722 ms. Those
 requests included lazy MLA model loading. Constructor time was an additional
 826–841 ms, and filesystem caches may have been warm.
 
-The current runner buffers all audio codes before waveform decoding. First PCM
+The legacy smoke runner buffers all audio codes before waveform decoding. First PCM
 therefore arrived at 2,002 ms for the 1.6-second TTS output and 3,435 ms for the
 3.04-second interleaved output. Audio codes are not playable PCM. These timings
-do not include transport or playback, and prefill currently uses only 16-token
-and single-token graphs.
+do not include transport or playback. These measurements predate padded prompt
+tails and the one-frame streaming decoder described below.
 
 Speech-in/speech-out was also measured directly, without a text prompt or
 separate ASR/TTS pipeline. A complete 1.44-second synthetic question, `Two plus
@@ -280,3 +305,51 @@ The initial request took 13,629 ms, plus 825 ms for construction. Recording,
 transport and playback are excluded. A separate 1.76-second partial greeting
 produced a clarification request and 9.92 seconds of audio in 9,604 ms; both
 cases are timing checks, not dataset-level quality results.
+
+## Streaming latency optimization, 2026-11-18
+
+The same complete 1.44-second question was measured through the native HTTP
+server with padded prefill and a one-frame decoder. The median of three warm
+requests was:
+
+| Event | Server time |
+| --- | --- |
+| First visible text | 146 ms |
+| First complete audio-code frame | 406 ms |
+| First playable PCM payload | 410 ms |
+
+Client PCM arrival was about 430 ms. A complete response produced 10.96 seconds
+of speech in about 10.31 seconds. Before these changes, streaming with the
+12-frame decoder took about 1.48 seconds to first PCM. Padding the partial
+43-token prompt reduced prefill from about 444 ms to 108 ms; compiling the
+one-frame decoder removed the remaining multi-frame buffering. All figures
+exclude recording, upload/network and playback from server timings, and the
+first request can be slower due to lazy loading.
+
+The first payload contains 1,440 samples/60 ms because inverse STFT trims the
+initial 20 ms. Subsequent payloads contain 1,920 samples/80 ms; final flush
+returns 480 samples/20 ms. Neural waveform decoding takes about 3.06 ms per
+frame and CPU FFT/overlap about 0.56 ms. The source's six-text/twelve-audio
+schedule is retained. First audio under 200 ms and a hard 80 ms deadline for
+every frame have not been achieved; early text bursts can cause audio gaps of
+about 302 ms. Input still requires the complete utterance.
+
+The prefill regression helper saves seven prefix lengths (2, 7, 15, 16, 17,
+31, 43), each followed by three continuation tokens. Run it on Modalix against
+the same bundle with the baseline and candidate private libraries, then compare
+the two output files:
+
+```bash
+LD_LIBRARY_PATH=/path/to/candidate/lib:$LD_LIBRARY_PATH \
+  /path/to/sima_lmm_lfm2_audio_prefill_test \
+  /path/to/audio-build/runtime /tmp/candidate-prefill.f32
+cmp /tmp/baseline-prefill.f32 /tmp/candidate-prefill.f32
+```
+
+All 28 states, each 2,048 dimensions, matched bit for bit on SDK 3.0.0 Modalix.
+One-frame versus 12-frame decoder waveforms were not bit-identical (selected
+PCM comparison: SNR 30.57 dB); independent Whisper transcribed the one-frame
+reply correctly. This does not establish broad speech-quality equivalence.
+The optimized runtime passed invalid-input, contention, cancellation,
+disconnect cleanup and deterministic repeated speech checks. Matching SDK
+3.0.1 release validation remains open.

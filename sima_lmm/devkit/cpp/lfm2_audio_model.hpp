@@ -13,6 +13,11 @@ struct AudioPromptMessage {
     std::vector<float> audio_embeddings;
 };
 
+struct AudioDecodeTimings {
+    double network_ms = 0.;
+    double waveform_cpu_ms = 0.;
+};
+
 // Private native audio runtime. It consumes the explicit audio_runtime.json
 // bundle, not the VisionLanguage/ASR GenAI task interface.
 class Lfm2AudioModel final : public AudioGenerationBackend {
@@ -42,6 +47,7 @@ public:
     std::vector<float> decode_codes(
         std::span<const std::array<uint32_t, 8>> codes, bool finish = false
     );
+    AudioDecodeTimings decode_timings() const;
 
 private:
     struct Impl;

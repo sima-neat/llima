@@ -14,6 +14,9 @@ target_compile_options(sima_lmm_audio_generation_test PRIVATE -UNDEBUG)
 add_test(NAME runtime.audio_generation COMMAND sima_lmm_audio_generation_test)
 set_tests_properties(runtime.audio_generation PROPERTIES LABELS "runtime;unit;audio" TIMEOUT 30)
 add_executable(sima_lmm_lfm2_audio_smoke lfm2_audio_smoke.cpp)
+add_executable(sima_lmm_lfm2_audio_prefill_test lfm2_audio_prefill_test.cpp)
+target_link_libraries(sima_lmm_lfm2_audio_prefill_test PRIVATE sima_lmm_runtime)
+set_target_properties(sima_lmm_lfm2_audio_prefill_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 target_include_directories(sima_lmm_lfm2_audio_smoke PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
 target_link_libraries(sima_lmm_lfm2_audio_smoke PRIVATE sima_lmm_runtime)
 set_target_properties(sima_lmm_lfm2_audio_smoke PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
@@ -194,6 +197,7 @@ install(
         sima_lmm_embedding_offload_test
         sima_lmm_audio_generation_test
         sima_lmm_lfm2_audio_smoke
+        sima_lmm_lfm2_audio_prefill_test
         sima_lmm_audio_component_test
         sima_lmm_mla_rt_lifecycle_test
         sima_lmm_text_generation_test
@@ -220,6 +224,7 @@ install(
         embedding_offload_test.cpp
         audio_generation_test.cpp
         lfm2_audio_smoke.cpp
+        lfm2_audio_prefill_test.cpp
         audio_component_test.cpp
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/lfm2_audio_model.hpp"
         "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/audio_generation.hpp"
