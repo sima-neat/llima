@@ -1,6 +1,7 @@
 #ifndef _SIMA_LLIMA_VISION_MODEL_
 #define _SIMA_LLIMA_VISION_MODEL_
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -46,6 +47,9 @@ class VisionModel {
         const std::shared_ptr<FileProvider>& _files;
         std::shared_ptr<spdlog::logger> _logger;
         std::unique_ptr<VisionWorkspace> _workspace;
+        std::vector<std::vector<std::byte>> encode(const std::vector<Eigen::bfloat16>& tensor);
+        void _run_locked(const std::vector<Eigen::bfloat16>& tensor,
+                         std::map<uint8_t, MLABufferSlice>* outputs);
         void define_buffer(const std::string& name, const std::vector<size_t>& shape,
                            const std::string& dtype = "bfloat16", bool align_last_dim = true);
         MLABuffer& get_buffer(const std::string& name);

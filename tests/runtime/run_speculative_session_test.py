@@ -1,6 +1,7 @@
 """Run the session lifecycle suite with both halves of a deployed speculative model."""
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,7 +18,9 @@ def main() -> int:
     target, draft = resolve_target_and_draft_paths(bundle)
     if draft is None:
         raise ValueError(f"Expected a paired target and draft in {bundle}")
-    os.execv(sys.argv[1], [sys.argv[1], str(target), str(draft)])
+    binary = sys.argv[1]
+    subprocess.run([binary, "--direct-pair", str(target), str(draft)], check=True)
+    os.execv(binary, [binary, str(target), str(draft)])
 
 
 if __name__ == "__main__":

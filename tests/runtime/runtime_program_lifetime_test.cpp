@@ -32,6 +32,9 @@ int main() {
         owner->load();
         auto old_lease = context.reserve(path);
         const auto index = old_lease->index;
+        MLAModelWithBuffer::free_all_models(path);
+        if (context.models.at(index)) throw std::runtime_error("Bulk unload retained an idle wrapper's program");
+        owner->load();
         std::weak_ptr<RuntimeProgram> expired = old_lease;
         old_lease.reset();
 

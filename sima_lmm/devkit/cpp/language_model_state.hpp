@@ -52,6 +52,7 @@ struct LanguageSession {
     std::map<std::string, MLABuffer> buffers;
     std::vector<uint32_t> cached_token_ids;
     uint32_t cached_first_generated_token = 0;
+    // Restore the prior EAGLE3 tree only when the complete prompt matches.
     std::vector<uint32_t> cached_draft_tokens;
     std::vector<std::vector<int32_t>> cached_retrieve_indices;
     eagle_helpers::EagleTreeMask cached_tree_mask;
@@ -61,6 +62,7 @@ struct LanguageSession {
     uint16_t kv_cache_len = 0; // tokens in KV cache;
     std::vector<uint16_t> checkpoint_boundaries;
     std::vector<LanguageModel::CachedState> cached_states;
+    // Zero marks an unused slot. Slot 0 is reserved for a stable system/tool prefix.
     std::array<uint16_t, LanguageModel::checkpoint_slot_count> state_checkpoint_positions{};
     std::shared_ptr<LanguageAdapter> adapter;
     std::string image_identity;
@@ -95,7 +97,7 @@ struct LanguageModel::DFlashScratch {
 
 struct LanguageWorkspace {
     std::shared_ptr<LanguageAdapter> bound_adapter;
-    std::weak_ptr<LanguageResources> paired_draft;
+    std::weak_ptr<LanguageSession> paired_draft_identity; // The draft runner owns its public session 0.
     std::vector<uint8_t> mtp_shared_kv_layers;
     LanguageModel::DFlashScratch dflash;
     std::vector<uint32_t> offload_prompt_ids;

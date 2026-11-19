@@ -5,6 +5,9 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include "language_model.hpp"
 #include "runtime_test_utils.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"
@@ -22,11 +25,90 @@ template<class F> void rejected(F&& action, const char* message) {
     try { action(); } catch (const std::exception&) { return; }
     throw std::runtime_error(message);
 }
+
+void check_direct_pair(const std::filesystem::path& target_root, const std::filesystem::path& draft_root) {
+    const auto cfg = json::parse(std::ifstream(target_root / "devkit/vlm_config.json")).get<VlmConfig>();
+    VlmHelper helper(cfg, target_root / "devkit", std::string(""), std::nullopt);
+    TextStreamer target_stream(helper.get_tokenizer()), draft_stream(helper.get_tokenizer());
+    target_stream.disable();
+    draft_stream.disable();
+    LanguageModel target(target_root, helper.get_stop_token_ids(), helper.get_image_token_id(),
+                         helper.get_pad_token_id(), target_stream);
+    auto make_draft = [&] {
+        return std::make_unique<LanguageModel>(draft_root, helper.get_stop_token_ids(), std::nullopt,
+                                               helper.get_pad_token_id(), draft_stream);
+    };
+    auto draft = make_draft();
+    const auto a = helper.get_tokenizer()->encode("Name one planet.", true);
+    const auto b = helper.get_tokenizer()->encode("Name one color.", true);
+    auto generate = [&](SessionId id, const std::vector<uint32_t>& prompt, bool direct_mtp = false) {
+        target.select_session(id);
+        target.create_input_buffers(prompt);
+        const uint16_t limit = static_cast<uint16_t>(prompt.size() + 12);
+        auto result = direct_mtp
+            ? target.run_model_gemma4_mtp(*draft, prompt, limit)
+            : target.run_model_speculative_decoding(*draft, prompt, limit);
+        require(result && !result->empty(), "Direct speculative generation did not return tokens");
+        return *result;
+    };
+
+    constexpr uint16_t sentinel = 7;
+    draft->set_kv_cache_len(sentinel);
+    const auto session = target.create_session();
+    const bool mtp = cfg.lm_cfg.is_gemma4_mtp_target();
+    const auto gold_a = generate(0, a, mtp);
+    const auto gold_b = generate(session, b);
+    require(draft->get_kv_cache_len() == sentinel, "Direct generation modified the public draft session");
+    target.reset_session(session);
+    require(generate(0, a) == gold_a && generate(session, b, mtp) == gold_b,
+            "Direct speculative sessions disagreed with their fresh references");
+    const std::vector<uint32_t> invalid{cfg.lm_cfg.token_cfg.vocab_size};
+    rejected([&] { generate(session, invalid, mtp); }, "Direct speculative request accepted an invalid token");
+    require(draft->get_kv_cache_len() == sentinel && target.get_kv_cache_len() == 0,
+            "A failed direct request did not preserve the public draft or clear the target");
+    require(generate(session, b, mtp) == gold_b, "Direct speculative recovery changed tokens");
+    target_stream.set_info_callback([&](const std::string& key, double) {
+        if (key == "tps") target.stop_model();
+    });
+    target_stream.enable();
+    target.create_input_buffers(a);
+    const auto interrupted = target.run_model_speculative_decoding(*draft, a, a.size() + 12);
+    target_stream.disable();
+    target_stream.set_info_callback([](const std::string&, double) {});
+    require(!interrupted && draft->get_kv_cache_len() == sentinel && target.get_kv_cache_len() == 0,
+            "Cancelled speculative request corrupted the public draft or retained the target cache");
+    require(generate(session, b, mtp) == gold_b, "Cancellation changed the next direct request");
+    target.release_session(session);
+    require(target.get_kv_cache_len() > 0, "Expected the original target session to retain its prefix");
+    const auto previous_length = target.get_kv_cache_len();
+    rejected([&] { target.run_model_speculative_decoding(target, a, a.size() + 12); },
+             "Direct speculative generation accepted the target as its own draft");
+    require(target.get_kv_cache_len() == previous_length && draft->get_kv_cache_len() == sentinel,
+            "Rejecting an incompatible draft changed a session cache");
+    auto replacement = make_draft();
+    target.attach_draft(*replacement);
+    require(target.get_kv_cache_len() == 0,
+            "Replacing a draft runner over the same package retained the old pair's cache");
+    draft = std::move(replacement);
+    require(generate(0, a, mtp) == gold_a, "Replacing the draft runner changed greedy output");
+    std::cout << "Direct speculative session pairing passed\n";
+}
+
+static_assert(std::is_const_v<std::remove_reference_t<
+    decltype(std::declval<LanguageModel&>().get_model_map("pre"))>>);
+
 }
 
 int main(int argc, char** argv) {
     bool connected = false;
     try {
+        if (argc == 4 && std::string_view(argv[1]) == "--direct-pair") {
+            connect({}, "/tmp/llima-direct-session.log", spdlog::level::warn);
+            connected = true;
+            check_direct_pair(argv[2], argv[3]);
+            disconnect();
+            return 0;
+        }
         const auto root = argc > 1 ? std::filesystem::path(argv[1]) : test::resolve_model_dir(
             "SIMA_TEST_LLIMA_TEXT_MODEL", test::kDefaultTextModelName, "session text", "devkit/vlm_config.json");
         const auto cfg = json::parse(std::ifstream(root / "devkit/vlm_config.json")).get<VlmConfig>();
@@ -175,8 +257,10 @@ int main(int argc, char** argv) {
         }
 
         std::atomic<unsigned> default_chunks = 0;
+        std::atomic<unsigned> default_events = 0;
         std::atomic<unsigned> request_chunks = 0;
         first->set_text_callback([&](const std::string&, bool, bool) { ++default_chunks; });
+        first->set_info_callback([&](const std::string&, double) { ++default_events; });
         GenerationOptions options;
         options.max_new_tokens = 16;
         options.text_callback = [&](const std::string&, bool, bool) { ++request_chunks; };
@@ -184,9 +268,11 @@ int main(int argc, char** argv) {
         option_chat.add_query("Name three planets.");
         require(first->run_model(sa, option_chat, options).has_value(), "Request options failed");
         require(request_chunks > 0 && default_chunks == 0, "Request callback did not replace the default");
+        require(default_events > 0, "Overriding text suppressed the default info callback");
         first->run_model(sa, option_chat, 16);
         require(default_chunks > 0, "Request callback leaked into a later request");
         first->set_text_callback([](const std::string&, bool, bool) {});
+        first->set_info_callback([](const std::string&, double) {});
         std::cout << json{{"case", "request_callback_isolation"}, {"runtime_ok", true}}.dump() << '\n';
 
         options.info_callback = [](const std::string& key, double) {
@@ -209,6 +295,20 @@ int main(int argc, char** argv) {
         const auto timing = first->run_model_for_ttnt(sa, a);
         require(timing.generated_tokens > 1, "Nested prefill leaked its output limit into decode");
         require(generate(sa, a) == gold_a, "Performance request left stale prompt state");
+        if (!draft) {
+            const std::set<uint32_t> no_stops;
+            const auto limit = static_cast<uint16_t>(a.size() + 4);
+            const auto four_tokens = first->run_model(sa, a, limit, no_stops);
+            require(four_tokens.size() == 4, "Ordinary generation ignored the token budget");
+            for (uint16_t budget : {0, 1, 4, 40}) {
+                const auto metrics = first->run_model_for_ttnt(sa, a, a.size() + budget, no_stops);
+                require(metrics.generated_tokens == budget && metrics.token_durations.size() == budget,
+                        "Ordinary timing must report exactly one sample per emitted token");
+            }
+            const auto stopped = first->run_model_for_ttnt(sa, a, limit, std::set{four_tokens.front()});
+            require(stopped.generated_tokens == 1 && stopped.token_durations.size() == 1,
+                    "An immediate stop token must have exactly one timing sample");
+        }
         if (cfg.pipeline_cfg.return_logits && !draft) {
             const auto suffix = std::span<const uint32_t>(b).last(2);
             first->run_model_for_loglikelihood(sa, b, b.size() - 2, suffix);

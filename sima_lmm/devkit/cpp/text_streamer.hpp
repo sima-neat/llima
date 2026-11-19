@@ -56,6 +56,11 @@ class TextStreamer {
         // web, ignored for plain output.
         using TextCallback = std::function<void(const std::string&, bool, bool)>;
 
+        struct CallbackOverrides {
+            std::optional<InfoCallback> info;
+            std::optional<TextCallback> text;
+        };
+
         TextStreamer(
             Tokenizer* tokenizer_ptr,
             std::optional<InfoCallback> info_callback = std::nullopt,
@@ -64,6 +69,7 @@ class TextStreamer {
         ~TextStreamer();
 
         void begin();
+        void begin(CallbackOverrides callbacks);
         void finish();
         void push(DecodeCallbackData data);
         void push(DecodeCallbackType type, uint32_t token_id, double duration) {
@@ -116,7 +122,7 @@ class TextStreamer {
             bool tool_call = false;
             bool performance_summary = true;
         };
-        void _begin_locked();
+        void _begin_locked(CallbackOverrides callbacks = {});
         void _snapshot_settings_locked();
         // Direct put/end callers are synchronous and use the current defaults.
         const Settings& _settings() const { return _is_streaming ? _request : _defaults; }
@@ -152,6 +158,7 @@ class TextStreamer {
 
         Settings _defaults;
         Settings _request;
+        CallbackOverrides _pending_callbacks;
         bool _settings_pending = false;
         std::atomic<bool> _is_streaming = false;
         std::jthread _pop_thread;

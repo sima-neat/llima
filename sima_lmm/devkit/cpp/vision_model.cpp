@@ -52,6 +52,32 @@ void VisionModel::run_model(
     const std::vector<Eigen::bfloat16>& ifm_tensor, std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
     std::lock_guard workspace_lock(_workspace->mutex);
+    _run_locked(ifm_tensor, ofm_map_ptr);
+}
+
+std::vector<std::vector<std::byte>> VisionModel::encode(const std::vector<Eigen::bfloat16>& tensor) {
+    std::lock_guard workspace_lock(_workspace->mutex);
+    _run_locked(tensor, nullptr);
+
+    // Preserve the MLA row padding. The language model uploads these bytes into equal-shaped slices.
+    std::vector<std::vector<std::byte>> outputs;
+    auto copy_output = [&](const std::string& name) {
+        auto& buffer = get_buffer(name);
+        buffer.invalidate_cache();
+        const auto* bytes = static_cast<const std::byte*>(buffer.get_virtual_addr());
+        outputs.emplace_back(bytes, bytes + buffer.get_allocation_size());
+    };
+    copy_output("vision_ofm");
+    if (_cfg.pipeline_cfg.quantize_embeddings)
+        copy_output("vision_ofm_scale");
+    for (size_t i = 0; i < _vm_cfg.deepstack_visual_indexes.size(); ++i)
+        copy_output(fmt::format("deepstack_feature_l{}", i));
+    return outputs;
+}
+
+void VisionModel::_run_locked(
+    const std::vector<Eigen::bfloat16>& ifm_tensor, std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
+) {
     // Upload the ifm.
     get_buffer("vision_ifm").upload(ifm_tensor.data());
 
@@ -113,7 +139,6 @@ void VisionModel::_initialize() {
 
 void VisionModel::_finalize() {
     if (!_workspace) return;
-    MLAModelWithBuffer::run_queue();
     _workspace.reset();
     _resources.reset();
 }

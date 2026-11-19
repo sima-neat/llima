@@ -128,14 +128,11 @@ std::string ZMQServer::_generate_multimodal(
     GenerationState state(reasoning_format_for_model(model.config().model_type), metadata.enable_thinking);
     GenerationOptions options;
     options.max_new_tokens = metadata.max_new_tokens;
-    options.info_callback = [&state, for_performance, speculative](const std::string& event, double value) {
+    options.info_callback = [&state](const std::string& event, double value) {
         if (event == "ttft" || event == "tps") {
             ++state.tokens;
             if (event == "ttft")
                 state.ttft = value;
-            // Ordinary generation already reports one native timing per output token.
-            if (for_performance && !speculative)
-                state.performance.token_durations.push_back(event == "ttft" ? value : 1.0 / value);
         } else if (event == "END")
             state.finish_reason = "stop";
         else if (event == "FULL")
@@ -151,7 +148,7 @@ std::string ZMQServer::_generate_multimodal(
         }
     };
     VisionLanguageModel::ChatBenchmark benchmark{
-        metadata.max_num_tokens.value(), for_performance && speculative ? &state.performance : nullptr};
+        metadata.max_num_tokens.value(), for_performance ? &state.performance : nullptr};
     auto tokens = model.benchmark_chat(chat, options, benchmark);
     if (!tokens)
         throw std::runtime_error("Image generation was interrupted");
@@ -165,8 +162,6 @@ std::string ZMQServer::_generate_multimodal(
     response.prompt_sha256 = sha256(benchmark.formatted_prompt);
     if (for_performance) {
         auto& result = state.performance;
-        if (!speculative)
-            result.generated_tokens = state.tokens;
         if (result.token_durations.empty() || result.generated_tokens != state.tokens
             || result.generated_tokens != result.token_durations.size()
             || result.generated_tokens > metadata.max_new_tokens.value())

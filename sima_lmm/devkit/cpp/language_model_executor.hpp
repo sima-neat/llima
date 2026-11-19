@@ -51,7 +51,8 @@ class LanguageExecutor {
 
     class Run {
       public:
-        Run(LanguageModel& target, LanguageModel* draft = nullptr);
+        Run(LanguageModel& target, LanguageModel* draft = nullptr,
+            TextStreamer::CallbackOverrides callbacks = {});
         ~Run();
         void complete();
         Run(const Run&) = delete;
@@ -65,6 +66,8 @@ class LanguageExecutor {
         int _exceptions;
         bool _outer;
         bool _stream_finished = false;
+        std::optional<std::shared_ptr<LanguageSession>> _previous_draft_session;
+        void finish_sessions(bool failed);
     };
 
   private:

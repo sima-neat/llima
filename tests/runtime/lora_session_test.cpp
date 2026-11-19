@@ -6,6 +6,7 @@
 #include <regex>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #include <cnpy.h>
 
@@ -160,7 +161,8 @@ std::vector<uint8_t> snapshot(const Buffers& buffers) {
     return bytes;
 }
 
-void verify_mixed_queue(const fs::path& elf, const MlaModelIFMOFMLengths& sizes) {
+void verify_mixed_queue(const fs::path& elf, const MlaModelIFMOFMLengths& sizes,
+                        const fs::path& idle_model = {}) {
     require(!sizes.reloc_len_array.empty(), "Expected relocatable N1 pre ELF");
     auto inputs = allocate(sizes.ifm_len_array, "input", -1);
     auto out_a = allocate(sizes.ofm_len_array, "out_a", 0);
@@ -172,14 +174,27 @@ void verify_mixed_queue(const fs::path& elf, const MlaModelIFMOFMLengths& sizes)
     a.update_reloc(reloc_map(rel_a));
     a.run();
     const auto direct_a = snapshot(out_a);
+    auto& context = RuntimeContext::instance();
+    const auto program = context.reserve(elf);
+    MLAModelWithBuffer::free_all_models(elf);
+    require(!context.models.at(program->index), "Explicit unload kept an idle shared program resident");
+    for (auto& buffer : out_a) buffer->clear();
+    a.run();
+    require(snapshot(out_a) == direct_a, "Reloading a program lost the wrapper's adapter");
     b.update_reloc(reloc_map(rel_b));
     b.run();
     const auto direct_b = snapshot(out_b);
     require(direct_a != direct_b, "Chosen ELF and input cannot distinguish the two relocations");
     for (auto& buffer : out_a) buffer->clear();
     for (auto& buffer : out_b) buffer->clear();
+    std::unique_ptr<VisionLanguageModel> idle;
+    if (!idle_model.empty()) idle = std::make_unique<VisionLanguageModel>(idle_model);
     a.add_to_queue();
     b.add_to_queue();
+    idle.reset();
+    require(program->queued_runs == 2, "Destroying an idle model consumed another model's queued work");
+    std::jthread([&] { MLAModelWithBuffer::free_all_models(elf); }).join();
+    require(context.models.at(program->index), "Bulk unload freed another thread's queued program");
     a.reset_reloc();
     b.reset_reloc();
     rel_a.clear();
@@ -187,6 +202,11 @@ void verify_mixed_queue(const fs::path& elf, const MlaModelIFMOFMLengths& sizes)
     MLAModelWithBuffer::run_queue();
     require(snapshot(out_a) == direct_a && snapshot(out_b) == direct_b,
             "Sharing an ELF changed the queued runs' adapter selection");
+    require(!context.models.at(program->index), "Deferred unload kept the program after its final wait");
+    a.add_to_queue();
+    MLAModelWithBuffer::free_all_models(elf);
+    MLAModelWithBuffer::discard_queue();
+    require(!context.models.at(program->index), "Discarding the pending run did not finish unloading");
 }
 } // namespace
 
@@ -200,16 +220,16 @@ int main(int argc, char** argv) {
             disconnect();
             return 0;
         }
-        if (argc == 3 && std::string_view(argv[1]) == "--queue-elf") {
+        if ((argc == 3 || argc == 4) && std::string_view(argv[1]) == "--queue-elf") {
             connect({}, "/tmp/llima-lora-queue-test.log", spdlog::level::warn);
             connected = true;
-            verify_mixed_queue(argv[2], port_lengths(argv[2]));
+            verify_mixed_queue(argv[2], port_lengths(argv[2]), argc == 4 ? argv[3] : "");
             disconnect();
             std::cout << "Mixed-adapter queue matches both direct submissions\n";
             return 0;
         }
         if (argc != 1 && argc != 2 && argc != 4)
-            throw std::invalid_argument("Usage: lora_session_test [MODEL_DIRECTORY [ADAPTER_A ADAPTER_B]] | --queue-elf ELF | --graph-widths MODEL");
+            throw std::invalid_argument("Usage: lora_session_test [MODEL_DIRECTORY [ADAPTER_A ADAPTER_B]] | --queue-elf ELF [IDLE_MODEL] | --graph-widths MODEL");
         const fs::path model = argc > 1 ? fs::absolute(argv[1]) :
             test::resolve_model_dir("SIMA_TEST_LLIMA_TEXT_MODEL", test::kDefaultTextModelName,
                                     "LoRA recovery", "devkit/vlm_config.json");

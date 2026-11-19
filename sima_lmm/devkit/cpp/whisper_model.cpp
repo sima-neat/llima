@@ -375,15 +375,12 @@ class WhisperRequest {
 public:
     WhisperRequest(WhisperWorkspace& workspace, const TranscriptionOptions& options)
         : _workspace(workspace), _workspace_lock(workspace.mutex),
-          _exceptions(std::uncaught_exceptions()),
-          _callbacks(_workspace.text_streamer->callbacks()) {
+          _exceptions(std::uncaught_exceptions()) {
+        _workspace.is_running.store(true, std::memory_order_relaxed);
         try {
-            if (options.info_callback) _workspace.text_streamer->set_info_callback(*options.info_callback);
-            if (options.text_callback) _workspace.text_streamer->set_text_callback(*options.text_callback);
-            _workspace.is_running.store(true, std::memory_order_relaxed);
-            _workspace.text_streamer->begin();
+            _workspace.text_streamer->begin({options.info_callback, options.text_callback});
         } catch (...) {
-            restore();
+            _workspace.is_running.store(false, std::memory_order_relaxed);
             throw;
         }
     }
@@ -399,18 +396,12 @@ public:
             MLAModelWithBuffer::discard_queue();
             try { _workspace.text_streamer->finish(); } catch (...) {}
         }
-        restore();
-    }
-private:
-    void restore() {
-        _workspace.text_streamer->set_info_callback(std::move(_callbacks.first));
-        _workspace.text_streamer->set_text_callback(std::move(_callbacks.second));
         _workspace.is_running.store(false, std::memory_order_relaxed);
     }
+private:
     WhisperWorkspace& _workspace;
     std::unique_lock<std::mutex> _workspace_lock;
     int _exceptions;
-    std::pair<TextStreamer::InfoCallback, TextStreamer::TextCallback> _callbacks;
 };
 }
 
@@ -650,7 +641,6 @@ void WhisperModel::_initialize() {
 
 void WhisperModel::_finalize() {
     if (!_workspace) return;
-    MLAModelWithBuffer::run_queue();
     _workspace.reset();
     _resources.reset();
 }

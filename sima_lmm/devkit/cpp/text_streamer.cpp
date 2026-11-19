@@ -58,7 +58,8 @@ TextStreamer::~TextStreamer() {
     if (_pop_thread.joinable()) _pop_thread.join();
 }
 
-void TextStreamer::_begin_locked() {
+void TextStreamer::_begin_locked(CallbackOverrides callbacks) {
+    _pending_callbacks = std::move(callbacks);
     _settings_pending = true;
     _callback_error = nullptr;
     _completion_queued = false;
@@ -69,7 +70,12 @@ void TextStreamer::_snapshot_settings_locked() {
     if (!_settings_pending) return;
     try {
         // Prompt preprocessing may update tool markers after begin().
-        _request = _defaults;
+        auto callbacks = std::move(_pending_callbacks);
+        _request = {
+            callbacks.info ? std::move(*callbacks.info) : _defaults.info,
+            callbacks.text ? std::move(*callbacks.text) : _defaults.text,
+            _defaults.preserved_tokens, _defaults.tool_call, _defaults.performance_summary
+        };
         _settings_pending = false;
     } catch (...) {
         _callback_error = std::current_exception();
@@ -81,11 +87,15 @@ void TextStreamer::_snapshot_settings_locked() {
 }
 
 void TextStreamer::begin() {
+    begin({});
+}
+
+void TextStreamer::begin(CallbackOverrides callbacks) {
     std::lock_guard lock(_mutex);
     if (!_is_enabled) { _callback_error = nullptr; return; }
     if (_is_streaming)
         throw std::logic_error("Text streaming is already active");
-    _begin_locked();
+    _begin_locked(std::move(callbacks));
 }
 
 void TextStreamer::finish() {

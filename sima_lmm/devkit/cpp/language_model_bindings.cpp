@@ -662,14 +662,13 @@ void LanguageModel::_init_attention_bindings() {
 
 
 void LanguageModel::_define_model(
-    const std::string& model_type,
+    LanguageModelMap& models,
     const LanguageModelMapKey& key,
     const std::filesystem::path& model_path,
     const std::vector<MLABufferSlice>& ifms,
     const std::vector<MLABufferSlice>& ofms
 ) {
-    LanguageModelMap& map = get_model_map(model_type);
-    auto [model, inserted] = map.emplace(key, MLAModelWithBuffer(model_path, ifms, ofms));
+    auto [model, inserted] = models.emplace(key, MLAModelWithBuffer(model_path, ifms, ofms));
     if (inserted)
         model->second._record_buffer_bindings(_workspace->session_bindings);
 }
@@ -812,7 +811,7 @@ void LanguageModel::_define_attn_models_iter(
     }
     if (define_pre) {
         _define_model(
-            "pre",
+            _workspace->pre_model_map,
             pre_post_key,
             _get_elf_path_pre(num_tokens, layer_idx),
             pre_ifms,
@@ -966,7 +965,7 @@ void LanguageModel::_define_attn_models_iter(
     };
     if (define_cache) {
         _define_model(
-            "cache",
+            _workspace->cache_model_map,
             cache_key,
             _get_elf_path_cache(num_tokens, aligned_eff_token_idx, use_sliding_cache),
             cache_ifms,
@@ -1128,7 +1127,7 @@ void LanguageModel::_define_attn_models_iter(
     if (_cfg.lm_cfg.is_moe()) {
         _define_moe_post_models(num_tokens, layer_idx, post_ifms, post_ofms);
     } else {
-        _define_model("post", pre_post_key, post_elf_path, post_ifms, post_ofms);
+        _define_model(_workspace->post_model_map, pre_post_key, post_elf_path, post_ifms, post_ofms);
     }
 }
 
@@ -1155,7 +1154,7 @@ void LanguageModel::_define_moe_post_models(
     };
     const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
     _define_model(
-        "router", model_key, _get_elf_path_router(moe_nt, layer_idx), post_ifms, router_ofms
+        _workspace->router_model_map, model_key, _get_elf_path_router(moe_nt, layer_idx), post_ifms, router_ofms
     );
 
     // Experts consume norm(h), scaled by their routing-weight column (runtime runs the top-k).
@@ -1171,7 +1170,7 @@ void LanguageModel::_define_moe_post_models(
         };
         LanguageModelMapKey expert_key{num_tokens, layer_idx, e};
         _define_model(
-            "expert", expert_key, _get_elf_path_expert(moe_nt, layer_idx, e),
+            _workspace->expert_model_map, expert_key, _get_elf_path_expert(moe_nt, layer_idx, e),
             expert_ifms, expert_ofms
         );
     }
@@ -1185,7 +1184,7 @@ void LanguageModel::_define_moe_post_models(
     ws_ifms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n{}_residual", moe_nt))});
 
     _define_model(
-        "weightedsum", model_key, _get_elf_path_weightedsum(moe_nt, layer_idx), ws_ifms, post_ofms
+        _workspace->weightedsum_model_map, model_key, _get_elf_path_weightedsum(moe_nt, layer_idx), ws_ifms, post_ofms
     );
 }
 
@@ -1238,7 +1237,7 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
         )
     );
     _define_model(
-        "conv",
+        _workspace->conv_model_map,
         model_key,
         _get_elf_path_conv(num_tokens, layer_idx),
         conv_ifms,
@@ -1264,7 +1263,7 @@ void LanguageModel::_define_conv_models_iter(uint16_t num_tokens, uint8_t layer_
         }
     }
     _define_model(
-        "conv_final",
+        _workspace->conv_final_model_map,
         model_key,
         _get_elf_path_conv_final(layer_idx),
         conv_final_ifms,
@@ -1368,7 +1367,7 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
         });
     }
     _define_model(
-        "linear",
+        _workspace->linear_model_map,
         model_key,
         _get_elf_path_linear(num_tokens, layer_idx),
         linear_ifms,
@@ -1644,12 +1643,12 @@ void LanguageModel::_define_per_layer_models() {
         std::vector<MLABufferSlice> ofms{
             MLABufferSlice{&get_buffer(fmt::format("n{}_per_layer_input", num_tokens))}
         };
-        _define_model("per_layer", key, _get_elf_path_per_layer(num_tokens), ifms, ofms);
+        _define_model(_workspace->per_layer_model_map, key, _get_elf_path_per_layer(num_tokens), ifms, ofms);
     }
 }
 
 
-LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) {
+const LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) const {
     if (model_type == "pre") {
         return _workspace->pre_model_map;
     } else if (model_type == "cache") {

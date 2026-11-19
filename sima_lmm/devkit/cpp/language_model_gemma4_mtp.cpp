@@ -595,11 +595,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result
 ) {
-    LanguageExecutor::Run run(*this, &draft_lm);
     if (!_cfg.lm_cfg.is_gemma4_mtp_target()) {
         throw std::runtime_error("gemma4_mtp speculative decoding must run on the target model");
     }
-    attach_draft(draft_lm);
+    LanguageExecutor::Run run(*this, &draft_lm);
     if (input_token_ids.empty()) {
         throw std::runtime_error("Gemma4 MTP generation requires at least one input token");
     }

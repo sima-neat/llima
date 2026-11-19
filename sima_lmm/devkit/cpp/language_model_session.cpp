@@ -147,6 +147,7 @@ void LanguageModel::_bind_session(const std::shared_ptr<LanguageSession>& select
 }
 
 void LanguageModel::_detach_draft_sessions(LanguageModel* draft) {
+    _workspace->paired_draft_identity.reset();
     for (auto id : _sessions->ids()) {
         auto& session = *_sessions->get(id);
         if (draft && session.draft && draft->_session == session.draft)

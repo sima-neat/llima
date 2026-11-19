@@ -73,19 +73,24 @@ int main() {
             pair_chat.add_image(image);
             pair_chat.add_image(image);
             pair_chat.add_query("Describe these images in a short phrase.");
-            std::vector<simaai::llima::EncodedImage> pair{encoded.front(), encoded.front()};
+            cv::Mat red(rgb.size(), CV_8UC3, cv::Scalar(255, 0, 0));
+            const std::vector<cv::Mat> originals{rgb, red};
+            const auto workspace_bytes = model.workspace_memory_bytes();
+            const auto pair = model.encode_images(originals);
+            if (pair.size() != originals.size() || model.workspace_memory_bytes() != workspace_bytes)
+                throw std::runtime_error("Encoding images changed the language workspace");
             simaai::llima::GenerationOptions pair_options;
             pair_options.max_new_tokens = 8;
             pair_options.encoded_images = pair;
             const auto pair_reference = model.run_model(pair_chat, pair_options);
             model.reset_session(0);
             pair_options.images = images;
-            pair_options.encoded_images = encoded;
+            pair_options.encoded_images = std::span(pair).last(1);
             if (!pair_reference || model.run_model(pair_chat, pair_options) != pair_reference)
                 throw std::runtime_error("Mixed fresh and encoded image rows differ from the encoded reference");
 
             const auto alternate = model.create_session();
-            images[0] = cv::Mat(rgb.size(), CV_8UC3, cv::Scalar(255, 0, 0));
+            images[0] = red;
             options.encoded_images = {};
             options.images = images;
             const auto reference_red = model.run_model(alternate, chat, options);

@@ -499,12 +499,23 @@ std::unique_lock<std::recursive_mutex> LanguageExecutor::lock_execution() {
     return std::unique_lock(RuntimeContext::instance().execution_mutex);
 }
 
-LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft)
+LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft,
+                           TextStreamer::CallbackOverrides callbacks)
     : _target(target), _draft(draft), _limit(target._run->max_num_tokens),
       _stop_ids(target._run->stop_token_ids), _exceptions(std::uncaught_exceptions()),
       _outer(!target._run->is_running.load(std::memory_order_relaxed)) {
     if (!_outer)
         return;
+    if (draft) {
+        target.attach_draft(*draft);
+        if (!target._session->draft || draft->_session != target._session->draft) {
+            // Direct LanguageModel callers borrow the draft workspace for this request.
+            // The facade has already selected the pair while holding its runner locks.
+            auto previous = draft->_session;
+            target._select_request_sessions(target.active_session(), draft);
+            _previous_draft_session.emplace(std::move(previous));
+        }
+    }
     try {
         target._run->cancelled = false;
         target._run->is_running = true;
@@ -512,7 +523,7 @@ LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft)
             draft->_run->cancelled = false;
             draft->_run->is_running = true;
         }
-        target._run->text_streamer.begin();
+        target._run->text_streamer.begin(std::move(callbacks));
         auto execution = lock_execution();
         target.bind_session_adapter();
         if (draft)
@@ -525,15 +536,35 @@ LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft)
             target._run->text_streamer.finish();
         } catch (...) {
         }
+        finish_sessions(false);
         throw;
     }
 }
 
-void LanguageExecutor::Run::complete() {
-    if (_outer && !_stream_finished) {
-        _stream_finished = true;
-        _target._run->text_streamer.finish();
+void LanguageExecutor::Run::finish_sessions(bool failed) {
+    if (failed) MLAModelWithBuffer::discard_queue();
+    if (failed || _target._run->cancelled.load(std::memory_order_relaxed)) {
+        _target._session->invalidate_reuse();
+        if (_draft) _target._session->draft->invalidate_reuse();
     }
+    if (!_previous_draft_session) return;
+    _draft->_bind_session(*_previous_draft_session);
+    _draft->bind_session_adapter();
+    _previous_draft_session.reset();
+}
+
+void LanguageExecutor::Run::complete() {
+    if (!_outer) return;
+    if (!_stream_finished) {
+        _stream_finished = true;
+        try {
+            _target._run->text_streamer.finish();
+        } catch (...) {
+            finish_sessions(true);
+            throw;
+        }
+    }
+    finish_sessions(std::uncaught_exceptions() > _exceptions);
 }
 
 LanguageExecutor::Run::~Run() {
@@ -543,20 +574,12 @@ LanguageExecutor::Run::~Run() {
     _target._run->max_num_tokens = _limit;
     _target._run->stop_token_ids = std::move(_stop_ids);
     if (_outer) {
-        bool failed = std::uncaught_exceptions() > _exceptions;
         try {
             complete();
+        } catch (const std::exception& error) {
+            _target._logger->error("Request cleanup failed: {}", error.what());
         } catch (...) {
-            // Cleanup must not replace the original inference exception.
-            failed = true;
-        }
-        if (failed)
-            MLAModelWithBuffer::discard_queue();
-        if (failed || _target._run->cancelled.load(std::memory_order_relaxed)) {
-            for (auto* model : {&_target, _draft}) {
-                if (model)
-                    model->_session->invalidate_reuse();
-            }
+            // Cleanup must not replace an inference or callback exception.
         }
         _target._run->is_running = false;
         if (_draft)

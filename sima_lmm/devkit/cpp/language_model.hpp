@@ -75,6 +75,12 @@ class LanguageModel {
             std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt,
             uint16_t stable_prefix_token_count = 0
         );
+        std::optional<std::vector<uint32_t>> run_model(
+            std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<std::set<uint32_t>> override_stop_token_ids,
+            uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
+        );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
             uint16_t num_cached_tokens,
@@ -138,8 +144,8 @@ class LanguageModel {
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
 
-        // Compiled stages have stable storage after initialization; keep map entries intact.
-        LanguageModelMap& get_model_map(const std::string& model_type);
+        // Inspect compiled stages without invalidating their registered session binding slots.
+        const LanguageModelMap& get_model_map(const std::string& model_type) const;
         uint16_t set_max_num_tokens(std::optional<uint16_t> max_num_tokens);
         uint16_t get_max_num_tokens() const;
         std::set<uint32_t> set_stop_token_ids(std::optional<std::set<uint32_t>> stop_token_ids);
@@ -321,6 +327,7 @@ class LanguageModel {
         bool has_buffer(const std::string& name) const;
         void _bind_session(const std::shared_ptr<LanguageSession>& selected);
         void _select_request_sessions(SessionId id, LanguageModel* draft, bool bind_adapter = false);
+        void _attach_draft(LanguageModel& draft, LanguageModel* previous);
         void _detach_draft_sessions(LanguageModel* draft);
         void _release_paired_session(SessionId id, LanguageModel* draft);
         void _init_attention_bindings();
@@ -409,7 +416,7 @@ class LanguageModel {
         const LinearAttentionConfig& _linear_attn_cfg() const;
         void _define_buffers();
         void _define_model(
-            const std::string& model_type,
+            LanguageModelMap& models,
             const LanguageModelMapKey& key,
             const std::filesystem::path& model_path,
             const std::vector<MLABufferSlice>& ifms,
@@ -577,6 +584,9 @@ class LanguageModel {
             uint16_t shared_kv_len
         );
 
+        uint32_t _prefill(std::span<const uint32_t> input_token_ids, uint16_t num_cached_tokens,
+                          std::optional<ChronoTimer> timer_ttft, std::vector<double>* durations);
+        void _decode(uint16_t num_input_tokens, uint32_t token_id, std::vector<double>* durations);
         void _notify_first_token(uint32_t token_id, double duration);
         void _notify_new_token(
             uint32_t token_id, double duration, bool from_draft = false
@@ -611,16 +621,6 @@ class LanguageModel {
         std::vector<MoeHostCache> _moe_host;
         void _init_moe_host_cache();
         MoeHostCache& _get_moe_host(uint16_t moe_nt);
-
-        // Draft-only context-fusion models indexed by their compiled width.
-
-
-
-
-        // Full-match cache: prior turn's tree state. Restored only when the
-        // matching token prefix also has the same prompt length.
-        // Positions are zero for unused slots. Slot 0 is reserved only for a system/tool prefix.
-
 
 };
 

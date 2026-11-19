@@ -23,12 +23,17 @@ struct RuntimeBufferImport {
 struct RuntimeRelocation {
     std::vector<mla_tensor> ports;
     std::vector<std::shared_ptr<RuntimeBufferImport>> imports;
+    // Keep the zero binding with the candidate until its native update succeeds.
+    std::shared_ptr<const RuntimeRelocation> neutral;
 };
 struct RuntimeProgram {
     RuntimeContext* context;
     size_t index;
     ~RuntimeProgram();
     void activate_relocation(const std::shared_ptr<const RuntimeRelocation>& desired);
+    void unload();
+    size_t queued_runs = 0;
+    bool unload_requested = false;
     std::shared_ptr<const RuntimeRelocation> neutral_reloc;
     std::shared_ptr<const RuntimeRelocation> active_reloc; // Null selects the base model.
 };

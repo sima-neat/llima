@@ -18,7 +18,7 @@ namespace llima {
 struct EncodedImageData {
     std::weak_ptr<ModelResources<VlmConfig>> resources;
     std::string identity;
-    std::map<uint8_t, std::vector<std::byte>> outputs;
+    std::vector<std::vector<std::byte>> outputs;
 };
 
 // Language execution state retained independently of the vision facade.
@@ -54,7 +54,7 @@ struct LanguageRunnerState {
 class VisionLanguageRequest {
   public:
     VisionLanguageRequest(std::shared_ptr<LanguageRunnerState> state, SessionId session,
-                          bool streaming = true, const GenerationOptions* options = nullptr);
+                          bool streaming = true, TextStreamer::CallbackOverrides callbacks = {});
     ~VisionLanguageRequest();
     void clear_images();
     void complete() { _execution->complete(); }
@@ -65,14 +65,13 @@ class VisionLanguageRequest {
     std::shared_ptr<LanguageRunnerState> _draft;
     std::unique_lock<std::mutex> _target_lock;
     std::unique_lock<std::mutex> _draft_lock;
-    bool _was_enabled;
-    std::pair<TextStreamer::InfoCallback, TextStreamer::TextCallback> _callbacks;
+    bool _restore_streaming;
     std::optional<LanguageExecutor::Run> _execution;
 };
 
 VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState> state,
                                              SessionId session, bool streaming,
-                                             const GenerationOptions* options)
+                                             TextStreamer::CallbackOverrides callbacks)
     : _target(std::move(state)), _target_lock(_target->run_mutex, std::defer_lock) {
     for (;;) {
         _target_lock.lock();
@@ -87,30 +86,19 @@ VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState
         _draft_lock.unlock();
         _target_lock.unlock();
     }
-    _callbacks = _target->text_streamer.callbacks();
-    _was_enabled = _target->text_streamer.enabled();
+    _target->language_model_ptr->_select_request_sessions(
+        session, _draft ? _draft->language_model_ptr.get() : nullptr);
+    _restore_streaming = !streaming && _target->text_streamer.enabled();
+    if (_restore_streaming)
+        _target->text_streamer.disable();
+    _target->active_draft.store(_draft);
     try {
-        _target->language_model_ptr->_select_request_sessions(
-            session, _draft ? _draft->language_model_ptr.get() : nullptr);
-        if (options) {
-            if (options->info_callback)
-                _target->text_streamer.set_info_callback(*options->info_callback);
-            if (options->text_callback)
-                _target->text_streamer.set_text_callback(*options->text_callback);
-        }
-        if (!streaming)
-            _target->text_streamer.disable();
-        _target->active_draft.store(_draft);
-        _execution.emplace(
-            *_target->language_model_ptr, _draft ? _draft->language_model_ptr.get() : nullptr);
+        _execution.emplace(*_target->language_model_ptr, _draft ? _draft->language_model_ptr.get() : nullptr,
+                           std::move(callbacks));
     } catch (...) {
         _target->active_draft.store(nullptr);
-        _target->text_streamer.set_info_callback(std::move(_callbacks.first));
-        _target->text_streamer.set_text_callback(std::move(_callbacks.second));
-        if (_was_enabled)
+        if (_restore_streaming)
             _target->text_streamer.enable();
-        else
-            _target->text_streamer.disable();
         throw;
     }
 }
@@ -127,13 +115,9 @@ void VisionLanguageRequest::clear_images() {
 
 VisionLanguageRequest::~VisionLanguageRequest() {
     _execution.reset();
-    _target->text_streamer.set_info_callback(std::move(_callbacks.first));
-    _target->text_streamer.set_text_callback(std::move(_callbacks.second));
     _target->active_draft.store(nullptr);
-    if (_was_enabled)
+    if (_restore_streaming)
         _target->text_streamer.enable();
-    else
-        _target->text_streamer.disable();
 }
 
 namespace {
@@ -262,28 +246,15 @@ VisionLanguageModel::VisionLanguageModel(
 
 std::vector<EncodedImage> VisionLanguageModel::encode_images(std::span<const cv::Mat> images) {
     if (!_vision_model) throw std::logic_error("Model does not support images");
-    VisionLanguageRequest request(_state, 0, false);
-    const auto tokens_per_image = _state->_cfg.mm_cfg->mm_tokens_per_image;
-    if (images.size() > _state->_cfg.pipeline_cfg.max_num_tokens / tokens_per_image)
-        throw std::invalid_argument("Image count exceeds the compiled context");
-    std::vector<uint32_t> placeholders(images.size() * tokens_per_image,
-                                      *_state->vlm_helper.get_image_token_id());
-    auto destinations = _state->language_model_ptr->create_input_buffers(placeholders);
+    std::lock_guard lock(_state->run_mutex);
     std::vector<EncodedImage> encoded;
-    for (size_t i = 0; i < images.size(); ++i) {
-        auto tensor = _state->vlm_helper.preprocess_image(images[i]);
-        _vision_model->run_model(tensor, &destinations.at(i));
+    encoded.reserve(images.size());
+    for (const auto& pixels : images) {
+        auto tensor = _state->vlm_helper.preprocess_image(pixels);
         auto data = std::make_shared<EncodedImageData>();
         data->resources = _vision_model->_resources;
         data->identity = image_digest(tensor);
-        for (const auto& [port, slice] : destinations.at(i)) {
-            auto* buffer = slice.get_buf_ptr();
-            const auto offset = buffer->get_buf_addr_offset(slice.get_buf_begins());
-            const auto length = buffer->get_buf_len(slice.get_buf_shapes());
-            buffer->invalidate_cache(offset, length);
-            const auto* bytes = static_cast<const std::byte*>(buffer->get_virtual_addr()) + offset;
-            data->outputs.emplace(port, std::vector<std::byte>(bytes, bytes + length));
-        }
+        data->outputs = _vision_model->encode(tensor);
         EncodedImage image;
         image._data = std::move(data);
         encoded.emplace_back(std::move(image));
@@ -328,7 +299,7 @@ std::optional<std::string> VisionLanguageModel::run_model(
 std::optional<std::string> VisionLanguageModel::run_model(
     SessionId session, const Chat& chat, const GenerationOptions& options
 ) {
-    VisionLanguageRequest request(_state, session, true, &options);
+    VisionLanguageRequest request(_state, session, true, {options.info_callback, options.text_callback});
     auto ids = generate_chat_tokens(request, chat, options);
     if (!ids) return std::nullopt;
     return _state->vlm_helper.get_tokenizer()->decode(*ids, true);
@@ -341,7 +312,7 @@ const VlmConfig& VisionLanguageModel::config() const {
 std::optional<std::vector<uint32_t>> VisionLanguageModel::benchmark_chat(
     const Chat& chat, const GenerationOptions& options, ChatBenchmark& benchmark
 ) {
-    VisionLanguageRequest request(_state, 0, true, &options);
+    VisionLanguageRequest request(_state, 0, true, {options.info_callback, options.text_callback});
     return generate_chat_tokens(request, chat, options, &benchmark);
 }
 
@@ -506,7 +477,7 @@ std::optional<std::vector<uint32_t>> LanguageRunnerState::run_language_model(
 ) {
     if (!active_draft.load()) {
         return language_model_ptr->run_model(
-            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count
+            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count, performance_result
         );
     }
     if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
@@ -576,63 +547,16 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
 ) {
     VisionLanguageRequest request(_state, session, false);
     request.clear_images();
-    // Given a list of input token ids, return a list of time in seconds for each generated token.
-    // The text streamer is disabled for this mode.
-
     _state->language_model_ptr->create_input_buffers(input_token_ids);
-    GenerationPerformanceResult result;
-
     _state->language_model_ptr->set_stop_token_ids(override_stop_token_ids);
-    if (auto draft = _state->active_draft.load()) {
-        auto output = _state->run_language_model(input_token_ids, override_max_num_tokens,
-                                          std::nullopt, &result);
-        if (!output) throw std::runtime_error("Speculative performance request was interrupted or has insufficient token capacity");
-        _state->language_model_ptr->invalidate_prompt_reuse();
-        draft->language_model_ptr->invalidate_prompt_reuse();
-        return result;
-    }
-
-    std::vector<double> ttnt;
-
-    ChronoTimer timer(true);
-
-    // Generate the first token.
-    auto prefill_result = _state->language_model_ptr->run_model(
-        input_token_ids, std::nullopt, input_token_ids.size(), override_stop_token_ids
-    );
-    ttnt.emplace_back(timer.stop(true));
-    if (!prefill_result.has_value()) {
-        _state->language_model_ptr->invalidate_prompt_reuse();
-        throw std::runtime_error("Performance request was interrupted during prefill");
-    }
-    auto next_token_id = _state->language_model_ptr->get_cached_first_generated_token();
-
-    if (prefill_result->empty() && !override_stop_token_ids.value_or(
-            _state->language_model_ptr->get_stop_token_ids()).contains(next_token_id)) {
-        // Override the max_num_tokens and stop_token_ids.
-        _state->language_model_ptr->set_max_num_tokens(override_max_num_tokens);
-
-        // Generate the new tokens until the stop token.
-        for (
-            size_t i = input_token_ids.size(); i < _state->language_model_ptr->get_max_num_tokens(); ++i
-        ) {
-            if (request.cancelled()) throw std::runtime_error("Performance request was interrupted");
-            next_token_id = _state->language_model_ptr->run_model_once(
-                1, i, input_token_ids.size(), next_token_id
-            );
-            ttnt.emplace_back(timer.stop(true));
-            _state->resources->logger->info("next_token_id: {}", next_token_id);
-            if (_state->language_model_ptr->get_stop_token_ids().contains(next_token_id))
-                break;
-        }
-
-    }
-
-    // Clear the token id cache to have correct measurement.
+    GenerationPerformanceResult result;
+    auto output = _state->run_language_model(input_token_ids, override_max_num_tokens,
+                                             ChronoTimer(true), &result);
+    if (!output)
+        throw std::runtime_error("Performance request was interrupted or has insufficient token capacity");
     _state->language_model_ptr->invalidate_prompt_reuse();
-
-    result.token_durations = std::move(ttnt);
-    result.generated_tokens = result.token_durations.size();
+    if (auto draft = _state->active_draft.load())
+        draft->language_model_ptr->invalidate_prompt_reuse();
     return result;
 }
 
@@ -658,9 +582,11 @@ void VisionLanguageModel::set_draft_vlm(VisionLanguageModel* draft) {
     std::unique_lock<std::mutex> next_lock;
     if (next) {
         next_lock = idle_lock(next->run_mutex);
-        _state->language_model_ptr->attach_draft(*next->language_model_ptr);
+        _state->language_model_ptr->_attach_draft(
+            *next->language_model_ptr, previous ? previous->language_model_ptr.get() : nullptr);
+    } else {
+        _state->language_model_ptr->_detach_draft_sessions(previous->language_model_ptr.get());
     }
-    _state->language_model_ptr->_detach_draft_sessions(previous ? previous->language_model_ptr.get() : nullptr);
     _state->draft = next;
 }
 

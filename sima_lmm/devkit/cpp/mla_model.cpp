@@ -27,6 +27,26 @@ namespace llima {
 namespace {
 
 struct QueuedRun {
+    QueuedRun() = default;
+    QueuedRun(QueuedRun&&) noexcept = default;
+    ~QueuedRun() {
+        if (!program) return;
+        std::lock_guard lock(program->context->execution_mutex);
+        release_locked();
+    }
+
+    void release_locked() {
+        auto& context = *program->context;
+        if (context.handle && epoch == context.epoch) {
+            --program->queued_runs;
+            if (program->queued_runs == 0 && program->unload_requested)
+                program->unload();
+        }
+        relocation.reset();
+        imports.clear();
+        program.reset();
+    }
+
     std::shared_ptr<RuntimeProgram> program;
     std::shared_ptr<const RuntimeRelocation> relocation;
     uint64_t epoch = 0;
@@ -49,7 +69,7 @@ mla_handle_p require_handle() {
     return state.handle;
 }
 
-uint32_t imported_buffer_id(MLABuffer* buffer) {
+const std::shared_ptr<RuntimeBufferImport>& import_buffer(MLABuffer* buffer) {
     auto& state = runtime_state();
     const uint64_t generation = buffer->get_allocation_generation();
     if (generation == 0) {
@@ -57,7 +77,7 @@ uint32_t imported_buffer_id(MLABuffer* buffer) {
     }
 
     const auto found = state.imported_buffers.find(generation);
-    if (found != state.imported_buffers.end()) return found->second->id;
+    if (found != state.imported_buffers.end()) return found->second;
 
     uint32_t id = 0;
     const int rc = mla_import_dmabuf(
@@ -69,9 +89,8 @@ uint32_t imported_buffer_id(MLABuffer* buffer) {
             rc, std::strerror(rc < 0 ? -rc : rc)
         ));
     }
-    state.imported_buffers.emplace(generation,
-        std::shared_ptr<RuntimeBufferImport>(new RuntimeBufferImport{&state, id, state.epoch}));
-    return id;
+    return state.imported_buffers.emplace(generation,
+        std::shared_ptr<RuntimeBufferImport>(new RuntimeBufferImport{&state, id, state.epoch})).first->second;
 }
 
 bool path_matches_family(
@@ -165,10 +184,6 @@ void make_bindings(
         const auto& slice = effective_slice(defaults, overrides, i);
         MLABuffer* buffer = effective_buffer(defaults, slice, i);
         const uint64_t offset = buffer->get_buf_addr_offset(slice.get_buf_begins());
-        if (imports) {
-            imported_buffer_id(buffer);
-            imports->push_back(runtime_state().imported_buffers.at(buffer->get_allocation_generation()));
-        }
         if (offset >= buffer->get_allocation_size()) {
             throw std::out_of_range(fmt::format(
                 "{} binding {} starts at {} outside its {}-byte dma-buf",
@@ -180,7 +195,9 @@ void make_bindings(
         // touched; this matters for strided KV-cache slices whose ELF section
         // size is larger than their per-token access span.
         const uint64_t length = buffer->get_allocation_size() - offset;
-        bindings.push_back({imported_buffer_id(buffer), 0, offset, length});
+        const auto& lease = import_buffer(buffer);
+        bindings.push_back({lease->id, 0, offset, length});
+        if (imports) imports->push_back(lease);
     }
 }
 
@@ -232,6 +249,7 @@ void RuntimeProgram::activate_relocation(const std::shared_ptr<const RuntimeRelo
         throw std::runtime_error(fmt::format("MLA-RT relocation failed for {}: rc={}",
                                              path_for(index), rc));
     active_reloc = desired;
+    if (desired) neutral_reloc = desired->neutral;
 }
 
 RuntimeContext& RuntimeContext::instance() {
@@ -278,10 +296,22 @@ RuntimeProgram::~RuntimeProgram() {
     // A replacement may have claimed this slot while this destructor waited.
     if (!context->programs[index].expired())
         return;
+    unload();
+}
+
+void RuntimeProgram::unload() {
+    // Pending runs may live on other threads or outlive their original wrapper.
+    if (queued_runs != 0) {
+        unload_requested = true;
+        return;
+    }
     if (context->models[index]) {
         mla_free_model(context->models[index]);
         context->models[index] = nullptr;
     }
+    active_reloc.reset();
+    neutral_reloc.reset();
+    unload_requested = false;
 }
 
 void release_mla_buffer_import(const MLABuffer* buffer) noexcept {
@@ -357,6 +387,8 @@ void disconnect_mla_rt() {
     queued_run_count = 0;
     for (const auto& weak : state.programs) {
         if (auto program = weak.lock()) {
+            program->queued_runs = 0;
+            program->unload_requested = false;
             program->active_reloc.reset();
             program->neutral_reloc.reset();
         }
@@ -397,11 +429,7 @@ void MLAModelWithBuffer::load() {
 void MLAModelWithBuffer::free() {
     auto& state = runtime_state();
     std::lock_guard execution_lock(state.execution_mutex);
-    if (_model_idx >= state.models.size() || !state.models[_model_idx]) return;
-    if (state.programs[_model_idx].use_count() > 1) return;
-    mla_free_model(state.models[_model_idx]);
-    state.models[_model_idx] = nullptr;
-    _program->active_reloc.reset();
+    _program->unload();
 }
 
 void MLAModelWithBuffer::run(
@@ -476,6 +504,7 @@ void MLAModelWithBuffer::add_to_queue(
     queued.program = _program;
     queued.relocation = _relocation;
     queued.epoch = state.epoch;
+    ++_program->queued_runs;
     ++queued_run_count;
 }
 
@@ -563,11 +592,7 @@ void MLAModelWithBuffer::run_queue() {
         total_tile_us += tile_us;
     }
     // Every submitted job has been reaped; retain vector capacity, release ownership.
-    for (size_t i = 0; i < run_count; ++i) {
-        queued_runs[i].relocation.reset();
-        queued_runs[i].imports.clear();
-        queued_runs[i].program.reset();
-    }
+    for (size_t i = 0; i < run_count; ++i) queued_runs[i].release_locked();
     if (!first_error.empty()) throw std::runtime_error(first_error);
     if (_profile) {
         const auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -585,7 +610,6 @@ std::shared_ptr<const RuntimeRelocation> MLAModelWithBuffer::_prepare_reloc(
 ) {
     if (buffers.empty()) return {};
     load();
-    auto& state = runtime_state();
     const auto lengths = mla_get_ifm_ofm_len_vector(model_for(_model_idx)).reloc_len_array;
     if (lengths.size() != buffers.size())
         throw std::invalid_argument(fmt::format("Relocation count for {} is {}, model expects {}",
@@ -593,9 +617,9 @@ std::shared_ptr<const RuntimeRelocation> MLAModelWithBuffer::_prepare_reloc(
     auto binding = std::make_shared<RuntimeRelocation>();
     auto neutral = _program->neutral_reloc ? nullptr : std::make_shared<RuntimeRelocation>();
     auto add_port = [&](RuntimeRelocation& reloc, MLABuffer& buffer, size_t size) {
-        const auto id = imported_buffer_id(&buffer);
-        reloc.ports.push_back({id, 0, buffer.get_buf_addr_offset(), size});
-        reloc.imports.push_back(state.imported_buffers.at(buffer.get_allocation_generation()));
+        const auto& lease = import_buffer(&buffer);
+        reloc.ports.push_back({lease->id, 0, buffer.get_buf_addr_offset(), size});
+        reloc.imports.push_back(lease);
     };
     for (const auto& [name, buffer] : buffers) {
         const auto size = lengths[binding->ports.size()];
@@ -613,7 +637,7 @@ std::shared_ptr<const RuntimeRelocation> MLAModelWithBuffer::_prepare_reloc(
             add_port(*neutral, zero, size);
         }
     }
-    if (neutral) _program->neutral_reloc = std::move(neutral);
+    binding->neutral = neutral ? std::move(neutral) : _program->neutral_reloc;
     return binding;
 }
 
@@ -679,7 +703,6 @@ void MLAModelWithBuffer::load_all_models(
                         "MLA-RT bulk load failed for model: {}", path
                     ));
                 }
-                state.models[state.path_to_index.at(path)] = model;
                 spdlog::info("Loaded model: {}", path);
             }
         }
@@ -707,9 +730,13 @@ void MLAModelWithBuffer::free_all_models(
     std::lock_guard execution_lock(state.execution_mutex);
     for (std::size_t i = 0; i < state.models.size(); ++i) {
         if (!state.models[i] || !path_matches_family(state.paths[i], relative_dir)) continue;
-        if (state.programs[i].use_count() != 0) continue;
-        mla_free_model(state.models[i]);
-        state.models[i] = nullptr;
+        if (auto program = state.programs[i].lock()) {
+            program->unload();
+        } else {
+            // The final lease's destructor may still be waiting on this mutex.
+            mla_free_model(state.models[i]);
+            state.models[i] = nullptr;
+        }
     }
 }
 
