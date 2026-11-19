@@ -76,6 +76,13 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             std::optional<float> avg_logprob;
         };
 
+        struct TranscriptionOptions {
+            std::string language = "auto";
+            std::string task = "transcribe";
+            // Preceding-context text, as OpenAI's `prompt`; empty disables it.
+            std::string prompt;
+        };
+
         WhisperModel(std::filesystem::path model_path);
         WhisperModel(std::filesystem::path model_path, std::shared_ptr<FileProvider> files);
         virtual ~WhisperModel() { _finalize(); };
@@ -91,6 +98,17 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             const std::string& language,
             const std::string& task = "transcribe"
         );
+        TranscriptionResult run_model(
+            const std::filesystem::path& audio_file_name,
+            const TranscriptionOptions& options
+        );
+        TranscriptionResult run_model_from_pcm(
+            std::span<const float> pcm,
+            uint32_t sample_rate,
+            const TranscriptionOptions& options
+        );
+        // Throws std::invalid_argument when the prompt cannot be used as decoder context.
+        void validate_prompt(const std::string& prompt) const { (void)_encode_prompt(prompt); }
         void set_info_callback(TextStreamer::InfoCallback callback) {
             _text_streamer->set_info_callback(callback);
         }
@@ -108,11 +126,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
     private:
         virtual void _initialize() override;
         virtual void _finalize() override;
-        TranscriptionResult _run_model(
-            const ArrayXXbf& mel,
-            const std::string& language,
-            const std::string& task
-        );
+        TranscriptionResult _run_model(const ArrayXXbf& mel, const TranscriptionOptions& options);
 
         virtual void _define_buffers() override;
         void _define_model(
@@ -131,6 +145,8 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::filesystem::path _get_elf_path_decoder_post(uint8_t layer_idx) const;
         std::filesystem::path _get_elf_path_decoder_language_detect() const;
         void _run_encoder();
+        std::vector<uint32_t> _encode_prompt(const std::string& prompt) const;
+        void _queue_decoder_step(uint32_t token_idx, uint32_t token_id);
         bool _is_auto_language(const std::string& language) const;
         struct LanguageDetectResult {
             uint32_t language_index;

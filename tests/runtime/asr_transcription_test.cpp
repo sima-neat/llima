@@ -57,10 +57,30 @@ int main() {
         );
         connected = true;
 
+        using TranscriptionOptions = simaai::llima::WhisperModel::TranscriptionOptions;
         simaai::llima::WhisperModel::TranscriptionResult result;
+        std::string prompted_text;
+        std::string truncated_prompt_text;
+        std::string repeated_text;
+        bool rejected_special_tokens = false;
         {
             simaai::llima::WhisperModel model(model_dir);
             result = model.run_model(audio, "auto");
+            prompted_text = model.run_model(
+                audio, TranscriptionOptions{.prompt = "Rayleigh scattering of sunlight."}
+            ).text;
+            std::string long_prompt;
+            for (int i = 0; i < 100; ++i)
+                long_prompt += "Rayleigh scattering. ";
+            truncated_prompt_text = model.run_model(
+                audio, TranscriptionOptions{.prompt = long_prompt}
+            ).text;
+            try {
+                model.run_model(audio, TranscriptionOptions{.prompt = "<|en|> sky"});
+            } catch (const std::invalid_argument&) {
+                rejected_special_tokens = true;
+            }
+            repeated_text = model.run_model(audio, "auto").text;
         }
 
         simaai::llima::disconnect();
@@ -84,6 +104,18 @@ int main() {
         }
         if (!result.avg_logprob.has_value() || !std::isfinite(*result.avg_logprob)) {
             throw std::runtime_error("ASR avg_logprob is invalid");
+        }
+        std::cout << "LLIMA_ASR prompted_text=" << prompted_text << '\n';
+        for (const auto& text : {prompted_text, truncated_prompt_text}) {
+            if (normalize_transcript(text).find("why is the sky blue") == std::string::npos) {
+                throw std::runtime_error("Unexpected prompted ASR transcript: " + text);
+            }
+        }
+        if (!rejected_special_tokens) {
+            throw std::runtime_error("ASR prompt with special tokens was not rejected");
+        }
+        if (repeated_text != result.text) {
+            throw std::runtime_error("Unprompted ASR transcript changed after prompted runs");
         }
     } catch (const std::exception& error) {
         if (connected) {

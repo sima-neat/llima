@@ -55,6 +55,7 @@ modalix:~$ llima run <model> [options]
 |----|----|
 | `model` | Model ID or path (e.g., `Qwen3-VL-8B-Instruct-a16w4`). |
 | `--stt_model_path` | Path to the elf files for a Speech-to-Text model (optional). |
+| `--stt_prompt`, `--stt_prompt_file` | Default transcription context, such as domain terms, given as text or a file (optional; requires `--stt_model_path`). |
 
 For all available options, run `llima run -h`.
 
@@ -84,12 +85,38 @@ Once `llima run` starts in CLI mode, use these commands at the prompt:
 | `print history` | Print chat history. |
 | `set audio <file>` | Set the audio file to transcribe as the query. |
 | `set language <lang>` | Set the language string used for transcription. |
+| `set prompt <text>` | Set the transcription context; omit `<text>` to clear it. |
 | `set lora <name>` | Use LoRA weights from a `npy_files` folder. |
 | `unset lora` | Revert the LoRA model to the baseline model. |
 | `enable-thinking` | Enable thinking mode and clear chat history. |
 | `disable-thinking` | Disable thinking mode and clear chat history. |
 | `quit` | Quit. |
 | `help` | Print available commands. |
+
+## Transcription Context
+
+Whisper accepts preceding text as context, as OpenAI Whisper does with `prompt`
+(`initial_prompt` in the open-source package). Use it to steer spelling and
+vocabulary, such as product names and acronyms. Context makes these words more
+likely but does not guarantee them.
+
+In web mode, `/v1/audio/transcriptions` and `/v1/audio/translations` accept
+`prompt` or `initial_prompt`:
+
+``` console
+$ curl http://<modalix-ip>:9998/v1/audio/transcriptions \
+    -F "file=@meeting.wav" \
+    -F "prompt=Modalix, SiMa.ai, PCIe, CSI-2, NPU"
+```
+
+A request prompt, including an empty one, replaces the `--stt_prompt` default.
+The runtime keeps the last 223 prompt tokens, and each one adds a decoder step
+before the first transcribed token. Prompts must not contain Whisper special
+tokens such as `<|en|>`; an invalid `--stt_prompt` stops `llima run` at startup
+and an invalid request prompt returns HTTP 400. Options that cannot be honored
+also return HTTP 400:
+`response_format` other than `json`, nonzero `temperature`,
+`timestamp_granularities[]`, `chunking_strategy` and `include[]`.
 
 
 ## Build an Application with Neat

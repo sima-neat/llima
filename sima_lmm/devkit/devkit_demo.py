@@ -98,6 +98,9 @@ def run_model(args: argparse.Namespace) -> int:
             flush=True,
         )
         return 1
+    if (args.stt_prompt or args.stt_prompt_file) and args.stt_model_path is None:
+        print("--stt_prompt and --stt_prompt_file require --stt_model_path.", flush=True)
+        return 1
 
     # Update logging config.
     _init_logging(args.mode, args.log_level)
@@ -123,6 +126,13 @@ def run_model(args: argparse.Namespace) -> int:
     else:
         chat_template = None
 
+    if args.stt_prompt:
+        stt_prompt = args.stt_prompt
+    elif args.stt_prompt_file:
+        stt_prompt = _read_text_file(args.stt_prompt_file, "STT prompt")
+    else:
+        stt_prompt = None
+
     print("Setting up environments and loading models", flush=True)
     try:
         if args.mode == DemoMode.CLI:
@@ -132,6 +142,7 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
+                stt_prompt=stt_prompt,
             )
         else:
             demo = WEB(
@@ -140,6 +151,7 @@ def run_model(args: argparse.Namespace) -> int:
                 draft_model_path,
                 system_prompt,
                 chat_template,
+                stt_prompt=stt_prompt,
             )
     except Exception:
         msg = "Failed to create VLM or STT model"
@@ -256,6 +268,19 @@ def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
         type=Path,
         default=None,
         help="Path to the elf files for speech-to-text model.",
+    )
+    stt_prompt_group = run_parser.add_mutually_exclusive_group()
+    stt_prompt_group.add_argument(
+        "--stt_prompt",
+        type=str,
+        default="",
+        help="Default speech-to-text context, such as domain terms; requests can replace it.",
+    )
+    stt_prompt_group.add_argument(
+        "--stt_prompt_file",
+        type=Path,
+        default=None,
+        help="Path to the file with the default speech-to-text context.",
     )
 
     group = run_parser.add_mutually_exclusive_group()
