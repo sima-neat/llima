@@ -177,6 +177,12 @@ class LanguagePostModel(LanguagePostBaseModel):
             rms_norm_in = graph.linear("pre_projection", rms_norm_in)
 
         has_ffn_norms = self.has_ffn_layernorms(base_name)
+        if self.is_dflash2_draft:
+            assert not has_ffn_norms, "DFlash 2 drafts use Qwen3 layers without FFN norms"
+            # The pre model consumed stage zero; recompute the kernels from the same layer input.
+            attention_conv = self._dflash2_conv(graph, "attention_conv")
+            attention_conv.project(graph.rms_norm(f"{base_name}.input_layernorm", rms_norm_in))
+            o_proj = attention_conv.finish(o_proj)
         if has_ffn_norms:
             rms_norm1 = graph.rms_norm(f"{base_name}.post_attention_layernorm", o_proj)
             add1 = graph.add(rms_norm_in, rms_norm1)
@@ -205,6 +211,10 @@ class LanguagePostModel(LanguagePostBaseModel):
             mlp = self._build_mlp(graph, mlp_base, [rms_norm2], merged_lora)
             mlp = graph.rms_norm(f"{base_name}.post_feedforward_layernorm", mlp)
             add2 = graph.add(add1, mlp)
+        elif self.is_dflash2_draft:
+            mlp_conv = self._dflash2_conv(graph, "mlp_conv")
+            mlp = self._build_mlp(graph, mlp_base, [mlp_conv.prepare(rms_norm2)], merged_lora)
+            add2 = graph.add(add1, mlp_conv.finish(mlp))
         else:
             add2 = self._build_mlp(
                 graph, mlp_base, [rms_norm2, add1], merged_lora, with_residual_add=True

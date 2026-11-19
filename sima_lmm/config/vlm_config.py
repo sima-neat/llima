@@ -657,6 +657,10 @@ class SpeculativeDecodingConfig(BaseConfig):
         centroid_intermediate_top_k: Number of active centroids during draft selection.
         target_layer_ids: Target layers consumed by DFlash context fusion.
         mask_token_id: DFlash mask token filling the proposal block.
+        dflash_conv_kernel_size: DFlash 2 causal convolution taps per draft layer; 0 for DFlash.
+        dflash_conv_group_size: Channels sharing one DFlash 2 dynamic convolution weight.
+        dflash_selector_rank: Rank of the DFlash 2 candidate selector codebooks; 0 for DFlash.
+        dflash_selector_top_k: Candidates the DFlash 2 selector keeps at each draft position.
     """
     method: str = SpeculativeDecodingMethod.EAGLE3
     is_draft: bool = False
@@ -667,6 +671,15 @@ class SpeculativeDecodingConfig(BaseConfig):
     centroid_intermediate_top_k: int = 0
     target_layer_ids: list[int] = field(default_factory=list)
     mask_token_id: int = -1
+    dflash_conv_kernel_size: int = 0
+    dflash_conv_group_size: int = 0
+    dflash_selector_rank: int = 0
+    dflash_selector_top_k: int = 0
+
+    @property
+    def is_dflash2(self) -> bool:
+        """Whether the DFlash draft uses DFlash 2 convolutions and candidate selection."""
+        return self.method == SpeculativeDecodingMethod.DFLASH and self.dflash_selector_rank > 0
 
 
 @dataclass
