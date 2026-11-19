@@ -32,7 +32,7 @@ class WhisperEncoderModel(BaseModel):
                     padding=((0, 0), (1, 1)),
                     stride=(1, stride),
                 )
-                hidden = graph.activation(conv, "gelu")
+                hidden = graph.activation(conv, self.cfg.activation_function)
             positions = graph.parameter("model.encoder.embed_positions.weight")
             positions = graph.constant(
                 positions.reshape(1, 1, self.cfg.max_source_positions, self.cfg.d_model)

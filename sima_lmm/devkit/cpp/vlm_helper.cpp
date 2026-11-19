@@ -186,6 +186,12 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat, bool load_images) {
                 replace += "<|image_pad|>";
             }
             num_images = find_and_replace_all(formatted_prompt, search, replace);
+        } else if (_vlm_cfg.model_type == "vlm-smolvlm") {
+            std::string replace = "<fake_token_around_image><global-img>";
+            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i)
+                replace += "<image>";
+            replace += "<fake_token_around_image>";
+            num_images = find_and_replace_all(formatted_prompt, "<image>", replace);
         } else if (_vlm_cfg.model_type == "vlm-gemma4") {
             std::string search = "<|image|>";
             std::string replace = "";
@@ -200,7 +206,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat, bool load_images) {
         }
 
         // Preprocess images.
-        if (load_images && chat.get_images().size() == 0 && num_images > 0) {
+        if (load_images && chat.get_images().empty()) {
             // Images are embedded in the messages.
             for (const auto& message: chat.get_messages()) {
                 const auto& content = message.at("content");
@@ -212,9 +218,14 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat, bool load_images) {
                     if (item.at("type") != "image")
                         continue;
                     std::string_view image_str = item.at("image").get_ref<const std::string&>();
-                    const std::string_view base64_prefix = "data:image/jpeg;base64,";
-                    if (image_str.starts_with(base64_prefix)) {
-                        auto image_bytes = base64_decode(image_str.substr(base64_prefix.size()));
+                    if (image_str.starts_with("data:")) {
+                        const auto comma = image_str.find(',');
+                        const auto header = image_str.substr(0, comma);
+                        if (comma == std::string_view::npos
+                            || (header != "data:image/jpeg;base64"
+                                && header != "data:image/png;base64"))
+                            throw std::invalid_argument("Expected a base64 PNG or JPEG image");
+                        auto image_bytes = base64_decode(image_str.substr(comma + 1));
                         image_tensors.emplace_back(_image_processor_ptr->preprocess(image_bytes));
                     } else {
                         // Assume regular file.
@@ -224,11 +235,12 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat, bool load_images) {
                 }
             }
         } else if (load_images) {
-            assert(chat.get_images().size() == num_images);
             for (const auto& image_file_name: chat.get_images()) {
                 image_tensors.emplace_back(_image_processor_ptr->preprocess(image_file_name));
             }
         }
+        if (load_images && image_tensors.size() != num_images)
+            throw std::invalid_argument("Chat template image placeholders do not match image inputs");
     }
 
     // Encode the formatted prompt to token ids.
@@ -456,6 +468,9 @@ void VlmHelper::_init_image_processor(FileProvider& files) {
     int resample = json.value("resample", 3);
     cv::InterpolationFlags interpolation;
     switch (resample) {
+        case 1:
+            interpolation = cv::INTER_LANCZOS4;
+            break;
         case 2:
             interpolation = cv::INTER_LINEAR;
             break;

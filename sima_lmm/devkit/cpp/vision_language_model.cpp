@@ -329,6 +329,26 @@ std::optional<std::string> VisionLanguageModel::run_model(
     SessionId session, const Chat& chat, const GenerationOptions& options
 ) {
     VisionLanguageRequest request(_state, session, true, &options);
+    auto ids = generate_chat_tokens(request, chat, options);
+    if (!ids) return std::nullopt;
+    return _state->vlm_helper.get_tokenizer()->decode(*ids, true);
+}
+
+const VlmConfig& VisionLanguageModel::config() const {
+    return _state->_cfg;
+}
+
+std::optional<std::vector<uint32_t>> VisionLanguageModel::benchmark_chat(
+    const Chat& chat, const GenerationOptions& options, ChatBenchmark& benchmark
+) {
+    VisionLanguageRequest request(_state, 0, true, &options);
+    return generate_chat_tokens(request, chat, options, &benchmark);
+}
+
+std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
+    VisionLanguageRequest& request, const Chat& chat, const GenerationOptions& options,
+    ChatBenchmark* benchmark
+) {
     if (options.stop_token_ids) _state->language_model_ptr->set_stop_token_ids(options.stop_token_ids);
     if (request.cancelled()) {
         request.complete();
@@ -370,7 +390,8 @@ std::optional<std::string> VisionLanguageModel::run_model(
 
     // Preprocess the chat.
     ChronoTimer timer_preprocess(true);
-    _state->resources->logger->info("Chat:\n{}", chat.get_messages().dump(4));
+    if (!benchmark)
+        _state->resources->logger->info("Chat:\n{}", chat.get_messages().dump(4));
     const bool supplied_images = !options.images.empty() || !options.encoded_images.empty();
     auto preprocessed_data = _state->vlm_helper.preprocess(chat, !supplied_images);
     if (supplied_images) {
@@ -378,6 +399,24 @@ std::optional<std::string> VisionLanguageModel::run_model(
             throw std::invalid_argument("Supplied image count must match the chat image placeholders");
         for (const auto& image : options.images)
             preprocessed_data.image_tensors.emplace_back(_state->vlm_helper.preprocess_image(image));
+    }
+    if (benchmark) {
+        if (benchmark->max_context > _state->_cfg.pipeline_cfg.max_num_tokens)
+            throw std::invalid_argument("Requested context exceeds the compiled model context");
+        const size_t input_tokens = preprocessed_data.input_token_ids.size();
+        if (!options.max_new_tokens || *options.max_new_tokens == 0 || input_tokens == 0 ||
+            input_tokens + *options.max_new_tokens > benchmark->max_context)
+            throw std::invalid_argument("Image/text prompt plus output budget exceeds context; no truncation applied");
+        // Each benchmark sample measures cold prefill for the selected target/draft pair.
+        _state->language_model_ptr->invalidate_prompt_reuse();
+        if (auto draft = _state->active_draft.load())
+            draft->language_model_ptr->invalidate_prompt_reuse();
+        benchmark->input_tokens = input_tokens;
+        benchmark->formatted_prompt = std::move(preprocessed_data.formatted_prompt);
+        _state->resources->logger->info("Benchmark prompt: {} input tokens, {} images", input_tokens,
+                                       preprocessed_data.image_count);
+    } else {
+        _state->resources->logger->info("Formatted prompt: {}", preprocessed_data.formatted_prompt);
     }
     // Placeholder IDs alone do not identify the pixels encoded into the cache.
     std::string image_identity;
@@ -391,7 +430,6 @@ std::optional<std::string> VisionLanguageModel::run_model(
     _state->language_model_ptr->set_image_identity(image_identity);
     if (auto draft = _state->active_draft.load())
         draft->language_model_ptr->set_image_identity(std::move(image_identity));
-    _state->resources->logger->info("Formatted prompt: {}", preprocessed_data.formatted_prompt);
     _state->resources->logger->info("Preprocess time: {:.2f}s", timer_preprocess.stop());
 
     if (request.cancelled()) {
@@ -439,13 +477,12 @@ std::optional<std::string> VisionLanguageModel::run_model(
 
     auto output_token_ids = _state->run_language_model(
         preprocessed_data.input_token_ids, max_num_tokens, timer_ttft,
-        nullptr, preprocessed_data.stable_prefix_token_count
+        benchmark ? benchmark->performance : nullptr, preprocessed_data.stable_prefix_token_count
     );
 
     request.complete();
-    if (output_token_ids.has_value() && !request.cancelled())
-        return _state->vlm_helper.get_tokenizer()->decode(output_token_ids.value(), true);
-    return std::nullopt;
+    if (request.cancelled()) return std::nullopt;
+    return output_token_ids;
 }
 
 

@@ -20,10 +20,10 @@ namespace {
 std::atomic<uint64_t> next_allocation_generation{1};
 
 // MLA-RT performs partial cache maintenance the same way: the
-// cacheable DMS mapping gives userspace a VA and arm64 permits dc cvac/civac
+// cacheable DMA-BUF mapping gives userspace a VA and arm64 permits dc cvac/civac
 // at EL0 when Linux enables SCTLR_EL1.UCI. Keep these operations local to
-// MLABuffer: every buffer allocated by this class comes from the SiMa DMS
-// dma-heap and LLiMa serializes CPU access with MLA completion.
+// MLABuffer: every buffer allocated by this class comes from the shared SiMa
+// MLA dma-heap and LLiMa serializes CPU access with MLA completion.
 #if defined(__aarch64__)
 constexpr size_t kA65CacheLineSize = 64;
 
@@ -163,15 +163,13 @@ void MLABuffer::allocate() {
     }
 
     // Allocate the buffer.
-    // B1157 exposes MLA-only memory through /dev/dma_heap/simaai,dms. The
-    // legacy DMS0 targets in simaai-memory are no longer allocatable on 3.0.
-    // simaai-heap keeps allocation, mapping, address discovery, and cache
-    // ownership in one supported API while MLA-RT continues to receive the
-    // physical address of each tensor slice.
-    simaai_heap_t* heap = simaai_heap_open_type(SIMAAI_HEAP_DMS, nullptr);
+    // Use the same shared heap as the MLA driver so tensor allocations follow
+    // its DMS, ordinary Linux RAM, and CMA fallback policy. The heap endpoint
+    // is required; do not select a different allocation policy in userspace.
+    simaai_heap_t* heap = simaai_heap_open("simaai,mla");
     if (!heap) {
         throw std::runtime_error(
-            "Failed to open MLA DMS heap for buffer (" + _name + "): " +
+            "Failed to open simaai,mla heap for buffer (" + _name + "): " +
             std::strerror(errno)
         );
     }

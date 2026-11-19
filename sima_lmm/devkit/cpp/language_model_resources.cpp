@@ -50,41 +50,35 @@ size_t LanguageModel::workspace_memory_bytes() const {
 }
 
 void LanguageResources::prepare_embeddings() {
-  const bool draft_model = cfg.lm_cfg.is_spec_decode() &&
-                           cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
+  if (ready || cfg.lm_cfg.is_speculative_draft())
+    return;
   const auto mode = embedding_offload_mode();
-  if (!ready && !draft_model && mode != EmbeddingOffloadMode::Off) {
-    const auto normal =
-        package->devkit_dir / (cfg.language_model_name + "_embeddings.bin");
-    const auto per_layer = package->devkit_dir / (cfg.language_model_name +
-                                                  "_per_layer_embeddings.bin");
-    const bool nvme = embedding_file_on_nvme(normal) &&
-                      (!(cfg.model_type == "vlm-gemma4" &&
-                         cfg.lm_cfg.hidden_size_per_layer_input > 0) ||
-                       embedding_file_on_nvme(per_layer));
-    if (nvme) {
-      auto offload = std::make_shared<EmbeddingOffload>();
-      const size_t elem = cfg.pipeline_cfg.quantize_embeddings ? 1 : 2;
-      const size_t vocab = cfg.lm_cfg.token_cfg.vocab_size;
-      offload->normal = std::make_unique<DiskEmbeddingTable>(
-          normal, vocab, cfg.lm_cfg.hidden_size * elem);
-      if ((cfg.model_type == "vlm-gemma4" &&
-           cfg.lm_cfg.hidden_size_per_layer_input > 0)) {
-        offload->per_layer = std::make_unique<DiskEmbeddingTable>(
-            per_layer, vocab,
-            static_cast<size_t>(cfg.lm_cfg.num_hidden_layers) *
-                cfg.lm_cfg.hidden_size_per_layer_input * elem);
-      }
-      embedding_offload = std::move(offload);
-      package->logger->info(
-          "Embedding offload enabled (local NVMe, scales remain in DRAM)");
-    } else {
-      package->logger->info(
-          "Embedding offload auto: resident DRAM (storage is not verified "
-          "local NVMe or raw tables are unavailable)");
-    }
-  } else if (!draft_model) {
+  if (mode == EmbeddingOffloadMode::Off) {
     package->logger->info("Embedding offload disabled: resident DRAM");
+    return;
+  }
+  const auto normal = package->devkit_dir / (cfg.language_model_name + "_embeddings.bin");
+  const auto per_layer = package->devkit_dir / (cfg.language_model_name + "_per_layer_embeddings.bin");
+  const bool has_per_layer = cfg.model_type == "vlm-gemma4" && cfg.lm_cfg.hidden_size_per_layer_input > 0;
+  if (mode != EmbeddingOffloadMode::On &&
+      (!std::filesystem::is_regular_file(normal) ||
+       (has_per_layer && !std::filesystem::is_regular_file(per_layer)))) {
+    package->logger->info("Embedding offload auto: resident DRAM (raw tables are unavailable)");
+    return;
+  }
+  auto offload = std::make_shared<EmbeddingOffload>();
+  const size_t elem = cfg.pipeline_cfg.quantize_embeddings ? 1 : 2;
+  const size_t vocab = cfg.lm_cfg.token_cfg.vocab_size;
+  offload->normal = std::make_unique<DiskEmbeddingTable>(normal, vocab, cfg.lm_cfg.hidden_size * elem);
+  if (has_per_layer)
+    offload->per_layer = std::make_unique<DiskEmbeddingTable>(
+        per_layer, vocab, static_cast<size_t>(cfg.lm_cfg.num_hidden_layers) *
+                              cfg.lm_cfg.hidden_size_per_layer_input * elem);
+  embedding_offload = std::move(offload);
+  package->logger->info("Embedding offload enabled (scales remain in DRAM)");
+  if (!embedding_file_on_nvme(normal) || (has_per_layer && !embedding_file_on_nvme(per_layer))) {
+    package->logger->warn("Embedding offload is enabled on non-NVMe storage; performance may be reduced. "
+                          "Set SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off to keep embeddings in DRAM.");
   }
 }
 

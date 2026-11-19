@@ -363,7 +363,7 @@ class ModelGraph(SimaBuilder):
         WeightOptions documents keyword overrides, including source
         names and matching weight/scale/bias transforms for fused or sliced weights.
         Optional scale is folded into floating weights, quantization scales and bias.
-        Single-token INT4 projections may pad output channels for 32-way layouts;
+        INT4 projections may pad output channels for 32-way layouts;
         the returned tensor always retains its original channel count.
         """
         _validate_weight_options(kwargs)
@@ -1061,7 +1061,6 @@ class ModelGraph(SimaBuilder):
         padded_channels = output_channels
         if (
             pad_output and not relocatable and not self.quantizable
-            and ifm_type.shape[:3] == (1, 1, 1)
             and weight_tensor.dtype.name == "int4" and scales is not None
             and output_channels > 512 and output_channels % mla_row_size == 0
             and output_channels - 31 * split_width <= 0

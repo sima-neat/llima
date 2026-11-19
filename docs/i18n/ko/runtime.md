@@ -45,7 +45,12 @@ modalix:~$ llima run <model> [options]
 
 사용 가능한 모든 옵션에 대해 `llima run -h`를 실행합니다.
 
-자동 임베딩 오프로드를 비활성화하고 테이블을 DRAM에 유지하려면 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`을 실행합니다.
+기본값(`auto`)에서는 원시 `.bin` 파일이 모델의 `devkit/` 디렉터리에 있으면
+임베딩 테이블을 오프로드합니다. 해당 파일이 없으면 테이블은 DRAM에 유지됩니다.
+NVMe가 아닌 스토리지는 읽기 속도가 느려 성능이 저하될 수 있으므로 경고가 표시됩니다.
+테이블을 DRAM에 유지하려면 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>`을 실행합니다.
+오프로드를 필수로 설정하려면 `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=on llima run <model>`을 실행합니다.
+이 경우 원시 파일이 없거나 유효하지 않으면 명령이 실패합니다.
 
 **예시**
 

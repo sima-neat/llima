@@ -335,6 +335,7 @@ target_compile_definitions(
     ${TARGET_RUNTIME}
     PRIVATE
         SIMA_LMM_DEFAULT_ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/sima_lmm/assets"
+        SIMA_LMM_PACKAGE_VERSION="${SIMA_LMM_PACKAGE_VERSION}"
 )
 
 target_compile_options(
@@ -591,7 +592,7 @@ string(CONCAT CPACK_DEBIAN_CORE_PACKAGE_DEPENDS
     "libopencv-core410, libopencv-imgproc410, libopencv-imgcodecs410, "
     "libavcodec61, libavformat61, libavutil59, libswresample5, "
     "libzmq5, libssl3t64, libreadline8t64, libgomp1, "
-    "libfmt10, libspdlog1.15")
+    "libfmt10, libspdlog1.15, rsync")
 string(CONCAT CPACK_DEBIAN_DEV_PACKAGE_DEPENDS
     "sima-lmm-core (= ${CPACK_PACKAGE_VERSION}), "
     "nlohmann-json3-dev (>= 3.11.2), libeigen3-dev, libfmt-dev, libspdlog-dev, "

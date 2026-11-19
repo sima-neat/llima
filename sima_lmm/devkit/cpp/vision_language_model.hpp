@@ -25,6 +25,8 @@ namespace llima {
 class CLI;
 class WEB;
 struct LanguageRunnerState;
+class VisionLanguageRequest;
+struct VlmConfig;
 class VisionModel;
 
 struct EncodedImageData;
@@ -141,6 +143,20 @@ class VisionLanguageModel {
         std::unique_ptr<VisionModel> _vision_model;
         friend class CLI;
         friend class WEB;
+        friend class ZMQServer;
+
+        struct ChatBenchmark {
+            uint16_t max_context;
+            GenerationPerformanceResult* performance;
+            size_t input_tokens = 0;
+            std::string formatted_prompt;
+        };
+        const VlmConfig& config() const;
+        std::optional<std::vector<uint32_t>> benchmark_chat(
+            const Chat& chat, const GenerationOptions& options, ChatBenchmark& benchmark);
+        std::optional<std::vector<uint32_t>> generate_chat_tokens(
+            VisionLanguageRequest& request, const Chat& chat, const GenerationOptions& options,
+            ChatBenchmark* benchmark = nullptr);
         std::string_view model_type() const;
 
 

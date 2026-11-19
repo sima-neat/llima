@@ -2,13 +2,16 @@ import argparse
 from pathlib import Path
 
 from sima_lmm.mole.modalixboard import ModalixBoard
+from sima_lmm.mole.perf_runner import PerformanceOptions
+from sima_lmm.mole.vlm_accuracy import AccuracyOptions
 from sima_lmm.mole.mole import perf_bench, prepare_mole, run
+from sima_lmm.mole.workloads import IMAGE_DATASETS
 
 def main():
     parser = argparse.ArgumentParser(description="LLM benchmark tool")
 
     common_parser = argparse.ArgumentParser(add_help=False)
-    common_parser.add_argument("model_id", type=str, help="Model ID")
+    common_parser.add_argument("model_id", type=str, help="Model/tokenizer for text workloads; run label for image workloads")
     common_parser.add_argument(
         "-n", "--num_samples", type=int,
         help="Number of samples to run. Run the full set if not specified"
@@ -17,14 +20,17 @@ def main():
         "--max_num_tokens", type=int, default=2048, help="Max number of tokens"
     )
     common_parser.add_argument("-o", "--output", type=Path, help="Output directory")
-    common_parser.add_argument("--board_ip", type=str, help="Board IP or host name")
+    common_parser.add_argument(
+        "--board_ip", type=str,
+        help="Remote board IP or host name; omit only when running on a Modalix DevKit",
+    )
     common_parser.add_argument("--board_port", type=int, default=8002, help="Board port")
     common_parser.add_argument(
         "--board_start_server", type=bool, action=argparse.BooleanOptionalAction, default=True,
         help="Start board server"
     )
     common_parser.add_argument("--board_venv_path", type=str, help="Python venv path on the board")
-    common_parser.add_argument("--board_model", type=str, help="Model ID or path on the board")
+    common_parser.add_argument("--board_model", type=str, help="Compiled model or speculative model bundle on the board")
     common_parser.add_argument(
         "--board_ssh_user", type=str, default="sima", help="Board user name for SSH connection"
     )
@@ -37,7 +43,18 @@ def main():
         "accuracy", parents=[common_parser], formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         help="Benchmark accuracy"
     )
-    acc_parser.set_defaults(max_new_tokens=0)
+    acc_parser.add_argument(
+        "--accuracy_manifest", type=Path,
+        help="Image task dataset revisions/prepared local datasets (JSON)",
+    )
+    acc_parser.add_argument(
+        "--max_new_tokens", type=int, default=None,
+        help="Override upstream image-task output budgets; otherwise retain each task's generation settings",
+    )
+    acc_parser.add_argument(
+        "--enable_thinking", action=argparse.BooleanOptionalAction, default=False,
+        help="Enable the deployed VLM's native thinking template for image accuracy",
+    )
     acc_parser.add_argument(
         "-b", "--backend", type=str, choices=["hf", "modalix"], required=True,
         help="Model evaluation backend"
@@ -58,7 +75,14 @@ def main():
         "--input_lengths", type=int, nargs="+",
         help="Exact input-token lengths to benchmark; omit for automatic buckets"
     )
+    perf_parser.add_argument("--dataset", choices=["bfcl-v3", "ifeval", "alpacaeval", "gsm8k", "dialogsum", *IMAGE_DATASETS],
+                             help="Single-turn workload; runs the full dataset unless -n is specified")
+    perf_parser.add_argument("--dataset_manifest", type=Path,
+                             help="Image dataset revisions/prepared local datasets (same format as --accuracy_manifest)")
     args = parser.parse_args()
+
+    performance = PerformanceOptions(dataset=getattr(args, "dataset", None),
+                                     manifest=getattr(args, "dataset_manifest", None))
 
     # Create and validate mole config.
     board = None
@@ -66,7 +90,7 @@ def main():
         board = ModalixBoard(
             address=args.board_ip, port=args.board_port, model=args.board_model,
             ssh_user=args.board_ssh_user, ssh_password=args.board_ssh_pass,
-            venv_path=args.board_venv_path
+            venv_path=args.board_venv_path,
         )
 
     config = prepare_mole(
@@ -81,6 +105,12 @@ def main():
         max_num_tokens=args.max_num_tokens,
         max_new_tokens=args.max_new_tokens,
         input_lengths=getattr(args, "input_lengths", None),
+        performance=performance,
+        accuracy=AccuracyOptions(
+            manifest=getattr(args, "accuracy_manifest", None),
+            max_new_tokens=args.max_new_tokens if args.command == "accuracy" else None,
+            enable_thinking=getattr(args, "enable_thinking", False),
+        ),
     )
     if config is None:
         parser.error("Invalid argument combinations")
