@@ -29,6 +29,7 @@ stribomon/gemma3-siglip448
 Qwen/Qwen2.5-VL-3B-Instruct
 LiquidAI/LFM2-VL-450M
 Qwen/Qwen3-VL-2B-Instruct
+HuggingFaceTB/SmolVLM2-256M-Video-Instruct 067788b187b95ebe7b2e040b3e4299e342e5b8fd
 
 # Expansion candidates: LLM baseline families.
 # Enable when we need broader architecture coverage or release qualification.

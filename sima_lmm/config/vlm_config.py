@@ -16,6 +16,7 @@ _VISION_MODEL_TYPE_ALIASES = {
     "qwen2_5_vl_vision": "qwen2_5_vl",
     "qwen3_vl_vision": "qwen3_vl",
     "qwen3_5_vision": "qwen3_5",
+    "smolvlm_vision": "siglip",
 }
 
 
@@ -125,6 +126,7 @@ class VlmArchType(str, ExtensibleEnum):
     VLM_QWEN2_5_VL = "vlm-qwen2_5_vl"
     VLM_QWEN3_VL = "vlm-qwen3_vl"
     VLM_QWEN3_5_VL = "vlm-qwen3_5"
+    VLM_SMOLVLM = "vlm-smolvlm"
 
 class VisionArchType(str, ExtensibleEnum):
     """Vision architecture type.
@@ -197,10 +199,6 @@ class GgufFileType(int, ExtensibleEnum):
     Q2_K_S = 21
     BF16 = 32
 
-
-MLA_CONSTRAINTS: dict = {
-    "max_position_embeddings": 2048,  # k-v cache size
-}
 
 # Number of tokens processed in parallel per speculative-decoding step.
 # "draft": the number of candidate tokens the draft model proposes per step (topk).
@@ -345,7 +343,7 @@ class MMConnectionConfig(BaseConfig):
             If mm_tokens_per_image is less than num_patches, AvgPool is inserted.
         proj_dim: The number of projected tokens for an image.
         downsample_factor: Reduces vision tokens by factor² via PixelUnshuffle.
-        projector_use_layernorm: Whether to apply LayerNorm, which is absent in LFM2.5-VL projector.
+        projector_use_layernorm: Whether the LFM2 projector applies LayerNorm.
     """
     num_layers: int = 2
     hidden_act: str = "gelu"
@@ -728,7 +726,6 @@ class LanguageModelConfig(BaseConfig):
         moe_cfg: The Mixture-of-Experts routing settings; None for dense models.
         hidden_size: The dimension of the embedding.
         num_hidden_layers: The number of transformer blocks.
-        max_position_embeddings: The context length.
         rms_norm_eps: The small value in RMS norm to prevent zero devision.
         rms_norm_unit_offset: Whether to add 1 to the weights in
             RMS norm layers before multiplying.  This parameter is
@@ -759,7 +756,6 @@ class LanguageModelConfig(BaseConfig):
     moe_cfg: MixtureOfExpertsConfig | None = None
     hidden_size: int = 0
     num_hidden_layers: int = 0
-    max_position_embeddings: int = 0
     rms_norm_eps: float = 1e-05
     rms_norm_unit_offset: bool = False
     layer_types: list[str] = field(default_factory=list)
@@ -883,7 +879,6 @@ class LanguageModelConfig(BaseConfig):
 
         self.hidden_size = text_cfg.get("hidden_size", 0)
         self.num_hidden_layers = num_hidden_layers
-        self.max_position_embeddings = text_cfg.get("max_position_embeddings", 0)
         self.rms_norm_eps = text_cfg.get("rms_norm_eps", text_cfg.get("norm_eps", 1e-05))
         self.rms_norm_unit_offset = (
             model_format == ModelFormat.FORMAT_HF
@@ -1344,6 +1339,11 @@ class VlmConfig(BaseConfig):
                 imgs = vlm_cfg.vm_cfg.image_size
                 ps = vlm_cfg.vm_cfg.patch_size
                 vlm_cfg.mm_cfg.mm_tokens_per_image = (imgs // ps) ** 2
+            elif vlm_cfg.model_type == VlmArchType.VLM_SMOLVLM:
+                vlm_cfg.mm_cfg.downsample_factor = model_cfg["scale_factor"]
+                vlm_cfg.mm_cfg.mm_tokens_per_image = (
+                    vlm_cfg.vm_cfg.num_patches // vlm_cfg.mm_cfg.downsample_factor
+                ) ** 2
             if vlm_cfg.model_type in (VlmArchType.VLM_LFM2_VL, VlmArchType.VLM_GEMMA4):
                 if not vlm_cfg.vm_cfg.temporal_patch_size:
                     vlm_cfg.vm_cfg.temporal_patch_size = 1
@@ -1370,7 +1370,6 @@ class VlmConfig(BaseConfig):
                 begin_token_id=model_cfg["boa_token_id"],
                 end_token_id=model_cfg.get("eoa_token_id", model_cfg.get("eoa_token_index")),
             )
-        apply_mla_constraint(vlm_cfg)
         return vlm_cfg
 
     @property
@@ -1748,24 +1747,6 @@ def llm_parameter_count(text_cfg: dict) -> int:
     total *= num_hidden_layers
     total += count_token_embedding + count_lm_rms
     return total
-
-
-def apply_mla_constraint(vlm_cfg: VlmConfig) -> None:
-    """Apply MLA constraints.
-
-    TODO: modify RoPE if context_length (max_position_embeddings) is changed.
-
-    Args:
-        vlm_cfg (VlmConfig): The configuration of VLM model.
-
-    Returns:
-        None. Change is made in place.
-    """
-    cfg = vlm_cfg.lm_cfg
-    if cfg is not None:
-        for key, value in MLA_CONSTRAINTS.items():
-            if getattr(cfg, key) > value:
-                setattr(cfg, key, value)
 
 
 def _cache_model_index(

@@ -168,6 +168,7 @@ graph.save([output])
 テセレーションは `sima_analysis.get_tessellate_parameters()` で一元的に推論します。HWC16 レイアウト、自動タイルサイズ、決定的な永続バッファ名を使用します。通常のコンポーネントは `BaseModel` から空の上書き設定を継承します。ストライド付き KV キャッシュなどの特殊なレイアウトでは、既存の `get_mla_input_tessellate_params()` / `get_mla_output_tessellate_params()` メソッドを上書きします。キーはテンソルのインデックスで、負のインデックスは末尾から数えます。
 
 Whisper コンポーネント、すべてのネイティブ言語グラフ部分、標準の vision tower でこの API を使用しています。attention、MLP、回転のヘルパーは同じ実装を共有します。
+DFlash のコンテキスト融合、K/V 射影、状態リゾルバーのコンポーネントも `generate_graph()` と `ModelGraph` を使用します。最終ドラフトグラフは、対応するターゲットのパック済み出力ヘッドの重みとスケールを保持します。検証グラフは、ランタイムの状態リゾルバーが必要とする S1 と求解済みの中間値の出力を保持します。
 
 ## テスト
 
@@ -297,6 +298,10 @@ sima-cli playbooks install ./skills
 インストール概要には、`detected: 3`、`valid: 3`、および`discarded: 0`の結果を必ず含めてください。
 各`playbook.yml`において、`sima-cli`のバージョンは、`min_cli_version`を満たしている必要があります。
 
+問題を報告する場合は[バグ報告テンプレート](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)、
+改善を提案する場合は[機能リクエストテンプレート](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)を使用してください。
+該当する項目を記入し、ログや再現手順から機密情報を削除してください。
+
 プルリクエストの場合：
 
 - 現在の`develop`から分岐させ、それをターゲットとする。
@@ -308,3 +313,14 @@ sima-cli playbooks install ./skills
 - 認証情報と機密性の高い資産は除外してください。
 
 関連するテストが意図しないスキップなしで正常に完了し、必要なパッケージとModalixのチェックが完了しているか、または明示的に利用できない状態になっている場合、互換性とドキュメントが適切に処理され、プルリクエストに再現可能な証拠が含まれている場合に、貢献として受け入れられます。
+
+## SDK パッケージのロック処理
+
+CI の SDK ホストパッケージ操作では、`sima-neat/.github@main` の共有ヘルパーを使用します。
+このヘルパーは、認識された dpkg/APT のロック競合に限り、操作ごとに最大 120 秒間再試行し、
+競合時にロック所有者とプロセスの診断情報を出力します。
+無関係なエラーは即座に失敗として扱い、ロックファイルとロックを保持するプロセスは変更しません。
+このヘルパーは、ターゲットの sysroot や DevKit のパッケージデータベースを管理しません。
+ローカルの CI セットアップスクリプトでは、レビュー済みの共有チェックアウト内にある
+`scripts/sdk-package.sh` の絶対パスを `SDK_PACKAGE_HELPER` に設定してください。
+[共有ヘルパーの契約](https://github.com/sima-neat/.github/tree/main/actions/setup-sdk-package-helper)を参照してください。

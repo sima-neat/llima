@@ -390,7 +390,6 @@ class WhisperModel(BaseModel):
                 cache_ifms = [
                     pre_ofms[0],
                     decoder_cache_key[layer_idx][..., :aligned_token_idx + 1, :],
-                    decoder_cache_value[layer_idx][..., :aligned_token_idx + 1, :],
                 ]
                 if self.use_future_token_mask:
                     mask = np.full(
@@ -400,6 +399,9 @@ class WhisperModel(BaseModel):
                     )
                     mask[..., :next_token_idx] = 0
                     cache_ifms.append(mask)
+                cache_ifms.append(
+                    decoder_cache_value[layer_idx][..., :aligned_token_idx + 1, :]
+                )
                 cache_model = self._get_part_model("cache", token_idx=aligned_token_idx)
                 cache_ofms = cache_model.run_model(eval_mode, cache_ifms)
 

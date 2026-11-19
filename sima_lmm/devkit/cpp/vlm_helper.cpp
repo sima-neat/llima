@@ -185,6 +185,12 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
             // Actual token counts are known only after aspect-preserving preprocessing.
             num_images = 0;
             for (size_t pos = 0; (pos = formatted_prompt.find("<|image|>", pos)) != std::string::npos; pos += 9) ++num_images;
+        } else if (_vlm_cfg.model_type == "vlm-smolvlm") {
+            std::string replace = "<fake_token_around_image><global-img>";
+            for (uint32_t i = 0; i < _vlm_cfg.mm_cfg.value().mm_tokens_per_image; ++i)
+                replace += "<image>";
+            replace += "<fake_token_around_image>";
+            num_images = find_and_replace_all(formatted_prompt, "<image>", replace);
         } else if (_vlm_cfg.model_type == "vlm-gemma4") {
             std::string search = "<|image|>";
             std::string replace = "";
@@ -205,10 +211,14 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
             for (const auto& item : content) {
                 if (item.at("type") != "image") continue;
                 const std::string_view source = item.at("image").get_ref<const std::string&>();
-                constexpr std::string_view base64_prefix = "data:image/jpeg;base64,";
-                if (source.starts_with(base64_prefix)) {
+                if (source.starts_with("data:")) {
+                    const auto comma = source.find(',');
+                    const auto header = source.substr(0, comma);
+                    if (comma == std::string_view::npos ||
+                        (header != "data:image/jpeg;base64" && header != "data:image/png;base64"))
+                        throw std::invalid_argument("Expected a base64 PNG or JPEG image");
                     image_tensors.emplace_back(_image_processor_ptr->preprocess(
-                        base64_decode(source.substr(base64_prefix.size()))));
+                        base64_decode(source.substr(comma + 1))));
                 } else {
                     image_tensors.emplace_back(_image_processor_ptr->preprocess(source));
                 }
@@ -508,6 +518,9 @@ void VlmHelper::_init_image_processor(FileProvider& files) {
     int resample = json.value("resample", 3);
     cv::InterpolationFlags interpolation;
     switch (resample) {
+        case 1:
+            interpolation = cv::INTER_LANCZOS4;
+            break;
         case 2:
             interpolation = cv::INTER_LINEAR;
             break;

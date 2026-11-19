@@ -38,8 +38,12 @@ saved with `graph.save()`.
 
 ## Model-Support CI Checklist
 
-1. Reuse or extend affected cases in `tests/compilation/cases.py`; add new cases
-   only for model contracts not already covered.
+1. Reuse or extend affected cases in `tests/compilation/cases.py`. Add only one
+   representative model case per architecture to each applicable suite and
+   reuse the same checkpoint across suites. Do not add separate model cases
+   for sizes, fine-tunes, or revisions of the same architecture. Component and
+   precision checks reuse the representative; use small hermetic tests for
+   parameter variants.
 2. Pin inputs by immutable revision in the matching cache manifest:
    - weighted HF: `tools/hf-safetensors/manifest.txt`;
    - metadata-only HF: `tools/hf-safetensors/config-manifest.txt`;

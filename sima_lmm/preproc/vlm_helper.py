@@ -36,6 +36,7 @@ class VlmHelper:
     ):
         self.vlm_cfg = vlm_cfg
         self.suppress_tokens = []
+        self.model_type = vlm_cfg.model_type
         try:
             if hf_path.suffix == ".gguf":
                 self.hf_tokenizer = LlamaCPPWrapper(
@@ -74,7 +75,7 @@ class VlmHelper:
                     self.hf_processor = AutoProcessor.from_pretrained(hf_path, **kwargs)
                     self.hf_tokenizer = self.hf_processor.tokenizer
                     assert isinstance(self.hf_processor, ProcessorMixin)
-                    if vlm_cfg.vm_cfg.arch in (
+                    if vlm_cfg.model_type == VlmArchType.VLM_SMOLVLM or vlm_cfg.vm_cfg.arch in (
                         VisionArchType.SIGLIP2,
                         VisionArchType.QWEN2_VISION_ENCODER,
                         VisionArchType.QWEN3_VISION_ENCODER,
@@ -153,7 +154,7 @@ class VlmHelper:
                 images = load_images(images)
             else:
                 images = None
-            image_kwargs = {}
+            processor_kwargs = {}
             if self.vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED and images:
                 from sima_lmm.preproc.gemma4_unified import resize_image
                 vm = self.vlm_cfg.vm_cfg
@@ -162,7 +163,7 @@ class VlmHelper:
                 largest = max((image.width // side) * (image.height // side) for image in images)
                 # HF requires a preset for tensor padding; LLiMa keeps only valid rows.
                 padding_budget = next(n for n in (70, 140, 280, 560, 1120) if n >= largest)
-                image_kwargs = {"images_kwargs": {"do_resize": False, "max_soft_tokens": padding_budget}}
+                processor_kwargs["images_kwargs"] = {"do_resize": False, "max_soft_tokens": padding_budget}
             if self.input_res is not None and images is not None:
                 if isinstance(self.input_res, list):
                     target_h, target_w = self.input_res
@@ -172,7 +173,18 @@ class VlmHelper:
                 resized_images = []
                 for img in images:
                     img_np = np.array(img)
-                    resized_img_np = cv2.resize(img_np, target_size, interpolation=cv2.INTER_CUBIC)
+                    interpolation = cv2.INTER_CUBIC
+                    if self.model_type == VlmArchType.VLM_SMOLVLM:
+                        height, width = img_np.shape[:2]
+                        side = max(height, width)
+                        top, left = (side - height) // 2, (side - width) // 2
+                        img_np = cv2.copyMakeBorder(
+                            img_np, top, side - height - top, left, side - width - left,
+                            cv2.BORDER_CONSTANT,
+                            value=tuple(int(mean * 255) for mean in self.hf_processor.image_processor.image_mean),
+                        )
+                        interpolation = cv2.INTER_LANCZOS4
+                    resized_img_np = cv2.resize(img_np, target_size, interpolation=interpolation)
                     resized_images.append(PIL.Image.fromarray(resized_img_np))
                 images = resized_images
             if self.hf_tokenizer.bos_token is not None and formatted_prompt.startswith(
@@ -182,14 +194,21 @@ class VlmHelper:
             else:
                 add_special_tokens = True
 
-            audio_kwargs = {}
             if audio_inputs:
-                audio_kwargs = {"audio": [frames.reshape(-1) for frames in audio_inputs],
-                                "sampling_rate": self.vlm_cfg.audio_cfg.sampling_rate}
+                processor_kwargs.update(audio=[frames.reshape(-1) for frames in audio_inputs],
+                                        sampling_rate=self.vlm_cfg.audio_cfg.sampling_rate)
+            if self.model_type == VlmArchType.VLM_SMOLVLM:
+                processor_kwargs.update(do_image_splitting=False, do_resize=False)
             processed_dict = self.hf_processor(
-                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens, **audio_kwargs, **image_kwargs
+                text=formatted_prompt, images=images, add_special_tokens=add_special_tokens,
+                **processor_kwargs,
             )
             processed_images = processed_dict.get("pixel_values")
+            if self.model_type == VlmArchType.VLM_SMOLVLM and processed_images is not None:
+                processed_images = np.asarray(processed_images)
+                if processed_images.ndim != 5 or processed_images.shape[0] != 1:
+                    raise ValueError("SmolVLM preprocessing expects one batch of image tiles")
+                processed_images = processed_images[0]
             image_grid_thw = processed_dict.get("image_grid_thw")
             if self.vlm_cfg.model_type == VlmArchType.VLM_GEMMA4_UNIFIED:
                 image_grid_thw = np.asarray(processed_dict.get("image_position_ids")) if processed_images is not None else None
