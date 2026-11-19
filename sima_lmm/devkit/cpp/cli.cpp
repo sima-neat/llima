@@ -43,6 +43,8 @@ CLI::CLI(
 {
     if (_singleton_ptr)
         throw std::runtime_error("Only one CLI instance can be created");
+    if (!_default_stt_prompt.empty() && !whisper_model_path.has_value())
+        throw std::invalid_argument("stt_prompt requires a Whisper model");
 
     if (whisper_model_path.has_value()) {
         _whisper_model_ptr = std::make_unique<WhisperModel>(whisper_model_path.value());
