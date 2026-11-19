@@ -1,4 +1,4 @@
-#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -154,8 +154,16 @@ void verify_mixed_queue(const fs::path& elf, const MlaModelIFMOFMLengths& sizes)
 int main(int argc, char** argv) {
     bool connected = false;
     try {
+        if (argc == 3 && std::string_view(argv[1]) == "--queue-elf") {
+            connect({}, "/tmp/llima-lora-queue-test.log", spdlog::level::warn);
+            connected = true;
+            verify_mixed_queue(argv[2], port_lengths(argv[2]));
+            disconnect();
+            std::cout << "Mixed-adapter queue matches both direct submissions\n";
+            return 0;
+        }
         if (argc != 1 && argc != 2 && argc != 4)
-            throw std::invalid_argument("Usage: lora_session_test [MODEL_DIRECTORY [ADAPTER_A ADAPTER_B]]");
+            throw std::invalid_argument("Usage: lora_session_test [MODEL_DIRECTORY [ADAPTER_A ADAPTER_B]] | --queue-elf ELF");
         const fs::path model = argc > 1 ? fs::absolute(argv[1]) :
             test::resolve_model_dir("SIMA_TEST_LLIMA_TEXT_MODEL", test::kDefaultTextModelName,
                                     "LoRA recovery", "devkit/vlm_config.json");
@@ -169,7 +177,8 @@ int main(int argc, char** argv) {
         connected = true;
         const fs::path elf = pre_elf(package.path / "elf_files");
         const auto sizes = port_lengths(elf);
-        malformed(root / "wrong_count", elf.stem().string(), sizes.reloc_len_array.size() + 1);
+        const auto ports = sizes.reloc_len_array.size();
+        malformed(root / "wrong_count", elf.stem().string(), ports > 1 ? ports - 1 : ports + 1);
         malformed(root / "unknown_graph", "model_n1_pre_layer255_stage1_mla", 1);
         {
             VisionLanguageModel target(package.path);

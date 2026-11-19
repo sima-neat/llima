@@ -43,6 +43,8 @@ int main(int argc, char** argv) {
             draft_files = files;
             draft = std::make_unique<VisionLanguageModel>(
                 draft_root, std::nullopt, std::nullopt, std::move(files));
+            require(draft->session_memory_bytes(0) == 0,
+                    "Draft construction allocated an unused public cache");
             first->set_draft_vlm(draft.get());
         }
         first->set_text_callback([](const std::string&, bool, bool) {});
@@ -64,13 +66,31 @@ int main(int argc, char** argv) {
         first->reset_session(0);
         const auto gold_a = generate(0, a);
         if (draft) {
+            require(draft->session_memory_bytes(0) == 0,
+                    "Target generation wrote the draft's public session");
             draft->reset_session(0);
+            require(draft->session_memory_bytes(0) == 0,
+                    "Reset of an unused public draft session allocated its cache");
             require(generate(0, a) == gold_a,
                     "Resetting the draft's public session corrupted a paired target cache");
             const auto branch_after_reset = generate(0, b);
             first->reset_session(0);
             require(branch_after_reset == generate(0, b),
                     "Resetting the draft's public session corrupted a branched prompt");
+
+            const auto limit = static_cast<uint16_t>(b.size() + 16);
+            const auto reference_repeat = first->run_model_for_ttnt(0, b, limit);
+            first->reset_session(0);
+            require(generate(0, b) == branch_after_reset, "Fresh target output changed");
+            draft->reset_session(0);
+            const auto after_reset = first->run_model_for_ttnt(0, b, limit);
+            require(reference_repeat.accepted_draft_tokens.has_value()
+                        && after_reset.accepted_draft_tokens == reference_repeat.accepted_draft_tokens
+                        && after_reset.generated_tokens == reference_repeat.generated_tokens,
+                    "Resetting the public draft session changed speculative acceptance");
+            std::cout << json{{"case", "paired_draft_isolation"}, {"runtime_ok", true},
+                {"generated_tokens", after_reset.generated_tokens},
+                {"accepted_draft_tokens", *after_reset.accepted_draft_tokens}}.dump() << '\n';
         }
         first->reset_session(0);
         const auto gold_b = generate(0, b);

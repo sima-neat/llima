@@ -1471,11 +1471,13 @@ void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapte
                 }
             }
             if (model._reloc_buffers != *desired)
-                changes.push_back({model, *desired, model._prepare_reloc(*desired), model._program->active_reloc});
+                changes.push_back({model, *desired, {}, model._program->active_reloc});
         }
     }
     if (adapter && matched != adapter->bindings.size())
         throw std::invalid_argument("LoRA names a graph not present in the model");
+    for (auto& change : changes)
+        change.next = change.model._prepare_reloc(change.buffers, true);
 
     // All ELF keys and ports are valid. Publish wrapper bindings only after every
     // native update succeeds. A failed driver call leaves existing requests retryable.
@@ -1488,7 +1490,12 @@ void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapte
     } catch (...) {
         while (applied > 0) {
             auto& change = changes[--applied];
-            change.model._program->activate_relocation(change.previous);
+            try {
+                change.model._program->activate_relocation(change.previous);
+            } catch (const std::exception& error) {
+                // The wrapper still owns its original binding and will retry on submission.
+                _logger->error("Could not restore MLA relocation: {}", error.what());
+            }
         }
         throw;
     }
@@ -1500,16 +1507,16 @@ void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapte
 }
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
-    if (_session->reloc_name == reloc_name) return;
+    if (_session->adapter && _session->adapter->name == reloc_name) return;
     if (_files->pulls_files())
         throw std::runtime_error("LoRA requires a local model directory; the asset provider cannot list npy_files");
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
     std::erase_if(_resources->adapters, [](const auto& entry) { return entry.second.expired(); });
-    std::optional<std::string> name(reloc_name);
     const auto found = _resources->adapters.find(reloc_name);
     auto adapter = found == _resources->adapters.end() ? nullptr : found->second.lock();
     if (!adapter) {
         adapter = std::make_shared<LanguageAdapter>();
+        adapter->name = reloc_name;
         const auto directory = _devkit_dir.parent_path() / "npy_files" / reloc_name;
         const std::regex pattern(R"(_n(\d+)_(pre|post|router)_layer(\d+)(?:_expert(\d+))?_)");
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
@@ -1529,7 +1536,9 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
             if (tensor.word_size != 1 || tensor.fortran_order || tensor.num_vals == 0)
                 throw std::invalid_argument("LoRA tensor must contain contiguous row-major bytes: " + filename);
             const auto key = entry.path().stem().string();
-            auto [buffer, inserted] = adapter->buffers.try_emplace(key, key, tensor.shape, "int8", true);
+            // Compiler-produced arrays already contain the packed MLA section bytes.
+            auto [buffer, inserted] = adapter->buffers.try_emplace(
+                key, key, std::vector<size_t>{tensor.num_bytes()}, "int8", false);
             buffer->second.allocate();
             buffer->second.upload(tensor.data<void>());
             adapter->bindings[{kind, {width, layer, expert}}].emplace(key, &buffer->second);
@@ -1541,7 +1550,6 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
     _bind_adapter(adapter);
     cached = adapter;
     _session->adapter = std::move(adapter);
-    _session->reloc_name = std::move(name);
     _session->invalidate_reuse();
     if (_session->draft) _session->draft->invalidate_reuse();
 }
@@ -1551,7 +1559,6 @@ void LanguageModel::unset_reloc() {
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
     _bind_adapter(nullptr);
     _session->adapter.reset();
-    _session->reloc_name.reset();
     _session->invalidate_reuse();
     if (_session->draft) _session->draft->invalidate_reuse();
 }

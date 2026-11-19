@@ -13,6 +13,7 @@ struct AdapterModelKey {
     auto operator<=>(const AdapterModelKey&) const = default;
 };
 struct LanguageAdapter {
+    std::string name;
     std::map<std::string, MLABuffer> buffers;
     std::map<AdapterModelKey, std::map<std::string, MLABuffer*>> bindings;
 };
@@ -66,7 +67,6 @@ struct LanguageSession {
     std::vector<uint16_t> checkpoint_boundaries;
     std::vector<LanguageModel::CachedState> cached_states;
     std::array<uint16_t, LanguageModel::checkpoint_slot_count> state_checkpoint_positions{};
-    std::optional<std::string> reloc_name;
     std::shared_ptr<LanguageAdapter> adapter;
     std::string image_identity;
 };

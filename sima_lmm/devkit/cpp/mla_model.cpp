@@ -29,6 +29,7 @@ namespace {
 struct QueuedRun {
     std::shared_ptr<RuntimeProgram> program;
     std::shared_ptr<const RuntimeRelocation> relocation;
+    uint64_t epoch = 0;
     std::vector<std::shared_ptr<RuntimeBufferImport>> imports;
     std::size_t model_index = 0;
     std::vector<mla_tensor> ifms;
@@ -464,12 +465,17 @@ void MLAModelWithBuffer::add_to_queue(
     const std::size_t slot = queued_run_count;
     if (slot == queued_runs.size()) queued_runs.emplace_back();
     auto& queued = queued_runs[slot];
+    try {
+        make_bindings(_ifms, ifm_map_ptr, "IFM", queued.ifms, &queued.imports);
+        make_bindings(_ofms, ofm_map_ptr, "OFM", queued.ofms, &queued.imports);
+    } catch (...) {
+        queued.imports.clear();
+        throw;
+    }
     queued.model_index = _model_idx;
     queued.program = _program;
     queued.relocation = _relocation;
-    queued.imports.clear();
-    make_bindings(_ifms, ifm_map_ptr, "IFM", queued.ifms, &queued.imports);
-    make_bindings(_ofms, ofm_map_ptr, "OFM", queued.ofms, &queued.imports);
+    queued.epoch = state.epoch;
     ++queued_run_count;
 }
 
@@ -499,6 +505,10 @@ void MLAModelWithBuffer::run_queue() {
         while (first_error.empty() && next < run_count &&
                inflight.size() < queue_ahead_depth) {
             const auto& queued = queued_runs[next];
+            if (queued.epoch != state.epoch) {
+                first_error = "Queued MLA run belongs to a closed connection";
+                break;
+            }
             mla_model_p model = model_for(queued.model_index);
             if (!model) {
                 first_error = fmt::format(
@@ -510,7 +520,9 @@ void MLAModelWithBuffer::run_queue() {
             if (queued.program->active_reloc != queued.relocation) {
                 // The driver rejects relocation changes on a model with pending
                 // jobs. Finish this batch before starting the next adapter.
-                if (!inflight.empty()) break;
+                if (std::ranges::any_of(inflight, [&](const auto& job) {
+                        return job.second == queued.model_index;
+                    })) break;
                 try {
                     queued.program->activate_relocation(queued.relocation);
                 } catch (const std::exception& error) {
@@ -569,7 +581,7 @@ void MLAModelWithBuffer::run_queue() {
 }
 
 std::shared_ptr<const RuntimeRelocation> MLAModelWithBuffer::_prepare_reloc(
-    const std::map<std::string, MLABuffer*>& buffers
+    const std::map<std::string, MLABuffer*>& buffers, bool complete_sections
 ) {
     if (buffers.empty()) return {};
     load();
@@ -590,6 +602,9 @@ std::shared_ptr<const RuntimeRelocation> MLAModelWithBuffer::_prepare_reloc(
         if (!buffer || size <= 0 || buffer->get_allocation_size() < static_cast<size_t>(size))
             throw std::invalid_argument(fmt::format("Relocation {} for {} needs {} bytes",
                                                     name, path_for(_model_idx), size));
+        if (complete_sections && buffer->get_num_elems() * buffer->get_elem_size() != static_cast<size_t>(size))
+            throw std::invalid_argument(fmt::format("LoRA tensor {} must contain exactly {} bytes for {}",
+                                                    name, size, path_for(_model_idx)));
         add_port(*binding, *buffer, size);
         if (neutral) {
             MLABuffer zero(name + "_neutral", {static_cast<size_t>(size)}, "int8", false);

@@ -257,7 +257,7 @@ install(TARGETS sima_lmm_session_generation_test RUNTIME DESTINATION lib/sima-lm
 install(FILES session_generation_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
 
 add_executable(sima_lmm_lora_session_test lora_session_test.cpp)
-target_link_libraries(sima_lmm_lora_session_test PRIVATE sima_lmm_runtime cnpy-static)
+target_link_libraries(sima_lmm_lora_session_test PRIVATE sima_lmm_runtime cnpy-static "${SIMA_LMM_MLART_LIBRARY}")
 set_target_properties(sima_lmm_lora_session_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 add_test(NAME runtime.lora_session COMMAND sima_lmm_lora_session_test)
 set_tests_properties(runtime.lora_session PROPERTIES LABELS "devkit;runtime;genai;lora" RESOURCE_LOCK mla TIMEOUT 600)

@@ -85,7 +85,7 @@ class MLAModelWithBuffer {
 
     private:
         std::shared_ptr<const RuntimeRelocation> _prepare_reloc(
-            const std::map<std::string, MLABuffer*>& buffers);
+            const std::map<std::string, MLABuffer*>& buffers, bool complete_sections = false);
         void _refresh_reloc();
         void _record_buffer_bindings(
             std::map<std::string, std::vector<MLABuffer**>>& bindings
