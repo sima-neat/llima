@@ -1443,7 +1443,7 @@ void LanguageModel::set_image_identity(std::string identity) {
 
 void LanguageModel::bind_session_adapter() {
     std::lock_guard lock(RuntimeContext::instance().execution_mutex);
-    _bind_adapter(_session->adapter);
+    _bind_adapter(_session ? _session->adapter : nullptr);
 }
 
 void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter) {

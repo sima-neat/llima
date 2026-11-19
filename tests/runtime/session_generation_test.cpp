@@ -43,8 +43,10 @@ int main(int argc, char** argv) {
             draft_files = files;
             draft = std::make_unique<VisionLanguageModel>(
                 draft_root, std::nullopt, std::nullopt, std::move(files));
+            const auto unused = draft->create_session();
+            draft->release_session(unused);
             require(draft->session_memory_bytes(0) == 0,
-                    "Draft construction allocated an unused public cache");
+                    "Draft setup or releasing an unused session allocated its public cache");
             first->set_draft_vlm(draft.get());
         }
         first->set_text_callback([](const std::string&, bool, bool) {});
