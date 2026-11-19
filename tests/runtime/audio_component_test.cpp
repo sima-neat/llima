@@ -2,12 +2,15 @@
 #include "mla_model.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <string_view>
 
 using namespace simaai::llima;
 
@@ -17,10 +20,19 @@ using namespace simaai::llima;
 // Keep this runner separate from model-free audio generation unit tests.
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) throw std::invalid_argument("Usage: sima_lmm_audio_component_test FIXTURE_JSON");
+        if (argc != 2 && argc != 3) throw std::invalid_argument("Usage: sima_lmm_audio_component_test FIXTURE_JSON [BENCHMARK_ITERATIONS]");
+        size_t iterations = 0;
+        if (argc == 3) {
+            const std::string_view argument(argv[2]);
+            const auto [end, error] = std::from_chars(argument.data(), argument.data() + argument.size(), iterations);
+            if (error != std::errc{} || end != argument.data() + argument.size() || !iterations || iterations > 10000) {
+                throw std::invalid_argument("Benchmark iterations must be an integer from 1 to 10000");
+            }
+        }
         const std::filesystem::path path(argv[1]), directory = path.parent_path();
         nlohmann::json fixture;
         std::ifstream(path) >> fixture;
+        MLAModelWithBuffer::read_env_vars();
         connect_mla_rt({});
         std::vector<std::unique_ptr<MLABuffer>> inputs, outputs;
         std::vector<MLABufferSlice> ifms, ofms;
@@ -51,6 +63,22 @@ int main(int argc, char** argv) {
         allocate(fixture.at("outputs"), outputs, ofms, false);
         MLAModelWithBuffer model(directory / fixture.at("elf").get<std::string>(),ifms,ofms);
         model.load(); model.run();
+        std::vector<double> durations;
+        durations.reserve(iterations);
+        for (size_t iteration = 0; iteration < iterations; ++iteration) {
+            const auto started = std::chrono::steady_clock::now();
+            model.run();
+            durations.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+        }
+        if (!durations.empty()) {
+            std::sort(durations.begin(), durations.end());
+            const auto middle = durations.size() / 2;
+            const double median = durations.size() % 2 ? durations[middle]
+                : (durations[middle - 1] + durations[middle]) / 2.;
+            std::cout << "benchmark_json=" << nlohmann::json({{"iterations", iterations},
+                {"median_ms", median}, {"p95_ms", durations[(durations.size() * 95 - 1) / 100]},
+                {"minimum_ms", durations.front()}}).dump() << '\n';
+        }
         for (size_t index=0;index<outputs.size();++index) {
             std::vector<Eigen::bfloat16> packed(outputs[index]->get_num_elems());
             outputs[index]->download(packed.data());

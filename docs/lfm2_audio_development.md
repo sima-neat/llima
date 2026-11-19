@@ -53,18 +53,30 @@ Defaults: 1,024-token language context, 16-token prefill, 256 input mel frames,
 build; splitting a bidirectional encoder input is not an equivalent workaround.
 Other sizing flags are `--context-length`, `--group-size`, `--decoder-frames`.
 
-For per-frame PCM output, compile with `--decoder-frames 1`:
+The encoder executes its full compiled bucket even for a shorter utterance,
+then returns only valid audio embeddings to the backbone. A larger bucket can
+therefore increase encoder time for short clips without adding padding tokens
+to the language prompt. An actual longer utterance adds valid prompt tokens
+and prefill work, and leaves less room in the language context. It does not
+change depth/decoder graph shapes. In the current fixed 1,024-token attention
+build, generation already scans the compiled cache shape. Exactly four seconds
+of 16 kHz PCM produces 401 mel frames, so a 400-frame bucket is insufficient;
+the larger encoder still requires compilation and device validation.
+
+For per-frame PCM output, compile with `--decoder-frames 1`. The tested
+lower-latency profile additionally uses `--group-size 32`:
 
 ```bash
 python scripts/gen_models--liquidai--lfm2_audio.py /path/to/snapshot \
-  -o /path/to/audio-streaming-build --decoder-frames 1
+  -o /path/to/audio-streaming-build --decoder-frames 1 --group-size 32
 ```
 
 Package that build with `prepare_lfm2_audio_runtime` as below. The default
 12-frame decoder waits for 12 generated audio-code frames before emitting PCM;
 changing only the server cannot remove that buffering. The one-frame plan still
 contains 104 units; its 14 detokenizer units process six neural timesteps per
-audio-code frame.
+audio-code frame. The group size selects the backbone prefill shape; the
+default remains 16. Use a fresh output directory when changing build options.
 
 After the complete build:
 
@@ -199,6 +211,11 @@ records at most 64 backend calls. Decoder/FFT timings accumulate across the
 request; first-PCM time is measured separately. TCP_NODELAY is enabled for
 streamed responses.
 
+Set `SIMA_LLIMA_RUN_PROFILE=1` when starting the server to log each ELF's MLA
+tile time and submit-to-reap time. The audio runtime honors the same native
+profiling environment variables as the ordinary runtime. Disable verbose
+profiling for final latency comparisons because logging adds overhead.
+
 For repeatable protocol and device checks, provide a short speech fixture and
 write reports outside the checkout:
 
@@ -247,6 +264,18 @@ chunking. `sima_lmm_audio_component_test` accepts a generated fixture JSON to
 save actual MLA outputs for comparison with quantized SDK outputs. Full-model
 ASR/TTS/speech-to-speech quality, long sessions and sustained throughput still
 require explicit evaluation before ready-to-use support is advertised.
+
+For a selected-unit benchmark on Modalix, append an iteration count (1–10,000):
+
+```bash
+LD_LIBRARY_PATH=/path/to/candidate/lib:$LD_LIBRARY_PATH \
+  /path/to/sima_lmm_audio_component_test /path/to/fixture.json 200
+```
+
+The helper warms the model once, reports median/p95/minimum wall time for
+repeated execution with the same fixture inputs, and saves the final outputs.
+It does not advance a session cache between iterations or measure complete
+speech generation. Compare the saved tensors separately against the reference.
 
 ## Local compile and Modalix validation, 2026-11-18
 
@@ -353,3 +382,45 @@ reply correctly. This does not establish broad speech-quality equivalence.
 The optimized runtime passed invalid-input, contention, cancellation,
 disconnect cleanup and deterministic repeated speech checks. Matching SDK
 3.0.1 release validation remains open.
+
+## Further prefill tuning, 2026-11-19
+
+The same 1.44-second synthetic question was compared with 16-token and 32-token
+prefill while retaining the one-frame decoder, BF16 activations, INT8 compute
+weights and trained interleave schedule. Four isolated server processes ran
+in A/B/B/A order, each with six requests; discarding the first request per
+process left ten resident samples per profile. Existing services stayed up.
+
+| Prefill group | Median first visible text | Median first PCM |
+| --- | --- | --- |
+| 16 tokens | 145.626 ms | 409.392 ms |
+| 32 tokens | 111.428 ms | 374.747 ms |
+
+This reduces first-PCM time by about 8.5% for this scenario. The 43-token prompt
+uses two prefill passes instead of three. The 32-token candidate comprised
+24 freshly compiled backbone units and 80 reused units after source,
+configuration, topology, interface and archive/ELF identity checks. Its host
+tables were checksum-verified. The selected 28 prefix/continuation states
+(2,048 dimensions each) and the full 263,040-sample waveform matched the
+baseline bit for bit. Protocol, cancellation, disconnect and deterministic
+repeated speech checks passed using the extracted candidate core and packaged
+server/tests. Independent Whisper recognized the complete expected reply.
+These are selected-case results, not full-model or dataset-level parity.
+
+A separate complete speech request took about 10.33 seconds for 10.96 seconds
+of audio; the initial lazy-loading request took about 910 ms to first PCM.
+Server timings exclude recording, upload/network and playback. The larger
+prefill group does not accelerate single-token generation or remove text-burst
+audio gaps. The under-200 ms first-audio target and sustained frame deadlines
+remain open, as does matching SDK 3.0.1 validation.
+
+Faster-looking alternatives were not adopted. A 64-token profile measured
+341.373 ms first PCM, but its 28-state relative L2 difference was 0.14027 and
+the test reply continued to the 320-step limit (24.48 seconds of audio).
+It is not recommended as an equivalent replacement. A selected gate/up
+projection fusion matched floating, quantized SDK and hardware outputs, but
+improved that unit only from 2.003 ms to 1.992 ms. Sharing rotary input buffers
+passed continuation checks but made no meaningful end-to-end timing difference.
+Neither source rewrite was retained. Per-ELF profiling showed about 31.7 ms of
+MLA tile execution within a roughly 34 ms backbone step, limiting the saving
+available from launch overhead alone.

@@ -206,6 +206,7 @@ struct Lfm2AudioModel::Impl {
             filters.insert(filters.end(), row.begin(), row.end());
         }
         features = std::make_unique<AudioFeatureExtractor>(tables.at("analysis_window")->row(0), filters);
+        MLAModelWithBuffer::read_env_vars();
         connect_mla_rt({});
         const auto& source = config.at("source_config");
         if (source.at("lfm").at("conv_L_cache") != 3 || config.at("detokenizer_config").at("conv_L_cache") != 3) {
