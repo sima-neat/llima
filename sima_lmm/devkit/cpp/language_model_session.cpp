@@ -100,10 +100,11 @@ SessionId LanguageModel::create_session() {
 }
 
 void LanguageModel::select_session(SessionId id) {
-    _select_request_sessions(id, nullptr);
+    // Standalone prefill/decode calls can follow immediately without a request guard.
+    _select_request_sessions(id, nullptr, true);
 }
 
-void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft) {
+void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft, bool bind_adapter) {
     if (_run->is_running || (draft && draft->_run->is_running))
         throw std::logic_error("Cannot select a session during generation");
 
@@ -120,11 +121,13 @@ void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft)
         target_session->allocate(*_resources);
         if (draft)
             draft_session->allocate(*draft->_resources);
-        _bind_session(target_session);
-        if (draft) {
-            draft->_bind_session(draft_session);
-            target_session->draft = std::move(draft_session);
-        }
+    }
+    if (bind_adapter)
+        _bind_adapter(target_session->adapter);
+    _bind_session(target_session);
+    if (draft) {
+        draft->_bind_session(draft_session);
+        target_session->draft = std::move(draft_session);
     }
     _sessions->active = id;
 }

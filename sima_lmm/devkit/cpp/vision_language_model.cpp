@@ -186,13 +186,13 @@ void VisionLanguageModel::unset_reloc() { unset_reloc(0); }
 
 void VisionLanguageModel::set_reloc(SessionId session, const std::string& name) {
     auto lock = idle_lock(_state->run_mutex);
-    _state->language_model_ptr->select_session(session);
+    _state->language_model_ptr->_select_request_sessions(session, nullptr);
     _state->language_model_ptr->set_reloc(name);
 }
 
 void VisionLanguageModel::unset_reloc(SessionId session) {
     auto lock = idle_lock(_state->run_mutex);
-    _state->language_model_ptr->select_session(session);
+    _state->language_model_ptr->_select_request_sessions(session, nullptr);
     _state->language_model_ptr->unset_reloc();
 }
 

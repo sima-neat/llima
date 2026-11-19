@@ -320,7 +320,7 @@ class LanguageModel {
         MLABuffer& get_buffer(const std::string& name);
         bool has_buffer(const std::string& name) const;
         void _bind_session(const std::shared_ptr<LanguageSession>& selected);
-        void _select_request_sessions(SessionId id, LanguageModel* draft);
+        void _select_request_sessions(SessionId id, LanguageModel* draft, bool bind_adapter = false);
         void _detach_draft_sessions(LanguageModel* draft);
         void _release_paired_session(SessionId id, LanguageModel* draft);
         void _init_attention_bindings();

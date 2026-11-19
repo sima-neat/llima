@@ -1442,12 +1442,12 @@ void LanguageModel::set_image_identity(std::string identity) {
 }
 
 void LanguageModel::bind_session_adapter() {
-    std::lock_guard lock(RuntimeContext::instance().execution_mutex);
     _bind_adapter(_session ? _session->adapter : nullptr);
 }
 
 void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter) {
     if (_workspace->bound_adapter == adapter) return;
+    std::lock_guard lock(RuntimeContext::instance().execution_mutex);
     using Buffers = std::map<std::string, MLABuffer*>;
     struct Change {
         MLAModelWithBuffer& model;
@@ -1507,7 +1507,10 @@ void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapte
 }
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
-    if (_session->adapter && _session->adapter->name == reloc_name) return;
+    if (_session->adapter && _session->adapter->name == reloc_name) {
+        bind_session_adapter();
+        return;
+    }
     if (_files->pulls_files())
         throw std::runtime_error("LoRA requires a local model directory; the asset provider cannot list npy_files");
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
@@ -1555,7 +1558,10 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
 }
 
 void LanguageModel::unset_reloc() {
-    if (!_session->adapter) return;
+    if (!_session->adapter) {
+        bind_session_adapter();
+        return;
+    }
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
     _bind_adapter(nullptr);
     _session->adapter.reset();
