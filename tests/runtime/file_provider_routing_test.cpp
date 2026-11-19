@@ -6,7 +6,7 @@
 //
 // It does this with a spy provider: a decorator that wraps a real
 // DiskFileProvider, records every name LLiMa asks for, and then delegates the
-// real read so the model still loads. Because BaseModel shares one provider
+// real read so the model still loads. Because package resources share one provider
 // instance down into LanguageModel, the single spy sees every load-time read.
 //
 // A missed routing site is invisible on disk today (it just reads the same

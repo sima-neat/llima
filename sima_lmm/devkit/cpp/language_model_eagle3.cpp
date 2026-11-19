@@ -36,6 +36,8 @@
 #include <fmt/ranges.h>
 
 #include "language_model.hpp"
+#include "language_model_executor.hpp"
+#include "language_model_state.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -54,6 +56,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     int num_cached_tokens,
     bool is_prefill
 ) {
+    auto execution = LanguageExecutor::lock_execution();
     const size_t seq_length = input_ids.size();
     const uint16_t num_tokens = is_prefill ? 128 : 5;
     size_t seq_len_with_past = seq_length;
@@ -78,8 +81,8 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         for (size_t i = 0; i < positions.size(); ++i) {
             const size_t pos = static_cast<size_t>(positions[i]);
             for (size_t k = 0; k < freq_dim; ++k) {
-                freq_real_padded[i * freq_dim + k] = _global_freq_host.re[pos * freq_dim + k];
-                freq_imag_padded[i * freq_dim + k] = _global_freq_host.im[pos * freq_dim + k];
+                freq_real_padded[i * freq_dim + k] = _resources->global_freq_host.re[pos * freq_dim + k];
+                freq_imag_padded[i * freq_dim + k] = _resources->global_freq_host.im[pos * freq_dim + k];
             }
         }
         const size_t freq_bytes = freq_real_padded.size() * sizeof(Eigen::bfloat16);
@@ -89,8 +92,8 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         const size_t freq_bytes =
             static_cast<size_t>(num_tokens) * freq_real_buf.get_shape().back()
             * sizeof(Eigen::bfloat16);
-        freq_real_buf.upload_raw(_global_freq_host.re.data(), 0, freq_bytes);
-        freq_imag_buf.upload_raw(_global_freq_host.im.data(), 0, freq_bytes);
+        freq_real_buf.upload_raw(_resources->global_freq_host.re.data(), 0, freq_bytes);
+        freq_imag_buf.upload_raw(_resources->global_freq_host.im.data(), 0, freq_bytes);
     }
 
     // Default mask is all-ones; tree overlay applied by prepare_attention_mask.
@@ -98,7 +101,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         attention_mask = std::vector<uint8_t>(seq_len_with_past, 1);
     }
     auto mask = eagle_helpers::prepare_attention_mask(
-        attention_mask, seq_length, past_key_values_length, _eagle3_tree_mask
+        attention_mask, seq_length, past_key_values_length, _workspace->eagle3_tree_mask
     );
 
     // Decode mask stride must match the cache ELF's compiled bucket; a wider
@@ -145,8 +148,8 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
         auto& fc_input = get_buffer(fmt::format("fc_n{}_input", num_tokens));
         fc_input.upload(hidden_states_padded.data());
 
-        auto it = _fc_model_map.find(num_tokens);
-        if (it == _fc_model_map.end()) {
+        auto it = _workspace->fc_model_map.find(num_tokens);
+        if (it == _workspace->fc_model_map.end()) {
             throw std::runtime_error(
                 "run_eagle3_draft_model: FC model not defined for n="
                 + std::to_string(num_tokens)
@@ -182,15 +185,9 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     }
     // Stage token embeds and, when quantized, their per-row dynamic-dequant scales.
     const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
-    auto& token_embeds_buf = use_int8_embedding_staging
-        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
-        : get_buffer(fmt::format("n{}_buffer1", num_tokens));
-    MLABuffer* token_embedding_scales_buf = use_int8_embedding_staging
-        ? &get_buffer(fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
-        : nullptr;
-    _stage_embedding_rows(
-        target_lm, input_ids, token_embeds_buf, token_embedding_scales_buf
-    );
+    const auto embedding = LanguageExecutor::stage_tokens(*this, target_lm, input_ids, num_tokens);
+    auto& token_embeds_buf = *embedding.values;
+    auto* token_embedding_scales_buf = embedding.scales;
 
     // Bind the compact wrappers to this forward pass before enqueueing them.
     const uint8_t  layer_idx = 0;
@@ -250,16 +247,12 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
             )
         );
     }
-    attn_models.pre->add_to_queue(&pre_ifm_map);
-
-    // cache_model dispatch. IFMs/OFMs are all statically wired, no overrides.
-    attn_models.cache->add_to_queue();
-
     // post_model dispatch (lm_head fused in). Override IFM[0] to fc_n{N}_output
     // (same buffer pre_model used as IFM[1]); IFM[1] is statically wired.
     std::map<uint8_t, MLABufferSlice> post_ifm_map;
     post_ifm_map.emplace(0, MLABufferSlice{&fc_output_buf});
-    attn_models.post->add_to_queue(&post_ifm_map);
+    LanguageExecutor::queue_attention(attn_models,
+        {.input = &pre_ifm_map, .post_input = &post_ifm_map});
 
     // Download both outputs: hidden_states (n{N}_buffer5) and logits
     // (n{N}_buffer4, lm_head fused into post_model; single split for draft).
@@ -293,10 +286,11 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     std::vector<uint32_t> input_ids,
     std::vector<int32_t> position_ids
 ) {
-    if (!_is_running.load(std::memory_order_relaxed))
+    auto execution = LanguageExecutor::lock_execution();
+    if (_run->cancelled.load(std::memory_order_relaxed))
         return {};
 
-    const int num_cached_tokens = static_cast<int>(_eagle3_stable_kv);
+    const int num_cached_tokens = static_cast<int>(_workspace->eagle3_stable_kv);
 
     // num_tokens = 16 for target verify; seq_length is the valid candidate count.
     const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
@@ -341,9 +335,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         real_buf.upload_raw(real_padded.data(), 0, freq_bytes);
         imag_buf.upload_raw(imag_padded.data(), 0, freq_bytes);
     };
-    upload_freq_rows(_global_freq_host, "global_freq_real", "global_freq_imag");
+    upload_freq_rows(_resources->global_freq_host, "global_freq_real", "global_freq_imag");
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
-        upload_freq_rows(_local_freq_host, "local_freq_real", "local_freq_imag");
+        upload_freq_rows(_resources->local_freq_host, "local_freq_real", "local_freq_imag");
     }
     auto& freq_real_buf = get_buffer("global_freq_real");
     auto& freq_imag_buf = get_buffer("global_freq_imag");
@@ -354,7 +348,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         std::vector<uint8_t>(seq_len_with_past, 1)
     };
     auto mask = eagle_helpers::prepare_attention_mask(
-        attention_mask, seq_length, past_key_values_length, _eagle3_tree_mask
+        attention_mask, seq_length, past_key_values_length, _workspace->eagle3_tree_mask
     );
 
     // pad_cols must match the cache ELF's compiled stride: rounding up
@@ -379,15 +373,9 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
 
     // Stage arbitrary candidate rows into the dtype expected by layer 0.
     const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
-    auto& input_embeds_buf = use_int8_embedding_staging
-        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
-        : get_buffer("input_embeds");
-    MLABuffer* input_embedding_scales_buf = use_int8_embedding_staging
-        ? &get_buffer(fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
-        : nullptr;
-    _stage_embedding_rows(
-        *this, input_ids, input_embeds_buf, input_embedding_scales_buf
-    );
+    const auto embedding = LanguageExecutor::stage_tokens(*this, *this, input_ids, num_tokens, &get_buffer("input_embeds"));
+    auto& input_embeds_buf = *embedding.values;
+    auto* input_embedding_scales_buf = embedding.scales;
 
     // Per-layer loop; capture hidden states at layers {2, N/2, N-3}.
     const uint16_t token_idx = static_cast<uint16_t>(past_key_values_length);
@@ -460,16 +448,15 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             )
         );
 
-        attn_models.pre->add_to_queue(&pre_ifm_map);
-        attn_models.cache->add_to_queue();
-        attn_models.post->add_to_queue(&ifm_map);
+        LanguageExecutor::queue_attention(attn_models,
+            {.input = &pre_ifm_map, .post_input = &ifm_map});
 
         // post_model.ofms[0] writes n{N}_buffer1 (next layer's IFM[0]), so
         // reading it here yields this layer's output.
         auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
         if (it != capture_layers.end()) {
             MLAModelWithBuffer::run_queue();
-            if (!_is_running.load(std::memory_order_relaxed))
+            if (_run->cancelled.load(std::memory_order_relaxed))
                 return result;
             const size_t cap_idx = std::distance(capture_layers.begin(), it);
             auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
@@ -494,7 +481,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     );
 
     MLAModelWithBuffer::run_queue();
-    if (!_is_running.load(std::memory_order_relaxed))
+    if (_run->cancelled.load(std::memory_order_relaxed))
         return result;
     for (uint32_t s = 0; s < num_splits; ++s) {
         const std::string buf_name = (num_splits == 1)
@@ -545,7 +532,7 @@ LanguageModel::TreeDecodingResult LanguageModel::tree_decoding(
         std::move(tree_candidates),
         std::move(position_ids)
     );
-    if (!_is_running.load(std::memory_order_relaxed))
+    if (_run->cancelled.load(std::memory_order_relaxed))
         return {};
 
     // Gather target predictions for each candidate path. -1 entries
@@ -642,21 +629,21 @@ LanguageModel::UpdateInferenceInputsResult LanguageModel::update_inference_input
     input_ids_with_bonus.push_back(bonus_token);
 
     // Build next round's tree from the accepted hidden states. Caller must sync
-    // target's _eagle3_stable_kv with draft's after this returns.
+    // target's _workspace->eagle3_stable_kv with draft's after this returns.
     auto tg = draft_lm.topk_generate(
         *this,
         std::move(input_ids_with_bonus),
         std::move(accept_hidden_state_new),
-        /*num_cached_tokens=*/static_cast<int>(draft_lm._eagle3_stable_kv),
+        /*num_cached_tokens=*/static_cast<int>(draft_lm._workspace->eagle3_stable_kv),
         /*is_prefill=*/false
     );
 
     new_token += accept_length + 1;
 
     // Cache for next-turn prefix matching. input_ids excludes the bonus, so
-    // it matches target's _kv_cache_len after compact_kv_after_accept.
-    _cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    draft_lm._cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    // it matches target's _session->kv_cache_len after compact_kv_after_accept.
+    _session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    draft_lm._session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
 
     UpdateInferenceInputsResult result;
     result.input_ids         = std::move(input_ids);
@@ -682,7 +669,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     bool is_prefill
 ) {
     TopkGenerateResult result;
-    if (!target_lm._is_running.load(std::memory_order_relaxed))
+    if (target_lm._run->cancelled.load(std::memory_order_relaxed))
         return result;
 
     // total_tokens = target's speculative_budget - 1 (typically 15 from 16).
@@ -712,16 +699,16 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     size_t len_posi = input_ids.size();
 
     // Clear stale tree mask on both target and draft (shared shared_ptr).
-    _eagle3_tree_mask.reset();
-    target_lm._eagle3_tree_mask.reset();
+    _workspace->eagle3_tree_mask.reset();
+    target_lm._workspace->eagle3_tree_mask.reset();
 
     // Cross-round input_ids has one MORE entry than hidden_states (bonus_token
     // has no hidden state yet). Use hidden_rows, not input_ids.size(), for
     // stable_kv advance and last_hidden indexing.
     const uint32_t embed_size_for_kv = _cfg.lm_cfg.hidden_size;
     const size_t hidden_rows = hidden_states.size() / (3 * embed_size_for_kv);
-    const size_t stable_kv_before = _eagle3_stable_kv;
-    input_ids.erase(input_ids.begin(), input_ids.begin() + _eagle3_stable_kv);
+    const size_t stable_kv_before = _workspace->eagle3_stable_kv;
+    input_ids.erase(input_ids.begin(), input_ids.begin() + _workspace->eagle3_stable_kv);
 
     DraftForwardResult draft_out;
     size_t last_row;
@@ -768,7 +755,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
                 /*num_cached_tokens=*/static_cast<int>(offset),
                 /*is_prefill=*/true
             );
-            if (!target_lm._is_running.load(std::memory_order_relaxed))
+            if (target_lm._run->cancelled.load(std::memory_order_relaxed))
                 return result;
             last_valid_in_chunk = valid;
         }
@@ -777,7 +764,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         // Last valid row of the last chunk = where lm_head logits for the
         // final input position live.
         last_row = static_cast<size_t>(last_valid_in_chunk) - 1;
-        _eagle3_stable_kv += hidden_rows;
+        _workspace->eagle3_stable_kv += hidden_rows;
     } else {
         // Cross-round single dispatch (n=5). Absolute position_ids are required
         // so the per-token freq slice matches stable_kv+1..+K, not 0..K-1.
@@ -793,16 +780,16 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             input_ids,
             /*attention_mask=*/std::nullopt,
             /*position_ids=*/first_call_position_ids,
-            /*num_cached_tokens=*/static_cast<int>(_eagle3_stable_kv),
+            /*num_cached_tokens=*/static_cast<int>(_workspace->eagle3_stable_kv),
             /*is_prefill=*/false
         );
-        if (!target_lm._is_running.load(std::memory_order_relaxed))
+        if (target_lm._run->cancelled.load(std::memory_order_relaxed))
             return result;
         hidden_states = std::move(draft_out.hidden_states);
         // Trim trailing bonus_token row (zero-FC slot, uninformative).
         hidden_states.resize(hidden_rows * embed_size_for_kv);
         last_row = hidden_rows - 1;
-        _eagle3_stable_kv += hidden_rows;
+        _workspace->eagle3_stable_kv += hidden_rows;
     }
 
     // lm_head logits row for the final input position.
@@ -836,7 +823,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     std::vector<uint32_t> target_tokens(topk_index[0].size());
     for (size_t i = 0; i < topk_index[0].size(); ++i) {
         const int32_t draft_idx = topk_index[0][i];
-        target_tokens[i] = static_cast<uint32_t>(draft_idx + _d2t[draft_idx]);
+        target_tokens[i] = static_cast<uint32_t>(draft_idx + _resources->d2t[draft_idx]);
     }
     ss_token.push_back({target_tokens});
     input_ids = std::move(target_tokens);  // (K,) for next draft_forward
@@ -862,23 +849,23 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     }
 
     // Copy because the depth-loop concat rebinds `tree_mask` later.
-    auto tree_mask = _eagle3_tree_mask_init;
+    auto tree_mask = _workspace->eagle3_tree_mask_init;
 
     std::vector<int32_t> topk_cs_index(topk);
     std::iota(topk_cs_index.begin(), topk_cs_index.end(), 0);
 
     // Reuse the function parameter slot; the depth loop advances it by topk
     // each iter.
-    num_cached_tokens = static_cast<int>(_eagle3_stable_kv);
+    num_cached_tokens = static_cast<int>(_workspace->eagle3_stable_kv);
 
     for (int i = 0; i < depth - 1; ++i) {
         // Share the current tree mask with the target via shared_ptr.
-        _eagle3_tree_mask = std::make_shared<eagle_helpers::EagleTreeMask>(tree_mask);
-        target_lm._eagle3_tree_mask = _eagle3_tree_mask;
+        _workspace->eagle3_tree_mask = std::make_shared<eagle_helpers::EagleTreeMask>(tree_mask);
+        target_lm._workspace->eagle3_tree_mask = _workspace->eagle3_tree_mask;
 
-        std::vector<int32_t> position_ids(_eagle3_position_ids.size());
-        for (size_t k = 0; k < _eagle3_position_ids.size(); ++k) {
-            position_ids[k] = static_cast<int32_t>(len_posi) + _eagle3_position_ids[k];
+        std::vector<int32_t> position_ids(_workspace->eagle3_position_ids.size());
+        for (size_t k = 0; k < _workspace->eagle3_position_ids.size(); ++k) {
+            position_ids[k] = static_cast<int32_t>(len_posi) + _workspace->eagle3_position_ids[k];
         }
 
         auto draft_out_d = run_eagle3_draft_model(
@@ -890,7 +877,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*num_cached_tokens=*/static_cast<int>(num_cached_tokens),
             /*is_prefill=*/false
         );
-        if (!target_lm._is_running.load(std::memory_order_relaxed))
+        if (target_lm._run->cancelled.load(std::memory_order_relaxed))
             return result;
         auto out_hidden = std::move(draft_out_d.hidden_states);
 
@@ -979,7 +966,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
         for (size_t k = 0; k < topk_cs_index.size(); ++k) {
             const size_t flat_idx = static_cast<size_t>(topk_cs_index[k]);
             const int32_t draft_idx = topk_index_d[flat_idx / topk][flat_idx % topk];
-            input_ids[k] = static_cast<uint32_t>(draft_idx + _d2t[draft_idx]);
+            input_ids[k] = static_cast<uint32_t>(draft_idx + _resources->d2t[draft_idx]);
         }
 
         // Map all (K, K) draft indices to target tokens via d2t.
@@ -988,7 +975,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             ss_token_entry_d[r].resize(topk_index_d[r].size());
             for (size_t k = 0; k < topk_index_d[r].size(); ++k) {
                 const int32_t draft_idx = topk_index_d[r][k];
-                ss_token_entry_d[r][k] = static_cast<uint32_t>(draft_idx + _d2t[draft_idx]);
+                ss_token_entry_d[r][k] = static_cast<uint32_t>(draft_idx + _resources->d2t[draft_idx]);
             }
         }
         ss_token.push_back(ss_token_entry_d);
@@ -1013,7 +1000,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
                 }
                 for (size_t c = 0; c < static_cast<size_t>(topk); ++c) {
                     new_tree_data[0][0][r][prev_cols + c] =
-                        _eagle3_tree_mask_init.data[0][0][r][c];
+                        _workspace->eagle3_tree_mask_init.data[0][0][r][c];
                 }
             }
             tree_mask.data = std::move(new_tree_data);
@@ -1178,25 +1165,25 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     const uint16_t num_tokens = _cfg.pipeline_cfg.input_token_group_size;
     const uint16_t num_input_tokens = static_cast<uint16_t>(input_ids.size());
 
-    get_buffer("global_freq_real").upload(_global_freq_host.re.data());
-    get_buffer("global_freq_imag").upload(_global_freq_host.im.data());
+    get_buffer("global_freq_real").upload(_resources->global_freq_host.re.data());
+    get_buffer("global_freq_imag").upload(_resources->global_freq_host.im.data());
 
     // Uploads token embeds and returns the prefix-match length against
-    // _cached_token_ids.
+    // _session->cached_token_ids.
     uint16_t prefix_cached = _set_input_text_embeds(input_ids);
 
     // Full-match early-out: every input token and the prompt length match the
     // tree state saved last turn.
     if (prefix_cached == num_input_tokens
-        && _cached_eagle3_prompt_len == num_input_tokens
-        && !_cached_draft_tokens.empty()) {
-        result.token              = _cached_first_generated_token;
-        result.draft_tokens       = _cached_draft_tokens;
-        result.retrieve_indices   = _cached_retrieve_indices;
-        result.tree_mask          = _cached_tree_mask;
-        result.tree_position_ids  = _cached_tree_position_ids;
-        _eagle3_stable_kv          = _cached_eagle3_stable_kv;
-        draft_lm._eagle3_stable_kv = draft_lm._cached_eagle3_stable_kv;
+        && _session->cached_eagle3_prompt_len == num_input_tokens
+        && !_session->cached_draft_tokens.empty()) {
+        result.token              = _session->cached_first_generated_token;
+        result.draft_tokens       = _session->cached_draft_tokens;
+        result.retrieve_indices   = _session->cached_retrieve_indices;
+        result.tree_mask          = _session->cached_tree_mask;
+        result.tree_position_ids  = _session->cached_tree_position_ids;
+        _workspace->eagle3_stable_kv          = _session->cached_eagle3_stable_kv;
+        draft_lm._workspace->eagle3_stable_kv = draft_lm._session->cached_eagle3_stable_kv;
         result.root_ready_time = std::chrono::steady_clock::now();
         result.time_to_first_token = timer_ttft.stop();
         _notify_first_token(result.token, result.time_to_first_token);
@@ -1235,7 +1222,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         // result.token is only meaningful at the LAST group; earlier ones get
         // overwritten by subsequent dispatches.
         result.token = run_model_once(num_tokens, offset, num_input_tokens, 0);
-        if (!_is_running.load(std::memory_order_relaxed))
+        if (_run->cancelled.load(std::memory_order_relaxed))
             return result;
 
         // Copy this group's captures into the accumulator before next dispatch.
@@ -1243,7 +1230,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
             std::memcpy(
                 result.hidden_states[cap_idx].data()
                     + static_cast<size_t>(offset) * hidden_size,
-                _eagle3_intermediate_hidden_states[cap_idx].data(),
+                _workspace->eagle3_intermediate_hidden_states[cap_idx].data(),
                 static_cast<size_t>(valid_rows) * hidden_size * sizeof(Eigen::bfloat16)
             );
         }
@@ -1256,9 +1243,9 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 
     // Cache for next-turn prefix matching. Must run BEFORE push_back so
     // input_ids still matches the pre-root-token prefill length.
-    _cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    draft_lm._cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    _cached_first_generated_token = result.token;
+    _session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    draft_lm._session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    _session->cached_first_generated_token = result.token;
 
     input_ids.push_back(result.token);
 
@@ -1283,7 +1270,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         *this, std::move(input_ids), std::move(hidden_states_concat),
         static_cast<int>(prefix_cached), /*is_prefill=*/true
     );
-    if (!_is_running.load(std::memory_order_relaxed))
+    if (_run->cancelled.load(std::memory_order_relaxed))
         return result;
     result.draft_tokens       = std::move(topk_result.draft_tokens);
     result.retrieve_indices   = std::move(topk_result.retrieve_indices);
@@ -1291,14 +1278,14 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     result.tree_position_ids  = std::move(topk_result.tree_position_ids);
 
     // Cache tree state for the next turn's full-match early-out.
-    // _cached_first_generated_token was set above (before the push_back).
-    _cached_draft_tokens       = result.draft_tokens;
-    _cached_retrieve_indices   = result.retrieve_indices;
-    _cached_tree_mask          = result.tree_mask;
-    _cached_tree_position_ids  = result.tree_position_ids;
-    _cached_eagle3_prompt_len  = num_input_tokens;
-    _cached_eagle3_stable_kv          = _eagle3_stable_kv;
-    draft_lm._cached_eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+    // _session->cached_first_generated_token was set above (before the push_back).
+    _session->cached_draft_tokens       = result.draft_tokens;
+    _session->cached_retrieve_indices   = result.retrieve_indices;
+    _session->cached_tree_mask          = result.tree_mask;
+    _session->cached_tree_position_ids  = result.tree_position_ids;
+    _session->cached_eagle3_prompt_len  = num_input_tokens;
+    _session->cached_eagle3_stable_kv          = _workspace->eagle3_stable_kv;
+    draft_lm._session->cached_eagle3_stable_kv = draft_lm._workspace->eagle3_stable_kv;
 
     return result;
 }
@@ -1314,7 +1301,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result
 ) {
-    _is_running = true;
 
     if (performance_result != nullptr) {
         *performance_result = GenerationPerformanceResult{};
@@ -1343,35 +1329,28 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
             "stop (pre-init): input_len {} + spec_budget {} > max_length {}",
             input_len, spec_budget, max_length
         );
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
-        _text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
-        _text_streamer.wait_streaming();
-        _is_running = false;
+        _session->cached_token_ids.clear();
+        draft_lm._session->cached_token_ids.clear();
+        _session->cached_draft_tokens.clear();
+        _session->cached_eagle3_prompt_len = 0;
+        _run->text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
         return std::nullopt;
     }
 
-    draft_lm._eagle3_stable_kv = 0;
+    draft_lm._workspace->eagle3_stable_kv = 0;
 
     // Paired-clear keeps target and draft shared_ptr both null so neither
     // sees a stale mask from a previous run.
-    _eagle3_tree_mask.reset();
-    draft_lm._eagle3_tree_mask.reset();
+    _workspace->eagle3_tree_mask.reset();
+    draft_lm._workspace->eagle3_tree_mask.reset();
 
     std::vector<uint16_t> total_generated_tokens;
 
     auto init = initialize_tree(
         draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
     );
-    if (!_is_running.load(std::memory_order_relaxed)) {
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
+    if (_run->cancelled.load(std::memory_order_relaxed)) {
         _notify_interrupt();
-        _text_streamer.wait_streaming();
         return std::nullopt;
     }
 
@@ -1380,9 +1359,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
         performance_result->generated_tokens = 1;
     }
 
-    // Sync target's _eagle3_stable_kv with draft's — the draft incremented it
+    // Sync target's _workspace->eagle3_stable_kv with draft's — the draft incremented it
     // inside initialize_tree's first topk_generate, and tree_decoding reads it.
-    _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+    _workspace->eagle3_stable_kv = draft_lm._workspace->eagle3_stable_kv;
 
     // Loop-carried state: seeded from initialize_tree, rebound each iter by
     // update_inference_inputs.
@@ -1412,13 +1391,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
             break;
         }
         // Share the current tree_mask across target and draft via shared_ptr.
-        _eagle3_tree_mask = std::make_shared<eagle_helpers::EagleTreeMask>(tree_mask);
-        draft_lm._eagle3_tree_mask = _eagle3_tree_mask;
+        _workspace->eagle3_tree_mask = std::make_shared<eagle_helpers::EagleTreeMask>(tree_mask);
+        draft_lm._workspace->eagle3_tree_mask = _workspace->eagle3_tree_mask;
 
         auto td = tree_decoding(
             draft_tokens, tree_position_ids, input_ids, retrieve_indices
         );
-        if (!_is_running.load(std::memory_order_relaxed))
+        if (_run->cancelled.load(std::memory_order_relaxed))
             break;
 
         // candidates[p][d] = draft_tokens[retrieve_indices[p][d]]; -1 entries
@@ -1476,12 +1455,12 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
                 td.hidden_states,
                 post.bonus_token
             );
-            if (!_is_running.load(std::memory_order_relaxed))
+            if (_run->cancelled.load(std::memory_order_relaxed))
                 break;
 
             // Sync target's stable_kv with draft's — same pattern as after
             // initialize_tree.
-            _eagle3_stable_kv = draft_lm._eagle3_stable_kv;
+            _workspace->eagle3_stable_kv = draft_lm._workspace->eagle3_stable_kv;
 
             input_ids          = std::move(upd.input_ids);
             draft_tokens       = std::move(upd.draft_tokens);
@@ -1508,7 +1487,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
             // offsets 1..accept_length are draft-accepted tokens.
             const size_t offset = i - prev_size;
             const bool from_draft = (offset > 0) && (offset <= post.accept_length);
-            _text_streamer.push(DecodeCallbackType::TPS, input_ids[i], per_token, from_draft);
+            _run->text_streamer.push(DecodeCallbackType::TPS, input_ids[i], per_token, from_draft);
             if (performance_result != nullptr) {
                 performance_result->token_durations.emplace_back(per_token);
                 ++performance_result->generated_tokens;
@@ -1536,13 +1515,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
         }
     }
 
-    if (!_is_running.load(std::memory_order_relaxed)) {
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
+    if (_run->cancelled.load(std::memory_order_relaxed)) {
         _notify_interrupt();
-        _text_streamer.wait_streaming();
         return std::nullopt;
     }
 
@@ -1568,26 +1542,20 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
         run_model_duration / static_cast<double>(rounds)
     );
 
-    // Signal end-of-stream and wait for the streamer thread to flush.
+    // Signal end-of-stream; the request boundary waits for the streamer to flush.
     // Use CACHE_FULL when generation stopped because the K-cache was exhausted,
     // mirroring non-spec; the streamer prints the "Cache full" notice.
     if (cache_full) {
-        _cached_token_ids.clear();
-        draft_lm._cached_token_ids.clear();
-        _cached_draft_tokens.clear();
-        _cached_eagle3_prompt_len = 0;
+        _session->cached_token_ids.clear();
+        draft_lm._session->cached_token_ids.clear();
+        _session->cached_draft_tokens.clear();
+        _session->cached_eagle3_prompt_len = 0;
     }
-    _text_streamer.push(
+    _run->text_streamer.push(
         cache_full ? DecodeCallbackType::CACHE_FULL : DecodeCallbackType::STOP, 0, 0
     );
-    _text_streamer.wait_streaming();
 
-    if (_is_running) {
-        _is_running = false;
-        return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
-    } else {
-        return std::nullopt;
-    }
+    return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
 }
 
 

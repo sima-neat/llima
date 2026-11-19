@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,8 +61,10 @@ class TextStreamer {
             std::optional<InfoCallback> info_callback = std::nullopt,
             std::optional<TextCallback> text_callback = std::nullopt
         );
-        ~TextStreamer() {};
+        ~TextStreamer();
 
+        void begin();
+        void finish();
         void push(DecodeCallbackData data);
         void push(DecodeCallbackType type, uint32_t token_id, double duration) {
             push({type, token_id, duration, false});
@@ -73,35 +76,50 @@ class TextStreamer {
         }
         void pop_forever(std::stop_token thread_stop_token);
         
+        std::pair<InfoCallback, TextCallback> callbacks() {
+            std::lock_guard<std::mutex> lock(_mutex);
+            return {_defaults.info, _defaults.text};
+        }
+
         void set_info_callback(InfoCallback callback) {
             std::lock_guard<std::mutex> lock(_mutex);
-            _callback_info = callback;
+            _defaults.info = std::move(callback);
         }
         
         void set_text_callback(TextCallback callback) {
             std::lock_guard<std::mutex> lock(_mutex);
-            _callback_finalize_text = callback;
+            _defaults.text = std::move(callback);
         }
 
         void set_preserved_token_ids(
             std::vector<std::pair<uint32_t, std::string>> tokens
         );
         void set_tool_call_enabled(bool enabled);
-        // Configure before the first run; do not change while inference is active.
         void set_performance_summary_enabled(bool enabled) {
-            _performance_summary_enabled = enabled;
+            std::lock_guard<std::mutex> lock(_mutex);
+            _defaults.performance_summary = enabled;
         }
 
         void put(uint32_t token_id, bool from_draft = false);
         void end();
 
+        bool enabled() const { return _is_enabled; }
         void enable() { _is_enabled = true; }
         void disable() { _is_enabled = false; }
-        void wait_streaming() {
-            _is_streaming.wait(true);
-        }
+        void wait_streaming();
 
     private:
+        struct Settings {
+            InfoCallback info;
+            TextCallback text;
+            std::vector<std::pair<uint32_t, std::string>> preserved_tokens;
+            bool tool_call = false;
+            bool performance_summary = true;
+        };
+        void _begin_locked();
+        void _snapshot_settings_locked();
+        // Direct put/end callers are synchronous and use the current defaults.
+        const Settings& _settings() const { return _is_streaming ? _request : _defaults; }
         void _on_finalized_text(const std::string& text, bool stream_end = false);
         void _flush_cached_text(bool stream_end = false);
         bool _ends_with_chinese_char(const std::string& text);
@@ -109,7 +127,7 @@ class TextStreamer {
         Tokenizer* _tokenizer_ptr;
         std::vector<uint32_t> _cached_token_ids;
         uint32_t _print_len;
-        bool _is_enabled;
+        std::atomic<bool> _is_enabled;
         // from_draft flag for the tokens currently buffered in
         // _cached_token_ids. Set when the buffer transitions from empty to
         // non-empty; used to color the next emit. put() force-flushes the
@@ -127,16 +145,16 @@ class TextStreamer {
         std::vector<double> _time_to_next_token_vec;
 
         std::queue<DecodeCallbackData> _queue;
+        bool _completion_queued = true;
+        std::exception_ptr _callback_error;
         std::mutex _mutex;
         std::condition_variable_any _cv;
 
-        InfoCallback _callback_info;
-        TextCallback _callback_finalize_text;
-        std::vector<std::pair<uint32_t, std::string>> _preserved_tokens;
-        bool _tool_call_enabled = false;
-        bool _performance_summary_enabled = true;
+        Settings _defaults;
+        Settings _request;
+        bool _settings_pending = false;
+        std::atomic<bool> _is_streaming = false;
         std::jthread _pop_thread;
-        std::atomic<bool> _is_streaming;
 
         std::shared_ptr<spdlog::logger> _logger;
 };

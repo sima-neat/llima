@@ -22,11 +22,12 @@ TextStreamer::TextStreamer(
     _print_len(0),
     _is_enabled(true),
     _time_to_first_token(-1),
-    // Default info callback: do nothing
-    _callback_info(info_callback.value_or([](const std::string&, double) {})),
+    _defaults{
+    // Default info callback: do nothing.
+    info_callback.value_or([](const std::string&, double) {}),
     // Default text callback: print to console. ANSI green wrap for
     // draft-accepted chunks when the highlight env var is set.
-    _callback_finalize_text(text_callback.value_or(
+    text_callback.value_or(
         [this](const std::string& text, bool stream_end, bool from_draft) {
             if (from_draft && _highlight_draft_tokens && !text.empty()) {
                 std::cout << "\033[32m" << text << "\033[0m";
@@ -38,8 +39,8 @@ TextStreamer::TextStreamer(
             }
             std::cout << std::flush;
         }
-    )),
-    _pop_thread(&TextStreamer::pop_forever, this)
+    )},
+    _pop_thread([this](std::stop_token token) { pop_forever(token); })
 {
     auto llima_logger = spdlog::get("llima");
     _logger = llima_logger? llima_logger->clone("STREAM") : spdlog::default_logger();
@@ -51,18 +52,82 @@ TextStreamer::TextStreamer(
 }
 
 
+TextStreamer::~TextStreamer() {
+    _pop_thread.request_stop();
+    _cv.notify_all();
+    if (_pop_thread.joinable()) _pop_thread.join();
+}
+
+void TextStreamer::_begin_locked() {
+    _settings_pending = true;
+    _callback_error = nullptr;
+    _completion_queued = false;
+    _is_streaming.store(true);
+}
+
+void TextStreamer::_snapshot_settings_locked() {
+    if (!_settings_pending) return;
+    try {
+        // Prompt preprocessing may update tool markers after begin().
+        _request = _defaults;
+        _settings_pending = false;
+    } catch (...) {
+        _callback_error = std::current_exception();
+        _completion_queued = true;
+        _is_streaming.store(false);
+        _is_streaming.notify_all();
+        throw;
+    }
+}
+
+void TextStreamer::begin() {
+    std::lock_guard lock(_mutex);
+    if (!_is_enabled) { _callback_error = nullptr; return; }
+    if (_is_streaming)
+        throw std::logic_error("Text streaming is already active");
+    _begin_locked();
+}
+
+void TextStreamer::finish() {
+    if (!_is_enabled) return;
+    {
+        std::lock_guard lock(_mutex);
+        if (!_completion_queued) {
+            _snapshot_settings_locked();
+            _completion_queued = true;
+            _queue.push({DecodeCallbackType::STOP, 0, 0});
+            _cv.notify_one();
+        }
+    }
+    wait_streaming();
+}
+
+void TextStreamer::wait_streaming() {
+    _is_streaming.wait(true);
+    Settings completed;
+    std::exception_ptr error;
+    {
+        std::lock_guard lock(_mutex);
+        if (!_is_streaming) completed = std::move(_request);
+        error = _callback_error;
+    }
+    // Release request captures on the waiting thread, outside the queue mutex.
+    if (error) std::rethrow_exception(error);
+}
+
 void TextStreamer::push(DecodeCallbackData data) {
     if (!_is_enabled)
         return;
 
-    if (
-        data.type != DecodeCallbackType::TPS
-        && data.type != DecodeCallbackType::CACHED_PROMPT_TOKENS
-    ) {
-        _is_streaming.store(true);
-    }
-
     std::lock_guard<std::mutex> lock(_mutex);
+    if (_callback_error) std::rethrow_exception(_callback_error);
+    if (!_is_streaming) _begin_locked();
+    _snapshot_settings_locked();
+    if (data.type == DecodeCallbackType::STOP || data.type == DecodeCallbackType::CACHE_FULL) {
+        _completion_queued = true;
+    } else if (data.type == DecodeCallbackType::TTFT) {
+        _completion_queued = false;
+    }
     _queue.push(std::move(data));
     _cv.notify_one();
 }
@@ -78,51 +143,72 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
 
         DecodeCallbackData data = std::move(_queue.front());
         _queue.pop();
-        
-        switch (data.type) {
-            case DecodeCallbackType::TTFT:
-                put(data.token_id, data.from_draft);
-                _time_to_first_token = data.duration;
-                _callback_info("ttft", data.duration);
-                break;
-            case DecodeCallbackType::TPS:
-                put(data.token_id, data.from_draft);
-                _time_to_next_token_vec.emplace_back(data.duration);
-                _callback_info("tps", 1.0 / data.duration);
-                break;
-            case DecodeCallbackType::CACHE_FULL:
-                end();
-                _callback_info("FULL", 0.0);
-                _is_streaming.store(false);
-                _is_streaming.notify_one();
-                _logger->info("Cache full. Please clear history.");
-                break;
-            case DecodeCallbackType::STOP:
-                end();
-                _callback_info("END", 0.0);
-                _is_streaming.store(false);
-                _is_streaming.notify_one();
-                break;
-            case DecodeCallbackType::CACHED_PROMPT_TOKENS:
-                _callback_info("cached_prompt_tokens", data.token_id);
-                break;
-            default:
-                throw std::runtime_error(
-                    fmt::format("Unsupported callback type: {}", static_cast<uint32_t>(data.type))
-                );
+        lock.unlock();
+
+        std::exception_ptr error;
+        const bool completed = data.type == DecodeCallbackType::STOP
+                            || data.type == DecodeCallbackType::CACHE_FULL;
+        try {
+            switch (data.type) {
+                case DecodeCallbackType::TTFT:
+                    put(data.token_id, data.from_draft);
+                    _time_to_first_token = data.duration;
+                    _request.info("ttft", data.duration);
+                    break;
+                case DecodeCallbackType::TPS:
+                    put(data.token_id, data.from_draft);
+                    _time_to_next_token_vec.emplace_back(data.duration);
+                    _request.info("tps", 1.0 / data.duration);
+                    break;
+                case DecodeCallbackType::CACHE_FULL:
+                    end();
+                    _request.info("FULL", 0.0);
+                    _logger->info("Cache full. Please clear history.");
+                    break;
+                case DecodeCallbackType::STOP:
+                    end();
+                    _request.info("END", 0.0);
+                    break;
+                case DecodeCallbackType::CACHED_PROMPT_TOKENS:
+                    _request.info("cached_prompt_tokens", data.token_id);
+                    break;
+                default:
+                    throw std::runtime_error(
+                        fmt::format("Unsupported callback type: {}", static_cast<uint32_t>(data.type))
+                    );
+            }
+        } catch (...) {
+            error = std::current_exception();
+            _cached_token_ids.clear();
+            _print_len = 0;
+            _chunk_from_draft = false;
+            _draft_token_count = 0;
+            _time_to_first_token = -1;
+            _time_to_next_token_vec.clear();
+        }
+        if (completed || error) {
+            lock.lock();
+            if (error) {
+                _callback_error = error;
+                _queue = {};
+                _completion_queued = true;
+            }
+            _is_streaming.store(false);
+            _is_streaming.notify_all();
         }
     }
 }
 
 
 void TextStreamer::put(uint32_t token_id, bool from_draft) {
+    const auto& settings = _settings();
     // Preserve structural markers only while the current request needs them.
-    if (_tool_call_enabled && !_preserved_tokens.empty()) {
+    if (settings.tool_call && !settings.preserved_tokens.empty()) {
         const auto preserved = std::find_if(
-            _preserved_tokens.begin(), _preserved_tokens.end(),
+            settings.preserved_tokens.begin(), settings.preserved_tokens.end(),
             [token_id](const auto& token) { return token.first == token_id; }
         );
-        if (preserved != _preserved_tokens.end()) {
+        if (preserved != settings.preserved_tokens.end()) {
             _flush_cached_text();
             if (from_draft) {
                 ++_draft_token_count;
@@ -234,7 +320,7 @@ void TextStreamer::end() {
 
     for (const auto& message: messages) {
         _logger->info(message);
-        if (_performance_summary_enabled) {
+        if (_settings().performance_summary) {
             std::cout << message << std::endl;
         }
     }
@@ -249,12 +335,12 @@ void TextStreamer::set_preserved_token_ids(
     std::vector<std::pair<uint32_t, std::string>> tokens
 ) {
     std::lock_guard<std::mutex> lock(_mutex);
-    _preserved_tokens = std::move(tokens);
+    _defaults.preserved_tokens = std::move(tokens);
 }
 
 void TextStreamer::set_tool_call_enabled(bool enabled) {
     std::lock_guard<std::mutex> lock(_mutex);
-    _tool_call_enabled = enabled;
+    _defaults.tool_call = enabled;
 }
 
 
@@ -262,7 +348,7 @@ void TextStreamer::_on_finalized_text(const std::string& text, bool stream_end) 
     _logger->info("Finalized text: '{}'", text);
     // Pass the chunk-from-draft flag through; sinks decide how to render
     // (ANSI in the CLI default, HTML/metadata in web, ignored elsewhere).
-    _callback_finalize_text(text, stream_end, _chunk_from_draft);
+    _settings().text(text, stream_end, _chunk_from_draft);
 }
 
 void TextStreamer::_flush_cached_text(bool stream_end) {

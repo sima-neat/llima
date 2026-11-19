@@ -47,12 +47,12 @@ static Eigen::ArrayXf calc_rope_scaling_llama3(
 
 static Eigen::ArrayXf calc_rope_scaling_longrope(
     const Eigen::ArrayXf& inv_freq,
-    RopeScalingConfig& rope_scaling_cfg,
+    const RopeScalingConfig& rope_scaling_cfg,
     uint16_t max_num_tokens
 ) {
     if (max_num_tokens > rope_scaling_cfg.original_max_position_embeddings) {
         assert(rope_scaling_cfg.long_factor.has_value());
-        auto long_factor = Eigen::Map<Eigen::ArrayXd>(
+        auto long_factor = Eigen::Map<const Eigen::ArrayXd>(
             rope_scaling_cfg.long_factor.value().data(),
             rope_scaling_cfg.long_factor.value().size()
         ).cast<float>();
@@ -60,7 +60,7 @@ static Eigen::ArrayXf calc_rope_scaling_longrope(
         return inv_freq.segment(0, long_factor.size()) / long_factor;
     } else {
         assert(rope_scaling_cfg.short_factor.has_value());
-        auto short_factor = Eigen::Map<Eigen::ArrayXd>(
+        auto short_factor = Eigen::Map<const Eigen::ArrayXd>(
             rope_scaling_cfg.short_factor.value().data(),
             rope_scaling_cfg.short_factor.value().size()
         ).cast<float>();
@@ -126,7 +126,7 @@ RopeTable calc_freq_real_imag(
     double theta,
     uint16_t rope_dimension_count,
     uint16_t layer_head_dim,
-    RopeScalingConfig& rope_scaling_cfg
+    const RopeScalingConfig& rope_scaling_cfg
 ) {
     assert(rope_dimension_count % 2 == 0);
     assert(layer_head_dim % 2 == 0);

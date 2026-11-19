@@ -16,6 +16,7 @@
 #include "language_model.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"
+#include "vlm_helper.hpp"
 
 namespace {
 

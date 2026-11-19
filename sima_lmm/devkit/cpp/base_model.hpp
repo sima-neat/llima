@@ -26,6 +26,7 @@
 namespace simaai {
 namespace llima {
 
+// Legacy installed compatibility type; runtime models use private resource/workspace owners.
 template <typename T>
 class BaseModel {
     protected:

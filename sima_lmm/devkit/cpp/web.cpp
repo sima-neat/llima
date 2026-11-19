@@ -562,14 +562,6 @@ void WEB::_execute_streaming_audio_transcription(
             std::optional<double> tps_value;
             std::optional<std::string> finish_reason;
 
-            struct WhisperCallbackGuard {
-                WhisperModel* model;
-                ~WhisperCallbackGuard() {
-                    model->set_info_callback([](const std::string&, double) {});
-                    model->set_text_callback([](const std::string&, bool, bool) {});
-                }
-            } callback_guard{_whisper_model_ptr.get()};
-
             auto info_callback = [&](const std::string& metric_type, double metric_value) {
                 if (metric_type == "ttft") {
                     ttft_value = metric_value;
@@ -592,9 +584,10 @@ void WEB::_execute_streaming_audio_transcription(
             };
 
             try {
-                _whisper_model_ptr->set_info_callback(info_callback);
-                _whisper_model_ptr->set_text_callback(text_callback);
-                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, language, task);
+                TranscriptionOptions options{language, task};
+                options.info_callback = info_callback;
+                options.text_callback = text_callback;
+                auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, options);
                 std::string chunk = _format_audio_sse_chunk(
                     "", task, true, finish_reason.value_or("stop"), ttft_value, tps_value,
                     result.language, result.task, result.no_speech_prob, result.avg_logprob
@@ -1013,18 +1006,16 @@ void WEB::_execute_streaming_chat(
                 }
             };
 
-            _vision_language_model_ptr->set_info_callback(info_callback);
-            _vision_language_model_ptr->set_text_callback(text_callback);
-
-            // Create thread and track it for /stop endpoint
-            _vlm_thread = std::jthread([this, chat]() {
-                _vision_language_model_ptr->run_model(chat);
+            GenerationOptions options;
+            options.info_callback = info_callback;
+            options.text_callback = text_callback;
+            // Create thread and track it for /stop endpoint.
+            _vlm_thread = std::jthread([this, chat, options]() {
+                _vision_language_model_ptr->run_model(chat, options);
             });
 
             // Wait for completion
             _vlm_thread.join();
-
-            // No need to reset callbacks - they'll be overwritten on next request
 
             sink.done();
             return true;
@@ -1096,16 +1087,14 @@ void WEB::_execute_normal_chat(
         }
     };
 
-    _vision_language_model_ptr->set_info_callback(info_callback);
-    _vision_language_model_ptr->set_text_callback(text_callback);
-
-    // Run in thread for consistency with barge-in logic
-    _vlm_thread = std::jthread([this, chat]() {
-        _vision_language_model_ptr->run_model(chat);
+    GenerationOptions options;
+    options.info_callback = info_callback;
+    options.text_callback = text_callback;
+    // Run in thread for consistency with barge-in logic.
+    _vlm_thread = std::jthread([this, chat, options]() {
+        _vision_language_model_ptr->run_model(chat, options);
     });
     _vlm_thread.join();
-
-    // No need to reset callbacks - they'll be overwritten on next request
 
     nlohmann::json tool_calls = nullptr;
     if (chat.has_tools()) {

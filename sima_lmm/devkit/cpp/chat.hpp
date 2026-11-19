@@ -2,13 +2,13 @@
 #define _SIMA_LLIMA_CHAT_
 
 #include <filesystem>
+#include <iostream>
 #include <string>
-#include <variant>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
-#include "vlm_helper.hpp"
 
 namespace simaai {
 namespace llima {
@@ -18,8 +18,6 @@ class VlmHelper;
 class Chat {
     public:
         Chat(VlmHelper& vlm_helper);
-        ~Chat() {}
-
         void set_system_prompt(std::string system_prompt);
         void clear_system_prompt();
 
@@ -53,7 +51,7 @@ class Chat {
         void print_history() const { std::cout << _messages << std::endl << std::flush; }
 
     protected:
-        VlmHelper& _vlm_helper;
+        bool _is_multimodal;
         nlohmann::ordered_json _messages;
         nlohmann::ordered_json _tools;
         std::vector<std::filesystem::path> _images;

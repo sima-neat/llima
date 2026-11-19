@@ -1,12 +1,13 @@
 #include <fmt/ranges.h>
 
 #include "chat.hpp"
+#include "vlm_helper.hpp"
 
 namespace simaai {
 namespace llima {
 
 
-Chat::Chat(VlmHelper& vlm_helper) : _vlm_helper(vlm_helper),
+Chat::Chat(VlmHelper& vlm_helper) : _is_multimodal(vlm_helper.is_multimodal()),
     _enable_thinking(vlm_helper.get_enable_thinking()),
     _reasoning_effort(vlm_helper.get_reasoning_effort()) {
     auto system_prompt = vlm_helper.get_system_prompt().value_or("");
@@ -16,7 +17,6 @@ Chat::Chat(VlmHelper& vlm_helper) : _vlm_helper(vlm_helper),
 
 
 void Chat::set_system_prompt(std::string system_prompt) {
-    _vlm_helper.set_system_prompt(system_prompt);
 
     if (system_prompt.empty()) {
         clear_system_prompt();
@@ -32,7 +32,6 @@ void Chat::set_system_prompt(std::string system_prompt) {
 
 
 void Chat::clear_system_prompt() {
-    _vlm_helper.set_system_prompt(std::nullopt);
     if (!_messages.empty() && _messages[0]["role"] == "system")
         _messages.erase(_messages.begin());
     clear_history();
@@ -40,7 +39,7 @@ void Chat::clear_system_prompt() {
 
 
 void Chat::add_query(std::string query) {
-    if (!_vlm_helper.is_multimodal()) {
+    if (!_is_multimodal) {
         _messages.push_back({{"role", "user"}, {"content", std::move(query)}});
         return;
     }
@@ -70,7 +69,7 @@ void Chat::add_query(std::string query) {
 
 std::string Chat::get_last_query() const {
     if (!_messages.empty() && _messages.back()["role"] == "user") {
-        if (_vlm_helper.is_multimodal()) {
+        if (_is_multimodal) {
             for (const auto& item: _messages.back()["content"]) {
                 if (item["type"] == "text")
                     return item["text"];
@@ -85,7 +84,7 @@ std::string Chat::get_last_query() const {
 
 void Chat::update_last_query(std::string query) {
     if (!_messages.empty() && _messages.back()["role"] == "user") {
-        if (_vlm_helper.is_multimodal()) {
+        if (_is_multimodal) {
             for (auto& item: _messages.back()["content"]) {
                 if (item["type"] == "text") {
                     item["text"] = std::move(query);
@@ -104,7 +103,7 @@ void Chat::update_last_query(std::string query) {
 void Chat::add_response(std::string response) {
     nlohmann::ordered_json message;
     message["role"] = "assistant";
-    if (_vlm_helper.is_multimodal()) {
+    if (_is_multimodal) {
         message["content"].push_back({{"type", "text"}, {"text", std::move(response)}});
     } else {
         message["content"] = std::move(response);

@@ -322,6 +322,8 @@ set_target_properties(
     ${TARGET_RUNTIME}
     PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION TRUE
+    VERSION ${PROJECT_VERSION}
+    SOVERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}"
     CXX_VISIBILITY_PRESET default
     VISIBILITY_INLINES_HIDDEN OFF
 )
@@ -419,6 +421,7 @@ endif()
 set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/base_model.hpp
     sima_lmm/devkit/cpp/file_provider.hpp
+    sima_lmm/devkit/cpp/generation_types.hpp
     sima_lmm/devkit/cpp/chat.hpp
     sima_lmm/devkit/cpp/eagle_helpers.hpp
     sima_lmm/devkit/cpp/eigen_types.hpp

@@ -242,3 +242,22 @@ endforeach()
 set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;runtime;long" RESOURCE_LOCK mla)
 install(FILES file_provider_test.cpp file_provider_routing_test.cpp
     DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
+
+add_executable(sima_lmm_session_generation_test session_generation_test.cpp)
+target_link_libraries(sima_lmm_session_generation_test PRIVATE sima_lmm_runtime)
+set_target_properties(sima_lmm_session_generation_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+add_test(NAME runtime.session_generation COMMAND sima_lmm_session_generation_test)
+set_tests_properties(runtime.session_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
+install(TARGETS sima_lmm_session_generation_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+install(FILES session_generation_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
+
+# This regression uses a private header, so only its binary is shipped in extras.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime_program_lifetime_test.cpp")
+    add_executable(sima_lmm_runtime_program_lifetime_test runtime_program_lifetime_test.cpp)
+    target_link_libraries(sima_lmm_runtime_program_lifetime_test PRIVATE sima_lmm_runtime)
+    set_target_properties(sima_lmm_runtime_program_lifetime_test PROPERTIES
+        INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+    add_test(NAME runtime.program_lifetime COMMAND sima_lmm_runtime_program_lifetime_test)
+    set_tests_properties(runtime.program_lifetime PROPERTIES LABELS "devkit;runtime" RESOURCE_LOCK mla TIMEOUT 120)
+    install(TARGETS sima_lmm_runtime_program_lifetime_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+endif()

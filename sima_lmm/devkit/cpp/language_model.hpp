@@ -19,8 +19,12 @@
 
 #include <Eigen/Dense>
 
-#include "base_model.hpp"
+#include "file_provider.hpp"
+#include "mla_model.hpp"
+#include "vlm_config.hpp"
+#include <spdlog/logger.h>
 #include "eagle_helpers.hpp"
+#include "generation_types.hpp"
 #include "rope_utils.hpp"
 #include "text_streamer.hpp"
 
@@ -28,24 +32,18 @@ namespace simaai {
 namespace llima {
 
 struct EmbeddingOffload;
-
-struct LogLikelihoodResult {
-    double logprob;
-    bool is_greedy;
-};
-
-struct GenerationPerformanceResult {
-    std::vector<double> token_durations;
-    uint32_t generated_tokens = 0;
-    std::optional<uint32_t> accepted_draft_tokens;
-};
-
+struct LanguageResources;
+struct LanguageSession;
+struct LanguageWorkspace;
+struct LanguageRunState;
+class SessionManager;
+class LanguageExecutor;
 // Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
 // (num_tokens, cache_kind, aligned_cache_token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
-class LanguageModel : public BaseModel<VlmConfig> {
+class LanguageModel {
     public:
         // Existing disk-loading overload; preserves source compatibility.
         LanguageModel(
@@ -64,7 +62,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             TextStreamer& text_streamer,
             std::shared_ptr<FileProvider> file_provider
         );
-        virtual ~LanguageModel() override { _finalize(); }
+        virtual ~LanguageModel();
 
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
@@ -121,26 +119,36 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::optional<ChronoTimer> timer_ttft = std::nullopt,
             GenerationPerformanceResult* performance_result = nullptr
         );
-        void stop_model() { _is_running = false; }
+        void attach_draft(LanguageModel& draft);
+        SessionId create_session();
+        void select_session(SessionId id);
+        void reset_session(SessionId id);
+        void release_session(SessionId id);
+        void set_session_limit(size_t limit);
+        SessionId active_session() const;
+        std::vector<SessionId> session_ids() const;
+        size_t session_limit() const;
+        size_t session_memory_bytes(SessionId id) const;
+        size_t shared_resource_bytes() const;
+        size_t workspace_memory_bytes() const;
+
+        void stop_model();
 
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
 
+        // Compiled stages have stable storage after initialization; keep map entries intact.
         LanguageModelMap& get_model_map(const std::string& model_type);
         uint16_t set_max_num_tokens(std::optional<uint16_t> max_num_tokens);
-        auto get_max_num_tokens() const { return _max_num_tokens; }
+        uint16_t get_max_num_tokens() const;
         std::set<uint32_t> set_stop_token_ids(std::optional<std::set<uint32_t>> stop_token_ids);
-        const auto& get_stop_token_ids() const { return _stop_token_ids; }
-        void clear_cached_token_ids() { _cached_token_ids.clear(); }
-        uint32_t get_cached_first_generated_token() const {
-            return _cached_first_generated_token;
-        }
+        const std::set<uint32_t>& get_stop_token_ids() const;
+        void clear_cached_token_ids();
+        uint32_t get_cached_first_generated_token() const;
 
         // Captured hidden states from layers 2, N/2, N-3 during prefill (spec decoding).
         // Populated by run_model_once when queue is disabled and spec mode is active.
-        const std::vector<std::vector<Eigen::bfloat16>>& get_eagle3_intermediate_hidden_states() const {
-            return _eagle3_intermediate_hidden_states;
-        }
+        const std::vector<std::vector<Eigen::bfloat16>>& get_eagle3_intermediate_hidden_states() const;
 
         // Result of initialize_tree.
         struct InitTreeResult {
@@ -239,7 +247,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         // Gather the accepted path's scattered KVs (at select_indices) and move
         // them to contiguous positions starting at prev_input_len. Updates
-        // _kv_cache_len. Operates on all layers' cache_{key,val}_l{i} buffers.
+        // _session->kv_cache_len. Operates on all layers' cache_{key,val}_l{i} buffers.
         void compact_kv_after_accept(
             std::span<const uint16_t> select_indices,
             uint16_t prev_input_len
@@ -270,25 +278,42 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
 
         // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
-        uint16_t get_kv_cache_len() const { return _kv_cache_len; }
-        void set_kv_cache_len(uint16_t len) { _kv_cache_len = len; }
-
-        // Current spec round's tree mask, shared between target and draft via
-        // shared_ptr. nullptr = "no tree active". Cleared on both at round start.
-        std::shared_ptr<eagle_helpers::EagleTreeMask> _eagle3_tree_mask;
-
-        // eye(topk) identity, built once (draft only). Depth-loop seed.
-        eagle_helpers::EagleTreeMask _eagle3_tree_mask_init;
-
-        // zeros(topk); used in depth loop as position_ids = len_posi + offsets.
-        std::vector<int32_t> _eagle3_position_ids;
-
-        // Cumulative draft KV position. Reset per round; advanced by hidden_rows
-        // after each first draft_forward in topk_generate.
-        size_t _eagle3_stable_kv = 0;
+        uint16_t get_kv_cache_len() const;
+        void set_kv_cache_len(uint16_t len);
 
     private:
-        std::shared_ptr<EmbeddingOffload> _embedding_offload;
+        friend struct LanguageResources;
+        friend struct LanguageSession;
+        friend struct LanguageWorkspace;
+        friend class VisionLanguageModel;
+        friend class VisionLanguageRequest;
+        friend class LanguageExecutor;
+        void invalidate_prompt_reuse();
+        void bind_session_adapter();
+        void set_image_identity(std::string identity);
+
+        friend class SessionManager;
+        std::shared_ptr<LanguageResources> _resources;
+        const VlmConfig& _cfg;
+        const std::filesystem::path& _elf_dir;
+        const std::filesystem::path& _devkit_dir;
+        const std::shared_ptr<FileProvider>& _files;
+        std::shared_ptr<spdlog::logger> _logger;
+        std::unique_ptr<SessionManager> _sessions;
+        LanguageSession* _session;
+        std::unique_ptr<LanguageWorkspace> _workspace;
+        std::unique_ptr<LanguageRunState> _run;
+
+        void define_buffer(const std::string& name, const std::vector<size_t>& shape,
+                           const std::string& dtype = "bfloat16", bool align_last_dim = true);
+        void _define_resource_buffer(const std::string& name, const std::vector<size_t>& shape,
+                                     const std::string& dtype = "bfloat16", bool align_last_dim = true);
+        void _define_session_buffer(const std::string& name, const std::vector<size_t>& shape,
+                                    const std::string& dtype = "bfloat16", bool align_last_dim = true);
+        MLABuffer& get_buffer(const std::string& name);
+        bool has_buffer(const std::string& name) const;
+        void _select_session(LanguageSession& selected);
+        void _init_attention_bindings();
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,
             MLABuffer* scales, size_t row_begin = 0
@@ -366,12 +391,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             MLAModelWithBuffer* post;
         };
 
-        virtual void _initialize() override;
-        virtual void _finalize() override;
+        void _initialize();
+        void _finalize();
         void _define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count);
         bool _has_linear_attention_layers() const;
         const LinearAttentionConfig& _linear_attn_cfg() const;
-        virtual void _define_buffers() override;
+        void _define_buffers();
         void _define_model(
             const std::string& model_type,
             const LanguageModelMapKey& key,
@@ -484,7 +509,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::span<const uint32_t> token_ids, uint16_t num_tokens,
             uint16_t valid_tokens = 0
         );
-        void _load_per_layer_embeddings();
+        void _init_session_layout();
         void _compute_and_upload_per_layer_inputs_prefill(
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
@@ -556,27 +581,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _notify_stop() const;
         void _notify_interrupt() const;
 
-        std::set<uint32_t> _stop_token_ids;
         std::optional<uint32_t> _image_token_id;
         std::optional<uint32_t> _pad_token_id;
-        uint16_t _max_num_tokens;
-        TextStreamer& _text_streamer;
         bool _use_group_token_models;
         bool _need_argmax;
 
-        LanguageModelMap _pre_model_map;
-        LanguageModelMap _cache_model_map;
-        LanguageModelMap _post_model_map;
-        LanguageModelMap _conv_model_map;
-        LanguageModelMap _conv_final_model_map;
-        LanguageModelMap _per_layer_model_map;
-        LanguageModelMap _linear_model_map;
         // Mixture-of-Experts maps. router/weightedsum are keyed like post
         // ({num_tokens, layer_idx, 0}); the expert map repurposes the third key slot
         // as the expert index ({num_tokens, layer_idx, expert_idx}).
-        LanguageModelMap _router_model_map;
-        LanguageModelMap _expert_model_map;
-        LanguageModelMap _weightedsum_model_map;
         // Preresolved handles + staging for the MoE host round-trip, one per MoE variant.
         struct MoeHostCache {
             uint16_t num_tokens = 0;             // the moe_nt this entry serves
@@ -597,54 +609,15 @@ class LanguageModel : public BaseModel<VlmConfig> {
         MoeHostCache& _get_moe_host(uint16_t moe_nt);
 
         // Draft-only context-fusion models indexed by their compiled width.
-        std::map<uint16_t, MLAModelWithBuffer> _fc_model_map;
-        LanguageModelMap _dflash_context_model_map;
-        LanguageModelMap _dflash_state_resolver_model_map;
-        uint16_t _dflash_resolved_prefix = 0;
 
-        std::vector<AttentionBindingBuffers> _attention_binding_buffers;
-        MLABuffer* _global_freq_real = nullptr;
-        MLABuffer* _global_freq_imag = nullptr;
-        MLABuffer* _local_freq_real = nullptr;
-        MLABuffer* _local_freq_imag = nullptr;
 
-        RopeTable _master_rope_table;
-        RopeTable _global_freq_host;  // pristine CPU copy; source for tree-RoPE rows
-        RopeTable _local_freq_host;   // empty if SWA not enabled
 
-        bool _has_image_token;
 
-        Eigen::bfloat16* _embeddings_tensor_ptr;
-        size_t _per_layer_embedding_rows_per_shard = 0;
-        std::vector<MLABuffer*> _per_layer_embedding_shards;
-        std::vector<uint32_t> _prompt_per_layer_token_ids;
-        std::vector<uint32_t> _cached_token_ids;
-        uint32_t _cached_first_generated_token;
         // Full-match cache: prior turn's tree state. Restored only when the
         // matching token prefix also has the same prompt length.
-        std::vector<uint32_t> _cached_draft_tokens;
-        std::vector<std::vector<int32_t>> _cached_retrieve_indices;
-        eagle_helpers::EagleTreeMask _cached_tree_mask;
-        std::vector<int32_t> _cached_tree_position_ids;
-        uint16_t _cached_eagle3_prompt_len = 0;
-        size_t _cached_eagle3_stable_kv = 0;
-        uint16_t _kv_cache_len = 0;  // tokens in KV cache; set by prefill, advanced by decode
-        std::vector<int32_t> _d2t;   // draft-to-target vocab offsets (draft only)
-        std::vector<uint32_t> _gemma4_token_ordering;
-        std::vector<uint16_t> _checkpoint_boundaries;
-        std::vector<CachedState> _cached_states;
         // Positions are zero for unused slots. Slot 0 is reserved only for a system/tool prefix.
-        std::array<uint16_t, 4> _state_checkpoint_positions{};
-        bool _capture_state_checkpoints = false;
-        uint8_t _writable_checkpoint_slots = 0;
-        uint16_t _system_checkpoint_position = 0;
-        size_t _rolling_checkpoint_slot = 0;
 
-        std::vector<std::vector<Eigen::bfloat16>> _eagle3_intermediate_hidden_states;
-        std::optional<std::vector<Eigen::bfloat16>> _gemma4_mtp_prefill_hidden_state;
 
-        std::atomic<bool> _is_running;
-        std::optional<std::string> _reloc_name;
 };
 
 }

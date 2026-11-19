@@ -34,8 +34,6 @@ private:
 struct EmbeddingOffload {
     std::unique_ptr<DiskEmbeddingTable> normal;
     std::unique_ptr<DiskEmbeddingTable> per_layer;
-    std::vector<uint32_t> prompt_ids;
-    bool chunk_staging = false;
 };
 
 } // namespace simaai::llima

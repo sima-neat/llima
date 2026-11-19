@@ -5,8 +5,8 @@
 #include <memory>
 #include <optional>
 #include <set>
-#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -27,9 +27,10 @@ struct PreprocessedChat {
     std::vector<uint32_t> input_token_ids;
     uint16_t stable_prefix_token_count;
     std::vector<std::vector<Eigen::bfloat16>> image_tensors;
+    uint32_t image_count = 0;
 };
 
-class Chat;
+// Formats and tokenizes chat prompts and preprocesses media for execution.
 class VlmHelper {
     public:
         // Existing devkit-directory overload; preserves source compatibility.
@@ -50,8 +51,6 @@ class VlmHelper {
             bool enable_thinking = false,
             std::string reasoning_effort = "low"
         );
-        ~VlmHelper() {};
-
         void set_system_prompt(const std::optional<std::string>& system_prompt);
         std::optional<std::string> get_system_prompt() const { return _system_prompt; }
         void set_enable_thinking(bool enable_thinking) { _enable_thinking = enable_thinking; }
@@ -61,6 +60,8 @@ class VlmHelper {
         }
         const std::string& get_reasoning_effort() const { return _reasoning_effort; }
         PreprocessedChat preprocess(const Chat& chat);
+        PreprocessedChat preprocess(const Chat& chat, bool load_images);
+        std::vector<Eigen::bfloat16> preprocess_image(const cv::Mat& image);
 
         bool is_multimodal() const { return _vlm_cfg.is_multimodal(); }
         bool support_image() const { return _vlm_cfg.support_image(); }

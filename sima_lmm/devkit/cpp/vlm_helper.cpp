@@ -130,7 +130,14 @@ void VlmHelper::set_system_prompt(const std::optional<std::string>& system_promp
 }
 
 
-PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
+std::vector<Eigen::bfloat16> VlmHelper::preprocess_image(const cv::Mat& image) {
+    if (!_image_processor_ptr) throw std::logic_error("Model does not support images");
+    return _image_processor_ptr->preprocess(image);
+}
+
+PreprocessedChat VlmHelper::preprocess(const Chat& chat) { return preprocess(chat, true); }
+
+PreprocessedChat VlmHelper::preprocess(const Chat& chat, bool load_images) {
     // Apply chat template.
     minja::chat_template_inputs inputs;
     inputs.messages = chat.get_messages();
@@ -145,8 +152,8 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     // Construct the actual prompt with full image tokens. Manually process the prompt because there
     // is no known automatic way.
     std::vector<std::vector<Eigen::bfloat16>> image_tensors;
+    uint32_t num_images = 0;
     if (_vlm_cfg.support_image()) {
-        uint32_t num_images;
         if (_vlm_cfg.model_type == "vlm-llava") {
             std::string search = "<image>";
             std::string replace = "";
@@ -193,7 +200,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         }
 
         // Preprocess images.
-        if (chat.get_images().size() == 0 && num_images > 0) {
+        if (load_images && chat.get_images().size() == 0 && num_images > 0) {
             // Images are embedded in the messages.
             for (const auto& message: chat.get_messages()) {
                 const auto& content = message.at("content");
@@ -216,7 +223,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                     }
                 }
             }
-        } else {
+        } else if (load_images) {
             assert(chat.get_images().size() == num_images);
             for (const auto& image_file_name: chat.get_images()) {
                 image_tensors.emplace_back(_image_processor_ptr->preprocess(image_file_name));
@@ -270,7 +277,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         std::move(formatted_prompt),
         std::move(input_token_ids),
         stable_prefix_token_count,
-        std::move(image_tensors)
+        std::move(image_tensors), num_images
     };
 }
 

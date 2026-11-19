@@ -13,6 +13,8 @@
 
 #include "gemma4_mtp_helpers.hpp"
 #include "language_model.hpp"
+#include "language_model_executor.hpp"
+#include "language_model_state.hpp"
 
 namespace simaai {
 namespace llima {
@@ -32,7 +34,7 @@ uint32_t LanguageModel::_argmax_gemma4_mtp_masked_row(
     uint16_t num_tokens, uint16_t row
 ) {
     const uint32_t output_size = _cfg.lm_cfg.get_lm_head_output_size();
-    if (_gemma4_token_ordering.size() != output_size) {
+    if (_resources->gemma4_token_ordering.size() != output_size) {
         throw std::runtime_error("Gemma4 token_ordering is not loaded");
     }
 
@@ -50,7 +52,7 @@ uint32_t LanguageModel::_argmax_gemma4_mtp_masked_row(
     );
     const auto candidate_tokens = gemma4_mtp_helpers::select_candidate_tokens(
         std::span<const Eigen::bfloat16>(centroid_logits, num_centroids),
-        _gemma4_token_ordering,
+        _resources->gemma4_token_ordering,
         _cfg.lm_cfg.speculative_decoding_cfg->centroid_intermediate_top_k
     );
 
@@ -98,9 +100,9 @@ uint32_t LanguageModel::_argmax_gemma4_mtp_masked_row(
 
 std::vector<Eigen::bfloat16> LanguageModel::_read_embedding_row_bf16(uint32_t token_id) {
     auto& embeddings = get_buffer(
-        _embedding_offload ? "offload_decode_embeds" : "embeddings"
+        _resources->embedding_offload ? "offload_decode_embeds" : "embeddings"
     );
-    const uint32_t row_index = _embedding_offload ? 0 : token_id;
+    const uint32_t row_index = _resources->embedding_offload ? 0 : token_id;
     const auto& shape = embeddings.get_shape();
     if (shape.size() != 2 || row_index >= shape.front()
         || token_id >= _cfg.lm_cfg.token_cfg.vocab_size) {
@@ -109,7 +111,7 @@ std::vector<Eigen::bfloat16> LanguageModel::_read_embedding_row_bf16(uint32_t to
         ));
     }
 
-    if (_embedding_offload) {
+    if (_resources->embedding_offload) {
         // Drafts read the target's embeddings; offloaded tables have only a
         // single staging row in DRAM, populated through the shared gather path.
         auto* scales = _cfg.pipeline_cfg.quantize_embeddings
@@ -138,7 +140,7 @@ std::vector<Eigen::bfloat16> LanguageModel::_read_embedding_row_bf16(uint32_t to
     }
 
     auto& scales = get_buffer(
-        _embedding_offload ? "offload_decode_scales" : "embedding_scales"
+        _resources->embedding_offload ? "offload_decode_scales" : "embedding_scales"
     );
     const size_t scale_row_bytes = scales.get_buf_len(std::vector<uint32_t>{1, 1});
     const auto* scale_base = reinterpret_cast<const uint8_t*>(
@@ -226,9 +228,9 @@ void LanguageModel::_upload_gemma4_mtp_freq_rows(
         imag_buf.upload_raw(imag.data(), 0, bytes);
     };
 
-    upload_one(_global_freq_host, "global_freq_real", "global_freq_imag");
+    upload_one(_resources->global_freq_host, "global_freq_real", "global_freq_imag");
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
-        upload_one(_local_freq_host, "local_freq_real", "local_freq_imag");
+        upload_one(_resources->local_freq_host, "local_freq_real", "local_freq_imag");
     }
 }
 
@@ -300,81 +302,12 @@ std::vector<uint8_t> LanguageModel::_prepare_gemma4_mtp_shared_kv_layers(
     return source_layers;
 }
 
-void LanguageModel::_bind_kv_cache_inputs(
-    LanguageModel& kv_owner,
-    uint8_t source_layer,
-    std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
-    uint8_t cache_ifm_idx,
-    uint16_t cache_token_idx_begin,
-    uint16_t aligned_eff_num_cached_tokens,
-    bool has_future_token_mask
-) {
-    const auto& buffers = kv_owner._attention_binding_buffers.at(source_layer);
-    const auto& attn_cfg = kv_owner._cfg.lm_cfg.attn_cfg;
-    const uint32_t kv_heads = attn_cfg.num_key_value_heads;
-    const uint32_t head_dim = attn_cfg.get_head_dim(kv_owner._cfg.lm_cfg.layer_types[source_layer]);
-    std::vector<uint32_t> kv_begin;
-    std::vector<uint32_t> kv_shape;
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-        kv_begin = {0, cache_token_idx_begin, 0};
-        kv_shape = {
-            kv_heads,
-            _cfg.pipeline_cfg.max_num_tokens,
-            head_dim
-        };
-    } else {
-        kv_begin = {cache_token_idx_begin, 0};
-        kv_shape = {aligned_eff_num_cached_tokens, kv_heads * head_dim};
-    }
 
-    cache_ifm_map.emplace(
-        std::piecewise_construct,
-        std::forward_as_tuple(cache_ifm_idx++),
-        std::forward_as_tuple(
-            buffers.key,
-            kv_begin,
-            kv_shape
-        )
-    );
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifm_map.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(cache_ifm_idx++),
-            std::forward_as_tuple(
-                buffers.key_scale,
-                std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                std::vector<uint32_t>{kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
-            )
-        );
-    }
-    if (has_future_token_mask) {
-        ++cache_ifm_idx;
-    }
-    cache_ifm_map.emplace(
-        std::piecewise_construct,
-        std::forward_as_tuple(cache_ifm_idx),
-        std::forward_as_tuple(
-            buffers.value,
-            kv_begin,
-            kv_shape
-        )
-    );
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifm_map.emplace(
-            std::piecewise_construct,
-            std::forward_as_tuple(cache_ifm_idx + 1),
-            std::forward_as_tuple(
-                buffers.value_scale,
-                std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                std::vector<uint32_t>{kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
-            )
-        );
-    }
-}
 
 LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_batch(
     uint16_t token_idx, std::span<const uint32_t> token_ids
 ) {
+    auto execution = LanguageExecutor::lock_execution();
     const uint16_t verification_width = _cfg.lm_cfg.get_single_num_tokens();
     const uint16_t valid_tokens = checked_u16(token_ids.size(), "Gemma4 MTP target batch");
     const uint16_t num_tokens = verification_width;
@@ -395,40 +328,16 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
     _upload_gemma4_mtp_freq_rows(num_tokens, token_idx, num_tokens);
     std::array<bool, 2> mask_uploaded{};
 
-    const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
-    auto& input_embeds_buf = use_int8_embedding_staging
-        ? get_buffer(fmt::format("eagle3_input_embeds_n{}", num_tokens))
-        : get_buffer(fmt::format("n{}_buffer1", num_tokens));
-    MLABuffer* input_embedding_scales_buf = use_int8_embedding_staging
-        ? &get_buffer(fmt::format("eagle3_input_embedding_scales_n{}", num_tokens))
-        : nullptr;
-    _gather_embedding_rows(token_ids, input_embeds_buf, input_embedding_scales_buf);
+    const auto embedding = LanguageExecutor::stage_tokens(*this, *this, token_ids, num_tokens);
+    auto& input_embeds_buf = *embedding.values;
+    auto* input_embedding_scales_buf = embedding.scales;
 
     if (_uses_per_layer_inputs()) {
         _upload_per_layer_embedding_rows(token_ids, num_tokens, valid_tokens);
 
-        std::map<uint8_t, MLABufferSlice> per_layer_ifm_map;
-        const uint8_t input_ifm_idx = _cfg.pipeline_cfg.quantize_embeddings ? 2 : 1;
-        per_layer_ifm_map.emplace(
-            input_ifm_idx,
-            MLABufferSlice{
-                &input_embeds_buf,
-                {0, 0},
-                {num_tokens, hidden_size}
-            }
-        );
-        if (_cfg.pipeline_cfg.quantize_embeddings) {
-            per_layer_ifm_map.emplace(
-                3,
-                MLABufferSlice{
-                    input_embedding_scales_buf,
-                    {0, 0},
-                    {num_tokens, 1}
-                }
-            );
-        }
-        const LanguageModelMapKey per_layer_key{num_tokens, 0, 0};
-        _per_layer_model_map.at(per_layer_key).run(&per_layer_ifm_map);
+        auto inputs = LanguageExecutor::per_layer_inputs(*this, &input_embeds_buf,
+            input_embedding_scales_buf, 0, num_tokens);
+        _workspace->per_layer_model_map.at({num_tokens, 0, 0}).run(&inputs);
     }
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
@@ -443,46 +352,14 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
         const LanguageModelMapKey cache_key = _get_cache_model_key(
             num_tokens, token_idx, layer_idx
         );
-        auto& pre_model = _pre_model_map.at(model_key);
-        auto& cache_model = _cache_model_map.at(cache_key);
-        auto& post_model = _post_model_map.at(model_key);
+        auto& pre_model = _workspace->pre_model_map.at(model_key);
+        auto& cache_model = _workspace->cache_model_map.at(cache_key);
+        auto& post_model = _workspace->post_model_map.at(model_key);
 
-        const bool pre_uses_embedding_scale = use_int8_embedding_staging && layer_idx == 0;
-        const uint8_t freq_ifm_idx = 1 + static_cast<uint8_t>(pre_uses_embedding_scale);
         const bool is_sliding = layer_type == "sliding_attention";
-        auto& freq_real = get_buffer(is_sliding ? "local_freq_real" : "global_freq_real");
-        auto& freq_imag = get_buffer(is_sliding ? "local_freq_imag" : "global_freq_imag");
-        pre_model._bind_ifm(freq_ifm_idx, &freq_real, {0, 0});
-        pre_model._bind_ifm(freq_ifm_idx + 1, &freq_imag, {0, 0});
-        if (pre_uses_embedding_scale) {
-            pre_model._bind_ifm(1, input_embedding_scales_buf, {0, 0});
-            post_model._bind_ifm(1, input_embedding_scales_buf, {0, 0});
-        }
-
-        uint8_t ofm_idx = 1;
-        if (!_cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
-            auto& key_buffer = get_buffer(fmt::format("cache_key_l{}", layer_idx));
-            auto& val_buffer = get_buffer(fmt::format("cache_val_l{}", layer_idx));
-            if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-                pre_model._bind_ofm(ofm_idx++, &key_buffer, {0, token_idx, 0});
-                if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                    auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
-                    pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
-                }
-                pre_model._bind_ofm(ofm_idx++, &val_buffer, {0, token_idx, 0});
-            } else {
-                pre_model._bind_ofm(ofm_idx++, &key_buffer, {token_idx, 0});
-                if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                    auto& scale = get_buffer(fmt::format("cache_key_scale_l{}", layer_idx));
-                    pre_model._bind_ofm(ofm_idx++, &scale, {0, token_idx, 0});
-                }
-                pre_model._bind_ofm(ofm_idx++, &val_buffer, {token_idx, 0});
-            }
-            if (_cfg.pipeline_cfg.quantize_kv_cache) {
-                auto& scale = get_buffer(fmt::format("cache_val_scale_l{}", layer_idx));
-                pre_model._bind_ofm(ofm_idx, &scale, {0, token_idx, 0});
-            }
-        }
+        LanguageExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
+            input_embedding_scales_buf, 0, 0);
+        LanguageExecutor::bind_kv_outputs(*this, pre_model, layer_idx, token_idx);
 
         const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
             num_tokens, token_idx, layer_type
@@ -548,13 +425,12 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             );
         }
 
-        pre_model.add_to_queue(&ifm_map);
-        cache_model.add_to_queue(&cache_ifm_map);
-        post_model.add_to_queue(&ifm_map);
+        LanguageExecutor::queue_attention({&pre_model, &cache_model, &post_model},
+            {.input = &ifm_map, .cache = &cache_ifm_map, .post_input = &ifm_map});
     }
 
     MLAModelWithBuffer::run_queue();
-    _kv_cache_len = static_cast<uint16_t>(token_idx + valid_tokens);
+    _session->kv_cache_len = static_cast<uint16_t>(token_idx + valid_tokens);
     auto next_token_ids = _argmax_lm_head_rows(
         num_tokens, valid_tokens, token_ids.subspan(1)
     );
@@ -574,6 +450,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     uint16_t query_position_id,
     uint16_t shared_kv_len
 ) {
+    auto execution = LanguageExecutor::lock_execution();
     const uint32_t backbone_hidden_size = _cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size;
     if (hidden_state.size() != backbone_hidden_size) {
         throw std::runtime_error(fmt::format(
@@ -618,15 +495,13 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
         const LanguageModelMapKey cache_key = _get_cache_model_key(
             num_tokens, cache_model_token_idx, layer_idx
         );
-        auto& pre_model = _pre_model_map.at(model_key);
-        auto& cache_model = _cache_model_map.at(cache_key);
-        auto& post_model = _post_model_map.at(model_key);
+        auto& pre_model = _workspace->pre_model_map.at(model_key);
+        auto& cache_model = _workspace->cache_model_map.at(cache_key);
+        auto& post_model = _workspace->post_model_map.at(model_key);
 
         const bool is_sliding = layer_type == "sliding_attention";
-        auto& freq_real = get_buffer(is_sliding ? "local_freq_real" : "global_freq_real");
-        auto& freq_imag = get_buffer(is_sliding ? "local_freq_imag" : "global_freq_imag");
-        pre_model._bind_ifm(1, &freq_real, {0, 0});
-        pre_model._bind_ifm(2, &freq_imag, {0, 0});
+        LanguageExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
+            nullptr, 0, 0);
 
         const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
             num_tokens, cache_model_token_idx, layer_type
@@ -694,9 +569,8 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
             ifm_map_ptr = &layer0_ifm_map;
         }
 
-        pre_model.add_to_queue(ifm_map_ptr);
-        cache_model.add_to_queue(&cache_ifm_map);
-        post_model.add_to_queue(ifm_map_ptr);
+        LanguageExecutor::queue_attention({&pre_model, &cache_model, &post_model},
+            {.input = ifm_map_ptr, .cache = &cache_ifm_map, .post_input = ifm_map_ptr});
     }
 
     MLAModelWithBuffer::run_queue();
@@ -721,35 +595,18 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result
 ) {
+    LanguageExecutor::Run run(*this, &draft_lm);
     if (!_cfg.lm_cfg.is_gemma4_mtp_target()) {
         throw std::runtime_error("gemma4_mtp speculative decoding must run on the target model");
     }
-    if (!draft_lm._cfg.lm_cfg.is_gemma4_mtp_draft()) {
-        throw std::runtime_error("gemma4_mtp draft model is missing draft speculative config");
-    }
-    if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size) {
-        throw std::runtime_error("Gemma4 MTP target hidden size must match assistant backbone size");
-    }
+    attach_draft(draft_lm);
     if (input_token_ids.empty()) {
         throw std::runtime_error("Gemma4 MTP generation requires at least one input token");
     }
+    const auto draft_budget = draft_lm._cfg.lm_cfg.speculative_decoding_cfg->speculative_budget;
+    const auto verification_width = _cfg.lm_cfg.get_single_num_tokens();
+    const auto& shared_kv_layers = _workspace->mtp_shared_kv_layers;
 
-    const uint16_t draft_budget = draft_lm._cfg.lm_cfg.speculative_decoding_cfg
-        .value().speculative_budget;
-    const uint16_t verification_width = _cfg.lm_cfg.get_single_num_tokens();
-    if (draft_budget == 0 || verification_width != draft_budget + 1) {
-        throw std::runtime_error(fmt::format(
-            "Gemma4 MTP target width n{} must equal draft budget {} plus one",
-            verification_width, draft_budget
-        ));
-    }
-    if (draft_lm._cfg.lm_cfg.get_single_num_tokens() != 1) {
-        throw std::runtime_error("Gemma4 MTP assistant must use pointwise n1 execution");
-    }
-    const auto shared_kv_layers = draft_lm._prepare_gemma4_mtp_shared_kv_layers(*this);
-
-    _is_running = true;
-    draft_lm._is_running = true;
     if (performance_result != nullptr) {
         *performance_result = GenerationPerformanceResult{};
         performance_result->accepted_draft_tokens = 0;
@@ -758,253 +615,244 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         timer_ttft = ChronoTimer{true};
     }
 
-    const uint16_t original_max_num_tokens = set_max_num_tokens(override_max_num_tokens);
-    const uint16_t max_length = _max_num_tokens;
+    set_max_num_tokens(override_max_num_tokens);
+    const uint16_t max_length = _run->max_num_tokens;
     std::vector<uint32_t> input_ids(input_token_ids.begin(), input_token_ids.end());
     std::vector<uint32_t> output_token_ids;
     std::optional<std::vector<Eigen::bfloat16>> predecessor_hidden_state;
     bool cache_full = false;
     bool stopped = false;
 
-    try {
-        // Only committed target rows can be matched on the next request. The
-        // physical buffers can also contain rejected drafts or prefill padding.
-        if (_cached_token_ids.size() > _kv_cache_len) {
-            _cached_token_ids.resize(_kv_cache_len);
-        }
-        // The assistant consumes the selected target's KV; it has no reusable
-        // private KV or hidden state to restore between requests.
-        draft_lm._kv_cache_len = 0;
+    // Only committed target rows can be matched on the next request. The
+    // physical buffers can also contain rejected drafts or prefill padding.
+    if (_session->cached_token_ids.size() > _session->kv_cache_len) {
+        _session->cached_token_ids.resize(_session->kv_cache_len);
+    }
+    // The assistant consumes the selected target's KV; it has no reusable
+    // private KV or hidden state to restore between requests.
+    draft_lm._session->kv_cache_len = 0;
 
-        if (input_ids.size() >= max_length) {
-            cache_full = true;
-        } else {
-            // Decode stages arbitrary positions over the start of the RoPE
-            // tables. Restore those rows before prefilling another request.
-            _upload_gemma4_mtp_freq_rows(verification_width, 0, verification_width);
-            const auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
-            // Even a complete prefix match needs a fresh next-token result because
-            // first_generated_token may belong to an earlier, shorter prompt.
-            // Recomputing the last prefill group also captures its final hidden row.
-            const auto prefill_cached_tokens = std::min<uint16_t>(
-                num_cached_tokens, static_cast<uint16_t>(input_token_ids.size() - 1)
+    if (input_ids.size() >= max_length) {
+        cache_full = true;
+    } else {
+        // Decode stages arbitrary positions over the start of the RoPE
+        // tables. Restore those rows before prefilling another request.
+        _upload_gemma4_mtp_freq_rows(verification_width, 0, verification_width);
+        const auto num_cached_tokens = _set_input_text_embeds(input_token_ids);
+        // Even a complete prefix match needs a fresh next-token result because
+        // first_generated_token may belong to an earlier, shorter prompt.
+        // Recomputing the last prefill group also captures its final hidden row.
+        const auto prefill_cached_tokens = std::min<uint16_t>(
+            num_cached_tokens, static_cast<uint16_t>(input_token_ids.size() - 1)
+        );
+        _workspace->gemma4_mtp_prefill_hidden_state.reset();
+        const auto first_begin = std::chrono::steady_clock::now();
+        auto first_token = run_model_prefill(
+            input_token_ids,
+            prefill_cached_tokens,
+            timer_ttft
+        );
+        const double first_duration = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - first_begin
+        ).count();
+        if (!_run->cancelled.load(std::memory_order_relaxed)) {
+            _session->kv_cache_len = checked_u16(
+                input_ids.size(), "Gemma4 MTP prompt length"
             );
-            _gemma4_mtp_prefill_hidden_state.reset();
-            const auto first_begin = std::chrono::steady_clock::now();
-            auto first_token = run_model_prefill(
-                input_token_ids,
-                prefill_cached_tokens,
-                timer_ttft
-            );
-            const double first_duration = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - first_begin
-            ).count();
-            if (_is_running.load(std::memory_order_relaxed)) {
-                _kv_cache_len = checked_u16(
-                    input_ids.size(), "Gemma4 MTP prompt length"
-                );
 
-                output_token_ids.push_back(first_token);
-                input_ids.push_back(first_token);
-                if (performance_result != nullptr) {
-                    performance_result->token_durations.emplace_back(first_duration);
-                    performance_result->generated_tokens = 1;
-                }
+            output_token_ids.push_back(first_token);
+            input_ids.push_back(first_token);
+            if (performance_result != nullptr) {
+                performance_result->token_durations.emplace_back(first_duration);
+                performance_result->generated_tokens = 1;
+            }
 
-                if (_stop_token_ids.contains(first_token)) {
-                    stopped = true;
-                }
+            if (_run->stop_token_ids.contains(first_token)) {
+                stopped = true;
+            }
 
-                if (!stopped && input_ids.size() < max_length) {
-                    if (!_gemma4_mtp_prefill_hidden_state.has_value()) {
-                        throw std::runtime_error(
-                            "Gemma4 MTP prefill did not capture the final target hidden state"
-                        );
-                    }
-                    predecessor_hidden_state = std::move(
-                        _gemma4_mtp_prefill_hidden_state.value()
+            if (!stopped && input_ids.size() < max_length) {
+                if (!_workspace->gemma4_mtp_prefill_hidden_state.has_value()) {
+                    throw std::runtime_error(
+                        "Gemma4 MTP prefill did not capture the final target hidden state"
                     );
-                    _gemma4_mtp_prefill_hidden_state.reset();
                 }
+                predecessor_hidden_state = std::move(
+                    _workspace->gemma4_mtp_prefill_hidden_state.value()
+                );
+                _workspace->gemma4_mtp_prefill_hidden_state.reset();
+            }
+        }
+    }
+
+    auto commit_processed_prefix = [&](size_t processed_tokens) {
+        const auto processed_end = input_ids.begin()
+            + static_cast<std::ptrdiff_t>(processed_tokens);
+        _session->cached_token_ids.assign(input_ids.begin(), processed_end);
+        _session->kv_cache_len = checked_u16(
+            processed_tokens, "Gemma4 MTP committed KV length"
+        );
+        draft_lm._session->kv_cache_len = 0;
+    };
+
+    uint16_t target_shared_kv_available_len = _session->kv_cache_len;
+
+    while (
+        !cache_full && !stopped
+        && !_run->cancelled.load(std::memory_order_relaxed)
+        && input_ids.size() < max_length
+    ) {
+        const auto round_begin = std::chrono::steady_clock::now();
+        const uint16_t current_pos = checked_u16(
+            input_ids.size() - 1, "Gemma4 MTP current position"
+        );
+        const uint32_t current_token = input_ids.back();
+        const size_t remaining_output_tokens = max_length - input_ids.size();
+        // Reserve one output slot for the target mismatch or bonus token.
+        // With one slot remaining, verify the anchor without drafting.
+        const uint16_t round_draft_tokens = static_cast<uint16_t>(std::min<size_t>(
+            draft_budget, remaining_output_tokens - 1
+        ));
+
+        const bool verification_fits = (
+            static_cast<size_t>(current_pos) + verification_width
+            <= _cfg.pipeline_cfg.max_num_tokens
+        );
+        if (!verification_fits) {
+            cache_full = true;
+            break;
+        }
+
+        std::vector<uint32_t> draft_token_ids;
+        draft_token_ids.reserve(round_draft_tokens);
+        if (round_draft_tokens > 0) {
+            if (!predecessor_hidden_state.has_value()) {
+                throw std::runtime_error(
+                    "Gemma4 MTP is missing the preceding target hidden state"
+                );
+            }
+            uint32_t draft_input_token = current_token;
+            std::vector<Eigen::bfloat16> draft_hidden = std::move(
+                predecessor_hidden_state.value()
+            );
+            predecessor_hidden_state.reset();
+            const uint16_t query_position_id =
+                gemma4_mtp_helpers::draft_query_position(
+                    input_ids.size(), _cfg.pipeline_cfg.max_num_tokens
+                );
+            const uint16_t shared_kv_len =
+                gemma4_mtp_helpers::draft_visible_shared_kv_len(
+                    input_ids.size(),
+                    target_shared_kv_available_len,
+                    _cfg.pipeline_cfg.max_num_tokens
+                );
+            while (draft_token_ids.size() < round_draft_tokens
+                   && !_run->cancelled.load(std::memory_order_relaxed)) {
+                auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
+                    *this,
+                    shared_kv_layers,
+                    draft_input_token,
+                    draft_hidden,
+                    query_position_id,
+                    shared_kv_len
+                );
+                draft_input_token = draft_step.token_id;
+                draft_hidden = std::move(draft_step.projected_hidden_state);
+                draft_token_ids.emplace_back(draft_step.token_id);
             }
         }
 
-        auto commit_processed_prefix = [&](size_t processed_tokens) {
-            const auto processed_end = input_ids.begin()
-                + static_cast<std::ptrdiff_t>(processed_tokens);
-            _cached_token_ids.assign(input_ids.begin(), processed_end);
-            _kv_cache_len = checked_u16(
-                processed_tokens, "Gemma4 MTP committed KV length"
-            );
-            draft_lm._kv_cache_len = 0;
-        };
+        if (_run->cancelled.load(std::memory_order_relaxed))
+            break;
 
-        uint16_t target_shared_kv_available_len = _kv_cache_len;
-
-        while (
-            !cache_full && !stopped
-            && _is_running.load(std::memory_order_relaxed)
-            && input_ids.size() < max_length
+        std::vector<uint32_t> verification_tokens;
+        verification_tokens.reserve(verification_width);
+        verification_tokens.emplace_back(current_token);
+        verification_tokens.insert(
+            verification_tokens.end(),
+            draft_token_ids.begin(), draft_token_ids.end()
+        );
+        auto verification = _run_gemma4_mtp_target_batch(
+            current_pos, verification_tokens
+        );
+        if (_run->cancelled.load(std::memory_order_relaxed))
+            break;
+        target_shared_kv_available_len = _session->kv_cache_len;
+        const size_t meaningful_verification_rows = draft_token_ids.size() + 1;
+        if (
+            verification.next_token_ids.empty()
+            || verification.next_token_ids.size() > meaningful_verification_rows
+            || verification.hidden_states.size()
+                != verification.next_token_ids.size() * _cfg.lm_cfg.hidden_size
         ) {
-            const auto round_begin = std::chrono::steady_clock::now();
-            const uint16_t current_pos = checked_u16(
-                input_ids.size() - 1, "Gemma4 MTP current position"
+            throw std::runtime_error(
+                "Invalid Gemma4 MTP target verification output"
             );
-            const uint32_t current_token = input_ids.back();
-            const size_t remaining_output_tokens = max_length - input_ids.size();
-            // Reserve one output slot for the target mismatch or bonus token.
-            // With one slot remaining, verify the anchor without drafting.
-            const uint16_t round_draft_tokens = static_cast<uint16_t>(std::min<size_t>(
-                draft_budget, remaining_output_tokens - 1
-            ));
+        }
 
-            const bool verification_fits = (
-                static_cast<size_t>(current_pos) + verification_width
-                <= _cfg.pipeline_cfg.max_num_tokens
-            );
-            if (!verification_fits) {
+        auto emitted_tokens = gemma4_mtp_helpers::resolve_draft_tokens(
+            draft_token_ids, verification.next_token_ids
+        );
+
+        uint16_t accepted_this_round = 0;
+        size_t emitted_count = 0;
+        for (const auto& [emitted, accepted] : emitted_tokens) {
+            if (input_ids.size() >= max_length) {
                 cache_full = true;
                 break;
             }
-
-            std::vector<uint32_t> draft_token_ids;
-            draft_token_ids.reserve(round_draft_tokens);
-            if (round_draft_tokens > 0) {
-                if (!predecessor_hidden_state.has_value()) {
-                    throw std::runtime_error(
-                        "Gemma4 MTP is missing the preceding target hidden state"
-                    );
-                }
-                uint32_t draft_input_token = current_token;
-                std::vector<Eigen::bfloat16> draft_hidden = std::move(
-                    predecessor_hidden_state.value()
-                );
-                predecessor_hidden_state.reset();
-                const uint16_t query_position_id =
-                    gemma4_mtp_helpers::draft_query_position(
-                        input_ids.size(), _cfg.pipeline_cfg.max_num_tokens
-                    );
-                const uint16_t shared_kv_len =
-                    gemma4_mtp_helpers::draft_visible_shared_kv_len(
-                        input_ids.size(),
-                        target_shared_kv_available_len,
-                        _cfg.pipeline_cfg.max_num_tokens
-                    );
-                while (draft_token_ids.size() < round_draft_tokens) {
-                    auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
-                        *this,
-                        shared_kv_layers,
-                        draft_input_token,
-                        draft_hidden,
-                        query_position_id,
-                        shared_kv_len
-                    );
-                    draft_input_token = draft_step.token_id;
-                    draft_hidden = std::move(draft_step.projected_hidden_state);
-                    draft_token_ids.emplace_back(draft_step.token_id);
-                }
+            output_token_ids.emplace_back(emitted);
+            input_ids.emplace_back(emitted);
+            ++emitted_count;
+            if (accepted) {
+                ++accepted_this_round;
             }
 
-            std::vector<uint32_t> verification_tokens;
-            verification_tokens.reserve(verification_width);
-            verification_tokens.emplace_back(current_token);
-            verification_tokens.insert(
-                verification_tokens.end(),
-                draft_token_ids.begin(), draft_token_ids.end()
-            );
-            auto verification = _run_gemma4_mtp_target_batch(
-                current_pos, verification_tokens
-            );
-            target_shared_kv_available_len = _kv_cache_len;
-            const size_t meaningful_verification_rows = draft_token_ids.size() + 1;
-            if (
-                verification.next_token_ids.empty()
-                || verification.next_token_ids.size() > meaningful_verification_rows
-                || verification.hidden_states.size()
-                    != verification.next_token_ids.size() * _cfg.lm_cfg.hidden_size
-            ) {
-                throw std::runtime_error(
-                    "Invalid Gemma4 MTP target verification output"
-                );
+            if (_run->stop_token_ids.contains(emitted)) {
+                stopped = true;
+                break;
             }
-
-            auto emitted_tokens = gemma4_mtp_helpers::resolve_draft_tokens(
-                draft_token_ids, verification.next_token_ids
-            );
-
-            uint16_t accepted_this_round = 0;
-            size_t emitted_count = 0;
-            for (const auto& [emitted, accepted] : emitted_tokens) {
-                if (input_ids.size() >= max_length) {
-                    cache_full = true;
-                    break;
-                }
-                output_token_ids.emplace_back(emitted);
-                input_ids.emplace_back(emitted);
-                ++emitted_count;
-                if (accepted) {
-                    ++accepted_this_round;
-                }
-
-                if (_stop_token_ids.contains(emitted)) {
-                    stopped = true;
-                    break;
-                }
-                if (input_ids.size() >= max_length) {
-                    cache_full = true;
-                    break;
-                }
+            if (input_ids.size() >= max_length) {
+                cache_full = true;
+                break;
             }
-            emitted_tokens.resize(emitted_count);
+        }
+        emitted_tokens.resize(emitted_count);
 
-            const size_t processed_tokens = static_cast<size_t>(current_pos) + 1
-                + accepted_this_round;
-            commit_processed_prefix(processed_tokens);
-            const size_t predecessor_hidden_begin = static_cast<size_t>(
-                accepted_this_round
-            ) * _cfg.lm_cfg.hidden_size;
-            predecessor_hidden_state = std::vector<Eigen::bfloat16>(
-                verification.hidden_states.begin() + predecessor_hidden_begin,
-                verification.hidden_states.begin()
-                    + predecessor_hidden_begin + _cfg.lm_cfg.hidden_size
-            );
+        const size_t processed_tokens = static_cast<size_t>(current_pos) + 1
+            + accepted_this_round;
+        commit_processed_prefix(processed_tokens);
+        const size_t predecessor_hidden_begin = static_cast<size_t>(
+            accepted_this_round
+        ) * _cfg.lm_cfg.hidden_size;
+        predecessor_hidden_state = std::vector<Eigen::bfloat16>(
+            verification.hidden_states.begin() + predecessor_hidden_begin,
+            verification.hidden_states.begin()
+                + predecessor_hidden_begin + _cfg.lm_cfg.hidden_size
+        );
 
-            const double round_duration = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - round_begin
-            ).count();
-            const double per_token = round_duration
-                / static_cast<double>(emitted_tokens.size());
-            for (const auto& [token, from_draft] : emitted_tokens) {
-                _notify_new_token(token, per_token, from_draft);
-                if (performance_result != nullptr) {
-                    performance_result->token_durations.emplace_back(per_token);
-                    ++performance_result->generated_tokens;
-                    if (from_draft) {
-                        ++performance_result->accepted_draft_tokens.value();
-                    }
+        const double round_duration = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - round_begin
+        ).count();
+        const double per_token = round_duration
+            / static_cast<double>(emitted_tokens.size());
+        for (const auto& [token, from_draft] : emitted_tokens) {
+            if (_run->cancelled.load(std::memory_order_relaxed))
+                break;
+            _notify_new_token(token, per_token, from_draft);
+            if (performance_result != nullptr) {
+                performance_result->token_durations.emplace_back(per_token);
+                ++performance_result->generated_tokens;
+                if (from_draft) {
+                    ++performance_result->accepted_draft_tokens.value();
                 }
             }
         }
-    } catch (...) {
-        _cached_token_ids.clear();
-        _kv_cache_len = 0;
-        draft_lm._kv_cache_len = 0;
-        _is_running = false;
-        draft_lm._is_running = false;
-        set_max_num_tokens(original_max_num_tokens);
-        _text_streamer.push(DecodeCallbackType::STOP, 0, 0);
-        _text_streamer.wait_streaming();
-        throw;
     }
 
-    if (!_is_running.load(std::memory_order_relaxed)) {
-        _cached_token_ids.clear();
-        _kv_cache_len = 0;
-        draft_lm._kv_cache_len = 0;
+    if (_run->cancelled.load(std::memory_order_relaxed)) {
         _notify_interrupt();
-        _text_streamer.wait_streaming();
-        draft_lm._is_running = false;
-        set_max_num_tokens(original_max_num_tokens);
+        run.complete();
         return std::nullopt;
     }
 
@@ -1013,12 +861,9 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     } else {
         _notify_stop();
     }
-    _text_streamer.wait_streaming();
-
-    _is_running = false;
-    draft_lm._is_running = false;
-    set_max_num_tokens(original_max_num_tokens);
-    return output_token_ids;
+    run.complete();
+    return _run->cancelled.load(std::memory_order_relaxed) ? std::nullopt
+                                                        : std::optional(std::move(output_token_ids));
 }
 
 } // namespace llima

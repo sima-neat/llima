@@ -22,7 +22,7 @@ RopeTable calc_freq_real_imag(
     double theta,
     uint16_t rope_dimension_count,
     uint16_t layer_head_dim,
-    RopeScalingConfig& rope_scaling_cfg
+    const RopeScalingConfig& rope_scaling_cfg
 );
 
 

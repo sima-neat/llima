@@ -87,3 +87,8 @@ add_test(runtime.file_provider "./sima_lmm_file_provider_test")
 set_tests_properties(runtime.file_provider PROPERTIES LABELS "devkit;runtime;provider" TIMEOUT 30)
 add_test(runtime.file_provider_routing "./sima_lmm_file_provider_routing_test")
 set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;runtime;long" RESOURCE_LOCK mla TIMEOUT 900)
+
+add_test(runtime.session_generation "./sima_lmm_session_generation_test")
+set_tests_properties(runtime.session_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
+add_test(runtime.program_lifetime "./sima_lmm_runtime_program_lifetime_test")
+set_tests_properties(runtime.program_lifetime PROPERTIES LABELS "devkit;runtime" RESOURCE_LOCK mla TIMEOUT 120)

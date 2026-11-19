@@ -1,18 +1,20 @@
 #ifndef _SIMA_LLIMA_WHISPER_MODEL_
 #define _SIMA_LLIMA_WHISPER_MODEL_
 
+#include <cstdint>
 #include <filesystem>
 #include <istream>
 #include <map>
 #include <memory>
 #include <optional>
 #include <tuple>
-#include <atomic>
-#include <mutex>
 #include <span>
+#include <string>
+#include <variant>
 #include <vector>
 
 #include <fftw3.h>
+#include <spdlog/logger.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -21,8 +23,10 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
-#include "base_model.hpp"
 #include "eigen_types.hpp"
+#include "file_provider.hpp"
+#include "mla_buffer.hpp"
+#include "mla_model.hpp"
 #include "text_streamer.hpp"
 #include "tokenizer.hpp"
 #include "whisper_config.hpp"
@@ -31,6 +35,9 @@ extern "C" {
 namespace simaai {
 namespace llima {
 
+
+struct WhisperPreprocessResources;
+struct WhisperWorkspace;
 
 class WhisperPreprocessor {
     public:
@@ -49,12 +56,14 @@ class WhisperPreprocessor {
         static constexpr uint32_t N_FRAMES = N_SAMPLES / HOP_LENGTH;
 
     private:
+        friend struct WhisperWorkspace;
+        WhisperPreprocessor(std::shared_ptr<FileProvider> files, std::filesystem::path identity);
         explicit WhisperPreprocessor(std::unique_ptr<std::istream> config);
+        explicit WhisperPreprocessor(std::shared_ptr<const WhisperPreprocessResources> resources);
         ArrayXf _load_audio_ffmpeg(const std::filesystem::path& audio_file_name);
         ArrayXXbf _log_mel_spectrogram(ArrayXf& audio_tensor);
 
-        ArrayXXd _mel_filters;
-        ArrayXd _hanning_window;
+        std::shared_ptr<const WhisperPreprocessResources> _resources;
         ArrayXf _padded_audio_tensor;
         double* _fft_in;
         fftw_complex* _fft_out;
@@ -66,7 +75,16 @@ class WhisperPreprocessor {
 using WhisperDecoderModelMapKey = std::tuple<uint8_t, uint16_t>;
 using WhisperDecoderModelMap = std::map<WhisperDecoderModelMapKey, MLAModelWithBuffer>;
 
-class WhisperModel : public BaseModel<WhisperConfig> {
+template<class Config> struct ModelResources;
+
+struct TranscriptionOptions {
+    std::string language = "en";
+    std::string task = "transcribe";
+    std::optional<TextStreamer::InfoCallback> info_callback;
+    std::optional<TextStreamer::TextCallback> text_callback;
+};
+
+class WhisperModel {
     public:
         struct TranscriptionResult {
             std::string text;
@@ -78,7 +96,7 @@ class WhisperModel : public BaseModel<WhisperConfig> {
 
         WhisperModel(std::filesystem::path model_path);
         WhisperModel(std::filesystem::path model_path, std::shared_ptr<FileProvider> files);
-        virtual ~WhisperModel() { _finalize(); };
+        virtual ~WhisperModel();
 
         TranscriptionResult run_model(
             const std::filesystem::path& audio_file_name,
@@ -91,30 +109,38 @@ class WhisperModel : public BaseModel<WhisperConfig> {
             const std::string& language,
             const std::string& task = "transcribe"
         );
-        void set_info_callback(TextStreamer::InfoCallback callback) {
-            _text_streamer->set_info_callback(callback);
-        }
-        void set_text_callback(TextStreamer::TextCallback callback) {
-            _text_streamer->set_text_callback(callback);
-        }
-        void set_performance_summary_enabled(bool enabled) {
-            _text_streamer->set_performance_summary_enabled(enabled);
-        }
-        void wait_for_streamer_completion() {
-            _text_streamer->wait_streaming();
-        }
+        TranscriptionResult run_model(const std::filesystem::path& audio_file,
+                                      const TranscriptionOptions& options);
+        TranscriptionResult run_model_from_pcm(std::span<const float> pcm, uint32_t sample_rate,
+                                               const TranscriptionOptions& options);
+        void set_info_callback(TextStreamer::InfoCallback callback);
+        void set_text_callback(TextStreamer::TextCallback callback);
+        void set_performance_summary_enabled(bool enabled);
+        void wait_for_streamer_completion();
         void stop_model();
 
     private:
-        virtual void _initialize() override;
-        virtual void _finalize() override;
+        std::shared_ptr<ModelResources<WhisperConfig>> _resources;
+        const WhisperConfig& _cfg;
+        const std::filesystem::path& _elf_dir;
+        const std::filesystem::path& _devkit_dir;
+        const std::shared_ptr<FileProvider>& _files;
+        std::shared_ptr<spdlog::logger> _logger;
+        std::unique_ptr<WhisperWorkspace> _workspace;
+        void define_buffer(const std::string& name, const std::vector<size_t>& shape,
+                           const std::string& dtype = "bfloat16", bool align_last_dim = true);
+        void _define_resource_buffer(const std::string& name, const std::vector<size_t>& shape);
+        MLABuffer& get_buffer(const std::string& name);
+
+        void _initialize();
+        void _finalize();
         TranscriptionResult _run_model(
             const ArrayXXbf& mel,
             const std::string& language,
             const std::string& task
         );
 
-        virtual void _define_buffers() override;
+        void _define_buffers();
         void _define_model(
             const std::string& model_type,
             std::variant<std::monostate, uint8_t, WhisperDecoderModelMapKey> key,
@@ -145,21 +171,8 @@ class WhisperModel : public BaseModel<WhisperConfig> {
         std::string _update_language(const std::string& language);
         std::string _update_task(const std::string& task);
         
-        std::mutex _mutex;
 
-        WhisperPreprocessor _preprocessor;
-        std::unique_ptr<Tokenizer> _tokenizer_ptr;
-        std::unique_ptr<TextStreamer> _text_streamer;
-        std::atomic<bool> _is_running;
 
-        std::map<uint8_t, MLAModelWithBuffer> _encoder_layer_model_map;
-        std::unique_ptr<MLAModelWithBuffer> _decoder_language_detect_model_ptr;
-        std::map<uint8_t, MLAModelWithBuffer> _decoder_init_model_map;
-        WhisperDecoderModelMap _decoder_pre_model_map;
-        WhisperDecoderModelMap _decoder_cache_model_map;
-        WhisperDecoderModelMap _decoder_post_model_map;
-        std::vector<uint32_t> _input_token_ids;
-        uint32_t _stop_token_id;
 
         static const std::map<std::string, std::string> _TO_LANGUAGE_CODE;
 };

@@ -1,9 +1,14 @@
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <exception>
 #include <iterator>
 #include <iostream>
 #include <limits>
+#include <mutex>
+#include <numbers>
 #include <stdexcept>
+#include <utility>
 
 #include <cnpy.h>
 #include <fmt/ranges.h>
@@ -13,40 +18,85 @@
 
 #include "utils.hpp"
 #include "whisper_model.hpp"
+#include "model_resources.hpp"
+#include "runtime_context.hpp"
 
 
 namespace simaai {
 namespace llima {
 
+struct WhisperWorkspace {
+    WhisperWorkspace(std::shared_ptr<FileProvider> files, const std::filesystem::path& identity)
+        : preprocessor(std::move(files), identity), is_running(false) {}
+    std::map<std::string, MLABuffer> buffers;
+    std::mutex mutex;
+    WhisperPreprocessor preprocessor;
+    std::unique_ptr<Tokenizer> tokenizer_ptr;
+    std::unique_ptr<TextStreamer> text_streamer;
+    std::atomic<bool> is_running;
+    std::map<uint8_t, MLAModelWithBuffer> encoder_layer_model_map;
+    std::unique_ptr<MLAModelWithBuffer> decoder_language_detect_model_ptr;
+    std::map<uint8_t, MLAModelWithBuffer> decoder_init_model_map;
+    WhisperDecoderModelMap decoder_pre_model_map;
+    WhisperDecoderModelMap decoder_cache_model_map;
+    WhisperDecoderModelMap decoder_post_model_map;
+    std::vector<uint32_t> input_token_ids;
+    uint32_t stop_token_id;
+};
+
+namespace {
+std::mutex& fftw_planner_mutex() { static std::mutex mutex; return mutex; }
+}
+
+struct WhisperPreprocessResources {
+    explicit WhisperPreprocessResources(std::unique_ptr<std::istream> config,
+                                        std::shared_ptr<FileProvider> provider = nullptr)
+        : files(std::move(provider)) {
+        const auto filters = nlohmann::json::parse(*config).at("mel_filters");
+        mel_filters.resize(filters.size(), filters[0].size());
+        for (uint32_t i = 0; i < filters.size(); ++i) {
+            mel_filters.row(i) = Eigen::Map<Eigen::RowVectorXd>(
+                filters[i].get<std::vector<double>>().data(), filters[i].size());
+        }
+        hanning_window.resize(WhisperPreprocessor::N_FFT);
+        for (uint32_t i = 0; i < WhisperPreprocessor::N_FFT; ++i)
+            hanning_window[i] = 0.5 - 0.5 * std::cos(
+                2.0 * std::numbers::pi * i / WhisperPreprocessor::N_FFT);
+    }
+    WhisperPreprocessResources(const std::filesystem::path&,
+                               std::shared_ptr<FileProvider> provider)
+        : WhisperPreprocessResources(
+              provider->open_stream("devkit/preprocessor_config.json"), provider) {}
+    std::shared_ptr<FileProvider> files;
+    ArrayXXd mel_filters;
+    ArrayXd hanning_window;
+};
+
 WhisperPreprocessor::WhisperPreprocessor(const std::filesystem::path& devkit_dir)
     : WhisperPreprocessor(DiskFileProvider(devkit_dir).open_stream("preprocessor_config.json")) {}
 
 WhisperPreprocessor::WhisperPreprocessor(std::shared_ptr<FileProvider> files)
-    : WhisperPreprocessor(files->open_stream("devkit/preprocessor_config.json")) {}
+    : WhisperPreprocessor(std::make_shared<WhisperPreprocessResources>(
+          files->open_stream("devkit/preprocessor_config.json"), files)) {}
 
-WhisperPreprocessor::WhisperPreprocessor(std::unique_ptr<std::istream> config) {
-    // Load mel filters.
-    auto json = nlohmann::json::parse(*config);
-    auto mel_filters_json = json["mel_filters"];
-    _mel_filters.resize(mel_filters_json.size(), mel_filters_json[0].size());
-    for (uint32_t i = 0; i < mel_filters_json.size(); ++i) {
-        _mel_filters.row(i) = Eigen::Map<Eigen::RowVectorXd>(
-            mel_filters_json[i].get<std::vector<double>>().data(), mel_filters_json[i].size()
-        );
-    }
+WhisperPreprocessor::WhisperPreprocessor(std::shared_ptr<FileProvider> files,
+                                       std::filesystem::path identity)
+    : WhisperPreprocessor(acquire_package_resource<WhisperPreprocessResources>(
+          identity, std::move(files))) {}
 
-    // Precompute the periodic Hann window used by Transformers/OpenAI Whisper.
-    _hanning_window.resize(N_FFT);
-    for (uint32_t i = 0; i < N_FFT; ++i)
-        _hanning_window[i] = 0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * i / N_FFT);
+WhisperPreprocessor::WhisperPreprocessor(std::unique_ptr<std::istream> config)
+    : WhisperPreprocessor(std::make_shared<WhisperPreprocessResources>(std::move(config))) {}
 
+WhisperPreprocessor::WhisperPreprocessor(std::shared_ptr<const WhisperPreprocessResources> resources)
+    : _resources(std::move(resources)) {
     _padded_audio_tensor.resize(N_SAMPLES + N_FFT);
 
     // FFT.
     _fft_in = fftw_alloc_real(N_FFT);
     if (!_fft_in) throw std::bad_alloc();
     _fft_out = fftw_alloc_complex(N_FRAMES * (N_FFT / 2 + 1));
-    if (!_fft_out) throw std::bad_alloc();
+    if (!_fft_out) { fftw_free(_fft_in); throw std::bad_alloc(); }
+    std::lock_guard planner_lock(fftw_planner_mutex());
     _fft_plan = fftw_plan_dft_r2c_1d(N_FFT, _fft_in, _fft_out, FFTW_PATIENT);
     if (!_fft_plan) {
         fftw_free(_fft_in);
@@ -57,6 +107,7 @@ WhisperPreprocessor::WhisperPreprocessor(std::unique_ptr<std::istream> config) {
 
 
 WhisperPreprocessor::~WhisperPreprocessor() {
+    std::lock_guard planner_lock(fftw_planner_mutex());
     fftw_free(_fft_in);
     fftw_free(_fft_out);
     fftw_destroy_plan(_fft_plan);
@@ -201,7 +252,7 @@ ArrayXXbf WhisperPreprocessor::_log_mel_spectrogram(ArrayXf& audio_tensor) {
     Eigen::Map<Eigen::ArrayXd> fft_in_map(_fft_in, N_FFT);
     for (uint32_t i = 0; i < N_FRAMES; ++i) {
         fft_in_map = (
-            _padded_audio_tensor.segment(i * HOP_LENGTH, N_FFT).cast<double>() * _hanning_window
+            _padded_audio_tensor.segment(i * HOP_LENGTH, N_FFT).cast<double>() * _resources->hanning_window
         );
         fftw_execute_dft_r2c(_fft_plan, _fft_in, _fft_out + i * (N_FFT / 2 + 1));
     }
@@ -211,7 +262,7 @@ ArrayXXbf WhisperPreprocessor::_log_mel_spectrogram(ArrayXf& audio_tensor) {
 
     // Post process.
     ArrayXXd tmp = (
-        (stft_result.abs2().matrix() * _mel_filters.matrix().transpose())
+        (stft_result.abs2().matrix() * _resources->mel_filters.matrix().transpose())
         .array().cwiseMax(1e-10).log10()
     );
     return ((tmp.cwiseMax(tmp.maxCoeff() - 8.0) + 4.0) / 4.0).cast<Eigen::bfloat16>();
@@ -247,52 +298,138 @@ const std::map<std::string, std::string> WhisperModel::_TO_LANGUAGE_CODE = {
 };
 
 
+WhisperModel::~WhisperModel() { _finalize(); }
+
+void WhisperModel::define_buffer(const std::string& name, const std::vector<size_t>& shape,
+                                const std::string& dtype, bool align_last_dim) {
+    _workspace->buffers.try_emplace(name, name, shape, dtype, align_last_dim);
+}
+void WhisperModel::_define_resource_buffer(const std::string& name, const std::vector<size_t>& shape) {
+    _resources->buffers.try_emplace(name, name, shape, "bfloat16", true);
+}
+MLABuffer& WhisperModel::get_buffer(const std::string& name) {
+    if (auto it = _workspace->buffers.find(name); it != _workspace->buffers.end()) return it->second;
+    return _resources->buffers.at(name);
+}
+
+void WhisperModel::set_info_callback(TextStreamer::InfoCallback callback) {
+    std::unique_lock lock(_workspace->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) throw std::logic_error("ASR defaults cannot change during a request");
+    _workspace->text_streamer->set_info_callback(callback);
+}
+
+void WhisperModel::set_text_callback(TextStreamer::TextCallback callback) {
+    std::unique_lock lock(_workspace->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) throw std::logic_error("ASR defaults cannot change during a request");
+    _workspace->text_streamer->set_text_callback(callback);
+}
+
+void WhisperModel::set_performance_summary_enabled(bool enabled) {
+    std::unique_lock lock(_workspace->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) throw std::logic_error("ASR defaults cannot change during a request");
+    _workspace->text_streamer->set_performance_summary_enabled(enabled);
+}
+
+void WhisperModel::wait_for_streamer_completion() {
+    _workspace->text_streamer->wait_streaming();
+}
+
 WhisperModel::WhisperModel(std::filesystem::path model_path)
     : WhisperModel(std::move(model_path), nullptr) {}
 
 WhisperModel::WhisperModel(std::filesystem::path model_path, std::shared_ptr<FileProvider> files)
-    : BaseModel(model_path, std::move(files)),
-    _preprocessor(_files),
-    _is_running(false)
+    : _resources(ModelResources<WhisperConfig>::acquire(model_path, std::move(files))),
+    _cfg(_resources->cfg),
+    _elf_dir(_resources->elf_dir),
+    _devkit_dir(_resources->devkit_dir),
+    _files(_resources->files),
+    _logger(_resources->logger),
+    _workspace(std::make_unique<WhisperWorkspace>(_files, model_path))
 {
-    _tokenizer_ptr = Tokenizer::from_hf_json(_files->get_path("devkit/tokenizer.json"));
+    _workspace->tokenizer_ptr = Tokenizer::from_hf_json(_files->get_path("devkit/tokenizer.json"));
     _files->release("devkit/tokenizer.json");
-    _text_streamer = std::make_unique<TextStreamer>(
-        _tokenizer_ptr.get(),
+    _workspace->text_streamer = std::make_unique<TextStreamer>(
+        _workspace->tokenizer_ptr.get(),
         [](const std::string&, double) {},
         [](const std::string&, bool, bool) {}
     );
     _initialize();
 
     // Run one dummy query to cache the system prompt and warm up other libraries.
-    _text_streamer->disable();
+    _workspace->text_streamer->disable();
     run_model(sample_audio_file_name.value(), "en");
-    _text_streamer->enable();
+    _workspace->text_streamer->enable();
 }
 
+
+namespace {
+class WhisperRequest {
+public:
+    WhisperRequest(WhisperWorkspace& workspace, const TranscriptionOptions& options)
+        : _workspace(workspace), _workspace_lock(workspace.mutex),
+          _exceptions(std::uncaught_exceptions()),
+          _callbacks(_workspace.text_streamer->callbacks()) {
+        try {
+            if (options.info_callback) _workspace.text_streamer->set_info_callback(*options.info_callback);
+            if (options.text_callback) _workspace.text_streamer->set_text_callback(*options.text_callback);
+            _workspace.is_running.store(true, std::memory_order_relaxed);
+            _workspace.text_streamer->begin();
+        } catch (...) {
+            restore();
+            throw;
+        }
+    }
+    void complete() { _workspace.text_streamer->finish(); }
+    ~WhisperRequest() {
+        if (std::uncaught_exceptions() > _exceptions) MLAModelWithBuffer::discard_queue();
+        try { complete(); } catch (...) {}
+        restore();
+    }
+private:
+    void restore() {
+        _workspace.text_streamer->set_info_callback(std::move(_callbacks.first));
+        _workspace.text_streamer->set_text_callback(std::move(_callbacks.second));
+        _workspace.is_running.store(false, std::memory_order_relaxed);
+    }
+    WhisperWorkspace& _workspace;
+    std::unique_lock<std::mutex> _workspace_lock;
+    int _exceptions;
+    std::pair<TextStreamer::InfoCallback, TextStreamer::TextCallback> _callbacks;
+};
+}
 
 WhisperModel::TranscriptionResult WhisperModel::run_model(
-    const std::filesystem::path& audio_file_name,
-    const std::string& language,
-    const std::string& task
+    const std::filesystem::path& audio_file, const std::string& language, const std::string& task
 ) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _logger->info("Audio file: {}", audio_file_name);
-
-    ArrayXXbf audio_tensor = _preprocessor.preprocess(audio_file_name);
-    return _run_model(audio_tensor, language, task);
+    return run_model(audio_file, TranscriptionOptions{language, task});
 }
 
+WhisperModel::TranscriptionResult WhisperModel::run_model_from_pcm(
+    std::span<const float> pcm, uint32_t sample_rate,
+    const std::string& language, const std::string& task
+) {
+    return run_model_from_pcm(pcm, sample_rate, TranscriptionOptions{language, task});
+}
+
+WhisperModel::TranscriptionResult WhisperModel::run_model(
+    const std::filesystem::path& audio_file, const TranscriptionOptions& options
+) {
+    WhisperRequest request(*_workspace, options);
+    _logger->info("Audio file: {}", audio_file);
+    auto mel = _workspace->preprocessor.preprocess(audio_file);
+    auto result = _run_model(mel, options.language, options.task);
+    request.complete();
+    return result;
+}
 
 WhisperModel::TranscriptionResult WhisperModel::run_model_from_pcm(
-    std::span<const float> pcm,
-    uint32_t sample_rate,
-    const std::string& language,
-    const std::string& task
+    std::span<const float> pcm, uint32_t sample_rate, const TranscriptionOptions& options
 ) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    ArrayXXbf mel = _preprocessor.preprocess_pcm(pcm, sample_rate);
-    return _run_model(mel, language, task);
+    WhisperRequest request(*_workspace, options);
+    auto mel = _workspace->preprocessor.preprocess_pcm(pcm, sample_rate);
+    auto result = _run_model(mel, options.language, options.task);
+    request.complete();
+    return result;
 }
 
 
@@ -301,13 +438,10 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     const std::string& language,
     const std::string& task
 ) {
-    _is_running.store(true, std::memory_order_relaxed);
-    struct RunningGuard {
-        std::atomic<bool>& running;
-        ~RunningGuard() {
-            running.store(false, std::memory_order_relaxed);
-        }
-    } running_guard{_is_running};
+    // Keep CPU preprocessing and callback completion outside the MLA transaction.
+    std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
+    if (!_workspace->is_running.load(std::memory_order_relaxed))
+        return {"", language, task, 0.0f, std::nullopt};
 
     ChronoTimer timer_ttft(true);
     _logger->info("Language: {}", language);
@@ -315,6 +449,8 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     // Upload audio_tensor and run the encoder model.
     get_buffer("encoder_ifm").upload(mel.data());
     _run_encoder();
+    if (!_workspace->is_running.load(std::memory_order_relaxed))
+        return {"", language, task, 0.0f, std::nullopt};
 
     auto language_detect_result = _run_language_detect();
 
@@ -342,9 +478,9 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     );
     auto token_embed_size = _cfg.d_model * 2;
     auto& decoder_init_buf = get_buffer("decoder_init");
-    for (uint32_t i = 0; i < _input_token_ids.size(); ++i) {
+    for (uint32_t i = 0; i < _workspace->input_token_ids.size(); ++i) {
         decoder_init_buf.upload_raw(
-            token_embeddings_ptr + _input_token_ids[i] * token_embed_size,
+            token_embeddings_ptr + _workspace->input_token_ids[i] * token_embed_size,
             i * token_embed_size,
             token_embed_size
         );
@@ -358,7 +494,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
 
     // Run decoder init model to generate the first token.
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
-        _decoder_init_model_map.at(layer_idx).add_to_queue();
+        _workspace->decoder_init_model_map.at(layer_idx).add_to_queue();
     }
     MLAModelWithBuffer::run_queue();
     new_token_buf.invalidate_cache();
@@ -371,11 +507,9 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     }
     const double ttft = timer_ttft.stop();
     _logger->info("Time to the first token: {:d} in {:.5f}s", new_tokens.back(), ttft);
-    _text_streamer->push(DecodeCallbackType::TTFT, new_tokens.back(), ttft);
-    if (new_tokens.back() == _stop_token_id) {
-        _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
-        _text_streamer->wait_streaming();
-        return {_tokenizer_ptr->decode(new_tokens, true), resolved_language,
+    _workspace->text_streamer->push(DecodeCallbackType::TTFT, new_tokens.back(), ttft);
+    if (new_tokens.back() == _workspace->stop_token_id) {
+        return {_workspace->tokenizer_ptr->decode(new_tokens, true), resolved_language,
                 resolved_task, language_detect_result.no_speech_prob,
                 _cfg.log_probe_enabled
                     ? std::optional<float>{logprob_sum / logprob_count}
@@ -385,11 +519,11 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
     // Run decoder pre/cache/post models to generate other tokens.
     ChronoTimer timer_tps(true);
     for (
-        uint32_t token_idx = _input_token_ids.size();
+        uint32_t token_idx = _workspace->input_token_ids.size();
         token_idx < _cfg.max_target_positions;
         ++token_idx
     ) {
-        if (!_is_running.load(std::memory_order_relaxed))
+        if (!_workspace->is_running.load(std::memory_order_relaxed))
             break;
 
         for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
@@ -407,9 +541,9 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
                     )
                 );
             }
-            _decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
-            _decoder_cache_model_map.at(model_key).add_to_queue();
-            _decoder_post_model_map.at(model_key).add_to_queue();
+            _workspace->decoder_pre_model_map.at(model_key).add_to_queue(&ifm_map);
+            _workspace->decoder_cache_model_map.at(model_key).add_to_queue();
+            _workspace->decoder_post_model_map.at(model_key).add_to_queue();
         }
 
         MLAModelWithBuffer::run_queue();
@@ -425,18 +559,16 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
         const double ttnt = timer_tps.stop(true);
         _logger->info("Got token {:d} in {:.5f}s", new_tokens.back(), ttnt);
 
-        if (new_tokens.back() == _stop_token_id)
+        if (new_tokens.back() == _workspace->stop_token_id)
             break;
 
-        _text_streamer->push(DecodeCallbackType::TPS, new_tokens.back(), ttnt);
+        _workspace->text_streamer->push(DecodeCallbackType::TPS, new_tokens.back(), ttnt);
     }
-    _text_streamer->push(DecodeCallbackType::STOP, 0, 0);
-    _text_streamer->wait_streaming();
     std::optional<float> avg_logprob = std::nullopt;
     if (_cfg.log_probe_enabled)
         avg_logprob = logprob_count > 0 ? logprob_sum / logprob_count : 0.0f;
     return {
-        _tokenizer_ptr->decode(new_tokens, true),
+        _workspace->tokenizer_ptr->decode(new_tokens, true),
         resolved_language,
         resolved_task,
         language_detect_result.no_speech_prob,
@@ -446,7 +578,7 @@ WhisperModel::TranscriptionResult WhisperModel::_run_model(
 
 
 void WhisperModel::stop_model() {
-    _is_running.store(false, std::memory_order_relaxed);
+    _workspace->is_running.store(false, std::memory_order_relaxed);
 }
 
 
@@ -454,35 +586,42 @@ void WhisperModel::_initialize() {
     _logger->info("Whisper model initialize starting ...");
     // Find the input token ids. This is a constant because we are only using this model to perform
     // transcription. Default to transcribe to English.
-    _input_token_ids = {
-        _tokenizer_ptr->token_to_id("<|startoftranscript|>"),
-        _tokenizer_ptr->token_to_id("<|en|>"),
-        _tokenizer_ptr->token_to_id("<|transcribe|>"),
-        _tokenizer_ptr->token_to_id("<|notimestamps|>")
+    _workspace->input_token_ids = {
+        _workspace->tokenizer_ptr->token_to_id("<|startoftranscript|>"),
+        _workspace->tokenizer_ptr->token_to_id("<|en|>"),
+        _workspace->tokenizer_ptr->token_to_id("<|transcribe|>"),
+        _workspace->tokenizer_ptr->token_to_id("<|notimestamps|>")
     };
-    _stop_token_id = _tokenizer_ptr->token_to_id("<|endoftext|>");
+    _workspace->stop_token_id = _workspace->tokenizer_ptr->token_to_id("<|endoftext|>");
 
-    // Define and allocate buffers.
-    BaseModel::_initialize();
+    std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
+    _define_buffers();
+    for (auto* buffers : {&_resources->buffers, &_workspace->buffers}) {
+        for (auto& [name, buffer] : *buffers) buffer.try_allocate();
+    }
 
     // Define and load the models in parallel.
     _define_models();
     MLAModelWithBuffer::load_all_models(_elf_dir, _files.get());
 
-    // Upload token and position embeddings.
-    auto token_embeddings_file_name = (
-        "devkit/" + fmt::format("{}_token_embeddings.npy", _cfg.model_name)
-    );
-    auto token_embeddings_tensor = cnpy::npy_load(_files->get_path(token_embeddings_file_name));
-    _files->release(token_embeddings_file_name);
-    get_buffer("token_embeddings").upload(token_embeddings_tensor.data<void>());
+    if (!_resources->ready) {
+        // Upload token and position embeddings.
+        auto token_embeddings_file_name = (
+            "devkit/" + fmt::format("{}_token_embeddings.npy", _cfg.model_name)
+        );
+        auto token_embeddings_tensor = cnpy::npy_load(_files->get_path(token_embeddings_file_name));
+        _files->release(token_embeddings_file_name);
+        get_buffer("token_embeddings").upload(token_embeddings_tensor.data<void>());
 
-    auto position_embeddings_file_name = (
-        "devkit/" + fmt::format("{}_position_embeddings.npy", _cfg.model_name)
-    );
-    auto position_embeddings_tensor = cnpy::npy_load(_files->get_path(position_embeddings_file_name));
-    _files->release(position_embeddings_file_name);
-    get_buffer("position_embeddings").upload(position_embeddings_tensor.data<void>());
+        auto position_embeddings_file_name = (
+            "devkit/" + fmt::format("{}_position_embeddings.npy", _cfg.model_name)
+        );
+        auto position_embeddings_tensor = cnpy::npy_load(_files->get_path(position_embeddings_file_name));
+        _files->release(position_embeddings_file_name);
+        get_buffer("position_embeddings").upload(position_embeddings_tensor.data<void>());
+
+        _resources->ready = true;
+    }
 
     // Populate the future token mask.
     std::vector<Eigen::bfloat16> decoder_future_token_mask(
@@ -506,10 +645,10 @@ void WhisperModel::_initialize() {
 
 
 void WhisperModel::_finalize() {
-    _logger->info("Whisper model finalize starting ...");
-    MLAModelWithBuffer::free_all_models(_elf_dir);
-    BaseModel::_finalize();
-    _logger->info("Whisper model finalize completed");
+    if (!_workspace) return;
+    MLAModelWithBuffer::run_queue();
+    _workspace.reset();
+    _resources.reset();
 }
 
 
@@ -519,8 +658,8 @@ void WhisperModel::_define_buffers() {
     define_buffer("encoder_ofm", {_cfg.max_source_positions, _cfg.d_model});
 
     // Embedding tables.
-    define_buffer("token_embeddings", {_cfg.vocab_size, _cfg.d_model});
-    define_buffer("position_embeddings", {_cfg.max_target_positions, _cfg.d_model});
+    _define_resource_buffer("token_embeddings", {_cfg.vocab_size, _cfg.d_model});
+    _define_resource_buffer("position_embeddings", {_cfg.max_target_positions, _cfg.d_model});
 
     // Cache.
     for (uint32_t i = 0; i < _cfg.decoder_layers; ++i) {
@@ -542,7 +681,7 @@ void WhisperModel::_define_buffers() {
 
     // Other buffers.
     define_buffer("decoder_future_token_mask", {2 * _cfg.max_target_positions});
-    define_buffer("decoder_init", {_input_token_ids.size(), _cfg.d_model});
+    define_buffer("decoder_init", {_workspace->input_token_ids.size(), _cfg.d_model});
 
     // Layer 0 positioned residual, pre input for later layers, and post input/output.
     define_buffer("decoder_n1_buffer1", {1, _cfg.d_model});
@@ -567,35 +706,35 @@ void WhisperModel::_define_model(
     const std::vector<MLABufferSlice>& ofms
 ) {
     if (model_type == "encoder_layer") {
-        _encoder_layer_model_map.emplace(
+        _workspace->encoder_layer_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<uint8_t>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_language_detect") {
-        _decoder_language_detect_model_ptr = std::make_unique<MLAModelWithBuffer>(
+        _workspace->decoder_language_detect_model_ptr = std::make_unique<MLAModelWithBuffer>(
             model_path, ifms, ofms
         );
     } else if (model_type == "decoder_init") {
-        _decoder_init_model_map.emplace(
+        _workspace->decoder_init_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<uint8_t>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_pre") {
-        _decoder_pre_model_map.emplace(
+        _workspace->decoder_pre_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_cache") {
-        _decoder_cache_model_map.emplace(
+        _workspace->decoder_cache_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
         );
     } else if (model_type == "decoder_post") {
-        _decoder_post_model_map.emplace(
+        _workspace->decoder_post_model_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(std::get<WhisperDecoderModelMapKey>(key)),
             std::forward_as_tuple(model_path, ifms, ofms)
@@ -674,7 +813,7 @@ void WhisperModel::_define_models() {
     );
 
     // Decoder init model.
-    uint32_t num_input_tokens = _input_token_ids.size();
+    uint32_t num_input_tokens = _workspace->input_token_ids.size();
     for (uint8_t layer_idx = 0; layer_idx < _cfg.decoder_layers; ++layer_idx) {
         std::vector<MLABufferSlice> ifms = {&get_buffer("decoder_init")};
         ifms.emplace_back(&get_buffer("encoder_ofm"));
@@ -885,7 +1024,7 @@ bool WhisperModel::_is_auto_language(const std::string& language) const {
 
 
 void WhisperModel::_run_encoder() {
-    for (auto& [layer_idx, encoder_layer_model] : _encoder_layer_model_map) {
+    for (auto& [layer_idx, encoder_layer_model] : _workspace->encoder_layer_model_map) {
         _logger->debug("Queueing Whisper encoder layer {}", layer_idx);
         encoder_layer_model.add_to_queue();
     }
@@ -894,13 +1033,13 @@ void WhisperModel::_run_encoder() {
 
 
 WhisperModel::LanguageDetectResult WhisperModel::_run_language_detect() {
-    _decoder_language_detect_model_ptr->run();
+    _workspace->decoder_language_detect_model_ptr->run();
     auto& new_token_buf = get_buffer("new_token");
     new_token_buf.invalidate_cache();
     auto* token_ptr = reinterpret_cast<uint32_t*>(new_token_buf.get_virtual_addr());
     // HF tokenizers name this token <|nocaptions|>; Whisper generation treats it as
     // the no-speech token at the id immediately before <|notimestamps|>.
-    auto no_speech_token_id = _tokenizer_ptr->token_to_id("<|notimestamps|>") - 1;
+    auto no_speech_token_id = _workspace->tokenizer_ptr->token_to_id("<|notimestamps|>") - 1;
     auto& logits_buf = get_buffer("language_detect_logits");
     logits_buf.invalidate_cache();
     return {
@@ -945,7 +1084,7 @@ uint32_t WhisperModel::_language_token_from_index(uint32_t language_idx) const {
 
 
 void WhisperModel::_set_language_token(uint32_t token_id) {
-    _input_token_ids[1] = token_id;
+    _workspace->input_token_ids[1] = token_id;
 }
 
 
@@ -982,11 +1121,11 @@ std::string WhisperModel::_update_language(const std::string& language) {
 
 std::string WhisperModel::_update_task(const std::string& task) {
     if (task == "transcribe") {
-        _input_token_ids[2] = _tokenizer_ptr->token_to_id("<|transcribe|>");
+        _workspace->input_token_ids[2] = _workspace->tokenizer_ptr->token_to_id("<|transcribe|>");
         return task;
     }
     if (task == "translate") {
-        _input_token_ids[2] = _tokenizer_ptr->token_to_id("<|translate|>");
+        _workspace->input_token_ids[2] = _workspace->tokenizer_ptr->token_to_id("<|translate|>");
         return task;
     }
     throw std::runtime_error("Invalid Whisper task: " + task);

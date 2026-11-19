@@ -6,6 +6,7 @@
 #include <initializer_list>
 #include <map>
 #include <optional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,12 +18,15 @@ namespace llima {
 
 class FileProvider;  // forward declaration; full type in file_provider.hpp
 class LanguageModel;
+struct RuntimeProgram;
+class LanguageExecutor;
 
 void connect_mla_rt(const std::vector<std::string>& args);
 void disconnect_mla_rt();
 
 class MLAModelWithBuffer {
     friend class LanguageModel;
+    friend class LanguageExecutor;
 
     public:
         MLAModelWithBuffer(
@@ -43,7 +47,10 @@ class MLAModelWithBuffer {
             std::map<uint8_t, MLABufferSlice>* ofm_map_ptr = nullptr
         );
         void update_reloc(const std::map<std::string, MLABuffer*>& reloc_buffers);
+        void reset_reloc();
 
+        void rebind_buffers(const std::map<MLABuffer*, MLABuffer*>& replacements);
+        static void discard_queue();
         static void run_queue();
         // Existing disk-loading overload.
         static void load_all_models(
@@ -76,6 +83,10 @@ class MLAModelWithBuffer {
         }
 
     private:
+        void _apply_reloc(const std::map<std::string, MLABuffer*>& reloc_buffers);
+        void _record_buffer_bindings(
+            std::map<std::string, std::vector<MLABuffer**>>& bindings
+        );
         void _debug_inouts(
             const std::string& name,
             std::map<uint8_t, MLABufferSlice>* fm_map_ptr
@@ -91,9 +102,11 @@ class MLAModelWithBuffer {
             std::initializer_list<uint32_t> begins
         );
 
+        std::shared_ptr<RuntimeProgram> _program;
         std::size_t _model_idx;
         std::vector<MLABufferSlice> _ifms;
         std::vector<MLABufferSlice> _ofms;
+        std::map<std::string, MLABuffer*> _reloc_buffers;
 
         static inline bool _profile = false;
         static inline bool _print_inouts = false;

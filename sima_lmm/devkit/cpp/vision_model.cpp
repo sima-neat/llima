@@ -1,11 +1,32 @@
-
+#include <mutex>
+#include <stdexcept>
 #include <utility>
 
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
+
 #include "vision_model.hpp"
+#include "model_resources.hpp"
+#include "mla_model.hpp"
+#include "runtime_context.hpp"
 
 
 namespace simaai {
 namespace llima {
+
+struct VisionWorkspace {
+    std::map<std::string, MLABuffer> buffers;
+    std::vector<std::unique_ptr<MLAModelWithBuffer>> models;
+    std::mutex mutex;
+};
+
+VisionModel::~VisionModel() { _finalize(); }
+
+void VisionModel::define_buffer(const std::string& name, const std::vector<size_t>& shape,
+                               const std::string& dtype, bool align_last_dim) {
+    _workspace->buffers.try_emplace(name, name, shape, dtype, align_last_dim);
+}
+MLABuffer& VisionModel::get_buffer(const std::string& name) { return _workspace->buffers.at(name); }
 
 VisionModel::VisionModel(std::filesystem::path model_path)
     : VisionModel(std::move(model_path), nullptr) {}
@@ -13,7 +34,13 @@ VisionModel::VisionModel(std::filesystem::path model_path)
 VisionModel::VisionModel(
     std::filesystem::path model_path,
     std::shared_ptr<FileProvider> file_provider
-) : BaseModel(model_path, std::move(file_provider)),
+) : _resources(ModelResources<VlmConfig>::acquire(model_path, std::move(file_provider))),
+    _cfg(_resources->cfg),
+    _elf_dir(_resources->elf_dir),
+    _devkit_dir(_resources->devkit_dir),
+    _files(_resources->files),
+    _logger(_resources->logger),
+    _workspace(std::make_unique<VisionWorkspace>()),
     _vm_cfg(_cfg.vm_cfg.value()),
     _mm_cfg(_cfg.mm_cfg.value())
 {
@@ -24,19 +51,20 @@ VisionModel::VisionModel(
 void VisionModel::run_model(
     const std::vector<Eigen::bfloat16>& ifm_tensor, std::map<uint8_t, MLABufferSlice>* ofm_map_ptr
 ) {
+    std::lock_guard workspace_lock(_workspace->mutex);
     // Upload the ifm.
     get_buffer("vision_ifm").upload(ifm_tensor.data());
 
-    if (_model_ptrs.size() == 1) {
-        _model_ptrs.front()->run(nullptr, ofm_map_ptr);
+    if (_workspace->models.size() == 1) {
+        _workspace->models.front()->run(nullptr, ofm_map_ptr);
         return;
     }
 
     // Each layer is a separate MLA job so other MLA workloads can run
     // between dependent vision layers.
     const uint8_t final_ofm_count = _cfg.pipeline_cfg.quantize_embeddings ? 2 : 1;
-    for (size_t layer_idx = 0; layer_idx < _model_ptrs.size(); ++layer_idx) {
-        const bool is_last = layer_idx + 1 == _model_ptrs.size();
+    for (size_t layer_idx = 0; layer_idx < _workspace->models.size(); ++layer_idx) {
+        const bool is_last = layer_idx + 1 == _workspace->models.size();
         std::map<uint8_t, MLABufferSlice> layer_ofm_map;
 
         if (ofm_map_ptr != nullptr) {
@@ -63,7 +91,7 @@ void VisionModel::run_model(
             }
         }
 
-        _model_ptrs[layer_idx]->run(
+        _workspace->models[layer_idx]->run(
             nullptr, layer_ofm_map.empty() ? nullptr : &layer_ofm_map
         );
     }
@@ -73,7 +101,8 @@ void VisionModel::run_model(
 void VisionModel::_initialize() {
     _logger->info("Vision model initialize starting ...");
     _validate_model_names();
-    BaseModel::_initialize();
+    _define_buffers();
+    for (auto& [name, buffer] : _workspace->buffers) buffer.allocate();
     _define_models();
     for (const auto& model_name: _cfg.vision_model_name) {
         MLAModelWithBuffer::load_all_models(_elf_dir / model_name, _files.get());
@@ -83,12 +112,10 @@ void VisionModel::_initialize() {
 
 
 void VisionModel::_finalize() {
-    _logger->info("Vision model finalize starting ...");
-    for (const auto& model_name: _cfg.vision_model_name) {
-        MLAModelWithBuffer::free_all_models(_elf_dir / model_name);
-    }
-    BaseModel::_finalize();
-    _logger->info("Vision model finalize completed");
+    if (!_workspace) return;
+    MLAModelWithBuffer::run_queue();
+    _workspace.reset();
+    _resources.reset();
 }
 
 
@@ -178,7 +205,7 @@ void VisionModel::_define_models() {
             }
         }
         auto elf_file_name = fmt::format("{}_stage1_mla.elf", _cfg.vision_model_name[i]);
-        _model_ptrs.emplace_back(std::make_unique<MLAModelWithBuffer>(
+        _workspace->models.emplace_back(std::make_unique<MLAModelWithBuffer>(
             _elf_dir / elf_file_name,
             std::vector<MLABufferSlice>{&ifm},
             std::move(ofms)
