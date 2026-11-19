@@ -26,6 +26,8 @@ When you run this command, the deployment tool performs three key steps:
 
 The tool uses `rsync` internally for efficient file transfer and will skip files that are already up-to-date.
 
+Remote deployments authenticate and check destination permissions before extracting ELF files. With standard SSH, the connection is reused for transfer, so password authentication happens at the start.
+
 ## Deployment Workflow
 
 After compiling your model with `llima-compile`, you'll have a directory structure like:

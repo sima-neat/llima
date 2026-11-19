@@ -298,6 +298,10 @@ sima-cli playbooks install ./skills
 安裝摘要必須報告 `detected: 3`、`valid: 3` 和 `discarded: 0`。
 每個 `playbook.yml` 中的 `sima-cli` 版本必須滿足 `min_cli_version`。
 
+回報缺陷時，請使用[錯誤回報範本](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/bug_report.md)；
+提出改善建議時，請使用[功能請求範本](https://github.com/sima-neat/llima/blob/develop/.github/ISSUE_TEMPLATE/feature_request.md)。
+請填寫相關欄位，並移除日誌和重現步驟中的機密資訊。
+
 對於提交的程式碼變更：
 
 - 從目前的分支切換到並以目前的分支作為目標分支：`develop`；
@@ -309,3 +313,14 @@ sima-cli playbooks install ./skills
 - 排除憑證和私人資產。
 
 當相關測試在沒有意外跳過的情況下通過，所需套件和 Modalix 檢查完成或明確指出無法使用，且已處理相容性和檔案問題，並且 PR 包含可重複驗證的證據時，即表示貢獻已準備就緒。
+
+## SDK 套件鎖定處理
+
+CI 的 SDK 主機套件操作使用 `sima-neat/.github@main` 的共用輔助程式。
+它僅針對已辨識的 dpkg/APT 鎖定競爭重試，每個操作最多重試 120 秒，
+並在發生競爭時提供鎖定擁有者與程序的診斷資訊。
+其他錯誤會立即導致失敗；鎖定檔案與持有鎖定的程序均維持不變。
+此輔助程式不管理目標 sysroot 或 DevKit 的套件資料庫。
+對於本機 CI 設定指令碼，請將 `SDK_PACKAGE_HELPER` 設為已審查的共用儲存庫
+簽出目錄中 `scripts/sdk-package.sh` 的絕對路徑。
+請參閱[共用輔助程式契約](https://github.com/sima-neat/.github/tree/main/actions/setup-sdk-package-helper)。

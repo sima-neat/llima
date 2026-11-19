@@ -183,9 +183,14 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
             for (const auto& item : content) {
                 if (item.at("type") != "image") continue;
                 std::string_view image = item.at("image").get_ref<const std::string&>();
-                constexpr std::string_view base64_prefix = "data:image/jpeg;base64,";
-                if (image.starts_with(base64_prefix)) {
-                    auto bytes = base64_decode(image.substr(base64_prefix.size()));
+                if (image.starts_with("data:")) {
+                    const auto comma = image.find(',');
+                    const auto header = image.substr(0, comma);
+                    if (comma == std::string_view::npos
+                        || (header != "data:image/jpeg;base64"
+                            && header != "data:image/png;base64"))
+                        throw std::invalid_argument("Expected a base64 PNG or JPEG image");
+                    auto bytes = base64_decode(image.substr(comma + 1));
                     image_tensors.emplace_back(_image_processor_ptr->preprocess(bytes));
                 } else {
                     assert(std::filesystem::is_regular_file(image));
@@ -193,7 +198,8 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                 }
             }
         }
-        assert(image_tensors.size() == num_images);
+        if (image_tensors.size() != num_images)
+            throw std::invalid_argument("Chat template image placeholders do not match image inputs");
     }
 
     std::vector<AudioInput> audio_tensors;

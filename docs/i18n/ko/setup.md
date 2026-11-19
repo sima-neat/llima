@@ -21,3 +21,10 @@ RAM이 128GB인 시스템에서는 모델 유형에 따라 컴파일을 완료�
 - 오픈 소스 모델을 다운로드하려면 유효한 Hugging Face 계정이 필요합니다.
 - 일부 모델, 예를 들어 `google/paligemma`와 같은 모델은 Hugging Face에서 라이선스 계약에 동의해야 합니다. 해당 모델을 다운로드하기 전에 라이선스 내용을 검토하고 동의했는지 확인하십시오.
 - CLI가 [사용자 액세스 토큰](https://huggingface.co/docs/hub/en/security-tokens) 및 `huggingface-cli`를 사용하여 Hugging Face에 액세스하도록 승인합니다. 참고로 `sima-cli`를 설치하면 `huggingface-cli`가 자동으로 설치됩니다.
+
+### CI sysroot 선택
+
+`deps/manifest.json`은 `elxr_version`을 선언합니다. 공유 워크플로는 일치하는
+`SYSROOT_VERSION`을 찾고 폴백 없이 정확한 펌웨어의 DevKit을 선택합니다.
+CI는 일회용 컨테이너에서 SDK 이미지에 설치된 도구로 해당 sysroot를 준비하고
+생성된 패키지 목록을 검증합니다.

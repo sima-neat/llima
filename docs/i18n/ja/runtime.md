@@ -45,7 +45,12 @@ modalix:~$ llima run <model> [options]
 
 利用可能なすべてのオプションについては、`llima run -h` を実行してください。
 
-自動の埋め込みオフロードを無効にし、テーブルを DRAM に保持するには、`SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>` を実行してください。
+デフォルト設定（`auto`）では、未加工の `.bin` ファイルがモデルの `devkit/` ディレクトリにある場合に
+埋め込みテーブルがオフロードされます。ファイルがなければテーブルは DRAM に保持されます。
+NVMe 以外のストレージでは、読み取り速度の低下が性能に影響する可能性があるため、警告が表示されます。
+テーブルを DRAM に保持するには `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=off llima run <model>` を実行します。
+オフロードを必須にするには `SIMA_LLIMA_RUN_EMBEDDING_OFFLOAD=on llima run <model>` を実行します。
+この場合、未加工のファイルが存在しないか無効であれば、コマンドは失敗します。
 
 **例**
 

@@ -29,6 +29,28 @@ controls the two expensive test jobs. Latest-tag promotion requires successful
 artifact publication and accepts an intentional test skip only when the
 corresponding resolver output is false.
 
+## MoLE evaluator checks
+
+Run `tests/mole/` in the candidate MoLE environment with network access disabled
+through Hugging Face's offline settings. This exercises
+upstream RealWorldQA, DocVQA and ChartQA protocols/scoring against prepared tiny
+datasets and the actual ZMQ client in both host and DevKit-local modes. It does
+not validate MLA execution or measured model accuracy.
+
+```bash
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+  python -P -m pytest -o addopts='' tests/mole -q
+```
+
+The runtime suite's `test_zmq_black_box.py` also checks image/text generation,
+multiple images, malformed request recovery and runtime identity against the
+installed candidate packages on Modalix. Set `SIMA_TEST_LLIMA_VLM_MODEL` to the
+packaged Qwen3.5-2B model directory for the initial model validation. Run the
+full dataset evaluation in both modes following
+[MoLE image-plus-text accuracy](../docs/mole.md#image-plus-text-accuracy) before publishing support
+or accuracy results. Those hardware checks are required even if hermetic tests
+and the package build pass.
+
 ## Model compiler CI
 
 ### Purpose
@@ -74,7 +96,7 @@ representative; cover configuration variants with small hermetic tests.
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 418
+- Expected cases: 457
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -362,7 +384,7 @@ CTest executes serially with a dispatcher resource lock:
 | `runtime.embedding_offload_generation` | Resident/automatic-offload token equivalence, DRAM savings, n128 boundaries, cancellation/recovery, image prompts and logits when supported |
 | `runtime.gemma4_mtp_helpers` | Packed causal masks at compiled context widths, sliding-window offsets, ordered-embedding selection, shared-KV/query position alignment, and verification bonus-token handling without model inference |
 
-The embedding generation test requires raw embedding tables on local NVMe
+The embedding generation test requires raw embedding tables on accessible storage
 and defaults to `Gemma-4-E2B-it-TextOnly-GPTQ-a16w4`; override it with
 `SIMA_TEST_LLIMA_EMBEDDING_MODEL` under `LLIMA_MODELS_PATH`. It compares `off`
 and `auto`, verifies that automatic offloading saves DRAM, and checks allocation

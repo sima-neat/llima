@@ -106,6 +106,9 @@ VENV_PYTHON="${VENV_PATH}/bin/python"
 # A branch wheel can retain the same public version as an older installation.
 # Reinstall only LLiMa itself without disturbing the resolved MoLE dependencies.
 "${VENV_PYTHON}" -m pip install --force-reinstall --no-deps "${WHEEL_PATH}"
+# MoLE already supplies the image evaluator's shared dependencies.
+"${VENV_PYTHON}" -m pip install --no-deps "lmms-eval==0.7.3" "tenacity>=8.3.0"
+"${VENV_PYTHON}" -c 'import lmms_eval.evaluator'
 "${VENV_PATH}/bin/llima-benchmark" --help >/dev/null
 
 echo "[mole] Installed successfully."

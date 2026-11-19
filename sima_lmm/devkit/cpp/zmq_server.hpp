@@ -30,10 +30,12 @@ struct ZMQRequestMetadata {
     std::optional<size_t> continuation_start;
     std::optional<std::vector<uint32_t>> continuation_token_ids;
     bool use_group_prefill = true;
+    std::optional<uint16_t> max_new_tokens;
+    bool enable_thinking = false;
 
     MSGPACK_DEFINE_MAP(
         type, tensor_dtype, tensor_shape, max_num_tokens, stop_token_ids, continuation_start,
-        continuation_token_ids, use_group_prefill
+        continuation_token_ids, use_group_prefill, max_new_tokens, enable_thinking
     );
 };
 
@@ -46,10 +48,15 @@ struct ZMQResponseMetadata {
     std::optional<uint32_t> generated_tokens;
     std::optional<uint32_t> accepted_draft_tokens;
     std::optional<std::string> error;
+    std::optional<uint32_t> input_tokens;
+    std::optional<std::string> finish_reason;
+    std::optional<std::string> prompt_sha256;
+    std::optional<std::string> raw_answer;
+    std::optional<std::string> error_type;
 
     MSGPACK_DEFINE_MAP(
         tensor_dtype, tensor_shape, infer_time_ns, result_type, generated_tokens,
-        accepted_draft_tokens, error
+        accepted_draft_tokens, error, input_tokens, finish_reason, prompt_sha256, raw_answer, error_type
     );
 };
 
@@ -67,6 +74,13 @@ class EXPORT ZMQServer {
         void stop();
 
     private:
+        std::string _multimodal_info();
+        std::string _generate_multimodal(
+            const ZMQRequestMetadata& metadata, const std::string& payload,
+            ZMQResponseMetadata& response, bool for_performance = false
+        );
+        std::filesystem::path _model_path;
+        std::optional<std::string> _multimodal_identity;
         uint32_t _port;
         zmq::context_t _zmq_ctx;
         zmq::socket_t _zmq_socket;

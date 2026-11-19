@@ -148,6 +148,7 @@ sdk_ext_require = [
 
     # Required for MoLE
     "datasets>=4.0.0",
+    "pyarrow<26",  # PyArrow 26 requires NumPy 2; the SDK pins NumPy 1.x.
     "fabric>=3.2.2",
     "lm-eval[hf]>=0.4.11",
     "loguru>=0.7.3",
