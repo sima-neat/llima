@@ -69,6 +69,21 @@ int main() {
             if (model.run_model(chat, options) != result)
                 throw std::runtime_error("Reusable encoded image differs from fresh encoding");
 
+            auto pair_chat = model.create_chat();
+            pair_chat.add_image(image);
+            pair_chat.add_image(image);
+            pair_chat.add_query("Describe these images in a short phrase.");
+            std::vector<simaai::llima::EncodedImage> pair{encoded.front(), encoded.front()};
+            simaai::llima::GenerationOptions pair_options;
+            pair_options.max_new_tokens = 8;
+            pair_options.encoded_images = pair;
+            const auto pair_reference = model.run_model(pair_chat, pair_options);
+            model.reset_session(0);
+            pair_options.images = images;
+            pair_options.encoded_images = encoded;
+            if (!pair_reference || model.run_model(pair_chat, pair_options) != pair_reference)
+                throw std::runtime_error("Mixed fresh and encoded image rows differ from the encoded reference");
+
             const auto alternate = model.create_session();
             images[0] = cv::Mat(rgb.size(), CV_8UC3, cv::Scalar(255, 0, 0));
             options.encoded_images = {};

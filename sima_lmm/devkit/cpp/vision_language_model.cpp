@@ -452,6 +452,17 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
             return std::nullopt;
         }
         _vision_model->run_model(preprocessed_data.image_tensors[i], &vision_ofm_maps[i]);
+        // Image rows come from DMA. A later CPU write to an adjacent text or encoded-image
+        // row must read the new edge cache line, especially for 16-byte embedding scales.
+        for (const auto& [port, slice] : vision_ofm_maps[i]) {
+            auto* buffer = slice.get_buf_ptr();
+            const auto begin = slice.get_byte_offset();
+            const auto size = buffer->get_buf_len(slice.get_buf_shapes());
+            if (size) {
+                buffer->invalidate_cache(begin, 1);
+                buffer->invalidate_cache(begin + size - 1, 1);
+            }
+        }
     }
     for (size_t i = 0; i < options.encoded_images.size(); ++i) {
         const auto& outputs = options.encoded_images[i]._data->outputs;
