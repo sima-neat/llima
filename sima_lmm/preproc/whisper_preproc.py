@@ -5,7 +5,7 @@ import numpy as np
 from functools import lru_cache
 from pathlib import Path
 from scipy import signal
-import av
+from sima_lmm.preproc.audio_preprocessing import load_audio
 """
 Script for audio preprocessing for whisper encoder using Numpy.
 """
@@ -17,20 +17,6 @@ HOP_LENGTH = 160
 CHUNK_LENGTH = 30
 N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 480000 samples in a 30-second chunk
 N_FRAMES = N_SAMPLES // HOP_LENGTH  # 3000 frames in a mel spectrogram input
-
-
-def load_audio(file: str, sr: int = SAMPLE_RATE):
-    container = av.open(file)
-    resampler = av.AudioResampler(format='s16', layout='mono', rate=sr)
-
-    parts = []
-    for frame in container.decode(audio=0):
-        frame.pts = None
-        for resampled in resampler.resample(frame):
-            parts.append(resampled.to_ndarray().flatten())
-            
-    audio_int16 = np.concatenate(parts)
-    return audio_int16.astype(np.float32) / 32768.0
 
 
 def pad_or_trim(array: np.ndarray, length: int = N_SAMPLES, *, axis: int = -1) -> np.ndarray:

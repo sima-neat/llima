@@ -3,12 +3,13 @@
 #define _SIMA_LLIMA_WEB_
 
 #include <csignal>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 
 #include "chat.hpp"
 #include "utils.hpp"
@@ -43,7 +44,7 @@ class EXPORT WEB {
         void stop();
 
     private:
-        void _stop_and_detach_vlm_thread();  // Helper to stop and detach active VLM thread
+        void _stop_active_inference();
         void _handle_stop(const httplib::Request& req, httplib::Response& res);
         void _handle_set_lora(const httplib::Request& req, httplib::Response& res);
         void _handle_unset_lora(const httplib::Request& req, httplib::Response& res);
@@ -60,9 +61,13 @@ class EXPORT WEB {
             const std::string& task
         );
 
+        void _handle_gemma_audio_transcription(
+            const httplib::Request& req,
+            httplib::Response& res
+        );
+
         // Helpers
         void _set_cors_headers(httplib::Response& res);
-        nlohmann::ordered_json _parse_endpoint_messages(const nlohmann::json& messages);
         std::string _format_openai_sse_chunk(
             const std::string& content,
             const std::string& model,
@@ -124,13 +129,15 @@ class EXPORT WEB {
         void _execute_streaming_audio_transcription(
             httplib::Response& res,
             const std::string& language,
-            const std::string& task
+            const std::string& task,
+            std::shared_ptr<FILE> upload
         );
         std::unique_ptr<VisionLanguageModel> _vision_language_model_ptr;
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
         bool _enable_thinking;
-        std::jthread _vlm_thread;
+        // Callbacks and preprocessing belong to one HTTP inference at a time.
+        std::mutex _inference_mutex;
 
         // HTTP server. For HTTPS, use SSLServer and define CPPHTTPLIB_OPENSSL_SUPPORT before
         // including the httplib.h header.
@@ -140,7 +147,6 @@ class EXPORT WEB {
         std::shared_ptr<spdlog::logger> _logger;
 
         inline static const uint32_t _SERVER_PORT = 9998;
-        inline static const std::string _AUDIO_FILE_NAME = "/tmp/audio.webm";
         inline static WEB* _singleton_ptr = nullptr;
         inline static struct sigaction _old_sigint_action = {};
 

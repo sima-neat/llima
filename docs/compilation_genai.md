@@ -133,6 +133,7 @@ Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 819
 | `--no-quantize_embeddings` | Disable embedding-table quantization, which is enabled by default for supported LLMs and VLMs. |
 | `--no-quantize_kv_cache` | Disable KV-cache quantization, which is enabled by default. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |
+| `--max_audio_duration` | Maximum audio duration per clip, in seconds (1–30; default: 30). Shorter limits reduce audio encoder graph sizes. Requires an audio-capable model. |
 | `--draft_model_path` | Path to a compatible EAGLE3, Gemma4 MTP, or DFlash draft model; the method is detected automatically. |
 | `--speculative_block_size` | DFlash verification width: 4, 8, or 16. Default: 8. |
 | `--lora_name` | Name for the LoRA adapter being compiled alongside the base model. |

@@ -302,6 +302,66 @@ class VisionModelConfig(BaseConfig):
 
 
 @dataclass
+class AudioModelConfig(BaseConfig):
+    """Gemma 4 audio encoder dimensions and compiled capacity."""
+
+    hidden_size: int = 1024
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 8
+    subsampling_conv_channels: list[int] = field(default_factory=lambda: [128, 32])
+    conv_kernel_size: int = 5
+    attention_chunk_size: int = 12
+    attention_logit_cap: float = 50.0
+    hidden_act: str = "silu"
+    rms_norm_eps: float = 1e-6
+    max_tokens: int = 750
+
+    @property
+    def num_frames(self) -> int:
+        return 4 * self.max_tokens
+
+    @property
+    def padded_tokens(self) -> int:
+        return round_up_to(self.max_tokens, self.attention_chunk_size)
+
+
+@dataclass
+class AudioPreprocessorConfig(BaseConfig):
+    """Resolved audio frontend settings and coefficients exported to the runtime."""
+
+    feature_extractor_type: str = ""
+    sampling_rate: int = 0
+    num_mel_bins: int = 0
+    frame_length: int = 0
+    hop_length: int = 0
+    fft_length: int = 0
+    window: list[float] = field(default_factory=list)
+    mel_filters: list[list[float]] = field(default_factory=list)
+    mel_floor: float = 0.0
+    per_bin_mean: list[float] | None = None
+    per_bin_stddev: list[float] | None = None
+
+    def set_config(self, feature_extractor, audio: AudioModelConfig):
+        if feature_extractor.dither or feature_extractor.preemphasis or feature_extractor.input_scale_factor != 1:
+            raise ValueError("Gemma audio currently requires zero dither/preemphasis and unit input scale")
+        if (feature_extractor.sampling_rate, feature_extractor.hop_length) != (16000, 160):
+            raise ValueError("Gemma audio requires 16-kHz sampling and a 160-sample hop")
+        if feature_extractor.feature_size != audio.subsampling_conv_channels[0]:
+            raise ValueError("Gemma audio mel bins must match the first subsampling convolution width")
+        self.feature_extractor_type = type(feature_extractor).__name__
+        self.sampling_rate = feature_extractor.sampling_rate
+        self.num_mel_bins = feature_extractor.feature_size
+        self.frame_length = feature_extractor.frame_length
+        self.hop_length = feature_extractor.hop_length
+        self.fft_length = feature_extractor.fft_length
+        self.window = feature_extractor.window.tolist()
+        self.mel_filters = feature_extractor.mel_filters.tolist()
+        self.mel_floor = float(feature_extractor.mel_floor)
+        self.per_bin_mean = None if feature_extractor.per_bin_mean is None else feature_extractor.per_bin_mean.reshape(-1).tolist()
+        self.per_bin_stddev = None if feature_extractor.per_bin_stddev is None else feature_extractor.per_bin_stddev.reshape(-1).tolist()
+
+
+@dataclass
 class MMConnectionConfig(BaseConfig):
     """Configuration of Multi-Modal Connection.
 
@@ -1124,9 +1184,14 @@ class VlmConfig(BaseConfig):
     mm_cfg: MMConnectionConfig | None = None
     lm_cfg: LanguageModelConfig = field(default_factory=LanguageModelConfig)
     pipeline_cfg: PipelineConfig = field(default_factory=PipelineConfig)
+    audio_cfg: AudioModelConfig | None = None
 
     @staticmethod
     def load(vlm_cfg: dict) -> "VlmConfig":
+        if vlm_cfg.get("audio_cfg") is not None:
+            audio = AudioModelConfig()
+            audio.set_config(vlm_cfg["audio_cfg"])
+            vlm_cfg["audio_cfg"] = audio
         if vlm_cfg.get("vm_cfg") is not None:
             vlm_cfg["vm_cfg"]["arch"] = VisionArchType(vlm_cfg["vm_cfg"]["arch"])
             vlm_cfg["vm_cfg"] = VisionModelConfig(**vlm_cfg["vm_cfg"])
@@ -1302,6 +1367,9 @@ class VlmConfig(BaseConfig):
             vlm_cfg.mm_cfg = None
             vlm_cfg.vm_cfg = None
 
+        if model_format == ModelFormat.FORMAT_HF and model_type == "gemma4" and model_cfg.get("audio_config"):
+            vlm_cfg.audio_cfg = AudioModelConfig()
+            vlm_cfg.audio_cfg.set_config(model_cfg["audio_config"])
         return vlm_cfg
 
     @property
@@ -1329,6 +1397,9 @@ class VlmConfig(BaseConfig):
             f"{model_name}_layer{layer_idx}"
             for layer_idx in range(self.num_vision_layers)
         ]
+
+    def get_audio_model_names(self, model_name: str) -> list[str]:
+        return [f"{model_name}_audio_layer{i}" for i in range(self.audio_cfg.num_hidden_layers)] if self.audio_cfg else []
 
     def config_pipeline(
         self,
@@ -1537,6 +1608,8 @@ class VlmConfig(BaseConfig):
             layers.append(LayerID("group_per_layer", 0))
             layers.append(LayerID("single_per_layer", 0))
 
+        if self.audio_cfg is not None:
+            layers.extend(LayerID("audio", i) for i in range(self.audio_cfg.num_hidden_layers))
         return layers
 
 

@@ -130,6 +130,18 @@
         "lora_cfg": null,
         "speculative_decoding_cfg": null
     },
+    "audio_cfg": {
+        "hidden_size": 1024,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 8,
+        "subsampling_conv_channels": [128, 32],
+        "conv_kernel_size": 5,
+        "attention_chunk_size": 12,
+        "attention_logit_cap": 50.0,
+        "hidden_act": "silu",
+        "rms_norm_eps": 0.000001,
+        "max_tokens": 750
+    },
     "pipeline_cfg": {
         "system_prompt": null,
         "chat_template": null,

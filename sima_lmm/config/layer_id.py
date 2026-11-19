@@ -13,7 +13,7 @@ class LayerID:
         part: Type of layer.  Valid values are 'group_pre',
             'group_cache', 'group_sliding_cache', 'group_post', 'single_pre',
             'single_cache', 'single_sliding_cache', 'single_post', 'group_conv',
-            'single_conv', 'group_linear', 'single_linear', 'conv_post_final', 'vision',
+            'single_conv', 'group_linear', 'single_linear', 'conv_post_final', 'vision', 'audio',
             'group_per_layer',
             'single_per_layer', 'group_dflash_context', 'single_dflash_context',
             and for Mixture-of-Experts models 'group_router',

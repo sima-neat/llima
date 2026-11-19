@@ -108,6 +108,7 @@ output_directory/
 | `--no-quantize_embeddings` | 기본적으로 지원되는 LLM 및 VLM에 대해 활성화되어 있는 임베딩 테이블 양자화를 비활성화합니다. |
 | `--no-quantize_kv_cache` | 기본적으로 활성화되어 있는 KV 캐시 양자화를 비활성화합니다. |
 | `--return_logits` | 마지막 레이어의 출력에서 로짓 값을 반환합니다(모델 평가에 필요). |
+| `--max_audio_duration` | 클립당 최대 오디오 길이(초, 1–30, 기본값: 30)입니다. 제한을 줄이면 오디오 인코더 그래프 크기가 작아집니다. 오디오 지원 모델이 필요합니다. |
 | `--draft_model_path` | 호환 가능한 EAGLE3, Gemma4 MTP 또는 DFlash 초안 모델의 경로입니다. 방식은 자동으로 감지됩니다. |
 | `--speculative_block_size` | DFlash 검증 너비: 4, 8 또는 16. 기본값: 8. |
 | `--lora_name` | 기본 모델과 함께 컴파일되는 LoRA 어댑터의 이름입니다. |

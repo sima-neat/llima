@@ -1,6 +1,9 @@
 import http.client
 import json
 import os
+import io
+import re
+import wave
 import platform
 import shutil
 import signal
@@ -73,7 +76,7 @@ def _wait_for_server(process: subprocess.Popen[str], timeout: float = 30) -> Non
 
 
 @contextmanager
-def _running_web_server(tmp_path, model_name: str | None = None):
+def _running_web_server(tmp_path, model_name: str | None = None, stt_model_name: str | None = None):
     models_path = Path(os.environ.get("LLIMA_MODELS_PATH", DEFAULT_MODELS_PATH))
     model_name = model_name or _text_model_name()
     assert (models_path / model_name / "devkit" / "vlm_config.json").is_file()
@@ -84,8 +87,11 @@ def _running_web_server(tmp_path, model_name: str | None = None):
 
     env = os.environ.copy()
     env["LLIMA_MODELS_PATH"] = str(models_path)
+    command = [llima, "run", model_name, "--mode", "web"]
+    if stt_model_name is not None:
+        command.extend(["--stt_model_path", str(models_path / stt_model_name)])
     process = subprocess.Popen(
-        [llima, "run", model_name, "--mode", "web"],
+        command,
         cwd=tmp_path,
         env=env,
         text=True,
@@ -110,14 +116,14 @@ def _running_web_server(tmp_path, model_name: str | None = None):
         assert process.returncode == 0, output
 
 
-def _post(path: str, body: bytes, timeout: float = 180):
+def _post(path: str, body: bytes, timeout: float = 180, content_type: str = "application/json"):
     connection = http.client.HTTPConnection(HOST, PORT, timeout=timeout)
     try:
         connection.request(
             "POST",
             path,
             body=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": content_type},
         )
         response = connection.getresponse()
         return response.status, dict(response.getheaders()), response.read()
@@ -217,13 +223,21 @@ def _reconstruct_openai_reasoning_stream(body: bytes) -> tuple[str, str, bool]:
     return "".join(reasoning), "".join(content), saw_done
 
 
-def test_openai_http_protocol_and_recovery(tmp_path):
+def test_http_protocol_and_recovery(tmp_path):
     assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
 
     with _running_web_server(tmp_path):
         malformed_status, _, malformed_body = _post("/v1/chat/completions", b"{")
         assert malformed_status in {400, 500}
         assert json.loads(malformed_body)["error"]
+
+        for endpoint, payload in (
+            ("/api/chat", {"messages": [{"role": "user", "content": QUERY, "images": ["%%%"]}]}),
+            ("/api/generate", {"prompt": QUERY, "images": ["===="]}),
+        ):
+            status, _, body = _post(endpoint, json.dumps(payload | {"stream": False}).encode())
+            assert status == 400, body.decode()
+            assert json.loads(body)["error"]
 
         status, headers, body = _post(
             "/v1/chat/completions", _chat_body(stream=False)
@@ -402,3 +416,215 @@ def test_reasoning_http_protocols(tmp_path, model_env, default_model):
         assert "5" in message["content"]
         for marker in REASONING_MARKERS:
             assert marker not in message["content"]
+
+
+
+def _audio_multipart(audio: bytes | None, **fields) -> tuple[bytes, str]:
+    boundary = "llima-audio-regression-boundary"
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    if audio is not None:
+        parts.extend([
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="speech.wav"\r\n'
+            'Content-Type: audio/wav\r\n\r\n'.encode(),
+            audio,
+            b"\r\n",
+        ])
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _post_audio(audio: bytes | None, *, endpoint="/v1/audio/transcriptions", **fields):
+    body, content_type = _audio_multipart(audio, **fields)
+    return _post(endpoint, body, content_type=content_type)
+
+
+def _assert_audio_transcript(text):
+    words = " ".join(re.findall(r"[a-z]+", text.lower()))
+    assert words == "why is the sky blue", text
+
+
+def _wav_clip(*, seconds=None, repeats=1):
+    sample = Path("/usr/share/sima_lmm/assets/why_is_the_sky_blue.wav")
+    if seconds is None and repeats == 1:
+        return sample.read_bytes()
+    output = io.BytesIO()
+    with wave.open(str(sample)) as source, wave.open(output, "wb") as destination:
+        destination.setparams(source.getparams())
+        if seconds is None:
+            destination.writeframes(source.readframes(source.getnframes()) * repeats)
+        else:
+            destination.writeframes(b"\0" * int(source.getframerate() * seconds)
+                                    * source.getnchannels() * source.getsampwidth())
+    return output.getvalue()
+
+
+@pytest.mark.parametrize("backend", ["gemma", "whisper"])
+def test_audio_transcription_and_recovery(tmp_path, backend):
+    assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
+    audio = _wav_clip()
+    model = _model_name("SIMA_TEST_LLIMA_AUDIO_MODEL", "Gemma-4-E2B-it-GPTQ-Multimodal-a16w4")
+    stt_model = None
+    if backend == "whisper":
+        # Even with an audio-capable primary model, explicitly configured
+        # Whisper keeps precedence and exposes its genuine metadata.
+        stt_model = _model_name("SIMA_TEST_LLIMA_ASR_MODEL", "whisper-small-a16w8")
+    with _running_web_server(tmp_path, model, stt_model):
+        status, _, body = _post_audio(None)
+        assert status == 400, body
+        status, _, body = _post_audio(audio)
+        assert status == 200, body
+        result = json.loads(body)
+        _assert_audio_transcript(result["text"])
+        assert result["task"] == "transcribe"
+        if backend == "gemma":
+            assert "language" not in result  # No fabricated auto-detection.
+            assert "no_speech_prob" not in result
+            assert "avg_logprob" not in result
+        else:
+            assert result["language"] == "en"
+            assert 0 <= result["no_speech_prob"] <= 1
+
+        status, _, body = _post_audio(audio, language="en", stream="true")
+        assert status == 200, body
+        transcript, done, metadata = [], False, None
+        for line in body.decode().splitlines():
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                done = True
+                continue
+            chunk = json.loads(data)
+            assert chunk["object"] != "audio.transcription.error", chunk
+            transcript.append(chunk["text"])
+            if chunk["object"] == "audio.transcription.done":
+                metadata = chunk
+        _assert_audio_transcript("".join(transcript))
+        assert done and metadata, body
+        assert metadata["language"] == "en"
+        assert metadata["finish_reason"] == "stop"
+        assert metadata["task"] == "transcribe"
+        if backend == "gemma":
+            assert "no_speech_prob" not in metadata
+            assert "avg_logprob" not in metadata
+            status, headers, body = _post_audio(audio, response_format="text", language="EN",
+                                               prompt="A short question about the sky.")
+            assert status == 200, body
+            assert headers["Content-Type"].startswith("text/plain")
+            _assert_audio_transcript(body.decode())
+            status, _, body = _post_audio(audio, endpoint="/audio/transcriptions")
+            assert status == 200, body
+            _assert_audio_transcript(json.loads(body)["text"])
+            for invalid_audio, fields in [
+                (b"", {}),
+                (b"corrupt audio", {}),
+                (_wav_clip(seconds=31), {}),
+                (b"corrupt audio", {"stream": "true"}),
+                (_wav_clip(seconds=31), {"stream": "true"}),
+                (audio, {"language": "English"}),
+                (audio, {"response_format": "verbose_json"}),
+                (audio, {"response_format": "text", "stream": "true"}),
+            ]:
+                status, _, body = _post_audio(invalid_audio, **fields)
+                assert status == 400, body
+                assert json.loads(body)["error"]
+            status, _, body = _post_audio(audio)
+            assert status == 200, body
+            _assert_audio_transcript(json.loads(body)["text"])
+        else:
+            status, _, body = _post_audio(audio, endpoint="/v1/audio/translations", language="en")
+            assert status == 200, body
+            translated = json.loads(body)
+            assert translated["task"] == "translate"
+            _assert_audio_transcript(translated["text"])
+            # A transcription barges into chat, then waits for its worker and
+            # callbacks to finish before running Whisper on the same hardware.
+            chat_started, chat_finished = threading.Event(), threading.Event()
+            chat_errors = []
+
+            def consume_chat():
+                connection = http.client.HTTPConnection(HOST, PORT, timeout=180)
+                try:
+                    connection.request("POST", "/v1/chat/completions",
+                                       _chat_body(stream=True, query="Count upward from 1 to 1000, writing every number."),
+                                       {"Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    assert response.status == 200
+                    while line := response.readline():
+                        if line.startswith(b"data: "):
+                            data = line[6:].strip()
+                            if data == b"[DONE]":
+                                break
+                            if json.loads(data)["choices"][0]["delta"].get("content"):
+                                chat_started.set()
+                except BaseException as error:
+                    chat_errors.append(error)
+                finally:
+                    connection.close()
+                    chat_finished.set()
+
+            consumer = threading.Thread(target=consume_chat, daemon=True)
+            consumer.start()
+            assert chat_started.wait(timeout=60)
+            status, _, body = _post_audio(audio)
+            assert status == 200, body
+            _assert_audio_transcript(json.loads(body)["text"])
+            assert chat_finished.wait(timeout=30)
+            consumer.join(timeout=1)
+            assert not consumer.is_alive()
+            assert not chat_errors, chat_errors
+        # Audio callbacks must not consume later chat tokens or use a dead SSE sink.
+        status, _, body = _post("/v1/chat/completions", _chat_body(stream=False))
+        assert status == 200, body
+        assert "berlin" in json.loads(body)["choices"][0]["message"]["content"].lower()
+
+
+def test_stop_interrupts_gemma_audio_transcription(tmp_path):
+    assert platform.machine() == "aarch64", "runtime tests require an ARM64 DevKit"
+    model = _model_name("SIMA_TEST_LLIMA_AUDIO_MODEL", "Gemma-4-E2B-it-GPTQ-Multimodal-a16w4")
+    started, finished = threading.Event(), threading.Event()
+    errors, chunks = [], []
+
+    def consume():
+        connection = http.client.HTTPConnection(HOST, PORT, timeout=180)
+        try:
+            body, content_type = _audio_multipart(_wav_clip(repeats=11), stream="true")
+            connection.request("POST", "/v1/audio/transcriptions", body,
+                               {"Content-Type": content_type})
+            response = connection.getresponse()
+            assert response.status == 200
+            while line := response.readline():
+                if not line.startswith(b"data: "):
+                    continue
+                data = line[6:].strip()
+                if data == b"[DONE]":
+                    break
+                chunk = json.loads(data)
+                chunks.append(chunk)
+                if chunk.get("text"):
+                    started.set()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            connection.close()
+            finished.set()
+
+    with _running_web_server(tmp_path, model):
+        consumer = threading.Thread(target=consume, daemon=True)
+        consumer.start()
+        assert started.wait(timeout=60), "Audio stream did not produce a token"
+        status, _, body = _post("/stop", b"{}", timeout=30)
+        assert status == 200, body
+        assert finished.wait(timeout=30), "Audio stream did not stop"
+        consumer.join(timeout=1)
+        assert not consumer.is_alive()
+        assert not errors, errors
+        assert chunks[-1]["object"] == "audio.transcription.done", chunks
+        assert chunks[-1]["finish_reason"] == "cancelled", chunks
+        status, _, body = _post_audio(_wav_clip())
+        assert status == 200, body
+        _assert_audio_transcript(json.loads(body)["text"])

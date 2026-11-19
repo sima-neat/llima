@@ -109,6 +109,7 @@ output_directory/
 | `--no-quantize_embeddings` | 停用嵌入表格量化功能。預設情況下，此功能會針對支援的 LLM 和 VLM 啟用。 |
 | `--no-quantize_kv_cache` | 停用 KV 快取量化功能，因為預設情況下已啟用此功能。 |
 | `--return_logits` | 傳回最後一層輸出的 logits 值（模型評估器需要此值）。 |
+| `--max_audio_duration` | 每段音訊的最長時間，單位為秒（1–30；預設：30）。縮短上限可減少音訊編碼器的圖大小。需要支援音訊的模型。 |
 | `--draft_model_path` | 相容的 EAGLE3、Gemma4 MTP 或 DFlash 草稿模型路徑。方法會自動偵測。 |
 | `--speculative_block_size` | DFlash 驗證寬度：4、8 或 16。預設：8。 |
 | `--lora_name` | 與基礎模型一同編譯的 LoRA 配接器的名稱。 |

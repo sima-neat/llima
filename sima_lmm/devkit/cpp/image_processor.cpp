@@ -146,6 +146,7 @@ std::vector<Eigen::bfloat16> ImageProcessor::_preprocess(cv::Mat image) {
 
 
 cv::Mat ImageProcessor::_convert_to_rgb(cv::Mat image) {
+    if (image.empty()) throw std::invalid_argument("Could not decode image attachment");
     if (image.channels() == 1) {
         cv::cvtColor(image, image, cv::COLOR_GRAY2RGB);
     } else if (image.channels() == 4) {
