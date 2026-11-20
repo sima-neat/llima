@@ -135,10 +135,14 @@ LanguageModel::LanguageModel(
         // intentionally does not emit grouped assistant pre/cache/post models.
         && !_cfg.lm_cfg.is_gemma4_mtp_draft()
     );
-    if (_cfg.vision_bidirectional_attention() &&
-        (!_use_group_token_models || !_cfg.vm_cfg.has_value() || _cfg.vm_cfg->max_soft_tokens == 0
-         || _cfg.lm_cfg.is_spec_decode())) {
-        throw std::invalid_argument("Gemma 4 Unified requires grouped prefill and no speculative draft");
+    if (_cfg.vision_bidirectional_attention()) {
+        if (!_use_group_token_models || !_cfg.vm_cfg || _cfg.vm_cfg->max_soft_tokens == 0) {
+            throw std::invalid_argument("Gemma 4 Unified requires grouped prefill and an image token budget");
+        }
+        if (_cfg.lm_cfg.is_spec_decode() && (!_cfg.lm_cfg.is_gemma4_mtp_target() ||
+            _cfg.pipeline_cfg.input_token_group_size <= _cfg.lm_cfg.get_single_num_tokens())) {
+            throw std::invalid_argument("Gemma 4 Unified requires an MTP verifier narrower than its prefill group");
+        }
     }
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
@@ -507,6 +511,15 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count) {
+    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
+                                          timer_ttft, performance_result, stable_prefix_token_count, {});
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count,
+    const MediaLoader& media_loader) {
     if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value() ||
         !draft_lm._cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
         throw std::invalid_argument("Both models must contain speculative-decoding configuration");
@@ -520,8 +533,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         throw std::invalid_argument("Target and draft speculative methods do not match");
     }
     if (target.is_gemma4_mtp()) {
-        return run_model_gemma4_mtp(draft_lm, input_token_ids, override_max_num_tokens, timer_ttft,
-                                    performance_result);
+        return _run_gemma4_mtp(draft_lm, input_token_ids, override_max_num_tokens, timer_ttft,
+                               performance_result, media_loader);
     }
     if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.hidden_size ||
         _cfg.lm_cfg.token_cfg.vocab_size != draft_lm._cfg.lm_cfg.token_cfg.vocab_size) {
@@ -634,7 +647,7 @@ uint32_t LanguageModel::run_model_prefill(
                     next_token_id = _run_image_window(begin, window->second, num_input_tokens);
                     if (!_is_running.load(std::memory_order_relaxed)) {
                         _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.begin() + begin);
-                        _notify_interrupt();
+                        if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                         return next_token_id;
                     }
                     token_idx = window->second;
@@ -1101,7 +1114,7 @@ uint32_t LanguageModel::run_model_once(
     auto use_input_tokens = token_idx < num_input_tokens;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
-    if (_cfg.vision_bidirectional_attention() && num_tokens > 1) {
+    if (_cfg.is_unified_prefill(num_tokens)) {
         _upload_image_attention_masks(token_idx, std::min<uint32_t>(num_input_tokens, token_idx + num_tokens), 0);
     } else {
         _upload_group_future_token_masks(num_tokens, token_idx);
@@ -1593,6 +1606,7 @@ uint32_t LanguageModel::run_model_once(
             const uint16_t logits_num_tokens = used_single_post_for_target_group
                 ? single_num_tokens
                 : num_tokens;
+            if (_cfg.lm_cfg.is_gemma4_mtp_target()) return _read_gemma4_mtp_prefill_token(row);
             const uint32_t vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
 
             if (_cfg.lm_cfg.lm_head_num_splits == 1) {
@@ -1641,18 +1655,6 @@ uint32_t LanguageModel::run_model_once(
                     }
                 }
                 next_token_id = best_idx;
-            }
-            if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
-                auto hidden_rows = _read_gemma4_mtp_target_hidden_rows(
-                    logits_num_tokens, static_cast<uint16_t>(row + 1)
-                );
-                const size_t hidden_size = _cfg.lm_cfg.hidden_size;
-                const auto row_begin = hidden_rows.begin()
-                    + static_cast<std::ptrdiff_t>(row * hidden_size);
-                _gemma4_mtp_prefill_hidden_state.emplace(
-                    row_begin,
-                    row_begin + static_cast<std::ptrdiff_t>(hidden_size)
-                );
             }
         } else {
             // Non-spec: read from single n1_buffer4
@@ -2686,7 +2688,7 @@ uint16_t LanguageModel::_get_cache_token_idx_begin(
     if (layer_type != "sliding_attention") {
         return 0;
     }
-    if (_cfg.vision_bidirectional_attention() && num_tokens > 1) {
+    if (_cfg.is_unified_prefill(num_tokens)) {
         return gemma4_cache_view(token_idx, num_tokens, _cfg.pipeline_cfg.max_num_tokens,
             _cfg.lm_cfg.attn_cfg.sliding_window.value(), _image_spans).first;
     }
@@ -2701,7 +2703,7 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
 ) const {
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    if (_cfg.vision_bidirectional_attention() && num_tokens > 1 && layer_type == "sliding_attention") {
+    if (_cfg.is_unified_prefill(num_tokens) && layer_type == "sliding_attention") {
         const uint16_t capacity = gemma4_cache_view(token_idx, num_tokens,
             _cfg.pipeline_cfg.max_num_tokens, _cfg.lm_cfg.attn_cfg.sliding_window.value(), _image_spans).second;
         return {num_tokens, 1, capacity - num_tokens};
@@ -2832,7 +2834,7 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
     pre_model._bind_ifm(freq_ifm_idx, freq_real, {token_idx, 0});
     pre_model._bind_ifm(freq_ifm_idx + 1, freq_imag, {token_idx, 0});
 
-    if (_cfg.vision_bidirectional_attention() && num_tokens > 1) {
+    if (_cfg.is_unified_prefill(num_tokens)) {
         pre_model._bind_ifm(0, &get_buffer(fmt::format("n{}_buffer1", num_tokens)), {0, 0});
         pre_model._bind_ofm(0, &get_buffer(fmt::format("n{}_buffer2", num_tokens)), {0, 0, 0});
         cache_model._bind_ifm(0, &get_buffer(fmt::format("n{}_buffer2", num_tokens)), {0, 0, 0});
@@ -2903,7 +2905,7 @@ LanguageModel::BoundAttentionModels LanguageModel::_bind_attn_models(
             {0, cache_token_idx_begin, 0}
         );
     }
-    if (_cfg.vision_bidirectional_attention() && num_tokens > 1 && use_sliding_cache) {
+    if (_cfg.is_unified_prefill(num_tokens) && use_sliding_cache) {
         cache_model._bind_ifm(cache_ifm_idx++, &get_buffer("group_sliding_future_token_mask"), {0});
     } else if (use_group_future_token_mask) {
         // Group-mask buffer, begin, and shape are fixed by the compact key.
@@ -3714,8 +3716,8 @@ void LanguageModel::_prepare_lm_head_logit_views(
 
 uint32_t LanguageModel::_argmax_lm_head_row(
     std::span<const LMHeadLogitView> views, uint16_t row
-) {
-    uint32_t best_index = 0;
+) const {
+    uint32_t best_index = std::numeric_limits<uint32_t>::max();
     float best_value = -std::numeric_limits<float>::infinity();
     for (const auto& view : views) {
         const auto* row_ptr = reinterpret_cast<const Eigen::bfloat16*>(
@@ -3723,11 +3725,21 @@ uint32_t LanguageModel::_argmax_lm_head_row(
         );
         const auto [value, offset] = argmax_bf16(row_ptr, view.width);
         const uint32_t index = view.vocab_begin + offset;
-        if (value > best_value || (value == best_value && index < best_index)) {
+        if (!_suppressed_tokens.empty() && _suppressed_tokens[index]) {
+            for (uint32_t i = 0; i < view.width; ++i) {
+                const auto token = view.vocab_begin + i;
+                const float logit = static_cast<float>(row_ptr[i]);
+                if (!_suppressed_tokens[token] && (logit > best_value || (logit == best_value && token < best_index))) {
+                    best_value = logit;
+                    best_index = token;
+                }
+            }
+        } else if (value > best_value || (value == best_value && index < best_index)) {
             best_value = value;
             best_index = index;
         }
     }
+    if (best_index == std::numeric_limits<uint32_t>::max()) throw std::runtime_error("No eligible vocabulary token");
     return best_index;
 }
 

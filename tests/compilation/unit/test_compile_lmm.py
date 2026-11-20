@@ -16,6 +16,7 @@ pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
             {"model_type": "gemma4_assistant", "architectures": ["Gemma4AssistantForCausalLM"]},
             "gemma4_mtp",
         ),
+        ({"model_type": "gemma4_unified_assistant"}, "gemma4_mtp"),
         (
             {"model_type": "llama", "architectures": ["LlamaForCausalLMEagle3"]},
             "eagle3",

@@ -29,7 +29,7 @@ void LanguageModel::_define_attn_models_iter(
 ) {
     const LanguageModelMapKey pre_post_key{num_tokens, layer_idx, 0};
     // Group sliding definitions enumerate bucket capacities, independent of a request's images.
-    const bool unified_sliding = _cfg.vision_bidirectional_attention() && num_tokens > 1
+    const bool unified_sliding = _cfg.is_unified_prefill(num_tokens)
         && _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention";
     const LanguageModelMapKey cache_key = unified_sliding
         ? LanguageModelMapKey{num_tokens, 1, token_idx}

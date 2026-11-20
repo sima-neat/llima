@@ -118,6 +118,15 @@ class LanguageModel : public BaseModel<VlmConfig> {
             GenerationPerformanceResult* performance_result,
             uint16_t stable_prefix_token_count
         );
+        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            uint16_t stable_prefix_token_count,
+            const MediaLoader& media_loader
+        );
         std::optional<std::vector<uint32_t>> run_model_gemma4_mtp(
             LanguageModel& draft_lm,
             std::span<const uint32_t> input_token_ids,
@@ -516,9 +525,18 @@ class LanguageModel : public BaseModel<VlmConfig> {
         void _prepare_lm_head_logit_views(
             uint16_t num_tokens, uint16_t output_rows, std::vector<LMHeadLogitView>& views
         );
-        static uint32_t _argmax_lm_head_row(
+        uint32_t _argmax_lm_head_row(
             std::span<const LMHeadLogitView> views, uint16_t row
+        ) const;
+        std::optional<std::vector<uint32_t>> _run_gemma4_mtp(
+            LanguageModel& draft_lm,
+            std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance_result,
+            const MediaLoader& media_loader
         );
+        uint32_t _read_gemma4_mtp_prefill_token(uint16_t row);
         uint32_t _argmax_gemma4_mtp_masked_row(uint16_t num_tokens, uint16_t row);
         std::vector<uint32_t> _argmax_lm_head_rows(
             uint16_t num_tokens, uint16_t valid_tokens,
@@ -526,7 +544,7 @@ class LanguageModel : public BaseModel<VlmConfig> {
         );
         std::vector<Eigen::bfloat16> _read_embedding_row_bf16(uint32_t token_id);
         std::vector<Eigen::bfloat16> _read_gemma4_mtp_target_hidden_rows(
-            uint16_t num_tokens, uint16_t valid_tokens
+            uint16_t num_tokens, uint16_t valid_tokens, uint16_t first_row = 0
         );
         void _upload_gemma4_mtp_freq_rows(
             uint16_t num_tokens, uint16_t position_id, uint16_t valid_tokens

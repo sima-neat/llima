@@ -244,7 +244,7 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_language_model(
     }
     return _language_model_ptr->run_model_speculative_decoding(
         *_draft_vlm_ptr->_language_model_ptr, input_token_ids,
-        max_num_tokens, timer_ttft, performance_result, stable_prefix_token_count
+        max_num_tokens, timer_ttft, performance_result, stable_prefix_token_count, media_loader
     );
 }
 

@@ -128,6 +128,12 @@ class VlmArchType(str, ExtensibleEnum):
     VLM_QWEN3_5_VL = "vlm-qwen3_5"
     VLM_SMOLVLM = "vlm-smolvlm"
 
+GEMMA4_ASSISTANT_TARGETS = {
+    "gemma4_assistant": VlmArchType.VLM_GEMMA4,
+    "gemma4_unified_assistant": VlmArchType.VLM_GEMMA4_UNIFIED,
+}
+
+
 class VisionArchType(str, ExtensibleEnum):
     """Vision architecture type.
     """
@@ -1232,7 +1238,7 @@ class VlmConfig(BaseConfig):
         """
         source_model_name = model_path.name
         is_vlm = _is_vlm_model(model_cfg)
-        is_gemma4_assistant = model_cfg.get("model_type") == "gemma4_assistant"
+        is_gemma4_assistant = model_cfg.get("model_type") in GEMMA4_ASSISTANT_TARGETS
         text_config = model_cfg["text_config"] if (is_vlm or is_gemma4_assistant) else model_cfg
         vision_config = model_cfg["vision_config"] if is_vlm else None
 

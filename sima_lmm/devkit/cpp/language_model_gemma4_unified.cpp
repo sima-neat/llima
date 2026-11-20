@@ -93,6 +93,7 @@ uint32_t LanguageModel::_run_image_window(uint16_t begin, uint16_t end, uint16_t
     const uint16_t group = _cfg.pipeline_cfg.input_token_group_size;
     const uint16_t chunks = (end - begin) / group;
     const uint32_t hidden = _cfg.lm_cfg.hidden_size;
+    const uint32_t post_width = _cfg.lm_cfg.get_single_num_tokens();
     auto& input = get_buffer("input_embeds");
     const bool quantize_embeddings = _cfg.pipeline_cfg.quantize_embeddings;
     auto* scales = quantize_embeddings ? &get_buffer("input_embedding_scales") : nullptr;
@@ -139,12 +140,14 @@ uint32_t LanguageModel::_run_image_window(uint16_t begin, uint16_t end, uint16_t
             models.cache->add_to_queue(&cache_ifms);
             if (final_layer) {
                 const uint32_t row = prompt_length - 1 - begin - slot * group;
+                // The verification-width post also finishes prefill. Select rows that contain the last prompt token.
+                const uint32_t first = row + 1 > post_width ? row + 1 - post_width : 0;
                 std::map<uint8_t, MLABufferSlice> post_ifms{
-                    {0, {residual_input, {slot * group + row, 0}, {1, hidden}}},
+                    {0, {residual_input, {slot * group + first, 0}, {post_width, hidden}}},
                     {static_cast<uint8_t>(1 + quantized_input),
-                        {&get_buffer(fmt::format("n{}_buffer3", group)), {row, 0}, {1, _cfg.lm_cfg.attn_cfg.get_q_size(type)}}},
+                        {&get_buffer(fmt::format("n{}_buffer3", group)), {first, 0}, {post_width, _cfg.lm_cfg.attn_cfg.get_q_size(type)}}},
                 };
-                if (quantized_input) post_ifms.emplace(1, MLABufferSlice{scales, {slot * group + row, 0}, {1, 1}});
+                if (quantized_input) post_ifms.emplace(1, MLABufferSlice{scales, {slot * group + first, 0}, {post_width, 1}});
                 models.post->add_to_queue(&post_ifms);
             } else {
                 std::map<uint8_t, MLABufferSlice> residual{{0, {residual_input,
@@ -158,6 +161,10 @@ uint32_t LanguageModel::_run_image_window(uint16_t begin, uint16_t end, uint16_t
         if (!_is_running.load(std::memory_order_relaxed)) return 0;
     }
     if (end < prompt_length) return 0;
+    if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
+        const uint32_t last_row = (prompt_length - 1 - begin) % group;
+        return _read_gemma4_mtp_prefill_token(std::min(last_row, post_width - 1));
+    }
     auto& result = get_buffer("n1_buffer4");
     if (_need_argmax) {
         result.invalidate_cache(0, static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) * sizeof(Eigen::bfloat16));

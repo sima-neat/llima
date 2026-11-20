@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
-    ModelFormat, SPECULATIVE_BUDGET, SpeculativeDecodingMethod, VisionArchType,
+    GEMMA4_ASSISTANT_TARGETS, ModelFormat, SPECULATIVE_BUDGET, SpeculativeDecodingMethod, VisionArchType,
     VlmArchType, VlmConfig, model_file_type,
 )
 from sima_lmm.gguf.gguf_conversion import GgufModel
@@ -20,7 +20,7 @@ from sima_lmm.logging import sima_log_info
 
 def _detect_speculative_method(model_config: dict) -> str:
     """Detect a draft model's speculative method from its loaded configuration."""
-    if model_config.get("model_type") == "gemma4_assistant":
+    if model_config.get("model_type") in GEMMA4_ASSISTANT_TARGETS:
         return SpeculativeDecodingMethod.GEMMA4_MTP
 
     architectures = model_config.get("architectures", [])
@@ -109,8 +109,6 @@ class VisionLanguageModel(BaseModel):
                     raise ValueError("Audio processor and model disagree on samples per token")
             if override_language_group_size is None:
                 override_language_group_size = 128
-            if target_model is not None:
-                raise ValueError("Gemma 4 Unified speculative decoding is not supported yet")
         # Set the token size and offsets for group processing.
         vlm_cfg.config_pipeline(
             system_prompt, chat_template, max_num_tokens, override_language_group_size,
@@ -123,13 +121,17 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
         if target_model is not None:
+            unified_target = target_model.cfg.lm_cfg.vision_bidirectional_attention
+            if unified_target and speculative_method != SpeculativeDecodingMethod.GEMMA4_MTP:
+                raise ValueError("Gemma 4 Unified requires a matching Unified MTP assistant")
             if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:
-                if target_model.cfg.model_type != VlmArchType.VLM_GEMMA4:
-                    raise ValueError("gemma4_mtp speculative decoding requires a Gemma4 target model")
-                if model_config.get("model_type") != "gemma4_assistant":
-                    raise ValueError(
-                        "gemma4_mtp speculative decoding requires a gemma4_assistant draft model"
-                    )
+                required_target = GEMMA4_ASSISTANT_TARGETS[model_config["model_type"]]
+                if target_model.cfg.model_type != required_target:
+                    raise ValueError(f"{model_config['model_type']} requires a {required_target} target")
+                if unified_target and (
+                    target_model.cfg.pipeline_cfg.input_token_group_size <= SPECULATIVE_BUDGET["gemma4_mtp_target"]
+                ):
+                    raise ValueError("Unified prefill group size must exceed the MTP verification width")
                 if vlm_cfg.lm_cfg.speculative_decoding_cfg.backbone_hidden_size != target_model.cfg.lm_cfg.hidden_size:
                     raise ValueError(
                         "Gemma4 MTP assistant backbone hidden size does not match target hidden size: "
@@ -239,6 +241,9 @@ class VisionLanguageModel(BaseModel):
     ):
         if method == SpeculativeDecodingMethod.GEMMA4_MTP:
             budget_key = "gemma4_mtp_draft" if is_draft else "gemma4_mtp_target"
+            # Every verification row needs a causal mask, even with exact-size cache buckets.
+            if not is_draft and self.cfg.pipeline_cfg.future_token_mask_size == 1:
+                self.cfg.pipeline_cfg.set_future_token_mask_size(SPECULATIVE_BUDGET[budget_key])
         else:
             budget_key = "draft" if is_draft else "target"
         speculative_budget = SPECULATIVE_BUDGET[budget_key]

@@ -31,6 +31,7 @@ from sima_lmm.config.layer_id import LayerID
 from sima_lmm.config.vlm_config import (
     LlmArchType,
     PipelineConfig,
+    SpeculativeDecodingMethod,
     VlmArchType,
 )
 
@@ -756,6 +757,10 @@ class LanguageModel(BaseModel):
         return embeddings_tensor.astype(bfloat16).astype(np.float32), None
 
     def get_input_embeddings_tensor(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        spec = self.cfg.lm_cfg.speculative_decoding_cfg
+        if spec and spec.is_draft and spec.method == SpeculativeDecodingMethod.GEMMA4_MTP:
+            # The assistant uses its tied table only as the output head.
+            return None, None
         return self.get_embeddings_tensor()
 
     def get_per_layer_embeddings_tensor(self) -> tuple[np.ndarray, np.ndarray | None]:

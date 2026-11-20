@@ -124,6 +124,28 @@ def test_image_windows_and_cache_views():
             assert not allowed[:, :begin].any() and not allowed[:, begin + capacity:].any()
 
 
+def test_mtp_verifies_causally_after_image_prefill(unified):
+    _, model, _ = unified
+    model.cfg.lm_cfg.set_speculative_decoding_config(
+        dict(method="gemma4_mtp", is_draft=False, speculative_budget=7)
+    )
+    assert model._get_part_model("sliding_cache", 128, token_idx=0).dynamic_mask
+    for kind in ("sliding_cache", "cache"):
+        part = model._get_part_model(kind, 7, token_idx=15)
+        assert not part.dynamic_mask
+        with patch.object(ModelGraph, "save", autospec=True) as save:
+            part.generate_graph({}, quantizable=True)
+        graph, outputs = save.call_args.args
+        graph.finish(outputs)
+        inputs = {name: np.zeros(tensor_type(node).shape, np.float32) for name, node in graph.inputs.items()}
+        inputs["cached_values"][:] = np.arange(16, dtype=np.float32)[:, None]
+        for row in range(7):
+            inputs["attn_mask"][0, 0, row, row + 1:] = -1e4
+        # With zero queries, each row averages only the visible token positions.
+        actual, = graph.run(**inputs)
+        np.testing.assert_allclose(actual[0, 0, :, 0], np.arange(7) / 2, atol=1e-6)
+
+
 @pytest.mark.parametrize("length,spans", [
     (129, [(127, 129)]),
     (600, [(511, 527), (528, 544)]),
