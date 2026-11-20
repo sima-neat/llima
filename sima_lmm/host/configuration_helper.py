@@ -39,6 +39,10 @@ _ENCODE_LAYER_PART: dict[str, tuple[bool, str]] = {
     "single_expert": (False, "EXPERT"),
     "group_weightedsum": (True, "WEIGHTEDSUM"),
     "single_weightedsum": (False, "WEIGHTEDSUM"),
+    "group_expert_template": (True, "EXPERT"),
+    "single_expert_template": (False, "EXPERT"),
+    "single_expert_fused_template": (False, "EXPERT"),
+    "single_final_head": (False, "WEIGHTEDSUM"),
 }
 
 

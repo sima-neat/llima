@@ -210,9 +210,18 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 struct MixtureOfExpertsConfig {
     uint16_t num_experts;
     uint16_t num_experts_per_tok;
+    // Experts run on a relocatable template with weights streamed from expert records
+    // (Qwen3-Next); see expert_streaming.hpp.
+    bool streamed_experts = false;
+    // Decode routers emit expert logits; the runtime takes the top-k and softmax on the host.
+    bool host_topk = false;
+    // Top-k weights are renormalized (softmax over the top-k logits) rather than taken from
+    // the softmax over all experts.
+    bool norm_topk_prob = false;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
-    MixtureOfExpertsConfig, num_experts, num_experts_per_tok
+    MixtureOfExpertsConfig, num_experts, num_experts_per_tok, streamed_experts, host_topk,
+    norm_topk_prob
 )
 
 struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
@@ -239,6 +248,7 @@ struct LanguageModelConfig {
 
     // Mixture-of-Experts: the post block is replaced by router + experts + weighted-sum.
     bool is_moe() const { return moe_cfg.has_value(); }
+    bool is_streamed_moe() const { return moe_cfg.has_value() && moe_cfg->streamed_experts; }
     // gpt_oss feeds a per-head "sink" logit into the attention softmax as an extra
     // per-layer input to the (shared) cache model.
     bool uses_attention_sinks() const { return arch == "gpt_oss"; }

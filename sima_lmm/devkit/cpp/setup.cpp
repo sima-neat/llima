@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <atomic>
 #include <memory>
 
@@ -53,7 +54,11 @@ void set_log_level(spdlog::level::level_enum log_level) {
 }
 
 void initialize_default_sample_files() {
-    const std::filesystem::path assets_dir = SIMA_LMM_DEFAULT_ASSETS_DIR;
+    // SIMA_LMM_ASSETS_DIR overrides the build's install location (e.g. a runtime built on one
+    // board and run on another).
+    const char* assets_env = std::getenv("SIMA_LMM_ASSETS_DIR");
+    const std::filesystem::path assets_dir = assets_env && *assets_env
+        ? std::filesystem::path(assets_env) : std::filesystem::path(SIMA_LMM_DEFAULT_ASSETS_DIR);
     set_sample_image_file_name(assets_dir / "sjc.jpg");
     set_sample_audio_file_name(assets_dir / "why_is_the_sky_blue.wav");
 }

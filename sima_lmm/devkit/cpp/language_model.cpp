@@ -1,6 +1,8 @@
 #include "embedding_offload.hpp"
 #include <algorithm>
 #include <cmath>
+#include <numeric>
+#include <future>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -133,6 +135,10 @@ LanguageModel::LanguageModel(
         // serialized pipeline config retains target group offsets, but the compiler
         // intentionally does not emit grouped assistant pre/cache/post models.
         && !_cfg.lm_cfg.is_gemma4_mtp_draft()
+        // SIMA_LLIMA_TOKEN_PREFILL_ONLY=1: never load the grouped (prefill) models and process
+        // prompts token by token. Frees their MLA memory (streamed 80B: ~1.4 GiB of DeltaNet
+        // units) for the decode expert cache, at the cost of TTFT on long prompts.
+        && !get_env_var("SIMA_LLIMA_TOKEN_PREFILL_ONLY", false)
     );
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
@@ -549,6 +555,9 @@ uint32_t LanguageModel::run_model_prefill(
         _prompt_per_layer_token_ids = _get_per_layer_token_ids(input_token_ids);
     if (!timer_ttft.has_value())
         timer_ttft = ChronoTimer{true};
+    _moe_phase = 0;
+    _moe_stats[0].reset();
+    const auto prefill_start = std::chrono::steady_clock::now();
     const uint16_t num_input_tokens = input_token_ids.size();
     const uint16_t group_size = _cfg.pipeline_cfg.input_token_group_size;
     uint16_t token_idx{};
@@ -562,7 +571,7 @@ uint32_t LanguageModel::run_model_prefill(
             next_token_id = _cached_token_ids[num_cached_tokens];
         else
             next_token_id = _cached_first_generated_token;
-    } else if (_use_group_token_models) {
+    } else if (_use_group_token_models && !_use_token_prefill(num_input_tokens - num_cached_tokens)) {
         const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
         auto it = offsets.end();
@@ -632,6 +641,13 @@ uint32_t LanguageModel::run_model_prefill(
         }
     }
     _cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
+    if (_expert_stats && _cfg.lm_cfg.is_streamed_moe()) {
+        _report_moe_stats(0, std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - prefill_start).count(),
+            num_input_tokens - num_cached_tokens);
+    }
+    _moe_phase = 1;
+    _moe_stats[1].reset();
     auto duration = timer_ttft.value().stop();
     if (num_input_tokens < _max_num_tokens)
         _notify_first_token(next_token_id, duration);
@@ -645,6 +661,19 @@ void LanguageModel::run_model_decode(
 ) {
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
+    // Report streamed-MoE decode counters however the loop ends.
+    struct DecodeStatsReport {
+        LanguageModel* self;
+        uint16_t first;
+        const uint16_t* last;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~DecodeStatsReport() {
+            if (self->_expert_stats && self->_cfg.lm_cfg.is_streamed_moe()) {
+                self->_report_moe_stats(1, std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count(), *last - first);
+            }
+        }
+    } decode_report{this, num_input_tokens, &token_idx};
     for (token_idx = num_input_tokens; token_idx < _max_num_tokens; ++token_idx ) {
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
         _cached_token_ids.emplace_back(token_id);
@@ -923,6 +952,10 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
                 );
             }
             _linear_model_map.at(linear_model_key).add_to_queue(&ifm_map);
+            if (_cfg.lm_cfg.is_streamed_moe()) {
+                // The router reads the linear unit's residual sum, not the layer input.
+                _run_streamed_moe_post(nullptr, num_tokens, layer_idx);
+            }
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
@@ -1046,6 +1079,8 @@ uint32_t LanguageModel::run_model_once(
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
     _upload_group_future_token_masks(num_tokens, token_idx);
+    // Rows of this chunk that hold prompt tokens (the rest of a group chunk is padding).
+    _moe_valid_rows = num_tokens > 1 ? static_cast<uint16_t>(next_token_idx - token_idx) : 1;
 
     MLABuffer* normal_input_buf;
     MLABuffer* normal_scale_buf = nullptr;
@@ -1438,6 +1473,10 @@ uint32_t LanguageModel::run_model_once(
             _linear_model_map.at(linear_model_key).add_to_queue(
                 &ifm_map, output_overrides
             );
+            if (_cfg.lm_cfg.is_streamed_moe()) {
+                // The router reads the linear unit's residual sum, not the layer input.
+                _run_streamed_moe_post(nullptr, num_tokens, layer_idx);
+            }
         } else {
             throw std::runtime_error(
                 std::string("Unsupported layer type: ") + _cfg.lm_cfg.layer_types[layer_idx]
@@ -1656,7 +1695,9 @@ void LanguageModel::_initialize() {
     MLAModelWithBuffer::load_all_models(_elf_dir / _cfg.language_model_name, _files.get());
 
     // Resolve the MoE host round-trip handles once (buffers allocated above).
-    if (_cfg.lm_cfg.is_moe()) {
+    if (_cfg.lm_cfg.is_streamed_moe()) {
+        _init_expert_streaming();
+    } else if (_cfg.lm_cfg.is_moe()) {
         _init_moe_host_cache();
     }
 
@@ -2391,8 +2432,38 @@ void LanguageModel::_define_buffers() {
             );
         }
 
+        // Streamed MoE: router outputs, two ping-pong accumulators, per-slot weights (decode)
+        // or the chain's per-expert token weights (prefill).
+        if (_cfg.lm_cfg.is_streamed_moe()) {
+            const uint16_t num_experts = _cfg.lm_cfg.moe_cfg.value().num_experts;
+            const uint16_t top_k = _cfg.lm_cfg.moe_cfg.value().num_experts_per_tok;
+            const uint32_t hidden = _cfg.lm_cfg.hidden_size;
+            define_buffer(fmt::format("n{}_router_values", num_tokens), {num_tokens, top_k});
+            define_buffer(
+                fmt::format("n{}_router_indices", num_tokens), {num_tokens, top_k}, "int32"
+            );
+            define_buffer(fmt::format("n{}_norm_hidden", num_tokens), {num_tokens, hidden});
+            define_buffer(fmt::format("n{}_moe_acc0", num_tokens), {num_tokens, hidden});
+            define_buffer(fmt::format("n{}_moe_acc1", num_tokens), {num_tokens, hidden});
+            if (num_tokens == 1) {
+                for (uint16_t j = 0; j < top_k; ++j) {
+                    define_buffer(fmt::format("n1_moe_w{}", j), {1, 1});
+                }
+                if (_cfg.lm_cfg.moe_cfg.value().host_topk) {
+                    define_buffer("n1_router_logits", {1, num_experts});
+                    // All slot weights in one buffer: one upload per layer instead of top_k.
+                    define_buffer("n1_moe_wslots", {top_k, 1});
+                }
+                define_buffer("n1_moe_acc_final", {1, hidden});
+            } else {
+                define_buffer(
+                    fmt::format("n{}_moe_chain_weights", num_tokens),
+                    {static_cast<uint32_t>(num_experts) * num_tokens, 1}
+                );
+            }
+        }
         // Mixture-of-Experts working buffers (router outputs + per-expert outputs).
-        if (_cfg.lm_cfg.is_moe()) {
+        else if (_cfg.lm_cfg.is_moe()) {
             const uint16_t num_experts = _cfg.lm_cfg.moe_cfg.value().num_experts;
             const uint16_t top_k = _cfg.lm_cfg.moe_cfg.value().num_experts_per_tok;
             // Router outputs: top-k weights + selected indices (int32 from the MLA), residual
@@ -2940,6 +3011,10 @@ void LanguageModel::_run_moe_post(
     std::map<uint8_t, MLABufferSlice>* ifm_map,
     uint16_t num_tokens, uint8_t layer_idx
 ) {
+    if (_cfg.lm_cfg.is_streamed_moe()) {
+        _run_streamed_moe_post(ifm_map, num_tokens, layer_idx);
+        return;
+    }
     const auto& moe = _cfg.lm_cfg.moe_cfg.value();
     const uint16_t num_experts = moe.num_experts;
     const uint16_t top_k = moe.num_experts_per_tok;
@@ -3747,6 +3822,566 @@ void LanguageModel::_notify_interrupt() const {
     _text_streamer.push(DecodeCallbackType::STOP, 0, 0);
 }
 
+
+}
+}
+
+
+namespace simaai {
+namespace llima {
+
+void LanguageModel::_init_expert_streaming() {
+    for (auto& [num_tokens, width] : _expert_widths) {
+        const auto& index = *width.index;
+        const uint64_t all_records = index.record_size * index.num_layers * index.num_experts;
+        const uint64_t budget = num_tokens == 1
+            ? _expert_options.cache_bytes : _expert_options.prefill_cache_bytes;
+        width.cache = std::make_unique<ExpertCache>(
+            index, std::min(budget, all_records), _expert_options.slab_bytes
+        );
+        width.store = std::make_unique<ExpertStore>(index, _expert_options.io_threads);
+        _logger->info(
+            "Streamed MoE n{}: records in {}, {} slots, {} read threads, fused decode {}",
+            num_tokens, index.dir, width.slots->num_slots(), _expert_options.io_threads,
+            width.fused ? "on" : "off"
+        );
+    }
+    _expert_trace = get_env_var("SIMA_LLIMA_EXPERT_TRACE", false);
+    _prefetch_early = get_env_var("SIMA_LLIMA_EXPERT_PREFETCH_EARLY", true);
+    _expert_stats = get_env_var("SIMA_LLIMA_EXPERT_STATS", false);
+    _batched_dispatch = get_env_var("SIMA_LLIMA_BATCHED_DISPATCH", false);
+    {
+        const std::string min_weight = get_env_var("SIMA_LLIMA_EXPERT_MIN_WEIGHT", std::string{});
+        _expert_min_weight = min_weight.empty() ? 0.0f : std::stof(min_weight);
+        // Skipping keeps ~6 of 10 experts per layer; predicting 10 then mostly reads experts
+        // that never run (80B, 8 GiB cap: 10.3 tok/s with top-10, 11.3 with top-7).
+        if (_expert_min_weight > 0.0f
+            && get_env_var("SIMA_LLIMA_EXPERT_PREFETCH_TOPK", std::string{}).empty()) {
+            _expert_options.prefetch_topk = std::min<uint32_t>(_expert_options.prefetch_topk, 7);
+        }
+    }
+    MLAModelWithBuffer::batched_dispatch = _batched_dispatch;
+    if (_expert_options.prefetch_topk > 0) {
+        auto& width = _expert_widths.at(1);
+        _expert_predictor = ExpertPredictor::load(
+            _expert_options.dir / "router_gates.bin", width.index->num_layers,
+            width.index->num_experts, _cfg.lm_cfg.hidden_size
+        );
+        if (_expert_predictor) {
+            width.prefetch.resize(3);
+            for (auto& batch : width.prefetch) {
+                batch.store = std::make_unique<ExpertStore>(
+                    *width.index, _expert_options.prefetch_io_threads
+                        ? _expert_options.prefetch_io_threads : _expert_options.io_threads
+                );
+            }
+            // Read-ahead records must survive until their layer runs.
+            width.cache->set_pin_batches(1 + _expert_options.prefetch_ahead);
+            _logger->info(
+                "Streamed MoE: expert prefetch, top {}, {} layer(s) ahead",
+                _expert_options.prefetch_topk, _expert_options.prefetch_ahead
+            );
+        }
+    }
+    {
+        const std::string short_tokens = get_env_var("SIMA_LLIMA_SHORT_PREFILL_TOKENS", std::string{});
+        _short_prefill_tokens = short_tokens.empty() ? 0 : static_cast<uint16_t>(std::stoul(short_tokens));
+    }
+    if (get_env_var("SIMA_LLIMA_EXPERT_SELFTEST", false)) {
+        _expert_selftest();
+    }
+}
+
+
+void LanguageModel::_expert_selftest() {
+    // The template ELF carries expert (layer 0, expert 0)'s weights in its reloc sections, and the
+    // record of that expert holds the same bytes. Running the template unbound and then bound to
+    // the record must give identical outputs; a difference means the reloc ports were bound in
+    // the wrong order or at the wrong offsets.
+    auto& width = _expert_widths.at(1);
+    MLABuffer& norm_hidden = get_buffer("n1_norm_hidden");
+    MLABuffer& weight = get_buffer("n1_moe_w0");
+    MLABuffer& acc0 = get_buffer("n1_moe_acc0");
+    MLABuffer& acc1 = get_buffer("n1_moe_acc1");
+    const uint32_t hidden = _cfg.lm_cfg.hidden_size;
+    std::vector<Eigen::bfloat16> x(hidden), zeros(hidden, Eigen::bfloat16(0.0f)), out_a(hidden), out_b(hidden);
+    for (uint32_t i = 0; i < hidden; ++i) x[i] = Eigen::bfloat16(std::sin(0.37f * i));
+    const Eigen::bfloat16 one(1.0f);
+    norm_hidden.upload(x.data());
+    weight.upload(&one);
+    acc0.upload(zeros.data());
+    std::map<uint8_t, MLABufferSlice> ifm{
+        {0, MLABufferSlice{&norm_hidden}}, {1, MLABufferSlice{&weight}}, {2, MLABufferSlice{&acc0}},
+    };
+    std::map<uint8_t, MLABufferSlice> ofm{{0, MLABufferSlice{&acc1}}};
+    MLAModelWithBuffer unbound(_get_elf_path_expert_template(1), {}, {}, 9999);
+    unbound._ifms = {MLABufferSlice{&norm_hidden}, MLABufferSlice{&weight}, MLABufferSlice{&acc0}};
+    unbound._ofms = {MLABufferSlice{&acc1}};
+    unbound.run(&ifm, &ofm);
+    acc1.download(out_a.data());
+
+    width.cache->begin_batch();
+    width.slots->begin_batch();
+    bool miss = false;
+    const uint32_t id = width.cache->acquire({0, 0}, miss);
+    if (miss) {
+        const ExpertStore::Request request{{0, 0}, &width.cache->entry(id)};
+        width.store->read(std::span<const ExpertStore::Request>(&request, 1));
+    }
+    acc0.upload(zeros.data());
+    width.slots->slot_for(id, *width.cache).run(&ifm, &ofm);
+    acc1.download(out_b.data());
+
+    size_t differ = 0;
+    for (uint32_t i = 0; i < hidden; ++i) differ += float(out_a[i]) != float(out_b[i]);
+    _logger->info(
+        "Expert self-test: unbound vs record (0,0): {} of {} outputs differ; out[0..3] = {} {} {} / {} {} {}",
+        differ, hidden, float(out_a[0]), float(out_a[1]), float(out_a[2]),
+        float(out_b[0]), float(out_b[1]), float(out_b[2])
+    );
+}
+
+
+void LanguageModel::_queue_expert_chain(
+    uint16_t moe_nt, uint8_t layer_idx,
+    std::span<const uint32_t> experts,
+    std::span<const MLABufferSlice> weights,
+    const MLABufferSlice& output,
+    const std::function<void()>& while_reading
+) {
+    // Experts run in batches of one slot each. Within a batch, experts already in the cache are
+    // queued and submitted first, so the MLA runs them while the misses are read from storage.
+    // While a batch executes, the next batch's misses are already being read. The cache keeps
+    // the current and previous batch resident, so read-ahead never evicts a pending expert.
+    if (experts.empty()) {
+        throw std::logic_error("Streamed MoE expert chain is empty");
+    }
+    auto& width = _expert_widths.at(moe_nt);
+    auto& pool = *width.slots;
+    auto& cache = *width.cache;
+    auto& stats = _moe_stats[_moe_phase];
+    const auto ns_since = [](std::chrono::steady_clock::time_point t) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t).count());
+    };
+    const uint64_t rebinds_before = pool.rebinds();
+    const uint64_t rebind_ns_before = pool.rebind_ns();
+    // Experts read ahead for this layer may still be in flight; they are queued only after the
+    // prefetch reads finish, everything else goes first.
+    // This layer's read-ahead batch (decode only). The prediction thread writes other slots only.
+    auto* prefetch = width.prefetch.empty() ? nullptr
+        : &width.prefetch[layer_idx % width.prefetch.size()];
+    if (prefetch && prefetch->layer != layer_idx) prefetch = nullptr;
+    std::vector<uint32_t> in_prefetch;
+    if (prefetch) {
+        for (const auto& key : prefetch->keys) in_prefetch.push_back(key.expert);
+    }
+    const auto is_prefetched = [&](uint32_t e) {
+        return std::find(in_prefetch.begin(), in_prefetch.end(), e) != in_prefetch.end();
+    };
+    // Index of this layer's prefetched expert e in its read-ahead batch (keys[i] is reads[i]).
+    const auto prefetch_request = [&](uint32_t e) {
+        for (size_t i = 0; i < prefetch->keys.size(); ++i) {
+            if (prefetch->keys[i].expert == e) return i;
+        }
+        throw std::logic_error("Expert is not in the prefetch batch");
+    };
+    bool prefetch_done = in_prefetch.empty();
+    MLABuffer* acc[2] = {
+        &get_buffer(fmt::format("n{}_moe_acc0", moe_nt)),
+        &get_buffer(fmt::format("n{}_moe_acc1", moe_nt)),
+    };
+    MLABuffer* norm_hidden = &get_buffer(fmt::format("n{}_norm_hidden", moe_nt));
+
+    struct Batch {
+        size_t begin = 0;
+        size_t end = 0;
+        std::vector<uint32_t> entries;
+        std::vector<bool> miss;
+        std::vector<ExpertStore::Request> reads;
+    };
+    const auto prepare = [&](size_t begin) {
+        cache.begin_batch();
+        Batch batch;
+        batch.begin = begin;
+        // Decode runs one token's experts in one batch; prefill flushes every prefill_batch.
+        const size_t batch_size = moe_nt == 1 ? pool.num_slots() : _expert_options.prefill_batch;
+        batch.end = std::min(experts.size(), begin + std::min<size_t>(batch_size, pool.num_slots()));
+        for (size_t j = batch.begin; j < batch.end; ++j) {
+            bool miss = false;
+            const uint32_t id = cache.acquire({layer_idx, experts[j]}, miss);
+            batch.entries.push_back(id);
+            batch.miss.push_back(miss);
+            if (miss) batch.reads.push_back({{layer_idx, experts[j]}, &cache.entry(id)});
+            ++(miss ? stats.misses : stats.hits);
+        }
+        if (!batch.reads.empty()) width.store->start(batch.reads);
+        return batch;
+    };
+
+    if (moe_nt == 1 && width.fused && experts.size() == width.fused->num_slots()) {
+        // Fused decode: one job runs every expert of the layer. It needs all records, so the
+        // misses (and this layer's prefetched experts) are waited for before it is queued.
+        Batch batch = prepare(0);
+        if (while_reading) while_reading();
+        bool any_prefetched = false;
+        for (size_t j = 0; j < experts.size(); ++j) {
+            if (!batch.miss[j] && is_prefetched(experts[j])) {
+                any_prefetched = true;
+                ++stats.prefetch_used;
+            }
+        }
+        if (any_prefetched && !prefetch_done) {
+            const auto wait_start = std::chrono::steady_clock::now();
+            prefetch->store->wait();
+            stats.prefetch_wait_ns += ns_since(wait_start);
+        }
+        if (!batch.reads.empty()) {
+            const auto read_start = std::chrono::steady_clock::now();
+            width.store->wait();
+            stats.read_ns += ns_since(read_start);
+        }
+        auto& fused = *width.fused;
+        const uint64_t fused_rebinds = fused.rebinds();
+        const uint64_t fused_rebind_ns = fused.rebind_ns();
+        auto& model = fused.bind(batch.entries, cache);
+        if (_expert_trace) {
+            spdlog::info("fused expert job layer {} experts {}", layer_idx, fmt::join(experts, ","));
+        }
+        std::map<uint8_t, MLABufferSlice> ofm{{0, output}};
+        model.add_to_queue(nullptr, &ofm);
+        if (!_batched_dispatch) MLAModelWithBuffer::submit_queue();
+        stats.first_submit_ns += ns_since(_router_done);
+        stats.expert_jobs += experts.size();
+        stats.rebinds += fused.rebinds() - fused_rebinds;
+        stats.rebind_ns += fused.rebind_ns() - fused_rebind_ns;
+        return;
+    }
+
+    size_t queued = 0;
+    int current = 0;  // the router seeded acc0
+    const auto queue_job = [&](const Batch& batch, size_t j) {
+        const bool last = ++queued == experts.size();
+        std::map<uint8_t, MLABufferSlice> ifm{
+            {0, MLABufferSlice{norm_hidden}},
+            {1, weights[j]},
+            {2, MLABufferSlice{acc[current]}},
+        };
+        std::map<uint8_t, MLABufferSlice> ofm{
+            {0, last ? output : MLABufferSlice{acc[1 - current]}},
+        };
+        if (_expert_trace) {
+            spdlog::info(
+                "expert job n{} layer {} expert {} entry {} chain {}/{} miss {}", moe_nt, layer_idx,
+                experts[j], batch.entries[j - batch.begin], queued - 1, experts.size(),
+                static_cast<bool>(batch.miss[j - batch.begin])
+            );
+        }
+        pool.slot_for(batch.entries[j - batch.begin], cache).add_to_queue(&ifm, &ofm);
+        // Async mode submits at once, so the MLA runs this expert while the next is prepared.
+        // Batched mode leaves it queued for the next batched dispatch.
+        if (!_batched_dispatch) MLAModelWithBuffer::submit_queue();
+        if (queued == 1) stats.first_submit_ns += ns_since(_router_done);
+        current = 1 - current;
+    };
+
+    Batch batch = prepare(0);
+    while (true) {
+        pool.begin_batch();
+        for (size_t j = batch.begin; j < batch.end; ++j) {
+            if (!batch.miss[j - batch.begin] && !is_prefetched(experts[j])) queue_job(batch, j);
+        }
+        bool any_prefetched = false;
+        for (size_t j = batch.begin; j < batch.end; ++j) {
+            any_prefetched |= !batch.miss[j - batch.begin] && is_prefetched(experts[j]);
+        }
+        if (any_prefetched) {
+            // Wait only for the prefetched records this layer uses, each queued as soon as it
+            // lands; mispredicted reads keep running (the next _issue_prefetch waits for them).
+            // Earlier, a full wait() here often waited for the next layer's batch instead, since
+            // the prediction thread had already replaced it.
+            for (size_t j = batch.begin; j < batch.end; ++j) {
+                if (batch.miss[j - batch.begin] || !is_prefetched(experts[j])) continue;
+                if (!prefetch_done) {
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    prefetch->store->wait_for(prefetch_request(experts[j]));
+                    stats.prefetch_wait_ns += ns_since(wait_start);
+                }
+                ++stats.prefetch_used;
+                queue_job(batch, j);
+            }
+            prefetch_done = true;
+        }
+        // Next-layer prediction starts only now: its first step waits for and then replaces the
+        // prefetch batch, so this layer's prefetched records must be consumed first.
+        if (while_reading && batch.begin == 0) while_reading();
+        if (!batch.reads.empty()) {
+            const auto read_start = std::chrono::steady_clock::now();
+            width.store->wait();
+            stats.read_ns += ns_since(read_start);
+        }
+        for (size_t j = batch.begin; j < batch.end; ++j) {
+            if (batch.miss[j - batch.begin]) queue_job(batch, j);
+        }
+        if (batch.end == experts.size()) break;
+        // Start reading the next batch, then let this one finish before its slots are rebound.
+        Batch next = prepare(batch.end);
+        _flush(stats);
+        batch = std::move(next);
+    }
+    stats.expert_jobs += experts.size();
+    stats.rebinds += pool.rebinds() - rebinds_before;
+    stats.rebind_ns += pool.rebind_ns() - rebind_ns_before;
+}
+
+
+std::vector<Eigen::bfloat16> LanguageModel::_host_topk(std::vector<int32_t>& indices) {
+    // Same selection as the MLA router: the top_k largest logits in descending order (ties keep
+    // the lower expert id), weighted by the softmax over those logits when norm_topk_prob
+    // (renormalized top-k), else by the softmax over all experts.
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+    std::vector<Eigen::bfloat16> raw(num_experts);
+    get_buffer("n1_router_logits").download(raw.data());
+    std::vector<float> logits(raw.begin(), raw.end());
+    std::vector<int32_t> order(num_experts);
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + top_k, order.end(), [&](int32_t a, int32_t b) {
+        return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+    });
+    const float top = logits[order[0]];
+    double denom = 0.0;
+    if (moe.norm_topk_prob) {
+        for (uint16_t j = 0; j < top_k; ++j) denom += std::exp(double(logits[order[j]]) - top);
+    } else {
+        for (const float l : logits) denom += std::exp(double(l) - top);
+    }
+    std::vector<Eigen::bfloat16> weights(top_k);
+    for (uint16_t j = 0; j < top_k; ++j) {
+        indices[j] = order[j];
+        weights[j] = Eigen::bfloat16(float(std::exp(double(logits[order[j]]) - top) / denom));
+    }
+    return weights;
+}
+
+
+void LanguageModel::_run_streamed_moe_post(
+    std::map<uint8_t, MLABufferSlice>* ifm_map,
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t num_experts = moe.num_experts;
+    const uint16_t top_k = moe.num_experts_per_tok;
+    const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
+    const uint16_t moe_nt = is_last ? 1 : num_tokens;
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+
+    // Router: attention projection (attention layers), residual, norm, top-k and the
+    // shared-expert accumulator seed. Flush so the selected experts can be read back.
+    auto& stats = _moe_stats[_moe_phase];
+    const auto step_start = std::chrono::steady_clock::now();
+    const uint64_t accounted_before = stats.mla_wait_ns + stats.read_ns + stats.rebind_ns;
+    _router_model_map.at(model_key).add_to_queue(ifm_map);
+    // Run the previous layer's experts, this layer's mixing unit and the router. The helper
+    // thread started by the previous layer predicts this layer's experts and issues their
+    // prefetch reads meanwhile; it is joined before the cache is used again.
+    _flush(stats);
+    if (_prediction_worker.busy()) {
+        const auto predict_start = std::chrono::steady_clock::now();
+        _prediction_worker.join();
+        stats.predict_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - predict_start).count();
+    }
+    _router_done = std::chrono::steady_clock::now();
+    ++stats.layers;
+
+    std::vector<int32_t> indices(static_cast<size_t>(moe_nt) * top_k);
+    std::vector<Eigen::bfloat16> slot_values;  // decode: the selected experts' weights
+    if (moe_nt == 1 && moe.host_topk) {
+        // Top-k on the host: it is ~86% of the router's MLA time, and the host waits here anyway.
+        const auto route_start = std::chrono::steady_clock::now();
+        slot_values = _host_topk(indices);
+        get_buffer("n1_moe_wslots").upload(slot_values.data());
+        stats.route_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - route_start).count();
+    } else {
+        get_buffer(fmt::format("n{}_router_indices", moe_nt)).download(indices.data());
+    }
+    for (const int32_t e : indices) {
+        if (e < 0 || e >= num_experts) {
+            throw std::runtime_error(fmt::format(
+                "MoE router emitted out-of-range expert index {} (layer {})", e, layer_idx
+            ));
+        }
+    }
+
+    std::vector<uint32_t> experts;
+    std::vector<MLABufferSlice> weights;
+    if (moe_nt == 1) {
+        if (_expert_min_weight > 0.0f && slot_values.empty()) {
+            slot_values.resize(top_k);
+            get_buffer("n1_router_values").download(slot_values.data());
+        }
+        for (uint16_t j = 0; j < top_k; ++j) {
+            // Values are sorted descending; always keep the top expert.
+            if (j > 0 && !slot_values.empty() && float(slot_values[j]) < _expert_min_weight) break;
+            experts.push_back(static_cast<uint32_t>(indices[j]));
+            if (moe.host_topk) {
+                weights.emplace_back(
+                    &get_buffer("n1_moe_wslots"), std::vector<uint32_t>{j, 0},
+                    std::vector<uint32_t>{1, 1}
+                );
+            } else {
+                weights.emplace_back(&get_buffer(fmt::format("n1_moe_w{}", j)));
+            }
+        }
+    } else {
+        // Prefill: one job per expert activated by a real prompt row, weighted per token (0
+        // where unrouted). Padding rows of the last chunk keep only the shared expert; their
+        // outputs are never used, so their routing would only add experts to run.
+        std::vector<Eigen::bfloat16> values(static_cast<size_t>(moe_nt) * top_k);
+        get_buffer(fmt::format("n{}_router_values", moe_nt)).download(values.data());
+        const uint16_t valid_rows = std::min<uint16_t>(_moe_valid_rows, moe_nt);
+        std::vector<int32_t> position(num_experts, -1);
+        for (size_t sel = 0; sel < static_cast<size_t>(valid_rows) * top_k; ++sel) {
+            const int32_t e = indices[sel];
+            if (position[e] < 0) {
+                position[e] = static_cast<int32_t>(experts.size());
+                experts.push_back(static_cast<uint32_t>(e));
+            }
+        }
+        MLABuffer& chain = get_buffer(fmt::format("n{}_moe_chain_weights", moe_nt));
+        std::vector<Eigen::bfloat16> token_weights(
+            static_cast<size_t>(num_experts) * moe_nt, Eigen::bfloat16(0.0f)
+        );
+        for (uint16_t t = 0; t < valid_rows; ++t) {
+            for (uint16_t j = 0; j < top_k; ++j) {
+                const size_t sel = static_cast<size_t>(t) * top_k + j;
+                token_weights[static_cast<size_t>(position[indices[sel]]) * moe_nt + t] = values[sel];
+            }
+        }
+        chain.upload(token_weights.data());
+        for (size_t k = 0; k < experts.size(); ++k) {
+            weights.emplace_back(
+                &chain,
+                std::vector<uint32_t>{static_cast<uint32_t>(k * moe_nt), 0},
+                std::vector<uint32_t>{moe_nt, 1}
+            );
+        }
+    }
+
+    // Decode read-ahead: from this layer's normalized hidden state, predict the experts of the
+    // next prefetch_ahead layers on a helper thread and read the uncached ones. With
+    // SIMA_LLIMA_EXPERT_PREFETCH_EARLY (default 1) this starts right after the router readback,
+    // concurrently with queuing this layer's experts (the cache is locked; each layer has its
+    // own read-ahead batch); with 0 it starts once this layer's cached experts are queued.
+    const bool prefetch = moe_nt == 1 && _moe_phase == 1 && _expert_predictor
+        && layer_idx + 1 < _cfg.lm_cfg.num_hidden_layers;
+    const auto start_prediction = [&] {
+        _pending_prediction_layer = static_cast<uint8_t>(layer_idx + 1);
+        const uint32_t last = std::min<uint32_t>(
+            layer_idx + _expert_options.prefetch_ahead, _cfg.lm_cfg.num_hidden_layers - 1
+        );
+        _prediction_worker.submit([this, layer_idx, last] {
+            // n1_norm_hidden is final once the router finished, and expert jobs only read it.
+            std::vector<Eigen::bfloat16> hidden_bf16(_cfg.lm_cfg.hidden_size);
+            get_buffer("n1_norm_hidden").download(hidden_bf16.data());
+            const std::vector<float> hidden(hidden_bf16.begin(), hidden_bf16.end());
+            for (uint32_t target = layer_idx + 1u; target <= last; ++target) {
+                const auto predicted = _expert_predictor->predict(
+                    target, hidden, _expert_options.prefetch_topk
+                );
+                _issue_prefetch(static_cast<uint8_t>(target), predicted);
+            }
+        });
+    };
+    if (prefetch && _prefetch_early) start_prediction();
+    _queue_expert_chain(
+        moe_nt, layer_idx, experts, weights, _streamed_moe_output.at(model_key),
+        prefetch && !_prefetch_early ? std::function<void()>(start_prediction) : std::function<void()>{}
+    );
+    if (is_last) {
+        _final_head_model_map.at(model_key).add_to_queue();
+    }
+    const uint64_t step_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - step_start).count();
+    const uint64_t accounted = stats.mla_wait_ns + stats.read_ns + stats.rebind_ns - accounted_before;
+    stats.host_ns += step_ns > accounted ? step_ns - accounted : 0;
+}
+
+
+void LanguageModel::_flush(ExpertPhaseStats& stats) {
+    const auto wait_start = std::chrono::steady_clock::now();
+    if (_batched_dispatch) {
+        MLAModelWithBuffer::run_queue_batched();
+    } else {
+        MLAModelWithBuffer::run_queue();
+    }
+    stats.mla_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - wait_start).count();
+}
+
+
+void LanguageModel::_issue_prefetch(uint8_t layer_idx, const std::vector<uint32_t>& predicted) {
+    auto& width = _expert_widths.at(1);
+    auto& stats = _moe_stats[_moe_phase];
+    auto& batch = width.prefetch[layer_idx % width.prefetch.size()];
+    // The slot's previous batch (an earlier layer, or an earlier prediction for this layer) must
+    // finish before the store is reused; its records are then ordinary cache entries.
+    const auto wait_start = std::chrono::steady_clock::now();
+    batch.store->wait();
+    stats.prefetch_reuse_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - wait_start).count();
+    batch.layer = layer_idx;
+    batch.keys.clear();
+    batch.reads.clear();
+    for (const uint32_t e : predicted) {
+        const ExpertKey key{layer_idx, e};
+        if (width.cache->contains(key)) continue;
+        bool miss = false;
+        const uint32_t id = width.cache->acquire(key, miss, _expert_options.prefetch_low_priority);
+        if (miss) {
+            batch.reads.push_back({key, &width.cache->entry(id)});
+            batch.keys.push_back(key);
+        }
+    }
+    stats.prefetches += batch.reads.size();
+    batch.store->start(batch.reads);
+}
+
+
+void LanguageModel::_report_moe_stats(int phase, double seconds, uint64_t tokens) {
+    const auto& s = _moe_stats[phase];
+    const auto ms = [](uint64_t ns) { return ns / 1e6; };
+    uint64_t add_now = 0, submit_now = 0, reap_now = 0, jobs_now = 0;
+    MLAModelWithBuffer::host_counters(add_now, submit_now, reap_now, jobs_now);
+    const double lookups = double(s.hits + s.misses);
+    const uint64_t record = _expert_widths.at(phase == 0 && _use_group_token_models ? _cfg.pipeline_cfg.input_token_group_size : 1).index->record_size;
+    const std::string line = fmt::format(
+        "[moe-stats] {} tokens={} time={:.3f}s | layers={} expert_jobs={} hits={} misses={} "
+        "hit_rate={:.1f}% nvme={:.2f}GB | mla_wait={:.0f}ms nvme_read={:.0f}ms rebind={:.0f}ms "
+        "({} rebinds, {:.1f}us each) host_other={:.0f}ms | mla_tile={:.0f}ms ({:.1f}ms/token) | "
+        "prefetch={} used={} predict={:.0f}ms prefetch_wait={:.0f}ms prefetch_reuse_wait={:.0f}ms "
+        "first_submit_gap={:.0f}ms route={:.0f}ms | "
+        "jobs={} add_to_queue={:.0f}ms submit={:.0f}ms reap={:.0f}ms",
+        phase == 0 ? "prefill" : "decode", tokens, seconds, s.layers, s.expert_jobs, s.hits,
+        s.misses, lookups ? 100.0 * s.hits / lookups : 0.0, s.misses * double(record) / 1e9,
+        ms(s.mla_wait_ns), ms(s.read_ns), ms(s.rebind_ns), s.rebinds,
+        s.rebinds ? s.rebind_ns / 1e3 / s.rebinds : 0.0, ms(s.host_ns),
+        (MLAModelWithBuffer::total_tile_us() - s.tile_start_us) / 1e3,
+        tokens ? (MLAModelWithBuffer::total_tile_us() - s.tile_start_us) / 1e3 / tokens : 0.0,
+        s.prefetches, s.prefetch_used, ms(s.predict_ns), ms(s.prefetch_wait_ns),
+        ms(s.prefetch_reuse_wait_ns),
+        ms(s.first_submit_ns), ms(s.route_ns), jobs_now - s.jobs0, ms(add_now - s.add0), ms(submit_now - s.submit0),
+        ms(reap_now - s.reap0)
+    );
+    _logger->info("{}", line);
+    std::cerr << line << std::endl;
+    if (MLAModelWithBuffer::unit_profile_enabled()) {
+        std::cerr << MLAModelWithBuffer::unit_profile_report(tokens) << std::flush;
+    }
+}
 
 }
 }

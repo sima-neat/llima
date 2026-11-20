@@ -16,6 +16,11 @@ from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_moe_router_model import LanguageMoeRouterModel
 from sima_lmm.model.language_moe_weightedsum_model import LanguageMoeWeightedSumModel
+from sima_lmm.model.language_moe_streamed_model import (
+    LanguageFinalHeadModel,
+    LanguageMoeExpertTemplateModel,
+    LanguageMoeFusedExpertTemplateModel,
+)
 from sima_lmm.model.language_cache_model import LanguageCacheModel
 from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_conv_post_model import LanguageConvPostModel
@@ -203,6 +208,18 @@ class LanguageModel(BaseModel):
                     part_model = self._get_part_model(
                         "post", single_model_num_tokens, layer_idx=layer_id.part_idx,
                         expert_idx=layer_id.expert_idx,
+                    )
+                case "group_expert_template":
+                    part_model = self._get_part_model("expert_template", num_tokens)
+                case "single_expert_template":
+                    part_model = self._get_part_model("expert_template", single_model_num_tokens)
+                case "single_expert_fused_template":
+                    part_model = self._get_part_model(
+                        "expert_fused_template", single_model_num_tokens
+                    )
+                case "single_final_head":
+                    part_model = self._get_part_model(
+                        "final_head", single_model_num_tokens, layer_idx=layer_id.part_idx
                     )
                 case "group_weightedsum":
                     part_model = self._get_part_model(
@@ -657,6 +674,28 @@ class LanguageModel(BaseModel):
                 return LanguageMoeRouterModel(
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                )
+            case "expert_template":
+                model_name = f"{self.model_name}_n{num_tokens}_moe_expert_template"
+                return LanguageMoeExpertTemplateModel(
+                    self.cfg, model_name, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=0,
+                    final_softcapping=None,
+                )
+            case "expert_fused_template":
+                model_name = f"{self.model_name}_n{num_tokens}_moe_expert_fused_template"
+                return LanguageMoeFusedExpertTemplateModel(
+                    self.cfg, model_name, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=0,
+                    final_softcapping=None,
+                )
+            case "final_head":
+                model_name = f"{self.model_name}_n{num_tokens}_final_head_layer{layer_idx}"
+                assert layer_idx is not None
+                return LanguageFinalHeadModel(
+                    self.cfg, model_name, sima_path=self.sima_path,
+                    hf_model=self.hf_model, num_tokens=num_tokens, layer_idx=layer_idx,
+                    final_softcapping=self.cfg.lm_cfg.final_logit_softcapping,
                 )
             case "moe_weightedsum":
                 model_name = f"{self.model_name}_n{num_tokens}_moe_weightedsum_layer{layer_idx}"

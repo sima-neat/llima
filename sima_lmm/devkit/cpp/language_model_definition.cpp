@@ -487,6 +487,10 @@ void LanguageModel::_define_moe_post_models(
     const std::vector<MLABufferSlice>& post_ifms,
     const std::vector<MLABufferSlice>& post_ofms
 ) {
+    if (_cfg.lm_cfg.is_streamed_moe()) {
+        _define_streamed_moe_models(num_tokens, layer_idx, post_ifms, post_ofms);
+        return;
+    }
     const auto& moe = _cfg.lm_cfg.moe_cfg.value();
     const uint16_t num_experts = moe.num_experts;
     const uint16_t top_k = moe.num_experts_per_tok;
@@ -723,6 +727,143 @@ void LanguageModel::_define_linear_models_iter(uint16_t num_tokens, uint8_t laye
         linear_ifms,
         linear_ofms
     );
+
+    // Streamed MoE: the linear unit stops at the residual sum in n{N}_buffer1; the router
+    // reads it and the expert chain writes the layer output back there.
+    if (_cfg.lm_cfg.is_streamed_moe() && !_router_model_map.contains(model_key)) {
+        const std::vector<MLABufferSlice> hidden{
+            MLABufferSlice{&get_buffer(fmt::format("n{}_buffer1", num_tokens))}
+        };
+        _define_streamed_moe_models(num_tokens, layer_idx, hidden, hidden);
+    }
+}
+
+
+void LanguageModel::_define_streamed_moe_models(
+    uint16_t num_tokens, uint8_t layer_idx,
+    const std::vector<MLABufferSlice>& router_ifms,
+    const std::vector<MLABufferSlice>& post_ofms
+) {
+    const auto& moe = _cfg.lm_cfg.moe_cfg.value();
+    const uint16_t top_k = moe.num_experts_per_tok;
+    const bool is_last = (layer_idx == _cfg.lm_cfg.num_hidden_layers - 1);
+    // The last layer runs single-token, like the dense and weighted-sum MoE paths.
+    const uint16_t moe_nt = is_last ? 1 : num_tokens;
+    const LanguageModelMapKey model_key{num_tokens, layer_idx, 0};
+
+    std::vector<MLABufferSlice> router_ofms{
+        MLABufferSlice{&get_buffer(fmt::format("n{}_router_values", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_router_indices", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_moe_acc0", moe_nt))},
+        MLABufferSlice{&get_buffer(fmt::format("n{}_norm_hidden", moe_nt))},
+    };
+    if (moe_nt == 1 && moe.host_topk) {
+        // Decode router emits the expert logits; the host selects the experts.
+        router_ofms = {
+            MLABufferSlice{&get_buffer("n1_router_logits")},
+            MLABufferSlice{&get_buffer("n1_moe_acc0")},
+            MLABufferSlice{&get_buffer("n1_norm_hidden")},
+        };
+    } else if (moe_nt == 1) {
+        // Single-token routers also emit each slot's weight as its own tensor, bound as
+        // the template's weight input without a host round-trip.
+        for (uint16_t j = 0; j < top_k; ++j) {
+            router_ofms.emplace_back(MLABufferSlice{&get_buffer(fmt::format("n1_moe_w{}", j))});
+        }
+    }
+    _define_model(
+        "router", model_key, _get_elf_path_router(moe_nt, layer_idx), router_ifms, router_ofms
+    );
+
+    if (is_last) {
+        // The chain ends in a scratch accumulator; the final head turns it into logits.
+        MLABufferSlice final_acc{&get_buffer("n1_moe_acc_final")};
+        _streamed_moe_output.insert_or_assign(model_key, final_acc);
+        _define_model(
+            "final_head", model_key, _get_elf_path_final_head(1, layer_idx), {final_acc}, post_ofms
+        );
+    } else {
+        _streamed_moe_output.insert_or_assign(model_key, post_ofms.at(0));
+    }
+
+    if (!_expert_widths.contains(moe_nt)) {
+        if (!_expert_options_loaded) {
+            _expert_options = ExpertStreamingOptions::from_env(
+                _devkit_dir.parent_path() / "expert_files", top_k
+            );
+            _expert_options_loaded = true;
+        }
+        auto& width = _expert_widths[moe_nt];
+        const auto dir = _expert_options.dir / fmt::format("n{}", moe_nt);
+        width.index = std::make_unique<ExpertIndex>(ExpertIndex::load(dir));
+        if (width.index->num_layers != _cfg.lm_cfg.num_hidden_layers
+            || width.index->num_experts != moe.num_experts) {
+            throw std::runtime_error(fmt::format(
+                "Expert records in {} have {} layers x {} experts; model has {} x {}",
+                dir.string(), width.index->num_layers, width.index->num_experts,
+                _cfg.lm_cfg.num_hidden_layers, moe.num_experts
+            ));
+        }
+        // Default bindings only fix the template's IFM/OFM shapes; every job overrides them.
+        const std::vector<MLABufferSlice> ifms{
+            MLABufferSlice{&get_buffer(fmt::format("n{}_norm_hidden", moe_nt))},
+            moe_nt == 1
+                ? MLABufferSlice{&get_buffer("n1_moe_w0")}
+                : MLABufferSlice{&get_buffer(fmt::format("n{}_moe_chain_weights", moe_nt)),
+                                 {0, 0}, {moe_nt, 1}},
+            MLABufferSlice{&get_buffer(fmt::format("n{}_moe_acc0", moe_nt))},
+        };
+        const std::vector<MLABufferSlice> ofms{
+            MLABufferSlice{&get_buffer(fmt::format("n{}_moe_acc1", moe_nt))},
+        };
+        uint32_t num_slots = _expert_options.slots;
+        // Expert skipping (SIMA_LLIMA_EXPERT_MIN_WEIGHT, read later) runs a variable number of
+        // experts per layer, so it keeps the per-expert jobs.
+        const bool skips_experts = !get_env_var(
+            "SIMA_LLIMA_EXPERT_MIN_WEIGHT", std::string{}
+        ).empty();
+        const auto fused_elf = moe_nt == 1 && _expert_options.fused && !skips_experts
+            ? _get_elf_path_expert_fused_template() : std::nullopt;
+        const bool fused = fused_elf.has_value();
+        if (fused) {
+            std::vector<MLABufferSlice> fused_ifms{
+                MLABufferSlice{&get_buffer("n1_norm_hidden")},
+                MLABufferSlice{&get_buffer("n1_moe_acc0")},
+            };
+            for (uint16_t j = 0; j < top_k; ++j) {
+                fused_ifms.emplace_back(moe.host_topk
+                    ? MLABufferSlice{&get_buffer("n1_moe_wslots"), {j, 0}, {1, 1}}
+                    : MLABufferSlice{&get_buffer(fmt::format("n1_moe_w{}", j))});
+            }
+            width.fused = std::make_unique<FusedExpertTemplate>(
+                *width.index, *fused_elf, top_k, 2, fused_ifms, ofms
+            );
+            // The per-expert pool is then only a fallback; keep it minimal (fast startup).
+            if (num_slots == 0) num_slots = top_k;
+        }
+        if (moe_nt == 1 && num_slots == 0) {
+            // Default: one slot per decode cache entry (bind once).
+            const uint64_t all = width.index->record_size * width.index->num_layers
+                * width.index->num_experts;
+            num_slots = static_cast<uint32_t>(
+                std::min(_expert_options.cache_bytes, all) / width.index->record_size
+            );
+            num_slots = std::max<uint32_t>(num_slots, moe.num_experts_per_tok);
+        }
+        if (moe_nt != 1) {
+            // Default: one slot per prefill cache entry, so slots stay bound to their entry.
+            const uint64_t entries = std::max<uint64_t>(
+                1, _expert_options.prefill_cache_bytes / width.index->record_size
+            );
+            num_slots = _expert_options.prefill_slots
+                ? _expert_options.prefill_slots
+                : static_cast<uint32_t>(std::min<uint64_t>(entries, 4096));
+            num_slots = std::max(num_slots, _expert_options.prefill_batch);
+        }
+        width.slots = std::make_unique<ExpertSlotPool>(
+            *width.index, _get_elf_path_expert_template(moe_nt), num_slots, ifms, ofms
+        );
+    }
 }
 
 
@@ -1013,6 +1154,8 @@ LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) {
         return _weightedsum_model_map;
     } else if (model_type == "linear") {
         return _linear_model_map;
+    } else if (model_type == "final_head") {
+        return _final_head_model_map;
     } else {
         throw std::runtime_error(std::string("Invalid model type: ") + model_type);
     }
@@ -1088,6 +1231,36 @@ std::filesystem::path LanguageModel::_get_elf_path_weightedsum(
     auto elf_file_name = fmt::format(
         "{}_n{}_moe_weightedsum_layer{}_stage1_mla.elf",
         _cfg.language_model_name, num_tokens, layer_idx
+    );
+    return _files->reserve("elf_files/" + elf_file_name);
+}
+
+
+std::optional<std::filesystem::path> LanguageModel::_get_elf_path_expert_fused_template() {
+    // Optional unit: models compiled before it existed have no fused template.
+    const auto elf_file_name = fmt::format(
+        "{}_n1_moe_expert_fused_template_stage1_mla.elf", _cfg.language_model_name
+    );
+    if (!std::filesystem::exists(_devkit_dir.parent_path() / "elf_files" / elf_file_name)) {
+        return std::nullopt;
+    }
+    return _files->reserve("elf_files/" + elf_file_name);
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_expert_template(uint16_t num_tokens) {
+    auto elf_file_name = fmt::format(
+        "{}_n{}_moe_expert_template_stage1_mla.elf", _cfg.language_model_name, num_tokens
+    );
+    return _files->reserve("elf_files/" + elf_file_name);
+}
+
+
+std::filesystem::path LanguageModel::_get_elf_path_final_head(
+    uint16_t num_tokens, uint8_t layer_idx
+) {
+    auto elf_file_name = fmt::format(
+        "{}_n{}_final_head_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx
     );
     return _files->reserve("elf_files/" + elf_file_name);
 }

@@ -78,6 +78,11 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::_run_chat_model(
     std::optional<uint16_t> strict_max_context, PreprocessedChat* prepared,
     GenerationPerformanceResult* performance_result
 ) {
+    // Debug aid: cap generation when the caller sets no limit (the CLI never does).
+    if (!max_new_tokens.has_value()) {
+        const std::string cap = get_env_var("SIMA_LLIMA_MAX_NEW_TOKENS", std::string{});
+        if (!cap.empty()) max_new_tokens = static_cast<uint16_t>(std::stoul(cap));
+    }
     // Acquire lock to ensure only one inference runs at a time
     std::lock_guard<std::mutex> lock(_run_mutex);
     std::vector<std::pair<uint32_t, std::string>> preserved_tokens;

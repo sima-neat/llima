@@ -57,6 +57,8 @@ class WeightOptions(TypedDict, total=False):
     q_size: int
     kv_size: int
     relocatable: bool
+    # Quantize relocatable weights like fixed ones (INT4 blocks) instead of per-channel INT8.
+    reloc_block_quantize: bool
     activation: ReluAttrs | ClipAttrs | None
     expert_idx: int
     de_interleave: bool
@@ -967,6 +969,7 @@ class ModelGraph(SimaBuilder):
         bias_process_func = kwargs.pop("bias_process_func", lambda x: x)
         q_size = kwargs.pop("q_size", None)
         kv_size = kwargs.pop("kv_size", None)
+        reloc_block_quantize = kwargs.pop("reloc_block_quantize", False)
         activation = kwargs.pop("activation", None)
         expert_idx = kwargs.pop("expert_idx", -1)
         de_interleave = kwargs.pop("de_interleave", False)
@@ -1089,6 +1092,7 @@ class ModelGraph(SimaBuilder):
             input_spatial_shape=ifm_type.shape[1:-1],
             batch_size=1,
             input_type=ifm_type.scalar,
+            reloc_block_quantize=relocatable and reloc_block_quantize,
         )
         conv = self.create_conv_node(
             ifm,

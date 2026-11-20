@@ -399,7 +399,8 @@ void VlmHelper::_init_stop_token_ids(
         throw std::runtime_error("Failed to determine the stop token ids");
     }
 
-    if (_vlm_cfg.model_type == "vlm-qwen3_5" && tokenizer_config_json != nullptr) {
+    if ((_vlm_cfg.model_type == "vlm-qwen3_5" || _vlm_cfg.model_type == "llm-qwen3_5_moe")
+        && tokenizer_config_json != nullptr) {
         _stop_token_ids.emplace(_tokenizer_ptr->token_to_id(
             tokenizer_config_json->at("eos_token").get<std::string>()
         ));

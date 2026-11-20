@@ -11,6 +11,8 @@ from sima_lmm.utils import ceil_div, round_up_to
 from sima_lmm.logging import sima_log_warning
 
 LONG_CONTEXT_MIN_TOKENS = 2048
+# Text model types whose routed experts are streamed (MixtureOfExpertsConfig.streamed_experts).
+STREAMED_MOE_MODEL_TYPES = ("qwen3_next", "qwen3_5_moe_text")
 LONG_CONTEXT_FUTURE_TOKEN_MASK_SIZE = 1024
 _VISION_MODEL_TYPE_ALIASES = {
     "qwen2_5_vl_vision": "qwen2_5_vl",
@@ -109,6 +111,8 @@ class VlmArchType(str, ExtensibleEnum):
     LLM_PHI3 = "llm-phi3"
     LLM_QWEN2 = "llm-qwen2"
     LLM_QWEN3 = "llm-qwen3"
+    LLM_QWEN3_NEXT = "llm-qwen3_next"
+    LLM_QWEN3_5_MOE = "llm-qwen3_5_moe"
     VLM_CUSTOM = "vlm-custom"
     VLM_GEMMA3 = "vlm-gemma3"
     VLM_GEMMA4 = "vlm-gemma4"
@@ -595,11 +599,29 @@ class MixtureOfExpertsConfig(BaseConfig):
         num_experts_per_tok: Number of experts the router activates per token (top-k).
         norm_topk_prob: Whether the selected routing weights are divided by their sum.
             Only meaningful when the softmax runs over all experts before the top-k
-            (OLMoE); HF defaults it to False.
+            (OLMoE, Qwen3-Next); HF defaults it to False.
+        moe_intermediate_size: Intermediate size of one routed expert; 0 when the experts
+            use the dense MlpBlockConfig.intermediate_size.
+        shared_expert_intermediate_size: Intermediate size of the always-active shared
+            expert gated by sigmoid(shared_expert_gate); 0 when there is none.
+        streamed_experts: Compile one relocatable expert template per token width instead of
+            one model per expert. The router seeds an accumulator with the residual and the
+            shared expert, each routed expert adds weight * expert(norm_hidden) to it, and the
+            runtime binds each expert's weights into the template's reloc sections, so experts
+            can be cached and streamed from storage. Enabled for STREAMED_MOE_MODEL_TYPES.
+        host_topk: With streamed experts, single-token (decode) routers emit the expert logits
+            and the runtime selects the top-k and their softmax weights on the host. Top-k over
+            all experts dominated the router on the MLA (86% of its cycles for 512 experts;
+            measured 486 us/router on dvt57), while the host already waits for every router to
+            learn the selected experts. Prefill routers keep top-k on the MLA.
     """
     num_experts: int = 0
     num_experts_per_tok: int = 0
     norm_topk_prob: bool = False
+    moe_intermediate_size: int = 0
+    shared_expert_intermediate_size: int = 0
+    streamed_experts: bool = False
+    host_topk: bool = False
 
     def set_config(self, text_cfg: dict):
         # gpt_oss/Mixtral use "num_local_experts"; OLMoE uses "num_experts".
@@ -609,7 +631,15 @@ class MixtureOfExpertsConfig(BaseConfig):
         self.num_experts_per_tok = text_cfg.get(
             "num_experts_per_tok", text_cfg.get("experts_per_token", 0)
         )
-        self.norm_topk_prob = text_cfg.get("norm_topk_prob", False)
+        # Qwen3.5-MoE's router always renormalizes the top-k weights and its config has no
+        # norm_topk_prob key (transformers Qwen3_5MoeTopKRouter).
+        self.norm_topk_prob = text_cfg.get(
+            "norm_topk_prob", text_cfg.get("model_type") == "qwen3_5_moe_text"
+        )
+        self.moe_intermediate_size = text_cfg.get("moe_intermediate_size") or 0
+        self.shared_expert_intermediate_size = text_cfg.get("shared_expert_intermediate_size") or 0
+        self.streamed_experts = text_cfg.get("model_type") in STREAMED_MOE_MODEL_TYPES
+        self.host_topk = self.streamed_experts
 
 
 @dataclass
@@ -833,9 +863,13 @@ class LanguageModelConfig(BaseConfig):
             model_format == ModelFormat.FORMAT_HF
             and (
                 (lm_arch == LlmArchType.GEMMA and not self.model_type.startswith("gemma4"))
-                or text_cfg.get("model_type") == "qwen3_5_text"
+                or text_cfg.get("model_type") in ("qwen3_5_text", "qwen3_5_moe_text", "qwen3_next")
             )
         )
+        if self.model_type == "qwen3_next":
+            # Qwen3-Next always gates attention output (q_proj emits [q | gate] per head);
+            # its HF config has no attn_output_gate key.
+            self.attn_cfg.attn_output_gate = True
         self.layer_types = layer_types
         self.draft_vocab_size = text_cfg.get("draft_vocab_size", 0)
 
@@ -1385,6 +1419,9 @@ class VlmConfig(BaseConfig):
             )
             else 1
         )
+        streamed_moe = getattr(lm_cfg.moe_cfg, "streamed_experts", False)
+        if streamed_moe and (is_speculative_draft or not layer_types):
+            raise NotImplementedError("Streamed MoE experts need layer_types and no speculative decoding")
         if layer_types:
             if len(layer_types) != lm_cfg.num_hidden_layers:
                 raise ValueError(
@@ -1408,7 +1445,16 @@ class VlmConfig(BaseConfig):
                         layers.append(LayerID("single_pre", i))
                         layers.append(LayerID("single_post", i))
                         continue
-                    if lm_cfg.moe_cfg is not None:
+                    if streamed_moe:
+                        # Streamed MoE: pre, then a router that also projects attention,
+                        # seeds the expert accumulator and runs the shared expert. Routed
+                        # experts run on the shared expert templates added below.
+                        layers.append(LayerID("group_pre", i))
+                        if i < lm_cfg.num_hidden_layers - 1:
+                            layers.append(LayerID("group_router", i))
+                        layers.append(LayerID("single_pre", i))
+                        layers.append(LayerID("single_router", i))
+                    elif lm_cfg.moe_cfg is not None:
                         # MoE layers replace the single post (MLP) part with a router
                         # plus one model per expert, for both group and single paths.
                         num_experts = lm_cfg.moe_cfg.num_experts
@@ -1439,6 +1485,11 @@ class VlmConfig(BaseConfig):
                 elif t == "linear_attention":
                     layers.append(LayerID("group_linear", i))
                     layers.append(LayerID("single_linear", i))
+                    if streamed_moe:
+                        # The linear unit stops after its residual add; the router owns
+                        # the MoE block, as for attention layers.
+                        layers.append(LayerID("group_router", i))
+                        layers.append(LayerID("single_router", i))
                 else:
                     raise ValueError(f"Unsupported layer type: {t}")
             # Cache models are shared across layers; include only for kinds that exist
@@ -1505,6 +1556,15 @@ class VlmConfig(BaseConfig):
                     ))
             if has_conv and layer_types[-1] == "conv":
                 layers.append(LayerID("conv_post_final", lm_cfg.num_hidden_layers - 1))
+            if streamed_moe:
+                # One relocatable expert template per token width serves every layer and
+                # expert; the final head applies the output norm and lm_head to the last
+                # layer's accumulator.
+                layers.append(LayerID("group_expert_template", 0))
+                layers.append(LayerID("single_expert_template", 0))
+                # Decode can also run all top_k experts of a layer as one job (fused template).
+                layers.append(LayerID("single_expert_fused_template", 0))
+                layers.append(LayerID("single_final_head", lm_cfg.num_hidden_layers - 1))
         else:
             # Fallback: attention-only if no layer_types
             if not (is_gemma4_mtp_draft or is_dflash_draft):
@@ -1596,9 +1656,12 @@ def get_model_arch_gen(
     """
     lm_arch = None
     t_reg = re.fullmatch(
-        r"(?P<arch>[a-zA-Z]+(?:_[a-zA-Z]+)*?)(?P<gen>\d+(?:_\d+)*)?(?:_vl|_vision)?(?:_text)?",
+        r"(?P<arch>[a-zA-Z]+(?:_[a-zA-Z]+)*?)(?P<gen>\d+(?:_\d+)*)?(?P<variant>_next|_moe)?"
+        r"(?:_vl|_vision)?(?:_text)?",
         text_type,
     )
+    if t_reg is None:
+        raise NotImplementedError(f"Unsupported LLM architecture: {text_type}")
     for arch in LlmArchType.values():
         if arch == t_reg.group("arch"):
             lm_arch = LlmArchType(arch)
@@ -1614,6 +1677,8 @@ def get_model_arch_gen(
         vm_arch = None
 
     gen = t_reg.group("gen")
+    if t_reg.group("variant"):
+        gen = f"{gen or ''}{t_reg.group('variant')}"
     return vm_arch, lm_arch, gen
 
 

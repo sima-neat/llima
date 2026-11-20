@@ -19,7 +19,8 @@ class LanguageLinearModel(LanguagePartBaseModel):
         - linear_delta_state: (1, num_value_heads, key_head_dim, value_head_dim)
 
     Outputs are NHWC:
-        - hidden: (1, 1, num_tokens, hidden)
+        - hidden: (1, 1, num_tokens, hidden); with streamed MoE experts, the residual sum
+          before the MoE block, which the router unit consumes
         - linear_conv_state_out: (1, 1, num_tokens + kernel - 2, linear_conv_dim)
         - linear_delta_state_out: (1, num_value_heads, key_head_dim, value_head_dim)
 
@@ -242,15 +243,20 @@ class LanguageLinearModel(LanguagePartBaseModel):
             f"{linear_base}.out_proj", core_attn_out, lora_rank=lora_rank, merged_lora=merged_lora
         )
         add1 = graph.add(residual, out_proj)
-        rms_norm2 = graph.rms_norm(f"{base_layer}.post_attention_layernorm", add1)
-        mlp = self._build_mlp(
-            graph,
-            f"{base_layer}.mlp",
-            [rms_norm2, add1],
-            merged_lora=merged_lora,
-            with_residual_add=True,
-        )
-        outputs = [mlp, linear_conv_state_out, linear_delta_state_out]
+        moe_cfg = self.cfg.lm_cfg.moe_cfg
+        if getattr(moe_cfg, "streamed_experts", False):
+            # The router unit owns the MoE block, including post_attention_layernorm.
+            hidden_out = add1
+        else:
+            rms_norm2 = graph.rms_norm(f"{base_layer}.post_attention_layernorm", add1)
+            hidden_out = self._build_mlp(
+                graph,
+                f"{base_layer}.mlp",
+                [rms_norm2, add1],
+                merged_lora=merged_lora,
+                with_residual_add=True,
+            )
+        outputs = [hidden_out, linear_conv_state_out, linear_delta_state_out]
         if self._emit_dflash_resolver_inputs:
             outputs.extend([resolver_key, resolver_value, resolver_decay_mask])
         graph.save(outputs)
@@ -431,42 +437,44 @@ class LanguageLinearModel(LanguagePartBaseModel):
         initial_attn: Node,
         chunk_size: int,
     ) -> Node:
-        """Build the exact NHWC lower-triangular inverse for one folded token block."""
-        if chunk_size == 4:
-            eye = graph.constant(
-                np.eye(chunk_size, dtype=np.float32).reshape(1, 1, chunk_size, chunk_size),
-            )
-            a_squared = graph.matmul(initial_attn, initial_attn)
-            i_plus_a = graph.add(initial_attn, eye)
-            i_plus_a_squared = graph.add(a_squared, eye)
-            return graph.matmul(i_plus_a_squared, i_plus_a)
+        """Build the exact NHWC inverse of (I - A) for strictly lower-triangular folded blocks.
 
-        half = chunk_size // 2
-        top_rows = graph.slice(initial_attn, start=0, stop=half, axis=2)
-        bottom_rows = graph.slice(initial_attn, start=half, stop=chunk_size, axis=2)
-        a00 = graph.slice(top_rows, start=0, stop=half, axis=3)
-        a10 = graph.slice(bottom_rows, start=0, stop=half, axis=3)
-        a11 = graph.slice(bottom_rows, start=half, stop=chunk_size, axis=3)
+        Recursive halving on the full block, with constant masks instead of slices: for block
+        size s, T_s = blockdiag of the (I - A_ii)^-1 over s x s diagonal blocks, and
+            T_1 = I,  T_2s = T_s + T_s (A o C_s) T_s,
+        where C_s selects the lower-left s x s block inside each 2s x 2s diagonal block. This is
+        the halving recurrence [[T00, 0], [T11 A10 T00, T11]] applied to every 2s block at once.
+        Slicing the halves instead needs channel offsets that are not 16-aligned, which lower to
+        selector convolutions that weight quantization then quantizes.
 
-        inv00 = self._build_direct_chunk_inverse(graph, a00, half)
-        inv11 = self._build_direct_chunk_inverse(graph, a11, half)
-        a10_inv00 = graph.matmul(a10, inv00)
-        inv10 = graph.matmul(inv11, a10_inv00)
-        inv01 = graph.constant(
-            np.zeros(
-                (
-                    1,
-                    (self.num_tokens // self._delta_block_size)
-                    * self.cfg.lm_cfg.linear_attn_cfg.num_value_heads,
-                    half,
-                    half,
-                ),
-                dtype=np.float32,
-            ),
+        Not prod_j (I + A^(2^j)): exact in exact arithmetic, but the powers grow far beyond the
+        inverse (|A^16| entries up to 2e6 on Qwen3.5-35B-A3B prompt data) and BF16 loses the
+        result (relative error 2.5e3 vs 6e-3 here; scripts/chunk_inverse_stability.py).
+        """
+        assert chunk_size >= 2 and chunk_size & (chunk_size - 1) == 0, chunk_size
+        rows, cols = np.indices((chunk_size, chunk_size))
+        eye = graph.constant(
+            np.eye(chunk_size, dtype=np.float32).reshape(1, 1, chunk_size, chunk_size),
         )
-        top = graph.concat([inv00, inv01], 3)
-        bottom = graph.concat([inv10, inv11], 3)
-        return graph.concat([top, bottom], 2)
+        inverse = None
+        span = 1
+        while span < chunk_size:
+            lower_left = (
+                (rows // (2 * span) == cols // (2 * span))
+                & ((rows // span) % 2 == 1)
+                & ((cols // span) % 2 == 0)
+            ).astype(np.float32)
+            off_diag = graph.mul(
+                initial_attn, graph.constant(lower_left.reshape(1, 1, chunk_size, chunk_size))
+            )
+            if inverse is None:
+                inverse = graph.add(off_diag, eye)  # T_1 = I, so T_2 = I + A o C_1
+            else:
+                inverse = graph.add(
+                    inverse, graph.matmul(inverse, graph.matmul(off_diag, inverse))
+                )
+            span *= 2
+        return inverse
 
     def _build_block_chunk_inverse(
         self, graph: ModelGraph, initial_attn: Node, block_size: int = 32

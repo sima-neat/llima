@@ -423,6 +423,7 @@ set(SIMA_LMM_PUBLIC_HEADERS
     sima_lmm/devkit/cpp/chat.hpp
     sima_lmm/devkit/cpp/eagle_helpers.hpp
     sima_lmm/devkit/cpp/eigen_types.hpp
+    sima_lmm/devkit/cpp/expert_streaming.hpp
     sima_lmm/devkit/cpp/image_processor.hpp
     sima_lmm/devkit/cpp/language_model.hpp
     sima_lmm/devkit/cpp/mla_buffer.hpp

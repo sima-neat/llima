@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -21,6 +22,7 @@
 
 #include "base_model.hpp"
 #include "eagle_helpers.hpp"
+#include "expert_streaming.hpp"
 #include "rope_utils.hpp"
 #include "text_streamer.hpp"
 
@@ -392,6 +394,57 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::map<uint8_t, MLABufferSlice>* ifm_map,
             uint16_t num_tokens, uint8_t layer_idx
         );
+        // Streamed MoE (Qwen3-Next): router (+ shared expert) seeds an accumulator, then one
+        // expert-template job per selected expert adds weight * expert(norm_hidden). The last
+        // job writes the layer output; the last layer adds the final head.
+        void _define_streamed_moe_models(
+            uint16_t num_tokens, uint8_t layer_idx,
+            const std::vector<MLABufferSlice>& router_ifms,
+            const std::vector<MLABufferSlice>& post_ofms
+        );
+        void _run_streamed_moe_post(
+            std::map<uint8_t, MLABufferSlice>* ifm_map,
+            uint16_t num_tokens, uint8_t layer_idx
+        );
+        // Queues one accumulate job per expert in chain order (rebinding template slots
+        // between queue flushes when the chain is longer than the slot pool).
+        // while_reading runs once, after the cached experts are submitted and before waiting
+        // for this layer's storage reads (idle host time).
+        void _queue_expert_chain(
+            uint16_t moe_nt, uint8_t layer_idx,
+            std::span<const uint32_t> experts,
+            std::span<const MLABufferSlice> weights,
+            const MLABufferSlice& output,
+            const std::function<void()>& while_reading = {}
+        );
+        void _init_expert_streaming();
+        void _expert_selftest();
+        bool _expert_trace = false;
+        bool _expert_stats = false;
+        std::chrono::steady_clock::time_point _router_done;
+        // Next-layer prediction started during a decode layer, consumed while the next layer's
+        // router runs on the MLA.
+        BackgroundWorker _prediction_worker;    // predicts and issues the prefetch reads
+        bool _batched_dispatch = false;          // SIMA_LLIMA_BATCHED_DISPATCH
+        // Approximation, off by default: decode skips experts whose routing weight is below
+        // this (SIMA_LLIMA_EXPERT_MIN_WEIGHT); the remaining weights are not renormalized.
+        float _expert_min_weight = 0.0f;
+        uint8_t _pending_prediction_layer = 0;
+        void _issue_prefetch(uint8_t layer_idx, const std::vector<uint32_t>& predicted);
+        void _flush(ExpertPhaseStats& stats);  // run queued jobs (batched or async), timed
+        std::unique_ptr<ExpertPredictor> _expert_predictor;
+        int _moe_phase = 0;                   // 0 prefill, 1 decode
+        bool _prefetch_early = true;          // SIMA_LLIMA_EXPERT_PREFETCH_EARLY
+        uint16_t _moe_valid_rows = 1;         // prompt rows in the current chunk
+        uint16_t _short_prefill_tokens = 0;   // SIMA_LLIMA_SHORT_PREFILL_TOKENS
+        // Streamed MoE: prompts this short run token by token on the decode models, which use
+        // the larger decode expert cache, instead of a padded 128-token chunk.
+        bool _use_token_prefill(int new_tokens) const {
+            return _cfg.lm_cfg.is_streamed_moe() && new_tokens > 0
+                && new_tokens <= _short_prefill_tokens;
+        }
+        ExpertPhaseStats _moe_stats[2];
+        void _report_moe_stats(int phase, double seconds, uint64_t tokens);
         LanguageModelMapKey _get_cache_model_key(
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
         ) const;
@@ -422,6 +475,12 @@ class LanguageModel : public BaseModel<VlmConfig> {
             uint16_t num_tokens, uint8_t layer_idx, uint16_t expert_idx
         );
         std::filesystem::path _get_elf_path_weightedsum(uint16_t num_tokens, uint8_t layer_idx);
+        std::filesystem::path _get_elf_path_expert_template(uint16_t num_tokens);
+        std::optional<std::filesystem::path> _get_elf_path_expert_fused_template();
+        // Decode routing on the host (MixtureOfExpertsConfig::host_topk): fills indices with the
+        // top_k experts from n1_router_logits and returns their weights.
+        std::vector<Eigen::bfloat16> _host_topk(std::vector<int32_t>& indices);
+        std::filesystem::path _get_elf_path_final_head(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv(uint16_t num_tokens, uint8_t layer_idx);
         std::filesystem::path _get_elf_path_conv_final(uint8_t layer_idx);
         std::filesystem::path _get_elf_path_per_layer(uint16_t num_tokens);
@@ -593,6 +652,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
             std::vector<uint8_t> activated_scratch;        // num_experts (prefill only)
         };
         std::vector<MoeHostCache> _moe_host;
+        // Streamed MoE state. Slot pools are keyed by token width; the final head by
+        // {1, last_layer, 0}; the layer output of each router is kept for its expert chain.
+        std::map<uint16_t, ExpertWidthState> _expert_widths;
+        bool _expert_options_loaded = false;
+        LanguageModelMap _final_head_model_map;
+        std::map<LanguageModelMapKey, MLABufferSlice> _streamed_moe_output;
+        ExpertStreamingOptions _expert_options;
         void _init_moe_host_cache();
         MoeHostCache& _get_moe_host(uint16_t moe_nt);
 

@@ -710,7 +710,7 @@ ToolCallFormat tool_call_format_for_model(std::string_view model_type) {
         model_type == "vlm-qwen2_5_vl" || model_type == "vlm-qwen3_vl") {
         return ToolCallFormat::Qwen;
     }
-    if (model_type == "vlm-qwen3_5") {
+    if (model_type == "vlm-qwen3_5" || model_type == "llm-qwen3_5_moe") {
         return ToolCallFormat::Qwen35;
     }
     if (model_type == "llm-gpt_oss") {

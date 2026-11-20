@@ -18,7 +18,9 @@ class LayerID:
             'single_per_layer', 'group_dflash_context', 'single_dflash_context',
             and for Mixture-of-Experts models 'group_router',
             'single_router', 'group_expert', 'single_expert',
-            'group_weightedsum', 'single_weightedsum'.
+            'group_weightedsum', 'single_weightedsum', and for streamed experts
+            'group_expert_template', 'single_expert_template',
+            'single_expert_fused_template', 'single_final_head'.
         part_idx: Index of the layer.
         expert_idx: Index of the expert within the layer, for the MoE
             'group_expert'/'single_expert' parts.  -1 for all non-expert parts.

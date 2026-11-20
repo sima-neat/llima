@@ -14,6 +14,8 @@ from PIL import Image
 from ml_dtypes import bfloat16, int4
 from transformers import AutoConfig, MistralConfig
 from transformers.image_utils import load_images
+from sima_lmm.hf.fused_expert_params import fused_expert_source, load_fused_expert_param
+from sima_lmm.hf.qwen3_next_params import Qwen3NextLinearDims, derive_param, derived_source
 from sima_lmm.logging import sima_log_info
 
 
@@ -372,6 +374,10 @@ class LocalHuggingFaceModel:
             return True
         if self.weight_map.get(param_name) is not None:
             return True
+        if self._qwen3_next_source(param_name) is not None:
+            return True
+        if self._fused_expert_source(param_name) is not None:
+            return True
         # For llm-compressor models, check for packed version
         if self.is_compressed_tensors_model() and param_name.endswith('.weight'):
             packed_name = param_name + "_packed"
@@ -391,6 +397,14 @@ class LocalHuggingFaceModel:
         """
         if self.params and param_name in self.params:
             return self.params[param_name]
+
+        if self._qwen3_next_source(param_name) is not None:
+            return derive_param(
+                param_name, self.load_np_param, Qwen3NextLinearDims.from_config(self.config)
+            )
+
+        if self._fused_expert_source(param_name) is not None:
+            return load_fused_expert_param(param_name, self._load_expert_slice)
 
         # For llm-compressor models, check for packed version
         packed_name = param_name + "_packed"
@@ -437,6 +451,32 @@ class LocalHuggingFaceModel:
 
         safetensors_file = self.weights[model_shard]
         return self._load_safetensors_tensor(safetensors_file, param_name)
+
+    def _qwen3_next_source(self, param_name: str) -> str | None:
+        """Name of the fused Qwen3-Next tensor a Qwen3.5-style DeltaNet name derives from."""
+        if self.config.get("model_type") != "qwen3_next" or param_name in self.weight_map:
+            return None
+        source = derived_source(param_name)
+        if source is None or source[0] not in self.weight_map:
+            return None
+        return source[0]
+
+    def _fused_expert_source(self, param_name: str) -> str | None:
+        """Name of the fused expert tensor (Qwen3.5-MoE) a per-expert name derives from."""
+        if param_name in self.weight_map:
+            return None
+        source = fused_expert_source(param_name)
+        if source is None or source[0] not in self.weight_map:
+            return None
+        return source[0]
+
+    def _load_expert_slice(self, tensor_name: str, expert: int) -> np.ndarray:
+        """Load fused[expert] of a 3-D fused expert tensor without reading the other experts."""
+        if self.params and tensor_name in self.params:
+            return self.params[tensor_name][expert]
+        safetensors_file = self.weights[self.weight_map[tensor_name]]
+        with safe_open(safetensors_file, framework="numpy") as f:
+            return f.get_slice(tensor_name)[expert]
 
     def _load_raw_tensor(self, tensor_name: str) -> np.ndarray:
         """Load a raw tensor from safetensors files by exact name."""

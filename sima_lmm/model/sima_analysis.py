@@ -44,20 +44,26 @@ def get_tessellate_parameters(
     mla_node = model._net.nodes["MLA_0"]
     tessellate_parameters = dict()
 
+    # Section names carry the input/output index, zero-padded to the widest index: the assembler
+    # orders DRAM sections by name and the runtime binds them by position, so "output_10" must not
+    # sort before "output_2" (the n2a default names follow the same rule, SWMLA-10093).
+    input_width = len(str(len(mla_node.input_names) - 1))
+
     # Set input tessellate parameters
     for input_idx, input_name in enumerate(mla_node.input_names):
         tessellate_parameters[input_name] = dataclasses.replace(
             _get_tessellate_params(input_params, input_idx, len(mla_node.input_names)),
-            persistent_mem_name=f"input_{input_idx}/{input_name}"
+            persistent_mem_name=f"input_{input_idx:0{input_width}d}/{input_name}"
         )
 
     # Set output tessellate parameters
     output_node = mla_node.ir.nodes[mla_node.ir.output_node_name]
     out_names = output_node.input_node_names if node_is_tuple(output_node) else [output_node.name]
+    output_width = len(str(len(out_names) - 1))
     for output_idx, output_name in enumerate(out_names):
         tessellate_parameters[f"{output_name}_output"] = dataclasses.replace(
             _get_tessellate_params(output_params, output_idx, len(out_names)),
-            persistent_mem_name=f"output_{output_idx}/{output_name}"
+            persistent_mem_name=f"output_{output_idx:0{output_width}d}/{output_name}"
         )
 
     return tessellate_parameters
