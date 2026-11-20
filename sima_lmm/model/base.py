@@ -7,7 +7,7 @@ import shutil
 from typing import ClassVar, NotRequired, TypedDict
 
 from abc import ABC
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
@@ -152,12 +152,22 @@ class BaseModel(ABC):
         hf_model: LocalHuggingFaceModel or GgufModel object
             for obtaining source parameters.
         weight_prefix: The prefix of weight tensor names in the source model.
+        weight_patch_record_dir: If set, the MLA compile is recorded as a weight patch template
+            into this directory (n2a_compiler mlc/compiler/weight_patching.py).
+        weight_patch_template_dir: If set, the MLA ELF is built from the weight patch template in
+            this directory when the compiled program matches it; otherwise it compiles in full.
+            gen_files_from_model_list compiles the model that records this directory first.
+        use_dram_embed: Write the MLA DRAM constants to binary files that the assembler embeds
+            (.dram_embed) instead of .mlc text rows; the ELF is the same.
     """
     cfg: BaseConfig
     model_name: str
     sima_path: Path = field(default="sima_files", kw_only=True)
     hf_model: LocalHuggingFaceModel | GgufModel | None = field(default=None, kw_only=True)
     vlm_helper: VlmHelper | None = field(default=None, kw_only=True)
+    weight_patch_record_dir: Path | None = field(default=None, kw_only=True)
+    weight_patch_template_dir: Path | None = field(default=None, kw_only=True)
+    use_dram_embed: bool = field(default=False, kw_only=True)
     enable_filter_sharing: ClassVar[bool] = True
 
     def gen_files(
@@ -368,7 +378,10 @@ class BaseModel(ABC):
             tessellate_parameters=tessellate_parameters,
             retained_temporary_directory_name=retained_temporary_directory_name,
             enable_filter_sharing=self.enable_filter_sharing,
-            layout_search_effort_level=layout_search_effort_level, deployable=False
+            layout_search_effort_level=layout_search_effort_level, deployable=False,
+            weight_patch_record_dir=_optional_str(self.weight_patch_record_dir),
+            weight_patch_template_dir=_optional_str(self.weight_patch_template_dir),
+            use_dram_embed=self.use_dram_embed,
         )
         return model
 
@@ -667,28 +680,67 @@ class BaseModel(ABC):
             with ProcessPoolExecutor(
                 max_workers=num_processes, mp_context=multiprocessing.get_context("spawn")
             ) as executor:
-                results = {}
+                results: dict[Future, tuple["BaseModel", Path]] = {}
                 generated_file_name = None
+                ready, waiting = _order_by_weight_patch_dependency(model_list)
+                caps = {
+                    template_dir: _patched_concurrency_cap(len(dependents), num_processes)
+                    for template_dir, dependents in waiting.items()
+                }
+                # Dependents of finished templates that wait for a slot under their group's cap.
+                released: dict[Path, list[tuple["BaseModel", LayerConfiguration]]] = {}
+                running: dict[Path, int] = dict.fromkeys(caps, 0)
+                completed = 0
+
+                def submit(model: "BaseModel", layer_cfg: LayerConfiguration) -> Future:
+                    nonlocal generated_file_name
+                    generated_file_name = model.get_gen_file_name(gen_mode)
+                    future = executor.submit(
+                        model.gen_files, gen_mode, layer_cfg=layer_cfg,
+                        log_level=logging.NOTSET, resume=resume
+                    )
+                    results[future] = (model, generated_file_name)
+                    return future
+
                 try:
-                    for model, layer_cfg in model_list:
-                        generated_file_name = model.get_gen_file_name(gen_mode)
-                        future = executor.submit(
-                            model.gen_files, gen_mode, layer_cfg=layer_cfg,
-                            log_level=logging.NOTSET, resume=resume
-                        )
-                        results[future] = (model.model_name, generated_file_name)
+                    for model, layer_cfg in ready:
+                        submit(model, layer_cfg)
                     # Include every spawned worker in the manager's exit watch set.
                     executor._executor_manager_thread_wakeup.wakeup()
                     with ScopedLogLevel(log_level):
-                        for completed, future in enumerate(as_completed(results), start=1):
-                            model_name, generated_file_name = results[future]
-                            created = future.result()
-                            if created:
-                                sima_log_info("Created %s.", generated_file_name)
-                            else:
-                                sima_log_info("Skipped %s.", generated_file_name)
-                            action = "Completed" if created else "Skipped"
-                            print(f"[{stage} {completed}/{total}] {action} {model_name}", flush=True)
+                        pending = set(results)
+                        while pending:
+                            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                            for future in done:
+                                model, generated_file_name = results[future]
+                                created = future.result()
+                                completed += 1
+                                if created:
+                                    sima_log_info("Created %s.", generated_file_name)
+                                else:
+                                    sima_log_info("Skipped %s.", generated_file_name)
+                                action = "Completed" if created else "Skipped"
+                                print(
+                                    f"[{stage} {completed}/{total}] {action} {model.model_name}",
+                                    flush=True,
+                                )
+                                # Models patched from this model's template can start now, at
+                                # most caps[template_dir] of them at a time.
+                                group = getattr(model, "weight_patch_template_dir", None)
+                                if group in running:
+                                    running[group] -= 1
+                                recorded = _patch_record_dir(model)
+                                if recorded in waiting:
+                                    released[recorded] = waiting.pop(recorded)
+                                started = False
+                                for template_dir in (group, recorded):
+                                    queue = released.get(template_dir)
+                                    while queue and running[template_dir] < caps[template_dir]:
+                                        running[template_dir] += 1
+                                        pending.add(submit(*queue.pop(0)))
+                                        started = True
+                                if started:
+                                    executor._executor_manager_thread_wakeup.wakeup()
                 except BaseException as exc:
                     # Python 3.11/3.12 have no public executor worker-termination API.
                     # Stop active work before the context manager waits for shutdown.
@@ -708,8 +760,10 @@ class BaseModel(ABC):
                     sima_log_exception(msg)
                     raise
         else:
+            ready, waiting = _order_by_weight_patch_dependency(model_list)
+            ordered = ready + [dep for deps in waiting.values() for dep in deps]
             with ScopedLogLevel(log_level):
-                for completed, (model, layer_cfg) in enumerate(model_list, start=1):
+                for completed, (model, layer_cfg) in enumerate(ordered, start=1):
                     try:
                         created = model.gen_files(
                             gen_mode, layer_cfg=layer_cfg, log_level=log_level, resume=resume
@@ -724,3 +778,58 @@ class BaseModel(ABC):
                         msg = f"Error occured when creating {model.get_gen_file_name(gen_mode)}."
                         sima_log_exception(msg)
                         raise
+
+
+def _optional_str(path: Path | None) -> str | None:
+    return None if path is None else str(path)
+
+
+def _order_by_weight_patch_dependency(
+    model_list: list[tuple["BaseModel", LayerConfiguration]],
+) -> tuple[
+    list[tuple["BaseModel", LayerConfiguration]],
+    dict[Path, list[tuple["BaseModel", LayerConfiguration]]],
+]:
+    """Split models into those that can start now and those that wait for a weight patch template.
+
+    Returns:
+        The models to start now, template-recording models first, and per template directory
+        the models to start once the model recording it has finished.
+    """
+    recorded = {_patch_record_dir(m) for m, _ in model_list} - {None}
+    ready, waiting = [], {}
+    for entry in model_list:
+        template_dir = getattr(entry[0], "weight_patch_template_dir", None)
+        if template_dir is not None and template_dir in recorded:
+            waiting.setdefault(template_dir, []).append(entry)
+        else:
+            ready.append(entry)
+    ready.sort(key=lambda entry: _patch_record_dir(entry[0]) is None)
+    return ready, waiting
+
+
+def _patched_concurrency_cap(num_dependents: int, num_processes: int) -> int:
+    """How many models patched from one template may run at once.
+
+    The dependents of a template all become ready when it finishes, and for the largest group they
+    are then the only work left. Running them num_processes at a time makes their memory peaks
+    coincide: on Llama 3.1 8B BF16 at -j20, the 30 prefill-MLP units (about 7 GB each, mostly the
+    simulator check, measured as PSS) peaked at 141 GB against 119 GB for a compile without
+    patching. Spreading them evenly over the minimum number of waves the workers allow keeps the
+    number of waves, and so the wall time, while lowering how many run at once (15 instead of 20
+    for 30 units at -j20).
+
+    This is not a memory model: it does not look at other work running at the same time or at the
+    size of each model.
+
+    Args:
+        num_dependents: Number of models patched from the template.
+        num_processes: Number of concurrent compiler processes.
+    """
+    waves = -(-num_dependents // num_processes)
+    return -(-num_dependents // waves)
+
+
+def _patch_record_dir(model: "BaseModel") -> Path | None:
+    # Model lists may hold other job types (e.g. in tests) that do not use weight patching.
+    return getattr(model, "weight_patch_record_dir", None)

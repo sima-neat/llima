@@ -1,8 +1,11 @@
+import hashlib
 import logging
 import numpy as np
+import shutil
 import time
 
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from ml_dtypes import bfloat16
 from afe.ir.quantization_conv import block_quantize_weight_tensor
@@ -11,7 +14,9 @@ from sima_lmm.logging import sima_log_info, sima_log_warning
 
 from sima_lmm.gguf.gguf_conversion import GgufModel
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.base import BaseModel, EvalMode, FileGenMode, GenConfiguration
+from sima_lmm.model.base import (
+    BaseModel, EvalMode, FileGenMode, GenConfiguration, LayerConfiguration
+)
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.language_moe_router_model import LanguageMoeRouterModel
@@ -33,6 +38,10 @@ from sima_lmm.config.vlm_config import (
     PipelineConfig,
     VlmArchType,
 )
+
+# Transformer-layer parts whose models of all layers share one program (see
+# LanguageModel._assign_weight_patch_templates).
+_WEIGHT_PATCH_PARTS = frozenset({"group_pre", "single_pre", "group_post", "single_post"})
 
 
 def quantize_embedding_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -85,6 +94,8 @@ class LanguageModel(BaseModel):
         log_level: int = logging.NOTSET,
         num_processes: int = 1,
         resume: bool = False,
+        weight_patching: bool = False,
+        dram_embed: bool = False,
     ):
         """
         Generates files based on the provided file generation mode.
@@ -98,7 +109,13 @@ class LanguageModel(BaseModel):
                 will not be processed.
                 The lora dict is a map from layer ID to lora graph mode for each layer.
             log_level: Logging level.
+            num_processes: Number of concurrent processes.
             resume: Generate the files if missing.
+            weight_patching: When compiling, build the ELFs of transformer layers from the ELF of
+                one compiled layer with the same part, token count, precision and lora mode
+                (see _assign_weight_patch_templates).
+            dram_embed: When compiling, write the MLA DRAM constants (weights) to binary files that
+                the assembler embeds instead of .mlc text rows; the ELFs are the same.
         """
         # Create a list of all models to compile
         model_list = list()
@@ -106,6 +123,7 @@ class LanguageModel(BaseModel):
         single_model_num_tokens = self.cfg.lm_cfg.single_model_num_tokens
         precision = gen_config["precision"]
         lora_mode = gen_config.get("lora", None)
+        layer_ids: list[LayerID] = []
 
         for layer_id, curr_precision in precision.items():
             part_model = None
@@ -219,6 +237,7 @@ class LanguageModel(BaseModel):
             if lora_mode:
                 curr_cfg["lora"] = lora_mode[layer_id]
             model_list.append((part_model, curr_cfg))
+            layer_ids.append(layer_id)
 
         speculative_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
         if (
@@ -243,8 +262,73 @@ class LanguageModel(BaseModel):
                     )
                 )
 
+        if dram_embed:
+            for model, _ in model_list:
+                model.use_dram_embed = True
+        patch_dirs = []
+        if weight_patching and gen_mode == FileGenMode.MODEL_SDK_COMPILE:
+            patch_dirs = self._assign_weight_patch_templates(model_list, layer_ids)
+
         # Finished creating model_list.  Compile these models.
         self.gen_files_from_model_list(model_list, gen_mode, num_processes, log_level, resume)
+        if patch_dirs:
+            _report_weight_patching(patch_dirs)
+        # The templates are only needed while compiling; each holds a full ELF.
+        for patch_dir in patch_dirs:
+            shutil.rmtree(patch_dir, ignore_errors=True)
+        if patch_dirs and not any(patch_dirs[0].parent.iterdir()):
+            patch_dirs[0].parent.rmdir()
+
+    def _assign_weight_patch_templates(
+        self,
+        model_list: list[tuple[BaseModel, LayerConfiguration]],
+        layer_ids: list[LayerID],
+    ) -> list[Path]:
+        """Groups the transformer-layer models that compile to the same program and picks a template.
+
+        Pre/post models with the same part (e.g. group_pre), precision, lora mode and quantized
+        graph structure (see _graph_fingerprint) compile to the same program and differ only in
+        their weights. The model with the lowest layer index above 0 records a weight patch
+        template; the others in the group are built from it. A model whose graph differs, such as
+        layer 0 with a quantized embedding input or the last layer with the lm_head, is in a group
+        of its own and compiles in full right away instead of waiting for a template. If two
+        graphs look alike but still compile to different programs, the compiler detects it and
+        compiles the model in full.
+
+        Args:
+            model_list: Models to compile with their layer configurations; updated in place.
+            layer_ids: Layer ID of each entry in model_list.
+
+        Returns:
+            The template directories.
+        """
+        groups: dict[tuple, list[tuple[LayerID, BaseModel]]] = {}
+        for (model, layer_cfg), layer_id in zip(model_list, layer_ids):
+            if layer_id.part not in _WEIGHT_PATCH_PARTS or layer_id.expert_idx >= 0:
+                continue
+            key = (
+                layer_id.part, layer_cfg["precision"], layer_cfg.get("lora"),
+                _graph_fingerprint(model),
+            )
+            groups.setdefault(key, []).append((layer_id, model))
+
+        patch_dirs = []
+        for (part, curr_precision, curr_lora, fingerprint), members in groups.items():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda member: (member[0].part_idx == 0, member[0].part_idx))
+            lora_name = "none" if curr_lora is None else curr_lora.name.lower()
+            graph = "" if fingerprint is None else f"_{fingerprint[:12]}"
+            patch_dir = (
+                Path(self.sima_path).resolve() / "weight_patch"
+                / f"{part}_{curr_precision.name.lower()}_{lora_name}{graph}"
+            )
+            shutil.rmtree(patch_dir, ignore_errors=True)
+            members[0][1].weight_patch_record_dir = patch_dir
+            for _, model in members[1:]:
+                model.weight_patch_template_dir = patch_dir
+            patch_dirs.append(patch_dir)
+        return patch_dirs
 
     def run_model(
         self,
@@ -737,3 +821,44 @@ class LanguageModel(BaseModel):
                     self.cfg, model_name, sima_path=self.sima_path,
                     hf_model=self.hf_model, num_tokens=num_tokens,
                 )
+
+
+def _graph_fingerprint(model: BaseModel) -> str | None:
+    """MD5 of the model's quantized graph description with its layer-specific names masked.
+
+    Models of different layers whose fingerprints match have the same graph structure. Reads the
+    .sima.json written by quantization; returns None if it does not exist or the model has no
+    layer-specific names, so that the model is grouped by part, precision and lora mode only.
+
+    Args:
+        model: A pre/post model of one transformer layer.
+    """
+    graph_file = Path(f"{model.get_gen_file_name(FileGenMode.FP_TO_QUANT)}.json")
+    layer_base_name = getattr(model, "_layer_base_name", None)
+    if not graph_file.is_file() or not layer_base_name:
+        return None
+    text = graph_file.read_text()
+    text = text.replace(model.model_name, "<model>").replace(layer_base_name, "<layer>")
+    return hashlib.md5(text.encode()).hexdigest()
+
+
+def _report_weight_patching(patch_dirs: list[Path]):
+    """Prints how many models were built from a weight patch template and why others were not."""
+    from collections import Counter
+
+    from mlc.compiler.weight_patching import read_patch_methods, read_patch_results
+
+    results = {}
+    methods = {}
+    for patch_dir in patch_dirs:
+        results.update(read_patch_results(patch_dir))
+        methods.update(read_patch_methods(patch_dir))
+    full = {name: result for name, result in results.items() if result != "patched"}
+    by_method = ", ".join(f"{n} {m}" for m, n in sorted(Counter(methods.values()).items()))
+    print(
+        f"[compile] Weight patching: {len(results) - len(full)} of {len(results)} models built "
+        f"from a template ({by_method or 'none'}), the others compiled in full",
+        flush=True,
+    )
+    for name, result in full.items():
+        print(f"[compile]   {name}: {result}", flush=True)

@@ -130,6 +130,7 @@ Most models support context lengths up to 8192 tokens. Use `--max_num_tokens 819
 |----|----|
 | `--language_group_size` | Batch size for parallel token processing during prefill. Larger values (e.g., 256) can improve TTFT for large input prompts, but can decrease TTFT for smaller input prompts. Default: 128. |
 | `--future_token_mask_size` | Mask size for reusing compiled models across token positions. Larger values reduce number of compiled binary files, but may reduce TPS. Default: 128. |
+| `--weight_patching` | Compile one transformer layer per part (prefill/decode, attention/MLP), precision, and LoRA mode, then build the other layers' compiled files from it by writing in their weights. Output is identical to a full compile and compile time is much shorter; layers whose compiled program differs (for example the first and last layer) are compiled in full. Supported for Modalix (gen2) targets. Default: disabled. |
 | `--no-quantize_embeddings` | Disable embedding-table quantization, which is enabled by default for supported LLMs and VLMs. |
 | `--no-quantize_kv_cache` | Disable KV-cache quantization, which is enabled by default. |
 | `--return_logits` | Return logits at the last layer output (needed for model evaluator). |

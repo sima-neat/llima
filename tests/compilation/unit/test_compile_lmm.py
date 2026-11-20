@@ -121,7 +121,30 @@ def test_dflash_cli_forwards_block_size(monkeypatch, tmp_path):
 
     compile_lmm.main()
 
-    assert calls[0][-1] == 8
+    # gen_files(..., speculative_block_size, weight_patching, dram_embed)
+    assert calls[0][-3] == 8
+    assert calls[0][-2] is False
+    assert calls[0][-1] is False
+
+
+@pytest.mark.parametrize(
+    "flag, position, expected",
+    [([], -2, False), (["--weight_patching"], -2, True), (["--dram_embed"], -1, True)],
+)
+def test_weight_patching_cli_forwarding(monkeypatch, tmp_path, flag, position, expected):
+    (tmp_path / "model").mkdir()
+    calls = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["llima-compile", str(tmp_path / "model"), "-o", str(tmp_path / "output"), "-j", "1"]
+        + flag,
+    )
+    monkeypatch.setattr(compile_lmm, "gen_files", lambda *args: calls.append(args))
+
+    compile_lmm.main()
+
+    assert calls[0][position] is expected
 
 
 @pytest.mark.parametrize("option", ["--system_prompt_file", "--chat_template_file"])
