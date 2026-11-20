@@ -323,6 +323,7 @@ class LanguageModel {
         LogLikelihoodResult _score(std::span<const uint32_t> ids, size_t continuation_start,
             std::span<const uint32_t> continuation_ids, bool use_group_prefill);
         void invalidate_prompt_reuse();
+        void _validate_eagle3_target() const;
         void bind_session_adapter();
         void _bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter);
         void set_image_identity(std::string identity);

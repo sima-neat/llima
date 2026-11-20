@@ -486,7 +486,9 @@ void LanguageModel::_attach_draft(LanguageModel& draft_lm, LanguageModel* previo
             throw std::invalid_argument("Target and draft hidden or vocabulary sizes do not match");
         if (target.method == "dflash")
             validate_dflash_pair(_cfg, draft_lm._cfg);
-        else if (target.method != "eagle3")
+        else if (target.is_eagle3())
+            _validate_eagle3_target();
+        else
             throw std::invalid_argument("Unsupported speculative-decoding method: " + target.method);
     }
     _detach_draft_sessions(previous);

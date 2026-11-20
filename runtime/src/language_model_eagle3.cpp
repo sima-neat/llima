@@ -273,6 +273,16 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
 }
 
 
+void LanguageModel::_validate_eagle3_target() const {
+    const auto& layers = _cfg.lm_cfg.layer_types;
+    if (layers.size() != _cfg.lm_cfg.num_hidden_layers)
+        throw std::invalid_argument("EAGLE3 target layer count does not match its configuration");
+    for (const auto& type : layers) {
+        if (type != "full_attention")
+            throw std::invalid_argument("EAGLE3 target verification requires full attention, found " + type);
+    }
+}
+
 // Target verify forward pass. K tree candidates with absolute position_ids
 // (= tree_position_ids + input_ids.shape[-1]). `this` is the target. Loops
 // through all target layers, captures hidden states at layers 2, N/2, N-3,
@@ -285,13 +295,14 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     if (_run->cancelled())
         return {};
 
+    // Direct verification can also be called without first attaching a draft.
+    _validate_eagle3_target();
     const int num_cached_tokens = static_cast<int>(_workspace->eagle3_stable_kv);
 
     // num_tokens = 16 for target verify; seq_length is the valid candidate count.
     const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
     const uint8_t  num_layers = _cfg.lm_cfg.num_hidden_layers;
     const uint32_t hidden_size = _cfg.lm_cfg.hidden_size;
-    const auto&    layer_types = _cfg.lm_cfg.layer_types;
     const size_t   seq_length = input_ids.size();
     const int      past_key_values_length = num_cached_tokens;
     const size_t   seq_len_with_past = seq_length + past_key_values_length;
@@ -303,39 +314,25 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         ));
     }
 
-    // Freq upload: gather rows at position_ids from pristine host, zero-pad to
-    // (num_tokens, freq_dim), upload to row 0. When SWA is enabled, do the
-    // same for the local freq table so sliding-attention layers see the right
-    // rotary base.
-    auto upload_freq_rows = [&](
-        const RopeTable& host, const std::string& real_name, const std::string& imag_name
-    ) {
-        auto& real_buf = get_buffer(real_name);
-        auto& imag_buf = get_buffer(imag_name);
-        const uint32_t freq_dim = real_buf.get_shape().back();
-        std::vector<Eigen::bfloat16> real_padded(
-            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
-        );
-        std::vector<Eigen::bfloat16> imag_padded(
-            static_cast<size_t>(num_tokens) * freq_dim, Eigen::bfloat16{0.0f}
-        );
-        for (size_t i = 0; i < seq_length; ++i) {
-            const size_t pos = static_cast<size_t>(position_ids[i]);
-            for (size_t k = 0; k < freq_dim; ++k) {
-                real_padded[i * freq_dim + k] = host.re[pos * freq_dim + k];
-                imag_padded[i * freq_dim + k] = host.im[pos * freq_dim + k];
-            }
-        }
-        const size_t freq_bytes = real_padded.size() * sizeof(Eigen::bfloat16);
-        real_buf.upload_raw(real_padded.data(), 0, freq_bytes);
-        imag_buf.upload_raw(imag_padded.data(), 0, freq_bytes);
-    };
-    upload_freq_rows(_resources->global_freq_host, "global_freq_real", "global_freq_imag");
-    if (_cfg.lm_cfg.attn_cfg.swa_enable) {
-        upload_freq_rows(_resources->local_freq_host, "local_freq_real", "local_freq_imag");
-    }
+    if (seq_length > num_tokens || seq_len_with_past > _cfg.pipeline_cfg.max_num_tokens ||
+        std::ranges::any_of(position_ids, [&](int32_t pos) { return pos < 0 || pos >= _cfg.pipeline_cfg.max_num_tokens; }))
+        throw std::invalid_argument("EAGLE3 verification tree exceeds the compiled context or width");
+
+    // Gather rotary rows in tree order and zero-pad to the compiled verification width.
     auto& freq_real_buf = get_buffer("global_freq_real");
     auto& freq_imag_buf = get_buffer("global_freq_imag");
+    const auto freq_dim = freq_real_buf.get_shape().back();
+    const auto& host = _resources->global_freq_host;
+    std::vector<Eigen::bfloat16> real_padded(num_tokens * freq_dim, Eigen::bfloat16{0.0f});
+    std::vector<Eigen::bfloat16> imag_padded(real_padded.size(), Eigen::bfloat16{0.0f});
+    for (size_t i = 0; i < seq_length; ++i) {
+        const size_t offset = static_cast<size_t>(position_ids[i]) * freq_dim;
+        std::copy_n(host.re.data() + offset, freq_dim, real_padded.data() + i * freq_dim);
+        std::copy_n(host.im.data() + offset, freq_dim, imag_padded.data() + i * freq_dim);
+    }
+    const auto freq_bytes = real_padded.size() * sizeof(Eigen::bfloat16);
+    freq_real_buf.upload_raw(real_padded.data(), 0, freq_bytes);
+    freq_imag_buf.upload_raw(imag_padded.data(), 0, freq_bytes);
 
     // Attention mask: ones over seq_len_with_past, overlay tree_mask, pad to
     // (16, aligned_cols), upload to future_token_mask.
@@ -383,13 +380,6 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     result.hidden_states.resize(capture_layers.size());
 
     for (uint8_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-        if (layer_types[layer_idx] != "full_attention"
-            && layer_types[layer_idx] != "sliding_attention") {
-            // Target verify is attention-only; conv layers don't apply here.
-            continue;
-        }
-
-
         // Slot 0 (input_embeds for layer 0) is shared between pre and post —
         // both have empty-placeholder bindings, so build the override once.
         std::map<uint8_t, MLABufferSlice> ifm_map;
@@ -408,34 +398,26 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         // Freq IFMs need pre-only overrides — redirect static
         // (past_kv_len, 0) read to row 0. Leaking these into post would
         // corrupt its scale/cache/per-layer inputs.
-        // Pick local vs global freq buffers based on layer type so sliding
-        // layers consume rope_local_base_freq and full layers consume rope_theta.
-        const bool is_sliding = layer_types[layer_idx] == "sliding_attention";
-        auto& layer_freq_real = is_sliding
-            ? get_buffer("local_freq_real") : freq_real_buf;
-        auto& layer_freq_imag = is_sliding
-            ? get_buffer("local_freq_imag") : freq_imag_buf;
         const uint8_t freq_ifm_idx = (
             use_int8_embedding_staging && layer_idx == 0 ? 2 : 1
         );
-        const uint32_t layer_freq_dim = layer_freq_real.get_shape().back();
         auto pre_ifm_map = ifm_map;
         pre_ifm_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(freq_ifm_idx),
             std::forward_as_tuple(
-                &layer_freq_real,
+                &freq_real_buf,
                 std::vector<uint32_t>{0, 0},
-                std::vector<uint32_t>{num_tokens, layer_freq_dim}
+                std::vector<uint32_t>{num_tokens, static_cast<uint32_t>(freq_dim)}
             )
         );
         pre_ifm_map.emplace(
             std::piecewise_construct,
             std::forward_as_tuple(freq_ifm_idx + 1),
             std::forward_as_tuple(
-                &layer_freq_imag,
+                &freq_imag_buf,
                 std::vector<uint32_t>{0, 0},
-                std::vector<uint32_t>{num_tokens, layer_freq_dim}
+                std::vector<uint32_t>{num_tokens, static_cast<uint32_t>(freq_dim)}
             )
         );
 
@@ -928,7 +910,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*cols=*/static_cast<size_t>(topk) * topk,
             topk
         );
-        std::vector<int32_t> topk_cs_index = std::move(cs_topk.indices[0]);
+        topk_cs_index = std::move(cs_topk.indices[0]);
         std::vector<float>   topk_cs_p     = std::move(cs_topk.values[0]);
         scores = topk_cs_p;
 
