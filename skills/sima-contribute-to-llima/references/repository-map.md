@@ -7,8 +7,8 @@
 | Graphs, quantization, model parts | `sima_lmm/model/` |
 | Host preprocessing | `sima_lmm/preproc/` |
 | Compile/deploy/benchmark/LoRA tools | `sima_lmm/host/` |
-| Python CLI orchestration/model management | `runtime/python/devkit/` |
-| C++ runtime, tokenizer, MLA, CLI/HTTP/ZMQ, internal CLI binding | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/bindings/python/` |
+| Python CLI orchestration/model management | `runtime/devkit/` |
+| C++ runtime, tokenizer, MLA, CLI/HTTP/ZMQ, internal CLI binding | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` |
 | MoLE evaluation | `sima_lmm/mole/` |
 | Runtime/Debian packaging | `CMakeLists.txt`, `cmake/`, `build.sh` |
 | Wheel profiles | `pyproject.toml`, `pyproject_metadata.py`, `build_*package.sh`, `build_compiler_wheel.sh` |

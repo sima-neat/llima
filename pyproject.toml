@@ -38,8 +38,8 @@ llima-benchmark = "sima_lmm.host.benchmark:main"
 logging.level = "DEBUG"
 experimental = true
 wheel.cmake = false
-wheel.packages = { "sima_lmm" = "sima_lmm", "sima_lmm/devkit" = "runtime/python/devkit" }
-wheel.exclude = ["**/__pycache__", "**/*.pyc"]
+wheel.packages = { "sima_lmm" = "sima_lmm", "sima_lmm/devkit" = "runtime/devkit" }
+wheel.exclude = ["sima_lmm/devkit/binding.cpp", "**/__pycache__", "**/*.pyc"]
 sdist.include = ["sima_lmm/VERSION"]
 # Package the CLI from runtime/ once. sima_lmm/devkit is a link for source checkouts.
 sdist.exclude = ["/sima_lmm/devkit/", "**/__pycache__", "**/*.pyc"]

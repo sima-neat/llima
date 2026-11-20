@@ -36,8 +36,8 @@ those boundaries.
 | Compilation | `sima_lmm/model/`, `sima_lmm/preproc/` | Model parts, quantization, graphs, and preprocessing |
 | Host tools | `sima_lmm/host/` | Compile, deploy, LoRA, and benchmark entry points |
 | Evaluation | `sima_lmm/mole/` | MoLE workflows |
-| Runtime CLI | `runtime/python/devkit/` | Python CLI orchestration and model management |
-| C++ runtime | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/bindings/python/` | Models, tokenizer, MLA, CLI/HTTP/ZMQ implementations, and the internal CLI binding |
+| Runtime CLI | `runtime/devkit/` | Python CLI orchestration and model management |
+| C++ runtime | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` | Models, tokenizer, MLA, CLI/HTTP/ZMQ implementations, and the internal CLI binding |
 | Tests | `tests/` | Compiler and Modalix runtime tests |
 | Packaging | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian, wheel, and artifact assembly |
 | CI/caches | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | Builds, tests, and model caches |

@@ -26,8 +26,8 @@ sima-cli playbooks install \
 | 編譯 | `sima_lmm/model/`, `sima_lmm/preproc/` | 模型組件、量化、圖表和預處理。 |
 | 主機工具 | `sima_lmm/host/` | 編譯、部署、LoRA，以及進行基準測試，以評估程式的進入點。 |
 | 評估 | `sima_lmm/mole/` | MoLE 工作流程 |
-| 執行階段 CLI | `runtime/python/devkit/` | Python CLI 流程協調與模型管理 |
-| C++ 執行階段 | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/bindings/python/` | 模型、權杖化器、MLA、CLI/HTTP/ZMQ 的實作，以及內部 CLI 繫結。 |
+| 執行階段 CLI | `runtime/devkit/` | Python CLI 流程協調與模型管理 |
+| C++ 執行階段 | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` | 模型、權杖化器、MLA、CLI/HTTP/ZMQ 的實作，以及內部 CLI 繫結。 |
 | 測試 | `tests/` | 編譯器和 Modalix 執行階段測試 |
 | 包裝 | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian、wheel 格式，以及成品組裝。 |
 | 持續整合/快取 | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | 建立、測試和快取模型。 |

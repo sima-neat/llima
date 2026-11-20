@@ -401,7 +401,7 @@ if(SIMA_LMM_BUILD_PYTHON)
         ${TARGET_BIND}
         NOMINSIZE
         LTO
-        runtime/bindings/python/binding.cpp
+        runtime/devkit/binding.cpp
     )
     target_include_directories(${TARGET_BIND} PRIVATE runtime/src)
     target_link_libraries(
@@ -501,7 +501,7 @@ patch: ${PROJECT_VERSION_PATCH}
         COMPONENT cli
     )
     install(
-        DIRECTORY runtime/python/devkit
+        DIRECTORY runtime/devkit
         DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
         COMPONENT cli
         FILES_MATCHING PATTERN "*.py"

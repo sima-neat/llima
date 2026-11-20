@@ -26,8 +26,8 @@ sima-cli playbooks install \
 | 컴파일 | `sima_lmm/model/`, `sima_lmm/preproc/` | 모델 구성 요소, 양자화, 그래프, 전처리 |
 | 호스트 도구 | `sima_lmm/host/` | 컴파일하고, 배포하고, LoRA를 적용하고, 벤치마크 진입 지점을 설정합니다. |
 | 평가 | `sima_lmm/mole/` | MoLE 워크플로우 |
-| 런타임 CLI | `runtime/python/devkit/` | Python CLI를 사용한 오케스트레이션 및 모델 관리 |
-| C++ 런타임 | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/bindings/python/` | 모델, 토크나이저, MLA, CLI/HTTP/ZMQ 구현, 그리고 내부 CLI 바인딩 |
+| 런타임 CLI | `runtime/devkit/` | Python CLI를 사용한 오케스트레이션 및 모델 관리 |
+| C++ 런타임 | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` | 모델, 토크나이저, MLA, CLI/HTTP/ZMQ 구현, 그리고 내부 CLI 바인딩 |
 | 테스트 | `tests/` | 컴파일러 및 Modalix 런타임 테스트 |
 | 포장 | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | 데비안, 휠, 그리고 아티팩트 패키징 |
 | 지속적 통합/캐시 | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | 빌드, 테스트, 모델 캐시 생성 |

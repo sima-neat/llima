@@ -24,7 +24,7 @@ class ScopeDecisionTests(unittest.TestCase):
             ),
             (
                 "DevKit only",
-                ["runtime/src/chat.cpp", "runtime/python/devkit/devkit_demo.py", "CMakeLists.txt"],
+                ["runtime/src/chat.cpp", "runtime/devkit/devkit_demo.py", "CMakeLists.txt"],
                 (False, True),
             ),
             ("shared", ["deps/manifest.json"], (True, True)),

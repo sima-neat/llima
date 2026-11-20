@@ -32,8 +32,8 @@ sima-cli playbooks install \
 | Компіляція | `sima_lmm/model/`, `sima_lmm/preproc/` | Компоненти моделі, квантування, графіки та попередня обробка. |
 | Інструменти для хостингу. | `sima_lmm/host/` | Зберіть, розгорніть, LoRA, і проведіть тестування продуктивності основних точок входу. |
 | Оцінювання. | `sima_lmm/mole/` | MoLE робочі процеси |
-| Інтерфейс командного рядка для середовища виконання. | `runtime/python/devkit/` | Python Оркестрація за допомогою інтерфейсу командного рядка та керування моделлю. |
-| C++ середовище виконання | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/bindings/python/` | Моделі, токенізатор, MLA, реалізації CLI/HTTP/ZMQ та внутрішнє зв’язування CLI. |
+| Інтерфейс командного рядка для середовища виконання. | `runtime/devkit/` | Python Оркестрація за допомогою інтерфейсу командного рядка та керування моделлю. |
+| C++ середовище виконання | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` | Моделі, токенізатор, MLA, реалізації CLI/HTTP/ZMQ та внутрішнє зв’язування CLI. |
 | Тести | `tests/` | Тести компілятора та середовища виконання Modalix. |
 | Упаковка | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian, формат wheel та збірка артефактів. |
 | Кеші CI | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | Здійснює збірку, тестування та зберігає кеш моделі. |
