@@ -15,6 +15,7 @@
 #include "chat.hpp"
 #include "file_provider.hpp"
 #include "image_processor.hpp"
+#include "media_span.hpp"
 #include "tokenizer.hpp"
 #include "vlm_config.hpp"
 
@@ -26,9 +27,9 @@ struct PreprocessedChat {
     std::string formatted_prompt;
     std::vector<uint32_t> input_token_ids;
     uint16_t stable_prefix_token_count;
-    std::vector<std::vector<Eigen::bfloat16>> image_tensors;
-    std::vector<std::vector<uint16_t>> image_positions;
+    std::vector<PreprocessedImage> image_tensors;
     std::vector<std::vector<Eigen::bfloat16>> audio_tensors;
+    std::vector<MediaSpan> media_spans;
 };
 
 class Chat;

@@ -412,11 +412,11 @@ struct VlmConfig {
     std::string gguf_file_name = "";
 
     bool is_multimodal() const { return vm_cfg.has_value(); }
-    bool vision_bidirectional_attention() const {
+    bool is_gemma4_unified_target() const {
         return model_type == "vlm-gemma4_unified" && !lm_cfg.is_speculative_draft();
     }
     bool is_unified_prefill(uint16_t num_tokens) const {
-        return vision_bidirectional_attention() && num_tokens == pipeline_cfg.input_token_group_size;
+        return is_gemma4_unified_target() && num_tokens == pipeline_cfg.input_token_group_size;
     }
     bool support_audio() const { return audio_cfg.has_value() && !audio_model_name.empty(); }
     uint16_t get_prefill_cache_capacity(const std::string& layer_type) const {

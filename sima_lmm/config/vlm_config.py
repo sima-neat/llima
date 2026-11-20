@@ -787,7 +787,7 @@ class LanguageModelConfig(BaseConfig):
         )
 
     @property
-    def vision_bidirectional_attention(self) -> bool:
+    def is_gemma4_unified_target(self) -> bool:
         """Unified targets need image-window prefill; speculative drafts do not."""
         return self.model_type == "gemma4_unified_text" and not (
             self.speculative_decoding_cfg is not None and self.speculative_decoding_cfg.is_draft
@@ -1429,7 +1429,7 @@ class VlmConfig(BaseConfig):
         self.pipeline_cfg.set_group_size(language_group_size)
         self.pipeline_cfg.set_future_token_mask_size(future_token_mask_size)
 
-        if self.lm_cfg.vision_bidirectional_attention:
+        if self.lm_cfg.is_gemma4_unified_target:
             if (self.lm_cfg.hidden_size_per_layer_input or self.lm_cfg.moe_cfg is not None
                     or any(kind not in ("full_attention", "sliding_attention") for kind in self.lm_cfg.layer_types)):
                 raise ValueError("Gemma 4 Unified currently requires dense attention layers without per-layer embedding inputs")
@@ -1573,9 +1573,9 @@ class VlmConfig(BaseConfig):
                     layers.extend(
                         LayerID("group_sliding_cache", n)
                         for n in (range(0, self.get_prefill_cache_capacity("sliding_attention"), pipeline_cfg.input_token_group_size)
-                                  if lm_cfg.vision_bidirectional_attention else
+                                  if lm_cfg.is_gemma4_unified_target else
                                   group_sliding_cache_model_indices(pipeline_cfg, lm_cfg.attn_cfg.sliding_window))
-                        if lm_cfg.vision_bidirectional_attention or separate_sliding_cache
+                        if lm_cfg.is_gemma4_unified_target or separate_sliding_cache
                         or n + pipeline_cfg.input_token_group_size > lm_cfg.attn_cfg.sliding_window
                     )
                 if separate_sliding_cache:

@@ -314,9 +314,8 @@ int main(int argc, char** argv) {
             try {
                 target.run_model(std::span<const uint32_t>{}, max_tokens,
                     std::set<uint32_t>{stop_token});
-            } catch (const std::runtime_error& error) {
-                rejected_empty = std::string(error.what())
-                    == "Gemma4 MTP generation requires at least one input token";
+            } catch (const std::invalid_argument&) {
+                rejected_empty = true;
             }
             require(rejected_empty, "Public MTP generation did not reject an empty prompt");
             require(target.run_model(public_prompt, max_tokens) == default_reference,

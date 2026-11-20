@@ -13,6 +13,12 @@
 namespace simaai {
 namespace llima {
 
+struct PreprocessedImage {
+    std::vector<Eigen::bfloat16> patches;
+    // Interleaved (x, y) coordinates for Unified patches; empty for other models.
+    std::vector<uint16_t> positions;
+};
+
 class ImageProcessor {
     public:
         ImageProcessor(
@@ -27,9 +33,11 @@ class ImageProcessor {
         ~ImageProcessor() {}
 
         std::vector<Eigen::bfloat16> preprocess(const std::filesystem::path image_path);
-        std::vector<Eigen::bfloat16> preprocess(const std::vector<uint8_t>& image_path);
+        std::vector<Eigen::bfloat16> preprocess(const std::vector<uint8_t>& image_bytes);
         std::vector<Eigen::bfloat16> preprocess(const cv::Mat& rgb_image);
-        const std::vector<uint16_t>& image_positions() const { return _image_positions; }
+        PreprocessedImage preprocess_with_positions(const std::filesystem::path& image_path);
+        PreprocessedImage preprocess_with_positions(const std::vector<uint8_t>& image_bytes);
+        PreprocessedImage preprocess_with_positions(const cv::Mat& rgb_image);
 
         static void read_env_vars() {
             // Set the debug info from env variables.
@@ -41,9 +49,8 @@ class ImageProcessor {
         }
 
     private:
-        std::vector<Eigen::bfloat16> _preprocess(cv::Mat image);
-        std::vector<Eigen::bfloat16> _preprocess_unified(const cv::Mat& image);
-        std::vector<uint16_t> _image_positions;
+        PreprocessedImage _preprocess(cv::Mat image);
+        PreprocessedImage _preprocess_unified(const cv::Mat& image);
         cv::Mat _convert_to_rgb(cv::Mat image);
         cv::Mat _pad_to_square(cv::Mat image);
         std::vector<Eigen::bfloat16> _cast_and_patchify(cv::Mat image);

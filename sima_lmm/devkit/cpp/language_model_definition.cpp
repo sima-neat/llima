@@ -763,7 +763,7 @@ void LanguageModel::_define_models() {
         } else {
             for (const auto& token_idx: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
-                    if (_cfg.vision_bidirectional_attention()
+                    if (_cfg.is_gemma4_unified_target()
                         && _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
                         && token_idx >= _cfg.get_prefill_cache_capacity("sliding_attention")) {
                         continue;

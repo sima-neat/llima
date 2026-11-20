@@ -135,7 +135,7 @@ LanguageModel::LanguageModel(
         // intentionally does not emit grouped assistant pre/cache/post models.
         && !_cfg.lm_cfg.is_gemma4_mtp_draft()
     );
-    if (_cfg.vision_bidirectional_attention()) {
+    if (_cfg.is_gemma4_unified_target()) {
         if (!_use_group_token_models || !_cfg.vm_cfg || _cfg.vm_cfg->max_soft_tokens == 0) {
             throw std::invalid_argument("Gemma 4 Unified requires grouped prefill and an image token budget");
         }
@@ -307,17 +307,27 @@ const LinearAttentionConfig& LanguageModel::_linear_attn_cfg() const {
 std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffers(
     std::span<const uint32_t> input_token_ids
 ) {
+    auto spans = _cfg.is_gemma4_unified_target()
+        ? gemma4_media_spans(input_token_ids, _cfg, _image_token_id) : std::vector<MediaSpan>{};
+    return create_input_buffers(input_token_ids, std::move(spans));
+}
+
+std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffers(
+    std::span<const uint32_t> input_token_ids, std::vector<MediaSpan> media_spans
+) {
     // Log.
     _logger->info("Input token ids: [{}]", fmt::join(input_token_ids, ", "));
 
     if (input_token_ids.empty() || input_token_ids.size() > _cfg.pipeline_cfg.max_num_tokens) {
         throw std::invalid_argument("Prompt must fit the compiled context and contain at least one token");
     }
-    _image_spans.clear();
+    _media_spans = std::move(media_spans);
     // Determine the shape of the buffer for input embeds.
     const uint16_t num_input_tokens = input_token_ids.size();
     uint16_t num_padded_input_tokens = num_input_tokens;
-    if (_use_group_token_models) {
+    if (_cfg.is_gemma4_unified_target()) {
+        num_padded_input_tokens = _prepare_image_windows(num_input_tokens);
+    } else if (_use_group_token_models) {
         for (const auto& offset: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
             if (offset + _cfg.pipeline_cfg.input_token_group_size > num_input_tokens) {
                 num_padded_input_tokens = offset + _cfg.pipeline_cfg.input_token_group_size;
@@ -326,27 +336,11 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
         }
     }
 
-    if (_cfg.vision_bidirectional_attention()) {
-        for (uint16_t at = 0; at < num_input_tokens;) {
-            if (!_image_token_id || input_token_ids[at] != *_image_token_id) { ++at; continue; }
-            uint16_t end = at + 1;
-            while (end < num_input_tokens && input_token_ids[end] == *_image_token_id) ++end;
-            if (end - at > _cfg.vm_cfg->max_soft_tokens) throw std::invalid_argument("Image exceeds the compiled token budget");
-            _image_spans.emplace_back(at, end);
-            at = end;
-        }
-        _prepare_image_windows(num_input_tokens);
-        num_padded_input_tokens = _cfg.pipeline_cfg.input_token_group_size;
-        for (const auto& [begin, end] : _image_windows) {
-            num_padded_input_tokens = std::max<uint16_t>(num_padded_input_tokens, end - begin);
-        }
-    }
-
     // Allocate the input embeds with padding to the buffer.
     if (_embedding_offload) {
-        _embedding_offload->chunk_staging = _cfg.vision_bidirectional_attention() || !_image_token_id.has_value()
+        _embedding_offload->chunk_staging = _cfg.is_gemma4_unified_target() || !_image_token_id.has_value()
             || std::find(input_token_ids.begin(), input_token_ids.end(), *_image_token_id) == input_token_ids.end();
-        if (_embedding_offload->chunk_staging && !_cfg.vision_bidirectional_attention()) {
+        if (_embedding_offload->chunk_staging && !_cfg.is_gemma4_unified_target()) {
             num_padded_input_tokens = std::max<uint16_t>(
                 _cfg.lm_cfg.get_single_num_tokens(),
                 _use_group_token_models ? _cfg.pipeline_cfg.input_token_group_size : 1
@@ -368,7 +362,7 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
         scale_buf.clear();
     }
     // Unified media is projected on demand into the active chunk/window.
-    if (_cfg.vision_bidirectional_attention()) return {};
+    if (_cfg.is_gemma4_unified_target()) return {};
 
     std::vector<std::map<uint8_t, MLABufferSlice>> vision_ofm_maps;
     if (_cfg.vm_cfg.has_value()) {
@@ -598,9 +592,9 @@ uint32_t LanguageModel::run_model_prefill(
     uint32_t next_token_id{};
     uint16_t last_group_valid_tokens = 0;
     num_cached_tokens = _prepare_state_checkpoints_for_prefill(num_cached_tokens);
-    if (_cfg.vision_bidirectional_attention()) {
-        _prepare_image_windows(num_input_tokens);
-        if (!_image_spans.empty()) num_cached_tokens = std::min(num_cached_tokens, _image_spans.front().first);
+    if (_cfg.is_gemma4_unified_target()) {
+        if (!_media_spans.empty())
+            num_cached_tokens = std::min(num_cached_tokens, _media_spans.front().begin);
         num_cached_tokens = num_cached_tokens / group_size * group_size;
     }
 
@@ -641,7 +635,7 @@ uint32_t LanguageModel::run_model_prefill(
                 }
                 const auto window = std::find_if(_image_windows.begin(), _image_windows.end(),
                     [&](const auto& span) { return span.first == token_idx && span.second - span.first > num_tokens; });
-                if (_cfg.vision_bidirectional_attention() && window != _image_windows.end()) {
+                if (_cfg.is_gemma4_unified_target() && window != _image_windows.end()) {
                     const uint16_t begin = token_idx;
                     _prepare_unified_input(input_token_ids, begin, window->second, media_loader);
                     next_token_id = _run_image_window(begin, window->second, num_input_tokens);
@@ -653,7 +647,7 @@ uint32_t LanguageModel::run_model_prefill(
                     token_idx = window->second;
                     it = std::lower_bound(offsets.begin(), offsets.end(), token_idx);
                 } else {
-                    if (_cfg.vision_bidirectional_attention()) {
+                    if (_cfg.is_gemma4_unified_target()) {
                         _prepare_unified_input(input_token_ids, token_idx, token_idx + num_tokens, media_loader);
                     }
                     next_token_id = run_model_once(num_tokens, token_idx, num_input_tokens, 0);
@@ -661,7 +655,7 @@ uint32_t LanguageModel::run_model_prefill(
                     token_idx += num_tokens;
                 }
             } else {
-                if (_cfg.vision_bidirectional_attention()) {
+                if (_cfg.is_gemma4_unified_target()) {
                     _prepare_unified_input(input_token_ids, token_idx, token_idx + 1, media_loader);
                 }
                 if (_uses_per_layer_inputs()) {
@@ -1129,8 +1123,8 @@ uint32_t LanguageModel::run_model_once(
         if (_cfg.pipeline_cfg.quantize_embeddings) {
             normal_scale_buf = &get_buffer("input_embedding_scales");
         }
-        if (_embedding_offload && !_cfg.vision_bidirectional_attention()) _prepare_offloaded_prompt(num_tokens, token_idx);
-        normal_input_row = _cfg.vision_bidirectional_attention() || (_embedding_offload && _embedding_offload->chunk_staging) ? 0 : token_idx;
+        if (_embedding_offload && !_cfg.is_gemma4_unified_target()) _prepare_offloaded_prompt(num_tokens, token_idx);
+        normal_input_row = _cfg.is_gemma4_unified_target() || (_embedding_offload && _embedding_offload->chunk_staging) ? 0 : token_idx;
         normal_input_num_tokens = num_tokens;
     } else {
         normal_input_buf = &get_buffer(_embedding_offload ? "offload_decode_embeds" : "embeddings");
@@ -1277,192 +1271,27 @@ uint32_t LanguageModel::run_model_once(
 
             attn_models.cache->add_to_queue();
 
-            const bool is_draft = _cfg.lm_cfg.is_spec_decode()
-                && _cfg.lm_cfg.speculative_decoding_cfg.value().is_draft;
-            const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-            // Using the single post for the target's final layer is valid only when the
-            // draft does not require that layer's hidden states. If it does, use the
-            // group post for the final layer so all group hidden states remain available.
-            const bool use_single_post_for_target_group = (
-                _cfg.lm_cfg.is_spec_decode()
-                && !is_draft
-                && num_tokens != single_num_tokens
-                && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
-            );
-
-            // Non-spec uses n1 for the final row. Target speculative prefill reuses
-            // the compiled verification width with a contiguous window containing that row.
-            if (num_tokens > 1 && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
-                && !_cfg.lm_cfg.is_spec_decode()) {
-                const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
+            const uint32_t post_width = _cfg.lm_cfg.get_single_num_tokens();
+            if (layer_idx + 1 == _cfg.lm_cfg.num_hidden_layers && num_tokens != post_width
+                && !_cfg.lm_cfg.is_speculative_draft()) {
+                // The last layer only needs the post slice containing the final prompt row.
+                const auto slice = final_post_rows(num_input_tokens - 1 - token_idx, post_width);
+                const auto q_size = _cfg.lm_cfg.attn_cfg.get_q_size(_cfg.lm_cfg.layer_types[layer_idx]);
                 ifm_map.clear();
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(0),
-                    std::forward_as_tuple(
-                        nullptr,
-                        std::vector<uint32_t>{last_valid_row, 0},
-                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size}
-                    )
-                );
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(1),
-                    std::forward_as_tuple(
-                        nullptr,
-                        std::vector<uint32_t>{last_valid_row, 0},
-                        std::vector<uint32_t>{
-                            1,
-                            _cfg.lm_cfg.attn_cfg.get_q_size(_cfg.lm_cfg.layer_types[layer_idx])
-                        }
-                    )
-                );
-                uint8_t post_ifm_idx = 2;
-                if (_uses_per_layer_inputs()) {
-                    const uint32_t layer_row_offset =
-                        static_cast<uint32_t>(layer_idx) * num_tokens;
-                    ifm_map.emplace(
-                        std::piecewise_construct,
-                        std::forward_as_tuple(post_ifm_idx++),
-                        std::forward_as_tuple(
-                            nullptr,
-                            std::vector<uint32_t>{layer_row_offset + last_valid_row, 0},
-                            std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size_per_layer_input}
-                        )
-                    );
+                auto add_rows = [&](MLABuffer* buffer, uint32_t first, uint32_t columns) {
+                    const auto index = static_cast<uint8_t>(ifm_map.size());
+                    ifm_map.emplace(index, MLABufferSlice{buffer, {first, 0}, {post_width, columns}});
+                };
+                add_rows(dflash_layer_input, slice.first_input, _cfg.lm_cfg.hidden_size);
+                add_rows(nullptr, slice.first_input, q_size);
+                if (_uses_per_layer_inputs())
+                    add_rows(nullptr, layer_idx * num_tokens + slice.first_input, _cfg.lm_cfg.hidden_size_per_layer_input);
+                if (_cfg.lm_cfg.attn_cfg.attn_output_gate)
+                    add_rows(nullptr, slice.first_input, q_size);
+                if (_cfg.vm_cfg && layer_idx < _cfg.vm_cfg->deepstack_visual_indexes.size()) {
+                    const auto& buffer = get_buffer(fmt::format("deepstack_feature_l{}_cache", layer_idx));
+                    add_rows(nullptr, token_idx + slice.first_input, buffer.get_shape().back());
                 }
-                if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
-                    ifm_map.emplace(
-                        std::piecewise_construct,
-                        std::forward_as_tuple(post_ifm_idx++),
-                        std::forward_as_tuple(
-                            nullptr,
-                            std::vector<uint32_t>{last_valid_row, 0},
-                            std::vector<uint32_t>{
-                                1,
-                                _cfg.lm_cfg.attn_cfg.get_q_size(
-                                    _cfg.lm_cfg.layer_types[layer_idx]
-                                )
-                            }
-                        )
-                    );
-                }
-                if (
-                    _cfg.vm_cfg.has_value()
-                    && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
-                ) {
-                    const auto buf_name = fmt::format(
-                        "deepstack_feature_l{}_cache", layer_idx
-                    );
-                    ifm_map.emplace(
-                        std::piecewise_construct,
-                        std::forward_as_tuple(post_ifm_idx),
-                        std::forward_as_tuple(
-                            nullptr,
-                            std::vector<uint32_t>{token_idx + last_valid_row, 0},
-                            std::vector<uint32_t>{
-                                1,
-                                static_cast<uint32_t>(get_buffer(buf_name).get_shape().back())
-                            }
-                        )
-                    );
-                }
-            }
-            if (use_single_post_for_target_group) {
-                const uint32_t last_valid_row = num_input_tokens - 1 - token_idx;
-                const uint32_t slice_start = last_valid_row >= single_num_tokens - 1
-                    ? last_valid_row - (single_num_tokens - 1)
-                    : 0;
-
-                ifm_map.clear();
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(0),
-                    std::forward_as_tuple(
-                        dflash_layer_input,
-                        std::vector<uint32_t>{slice_start, 0},
-                        std::vector<uint32_t>{single_num_tokens, _cfg.lm_cfg.hidden_size}
-                    )
-                );
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(1),
-                    std::forward_as_tuple(
-                        nullptr,
-                        std::vector<uint32_t>{slice_start, 0},
-                        std::vector<uint32_t>{
-                            single_num_tokens,
-                            _cfg.lm_cfg.attn_cfg.get_q_size(_cfg.lm_cfg.layer_types[layer_idx])
-                        }
-                    )
-                );
-                uint8_t post_ifm_idx = 2;
-                if (_uses_per_layer_inputs()) {
-                    const uint32_t layer_row_offset =
-                        static_cast<uint32_t>(layer_idx) * num_tokens;
-                    ifm_map.emplace(
-                        std::piecewise_construct,
-                        std::forward_as_tuple(post_ifm_idx++),
-                        std::forward_as_tuple(
-                            nullptr,
-                            std::vector<uint32_t>{layer_row_offset + slice_start, 0},
-                            std::vector<uint32_t>{
-                                single_num_tokens,
-                                _cfg.lm_cfg.hidden_size_per_layer_input
-                            }
-                        )
-                    );
-                }
-                if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
-                    ifm_map.emplace(
-                        std::piecewise_construct,
-                        std::forward_as_tuple(post_ifm_idx++),
-                        std::forward_as_tuple(
-                            nullptr,
-                            std::vector<uint32_t>{slice_start, 0},
-                            std::vector<uint32_t>{
-                                single_num_tokens,
-                                _cfg.lm_cfg.attn_cfg.get_q_size(
-                                    _cfg.lm_cfg.layer_types[layer_idx]
-                                )
-                            }
-                        )
-                    );
-                }
-                if (
-                    _cfg.vm_cfg.has_value()
-                    && layer_idx < _cfg.vm_cfg.value().deepstack_visual_indexes.size()
-                ) {
-                    const auto buf_name = fmt::format("deepstack_feature_l{}_cache", layer_idx);
-                    ifm_map.emplace(
-                        std::piecewise_construct,
-                        std::forward_as_tuple(post_ifm_idx),
-                        std::forward_as_tuple(
-                            nullptr,
-                            std::vector<uint32_t>{token_idx + slice_start, 0},
-                            std::vector<uint32_t>{
-                                single_num_tokens,
-                                static_cast<uint32_t>(get_buffer(buf_name).get_shape().back())
-                            }
-                        )
-                    );
-                }
-            }
-            if (_uses_per_layer_inputs() && num_tokens > 1
-                && layer_idx == _cfg.lm_cfg.num_hidden_layers - 1
-                && !_cfg.lm_cfg.is_spec_decode()) {
-                uint32_t layer_row_offset = static_cast<uint32_t>(layer_idx) * num_tokens;
-                ifm_map.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(2),
-                    std::forward_as_tuple(
-                        nullptr,
-                        std::vector<uint32_t>{
-                            layer_row_offset + static_cast<uint32_t>(num_input_tokens - 1 - token_idx), 0
-                        },
-                        std::vector<uint32_t>{1, _cfg.lm_cfg.hidden_size_per_layer_input}
-                    )
-                );
             }
             if (_cfg.lm_cfg.is_moe()) {
                 _run_moe_post(&ifm_map, num_tokens, layer_idx);
@@ -1598,11 +1427,8 @@ uint32_t LanguageModel::run_model_once(
             const bool used_single_post_for_target_group = (
                 !is_draft && num_tokens != single_num_tokens
             );
-            const uint32_t slice_start = (
-                used_single_post_for_target_group
-                && last_valid_row >= single_num_tokens - 1
-            ) ? last_valid_row - (single_num_tokens - 1) : 0;
-            const uint32_t row = last_valid_row - slice_start;
+            const uint32_t row = used_single_post_for_target_group
+                ? final_post_rows(last_valid_row, single_num_tokens).result : last_valid_row;
             const uint16_t logits_num_tokens = used_single_post_for_target_group
                 ? single_num_tokens
                 : num_tokens;
@@ -1712,7 +1538,7 @@ void LanguageModel::_initialize() {
         _logger->info("Embedding offload disabled: resident DRAM");
     }
     BaseModel::_initialize();
-    if (_cfg.vision_bidirectional_attention() && _files->exists("devkit/generation_config.json")) {
+    if (_cfg.is_gemma4_unified_target() && _files->exists("devkit/generation_config.json")) {
         const auto generation = nlohmann::json::parse(*_files->open_stream("devkit/generation_config.json"));
         _suppressed_tokens.assign(_cfg.lm_cfg.token_cfg.vocab_size, false);
         for (const auto& id : generation.value("suppress_tokens", std::vector<uint32_t>{})) {
@@ -2406,13 +2232,13 @@ void LanguageModel::_define_buffers() {
     if (
         _use_group_token_models
         && _cfg.lm_cfg.attn_cfg.swa_enable
-        && (_cfg.vision_bidirectional_attention() || _get_cache_mask_size(
+        && (_cfg.is_gemma4_unified_target() || _get_cache_mask_size(
             "sliding_attention", _cfg.pipeline_cfg.max_num_tokens, true
         ) > group_size)
     ) {
         define_buffer(
             "group_sliding_future_token_mask",
-            {static_cast<size_t>(group_size) * (_cfg.vision_bidirectional_attention()
+            {static_cast<size_t>(group_size) * (_cfg.is_gemma4_unified_target()
                 ? _cfg.get_prefill_cache_capacity("sliding_attention") : _cfg.pipeline_cfg.max_num_tokens)},
             "bfloat16",
             false
@@ -2690,7 +2516,7 @@ uint16_t LanguageModel::_get_cache_token_idx_begin(
     }
     if (_cfg.is_unified_prefill(num_tokens)) {
         return gemma4_cache_view(token_idx, num_tokens, _cfg.pipeline_cfg.max_num_tokens,
-            _cfg.lm_cfg.attn_cfg.sliding_window.value(), _image_spans).first;
+            _cfg.lm_cfg.attn_cfg.sliding_window.value(), _media_spans).first;
     }
     // Retain the first query's full window for prefill and verification.
     return std::max(
@@ -2705,7 +2531,7 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     if (_cfg.is_unified_prefill(num_tokens) && layer_type == "sliding_attention") {
         const uint16_t capacity = gemma4_cache_view(token_idx, num_tokens,
-            _cfg.pipeline_cfg.max_num_tokens, _cfg.lm_cfg.attn_cfg.sliding_window.value(), _image_spans).second;
+            _cfg.pipeline_cfg.max_num_tokens, _cfg.lm_cfg.attn_cfg.sliding_window.value(), _media_spans).second;
         return {num_tokens, 1, capacity - num_tokens};
     }
     const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
@@ -3489,53 +3315,36 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
     MLABuffer& buf = get_buffer("input_embeds");
     MLABuffer* scales_buf = _cfg.pipeline_cfg.quantize_embeddings
         ? &get_buffer("input_embedding_scales") : nullptr;
-    uint32_t token_idx = 0;
-    uint32_t num_images = 0;
-    uint32_t num_media = 0;
-    uint16_t num_cached_tokens = 0;
-    while (token_idx < num_input_tokens) {
-        const auto& token_id = input_token_ids[token_idx];
-        const bool audio_token = _cfg.support_audio() && token_id == _cfg.audio_cfg->token_id;
-        if ((_image_token_id.has_value() && token_id == _image_token_id.value()) || audio_token) {
-            auto next_token_idx = token_idx + 1;
-            if (_cfg.vision_bidirectional_attention()) {
-                while (next_token_idx < num_input_tokens && input_token_ids[next_token_idx] == token_id) ++next_token_idx;
-            } else {
-                next_token_idx = token_idx + _cfg.mm_cfg.value().mm_tokens_per_image;
+    size_t text_prefix = num_input_tokens;
+    bool has_image = false;
+    if (_cfg.is_gemma4_unified_target()) {
+        // Unified embeddings are staged later, one prefill window at a time.
+        if (!_media_spans.empty()) text_prefix = std::min<size_t>(text_prefix, _media_spans.front().begin);
+    } else {
+        const auto audio_token = _cfg.support_audio() ? std::optional(_cfg.audio_cfg->token_id) : std::nullopt;
+        const auto is_media = [&](uint32_t id) { return _image_token_id == id || audio_token == id; };
+        for (size_t at = 0; at < num_input_tokens;) {
+            if (is_media(input_token_ids[at])) {
+                text_prefix = std::min(text_prefix, at);
+                has_image |= _image_token_id == input_token_ids[at];
+                at += _cfg.mm_cfg->mm_tokens_per_image;
+                continue;
             }
-            ++num_media;
-            num_images += !audio_token;
-            token_idx = next_token_idx;
-        } else {
-            auto next_token_idx = token_idx + 1;
-            while (
-                next_token_idx < num_input_tokens
-                && (!_image_token_id
-                    || input_token_ids[next_token_idx] != *_image_token_id)
-                && (!_cfg.support_audio() || input_token_ids[next_token_idx] != _cfg.audio_cfg->token_id)
-            )
-                ++next_token_idx;
-            if (!_embedding_offload && !_cfg.vision_bidirectional_attention())
-                _gather_embedding_rows(
-                    input_token_ids.subspan(token_idx, next_token_idx - token_idx),
-                    buf, scales_buf, token_idx
-                );
-            for (auto idx = token_idx; idx < next_token_idx; ++idx) {
-                if (
-                    num_media == 0
-                    && idx == num_cached_tokens
-                    && idx < _cached_token_ids.size()
-                    && input_token_ids[idx] == _cached_token_ids[idx]
-                )
-                    ++num_cached_tokens;
-            }
-            token_idx = next_token_idx;
+            size_t end = at + 1;
+            while (end < num_input_tokens && !is_media(input_token_ids[end])) ++end;
+            if (!_embedding_offload)
+                _gather_embedding_rows(input_token_ids.subspan(at, end - at), buf, scales_buf, at);
+            at = end;
         }
     }
+    // Identical placeholders need not refer to the same attachment.
+    const auto prefix = input_token_ids.first(text_prefix);
+    const auto mismatch = std::mismatch(prefix.begin(), prefix.end(), _cached_token_ids.begin(), _cached_token_ids.end());
+    const uint16_t num_cached_tokens = mismatch.first - prefix.begin();
     // Update rope table if needed.
     if (
         _cfg.lm_cfg.rope_cfg.rope_scaling.rope_type == "mrope"
-        && (_has_image_token || num_images > 0)
+        && (_has_image_token || has_image)
     ) {
         // Previous or current input has image.
         _logger->info("Update rope table");
@@ -3545,7 +3354,7 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
         get_buffer("global_freq_real").upload(rope_table.re.data());
         get_buffer("global_freq_imag").upload(rope_table.im.data());
     }
-    _has_image_token = num_images > 0;
+    _has_image_token = has_image;
 
     _text_streamer.push(
         DecodeCallbackType::CACHED_PROMPT_TOKENS, num_cached_tokens, 0.0

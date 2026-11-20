@@ -50,7 +50,7 @@ class LanguageCacheModel(LanguagePartBaseModel):
 
     @property
     def dynamic_mask(self) -> bool:
-        return (self.cfg.lm_cfg.vision_bidirectional_attention
+        return (self.cfg.lm_cfg.is_gemma4_unified_target
                 and self.layer_type == "sliding_attention" and self._is_group_model)
 
     @property

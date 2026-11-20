@@ -12,39 +12,41 @@ void LanguageModel::_prepare_unified_input(std::span<const uint32_t> ids, uint16
     input.clear(false);
     if (scales) scales->clear(false);
     const uint16_t valid_end = std::min<size_t>(end, ids.size());
-    bool has_media = false;
-    auto is_media = [&](uint32_t token) {
-        return (_image_token_id && token == *_image_token_id)
-            || (_cfg.support_audio() && token == _cfg.audio_cfg->token_id);
+    uint16_t at = begin;
+    auto gather_text_until = [&](uint16_t next) {
+        if (at < next) _gather_embedding_rows(ids.subspan(at, next - at), input, scales, at - begin);
     };
-    for (uint16_t at = begin; at < valid_end;) {
-        if (is_media(ids[at])) { has_media = true; ++at; continue; }
-        uint16_t next = at + 1;
-        while (next < valid_end && !is_media(ids[next])) ++next;
-        _gather_embedding_rows(ids.subspan(at, next - at), input, scales, at - begin);
-        at = next;
-    }
-    if (has_media) {
+    for (const auto& span : _media_spans) {
+        if (span.end <= begin) continue;
+        if (span.begin >= valid_end) break;
         if (!media_loader) throw std::invalid_argument("Media tokens require image/audio inputs");
-        const MLABufferSlice values{&input, {0, 0}, {static_cast<uint32_t>(valid_end - begin), _cfg.lm_cfg.hidden_size}};
-        const MLABufferSlice scale_rows{scales, {0, 0}, {static_cast<uint32_t>(valid_end - begin), 1}};
-        media_loader(begin, valid_end, values, scales ? &scale_rows : nullptr);
+        const uint16_t first = std::max(begin, span.begin);
+        const uint16_t last = std::min(valid_end, span.end);
+        gather_text_until(first);
+        const uint32_t offset = first - begin, rows = last - first;
+        const MLABufferSlice values{&input, {offset, 0}, {rows, _cfg.lm_cfg.hidden_size}};
+        const MLABufferSlice scale_rows{scales, {offset, 0}, {rows, 1}};
+        media_loader(span, first - span.begin, values, scales ? &scale_rows : nullptr);
+        at = last;
     }
+    gather_text_until(valid_end);
     input.flush_cache();
     if (scales) scales->flush_cache();
 }
 
-void LanguageModel::_prepare_image_windows(uint16_t prompt_length) {
+uint16_t LanguageModel::_prepare_image_windows(uint16_t prompt_length) {
     const auto group = _cfg.pipeline_cfg.input_token_group_size;
-    _image_windows = gemma4_image_windows(_image_spans, group);
-    uint16_t rows = 0;
+    _image_windows = gemma4_image_windows(_media_spans, group);
+    uint16_t rows = group;
     for (const auto& [begin, end] : _image_windows) {
         if (end > _cfg.pipeline_cfg.max_num_tokens || begin >= prompt_length) {
             throw std::invalid_argument("Image window exceeds the compiled context");
         }
-        if (end - begin > group) rows = std::max<uint16_t>(rows, end - begin);
+        rows = std::max<uint16_t>(rows, end - begin);
     }
-    if (rows <= _image_scratch_rows) return;
+    if (rows == group || rows <= _image_scratch_rows) return rows;
+    // A failed growth must force the next window to allocate all buffers again.
+    _image_scratch_rows = 0;
     const auto heads = _cfg.lm_cfg.attn_cfg.num_attention_heads;
     const auto max_dim = std::max(_cfg.lm_cfg.attn_cfg.get_head_dim("full_attention"),
                                   _cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention"));
@@ -60,6 +62,7 @@ void LanguageModel::_prepare_image_windows(uint16_t prompt_length) {
         if (buffer) buffer->allocate();
     }
     _image_scratch_rows = rows;
+    return rows;
 }
 
 void LanguageModel::_upload_image_attention_masks(uint16_t begin, uint16_t valid_end, uint16_t slot) {
@@ -72,14 +75,14 @@ void LanguageModel::_upload_image_attention_masks(uint16_t begin, uint16_t valid
         uint16_t capacity = _cfg.get_prefill_cache_capacity(type);
         if (sliding) {
             capacity = gemma4_cache_view(begin, group, _cfg.pipeline_cfg.max_num_tokens,
-                _cfg.lm_cfg.attn_cfg.sliding_window.value(), _image_spans).second;
+                _cfg.lm_cfg.attn_cfg.sliding_window.value(), _media_spans).second;
         } else {
             const uint16_t mask_size = _get_cache_mask_size(type, begin + group, true);
             if (mask_size <= group) continue; // The causal mask is compiled into this bucket.
             capacity = std::min<uint16_t>(round_up_to(begin + group, mask_size), capacity);
         }
         const auto mask = gemma4_attention_mask(begin, group,
-            _get_cache_token_idx_begin(group, begin, type), capacity, valid_end, _image_spans,
+            _get_cache_token_idx_begin(group, begin, type), capacity, valid_end, _media_spans,
             sliding ? _cfg.lm_cfg.attn_cfg.sliding_window.value() : 0);
         auto* buffer = staged ? (sliding ? _image_sliding_masks.get() : _image_global_masks.get())
             : &get_buffer(sliding ? "group_sliding_future_token_mask" : "group_future_token_mask");
@@ -94,6 +97,7 @@ uint32_t LanguageModel::_run_image_window(uint16_t begin, uint16_t end, uint16_t
     const uint16_t chunks = (end - begin) / group;
     const uint32_t hidden = _cfg.lm_cfg.hidden_size;
     const uint32_t post_width = _cfg.lm_cfg.get_single_num_tokens();
+    const auto post_rows = final_post_rows((prompt_length - 1 - begin) % group, post_width);
     auto& input = get_buffer("input_embeds");
     const bool quantize_embeddings = _cfg.pipeline_cfg.quantize_embeddings;
     auto* scales = quantize_embeddings ? &get_buffer("input_embedding_scales") : nullptr;
@@ -139,9 +143,7 @@ uint32_t LanguageModel::_run_image_window(uint16_t begin, uint16_t end, uint16_t
             }
             models.cache->add_to_queue(&cache_ifms);
             if (final_layer) {
-                const uint32_t row = prompt_length - 1 - begin - slot * group;
-                // The verification-width post also finishes prefill. Select rows that contain the last prompt token.
-                const uint32_t first = row + 1 > post_width ? row + 1 - post_width : 0;
+                const auto first = post_rows.first_input;
                 std::map<uint8_t, MLABufferSlice> post_ifms{
                     {0, {residual_input, {slot * group + first, 0}, {post_width, hidden}}},
                     {static_cast<uint8_t>(1 + quantized_input),
@@ -162,8 +164,7 @@ uint32_t LanguageModel::_run_image_window(uint16_t begin, uint16_t end, uint16_t
     }
     if (end < prompt_length) return 0;
     if (_cfg.lm_cfg.is_gemma4_mtp_target()) {
-        const uint32_t last_row = (prompt_length - 1 - begin) % group;
-        return _read_gemma4_mtp_prefill_token(std::min(last_row, post_width - 1));
+        return _read_gemma4_mtp_prefill_token(post_rows.result);
     }
     auto& result = get_buffer("n1_buffer4");
     if (_need_argmax) {

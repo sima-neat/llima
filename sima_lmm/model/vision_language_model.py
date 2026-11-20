@@ -121,7 +121,7 @@ class VisionLanguageModel(BaseModel):
         vlm_cfg.pipeline_cfg.set_quantize_kv_cache(quantize_kv_cache)
 
         if target_model is not None:
-            unified_target = target_model.cfg.lm_cfg.vision_bidirectional_attention
+            unified_target = target_model.cfg.lm_cfg.is_gemma4_unified_target
             if unified_target and speculative_method != SpeculativeDecodingMethod.GEMMA4_MTP:
                 raise ValueError("Gemma 4 Unified requires a matching Unified MTP assistant")
             if speculative_method == SpeculativeDecodingMethod.GEMMA4_MTP:

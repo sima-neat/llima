@@ -255,7 +255,7 @@ class LanguageModel(BaseModel):
         embedding_scales: np.ndarray | None = None,
         image_spans: list[tuple[int, int]] | None = None,
     ) -> list[np.ndarray]:
-        if self.cfg.lm_cfg.vision_bidirectional_attention:
+        if self.cfg.lm_cfg.is_gemma4_unified_target:
             return self._run_unified_model(eval_mode, ifms, embeddings_tensor, embedding_scales, image_spans or [])
         assert self.vlm_helper is not None
         expected_num_ifms = 2 if self.cfg.pipeline_cfg.quantize_embeddings else 1
@@ -746,7 +746,7 @@ class LanguageModel(BaseModel):
             assert isinstance(self.hf_model, GgufModel)
             embeddings_tensor = self.hf_model.load_np_param(weight_name, force_float=True)
         embeddings_tensor = embeddings_tensor.astype(np.float32)
-        if self.cfg.lm_cfg.vision_bidirectional_attention:
+        if self.cfg.lm_cfg.is_gemma4_unified_target:
             embed_scale = float(np.asarray(embed_scale, dtype=bfloat16))
         embeddings_tensor *= embed_scale
 

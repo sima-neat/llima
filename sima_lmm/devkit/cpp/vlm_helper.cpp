@@ -145,8 +145,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
 
     // Construct the actual prompt with full image tokens. Manually process the prompt because there
     // is no known automatic way.
-    std::vector<std::vector<Eigen::bfloat16>> image_tensors;
-    std::vector<std::vector<uint16_t>> image_positions;
+    std::vector<PreprocessedImage> image_tensors;
     uint32_t num_images = 0;
     if (_vlm_cfg.support_image()) {
         if (_vlm_cfg.model_type == "vlm-llava") {
@@ -217,13 +216,10 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
                     if (comma == std::string_view::npos ||
                         (header != "data:image/jpeg;base64" && header != "data:image/png;base64"))
                         throw std::invalid_argument("Expected a base64 PNG or JPEG image");
-                    image_tensors.emplace_back(_image_processor_ptr->preprocess(
+                    image_tensors.emplace_back(_image_processor_ptr->preprocess_with_positions(
                         base64_decode(source.substr(comma + 1))));
                 } else {
-                    image_tensors.emplace_back(_image_processor_ptr->preprocess(source));
-                }
-                if (_vlm_cfg.model_type == "vlm-gemma4_unified") {
-                    image_positions.push_back(_image_processor_ptr->image_positions());
+                    image_tensors.emplace_back(_image_processor_ptr->preprocess_with_positions(source));
                 }
             }
         }
@@ -231,15 +227,12 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     }
 
     if (_vlm_cfg.model_type == "vlm-gemma4_unified") {
-        if (image_positions.size() != image_tensors.size()) {
-            throw std::runtime_error("Image placeholder/count mismatch");
-        }
         size_t cursor = 0;
-        for (const auto& positions : image_positions) {
+        for (const auto& image : image_tensors) {
             const auto at = formatted_prompt.find("<|image|>", cursor);
-            if (at == std::string::npos || positions.empty()) throw std::runtime_error("Image placeholder/count mismatch");
+            if (at == std::string::npos || image.positions.empty()) throw std::runtime_error("Image placeholder/count mismatch");
             std::string expanded = "<|image>";
-            for (size_t i = 0; i < positions.size() / 2; ++i) expanded += "<|image|>";
+            for (size_t i = 0; i < image.positions.size() / 2; ++i) expanded += "<|image|>";
             expanded += "<image|>";
             formatted_prompt.replace(at, 9, expanded);
             cursor = at + expanded.size();
@@ -295,6 +288,23 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
     auto add_special_tokens = !formatted_prompt.starts_with(_bos_token);
     auto input_token_ids = _tokenizer_ptr->encode(formatted_prompt, add_special_tokens);
 
+    std::vector<MediaSpan> media_spans;
+    if (_vlm_cfg.is_gemma4_unified_target()) {
+        media_spans = gemma4_media_spans(input_token_ids, _vlm_cfg, _image_token_id);
+        if (media_spans.size() != image_tensors.size() + audio_tensors.size())
+            throw std::invalid_argument("Media placeholder/count mismatch");
+        for (const auto& span : media_spans) {
+            const size_t rows = span.end - span.begin;
+            const size_t i = span.attachment_index;
+            if (span.kind == MediaKind::Image) {
+                if (i >= image_tensors.size() || image_tensors[i].positions.size() != 2 * rows)
+                    throw std::invalid_argument("Image patches do not match the prompt");
+            } else if (i >= audio_tensors.size() || audio_tensors[i].size() != rows * _vlm_cfg.audio_cfg->samples_per_token) {
+                throw std::invalid_argument("Audio frames do not match the prompt");
+            }
+        }
+    }
+
     uint16_t stable_prefix_token_count = 0;
     const auto& messages = chat.get_messages();
     const auto& layer_types = _vlm_cfg.lm_cfg.layer_types;
@@ -338,8 +348,8 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat) {
         std::move(input_token_ids),
         stable_prefix_token_count,
         std::move(image_tensors),
-        std::move(image_positions),
-        std::move(audio_tensors)
+        std::move(audio_tensors),
+        std::move(media_spans)
     };
 }
 

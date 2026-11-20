@@ -21,6 +21,7 @@
 
 #include "base_model.hpp"
 #include "eagle_helpers.hpp"
+#include "media_span.hpp"
 #include "rope_utils.hpp"
 #include "text_streamer.hpp"
 
@@ -47,8 +48,9 @@ using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
 class LanguageModel : public BaseModel<VlmConfig> {
     public:
-        // Project media in [begin, end) into slices whose row zero corresponds to begin.
-        using MediaLoader = std::function<void(uint16_t, uint16_t, const MLABufferSlice&, const MLABufferSlice*)>;
+        // Project the attachment starting at source_row into the supplied embedding rows.
+        using MediaLoader = std::function<void(const MediaSpan&, uint16_t source_row,
+                                               const MLABufferSlice&, const MLABufferSlice*)>;
         // Existing disk-loading overload; preserves source compatibility.
         LanguageModel(
             std::filesystem::path model_path,
@@ -70,6 +72,10 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
+        );
+        // Use the ordered, validated spans from the same PreprocessedChat.
+        std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
+            std::span<const uint32_t> input_token_ids, std::vector<MediaSpan> media_spans
         );
         std::optional<std::vector<uint32_t>> run_model(
             std::span<const uint32_t> input_token_ids,
@@ -302,14 +308,14 @@ class LanguageModel : public BaseModel<VlmConfig> {
 
     private:
         std::vector<bool> _suppressed_tokens;
-        std::vector<std::pair<uint16_t, uint16_t>> _image_spans;
+        std::vector<MediaSpan> _media_spans;
         std::vector<std::pair<uint16_t, uint16_t>> _image_windows;
         std::unique_ptr<MLABuffer> _image_hidden;
         std::unique_ptr<MLABuffer> _image_queries;
         std::unique_ptr<MLABuffer> _image_global_masks;
         std::unique_ptr<MLABuffer> _image_sliding_masks;
         uint16_t _image_scratch_rows = 0;
-        void _prepare_image_windows(uint16_t prompt_length);
+        uint16_t _prepare_image_windows(uint16_t prompt_length);
         void _upload_image_attention_masks(uint16_t begin, uint16_t valid_end, uint16_t slot);
         uint32_t _run_image_window(uint16_t begin, uint16_t end, uint16_t prompt_length);
         void _prepare_unified_input(std::span<const uint32_t> ids, uint16_t begin, uint16_t end,

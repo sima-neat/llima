@@ -45,6 +45,10 @@ ImageProcessor::ImageProcessor(
 
 
 std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const std::filesystem::path image_path) {
+    return preprocess_with_positions(image_path).patches;
+}
+
+PreprocessedImage ImageProcessor::preprocess_with_positions(const std::filesystem::path& image_path) {
     if (_vlm_cfg.model_type == "vlm-gemma4_unified" && image_path.extension() == ".bin") {
         throw std::invalid_argument("Gemma 4 Unified requires RGB images to derive patch positions; raw .bin inputs are unsupported");
     }
@@ -55,7 +59,7 @@ std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const std::filesystem::p
         std::ifstream ifs(image_path, std::ios::binary);
         ifs.read(reinterpret_cast<char*>(image.data()), file_size);
         ifs.close();
-        return image;
+        return {std::move(image), {}};
     } else {
         // Read image from file.
         auto image = cv::imread(image_path, cv::IMREAD_COLOR);
@@ -70,6 +74,10 @@ std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const std::filesystem::p
 
 
 std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const std::vector<uint8_t>& image_bytes) {
+    return preprocess_with_positions(image_bytes).patches;
+}
+
+PreprocessedImage ImageProcessor::preprocess_with_positions(const std::vector<uint8_t>& image_bytes) {
     // Decode the image from bytes.
     auto image = cv::imdecode(image_bytes, cv::IMREAD_COLOR);
 
@@ -82,6 +90,10 @@ std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const std::vector<uint8_
 
 
 std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const cv::Mat& rgb_image) {
+    return preprocess_with_positions(rgb_image).patches;
+}
+
+PreprocessedImage ImageProcessor::preprocess_with_positions(const cv::Mat& rgb_image) {
     if (rgb_image.type() != CV_8UC3) {
         throw std::runtime_error("ImageProcessor::preprocess requires CV_8UC3 RGB input");
     }
@@ -90,7 +102,7 @@ std::vector<Eigen::bfloat16> ImageProcessor::preprocess(const cv::Mat& rgb_image
 }
 
 
-std::vector<Eigen::bfloat16> ImageProcessor::_preprocess(cv::Mat image) {
+PreprocessedImage ImageProcessor::_preprocess(cv::Mat image) {
     if (_vlm_cfg.model_type == "vlm-gemma4_unified") return _preprocess_unified(image);
     if (_do_pad_to_square)
         image = _pad_to_square(image);
@@ -146,7 +158,7 @@ std::vector<Eigen::bfloat16> ImageProcessor::_preprocess(cv::Mat image) {
         ofs.write(reinterpret_cast<char*>(cast_image.data()), cast_image.size() * 2);
         ofs.close();
     }
-    return cast_image;
+    return {std::move(cast_image), {}};
 }
 
 // Match Torchvision's antialiased uint8 bicubic path, including rounding between
@@ -199,7 +211,7 @@ static cv::Mat resize_unified_image(const cv::Mat& image, int height, int width)
     return resize_axis(resize_axis(image, width, true), height, false);
 }
 
-std::vector<Eigen::bfloat16> ImageProcessor::_preprocess_unified(const cv::Mat& image) {
+PreprocessedImage ImageProcessor::_preprocess_unified(const cv::Mat& image) {
     if (image.empty()) throw std::invalid_argument("Cannot preprocess an empty image");
     const auto& vm = _vlm_cfg.vm_cfg.value();
     const uint32_t side = vm.spatial_patch_size * vm.spatial_merge_size;
@@ -217,20 +229,19 @@ std::vector<Eigen::bfloat16> ImageProcessor::_preprocess_unified(const cv::Mat& 
     if (height == side) width = std::min<uint32_t>(width, vm.max_soft_tokens * side);
     if (width == side) height = std::min<uint32_t>(height, vm.max_soft_tokens * side);
     const auto resized = resize_unified_image(source, height, width);
-    _image_positions.clear();
-    std::vector<Eigen::bfloat16> patches;
-    patches.reserve(static_cast<size_t>(height) * width * 3);
+    PreprocessedImage result;
+    result.patches.reserve(static_cast<size_t>(height) * width * 3);
     for (int row = 0; row < height; row += side) for (int col = 0; col < width; col += side) {
-        _image_positions.push_back(col / side);
-        _image_positions.push_back(row / side);
+        result.positions.push_back(col / side);
+        result.positions.push_back(row / side);
         for (uint32_t y = 0; y < side; ++y) for (uint32_t x = 0; x < side; ++x) {
             const auto pixel = resized.at<cv::Vec3b>(row + y, col + x);
             for (int channel = 0; channel < 3; ++channel) {
-                patches.emplace_back(static_cast<float>(pixel[channel]) * static_cast<float>(_rescale_factor));
+                result.patches.emplace_back(static_cast<float>(pixel[channel]) * static_cast<float>(_rescale_factor));
             }
         }
     }
-    return patches;
+    return result;
 }
 
 
