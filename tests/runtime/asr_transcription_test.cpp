@@ -3,6 +3,8 @@
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <vector>
 #include <stdexcept>
 #include <string>
 
@@ -59,8 +61,52 @@ int main() {
 
         simaai::llima::WhisperModel::TranscriptionResult result;
         {
-            simaai::llima::WhisperModel model(model_dir);
-            result = model.run_model(audio, "auto");
+            auto first = std::make_unique<simaai::llima::WhisperModel>(model_dir);
+            result = first->run_model(audio, "auto");
+            try {
+                first->run_model(audio, "invalid_language");
+                throw std::logic_error("Invalid ASR language was accepted");
+            } catch (const std::runtime_error&) {}
+            first->wait_for_streamer_completion();
+            if (first->run_model(audio, "auto").text != result.text)
+                throw std::runtime_error("ASR exception recovery changed transcription");
+            auto survivor = std::make_unique<simaai::llima::WhisperModel>(model_dir);
+            unsigned default_callbacks = 0;
+            std::string streamed, nested_transcript;
+            bool stream_ended = false;
+            first->set_text_callback([&](const std::string&, bool, bool) { ++default_callbacks; });
+            simaai::llima::TranscriptionOptions options;
+            options.language = "auto";
+            options.text_callback = [&](const std::string& chunk, bool done, bool) {
+                streamed += chunk;
+                stream_ended = done;
+            };
+            options.info_callback = [&](const std::string& key, double) {
+                // Keep later tokens queued until the first model releases the MLA transaction.
+                if (key == "ttft") nested_transcript = survivor->run_model(audio, "auto").text;
+            };
+            const auto transcription = first->run_model(audio, options);
+            if (default_callbacks || !stream_ended || streamed != result.text ||
+                transcription.text != streamed || nested_transcript != result.text)
+                throw std::runtime_error("ASR streaming and final transcripts differ");
+            first->run_model(audio, "auto");
+            if (!default_callbacks) throw std::runtime_error("ASR request callback leaked into defaults");
+            options.info_callback = [](const std::string& key, double) {
+                if (key == "ttft") throw std::runtime_error("Intentional ASR callback failure");
+            };
+            bool callback_failed = false;
+            try { first->run_model(audio, options); }
+            catch (const std::runtime_error&) { callback_failed = true; }
+            if (!callback_failed || first->run_model(audio, "auto").text != result.text)
+                throw std::runtime_error("ASR callback failure/recovery failed");
+            first->set_text_callback([](const std::string&, bool, bool) {});
+            std::vector<float> silence(16000);
+            const auto pcm = first->run_model_from_pcm(silence, 16000, "en");
+            first.reset();
+            if (survivor->run_model_from_pcm(silence, 16000, "en").text != pcm.text)
+                throw std::runtime_error("ASR PCM or shared-program lifetime changed transcription");
+            if (survivor->run_model(audio, "auto").text != result.text)
+                throw std::runtime_error("Releasing one ASR wrapper corrupted the survivor");
         }
 
         simaai::llima::disconnect();

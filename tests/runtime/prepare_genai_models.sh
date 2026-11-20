@@ -97,4 +97,9 @@ download_model \
   "${SIMA_TEST_LLIMA_REASONING_GEMMA_MODEL}" "devkit/vlm_config.json" \
   "${DEFAULT_REASONING_GEMMA_REVISION}"
 
+download_model "DFlash sessions" "simaai/Qwen3-4B-Autoround-DFlash-a16w4" "Qwen3-4B-Autoround-DFlash-a16w4" \
+  "models--simaai--Qwen3-4B-Autoround-Safetensors/devkit/vlm_config.json" "5aa886a457ce0ec501be6c254524860b6010808d"
+download_model "MTP sessions" "simaai/Gemma-4-E2B-it-TextOnly-GPTQ-MTP-a16w4" "Gemma-4-E2B-it-TextOnly-GPTQ-MTP-a16w4" \
+  "models--simaai--Gemma-4-E2B-it-TextOnly-GPTQ-Safetensors/devkit/vlm_config.json" "2c4df0a4e27275ef382b9ae4ec5004600d801b1a"
+
 echo "[runtime-models] ready under ${LLIMA_MODELS_PATH}"

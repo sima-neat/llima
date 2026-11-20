@@ -68,6 +68,8 @@ def _aggregate(records):
 def run_performance(lm, config):
     options = config.performance
     multimodal = options.dataset in IMAGE_DATASETS
+    # Buckets measure TTFT plus max_new_tokens decode steps. Dataset budgets include TTFT.
+    budget = config.max_new_tokens + (options.dataset is None)
     report = {"schema_version": 1, "status": "running", "requests": [], "summary": {},
               "settings": {**dataclasses.asdict(options), "max_num_tokens": config.max_num_tokens,
                            "max_new_tokens": config.max_new_tokens, "num_samples": config.limit,
@@ -89,6 +91,7 @@ def run_performance(lm, config):
     try:
         torch.set_num_threads(1)
         mode = None
+        legacy_ordinary = False
         if multimodal:
             from sima_lmm.mole.workloads import load_image_workload
 
@@ -121,7 +124,7 @@ def run_performance(lm, config):
             )
             if config.input_lengths is None:
                 data = {length: rows for length, rows in data.items()
-                        if length + config.max_new_tokens <= config.max_num_tokens}
+                        if length + budget <= config.max_num_tokens}
             samples = [{"id": f"bucket-{length}-{index}", "category": f"n{length}", "input_ids": tokens}
                        for length, rows in data.items() for index, tokens in enumerate(rows)]
             report["dataset"] = {"name": "lambada-buckets", "repository": "cimec/lambada"}
@@ -131,7 +134,7 @@ def run_performance(lm, config):
             report["selected_sample_ids"].append(sample["id"])
             try:
                 if multimodal:
-                    prepared.append((sample, None, config.max_new_tokens))
+                    prepared.append((sample, None))
                     continue
                 elif "input_ids" in sample:
                     tokens = sample["input_ids"]
@@ -142,13 +145,9 @@ def run_performance(lm, config):
                         raise ValueError("The selected tokenizer's chat template does not support tools")
                     tokens = lm.tokenizer.apply_chat_template(sample["messages"], tools=sample.get("tools"),
                         tokenize=True, add_generation_prompt=True, return_dict=False)
-                # Existing buckets measure TTFT plus max_new_tokens decode steps; dataset budgets
-                # count all generated tokens, including the first.
-                budget = config.max_new_tokens + (0 if options.dataset else 1)
-                context_tokens = len(tokens) + config.max_new_tokens
-                if not tokens or context_tokens > config.max_num_tokens:
+                if not tokens or len(tokens) + budget > config.max_num_tokens:
                     raise ValueError(f"Input {len(tokens)} + output {budget} exceeds context {config.max_num_tokens}; no truncation applied")
-                prepared.append((sample, tokens, budget))
+                prepared.append((sample, tokens))
             except Exception as exc:
                 report["requests"].append({"sample_id": sample["id"], "category": sample["category"],
                                            "status": "failed", "phase": "prepare", "error": str(exc)})
@@ -156,7 +155,7 @@ def run_performance(lm, config):
             raise ValueError("No valid performance requests were prepared")
         for phase in ("warmup", "measure"):
             selected = prepared[:1] if phase == "warmup" else prepared
-            for sample, tokens, budget in selected:
+            for sample, tokens in selected:
                 record = {"sample_id": sample["id"], "category": sample["category"],
                           "source": sample.get("source"),
                           "phase": phase,
@@ -174,14 +173,17 @@ def run_performance(lm, config):
                     else:
                         record["input_tokens"] = len(tokens)
                         context = torch.tensor([tokens], dtype=torch.int64)
-                        # Ordinary text profiling returns the first token plus decode steps.
-                        # The unmeasured warmup identifies the mode from its draft counter.
+                        # Older ordinary servers count TTFT outside the requested token limit.
+                        # The real warmup identifies their response format before measurement.
                         max_length = len(tokens) + (config.max_new_tokens if phase == "warmup"
-                                                   else budget - (mode == "ordinary"))
-                        max_length = min(max_length, config.max_num_tokens)
+                                                   else budget - legacy_ordinary)
                         durations = lm._zmq_infer(context, "generate_for_perf", max_num_tokens=max_length,
                             stop_token_ids=stops).cpu().tolist()[0]
                         metadata = lm.last_profile_data
+                        if phase == "warmup":
+                            legacy_ordinary = (metadata.get("result_type") != "token_durations"
+                                               and metadata.get("accepted_draft_tokens") is None)
+                            record["output_budget"] = max_length - len(tokens) + legacy_ordinary
                     count, accepted = metadata.get("generated_tokens"), metadata.get("accepted_draft_tokens")
                     if not durations or count != len(durations):
                         raise RuntimeError("Runtime must return one timing per generated token")
@@ -190,8 +192,6 @@ def run_performance(lm, config):
                     mode = "speculative" if accepted is not None else "ordinary"
                     report["settings"]["decoding"] = mode
                     record["decoding"] = mode
-                    if phase == "warmup" and not multimodal:
-                        record["output_budget"] = max_length - len(tokens) + (mode == "ordinary")
                     if count > record["output_budget"]:
                         raise RuntimeError("Runtime returned more tokens than the requested output budget")
                     decode_time = sum(durations[1:])

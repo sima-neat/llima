@@ -77,7 +77,7 @@ from a model name.
 
 ## Runtime Contract
 
-Audit `sima_lmm/devkit/cpp/vlm_config.hpp` and `language_model.*` for:
+Audit `runtime/include/sima_lmm/vlm_config.hpp` and `language_model.*` for:
 
 - generated part names and group/single selection;
 - state allocation, update, rollover, reset, and prefill/decode transition;

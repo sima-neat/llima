@@ -7,8 +7,8 @@
 | Graphs, quantization, model parts | `sima_lmm/model/` |
 | Host preprocessing | `sima_lmm/preproc/` |
 | Compile/deploy/benchmark/LoRA tools | `sima_lmm/host/` |
-| Python CLI orchestration/model management | `sima_lmm/devkit/` |
-| C++ runtime, tokenizer, MLA, CLI/HTTP/ZMQ, internal CLI binding | `sima_lmm/devkit/cpp/` |
+| Python CLI orchestration/model management | `runtime/devkit/` |
+| C++ runtime, tokenizer, MLA, CLI/HTTP/ZMQ, internal CLI binding | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` |
 | MoLE evaluation | `sima_lmm/mole/` |
 | Runtime/Debian packaging | `CMakeLists.txt`, `cmake/`, `build.sh` |
 | Wheel profiles | `pyproject.toml`, `pyproject_metadata.py`, `build_*package.sh`, `build_compiler_wheel.sh` |
@@ -20,7 +20,7 @@
 Whisper compilation is a repository-local exception:
 `scripts/gen_models--openai--whisper.py`,
 `sima_lmm/config/whisper_config.py`, and `sima_lmm/model/whisper_*.py`.
-Its runtime starts at `sima_lmm/devkit/cpp/whisper_*`; the script is not a
+Its runtime starts at `runtime/src/whisper_*.cpp`; the script is not a
 public `llima-compile` entry point.
 
 Use:

@@ -16,7 +16,7 @@ setup, graph development, validation commands, and contribution policy.
 
 1. Classify the primary surface:
    - compiler: `sima_lmm/config`, `hf`, `gguf`, `host`, `model`, `preproc`;
-   - runtime: `sima_lmm/devkit` and `sima_lmm/devkit/cpp`;
+   - runtime: `runtime/`;
    - evaluation: `sima_lmm/mole`;
    - packaging: `CMakeLists.txt`, `build*.sh`, `cmake`, `deps`, installers;
    - CI/tests: `.github/workflows`, `tools/ci`, `tests`; or

@@ -613,7 +613,7 @@ jobs:
           python3 -m json.tool _work/llima-install/llima-package-manifest.json >/dev/null
           dpkg-query -W sima-lmm-core sima-lmm-cli sima-lmm-dev
           llima --help >/dev/null
-          python3 -c 'import sima_lmm'
+          /usr/bin/python3 -I -c 'from sima_lmm.devkit.model_manager import resolve_target_and_draft_paths'
 
       - name: Extract packaged runtime tests
         run: |
