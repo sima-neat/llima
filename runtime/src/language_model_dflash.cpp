@@ -402,14 +402,15 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     performance_result->accepted_draft_tokens = 0;
   }
   const uint16_t max_length =
-      override_max_num_tokens.value_or(_run->max_num_tokens);
+      override_max_num_tokens.value_or(_run->limits().max_num_tokens);
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
   if (input_token_ids.empty() || input_token_ids.size() >= max_length ||
       input_token_ids.size() > _cfg.pipeline_cfg.max_num_tokens) {
+    _notify_cache_full();
     return std::nullopt;
   }
 
-  const auto cancelled = [this] { return _run->cancelled.load(std::memory_order_relaxed); };
+  const auto cancelled = [this] { return _run->cancelled(); };
   // A prior DFlash request may leave the verification model bound to its
   // accepted scratch tail. Prefill restores or clears the persistent state.
   _bind_dflash_linear_conv_state(0);
@@ -477,7 +478,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     performance_result->token_durations.push_back(first_duration);
     performance_result->generated_tokens = 1;
   }
-  bool stopped = _run->stop_token_ids.contains(anchor);
+  bool stopped = _run->limits().stop_token_ids.contains(anchor);
   bool cache_full = false;
   auto& scratch = _workspace->dflash;
   scratch.verify_input.resize(block_size);
@@ -511,7 +512,7 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     size_t produced = std::min<size_t>(
         emitted.size(), max_length - prompt_len - output.size());
     for (size_t index = 0; index < produced; ++index) {
-      if (_run->stop_token_ids.contains(emitted[index])) {
+      if (_run->limits().stop_token_ids.contains(emitted[index])) {
         produced = index + 1;
         stopped = true;
         break;

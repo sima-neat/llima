@@ -243,6 +243,15 @@ set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;run
 install(FILES file_provider_test.cpp file_provider_routing_test.cpp
     DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
 
+add_executable(sima_lmm_request_lifecycle_test request_lifecycle_test.cpp)
+target_include_directories(sima_lmm_request_lifecycle_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
+target_link_libraries(sima_lmm_request_lifecycle_test PRIVATE sima_lmm_runtime)
+set_target_properties(sima_lmm_request_lifecycle_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+add_test(NAME runtime.request_lifecycle COMMAND sima_lmm_request_lifecycle_test)
+set_tests_properties(runtime.request_lifecycle PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)
+install(TARGETS sima_lmm_request_lifecycle_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+install(FILES request_lifecycle_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
+
 add_executable(sima_lmm_session_generation_test session_generation_test.cpp)
 target_link_libraries(sima_lmm_session_generation_test PRIVATE sima_lmm_runtime)
 set_target_properties(sima_lmm_session_generation_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")

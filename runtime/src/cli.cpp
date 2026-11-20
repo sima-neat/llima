@@ -191,20 +191,13 @@ void CLI::run() {
                 continue;
             }
             std::cout << "Transcribed query: " << std::flush;
-            _whisper_model_ptr->set_text_callback(
-                [](const std::string& text, bool stream_end, bool) {
-                    std::cout << text << std::flush;
-                    if (stream_end)
-                        std::cout << std::endl;
-                }
-            );
-            struct WhisperTextCallbackGuard {
-                WhisperModel* model;
-                ~WhisperTextCallbackGuard() {
-                    model->set_text_callback([](const std::string&, bool, bool) {});
-                }
-            } callback_guard{_whisper_model_ptr.get()};
-            auto result = _whisper_model_ptr->run_model(audio_file_name, language);
+            TranscriptionOptions options;
+            options.language = language;
+            options.text_callback = [](const std::string& text, bool stream_end, bool) {
+                std::cout << text << std::flush;
+                if (stream_end) std::cout << std::endl;
+            };
+            auto result = _whisper_model_ptr->run_model(audio_file_name, options);
             chat.add_query(result.text);
         } else {
             std::cout << "Query: " << command << std::endl;
@@ -227,41 +220,31 @@ void CLI::run() {
             std::cout << std::flush;
         };
 
-        _vision_language_model_ptr->set_text_callback(
-            [&](const std::string& text, bool stream_end, bool from_draft) {
-                for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
-                    if (event.reasoning) {
-                        if (!saw_reasoning) {
-                            std::cout << "Thinking:\n";
-                            saw_reasoning = true;
-                        }
-                        print_text(event.text, event.from_draft);
-                        continue;
+        GenerationOptions options;
+        options.text_callback = [&](const std::string& text, bool stream_end, bool from_draft) {
+            for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
+                if (event.reasoning) {
+                    if (!saw_reasoning) {
+                        std::cout << "Thinking:\n";
+                        saw_reasoning = true;
                     }
-
-                    if (!saw_content) {
-                        std::cout << (saw_reasoning ? "\nAnswer:\n" : "Assistant: ");
-                        saw_content = true;
-                    }
-                    final_response += event.text;
                     print_text(event.text, event.from_draft);
+                    continue;
                 }
-                if (stream_end) {
-                    if (!saw_reasoning && !saw_content) std::cout << "Assistant: ";
-                    std::cout << std::endl;
-                }
-            }
-        );
-        struct TextCallbackGuard {
-            VisionLanguageModel* model;
-            ~TextCallbackGuard() {
-                model->set_text_callback([](const std::string&, bool, bool) {});
-            }
-        } callback_guard{_vision_language_model_ptr.get()};
 
-        // run_model dispatches to speculative decoding internally when a
-        // draft VLM was registered at construction time.
-        auto response = _vision_language_model_ptr->run_model(chat);
+                if (!saw_content) {
+                    std::cout << (saw_reasoning ? "\nAnswer:\n" : "Assistant: ");
+                    saw_content = true;
+                }
+                final_response += event.text;
+                print_text(event.text, event.from_draft);
+            }
+            if (stream_end) {
+                if (!saw_reasoning && !saw_content) std::cout << "Assistant: ";
+                std::cout << std::endl;
+            }
+        };
+        auto response = _vision_language_model_ptr->run_model(chat, options);
         if (response.has_value()) {
             auto answer = trim(std::move(final_response));
             if (answer.empty()) {

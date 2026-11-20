@@ -80,6 +80,7 @@ const std::shared_ptr<RuntimeBufferImport>& import_buffer(MLABuffer* buffer) {
     if (found != state.imported_buffers.end()) return found->second;
 
     uint32_t id = 0;
+    // The driver holds its own dma_buf_get() reference until this import is released.
     const int rc = mla_import_dmabuf(
         require_handle(), buffer->get_dmabuf_fd(), MLA_BUF_IFM, &id, nullptr
     );

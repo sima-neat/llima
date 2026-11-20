@@ -153,27 +153,39 @@ void WEB::stop() {
 }
 
 
-void WEB::_stop_and_detach_vlm_thread() {
-    if (_vlm_thread.joinable()) {
-        _logger->info("Received stop from remote.");
-        _vision_language_model_ptr->stop_model();
-
-        // Wait for VLM to send STOP token and queue to drain
-        _vision_language_model_ptr->wait_for_streamer_completion();
-
-        _vlm_thread.detach();
-        _logger->info("VLM stopped.");
+std::stop_token WEB::_begin_chat() {
+    std::stop_source next;
+    auto token = next.get_token();
+    {
+        std::lock_guard lock(_stop_mutex);
+        _chat_stop.swap(next);
     }
+    next.request_stop();
+    return token;
+}
+
+void WEB::_stop_chat() {
+    std::stop_source current{std::nostopstate};
+    {
+        std::lock_guard lock(_stop_mutex);
+        current = _chat_stop;
+    }
+    current.request_stop();
+}
+
+ChatResult WEB::_run_chat(const Chat& chat, const GenerationOptions& options) {
+    std::lock_guard lock(_generation_mutex);
+    return _vision_language_model_ptr->generate(chat, options);
 }
 
 void WEB::_handle_stop(const httplib::Request& req, httplib::Response& res) {
     _set_cors_headers(res);
 
-    _stop_and_detach_vlm_thread();
+    _stop_chat();
 
     // Send response immediately
     res.status = 200;
-    _logger->info("VLM completed.");
+    _logger->info("Chat stop requested.");
 }
 
 void WEB::_set_cors_headers(httplib::Response& res) {
@@ -451,14 +463,14 @@ void WEB::_handle_chat_completions(
         }
         Chat chat = std::move(chat_opt.value());
 
-        // 2. Barge-in check
-        _stop_and_detach_vlm_thread();
+        // Register before a streaming response defers execution to its content provider.
+        auto stop = _begin_chat();
 
         // 3. Execution
         if (stream) {
-            _execute_streaming_chat(res, chat, model, protocol);
+            _execute_streaming_chat(res, chat, model, protocol, stop);
         } else {
-            _execute_normal_chat(res, chat, model, protocol);
+            _execute_normal_chat(res, chat, model, protocol, stop);
         }
     } catch (const std::exception& e) {
         _logger->error("Error in chat handler: {}", e.what());
@@ -487,7 +499,7 @@ void WEB::_handle_audio_transcriptions(
         }
 
         // Barge-in check
-        _stop_and_detach_vlm_thread();
+        _stop_chat();
 
         const auto file = req.get_file_value("file");
 
@@ -808,7 +820,7 @@ void WEB::_execute_streaming_chat(
     httplib::Response& res,
     Chat& chat,
     const std::string& model,
-    ChatProtocol protocol
+    ChatProtocol protocol, std::stop_token stop
 ) {
     const bool is_openai = protocol == ChatProtocol::OpenAI;
     res.set_header("Content-Type", is_openai ? "text/event-stream" : "application/x-ndjson");
@@ -817,7 +829,7 @@ void WEB::_execute_streaming_chat(
 
     res.set_chunked_content_provider(
         is_openai ? "text/event-stream" : "application/x-ndjson",
-        [this, chat, model, protocol](size_t offset, httplib::DataSink &sink) {
+        [this, chat, model, protocol, stop](size_t offset, httplib::DataSink &sink) {
             (void)offset;
             const bool is_openai = protocol == ChatProtocol::OpenAI;
             const auto created = std::time(nullptr);
@@ -932,58 +944,44 @@ void WEB::_execute_streaming_chat(
                 }
             };
 
-            // Info callback handles timing/status information
-            auto info_callback = [&](const std::string& metric_type, double metric_value) {
-                // Store TTFT metric
-                if (metric_type == "ttft") {
-                    ttft_value = metric_value;
-                    return;
-                }
+            auto info_callback = [&](const std::string& metric, double value) {
+                if (metric == "ttft") ttft_value = value;
+                if (metric == "tps") tps_value = value;
+            };
 
-                // Store TPS metric
-                if (metric_type == "tps") {
-                    tps_value = metric_value;
-                    return;
-                }
-
-                // Handle END and FULL signals (metric_value is 0.0 for these)
-                if (metric_type == "END" || metric_type == "FULL") {
-                    const std::string default_finish_reason =
-                        (metric_type == "FULL") ? "length" : "stop";
-
-                    if (has_tools) handle_tool_parser_events(tool_parser.add("", true));
-                    const std::string finish_reason =
-                        saw_tool_calls ? "tool_calls" : default_finish_reason;
-                    if (is_openai) {
-                        send_openai_initial();
-                        auto formatted_chunk = _format_openai_sse_chunk(
-                            "", model, completion_id, created, true, finish_reason
-                        ) + "data: [DONE]\n\n";
-                        sink.write(formatted_chunk.data(), formatted_chunk.size());
-                    } else {
-                        nlohmann::json final_obj = {
-                            {"model", model},
-                            {"created_at", get_iso_timestamp()},
-                            {"done", true},
-                            {"finish_reason", finish_reason},
+            auto send_completion = [&](ChatResult::Finish finish) {
+                if (has_tools) handle_tool_parser_events(tool_parser.add("", true));
+                const std::string finish_reason =
+                    saw_tool_calls ? "tool_calls" : (finish == ChatResult::Finish::Length ? "length" : "stop");
+                if (is_openai) {
+                    send_openai_initial();
+                    auto formatted_chunk = _format_openai_sse_chunk(
+                        "", model, completion_id, created, true, finish_reason
+                    ) + "data: [DONE]\n\n";
+                    sink.write(formatted_chunk.data(), formatted_chunk.size());
+                } else {
+                    nlohmann::json final_obj = {
+                        {"model", model},
+                        {"created_at", get_iso_timestamp()},
+                        {"done", true},
+                        {"finish_reason", finish_reason},
+                    };
+                    if (ttft_value.has_value()) final_obj["ttft"] = *ttft_value;
+                    if (tps_value.has_value()) final_obj["tps"] = *tps_value;
+                    if (protocol == ChatProtocol::OllamaChat) {
+                        nlohmann::json message = {
+                            {"role", "assistant"}, {"content", ""}
                         };
-                        if (ttft_value.has_value()) final_obj["ttft"] = *ttft_value;
-                        if (tps_value.has_value()) final_obj["tps"] = *tps_value;
-                        if (protocol == ChatProtocol::OllamaChat) {
-                            nlohmann::json message = {
-                                {"role", "assistant"}, {"content", ""}
-                            };
-                            if (!pending_ollama_tool_calls.is_null()) {
-                                message["tool_calls"] =
-                                    openai_tool_calls_to_ollama(pending_ollama_tool_calls);
-                            }
-                            final_obj["message"] = std::move(message);
-                        } else {
-                            final_obj["response"] = "";
+                        if (!pending_ollama_tool_calls.is_null()) {
+                            message["tool_calls"] =
+                                openai_tool_calls_to_ollama(pending_ollama_tool_calls);
                         }
-                        auto formatted_chunk = final_obj.dump() + "\n";
-                        sink.write(formatted_chunk.data(), formatted_chunk.size());
+                        final_obj["message"] = std::move(message);
+                    } else {
+                        final_obj["response"] = "";
                     }
+                    auto formatted_chunk = final_obj.dump() + "\n";
+                    sink.write(formatted_chunk.data(), formatted_chunk.size());
                 }
             };
 
@@ -1009,14 +1007,13 @@ void WEB::_execute_streaming_chat(
             GenerationOptions options;
             options.info_callback = info_callback;
             options.text_callback = text_callback;
-            // Create thread and track it for /stop endpoint.
-            _vlm_thread = std::jthread([this, chat, options]() {
-                _vision_language_model_ptr->run_model(chat, options);
-            });
-
-            // Wait for completion
-            _vlm_thread.join();
-
+            options.stop = stop;
+            try {
+                send_completion(_run_chat(chat, options).finish);
+            } catch (const std::exception& error) {
+                _logger->error("Streaming chat failed: {}", error.what());
+                return false;
+            }
             sink.done();
             return true;
         }
@@ -1060,7 +1057,7 @@ void WEB::_execute_normal_chat(
     httplib::Response& res,
     Chat& chat,
     const std::string& model,
-    ChatProtocol protocol
+    ChatProtocol protocol, std::stop_token stop
 ) {
     std::string reasoning_response;
     std::string full_response;
@@ -1090,11 +1087,9 @@ void WEB::_execute_normal_chat(
     GenerationOptions options;
     options.info_callback = info_callback;
     options.text_callback = text_callback;
-    // Run in thread for consistency with barge-in logic.
-    _vlm_thread = std::jthread([this, chat, options]() {
-        _vision_language_model_ptr->run_model(chat, options);
-    });
-    _vlm_thread.join();
+    options.stop = stop;
+    if (_run_chat(chat, options).finish == ChatResult::Finish::Length)
+        finish_reason = "length";
 
     nlohmann::json tool_calls = nullptr;
     if (chat.has_tools()) {
@@ -1170,9 +1165,10 @@ void WEB::_handle_set_lora(const httplib::Request& req, httplib::Response& res) 
         return;
     }
 
-    _stop_and_detach_vlm_thread();
+    _stop_chat();
 
     try {
+        std::lock_guard lock(_generation_mutex);
         _vision_language_model_ptr->set_reloc(json_data["name"]);
         res.status = 200;
         _logger->info("Set LoRA weights completed.");
@@ -1188,7 +1184,8 @@ void WEB::_handle_set_lora(const httplib::Request& req, httplib::Response& res) 
 void WEB::_handle_unset_lora(const httplib::Request& req, httplib::Response& res) {
     _set_cors_headers(res);
 
-    _stop_and_detach_vlm_thread();
+    _stop_chat();
+    std::lock_guard lock(_generation_mutex);
     _vision_language_model_ptr->unset_reloc();
 
     // Send response immediately

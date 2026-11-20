@@ -61,6 +61,14 @@ class TextStreamer {
             std::optional<TextCallback> text;
         };
 
+        using PreservedTokens = std::vector<std::pair<uint32_t, std::string>>;
+        struct RequestOptions {
+            CallbackOverrides callbacks;
+            std::optional<PreservedTokens> preserved_tokens;
+            std::optional<bool> performance_summary;
+            bool streaming = true;
+        };
+
         TextStreamer(
             Tokenizer* tokenizer_ptr,
             std::optional<InfoCallback> info_callback = std::nullopt,
@@ -70,6 +78,7 @@ class TextStreamer {
 
         void begin();
         void begin(CallbackOverrides callbacks);
+        void begin_request(RequestOptions options);
         void finish();
         void push(DecodeCallbackData data);
         void push(DecodeCallbackType type, uint32_t token_id, double duration) {
@@ -122,8 +131,8 @@ class TextStreamer {
             bool tool_call = false;
             bool performance_summary = true;
         };
-        void _begin_locked(CallbackOverrides callbacks = {});
-        void _snapshot_settings_locked();
+        void _begin_locked(RequestOptions options);
+        void _wait_for_completion(bool owner);
         // Direct put/end callers are synchronous and use the current defaults.
         const Settings& _settings() const { return _is_streaming ? _request : _defaults; }
         void _on_finalized_text(const std::string& text, bool stream_end = false);
@@ -158,8 +167,8 @@ class TextStreamer {
 
         Settings _defaults;
         Settings _request;
-        CallbackOverrides _pending_callbacks;
-        bool _settings_pending = false;
+        bool _explicit_request = false;
+        bool _muted = false;
         std::atomic<bool> _is_streaming = false;
         std::jthread _pop_thread;
 

@@ -58,81 +58,75 @@ TextStreamer::~TextStreamer() {
     if (_pop_thread.joinable()) _pop_thread.join();
 }
 
-void TextStreamer::_begin_locked(CallbackOverrides callbacks) {
-    _pending_callbacks = std::move(callbacks);
-    _settings_pending = true;
-    _callback_error = nullptr;
-    _completion_queued = false;
-    _is_streaming.store(true);
+void TextStreamer::_begin_locked(RequestOptions options) {
+    auto& cb = options.callbacks;
+    const bool preserve = options.preserved_tokens ? !options.preserved_tokens->empty() : _defaults.tool_call;
+    _request = {
+        cb.info ? std::move(*cb.info) : _defaults.info,
+        cb.text ? std::move(*cb.text) : _defaults.text,
+        options.preserved_tokens ? std::move(*options.preserved_tokens) : _defaults.preserved_tokens,
+        preserve, options.performance_summary.value_or(_defaults.performance_summary)
+    };
+    _muted = !options.streaming || !_is_enabled;
+    _completion_queued = _muted;
+    _is_streaming.store(!_muted);
 }
 
-void TextStreamer::_snapshot_settings_locked() {
-    if (!_settings_pending) return;
-    try {
-        // Prompt preprocessing may update tool markers after begin().
-        auto callbacks = std::move(_pending_callbacks);
-        _request = {
-            callbacks.info ? std::move(*callbacks.info) : _defaults.info,
-            callbacks.text ? std::move(*callbacks.text) : _defaults.text,
-            _defaults.preserved_tokens, _defaults.tool_call, _defaults.performance_summary
-        };
-        _settings_pending = false;
-    } catch (...) {
-        _callback_error = std::current_exception();
-        _completion_queued = true;
-        _is_streaming.store(false);
-        _is_streaming.notify_all();
-        throw;
-    }
-}
-
-void TextStreamer::begin() {
-    begin({});
-}
+void TextStreamer::begin() { begin_request({}); }
 
 void TextStreamer::begin(CallbackOverrides callbacks) {
+    begin_request({std::move(callbacks)});
+}
+
+void TextStreamer::begin_request(RequestOptions options) {
     std::lock_guard lock(_mutex);
-    if (!_is_enabled) { _callback_error = nullptr; return; }
-    if (_is_streaming)
+    if (_explicit_request || _is_streaming)
         throw std::logic_error("Text streaming is already active");
-    _begin_locked(std::move(callbacks));
+    if (_callback_error)
+        std::rethrow_exception(std::exchange(_callback_error, {}));
+    _begin_locked(std::move(options));
+    _explicit_request = true;
 }
 
 void TextStreamer::finish() {
-    if (!_is_enabled) return;
     {
         std::lock_guard lock(_mutex);
         if (!_completion_queued) {
-            _snapshot_settings_locked();
-            _completion_queued = true;
             _queue.push({DecodeCallbackType::STOP, 0, 0});
+            _completion_queued = true;
             _cv.notify_one();
         }
     }
-    wait_streaming();
+    _wait_for_completion(true);
 }
 
-void TextStreamer::wait_streaming() {
+void TextStreamer::wait_streaming() { _wait_for_completion(false); }
+
+void TextStreamer::_wait_for_completion(bool owner) {
     _is_streaming.wait(true);
     Settings completed;
     std::exception_ptr error;
     {
         std::lock_guard lock(_mutex);
-        if (!_is_streaming) completed = std::move(_request);
-        error = _callback_error;
+        // An observer must not take the owning request's callback exception.
+        if (_is_streaming || (_explicit_request && !owner)) return;
+        completed = std::move(_request);
+        error = std::exchange(_callback_error, {});
+        _explicit_request = false;
+        _muted = false;
     }
-    // Release request captures on the waiting thread, outside the queue mutex.
     if (error) std::rethrow_exception(error);
 }
 
 void TextStreamer::push(DecodeCallbackData data) {
-    if (!_is_enabled)
-        return;
-
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (_callback_error) std::rethrow_exception(_callback_error);
-    if (!_is_streaming) _begin_locked();
-    _snapshot_settings_locked();
+    if (!_is_enabled) return;
+    std::lock_guard lock(_mutex);
+    if (_muted) return;
+    if (_callback_error) std::rethrow_exception(std::exchange(_callback_error, {}));
+    if (!_is_streaming) {
+        if (_explicit_request) return;
+        _begin_locked({});
+    }
     if (data.type == DecodeCallbackType::STOP || data.type == DecodeCallbackType::CACHE_FULL) {
         _completion_queued = true;
     } else if (data.type == DecodeCallbackType::TTFT) {

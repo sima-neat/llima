@@ -14,22 +14,28 @@ void LanguageSession::init_layout(const LanguageSession& prototype) {
 }
 
 void LanguageSession::allocate(const LanguageResources& resources) {
-    if (!buffers.empty())
-        return;
-    // Allocate into a temporary owner: an allocation failure leaves this session retryable.
-    std::map<std::string, MLABuffer> created;
-    for (const auto& [name, spec] : resources.session_layout) {
-        auto [it, inserted] =
-            created.try_emplace(name, name, spec.shape, spec.dtype, spec.align_last_dim);
-        it->second.allocate();
-        it->second.clear();
+    if (buffers_allocated) return;
+    // Descriptors can already be bound to compiled stages. Keep their addresses
+    // stable even when rolling back a partial allocation.
+    for (const auto& [name, spec] : resources.session_layout)
+        buffers.try_emplace(name, name, spec.shape, spec.dtype, spec.align_last_dim);
+    try {
+        for (auto& [name, buffer] : buffers) {
+            buffer.allocate();
+            buffer.clear();
+        }
+    } catch (...) {
+        for (auto& [name, buffer] : buffers) buffer.free();
+        throw;
     }
-    buffers.swap(created);
+    buffers_allocated = true;
+    publish_memory_bytes();
 }
 
 void LanguageSession::reset() {
-    for (auto& [name, buffer] : buffers)
-        buffer.clear();
+    if (buffers_allocated) {
+        for (auto& [name, buffer] : buffers) buffer.clear();
+    }
     invalidate_reuse();
     image_identity.clear();
     if (draft)
@@ -53,7 +59,8 @@ SessionManager::SessionManager() {
     _sessions.emplace(0, std::make_shared<LanguageSession>());
 }
 
-const std::shared_ptr<LanguageSession>& SessionManager::get(SessionId id) const {
+std::shared_ptr<LanguageSession> SessionManager::get(SessionId id) const {
+    std::lock_guard lock(_mutex);
     const auto found = _sessions.find(id);
     if (found == _sessions.end())
         throw std::invalid_argument("Unknown language session");
@@ -61,6 +68,7 @@ const std::shared_ptr<LanguageSession>& SessionManager::get(SessionId id) const 
 }
 
 SessionId SessionManager::create(const LanguageSession& prototype) {
+    std::lock_guard lock(_mutex);
     if (_sessions.size() >= _limit)
         throw std::runtime_error("Language session limit reached");
     auto session = std::make_shared<LanguageSession>();
@@ -76,11 +84,12 @@ void SessionManager::release(SessionId id) {
         throw std::invalid_argument("The default session cannot be released");
     if (id == active)
         throw std::logic_error("Select another session before releasing the active session");
-    get(id);
-    _sessions.erase(id);
+    std::lock_guard lock(_mutex);
+    if (!_sessions.erase(id)) throw std::invalid_argument("Unknown language session");
 }
 
 std::vector<SessionId> SessionManager::ids() const {
+    std::lock_guard lock(_mutex);
     std::vector<SessionId> result;
     for (const auto& [id, session] : _sessions)
         result.push_back(id);
@@ -88,13 +97,14 @@ std::vector<SessionId> SessionManager::ids() const {
 }
 
 void SessionManager::set_limit(size_t limit) {
+    std::lock_guard lock(_mutex);
     if (limit < _sessions.size())
         throw std::invalid_argument("Session limit is smaller than the live session count");
     _limit = limit;
 }
 
 SessionId LanguageModel::create_session() {
-    if (_run->is_running)
+    if (_run->active)
         throw std::logic_error("Cannot create a session during generation");
     return _sessions->create(*_sessions->get(0));
 }
@@ -105,7 +115,7 @@ void LanguageModel::select_session(SessionId id) {
 }
 
 void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft, bool bind_adapter) {
-    if (_run->is_running || (draft && draft->_run->is_running))
+    if (_run->active || (draft && draft->_run->active))
         throw std::logic_error("Cannot select a session during generation");
 
     const auto& target_session = _sessions->get(id);
@@ -116,7 +126,8 @@ void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft,
     }
 
     // Complete old submissions and allocate both sides before changing either workspace.
-    if (_session != target_session || (draft && draft->_session != draft_session)) {
+    if (_session != target_session || !target_session->buffers_allocated ||
+        (draft && (draft->_session != draft_session || !draft_session->buffers_allocated))) {
         MLAModelWithBuffer::run_queue();
         target_session->allocate(*_resources);
         if (draft)
@@ -127,7 +138,10 @@ void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft,
     _bind_session(target_session);
     if (draft) {
         draft->_bind_session(draft_session);
-        target_session->draft = std::move(draft_session);
+        if (target_session->draft != draft_session) {
+            target_session->draft = std::move(draft_session);
+            target_session->publish_memory_bytes();
+        }
     }
     _sessions->active = id;
 }
@@ -136,14 +150,12 @@ void LanguageModel::_bind_session(const std::shared_ptr<LanguageSession>& select
     if (_session == selected)
         return;
     for (auto& [name, slots] : _workspace->session_bindings) {
-        auto* buffer = selected ? &selected->buffers.at(name) : nullptr;
+        auto* buffer = &selected->buffers.at(name);
         for (auto* slot : slots)
             *slot = buffer;
     }
     _session = selected;
-    _workspace->dflash_resolved_prefix = 0;
-    _workspace->gemma4_mtp_prefill_hidden_state.reset();
-    _workspace->eagle3_tree_mask.reset();
+    _workspace->clear_session_scratch();
 }
 
 void LanguageModel::_detach_draft_sessions(LanguageModel* draft) {
@@ -151,8 +163,9 @@ void LanguageModel::_detach_draft_sessions(LanguageModel* draft) {
     for (auto id : _sessions->ids()) {
         auto& session = *_sessions->get(id);
         if (draft && session.draft && draft->_session == session.draft)
-            draft->_bind_session(nullptr);
+            draft->_bind_session(draft->_sessions->get(draft->active_session()));
         session.draft.reset();
+        session.publish_memory_bytes();
         session.invalidate_reuse();
     }
 }
@@ -160,19 +173,25 @@ void LanguageModel::_detach_draft_sessions(LanguageModel* draft) {
 void LanguageModel::_release_paired_session(SessionId id, LanguageModel* draft) {
     const auto& session = _sessions->get(id);
     if (id != 0 && draft && session->draft && draft->_session == session->draft)
-        draft->_bind_session(nullptr);
+        draft->_bind_session(draft->_sessions->get(draft->active_session()));
     release_session(id);
 }
 
-void LanguageModel::reset_session(SessionId id) {
-    if (_run->is_running)
+void LanguageModel::reset_session(SessionId id) { _reset_session(id, nullptr); }
+
+void LanguageModel::_reset_session(SessionId id, LanguageModel* draft) {
+    if (_run->active)
         throw std::logic_error("Cannot reset a session during generation");
     MLAModelWithBuffer::run_queue();
-    _sessions->get(id)->reset();
+    const auto& session = _sessions->get(id);
+    session->reset();
+    if (_session == session) _workspace->clear_session_scratch();
+    if (draft && session->draft && draft->_session == session->draft)
+        draft->_workspace->clear_session_scratch();
 }
 
 void LanguageModel::release_session(SessionId id) {
-    if (_run->is_running)
+    if (_run->active)
         throw std::logic_error("Cannot release a session during generation");
     if (_sessions->active == id && id != 0)
         select_session(0);
@@ -193,21 +212,22 @@ size_t LanguageModel::session_limit() const {
     return _sessions->limit();
 }
 
-size_t LanguageSession::memory_bytes() const {
+void LanguageSession::publish_memory_bytes() {
     size_t bytes = 0;
-    for (const auto& [name, buffer] : buffers)
-        bytes += buffer.get_allocation_size();
+    if (buffers_allocated) {
+        for (const auto& [name, buffer] : buffers) bytes += buffer.get_allocation_size();
+    }
     for (const auto& state : cached_states) {
         for (const auto& layer : state.checkpoints) {
             for (const auto& snapshot : layer)
                 bytes += snapshot.size();
         }
     }
-    return bytes + (draft ? draft->memory_bytes() : 0);
+    published_bytes.store(bytes + (draft ? draft->published_bytes.load() : 0));
 }
 
 size_t LanguageModel::session_memory_bytes(SessionId id) const {
-    return _sessions->get(id)->memory_bytes();
+    return _sessions->get(id)->published_bytes.load();
 }
 
 void LanguageModel::_init_session_layout() {

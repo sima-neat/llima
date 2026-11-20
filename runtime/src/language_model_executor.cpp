@@ -500,90 +500,96 @@ std::unique_lock<std::recursive_mutex> LanguageExecutor::lock_execution() {
 }
 
 LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft,
-                           TextStreamer::CallbackOverrides callbacks)
-    : _target(target), _draft(draft), _limit(target._run->max_num_tokens),
-      _stop_ids(target._run->stop_token_ids), _exceptions(std::uncaught_exceptions()),
-      _outer(!target._run->is_running.load(std::memory_order_relaxed)) {
-    if (!_outer)
-        return;
+                           TextStreamer::RequestOptions stream, std::stop_token stop,
+                           std::optional<std::set<uint32_t>> stop_ids)
+    : _target(target), _draft(draft),
+      _request{{stop_ids ? std::move(*stop_ids) : target._run->defaults.stop_token_ids,
+                target._run->defaults.max_num_tokens}, std::move(stop),
+               LanguageRequestState::Interrupt(target._run->interrupts), std::nullopt} {
+    if (target._run->active || (draft && draft->_run->active))
+        throw std::logic_error("Language model already has an active request");
     if (draft) {
+        _request.draft_interrupt.emplace(draft->_run->interrupts);
         target.attach_draft(*draft);
         if (!target._session->draft || draft->_session != target._session->draft) {
-            // Direct LanguageModel callers borrow the draft workspace for this request.
-            // The facade has already selected the pair while holding its runner locks.
             auto previous = draft->_session;
             target._select_request_sessions(target.active_session(), draft);
-            _previous_draft_session.emplace(std::move(previous));
+            _previous_draft_session = std::move(previous);
         }
     }
     try {
-        target._run->cancelled = false;
-        target._run->is_running = true;
-        if (draft) {
-            draft->_run->cancelled = false;
-            draft->_run->is_running = true;
-        }
-        target._run->text_streamer.begin(std::move(callbacks));
         auto execution = lock_execution();
         target.bind_session_adapter();
-        if (draft)
-            draft->bind_session_adapter();
+        if (draft) draft->bind_session_adapter();
+        target._run->text_streamer.begin_request(std::move(stream));
     } catch (...) {
-        target._run->is_running = false;
-        if (draft)
-            draft->_run->is_running = false;
-        try {
-            target._run->text_streamer.finish();
-        } catch (...) {
-        }
-        finish_sessions(false);
+        restore_draft();
         throw;
+    }
+    target._run->standalone_start = _request.target_interrupt.initial;
+    target._run->active = &_request;
+    if (draft) {
+        draft->_run->standalone_start = _request.draft_interrupt->initial;
+        draft->_run->active = &_request;
     }
 }
 
-void LanguageExecutor::Run::finish_sessions(bool failed) {
-    if (failed) MLAModelWithBuffer::discard_queue();
-    if (failed || _target._run->cancelled.load(std::memory_order_relaxed)) {
-        _target._session->invalidate_reuse();
-        if (_draft) _target._session->draft->invalidate_reuse();
+std::optional<std::vector<uint32_t>> LanguageExecutor::Run::generate(
+    std::span<const uint32_t> ids, std::optional<uint16_t> limit, std::optional<ChronoTimer> timer,
+    GenerationPerformanceResult* performance, uint16_t stable_prefix
+) {
+    if (cancelled()) {
+        if (performance) *performance = {};
+        return std::nullopt;
     }
-    if (!_previous_draft_session) return;
-    _draft->_bind_session(*_previous_draft_session);
-    _draft->bind_session_adapter();
-    _previous_draft_session.reset();
+    auto& max_tokens = _request.limits.max_num_tokens;
+    if (limit) max_tokens = std::min(*limit, _target._cfg.pipeline_cfg.max_num_tokens);
+    if (!_draft) return _target._run_model_ordinary(ids, timer, stable_prefix, performance);
+    const auto& spec = *_target._cfg.lm_cfg.speculative_decoding_cfg;
+    if (spec.is_gemma4_mtp())
+        return _target._run_model_gemma4_mtp(*_draft, ids, max_tokens, timer, performance);
+    if (spec.is_dflash())
+        return _target._run_model_dflash_speculative_decoding(*_draft, ids, max_tokens, timer,
+                                                              performance, stable_prefix);
+    return _target._run_model_eagle3_speculative_decoding(*_draft, ids, max_tokens, timer, performance);
+}
+
+void LanguageExecutor::Run::restore_draft() {
+    if (_previous_draft_session) {
+        _draft->_bind_session(_previous_draft_session);
+        _draft->bind_session_adapter();
+        _previous_draft_session.reset();
+    }
 }
 
 void LanguageExecutor::Run::complete() {
-    if (!_outer) return;
-    if (!_stream_finished) {
-        _stream_finished = true;
-        try {
-            _target._run->text_streamer.finish();
-        } catch (...) {
-            finish_sessions(true);
-            throw;
-        }
-    }
-    finish_sessions(std::uncaught_exceptions() > _exceptions);
+    _target._run->text_streamer.finish();
+    restore_draft();
+    _cancelled_at_finish = _request.cancelled();
+    _completed = true;
 }
 
 LanguageExecutor::Run::~Run() {
+    if (!_completed) {
+        MLAModelWithBuffer::discard_queue();
+        // Preserve the original exception while releasing request callbacks.
+        try { _target._run->text_streamer.finish(); } catch (...) {}
+    }
+    if (!_completed || _cancelled_at_finish) {
+        _target._session->invalidate_reuse();
+        if (_draft) _target._session->draft->invalidate_reuse();
+    }
     _target._workspace->capture_state_checkpoints = false;
     _target._workspace->rolling_checkpoint_slot = 0;
     _target._workspace->writable_checkpoint_slots = 0;
-    _target._run->max_num_tokens = _limit;
-    _target._run->stop_token_ids = std::move(_stop_ids);
-    if (_outer) {
-        try {
-            complete();
-        } catch (const std::exception& error) {
-            _target._logger->error("Request cleanup failed: {}", error.what());
-        } catch (...) {
-            // Cleanup must not replace an inference or callback exception.
-        }
-        _target._run->is_running = false;
-        if (_draft)
-            _draft->_run->is_running = false;
+    if (_draft) _target._session->draft->publish_memory_bytes();
+    _target._session->publish_memory_bytes();
+    _target._run->active = nullptr;
+    if (_draft) _draft->_run->active = nullptr;
+    try {
+        restore_draft();
+    } catch (const std::exception& error) {
+        _target._logger->error("Failed to restore draft adapter: {}", error.what());
     }
 }
 

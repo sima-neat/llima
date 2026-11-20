@@ -62,12 +62,7 @@ void LanguageModel::_initialize(bool defer_session_buffers) {
         for (auto& [name, buffer] : *buffers) buffer.try_allocate();
     }
 
-    if (!defer_session_buffers) {
-        for (auto& [name, buffer] : _session->buffers) {
-            buffer.allocate();
-            buffer.clear();
-        }
-    }
+    if (!defer_session_buffers) _session->allocate(*_resources);
 
     // Define and load the models in parallel.
     _define_models();
@@ -107,13 +102,6 @@ void LanguageModel::_initialize(bool defer_session_buffers) {
             );
         }
     }
-    if (defer_session_buffers) {
-        // Program definitions used the default session's descriptors to record their binding slots.
-        // The first request supplies the actual storage, including for the assistant's public session.
-        _bind_session(nullptr);
-        _sessions->get(0)->buffers.clear();
-    }
-
     _logger->info("Language model initialize completed");
 }
 

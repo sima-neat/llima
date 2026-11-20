@@ -8,7 +8,8 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <thread>
+#include <mutex>
+#include <stop_token>
 
 #include "chat.hpp"
 #include "utils.hpp"
@@ -43,7 +44,9 @@ class EXPORT WEB {
         void stop();
 
     private:
-        void _stop_and_detach_vlm_thread();  // Helper to stop and detach active VLM thread
+        std::stop_token _begin_chat();
+        void _stop_chat();
+        ChatResult _run_chat(const Chat& chat, const GenerationOptions& options);
         void _handle_stop(const httplib::Request& req, httplib::Response& res);
         void _handle_set_lora(const httplib::Request& req, httplib::Response& res);
         void _handle_unset_lora(const httplib::Request& req, httplib::Response& res);
@@ -112,14 +115,14 @@ class EXPORT WEB {
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            ChatProtocol protocol
+            ChatProtocol protocol, std::stop_token stop
         );
 
         void _execute_normal_chat(
             httplib::Response& res, 
             Chat& chat, 
             const std::string& model, 
-            ChatProtocol protocol
+            ChatProtocol protocol, std::stop_token stop
         );
         void _execute_streaming_audio_transcription(
             httplib::Response& res,
@@ -130,7 +133,9 @@ class EXPORT WEB {
         std::unique_ptr<VisionLanguageModel> _vision_language_draft_model_ptr;
         std::unique_ptr<WhisperModel> _whisper_model_ptr;
         bool _enable_thinking;
-        std::jthread _vlm_thread;
+        std::mutex _stop_mutex;
+        std::stop_source _chat_stop{std::nostopstate};
+        std::mutex _generation_mutex;  // Serialize generation with HTTP adapter changes.
 
         // HTTP server. For HTTPS, use SSLServer and define CPPHTTPLIB_OPENSSL_SUPPORT before
         // including the httplib.h header.

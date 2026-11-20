@@ -282,7 +282,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     std::vector<int32_t> position_ids
 ) {
     auto execution = LanguageExecutor::lock_execution();
-    if (_run->cancelled.load(std::memory_order_relaxed))
+    if (_run->cancelled())
         return {};
 
     const int num_cached_tokens = static_cast<int>(_workspace->eagle3_stable_kv);
@@ -447,7 +447,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
         auto it = std::find(capture_layers.begin(), capture_layers.end(), layer_idx);
         if (it != capture_layers.end()) {
             MLAModelWithBuffer::run_queue();
-            if (_run->cancelled.load(std::memory_order_relaxed))
+            if (_run->cancelled())
                 return result;
             const size_t cap_idx = std::distance(capture_layers.begin(), it);
             auto& buf = get_buffer(fmt::format("n{}_buffer1", num_tokens));
@@ -472,7 +472,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     );
 
     MLAModelWithBuffer::run_queue();
-    if (_run->cancelled.load(std::memory_order_relaxed))
+    if (_run->cancelled())
         return result;
     for (uint32_t s = 0; s < num_splits; ++s) {
         const std::string buf_name = (num_splits == 1)
@@ -523,7 +523,7 @@ LanguageModel::TreeDecodingResult LanguageModel::tree_decoding(
         std::move(tree_candidates),
         std::move(position_ids)
     );
-    if (_run->cancelled.load(std::memory_order_relaxed))
+    if (_run->cancelled())
         return {};
 
     // Gather target predictions for each candidate path. -1 entries
@@ -660,7 +660,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
     bool is_prefill
 ) {
     TopkGenerateResult result;
-    if (target_lm._run->cancelled.load(std::memory_order_relaxed))
+    if (target_lm._run->cancelled())
         return result;
 
     // total_tokens = target's speculative_budget - 1 (typically 15 from 16).
@@ -746,7 +746,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
                 /*num_cached_tokens=*/static_cast<int>(offset),
                 /*is_prefill=*/true
             );
-            if (target_lm._run->cancelled.load(std::memory_order_relaxed))
+            if (target_lm._run->cancelled())
                 return result;
             last_valid_in_chunk = valid;
         }
@@ -774,7 +774,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*num_cached_tokens=*/static_cast<int>(_workspace->eagle3_stable_kv),
             /*is_prefill=*/false
         );
-        if (target_lm._run->cancelled.load(std::memory_order_relaxed))
+        if (target_lm._run->cancelled())
             return result;
         hidden_states = std::move(draft_out.hidden_states);
         // Trim trailing bonus_token row (zero-FC slot, uninformative).
@@ -868,7 +868,7 @@ LanguageModel::TopkGenerateResult LanguageModel::topk_generate(
             /*num_cached_tokens=*/static_cast<int>(num_cached_tokens),
             /*is_prefill=*/false
         );
-        if (target_lm._run->cancelled.load(std::memory_order_relaxed))
+        if (target_lm._run->cancelled())
             return result;
         auto out_hidden = std::move(draft_out_d.hidden_states);
 
@@ -1213,7 +1213,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         // result.token is only meaningful at the LAST group; earlier ones get
         // overwritten by subsequent dispatches.
         result.token = run_model_once(num_tokens, offset, num_input_tokens, 0);
-        if (_run->cancelled.load(std::memory_order_relaxed))
+        if (_run->cancelled())
             return result;
 
         // Copy this group's captures into the accumulator before next dispatch.
@@ -1261,7 +1261,7 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
         *this, std::move(input_ids), std::move(hidden_states_concat),
         static_cast<int>(prefix_cached), /*is_prefill=*/true
     );
-    if (_run->cancelled.load(std::memory_order_relaxed))
+    if (_run->cancelled())
         return result;
     result.draft_tokens       = std::move(topk_result.draft_tokens);
     result.retrieve_indices   = std::move(topk_result.retrieve_indices);
@@ -1324,7 +1324,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
         draft_lm._session->cached_token_ids.clear();
         _session->cached_draft_tokens.clear();
         _session->cached_eagle3_prompt_len = 0;
-        _run->text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
+        _notify_cache_full();
         return std::nullopt;
     }
 
@@ -1340,7 +1340,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
     auto init = initialize_tree(
         draft_lm, input_ids, num_cached_tokens, timer_ttft.value()
     );
-    if (_run->cancelled.load(std::memory_order_relaxed)) {
+    if (_run->cancelled()) {
         _notify_interrupt();
         return std::nullopt;
     }
@@ -1388,7 +1388,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
         auto td = tree_decoding(
             draft_tokens, tree_position_ids, input_ids, retrieve_indices
         );
-        if (_run->cancelled.load(std::memory_order_relaxed))
+        if (_run->cancelled())
             break;
 
         // candidates[p][d] = draft_tokens[retrieve_indices[p][d]]; -1 entries
@@ -1446,7 +1446,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
                 td.hidden_states,
                 post.bonus_token
             );
-            if (_run->cancelled.load(std::memory_order_relaxed))
+            if (_run->cancelled())
                 break;
 
             // Sync target's stable_kv with draft's — same pattern as after
@@ -1506,7 +1506,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
         }
     }
 
-    if (_run->cancelled.load(std::memory_order_relaxed)) {
+    if (_run->cancelled()) {
         _notify_interrupt();
         return std::nullopt;
     }
@@ -1541,10 +1541,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
         draft_lm._session->cached_token_ids.clear();
         _session->cached_draft_tokens.clear();
         _session->cached_eagle3_prompt_len = 0;
+        _notify_cache_full();
+    } else {
+        _notify_stop();
     }
-    _run->text_streamer.push(
-        cache_full ? DecodeCallbackType::CACHE_FULL : DecodeCallbackType::STOP, 0, 0
-    );
 
     return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
 }

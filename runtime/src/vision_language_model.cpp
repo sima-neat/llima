@@ -30,12 +30,7 @@ struct LanguageRunnerState {
           _cfg(resources->cfg), _files(resources->files),
           vlm_helper(_cfg, *_files, std::move(system), std::move(chat_template)),
           text_streamer(vlm_helper.get_tokenizer(), std::nullopt, std::nullopt) {}
-    std::optional<std::vector<uint32_t>>
-    run_language_model(std::span<const uint32_t> input_token_ids,
-                       std::optional<uint16_t> max_num_tokens,
-                       std::optional<ChronoTimer> timer_ttft = std::nullopt,
-                       GenerationPerformanceResult* performance_result = nullptr,
-                       uint16_t stable_prefix_token_count = 0);
+    PreservedToolCallTokens structural_tokens(const Chat& chat);
     std::shared_ptr<ModelResources<VlmConfig>> resources;
     const VlmConfig& _cfg;
     const std::shared_ptr<FileProvider>& _files;
@@ -46,32 +41,34 @@ struct LanguageRunnerState {
     std::mutex run_mutex;
     mutable std::mutex defaults_mutex;
     std::shared_ptr<LanguageRunnerState> draft;
-    // Cancellation reads this lease without taking the request mutex.
-    std::atomic<std::shared_ptr<LanguageRunnerState>> active_draft;
 };
 
 // Locks and leases both workspaces before preparing prompt/image data.
 class VisionLanguageRequest {
   public:
     VisionLanguageRequest(std::shared_ptr<LanguageRunnerState> state, SessionId session,
-                          bool streaming = true, TextStreamer::CallbackOverrides callbacks = {});
-    ~VisionLanguageRequest();
+                          const GenerationOptions& options = {}, const Chat* chat = nullptr);
+    LanguageModel* draft() const { return _draft ? _draft->language_model_ptr.get() : nullptr; }
+    LanguageExecutor::Run& execution() { return *_execution; }
+    bool cancelled() const { return !_execution || _execution->cancelled(); }
+    bool length_limit_reached() const { return _execution && _execution->length_limit_reached(); }
     void clear_images();
-    void complete() { _execution->complete(); }
-    bool cancelled() const;
+    std::optional<std::vector<uint32_t>> finish(std::optional<std::vector<uint32_t>> ids) {
+        if (_execution) _execution->complete();
+        return cancelled() ? std::nullopt : std::move(ids);
+    }
+    PreservedToolCallTokens markers;
 
   private:
     std::shared_ptr<LanguageRunnerState> _target;
     std::shared_ptr<LanguageRunnerState> _draft;
     std::unique_lock<std::mutex> _target_lock;
     std::unique_lock<std::mutex> _draft_lock;
-    bool _restore_streaming;
     std::optional<LanguageExecutor::Run> _execution;
 };
 
-VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState> state,
-                                             SessionId session, bool streaming,
-                                             TextStreamer::CallbackOverrides callbacks)
+VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState> state, SessionId session,
+                                             const GenerationOptions& options, const Chat* chat)
     : _target(std::move(state)), _target_lock(_target->run_mutex, std::defer_lock) {
     for (;;) {
         _target_lock.lock();
@@ -86,38 +83,22 @@ VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState
         _draft_lock.unlock();
         _target_lock.unlock();
     }
-    _target->language_model_ptr->_select_request_sessions(
-        session, _draft ? _draft->language_model_ptr.get() : nullptr);
-    _restore_streaming = !streaming && _target->text_streamer.enabled();
-    if (_restore_streaming)
-        _target->text_streamer.disable();
-    _target->active_draft.store(_draft);
-    try {
-        _execution.emplace(*_target->language_model_ptr, _draft ? _draft->language_model_ptr.get() : nullptr,
-                           std::move(callbacks));
-    } catch (...) {
-        _target->active_draft.store(nullptr);
-        if (_restore_streaming)
-            _target->text_streamer.enable();
-        throw;
+    if (options.stop.stop_requested()) return;
+    _target->language_model_ptr->_select_request_sessions(session, draft());
+    if (chat) {
+        markers = _target->structural_tokens(*chat);
+        if (!options.preserve_structural_tokens) markers.clear();
     }
-}
-
-bool VisionLanguageRequest::cancelled() const {
-    return _target->language_model_ptr->_run->cancelled.load(std::memory_order_relaxed);
+    TextStreamer::RequestOptions stream{
+        {options.info_callback, options.text_callback}, markers, options.performance_summary, chat != nullptr};
+    _execution.emplace(*_target->language_model_ptr, draft(), std::move(stream), options.stop,
+                       options.stop_token_ids);
 }
 
 void VisionLanguageRequest::clear_images() {
     _target->language_model_ptr->set_image_identity({});
     if (_draft)
         _draft->language_model_ptr->set_image_identity({});
-}
-
-VisionLanguageRequest::~VisionLanguageRequest() {
-    _execution.reset();
-    _target->active_draft.store(nullptr);
-    if (_restore_streaming)
-        _target->text_streamer.enable();
 }
 
 namespace {
@@ -293,16 +274,36 @@ std::optional<std::string> VisionLanguageModel::run_model(
 std::optional<std::string> VisionLanguageModel::run_model(
     const Chat& chat, const GenerationOptions& options
 ) {
-    return run_model(0, chat, options);
+    return run_model(options.session, chat, options);
 }
 
 std::optional<std::string> VisionLanguageModel::run_model(
     SessionId session, const Chat& chat, const GenerationOptions& options
 ) {
-    VisionLanguageRequest request(_state, session, true, {options.info_callback, options.text_callback});
-    auto ids = generate_chat_tokens(request, chat, options);
+    VisionLanguageRequest request(_state, session, options, &chat);
+    auto ids = request.finish(generate_chat_tokens(request, chat, options, nullptr));
     if (!ids) return std::nullopt;
     return _state->vlm_helper.get_tokenizer()->decode(*ids, true);
+}
+
+ChatResult VisionLanguageModel::generate(const Chat& chat, const GenerationOptions& options) {
+    ChatResult result;
+    VisionLanguageRequest request(_state, options.session, options, &chat);
+    auto ids = request.finish(generate_chat_tokens(request, chat, options, &result.performance));
+    if (request.cancelled()) {
+        result.finish = ChatResult::Finish::Cancelled;
+        result.performance = {};
+        return result;
+    }
+    if (request.length_limit_reached() || !ids) result.finish = ChatResult::Finish::Length;
+    if (ids) {
+        result.token_ids = std::move(*ids);
+        result.performance.generated_tokens = result.token_ids.size();
+        auto& tokenizer = *_state->vlm_helper.get_tokenizer();
+        result.text = request.markers.empty() ? tokenizer.decode(result.token_ids, true)
+            : decode_tool_call_output(tokenizer, result.token_ids, request.markers);
+    }
+    return result;
 }
 
 const VlmConfig& VisionLanguageModel::config() const {
@@ -312,28 +313,20 @@ const VlmConfig& VisionLanguageModel::config() const {
 std::optional<std::vector<uint32_t>> VisionLanguageModel::benchmark_chat(
     const Chat& chat, const GenerationOptions& options, ChatBenchmark& benchmark
 ) {
-    VisionLanguageRequest request(_state, 0, true, {options.info_callback, options.text_callback});
-    return generate_chat_tokens(request, chat, options, &benchmark);
+    VisionLanguageRequest request(_state, options.session, options, &chat);
+    return request.finish(generate_chat_tokens(request, chat, options, benchmark.performance, &benchmark));
 }
 
-std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
-    VisionLanguageRequest& request, const Chat& chat, const GenerationOptions& options,
-    ChatBenchmark* benchmark
-) {
-    if (options.stop_token_ids) _state->language_model_ptr->set_stop_token_ids(options.stop_token_ids);
-    if (request.cancelled()) {
-        request.complete();
-        return std::nullopt;
-    }
-    std::vector<std::pair<uint32_t, std::string>> preserved_tokens;
-    auto* tokenizer = _state->vlm_helper.get_tokenizer();
+PreservedToolCallTokens LanguageRunnerState::structural_tokens(const Chat& chat) {
+    PreservedToolCallTokens preserved_tokens;
+    auto* tokenizer = vlm_helper.get_tokenizer();
     if (chat.has_tools()) {
-        preserved_tokens = resolve_tool_call_special_tokens(_state->tool_call_format, *tokenizer);
+        preserved_tokens = resolve_tool_call_special_tokens(tool_call_format, *tokenizer);
     }
-    const auto reasoning_format = reasoning_format_for_model(_state->_cfg.model_type);
+    const auto reasoning_format = reasoning_format_for_model(_cfg.model_type);
     if (chat.get_enable_thinking() && reasoning_format == ReasoningFormat::None) {
         throw std::invalid_argument(
-            "Thinking is not supported for model type '" + _state->_cfg.model_type + "'"
+            "Thinking is not supported for model type '" + _cfg.model_type + "'"
         );
     }
     // gpt_oss always emits harmony channel tokens; preserve them even with
@@ -351,12 +344,14 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
             }
         }
     }
-    const bool preserve_structural_tokens = !preserved_tokens.empty();
-    _state->text_streamer.set_preserved_token_ids(std::move(preserved_tokens));
-    // Keep the existing setter for ABI compatibility; it now gates all
-    // request-specific structural markers, not only tool-call markers.
-    _state->text_streamer.set_tool_call_enabled(preserve_structural_tokens);
-    
+    return preserved_tokens;
+}
+
+std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
+    VisionLanguageRequest& request, const Chat& chat, const GenerationOptions& options,
+    GenerationPerformanceResult* performance, ChatBenchmark* benchmark
+) {
+    if (request.cancelled()) return std::nullopt;
     ChronoTimer timer_ttft(true);
 
     // Preprocess the chat.
@@ -365,6 +360,17 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
         _state->resources->logger->info("Chat:\n{}", chat.get_messages().dump(4));
     const bool supplied_images = !options.images.empty() || !options.encoded_images.empty();
     auto preprocessed_data = _state->vlm_helper.preprocess(chat, !supplied_images);
+    const auto prompt_size = preprocessed_data.input_token_ids.size();
+    if (options.reject_oversized_prompt) {
+        const auto context_size = _state->_cfg.pipeline_cfg.max_num_tokens;
+        if (prompt_size >= context_size) {
+            throw std::length_error(fmt::format(
+                "Prompt uses {} tokens; model context is {}. Start a new conversation or shorten the input.",
+                prompt_size, context_size));
+        }
+        if (options.max_new_tokens && prompt_size + *options.max_new_tokens > UINT16_MAX)
+            throw std::length_error("Requested token budget exceeds the LLiMa token limit");
+    }
     if (supplied_images) {
         if (options.images.size() + options.encoded_images.size() != preprocessed_data.image_count)
             throw std::invalid_argument("Supplied image count must match the chat image placeholders");
@@ -380,8 +386,7 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
             throw std::invalid_argument("Image/text prompt plus output budget exceeds context; no truncation applied");
         // Each benchmark sample measures cold prefill for the selected target/draft pair.
         _state->language_model_ptr->invalidate_prompt_reuse();
-        if (auto draft = _state->active_draft.load())
-            draft->language_model_ptr->invalidate_prompt_reuse();
+        if (auto* draft = request.draft()) draft->invalidate_prompt_reuse();
         benchmark->input_tokens = input_tokens;
         benchmark->formatted_prompt = std::move(preprocessed_data.formatted_prompt);
         _state->resources->logger->info("Benchmark prompt: {} input tokens, {} images", input_tokens,
@@ -399,14 +404,10 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
         image_identity += image._data->identity;
     }
     _state->language_model_ptr->set_image_identity(image_identity);
-    if (auto draft = _state->active_draft.load())
-        draft->language_model_ptr->set_image_identity(std::move(image_identity));
+    if (auto* draft = request.draft()) draft->set_image_identity(std::move(image_identity));
     _state->resources->logger->info("Preprocess time: {:.2f}s", timer_preprocess.stop());
 
-    if (request.cancelled()) {
-        request.complete();
-        return std::nullopt;
-    }
+    if (request.cancelled()) return std::nullopt;
 
     // Create buffers for the input embeds and deepstack features (for qwen3) and ofm maps for
     // vision models.
@@ -418,22 +419,8 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
     // input embeddings for the language models.
     ChronoTimer timer_image_encode(true);
     for (size_t i = 0; i < preprocessed_data.image_tensors.size(); ++i) {
-        if (request.cancelled()) {
-            request.complete();
-            return std::nullopt;
-        }
+        if (request.cancelled()) return std::nullopt;
         _vision_model->run_model(preprocessed_data.image_tensors[i], &vision_ofm_maps[i]);
-        // Image rows come from DMA. A later CPU write to an adjacent text or encoded-image
-        // row must read the new edge cache line, especially for 16-byte embedding scales.
-        for (const auto& [port, slice] : vision_ofm_maps[i]) {
-            auto* buffer = slice.get_buf_ptr();
-            const auto begin = slice.get_byte_offset();
-            const auto size = buffer->get_buf_len(slice.get_buf_shapes());
-            if (size) {
-                buffer->invalidate_cache(begin, 1);
-                buffer->invalidate_cache(begin + size - 1, 1);
-            }
-        }
     }
     for (size_t i = 0; i < options.encoded_images.size(); ++i) {
         const auto& outputs = options.encoded_images[i]._data->outputs;
@@ -457,38 +444,8 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::generate_chat_tokens(
         max_num_tokens = std::min<size_t>(_state->_cfg.pipeline_cfg.max_num_tokens,
             preprocessed_data.input_token_ids.size() + *options.max_new_tokens);
 
-    auto output_token_ids = _state->run_language_model(
-        preprocessed_data.input_token_ids, max_num_tokens, timer_ttft,
-        benchmark ? benchmark->performance : nullptr, preprocessed_data.stable_prefix_token_count
-    );
-
-    request.complete();
-    if (request.cancelled()) return std::nullopt;
-    return output_token_ids;
-}
-
-
-std::optional<std::vector<uint32_t>> LanguageRunnerState::run_language_model(
-    std::span<const uint32_t> input_token_ids,
-    std::optional<uint16_t> max_num_tokens,
-    std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result,
-    uint16_t stable_prefix_token_count
-) {
-    if (!active_draft.load()) {
-        return language_model_ptr->run_model(
-            input_token_ids, timer_ttft, max_num_tokens, std::nullopt, stable_prefix_token_count, performance_result
-        );
-    }
-    if (!_cfg.lm_cfg.speculative_decoding_cfg.has_value()) {
-        throw std::runtime_error(
-            "Draft VLM is configured but target model lacks speculative decoding config"
-        );
-    }
-    return language_model_ptr->run_model_speculative_decoding(
-        *active_draft.load()->language_model_ptr, input_token_ids,
-        max_num_tokens, timer_ttft, performance_result, stable_prefix_token_count
-    );
+    return request.execution().generate(preprocessed_data.input_token_ids, max_num_tokens,
+        timer_ttft, performance, preprocessed_data.stable_prefix_token_count);
 }
 
 
@@ -498,12 +455,12 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids
 ) {
-    VisionLanguageRequest request(_state, session, false);
+    GenerationOptions options;
+    options.stop_token_ids = std::move(override_stop_token_ids);
+    VisionLanguageRequest request(_state, session, options);
     request.clear_images();
-    _state->text_streamer.set_tool_call_enabled(false);
-    _state->language_model_ptr->set_stop_token_ids(override_stop_token_ids);
     _state->language_model_ptr->create_input_buffers(input_token_ids);
-    auto output = _state->run_language_model(input_token_ids, override_max_num_tokens);
+    auto output = request.finish(request.execution().generate(input_token_ids, override_max_num_tokens, {}, nullptr, 0));
     return output.value_or(std::vector<uint32_t>());
 }
 
@@ -512,7 +469,7 @@ std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
     SessionId session,
     std::span<const uint32_t> input_token_ids
 ) {
-    VisionLanguageRequest request(_state, session, false);
+    VisionLanguageRequest request(_state, session);
     request.clear_images();
     _state->language_model_ptr->invalidate_prompt_reuse();
     std::vector<Eigen::bfloat16> logits;
@@ -520,6 +477,7 @@ std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
         if (request.cancelled()) throw std::runtime_error("Scoring request was interrupted");
         _state->language_model_ptr->run_model_once(1, i, 0, input_token_ids[i], &logits);
     }
+    request.execution().complete();
     return logits;
 }
 
@@ -531,11 +489,13 @@ LogLikelihoodResult VisionLanguageModel::run_model_for_loglikelihood(
     std::span<const uint32_t> continuation_token_ids,
     bool use_group_prefill
 ) {
-    VisionLanguageRequest request(_state, session, false);
+    VisionLanguageRequest request(_state, session);
     request.clear_images();
     _state->language_model_ptr->invalidate_prompt_reuse();
-    return _state->language_model_ptr->run_model_for_loglikelihood(
+    auto result = _state->language_model_ptr->_score(
         input_token_ids, continuation_start, continuation_token_ids, use_group_prefill);
+    request.execution().complete();
+    return result;
 }
 
 
@@ -545,25 +505,24 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     std::optional<uint16_t> override_max_num_tokens,
     std::optional<std::set<uint32_t>> override_stop_token_ids
 ) {
-    VisionLanguageRequest request(_state, session, false);
+    GenerationOptions options;
+    options.stop_token_ids = std::move(override_stop_token_ids);
+    VisionLanguageRequest request(_state, session, options);
     request.clear_images();
     _state->language_model_ptr->create_input_buffers(input_token_ids);
-    _state->language_model_ptr->set_stop_token_ids(override_stop_token_ids);
     GenerationPerformanceResult result;
-    auto output = _state->run_language_model(input_token_ids, override_max_num_tokens,
-                                             ChronoTimer(true), &result);
+    auto output = request.finish(request.execution().generate(input_token_ids, override_max_num_tokens,
+                                                              ChronoTimer(true), &result, 0));
     if (!output)
         throw std::runtime_error("Performance request was interrupted or has insufficient token capacity");
     _state->language_model_ptr->invalidate_prompt_reuse();
-    if (auto draft = _state->active_draft.load())
-        draft->language_model_ptr->invalidate_prompt_reuse();
+    if (auto* draft = request.draft()) draft->invalidate_prompt_reuse();
     return result;
 }
 
 
 void VisionLanguageModel::stop_model() {
     _state->language_model_ptr->stop_model();
-    if (auto draft = _state->active_draft.load()) draft->language_model_ptr->stop_model();
 }
 
 
@@ -600,7 +559,7 @@ void VisionLanguageModel::reset_session(SessionId id) {
     std::unique_lock<std::mutex> draft_lock;
     if (_state->draft)
         draft_lock = idle_lock(_state->draft->run_mutex);
-    _state->language_model_ptr->reset_session(id);
+    _state->language_model_ptr->_reset_session(id, _state->draft ? _state->draft->language_model_ptr.get() : nullptr);
 }
 
 void VisionLanguageModel::release_session(SessionId id) {
@@ -618,14 +577,12 @@ void VisionLanguageModel::set_session_limit(size_t limit) {
 }
 
 size_t VisionLanguageModel::session_memory_bytes(SessionId id) const {
-    auto lock = idle_lock(_state->run_mutex);
     return _state->language_model_ptr->session_memory_bytes(id);
 }
 size_t VisionLanguageModel::shared_resource_bytes() const {
     return _state->language_model_ptr->shared_resource_bytes();
 }
 size_t VisionLanguageModel::workspace_memory_bytes() const {
-    auto lock = idle_lock(_state->run_mutex);
     return _state->language_model_ptr->workspace_memory_bytes();
 }
 

@@ -234,7 +234,8 @@ int main(int argc, char** argv) {
             busy_rejected = busy([&] { first->reset_session(sa); })
                          && busy([&] { first->unset_reloc(sa); })
                          && busy([&] { first->set_reloc(sa, "unused"); })
-                         && busy([&] { first->workspace_memory_bytes(); });
+                         && first->workspace_memory_bytes() == workspace
+                         && first->session_memory_bytes(sa) > 0;
             first->stop_model();
         });
         auto cancel_chat = first->create_chat();
@@ -307,6 +308,47 @@ int main(int argc, char** argv) {
         require(!first->run_model(sa, option_chat, options),
                 "Cancellation from the terminal callback arrived after result assembly");
         require(completions == 1, "Streaming completion was delivered more than once");
+
+        std::stop_source retired;
+        options.stop = retired.get_token();
+        options.session = first->create_session();
+        options.max_new_tokens = 32;
+        options.stop_token_ids = std::set<uint32_t>{};
+        options.performance_summary = false;
+        options.preserve_structural_tokens = false;
+        options.info_callback.reset();
+        const auto reference = first->generate(option_chat, options);
+        require(reference.finish == ChatResult::Finish::Length && !reference.token_ids.empty(),
+                "Expected the token budget to end the request");
+        require(reference.text == helper.get_tokenizer()->decode(reference.token_ids, true)
+                    && reference.performance.generated_tokens == reference.token_ids.size(),
+                "ChatResult text or metrics disagree with its token IDs");
+        require(first->session_memory_bytes(options.session) > 0, "generate ignored options.session");
+
+        std::stop_source current;
+        options.stop = current.get_token();
+        options.info_callback = [&](const std::string& key, double) {
+            if (key == "ttft") retired.request_stop();
+        };
+        first->reset_session(options.session);
+        auto next = first->generate(option_chat, options);
+        require(retired.stop_requested() && next.finish == reference.finish && next.token_ids == reference.token_ids,
+                "Stopping a completed request interrupted the next request");
+
+        options.stop = retired.get_token();
+        options.info_callback = [](const std::string&, double) { throw std::runtime_error("Pre-cancel callback"); };
+        const auto skipped = first->generate(option_chat, options);
+        require(skipped.finish == ChatResult::Finish::Cancelled && skipped.token_ids.empty()
+                    && skipped.text.empty() && skipped.performance.generated_tokens == 0,
+                "An already-cancelled request generated output");
+        options.stop = current.get_token();
+        options.info_callback = [&](const std::string& key, double) {
+            if (key == "END" || key == "FULL") current.request_stop();
+        };
+        next = first->generate(option_chat, options);
+        require(next.finish == ChatResult::Finish::Cancelled && next.token_ids.empty() && next.text.empty(),
+                "A terminal callback cancelled too late to affect ChatResult");
+        first->release_session(options.session);
 
         const auto timing = first->run_model_for_ttnt(sa, a);
         require(timing.generated_tokens > 1, "Nested prefill leaked its output limit into decode");

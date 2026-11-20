@@ -12,6 +12,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -81,6 +82,13 @@ class LanguageModel {
             std::optional<std::set<uint32_t>> override_stop_token_ids,
             uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
         );
+        std::optional<std::vector<uint32_t>> run_model(
+            std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
+            std::optional<uint16_t> override_max_num_tokens,
+            std::optional<std::set<uint32_t>> override_stop_token_ids,
+            uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance,
+            std::stop_token stop
+        );
         uint32_t run_model_prefill(
             std::span<const uint32_t> input_token_ids,
             uint16_t num_cached_tokens,
@@ -118,6 +126,12 @@ class LanguageModel {
             std::optional<ChronoTimer> timer_ttft,
             GenerationPerformanceResult* performance_result,
             uint16_t stable_prefix_token_count
+        );
+        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+            std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
+            GenerationPerformanceResult* performance, uint16_t stable_prefix_token_count,
+            std::stop_token stop
         );
         std::optional<std::vector<uint32_t>> run_model_gemma4_mtp(
             LanguageModel& draft_lm,
@@ -300,6 +314,14 @@ class LanguageModel {
         friend class VisionLanguageModel;
         friend class VisionLanguageRequest;
         friend class LanguageExecutor;
+        std::optional<std::vector<uint32_t>> _run_model_ordinary(
+            std::span<const uint32_t> ids, std::optional<ChronoTimer> timer,
+            uint16_t stable_prefix, GenerationPerformanceResult* performance);
+        std::optional<std::vector<uint32_t>> _run_model_gemma4_mtp(
+            LanguageModel& draft, std::span<const uint32_t> ids, uint16_t limit,
+            std::optional<ChronoTimer> timer, GenerationPerformanceResult* performance);
+        LogLikelihoodResult _score(std::span<const uint32_t> ids, size_t continuation_start,
+            std::span<const uint32_t> continuation_ids, bool use_group_prefill);
         void invalidate_prompt_reuse();
         void bind_session_adapter();
         void _bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter);
@@ -329,6 +351,7 @@ class LanguageModel {
         void _select_request_sessions(SessionId id, LanguageModel* draft, bool bind_adapter = false);
         void _attach_draft(LanguageModel& draft, LanguageModel* previous);
         void _detach_draft_sessions(LanguageModel* draft);
+        void _reset_session(SessionId id, LanguageModel* draft);
         void _release_paired_session(SessionId id, LanguageModel* draft);
         void _init_attention_bindings();
         void _gather_embedding_rows(

@@ -76,11 +76,11 @@ LogLikelihoodResult score_logits(
 
 LanguageModel::~LanguageModel() { _finalize(); }
 
-void LanguageModel::stop_model() { _run->cancelled.store(true, std::memory_order_relaxed); }
+void LanguageModel::stop_model() { _run->interrupts.fetch_add(1, std::memory_order_relaxed); }
 
-uint16_t LanguageModel::get_max_num_tokens() const { return _run->max_num_tokens; }
+uint16_t LanguageModel::get_max_num_tokens() const { return _run->limits().max_num_tokens; }
 
-const std::set<uint32_t>& LanguageModel::get_stop_token_ids() const { return _run->stop_token_ids; }
+const std::set<uint32_t>& LanguageModel::get_stop_token_ids() const { return _run->limits().stop_token_ids; }
 
 void LanguageModel::clear_cached_token_ids() { _session->cached_token_ids.clear(); }
 
@@ -333,16 +333,36 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     std::optional<std::set<uint32_t>> override_stop_token_ids,
     uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
 ) {
-    LanguageExecutor::Run run(*this);
+    return run_model(input_token_ids, timer_ttft, override_max_num_tokens, std::move(override_stop_token_ids),
+                     stable_prefix_token_count, performance, {});
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model(
+    std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
+    std::optional<uint16_t> override_max_num_tokens, std::optional<std::set<uint32_t>> override_stop_token_ids,
+    uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance, std::stop_token stop
+) {
+    if (stop.stop_requested()) {
+        if (performance) *performance = {};
+        return std::nullopt;
+    }
+    LanguageExecutor::Run run(*this, nullptr, {}, stop, std::move(override_stop_token_ids));
+    auto output = run.generate(input_token_ids, override_max_num_tokens, timer_ttft, performance, stable_prefix_token_count);
+    run.complete();
+    return run.cancelled() ? std::nullopt : output;
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::_run_model_ordinary(
+    std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
+    uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
+) {
     if (performance) *performance = {};
     auto* durations = performance ? &performance->token_durations : nullptr;
-    set_max_num_tokens(override_max_num_tokens);
-    set_stop_token_ids(override_stop_token_ids);
 
     std::optional<std::vector<uint32_t>> output_token_ids{};
 
     // If the input is already greater than the cache size, no need to run the model.
-    if (input_token_ids.size() > _run->max_num_tokens) {
+    if (input_token_ids.size() > _run->limits().max_num_tokens) {
         _notify_cache_full();
         output_token_ids = std::vector<uint32_t>();
     } else {
@@ -354,14 +374,13 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         // Prefill.
         auto token_id = _prefill(input_token_ids, num_cached_tokens, timer_ttft, durations);
         const auto output_token_id_begin = input_token_ids.size();
-        if (_run->cancelled.load(std::memory_order_relaxed)) {
-            run.complete();
+        if (_run->cancelled()) {
             return std::nullopt;
         }
-        if (input_token_ids.size() == _run->max_num_tokens) {
+        if (input_token_ids.size() == _run->limits().max_num_tokens) {
             _notify_cache_full();
             output_token_ids = std::vector<uint32_t>();
-        } else if (_run->stop_token_ids.contains(token_id)) {
+        } else if (_run->limits().stop_token_ids.contains(token_id)) {
             _notify_stop();
             output_token_ids = std::vector<uint32_t>{token_id};
         } else {
@@ -374,8 +393,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     }
 
     if (performance) performance->generated_tokens = durations->size();
-    run.complete();
-    return _run->cancelled.load(std::memory_order_relaxed) ? std::nullopt : output_token_ids;
+    return output_token_ids;
 }
 
 
@@ -391,22 +409,23 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
     std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count) {
-    LanguageExecutor::Run run(*this, &draft_lm);
-    const auto& target = *_cfg.lm_cfg.speculative_decoding_cfg;
-    const uint16_t limit = std::min(override_max_num_tokens.value_or(_run->max_num_tokens),
-                                    _cfg.pipeline_cfg.max_num_tokens);
-    std::optional<std::vector<uint32_t>> output;
-    if (target.is_gemma4_mtp()) {
-        output = run_model_gemma4_mtp(draft_lm, input_token_ids, limit, timer_ttft, performance_result);
-    } else if (target.method == "dflash") {
-        output = _run_model_dflash_speculative_decoding(draft_lm, input_token_ids, limit, timer_ttft,
-                                                       performance_result, stable_prefix_token_count);
-    } else {
-        output = _run_model_eagle3_speculative_decoding(draft_lm, input_token_ids, limit, timer_ttft,
-                                                      performance_result);
+    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
+        timer_ttft, performance_result, stable_prefix_token_count, {});
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
+    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count, std::stop_token stop) {
+    if (stop.stop_requested()) {
+        if (performance_result) *performance_result = {};
+        return std::nullopt;
     }
+    LanguageExecutor::Run run(*this, &draft_lm, {}, stop);
+    auto output = run.generate(input_token_ids, override_max_num_tokens, timer_ttft,
+                               performance_result, stable_prefix_token_count);
     run.complete();
-    return _run->cancelled.load(std::memory_order_relaxed) ? std::nullopt : output;
+    return run.cancelled() ? std::nullopt : output;
 }
 
 namespace {
@@ -438,7 +457,7 @@ void LanguageModel::attach_draft(LanguageModel& draft_lm) {
 
 void LanguageModel::_attach_draft(LanguageModel& draft_lm, LanguageModel* previous) {
     std::lock_guard lock(RuntimeContext::instance().execution_mutex);
-    if (_run->is_running || draft_lm._run->is_running)
+    if (_run->active || draft_lm._run->active)
         throw std::logic_error("Cannot change the target/draft pair during generation");
     const auto& identity = draft_lm._sessions->get(0);
     if (_workspace->paired_draft_identity.lock() == identity) return;
@@ -479,6 +498,7 @@ uint32_t LanguageModel::run_model_prefill(
     uint16_t num_cached_tokens,
     std::optional<ChronoTimer> timer_ttft
 ) {
+    if (!_run->active) _run->standalone_start = _run->interrupts.load(std::memory_order_relaxed);
     return _prefill(input_token_ids, num_cached_tokens, timer_ttft, nullptr);
 }
 
@@ -542,7 +562,7 @@ uint32_t LanguageModel::_prefill(
                 next_token_id = run_model_once(1, token_idx, num_input_tokens, 0);
                 token_idx += 1;
             }
-            if (_run->cancelled.load(std::memory_order_relaxed)) {
+            if (_run->cancelled()) {
                 if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                 return next_token_id;
             }
@@ -560,7 +580,7 @@ uint32_t LanguageModel::_prefill(
                 _compute_and_upload_per_layer_inputs_prefill(1, token_idx, num_input_tokens);
             }
             next_token_id = run_model_once(1, token_idx, num_input_tokens, 0);
-            if (_run->cancelled.load(std::memory_order_relaxed)) {
+            if (_run->cancelled()) {
                 if (!_cfg.lm_cfg.is_gemma4_mtp_target()) _notify_interrupt();
                 return next_token_id;
             }
@@ -568,7 +588,7 @@ uint32_t LanguageModel::_prefill(
     }
     _session->cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
     auto duration = timer_ttft.value().stop();
-    if (num_input_tokens < _run->max_num_tokens) {
+    if (num_input_tokens < _run->limits().max_num_tokens) {
         if (durations) durations->push_back(duration);
         _notify_first_token(next_token_id, duration);
     }
@@ -587,13 +607,13 @@ void LanguageModel::_decode(uint16_t num_input_tokens, uint32_t token_id,
                             std::vector<double>* durations) {
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
-    for (token_idx = num_input_tokens; token_idx < _run->max_num_tokens; ++token_idx ) {
-        if (_run->cancelled.load(std::memory_order_relaxed)) {
+    for (token_idx = num_input_tokens; token_idx < _run->limits().max_num_tokens; ++token_idx ) {
+        if (_run->cancelled()) {
             _notify_interrupt();
             return;
         }
         auto next_token_id = run_model_once(1, token_idx, num_input_tokens, token_id);
-        if (_run->cancelled.load(std::memory_order_relaxed)) {
+        if (_run->cancelled()) {
             _notify_interrupt();
             return;
         }
@@ -601,10 +621,10 @@ void LanguageModel::_decode(uint16_t num_input_tokens, uint32_t token_id,
         token_id = next_token_id;
 
         auto duration = timer_tps.stop(true);
-        if (token_idx + 1 < _run->max_num_tokens) {
+        if (token_idx + 1 < _run->limits().max_num_tokens) {
             if (durations) durations->push_back(duration);
             _notify_new_token(next_token_id, duration);
-            if (_run->stop_token_ids.contains(token_id)) {
+            if (_run->limits().stop_token_ids.contains(token_id)) {
                 _notify_stop();
                 return;
             }
@@ -612,13 +632,25 @@ void LanguageModel::_decode(uint16_t num_input_tokens, uint32_t token_id,
     }
 
     // Check if cache is full.
-    if (token_idx == _run->max_num_tokens) {
+    if (token_idx == _run->limits().max_num_tokens) {
         _notify_cache_full();
     }
 }
 
 
 LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
+    std::span<const uint32_t> input_token_ids,
+    size_t continuation_start,
+    std::span<const uint32_t> continuation_token_ids,
+    bool use_group_prefill
+) {
+    LanguageExecutor::Run run(*this);
+    auto result = _score(input_token_ids, continuation_start, continuation_token_ids, use_group_prefill);
+    run.complete();
+    return result;
+}
+
+LogLikelihoodResult LanguageModel::_score(
     std::span<const uint32_t> input_token_ids,
     size_t continuation_start,
     std::span<const uint32_t> continuation_token_ids,
@@ -633,12 +665,12 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     if (input_token_ids.empty()) {
         throw std::runtime_error("Loglikelihood request must include at least one input token");
     }
-    if (input_token_ids.size() > _run->max_num_tokens) {
+    if (input_token_ids.size() > _run->limits().max_num_tokens) {
         throw std::runtime_error(
             fmt::format(
                 "Loglikelihood input length {} exceeds max_num_tokens {}",
                 input_token_ids.size(),
-                _run->max_num_tokens
+                _run->limits().max_num_tokens
             )
         );
     }
@@ -665,7 +697,6 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
         );
     }
 
-    LanguageExecutor::Run run(*this);
     double total_logprob = 0.0;
     bool is_greedy = true;
     const size_t continuation_end = continuation_start + continuation_token_ids.size();
@@ -713,7 +744,7 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
             num_cached_tokens = static_cast<uint16_t>(prefill_token_count - 1);
         }
         run_model_prefill(prefill_input_tokens, num_cached_tokens, std::nullopt);
-        if (_run->cancelled.load(std::memory_order_relaxed)) {
+        if (_run->cancelled()) {
             throw std::runtime_error("Loglikelihood group prefill was interrupted");
         }
         const auto first_token_score = score_current_logits(continuation_token_ids[0]);
@@ -723,7 +754,7 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     }
 
     for (size_t token_idx = token_idx_begin; token_idx < input_token_ids.size(); ++token_idx) {
-        if (_run->cancelled.load(std::memory_order_relaxed))
+        if (_run->cancelled())
             throw std::runtime_error("Loglikelihood request was interrupted");
         if (token_idx >= continuation_start && token_idx < continuation_end) {
             const auto token_score = _run_model_once_for_loglikelihood(
@@ -739,7 +770,6 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
             );
         }
     }
-    run.complete();
     return {total_logprob, is_greedy};
 }
 
@@ -1607,11 +1637,11 @@ void LanguageModel::unset_reloc() {
 }
 
 uint16_t LanguageModel::set_max_num_tokens(std::optional<uint16_t> max_num_tokens) {
-    auto original_max_num_tokens = _run->max_num_tokens;
+    auto original_max_num_tokens = _run->limits().max_num_tokens;
     if (max_num_tokens.has_value()) {
-        _run->max_num_tokens = std::min(max_num_tokens.value(), _cfg.pipeline_cfg.max_num_tokens);
+        _run->limits().max_num_tokens = std::min(max_num_tokens.value(), _cfg.pipeline_cfg.max_num_tokens);
     }
-    _logger->info("Setting max_num_tokens: {} -> {}", original_max_num_tokens, _run->max_num_tokens);
+    _logger->info("Setting max_num_tokens: {} -> {}", original_max_num_tokens, _run->limits().max_num_tokens);
     return original_max_num_tokens;
 }
 
@@ -1619,12 +1649,12 @@ uint16_t LanguageModel::set_max_num_tokens(std::optional<uint16_t> max_num_token
 std::set<uint32_t> LanguageModel::set_stop_token_ids(
     std::optional<std::set<uint32_t>> stop_token_ids
 ) {
-    auto original_stop_token_ids = _run->stop_token_ids;
+    auto original_stop_token_ids = _run->limits().stop_token_ids;
     if (stop_token_ids.has_value()) {
-        _run->stop_token_ids = stop_token_ids.value();
+        _run->limits().stop_token_ids = stop_token_ids.value();
     }
     _logger->info(
-        "Setting stop_token_ids: {} -> {}", original_stop_token_ids, _run->stop_token_ids
+        "Setting stop_token_ids: {} -> {}", original_stop_token_ids, _run->limits().stop_token_ids
     );
     return original_stop_token_ids;
 }
@@ -1869,9 +1899,8 @@ void LanguageModel::_notify_new_token(
 
 
 void LanguageModel::_notify_cache_full() const {
-    // Use negative token id to indicate that the cache is full.
+    if (_run->active) _run->active->length_limit_reached = true;
     _logger->info("Cache full");
-    // _py_decode_callback_func(-1, 0);
     _run->text_streamer.push(DecodeCallbackType::CACHE_FULL, 0, 0);
 }
 

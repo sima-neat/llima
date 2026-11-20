@@ -44,8 +44,11 @@ struct LanguageResources {
 
 struct LanguageSession {
     void init_layout(const LanguageSession& prototype);
-    size_t memory_bytes() const;
+    // Readers can inspect the last allocation/checkpoint size during generation.
+    std::atomic<size_t> published_bytes{0};
+    void publish_memory_bytes();
     std::shared_ptr<LanguageSession> draft;
+    bool buffers_allocated = false;
     void reset();
     void invalidate_reuse();
     void allocate(const LanguageResources& resources);
@@ -72,15 +75,16 @@ struct LanguageSession {
 class SessionManager {
   public:
     SessionManager();
-    const std::shared_ptr<LanguageSession>& get(SessionId id) const;
+    std::shared_ptr<LanguageSession> get(SessionId id) const;
     SessionId create(const LanguageSession& prototype);
     void release(SessionId id);
     void set_limit(size_t limit);
-    size_t limit() const { return _limit; }
+    size_t limit() const { std::lock_guard lock(_mutex); return _limit; }
     std::vector<SessionId> ids() const;
     SessionId active = 0;
 
   private:
+    mutable std::mutex _mutex;
     size_t _limit = 4;
     SessionId _next = 1;
     std::map<SessionId, std::shared_ptr<LanguageSession>> _sessions;
@@ -96,6 +100,12 @@ struct LanguageModel::DFlashScratch {
 };
 
 struct LanguageWorkspace {
+    void clear_session_scratch() {
+        dflash_resolved_prefix = 0;
+        gemma4_mtp_prefill_hidden_state.reset();
+        eagle3_tree_mask.reset();
+        eagle3_stable_kv = 0;
+    }
     std::shared_ptr<LanguageAdapter> bound_adapter;
     std::weak_ptr<LanguageSession> paired_draft_identity; // The draft runner owns its public session 0.
     std::vector<uint8_t> mtp_shared_kv_layers;
@@ -138,15 +148,52 @@ struct LanguageWorkspace {
     size_t eagle3_stable_kv = 0;
 };
 
-struct LanguageRunState {
-    LanguageRunState(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
-        : stop_token_ids(std::move(stops)), max_num_tokens(limit), text_streamer(streamer),
-          is_running(false) {}
+struct LanguageLimits {
     std::set<uint32_t> stop_token_ids;
     uint16_t max_num_tokens;
+};
+
+// Legacy stop_model() is called by the CLI's SIGINT handler. A request observes
+// only interrupts delivered during its lifetime. Caller-owned tokens can be stopped earlier.
+using InterruptCounter = std::atomic<uint64_t>;
+static_assert(InterruptCounter::is_always_lock_free);
+
+struct LanguageRequestState {
+    struct Interrupt {
+        explicit Interrupt(const InterruptCounter& counter)
+            : counter(counter), initial(counter.load(std::memory_order_relaxed)) {}
+        bool fired() const { return counter.load(std::memory_order_relaxed) != initial; }
+        const InterruptCounter& counter;
+        uint64_t initial;
+    };
+
+    LanguageLimits limits;
+    std::stop_token stop;
+    Interrupt target_interrupt;
+    std::optional<Interrupt> draft_interrupt;
+    bool length_limit_reached = false;
+
+    bool cancelled() const {
+        return stop.stop_requested() || target_interrupt.fired() ||
+               (draft_interrupt && draft_interrupt->fired());
+    }
+};
+
+struct LanguageRunState {
+    LanguageRunState(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
+        : defaults{std::move(stops), limit}, text_streamer(streamer) {}
+
+    LanguageLimits& limits() { return active ? active->limits : defaults; }
+    bool cancelled() const {
+        return active ? active->cancelled() : interrupts.load(std::memory_order_relaxed) != standalone_start;
+    }
+
+    LanguageLimits defaults;
     TextStreamer& text_streamer;
-    std::atomic<bool> is_running; // Request activity; cancellation is never inferred from this flag.
-    std::atomic<bool> cancelled = false;
+    InterruptCounter interrupts{0};
+    uint64_t standalone_start = 0; // Shared by a standalone prefill/decode pair.
+    // Only the serialized execution thread uses this pointer. stop_model() touches only interrupts.
+    LanguageRequestState* active = nullptr;
 };
 
 } // namespace simaai::llima

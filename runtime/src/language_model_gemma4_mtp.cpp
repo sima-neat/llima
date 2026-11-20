@@ -598,7 +598,17 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     if (!_cfg.lm_cfg.is_gemma4_mtp_target()) {
         throw std::runtime_error("gemma4_mtp speculative decoding must run on the target model");
     }
-    LanguageExecutor::Run run(*this, &draft_lm);
+    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
+                                          timer_ttft, performance_result);
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
+    LanguageModel& draft_lm,
+    std::span<const uint32_t> input_token_ids,
+    uint16_t max_length,
+    std::optional<ChronoTimer> timer_ttft,
+    GenerationPerformanceResult* performance_result
+) {
     if (input_token_ids.empty()) {
         throw std::runtime_error("Gemma4 MTP generation requires at least one input token");
     }
@@ -614,8 +624,6 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         timer_ttft = ChronoTimer{true};
     }
 
-    set_max_num_tokens(override_max_num_tokens);
-    const uint16_t max_length = _run->max_num_tokens;
     std::vector<uint32_t> input_ids(input_token_ids.begin(), input_token_ids.end());
     std::vector<uint32_t> output_token_ids;
     std::optional<std::vector<Eigen::bfloat16>> predecessor_hidden_state;
@@ -654,7 +662,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         const double first_duration = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - first_begin
         ).count();
-        if (!_run->cancelled.load(std::memory_order_relaxed)) {
+        if (!_run->cancelled()) {
             _session->kv_cache_len = checked_u16(
                 input_ids.size(), "Gemma4 MTP prompt length"
             );
@@ -666,7 +674,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 performance_result->generated_tokens = 1;
             }
 
-            if (_run->stop_token_ids.contains(first_token)) {
+            if (_run->limits().stop_token_ids.contains(first_token)) {
                 stopped = true;
             }
 
@@ -698,7 +706,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
 
     while (
         !cache_full && !stopped
-        && !_run->cancelled.load(std::memory_order_relaxed)
+        && !_run->cancelled()
         && input_ids.size() < max_length
     ) {
         const auto round_begin = std::chrono::steady_clock::now();
@@ -746,7 +754,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                     _cfg.pipeline_cfg.max_num_tokens
                 );
             while (draft_token_ids.size() < round_draft_tokens
-                   && !_run->cancelled.load(std::memory_order_relaxed)) {
+                   && !_run->cancelled()) {
                 auto draft_step = draft_lm._run_gemma4_mtp_draft_step(
                     *this,
                     shared_kv_layers,
@@ -761,7 +769,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
             }
         }
 
-        if (_run->cancelled.load(std::memory_order_relaxed))
+        if (_run->cancelled())
             break;
 
         std::vector<uint32_t> verification_tokens;
@@ -774,7 +782,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         auto verification = _run_gemma4_mtp_target_batch(
             current_pos, verification_tokens
         );
-        if (_run->cancelled.load(std::memory_order_relaxed))
+        if (_run->cancelled())
             break;
         target_shared_kv_available_len = _session->kv_cache_len;
         const size_t meaningful_verification_rows = draft_token_ids.size() + 1;
@@ -807,7 +815,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
                 ++accepted_this_round;
             }
 
-            if (_run->stop_token_ids.contains(emitted)) {
+            if (_run->limits().stop_token_ids.contains(emitted)) {
                 stopped = true;
                 break;
             }
@@ -836,7 +844,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         const double per_token = round_duration
             / static_cast<double>(emitted_tokens.size());
         for (const auto& [token, from_draft] : emitted_tokens) {
-            if (_run->cancelled.load(std::memory_order_relaxed))
+            if (_run->cancelled())
                 break;
             _notify_new_token(token, per_token, from_draft);
             if (performance_result != nullptr) {
@@ -849,9 +857,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
         }
     }
 
-    if (_run->cancelled.load(std::memory_order_relaxed)) {
+    if (_run->cancelled()) {
         _notify_interrupt();
-        run.complete();
         return std::nullopt;
     }
 
@@ -860,8 +867,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
     } else {
         _notify_stop();
     }
-    run.complete();
-    return _run->cancelled.load(std::memory_order_relaxed) ? std::nullopt
+    return _run->cancelled() ? std::nullopt
                                                         : std::optional(std::move(output_token_ids));
 }
 

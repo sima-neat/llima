@@ -53,6 +53,19 @@ void VisionModel::run_model(
 ) {
     std::lock_guard workspace_lock(_workspace->mutex);
     _run_locked(ifm_tensor, ofm_map_ptr);
+    if (ofm_map_ptr) {
+        // Image rows come from DMA. A later CPU write to an adjacent text or encoded-image
+        // row must read the new edge cache line, especially for 16-byte embedding scales.
+        for (const auto& [port, slice] : *ofm_map_ptr) {
+            auto* buffer = slice.get_buf_ptr();
+            const auto begin = slice.get_byte_offset();
+            const auto size = buffer->get_buf_len(slice.get_buf_shapes());
+            if (size) {
+                buffer->invalidate_cache(begin, 1);
+                buffer->invalidate_cache(begin + size - 1, 1);
+            }
+        }
+    }
 }
 
 std::vector<std::vector<std::byte>> VisionModel::encode(const std::vector<Eigen::bfloat16>& tensor) {
