@@ -1,8 +1,8 @@
 add_executable(sima_lmm_embedding_offload_generation_test embedding_offload_generation_test.cpp)
 target_link_libraries(sima_lmm_embedding_offload_generation_test PRIVATE sima_lmm_runtime)
 add_executable(sima_lmm_embedding_offload_test embedding_offload_test.cpp
-    "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp")
-target_include_directories(sima_lmm_embedding_offload_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+    "${PROJECT_SOURCE_DIR}/runtime/src/embedding_offload.cpp")
+target_include_directories(sima_lmm_embedding_offload_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 target_link_libraries(sima_lmm_embedding_offload_test PRIVATE OpenMP::OpenMP_CXX)
 add_test(NAME runtime.embedding_offload COMMAND sima_lmm_embedding_offload_test)
 set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
@@ -37,6 +37,7 @@ add_executable(
     sima_lmm_gemma4_mtp_helpers_test
     gemma4_mtp_helpers_test.cpp
 )
+target_include_directories(sima_lmm_gemma4_mtp_helpers_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 add_executable(
     sima_lmm_gemma4_mtp_cache_test
     gemma4_mtp_cache_test.cpp
@@ -200,8 +201,8 @@ install(
         CMakeLists.txt
         embedding_offload_generation_test.cpp
         embedding_offload_test.cpp
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.hpp"
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/embedding_offload.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/embedding_offload.cpp"
         asr_transcription_test.cpp
         mla_rt_lifecycle_test.cpp
         gemma4_mtp_helpers_test.cpp
@@ -214,8 +215,8 @@ install(
         test_python_runtime_lifecycle.py
         test_zmq_black_box.py
         text_generation_test.cpp
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/reasoning_parser.hpp"
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/gemma4_mtp_helpers.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/include/sima_lmm/reasoning_parser.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/gemma4_mtp_helpers.hpp"
         reasoning_parser_test.cpp
         tool_call_parser_test.cpp
         vision_generation_test.cpp
@@ -233,7 +234,6 @@ install(
 
 foreach(provider_test IN ITEMS file_provider file_provider_routing)
     add_executable(sima_lmm_${provider_test}_test ${provider_test}_test.cpp)
-    target_include_directories(sima_lmm_${provider_test}_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
     target_link_libraries(sima_lmm_${provider_test}_test PRIVATE sima_lmm_runtime)
     add_test(NAME runtime.${provider_test} COMMAND sima_lmm_${provider_test}_test)
     set_tests_properties(runtime.${provider_test} PROPERTIES LABELS "devkit;runtime;provider" TIMEOUT 900)
@@ -257,6 +257,7 @@ install(TARGETS sima_lmm_session_generation_test RUNTIME DESTINATION lib/sima-lm
 install(FILES session_generation_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
 
 add_executable(sima_lmm_lora_session_test lora_session_test.cpp)
+target_include_directories(sima_lmm_lora_session_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 target_link_libraries(sima_lmm_lora_session_test PRIVATE sima_lmm_runtime cnpy-static "${SIMA_LMM_MLART_LIBRARY}")
 set_target_properties(sima_lmm_lora_session_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 add_test(NAME runtime.lora_session COMMAND sima_lmm_lora_session_test)
@@ -266,6 +267,7 @@ install(TARGETS sima_lmm_lora_session_test RUNTIME DESTINATION lib/sima-lmm/test
 # This regression uses a private header, so only its binary is shipped in extras.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime_program_lifetime_test.cpp")
     add_executable(sima_lmm_runtime_program_lifetime_test runtime_program_lifetime_test.cpp)
+    target_include_directories(sima_lmm_runtime_program_lifetime_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
     target_link_libraries(sima_lmm_runtime_program_lifetime_test PRIVATE sima_lmm_runtime)
     set_target_properties(sima_lmm_runtime_program_lifetime_test PROPERTIES
         INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")

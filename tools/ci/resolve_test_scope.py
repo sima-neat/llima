@@ -61,6 +61,7 @@ DEVKIT_PATHS = frozenset(
         ".gitmodules",
         "CMakeLists.txt",
         "build.sh",
+        "sima_lmm/devkit",
         "toolchain-sima.cmake",
         "tools/install_llima.sh",
     }
@@ -68,8 +69,8 @@ DEVKIT_PATHS = frozenset(
 
 DEVKIT_PATH_PREFIXES = (
     "cmake/",
+    "runtime/",
     "sima_lmm/assets/",
-    "sima_lmm/devkit/",
     "tests/runtime/",
     "third_party/",
 )

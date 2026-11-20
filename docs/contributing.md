@@ -36,14 +36,14 @@ those boundaries.
 | Compilation | `sima_lmm/model/`, `sima_lmm/preproc/` | Model parts, quantization, graphs, and preprocessing |
 | Host tools | `sima_lmm/host/` | Compile, deploy, LoRA, and benchmark entry points |
 | Evaluation | `sima_lmm/mole/` | MoLE workflows |
-| Runtime CLI | `sima_lmm/devkit/` | Python CLI orchestration and model management |
-| C++ runtime | `sima_lmm/devkit/cpp/` | Models, tokenizer, MLA, CLI/HTTP/ZMQ implementations, and the internal CLI binding |
+| Runtime CLI | `runtime/python/devkit/` | Python CLI orchestration and model management |
+| C++ runtime | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/bindings/python/` | Models, tokenizer, MLA, CLI/HTTP/ZMQ implementations, and the internal CLI binding |
 | Tests | `tests/` | Compiler and Modalix runtime tests |
 | Packaging | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian, wheel, and artifact assembly |
 | CI/caches | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | Builds, tests, and model caches |
 | Docs/skills | `README.md`, `docs/`, `skills/` | User, contributor, and Playbooks guidance |
 
-Compiler-only dependencies must not enter `sima_lmm/devkit/` or the Modalix
+Compiler-only dependencies must not enter `runtime/` or the Modalix
 runtime packages.
 
 ## Development Environments
@@ -122,7 +122,7 @@ layered model or recompile the checkpoint with the current LLiMa version.
 
 Compiler changes normally touch `sima_lmm/config/whisper_config.py`,
 `sima_lmm/model/whisper_*.py`, and the script; runtime changes touch
-`sima_lmm/devkit/cpp/whisper_*`. Validate with the packaged C++ ASR runtime
+`runtime/src/whisper_*.cpp`. Validate with the packaged C++ ASR runtime
 test documented in `tests/README.md` and representative audio on Modalix. This
 is a Whisper-specific path, not a general ASR architecture framework.
 

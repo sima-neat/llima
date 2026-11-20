@@ -133,8 +133,8 @@ Tokenizer compatibility is more than chat-template rendering. Inspect:
 2. host discovery and `AutoTokenizer`/`AutoProcessor` loading in
    `sima_lmm/preproc/vlm_helper.py`;
 3. copied/generated files in `BaseModel.gen_devkit_files`;
-4. `sima_lmm/devkit/cpp/vlm_helper.*` asset selection; and
-5. `sima_lmm/devkit/cpp/tokenizer.*` supported formats.
+4. `runtime/src/vlm_helper.cpp` asset selection; and
+5. `runtime/src/tokenizer.cpp` supported formats.
 
 A host-only custom tokenizer is insufficient if compilation does not produce a
 runtime-supported asset. Prefer a deterministic compiler-side conversion when

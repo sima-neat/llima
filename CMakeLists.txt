@@ -312,10 +312,7 @@ find_library(
 )
 
 # Build the core library.
-file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
-    "sima_lmm/devkit/cpp/*.cpp"
-)
-list(FILTER SOURCES EXCLUDE REGEX "sima_lmm/devkit/cpp/binding.cpp")
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "runtime/src/*.cpp")
 
 add_library(${TARGET_RUNTIME} SHARED ${SOURCES})
 set_target_properties(
@@ -351,7 +348,8 @@ target_compile_options(${TARGET_RUNTIME} PUBLIC ${HTTPLIB_CFLAGS_OTHER})
 target_include_directories(
     ${TARGET_RUNTIME}
     PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit/cpp>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include/sima_lmm>
     $<BUILD_INTERFACE:${MSGPACK_CXX_SOURCE_DIR}/include>
     # cnpy include directory is not automatically added when library is linked.
     $<BUILD_INTERFACE:${cnpy_SOURCE_DIR}>
@@ -403,9 +401,9 @@ if(SIMA_LMM_BUILD_PYTHON)
         ${TARGET_BIND}
         NOMINSIZE
         LTO
-        sima_lmm/devkit/cpp/binding.cpp
+        runtime/bindings/python/binding.cpp
     )
-
+    target_include_directories(${TARGET_BIND} PRIVATE runtime/src)
     target_link_libraries(
         ${TARGET_BIND}
         PRIVATE
@@ -416,33 +414,6 @@ if(SIMA_LMM_BUILD_PYTHON)
         INSTALL_RPATH "\$ORIGIN;${CMAKE_INSTALL_FULL_LIBDIR}"
     )
 endif()
-
-set(SIMA_LMM_PUBLIC_HEADERS
-    sima_lmm/devkit/cpp/base_model.hpp
-    sima_lmm/devkit/cpp/file_provider.hpp
-    sima_lmm/devkit/cpp/generation_types.hpp
-    sima_lmm/devkit/cpp/chat.hpp
-    sima_lmm/devkit/cpp/eagle_helpers.hpp
-    sima_lmm/devkit/cpp/eigen_types.hpp
-    sima_lmm/devkit/cpp/image_processor.hpp
-    sima_lmm/devkit/cpp/language_model.hpp
-    sima_lmm/devkit/cpp/mla_buffer.hpp
-    sima_lmm/devkit/cpp/mla_model.hpp
-    sima_lmm/devkit/cpp/nlohmann_optional.hpp
-    sima_lmm/devkit/cpp/reasoning_parser.hpp
-    sima_lmm/devkit/cpp/rope_utils.hpp
-    sima_lmm/devkit/cpp/setup.hpp
-    sima_lmm/devkit/cpp/text_streamer.hpp
-    sima_lmm/devkit/cpp/tokenizer.hpp
-    sima_lmm/devkit/cpp/tool_call_parser.hpp
-    sima_lmm/devkit/cpp/utils.hpp
-    sima_lmm/devkit/cpp/vision_language_model.hpp
-    sima_lmm/devkit/cpp/vision_model.hpp
-    sima_lmm/devkit/cpp/vlm_config.hpp
-    sima_lmm/devkit/cpp/vlm_helper.hpp
-    sima_lmm/devkit/cpp/whisper_config.hpp
-    sima_lmm/devkit/cpp/whisper_model.hpp
-)
 
 if(SIMA_LMM_BUILD_PYTHON)
     install(
@@ -465,9 +436,10 @@ install(
     PATTERN "__pycache__" EXCLUDE
 )
 install(
-    FILES ${SIMA_LMM_PUBLIC_HEADERS}
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/sima_lmm
+    DIRECTORY runtime/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     COMPONENT dev
+    FILES_MATCHING PATTERN "*.hpp"
 )
 
 # Header-only/public-header dependencies used by the installed LLiMa headers.
@@ -529,12 +501,11 @@ patch: ${PROJECT_VERSION_PATCH}
         COMPONENT cli
     )
     install(
-        DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/sima_lmm/devkit"
+        DIRECTORY runtime/python/devkit
         DESTINATION ${SIMA_LMM_PYTHON_PACKAGE_INSTALL_DIR}
         COMPONENT cli
-        PATTERN "cpp" EXCLUDE
+        FILES_MATCHING PATTERN "*.py"
         PATTERN "__pycache__" EXCLUDE
-        PATTERN "*.pyc" EXCLUDE
     )
 
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/llima"

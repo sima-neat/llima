@@ -1,7 +1,7 @@
 
 [build-system]
 requires = [
-    "scikit-build-core",
+    "scikit-build-core>=0.10",
     "pyyaml",
 ]
 build-backend = "scikit_build_core.build"
@@ -38,9 +38,11 @@ llima-benchmark = "sima_lmm.host.benchmark:main"
 logging.level = "DEBUG"
 experimental = true
 wheel.cmake = false
-wheel.exclude = ["sima_lmm/devkit/cpp/*", "**/__pycache__", "**/*.pyc"]
+wheel.packages = { "sima_lmm" = "sima_lmm", "sima_lmm/devkit" = "runtime/python/devkit" }
+wheel.exclude = ["**/__pycache__", "**/*.pyc"]
 sdist.include = ["sima_lmm/VERSION"]
-sdist.exclude = ["**/__pycache__", "**/*.pyc"]
+# Package the CLI from runtime/ once. sima_lmm/devkit is a link for source checkouts.
+sdist.exclude = ["/sima_lmm/devkit/", "**/__pycache__", "**/*.pyc"]
 wheel.install-dir = "sima_lmm"
 build.verbose = true
 

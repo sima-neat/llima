@@ -113,18 +113,17 @@ with zipfile.ZipFile(wheel_path) as wheel:
 
     native_files = [
         name for name in names
-        if name.endswith((".so", ".dylib", ".dll", ".pyd", ".a"))
+        if name.endswith((".so", ".dylib", ".dll", ".pyd", ".a", ".cpp", ".hpp"))
         or ".so." in name
     ]
-    cpp_sources = [
-        name for name in names
-        if name.startswith("sima_lmm/devkit/cpp/")
-    ]
-    if native_files or cpp_sources:
-        details = "\n".join(f"  {name}" for name in native_files + cpp_sources)
+    if native_files:
+        details = "\n".join(f"  {name}" for name in native_files)
         raise SystemExit(
             "ERROR: Compiler wheel contains native runtime content:\n" + details
         )
+
+    if "sima_lmm/devkit/devkit_demo.py" not in names:
+        raise SystemExit("ERROR: Compiler wheel is missing the llima CLI module.")
 
     wheel_metadata = [name for name in names if name.endswith(".dist-info/WHEEL")]
     if len(wheel_metadata) != 1:

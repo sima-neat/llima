@@ -24,7 +24,7 @@ class ScopeDecisionTests(unittest.TestCase):
             ),
             (
                 "DevKit only",
-                ["sima_lmm/devkit/cpp/chat.cpp", "CMakeLists.txt"],
+                ["runtime/src/chat.cpp", "runtime/python/devkit/devkit_demo.py", "CMakeLists.txt"],
                 (False, True),
             ),
             ("shared", ["deps/manifest.json"], (True, True)),
@@ -62,7 +62,7 @@ class ScopeDecisionTests(unittest.TestCase):
     def test_mixed_known_paths_run_both_without_unknowns(self):
         decision = classify_changed_paths(
             [
-                "sima_lmm/devkit/cpp/chat.cpp",
+                "runtime/include/sima_lmm/chat.hpp",
                 "sima_lmm/config/vlm_config.py",
                 "docs/runtime.md",
             ],
