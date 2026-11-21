@@ -430,6 +430,23 @@ class BaseModel(ABC):
                 ])
                 sinks.astype(bfloat16).tofile(sinks_file_name)
 
+        # DFlash 2 candidate selector codebooks, (vocab_size, selector_rank) each, for the devkit.
+        spec_cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        if spec_cfg is not None and spec_cfg.is_draft and spec_cfg.is_dflash2:
+            for name in ("predecessor_codebook", "successor_codebook"):
+                codebook_file_name = (
+                    self.sima_devkit_path / f"{self.language_model_name}_dflash2_{name}.bin"
+                )
+                if resume and codebook_file_name.is_file():
+                    continue
+                codebook = np.asarray(self.get_hf_param(f"candidate_selector.{name}"))
+                expected = (self.cfg.lm_cfg.token_cfg.vocab_size, spec_cfg.dflash_selector_rank)
+                if codebook.shape != expected:
+                    raise ValueError(
+                        f"DFlash 2 {name} has shape {codebook.shape}, expected {expected}"
+                    )
+                codebook.astype(bfloat16).tofile(codebook_file_name)
+
         if write_cfg:
             cfg_dict = asdict(self.cfg)
             cfg_dict["language_model_name"] = self.language_model_name

@@ -1798,6 +1798,10 @@ void LanguageModel::_initialize() {
             buf.upload(host.data());
         }
     }
+    if (_cfg.lm_cfg.is_speculative_draft() && _cfg.lm_cfg.speculative_decoding_cfg
+        && _cfg.lm_cfg.speculative_decoding_cfg->is_dflash2()) {
+        _load_dflash2_codebooks();
+    }
 
     // Upload freq real and imag.
     auto rope_table = calc_freq_real_imag(
@@ -2575,6 +2579,15 @@ void LanguageModel::_define_buffers() {
                         {output_rows, split_size}
                     );
                 }
+            }
+            if (is_draft && _cfg.lm_cfg.speculative_decoding_cfg
+                && _cfg.lm_cfg.speculative_decoding_cfg->is_dflash2()) {
+                // DFlash 2 candidate selector projection of each proposal row.
+                define_buffer(
+                    fmt::format("n{}_dflash2_selector_hidden", num_tokens),
+                    {static_cast<uint16_t>(num_tokens - 1),
+                     _cfg.lm_cfg.speculative_decoding_cfg->dflash_selector_rank}
+                );
             }
         }
     }

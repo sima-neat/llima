@@ -19,7 +19,7 @@ from sima_lmm.model.model_graph import ModelGraph
 pytestmark = [pytest.mark.premerge, pytest.mark.compiler_unit]
 
 
-def _config(tokens, *, draft=True):
+def _config(tokens, *, draft=True, dflash2=False):
     attn = SimpleNamespace(
         num_attention_heads=2, num_key_value_heads=1, attn_output_gate=False,
         get_head_dim=lambda _: 16, get_q_size=lambda _: 32, get_kv_size=lambda _: 16,
@@ -31,6 +31,8 @@ def _config(tokens, *, draft=True):
         rms_norm_unit_offset=False, mlp_cfg=SimpleNamespace(act="silu", swiglu_limit=None),
         speculative_decoding_cfg=SimpleNamespace(
             method="dflash", is_draft=draft, speculative_budget=tokens, target_layer_ids=[0, 1, 2],
+            dflash_conv_kernel_size=2 if dflash2 else 0, dflash_conv_group_size=16 if dflash2 else 0,
+            dflash_selector_rank=8 if dflash2 else 0, dflash_selector_top_k=4 if dflash2 else 0,
         ),
         rope_cfg=SimpleNamespace(
             get_rope_dimension_count=lambda _: 16,
@@ -46,7 +48,7 @@ def _config(tokens, *, draft=True):
                            pipeline_cfg=PipelineConfig(quantize_embeddings=False, quantize_kv_cache=False))
 
 
-def _model(cls, tmp_path, tokens):
+def _model(cls, tmp_path, tokens, *, dflash2=False):
     args = dict(num_tokens=tokens)
     if cls in (LanguagePreModel, LanguagePostModel, LanguageDFlashContextModel):
         args["layer_idx"] = 0
@@ -54,7 +56,7 @@ def _model(cls, tmp_path, tokens):
         args["final_softcapping"] = None
     if cls is LanguageDFlashStateResolverModel:
         args = dict(block_size=tokens)
-    model = cls(_config(tokens), "dflash_component", sima_path=tmp_path,
+    model = cls(_config(tokens, dflash2=dflash2), "dflash_component", sima_path=tmp_path,
                 hf_model=SimpleNamespace(language_model_param_base_name="model", is_gguf=False), **args)
     rng = np.random.default_rng(21)
     params = {name + ".weight": rng.normal(0, 0.05, shape).astype(np.float32) for name, shape in [
@@ -62,7 +64,13 @@ def _model(cls, tmp_path, tokens):
         ("layers.0.self_attn.k_proj", (16, 32)), ("layers.0.self_attn.v_proj", (16, 32)),
         ("layers.0.self_attn.o_proj", (32, 32)),
         *[("layers.0.mlp." + name, (32, 32)) for name in ("gate_proj", "up_proj", "down_proj")],
+        # DFlash 2: 2 stages x 2 taps x 2 groups of 16 channels, and a rank-8 selector projection.
+        ("layers.0.attention_conv.kernel_projection", (8, 32)),
+        ("layers.0.mlp_conv.kernel_projection", (8, 32)),
+        ("candidate_selector.hidden_projection", (8, 32)),
     ]}
+    for name in ("attention_conv", "mlp_conv"):
+        params[f"layers.0.{name}.base_kernel"] = rng.normal(0, 0.5, (2, 2, 32)).astype(np.float32)
     for name, channels in [("hidden_norm", 32), ("norm", 32),
                             ("layers.0.input_layernorm", 32), ("layers.0.post_attention_layernorm", 32)]:
         params[name + ".weight"] = np.ones(channels, np.float32)
@@ -172,3 +180,85 @@ def test_dflash_target_source_does_not_change_moe_factory(tmp_path):
     model = LanguageModel(cfg, "target", sima_path=tmp_path, hf_model=SimpleNamespace())
     assert isinstance(model._get_part_model("moe_weightedsum", 8, layer_idx=0),
                       LanguageMoeWeightedSumModel)
+
+
+def _reference_dflash2_conv(hidden, dynamic, base, group_size):
+    """NumPy port of z-lab/dflash ``_grouped_dynamic_convolve`` for one (tokens, hidden) block."""
+    tokens, hidden_size = hidden.shape
+    groups = hidden_size // group_size
+    blocks = hidden.reshape(tokens, groups, group_size)
+    output = np.zeros_like(blocks)
+    for offset in range(base.shape[0]):
+        values = blocks if offset == 0 else np.pad(blocks[:-offset], ((offset, 0), (0, 0), (0, 0)))
+        output += base[offset].reshape(groups, group_size) * values + dynamic[:, offset, :, None] * values
+    return output.reshape(tokens, hidden_size)
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize("tokens", [4, 8, 16])
+def test_dflash2_conv_matches_reference(tmp_path, tokens, quantizable):
+    from sima_lmm.model.dflash2_conv import DFlash2Conv
+
+    model = _model(LanguagePreModel, tmp_path, tokens, dflash2=True)
+    shape = (1, 1, tokens, 32)
+    graph = ModelGraph(model, {"input": shape, "sublayer": shape}, quantizable)
+    conv = DFlash2Conv(graph, "layers.0.attention_conv", kernel_size=2, group_size=16)
+    prepared = conv.prepare(graph.inputs["input"])
+    finished = conv.finish(graph.inputs["sublayer"])
+    rng = np.random.default_rng(5)
+    values = {name: rng.normal(0, 0.5, shape).astype(np.float32) for name in ("input", "sublayer")}
+    actual = _run(graph.finish([prepared, finished]), values, quantizable)
+
+    weight = model.get_hf_param("layers.0.attention_conv.kernel_projection.weight")
+    base = model.get_hf_param("layers.0.attention_conv.base_kernel")
+    x, y = values["input"][0, 0], values["sublayer"][0, 0]
+    dynamic = (x @ weight.T).reshape(tokens, 2, 2, 2)  # (tokens, stage, tap, group)
+    expected = [
+        _reference_dflash2_conv(x, dynamic[:, 0], base[0], 16),
+        _reference_dflash2_conv(y, dynamic[:, 1], base[1], 16),
+    ]
+    for result, reference in zip(actual, expected):
+        np.testing.assert_allclose(result.reshape(tokens, 32).astype(np.float32), reference,
+                                   rtol=0.03 if not quantizable else 1e-5,
+                                   atol=0.02 if not quantizable else 1e-6)
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+def test_dflash2_draft_graph_contracts(tmp_path, quantizable):
+    tokens = 8
+    rng = np.random.default_rng(3)
+    hidden = rng.normal(0, 0.1, (1, 1, tokens, 32)).astype(np.float32)
+    values = {"input": hidden, "freq_real": np.ones((1, 1, tokens, 8), np.float32),
+              "freq_imag": np.zeros((1, 1, tokens, 8), np.float32)}
+    pre = _model(LanguagePreModel, tmp_path, tokens, dflash2=True)
+    assert pre.is_dflash2_draft
+    pre_net = _net(pre, quantizable)
+    assert list(pre_net.input_node_names) == list(values)
+    pre_out = _run(pre_net, values, quantizable)
+    assert [x.shape for x in pre_out] == [(1, 2, tokens, 16), (1, 1, tokens, 16), (1, 1, tokens, 16)]
+    # The convolution changes the query relative to a DFlash draft with the same weights.
+    plain = _run(_net(_model(LanguagePreModel, tmp_path, tokens), quantizable), values, quantizable)
+    assert not np.allclose(np.asarray(pre_out[0], np.float32), np.asarray(plain[0], np.float32))
+    post = _model(LanguagePostModel, tmp_path, tokens, dflash2=True)
+    result = _run(_net(post, quantizable), {"input": hidden, "self_attn": hidden}, quantizable)
+    # Two lm_head splits plus the rank-8 selector projection of the proposal rows.
+    assert [x.shape for x in result] == [(1, 1, tokens - 1, 32)] * 2 + [(1, 1, tokens - 1, 8)]
+
+
+def test_dflash2_settings_accept_dflash2_and_reject_mixed_configs():
+    from sima_lmm.model.vision_language_model import _dflash2_settings
+
+    dflash2 = {"conv_kernel_size": 2, "conv_group_size": 16, "selector_rank": 256, "selector_top_k": 16}
+    assert _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, dflash2, 8, 5120, 248320) == dict(
+        dflash_conv_kernel_size=2, dflash_conv_group_size=16,
+        dflash_selector_rank=256, dflash_selector_top_k=16,
+    )
+    assert _dflash2_settings({"architectures": ["DFlashDraftModel"]}, {}, 8, 5120, 248320) == {}
+    with pytest.raises(ValueError, match="without DFlash2DraftModel"):
+        _dflash2_settings({"architectures": ["DFlashDraftModel"]}, dflash2, 8, 5120, 248320)
+    with pytest.raises(ValueError, match="missing dflash_config keys"):
+        _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {"conv_kernel_size": 2}, 8, 5120, 248320)
+    with pytest.raises(ValueError, match="conv_group_size"):
+        _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {**dflash2, "conv_group_size": 7}, 8, 5120, 248320)
+    with pytest.raises(ValueError, match="block size"):
+        _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {**dflash2, "conv_kernel_size": 8}, 8, 5120, 248320)

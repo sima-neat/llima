@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from sima_lmm.model.base import BaseModel
+from sima_lmm.model.dflash2_conv import DFlash2Conv
 from sima_lmm.model.model_graph import Node
 from sima_lmm.config.vlm_config import LlmArchType, SpeculativeDecodingMethod, VlmArchType
 
@@ -53,6 +54,20 @@ class LanguagePartBaseModel(BaseModel):
     @property
     def is_dflash_draft(self) -> bool:
         return self.is_draft and self.is_dflash
+
+    @property
+    def is_dflash2_draft(self) -> bool:
+        """A DFlash 2 draft adds convolutions to its layers and a candidate selector input."""
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return self.is_dflash_draft and getattr(cfg, "dflash_selector_rank", 0) > 0
+
+    def _dflash2_conv(self, graph, name: str) -> DFlash2Conv:
+        """Return the DFlash 2 convolution named ``name`` of this layer."""
+        cfg = self.cfg.lm_cfg.speculative_decoding_cfg
+        return DFlash2Conv(
+            graph, f"{self._layer_base_name}.{name}",
+            cfg.dflash_conv_kernel_size, cfg.dflash_conv_group_size,
+        )
 
     @property
     def is_eagle3_draft(self) -> bool:
@@ -163,6 +178,9 @@ class LanguagePostBaseModel(LanguagePartBaseModel):
             lm_heads.append(lm_head)
 
         if is_dflash_draft:
+            if self.is_dflash2_draft:
+                # The candidate selector scores the top logits with this rank-r projection.
+                lm_heads.append(graph.linear("candidate_selector.hidden_projection", rms_norm))
             return lm_heads
         if self.is_eagle3_draft:
             lm_heads.append(input_node)

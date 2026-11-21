@@ -467,6 +467,16 @@ void LanguageModel::_define_attn_models_iter(
             );
         }
 
+        // The DFlash 2 draft post appends the selector projection after the logits.
+        if (_cfg.lm_cfg.is_speculative_draft() && _cfg.lm_cfg.speculative_decoding_cfg
+            && _cfg.lm_cfg.speculative_decoding_cfg->is_dflash2()) {
+            post_ofms.emplace_back(
+                MLABufferSlice{
+                    &get_buffer(fmt::format("n{}_dflash2_selector_hidden", post_num_tokens))
+                }
+            );
+        }
+
         // Draft post produces an additional output: hidden states for next iteration.
         if (is_eagle3_draft || is_gemma4_mtp_draft) {
             post_ofms.emplace_back(
