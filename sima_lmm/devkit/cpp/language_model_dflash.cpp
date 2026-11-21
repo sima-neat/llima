@@ -109,11 +109,13 @@ void LanguageModel::_select_dflash2_path(uint32_t anchor_token,
       const auto *values = reinterpret_cast<const Eigen::bfloat16 *>(
           view.data + static_cast<size_t>(row) * view.row_bytes);
       for (uint32_t offset = 0; offset < view.width; ++offset) {
-        const float value = static_cast<float>(values[offset]);
-        if (heap.size() == top_k && !(value > heap.front().first)) {
+        const std::pair<float, uint32_t> candidate{static_cast<float>(values[offset]),
+                                                   view.vocab_begin + offset};
+        // A full heap admits only a better entry; equal logits keep the lower token id.
+        if (heap.size() == top_k && !worse(candidate, heap.front())) {
           continue;
         }
-        heap.emplace_back(value, view.vocab_begin + offset);
+        heap.push_back(candidate);
         std::push_heap(heap.begin(), heap.end(), worse);
         if (heap.size() > top_k) {
           std::pop_heap(heap.begin(), heap.end(), worse);
