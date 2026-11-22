@@ -1,4 +1,5 @@
 import logging
+import math
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +26,7 @@ def _detect_speculative_method(model_config: dict) -> str:
     architectures = model_config.get("architectures", [])
     if isinstance(architectures, str):
         architectures = [architectures]
-    if "DFlashDraftModel" in architectures:
+    if "DFlashDraftModel" in architectures or "DFlash2DraftModel" in architectures:
         return SpeculativeDecodingMethod.DFLASH
     if any("eagle3" in architecture.lower() for architecture in architectures):
         return SpeculativeDecodingMethod.EAGLE3
@@ -34,6 +35,52 @@ def _detect_speculative_method(model_config: dict) -> str:
         "Unsupported speculative draft configuration: "
         f"model_type={model_config.get('model_type')!r}, architectures={architectures!r}. "
         "Expected a Gemma4 MTP, EAGLE3, or DFlash draft model."
+    )
+
+
+_DFLASH2_KEYS = ("conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k")
+
+
+def _dflash2_settings(
+    model_config: dict, dflash_cfg: dict, block_size: int, hidden_size: int, vocab_size: int,
+) -> dict:
+    """Read a DFlash 2 draft's convolution and selector settings; empty for a DFlash draft."""
+    architectures = model_config.get("architectures", [])
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    present = [key for key in _DFLASH2_KEYS if dflash_cfg.get(key) is not None]
+    if "DFlash2DraftModel" not in architectures:
+        if present:
+            raise ValueError(f"DFlash draft config sets DFlash 2 keys {present} without DFlash2DraftModel")
+        return {}
+    missing = [key for key in _DFLASH2_KEYS if key not in present]
+    if missing:
+        raise ValueError(f"DFlash2DraftModel config is missing dflash_config keys {missing}")
+    kernel_size, group_size, rank, top_k = (int(dflash_cfg[key]) for key in _DFLASH2_KEYS)
+    if not 1 <= kernel_size <= block_size:
+        raise ValueError(
+            f"DFlash 2 conv_kernel_size {kernel_size} must be at least 1 and at most the block size {block_size}"
+        )
+    if group_size <= 0 or hidden_size % group_size:
+        raise ValueError(f"DFlash 2 conv_group_size {group_size} must divide the hidden size {hidden_size}")
+    if rank <= 0:
+        raise ValueError(f"DFlash 2 selector_rank {rank} must be positive")
+    if not 1 <= top_k <= vocab_size:
+        raise ValueError(f"DFlash 2 selector_top_k {top_k} must be between 1 and the vocabulary size {vocab_size}")
+    # Logit transforms ahead of selection, read from dflash_config first, then the top level, as upstream does.
+    multiplier = float(dflash_cfg.get("output_multiplier", model_config.get("output_multiplier", 1.0)))
+    softcap = dflash_cfg.get("final_logit_softcapping", model_config.get("final_logit_softcapping"))
+    softcap = float(softcap) if softcap is not None else 0.0
+    if not 0 < multiplier < math.inf:
+        # A positive scale keeps the logit order, so the runtime takes the top-k before transforming.
+        raise ValueError(f"DFlash 2 output_multiplier {multiplier} must be positive and finite")
+    return dict(
+        dflash_conv_kernel_size=kernel_size,
+        dflash_conv_group_size=group_size,
+        dflash_selector_rank=rank,
+        dflash_selector_top_k=top_k,
+        dflash_output_multiplier=multiplier,
+        dflash_final_logit_softcapping=max(softcap, 0.0),
     )
 
 
@@ -148,6 +195,7 @@ class VisionLanguageModel(BaseModel):
 
             if speculative_method == SpeculativeDecodingMethod.DFLASH:
                 dflash_cfg = model_config["dflash_config"]
+                is_causal = model_config.get("is_causal")
                 budget = speculative_block_size or 8
                 if target_model.cfg.pipeline_cfg.input_token_group_size <= budget:
                     raise ValueError(
@@ -174,6 +222,11 @@ class VisionLanguageModel(BaseModel):
                     speculative_budget=budget,
                     target_layer_ids=target_layer_ids,
                     mask_token_id=mask_token_id,
+                    dflash_is_causal=None if is_causal is None else bool(is_causal),
+                    **_dflash2_settings(
+                        model_config, dflash_cfg, budget, vlm_cfg.lm_cfg.hidden_size,
+                        target_model.cfg.lm_cfg.token_cfg.vocab_size,
+                    ),
                 )
                 target_model.cfg.lm_cfg.set_speculative_decoding_config(
                     dict(**spec_cfg, is_draft=False)

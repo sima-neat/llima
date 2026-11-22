@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -38,7 +41,133 @@ struct LanguageModel::DFlashScratch {
   std::vector<uint32_t> emitted;
   std::vector<LMHeadLogitView> logit_views;
   std::vector<Eigen::bfloat16> attention_mask;
+  // DFlash 2: top-k token ids and logits of each proposal row, row-major.
+  std::vector<uint32_t> candidate_ids;
+  std::vector<float> candidate_logits;
 };
+
+void LanguageModel::_load_dflash2_codebooks() {
+  const auto &spec = _cfg.lm_cfg.speculative_decoding_cfg.value();
+  const size_t expected_values = static_cast<size_t>(_cfg.lm_cfg.token_cfg.vocab_size) *
+                                 spec.dflash_selector_rank;
+  for (auto [name, codebook] :
+       {std::pair{"predecessor_codebook", &_dflash2_predecessor_codebook},
+        std::pair{"successor_codebook", &_dflash2_successor_codebook}}) {
+    const auto asset =
+        fmt::format("devkit/{}_dflash2_{}.bin", _cfg.language_model_name, name);
+    const auto path = _files->get_path(asset);
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+      throw std::runtime_error(
+          fmt::format("Missing DFlash 2 {} file: {}", name, path.string()));
+    }
+    const auto expected_bytes =
+        static_cast<std::uintmax_t>(expected_values * sizeof(Eigen::bfloat16));
+    const auto actual_bytes = std::filesystem::file_size(path);
+    if (actual_bytes != expected_bytes) {
+      throw std::runtime_error(fmt::format(
+          "DFlash 2 {} file {} has {} bytes, expected {} for {} tokens x rank {}. "
+          "The file is stale or truncated; recompile the model.",
+          name, path.string(), actual_bytes, expected_bytes,
+          _cfg.lm_cfg.token_cfg.vocab_size, spec.dflash_selector_rank));
+    }
+    codebook->resize(expected_values);
+    file.read(reinterpret_cast<char *>(codebook->data()),
+              static_cast<std::streamsize>(expected_bytes));
+    if (!file) {
+      throw std::runtime_error(
+          fmt::format("Failed to read DFlash 2 {} file: {}", name, path.string()));
+    }
+    _files->release(asset);
+  }
+}
+
+void LanguageModel::_select_dflash2_path(uint32_t anchor_token,
+                                         uint16_t num_tokens,
+                                         DFlashScratch &scratch) {
+  // Keep each proposal row's top-k logits, then trace one path through them:
+  // score(k) = unary(logit(k)) + sum_r pred[prev][r] * hidden[row][r] * succ[cand(k)][r].
+  const auto &spec = _cfg.lm_cfg.speculative_decoding_cfg.value();
+  const uint32_t rank = spec.dflash_selector_rank;
+  const uint32_t top_k = spec.dflash_selector_top_k;
+  // The draft's scale and soft cap keep the logit order, so they apply after the top-k.
+  const float multiplier = spec.dflash_output_multiplier;
+  const float softcap = spec.dflash_final_logit_softcapping;
+  const auto unary = [multiplier, softcap](float logit) {
+    const float scaled = logit * multiplier;
+    return softcap > 0.0f ? std::tanh(scaled / softcap) * softcap : scaled;
+  };
+  auto &proposals = scratch.proposals;
+  const int rows = static_cast<int>(proposals.size());
+  auto &ids = scratch.candidate_ids;
+  auto &logits = scratch.candidate_logits;
+  ids.resize(static_cast<size_t>(rows) * top_k);
+  logits.resize(static_cast<size_t>(rows) * top_k);
+  const auto &views = scratch.logit_views;
+
+#pragma omp parallel for schedule(static)
+  for (int row = 0; row < rows; ++row) {
+    // A min-heap of (logit, token) holds the best top_k seen so far.
+    std::vector<std::pair<float, uint32_t>> heap;
+    heap.reserve(top_k + 1);
+    const auto worse = [](const auto &lhs, const auto &rhs) {
+      return lhs.first > rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
+    };
+    for (const auto &view : views) {
+      const auto *values = reinterpret_cast<const Eigen::bfloat16 *>(
+          view.data + static_cast<size_t>(row) * view.row_bytes);
+      for (uint32_t offset = 0; offset < view.width; ++offset) {
+        const std::pair<float, uint32_t> candidate{static_cast<float>(values[offset]),
+                                                   view.vocab_begin + offset};
+        // A full heap admits only a better entry; equal logits keep the lower token id.
+        if (heap.size() == top_k && !worse(candidate, heap.front())) {
+          continue;
+        }
+        heap.push_back(candidate);
+        std::push_heap(heap.begin(), heap.end(), worse);
+        if (heap.size() > top_k) {
+          std::pop_heap(heap.begin(), heap.end(), worse);
+          heap.pop_back();
+        }
+      }
+    }
+    for (size_t k = 0; k < heap.size(); ++k) {
+      logits[static_cast<size_t>(row) * top_k + k] = unary(heap[k].first);
+      ids[static_cast<size_t>(row) * top_k + k] = heap[k].second;
+    }
+  }
+
+  auto &hidden_buffer =
+      get_buffer(fmt::format("n{}_dflash2_selector_hidden", num_tokens));
+  hidden_buffer.invalidate_cache();
+  const auto *hidden_base = static_cast<const uint8_t *>(hidden_buffer.get_virtual_addr());
+  const size_t hidden_row_bytes = hidden_buffer.get_buf_len(std::vector<uint32_t>{1, rank});
+  uint32_t predecessor = anchor_token;
+  for (int row = 0; row < rows; ++row) {
+    const auto *hidden = reinterpret_cast<const Eigen::bfloat16 *>(
+        hidden_base + static_cast<size_t>(row) * hidden_row_bytes);
+    const auto *previous =
+        _dflash2_predecessor_codebook.data() + static_cast<size_t>(predecessor) * rank;
+    float best_score = -std::numeric_limits<float>::infinity();
+    uint32_t best_token = ids[static_cast<size_t>(row) * top_k];
+    for (uint32_t k = 0; k < top_k; ++k) {
+      const uint32_t token = ids[static_cast<size_t>(row) * top_k + k];
+      const auto *next =
+          _dflash2_successor_codebook.data() + static_cast<size_t>(token) * rank;
+      float score = logits[static_cast<size_t>(row) * top_k + k];
+      for (uint32_t r = 0; r < rank; ++r) {
+        score += static_cast<float>(previous[r]) * static_cast<float>(hidden[r]) *
+                 static_cast<float>(next[r]);
+      }
+      if (score > best_score || (score == best_score && token < best_token)) {
+        best_score = score;
+        best_token = token;
+      }
+    }
+    proposals[row] = best_token;
+    predecessor = best_token;
+  }
+}
 
 MLABuffer* LanguageModel::_get_dflash_hidden_buffer(uint16_t num_tokens, uint8_t layer_idx) {
   const auto& layers = _cfg.lm_cfg.speculative_decoding_cfg->target_layer_ids;
@@ -206,16 +335,18 @@ void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
 
   for (uint16_t query = 0; query < num_tokens; ++query) {
     const uint16_t query_position = token_idx + query;
-    const uint16_t end = bidirectional
-                             ? token_idx + num_tokens
-                             : static_cast<uint16_t>(query_position + 1);
-    const uint16_t begin =
-        layer_type == "sliding_attention"
-            ? std::max<uint16_t>(
-                  cache_begin,
-                  end - std::min<uint16_t>(
-                            end, _cfg.lm_cfg.attn_cfg.sliding_window.value()))
-            : 0;
+    const uint16_t causal_end = query_position + 1;
+    uint16_t end = bidirectional ? token_idx + num_tokens : causal_end;
+    uint16_t begin = 0;
+    if (layer_type == "sliding_attention") {
+      // The window limits keys on both sides of the query.
+      const uint32_t window = _cfg.lm_cfg.attn_cfg.sliding_window.value();
+      begin = std::max<uint16_t>(
+          cache_begin, static_cast<uint16_t>(
+                           causal_end - std::min<uint32_t>(causal_end, window)));
+      end = static_cast<uint16_t>(
+          std::min<uint32_t>(end, query_position + window));
+    }
     std::fill(mask.begin() + static_cast<size_t>(query) * aligned_context +
                   begin - cache_begin,
               mask.begin() + static_cast<size_t>(query) * aligned_context +
@@ -311,7 +442,8 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const bool bidirectional = layer_type == "full_attention";
+    const bool bidirectional =
+        !_cfg.lm_cfg.speculative_decoding_cfg->is_dflash_causal(layer_type);
     if (!active_mask_type.has_value() || *active_mask_type != layer_type) {
       MLAModelWithBuffer::run_queue();
       _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx,
@@ -339,9 +471,13 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
     view.buffer->invalidate_cache();
   }
 
+  if (_cfg.lm_cfg.speculative_decoding_cfg.value().is_dflash2()) {
+    _select_dflash2_path(anchor_token, num_tokens, scratch);
+  } else {
 #pragma omp parallel for schedule(static)
-  for (int row = 0; row < static_cast<int>(proposals.size()); ++row) {
-    proposals[row] = _argmax_lm_head_row(views, row);
+    for (int row = 0; row < static_cast<int>(proposals.size()); ++row) {
+      proposals[row] = _argmax_lm_head_row(views, row);
+    }
   }
 
   // Drop the noisy block. The next accepted target context overwrites its rows.

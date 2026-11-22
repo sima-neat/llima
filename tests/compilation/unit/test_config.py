@@ -307,6 +307,17 @@ def _dflash_draft_config() -> VlmConfig:
     return config
 
 
+@pytest.mark.parametrize("is_causal", [None, False, True])
+def test_dflash_draft_causality_survives_serialization(is_causal):
+    config = _dflash_draft_config()
+    config.lm_cfg.set_speculative_decoding_config(
+        {**asdict(config.lm_cfg.speculative_decoding_cfg), "dflash_is_causal": is_causal}
+    )
+
+    restored = VlmConfig.load(json.loads(json.dumps(asdict(config))))
+    assert restored.lm_cfg.speculative_decoding_cfg.dflash_is_causal is is_causal
+
+
 def test_dflash_draft_layers_keep_prefill_and_verification_widths_separate(tmp_path):
     config = _dflash_draft_config()
 

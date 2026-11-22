@@ -283,7 +283,9 @@ show this API in use; their attention, MLP and rotary helpers share the same
 implementations. DFlash context fusion, K/V projection and state resolver components
 also use `generate_graph()` and `ModelGraph`. Its final draft graph keeps the paired
 target's packed output-head weights and scales; verification retains the S1 and
-solved-intermediate outputs expected by the runtime resolver.
+solved-intermediate outputs expected by the runtime resolver. DFlash 2 drafts add
+`DFlash2Conv` (`sima_lmm/model/dflash2_conv.py`) around attention and the MLP, and their
+final draft graph appends the selector's hidden projection after the output-head splits.
 
 ## Testing
 

@@ -107,6 +107,8 @@ class LanguagePreModel(LanguagePartBaseModel):
         if self.is_eagle3_draft:
             hidden_states_norm = graph.rms_norm(f"{base_name}.hidden_norm", inputs["hidden_states"])
             attn_input = graph.concat([rms_norm, hidden_states_norm], 3)
+        elif self.is_dflash2_draft:
+            attn_input = self._dflash2_conv(graph, "attention_conv").prepare(rms_norm)
         else:
             attn_input = rms_norm
         mla_q_result = self._build_attn_query(

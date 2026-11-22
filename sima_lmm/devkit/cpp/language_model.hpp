@@ -321,6 +321,13 @@ class LanguageModel : public BaseModel<VlmConfig> {
             LanguageModel& target_lm, uint32_t anchor_token, uint16_t token_idx,
             DFlashScratch& scratch
         );
+        void _load_dflash2_codebooks();
+        void _select_dflash2_path(
+            uint32_t anchor_token, uint16_t num_tokens, DFlashScratch& scratch
+        );
+        // DFlash 2 candidate selector codebooks, (vocab_size, selector_rank) each.
+        std::vector<Eigen::bfloat16> _dflash2_predecessor_codebook;
+        std::vector<Eigen::bfloat16> _dflash2_successor_codebook;
         std::optional<std::vector<uint32_t>> _run_model_dflash_speculative_decoding(
             LanguageModel& draft_lm,
             std::span<const uint32_t> input_token_ids,

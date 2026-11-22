@@ -146,6 +146,14 @@ llima-compile <target-model-path> --draft_model_path <dflash-draft-path> \
     --speculative_block_size 16
 ```
 
+DFlash 2 drafts (`DFlash2DraftModel`, for example `z-lab/Qwen3.8-27B-DFlash2`) use the
+same command. Their dynamic convolutions compile into the draft layers, and the candidate
+selector's two codebooks are written to the draft's `devkit/` directory as
+`<model>_dflash2_predecessor_codebook.bin` and `<model>_dflash2_successor_codebook.bin`
+(`vocab_size x selector_rank` BF16 each). The runtime keeps each proposal row's
+`selector_top_k` logits and traces one path through them, so greedy output still matches
+the target model.
+
 ## System Prompts
 
 Use `--system_prompt` or `--system_prompt_file` to store a system prompt in the
