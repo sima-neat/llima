@@ -204,6 +204,9 @@ struct SpeculativeDecodingConfig {
     uint16_t dflash_conv_group_size = 0;
     uint32_t dflash_selector_rank = 0;
     uint32_t dflash_selector_top_k = 0;
+    // Scale on the draft logits before selection, then a soft cap when positive.
+    float dflash_output_multiplier = 1.0f;
+    float dflash_final_logit_softcapping = 0.0f;
 
     bool is_dflash() const { return method == "dflash"; }
     bool is_dflash2() const { return is_dflash() && dflash_selector_rank > 0; }
@@ -218,7 +221,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     backbone_hidden_size, use_ordered_embeddings, num_centroids,
     centroid_intermediate_top_k, target_layer_ids, mask_token_id,
     dflash_is_causal, dflash_conv_kernel_size, dflash_conv_group_size,
-    dflash_selector_rank, dflash_selector_top_k
+    dflash_selector_rank, dflash_selector_top_k, dflash_output_multiplier,
+    dflash_final_logit_softcapping
 )
 
 struct MixtureOfExpertsConfig {

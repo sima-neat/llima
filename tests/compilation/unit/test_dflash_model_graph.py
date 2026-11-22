@@ -263,7 +263,17 @@ def test_dflash2_settings_accept_dflash2_and_reject_mixed_configs():
     assert _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, dflash2, 8, 5120, 248320) == dict(
         dflash_conv_kernel_size=2, dflash_conv_group_size=16,
         dflash_selector_rank=256, dflash_selector_top_k=16,
+        dflash_output_multiplier=1.0, dflash_final_logit_softcapping=0.0,
     )
+    # Logit transforms come from dflash_config first, then the top level, as upstream reads them.
+    transformed = _dflash2_settings(
+        {"architectures": ["DFlash2DraftModel"], "output_multiplier": 0.5, "final_logit_softcapping": 30.0},
+        {**dflash2, "output_multiplier": 2.0}, 8, 5120, 248320,
+    )
+    assert (transformed["dflash_output_multiplier"], transformed["dflash_final_logit_softcapping"]) == (2.0, 30.0)
+    with pytest.raises(ValueError, match="output_multiplier"):
+        _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {**dflash2, "output_multiplier": -1.0}, 8,
+                          5120, 248320)
     assert _dflash2_settings({"architectures": ["DFlashDraftModel"]}, {}, 8, 5120, 248320) == {}
     with pytest.raises(ValueError, match="without DFlash2DraftModel"):
         _dflash2_settings({"architectures": ["DFlashDraftModel"]}, dflash2, 8, 5120, 248320)

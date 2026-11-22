@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -85,10 +86,17 @@ void LanguageModel::_select_dflash2_path(uint32_t anchor_token,
                                          uint16_t num_tokens,
                                          DFlashScratch &scratch) {
   // Keep each proposal row's top-k logits, then trace one path through them:
-  // score(k) = logit(k) + sum_r pred[prev][r] * hidden[row][r] * succ[cand(k)][r].
+  // score(k) = unary(logit(k)) + sum_r pred[prev][r] * hidden[row][r] * succ[cand(k)][r].
   const auto &spec = _cfg.lm_cfg.speculative_decoding_cfg.value();
   const uint32_t rank = spec.dflash_selector_rank;
   const uint32_t top_k = spec.dflash_selector_top_k;
+  // The draft's scale and soft cap keep the logit order, so they apply after the top-k.
+  const float multiplier = spec.dflash_output_multiplier;
+  const float softcap = spec.dflash_final_logit_softcapping;
+  const auto unary = [multiplier, softcap](float logit) {
+    const float scaled = logit * multiplier;
+    return softcap > 0.0f ? std::tanh(scaled / softcap) * softcap : scaled;
+  };
   auto &proposals = scratch.proposals;
   const int rows = static_cast<int>(proposals.size());
   auto &ids = scratch.candidate_ids;
@@ -124,7 +132,7 @@ void LanguageModel::_select_dflash2_path(uint32_t anchor_token,
       }
     }
     for (size_t k = 0; k < heap.size(); ++k) {
-      logits[static_cast<size_t>(row) * top_k + k] = heap[k].first;
+      logits[static_cast<size_t>(row) * top_k + k] = unary(heap[k].first);
       ids[static_cast<size_t>(row) * top_k + k] = heap[k].second;
     }
   }

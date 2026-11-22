@@ -1,4 +1,5 @@
 import logging
+import math
 import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,11 +67,20 @@ def _dflash2_settings(
         raise ValueError(f"DFlash 2 selector_rank {rank} must be positive")
     if not 1 <= top_k <= vocab_size:
         raise ValueError(f"DFlash 2 selector_top_k {top_k} must be between 1 and the vocabulary size {vocab_size}")
+    # Logit transforms ahead of selection, read from dflash_config first, then the top level, as upstream does.
+    multiplier = float(dflash_cfg.get("output_multiplier", model_config.get("output_multiplier", 1.0)))
+    softcap = dflash_cfg.get("final_logit_softcapping", model_config.get("final_logit_softcapping"))
+    softcap = float(softcap) if softcap is not None else 0.0
+    if not 0 < multiplier < math.inf:
+        # A positive scale keeps the logit order, so the runtime takes the top-k before transforming.
+        raise ValueError(f"DFlash 2 output_multiplier {multiplier} must be positive and finite")
     return dict(
         dflash_conv_kernel_size=kernel_size,
         dflash_conv_group_size=group_size,
         dflash_selector_rank=rank,
         dflash_selector_top_k=top_k,
+        dflash_output_multiplier=multiplier,
+        dflash_final_logit_softcapping=max(softcap, 0.0),
     )
 
 

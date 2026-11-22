@@ -663,6 +663,8 @@ class SpeculativeDecodingConfig(BaseConfig):
         dflash_conv_group_size: Channels sharing one DFlash 2 dynamic convolution weight.
         dflash_selector_rank: Rank of the DFlash 2 candidate selector codebooks; 0 for DFlash.
         dflash_selector_top_k: Candidates the DFlash 2 selector keeps at each draft position.
+        dflash_output_multiplier: Scale on the DFlash 2 draft logits before selection.
+        dflash_final_logit_softcapping: Soft cap on the scaled DFlash 2 draft logits; 0 for none.
     """
     method: str = SpeculativeDecodingMethod.EAGLE3
     is_draft: bool = False
@@ -678,6 +680,8 @@ class SpeculativeDecodingConfig(BaseConfig):
     dflash_conv_group_size: int = 0
     dflash_selector_rank: int = 0
     dflash_selector_top_k: int = 0
+    dflash_output_multiplier: float = 1.0
+    dflash_final_logit_softcapping: float = 0.0
 
     @property
     def is_dflash2(self) -> bool:
