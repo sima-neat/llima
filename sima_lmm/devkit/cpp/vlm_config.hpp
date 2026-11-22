@@ -196,6 +196,9 @@ struct SpeculativeDecodingConfig {
 
     std::vector<uint8_t> target_layer_ids = {};
     int32_t mask_token_id = -1;
+    // The DFlash draft's is_causal for every attention layer; unset keeps
+    // sliding layers causal and full layers bidirectional.
+    std::optional<bool> dflash_is_causal;
     // DFlash 2 only; zero for DFlash drafts and every other method.
     uint16_t dflash_conv_kernel_size = 0;
     uint16_t dflash_conv_group_size = 0;
@@ -204,6 +207,9 @@ struct SpeculativeDecodingConfig {
 
     bool is_dflash() const { return method == "dflash"; }
     bool is_dflash2() const { return is_dflash() && dflash_selector_rank > 0; }
+    bool is_dflash_causal(const std::string& layer_type) const {
+        return dflash_is_causal.value_or(layer_type == "sliding_attention");
+    }
     bool is_eagle3() const { return method == "eagle3"; }
     bool is_gemma4_mtp() const { return method == "gemma4_mtp"; }
 };
@@ -211,8 +217,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     SpeculativeDecodingConfig, method, is_draft, speculative_budget,
     backbone_hidden_size, use_ordered_embeddings, num_centroids,
     centroid_intermediate_top_k, target_layer_ids, mask_token_id,
-    dflash_conv_kernel_size, dflash_conv_group_size, dflash_selector_rank,
-    dflash_selector_top_k
+    dflash_is_causal, dflash_conv_kernel_size, dflash_conv_group_size,
+    dflash_selector_rank, dflash_selector_top_k
 )
 
 struct MixtureOfExpertsConfig {

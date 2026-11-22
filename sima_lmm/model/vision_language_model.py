@@ -56,9 +56,9 @@ def _dflash2_settings(
     if missing:
         raise ValueError(f"DFlash2DraftModel config is missing dflash_config keys {missing}")
     kernel_size, group_size, rank, top_k = (int(dflash_cfg[key]) for key in _DFLASH2_KEYS)
-    if not 1 <= kernel_size < block_size:
+    if not 1 <= kernel_size <= block_size:
         raise ValueError(
-            f"DFlash 2 conv_kernel_size {kernel_size} must be at least 1 and below the block size {block_size}"
+            f"DFlash 2 conv_kernel_size {kernel_size} must be at least 1 and at most the block size {block_size}"
         )
     if group_size <= 0 or hidden_size % group_size:
         raise ValueError(f"DFlash 2 conv_group_size {group_size} must divide the hidden size {hidden_size}")
@@ -185,6 +185,7 @@ class VisionLanguageModel(BaseModel):
 
             if speculative_method == SpeculativeDecodingMethod.DFLASH:
                 dflash_cfg = model_config["dflash_config"]
+                is_causal = model_config.get("is_causal")
                 budget = speculative_block_size or 8
                 if target_model.cfg.pipeline_cfg.input_token_group_size <= budget:
                     raise ValueError(
@@ -211,6 +212,7 @@ class VisionLanguageModel(BaseModel):
                     speculative_budget=budget,
                     target_layer_ids=target_layer_ids,
                     mask_token_id=mask_token_id,
+                    dflash_is_causal=None if is_causal is None else bool(is_causal),
                     **_dflash2_settings(
                         model_config, dflash_cfg, budget, vlm_cfg.lm_cfg.hidden_size,
                         target_model.cfg.lm_cfg.token_cfg.vocab_size,

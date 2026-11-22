@@ -195,14 +195,25 @@ def _reference_dflash2_conv(hidden, dynamic, base, group_size):
 
 
 @pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize("full_block_kernel", [False, True])
 @pytest.mark.parametrize("tokens", [4, 8, 16])
-def test_dflash2_conv_matches_reference(tmp_path, tokens, quantizable):
+def test_dflash2_conv_matches_reference(tmp_path, tokens, full_block_kernel, quantizable):
     from sima_lmm.model.dflash2_conv import DFlash2Conv
 
     model = _model(LanguagePreModel, tmp_path, tokens, dflash2=True)
+    kernel_size = tokens if full_block_kernel else 2
+    if full_block_kernel:
+        rng = np.random.default_rng(13)
+        overrides = {
+            "layers.0.attention_conv.base_kernel": rng.normal(0, 0.5, (2, kernel_size, 32)).astype(np.float32),
+            "layers.0.attention_conv.kernel_projection.weight":
+                rng.normal(0, 0.05, (2 * kernel_size * 2, 32)).astype(np.float32),
+        }
+        params = model.get_hf_param
+        model.get_hf_param = lambda name: overrides[name] if name in overrides else params(name)
     shape = (1, 1, tokens, 32)
     graph = ModelGraph(model, {"input": shape, "sublayer": shape}, quantizable)
-    conv = DFlash2Conv(graph, "layers.0.attention_conv", kernel_size=2, group_size=16)
+    conv = DFlash2Conv(graph, "layers.0.attention_conv", kernel_size=kernel_size, group_size=16)
     prepared = conv.prepare(graph.inputs["input"])
     finished = conv.finish(graph.inputs["sublayer"])
     rng = np.random.default_rng(5)
@@ -212,7 +223,7 @@ def test_dflash2_conv_matches_reference(tmp_path, tokens, quantizable):
     weight = model.get_hf_param("layers.0.attention_conv.kernel_projection.weight")
     base = model.get_hf_param("layers.0.attention_conv.base_kernel")
     x, y = values["input"][0, 0], values["sublayer"][0, 0]
-    dynamic = (x @ weight.T).reshape(tokens, 2, 2, 2)  # (tokens, stage, tap, group)
+    dynamic = (x @ weight.T).reshape(tokens, 2, kernel_size, 2)  # (tokens, stage, tap, group)
     expected = [
         _reference_dflash2_conv(x, dynamic[:, 0], base[0], 16),
         _reference_dflash2_conv(y, dynamic[:, 1], base[1], 16),
@@ -260,5 +271,8 @@ def test_dflash2_settings_accept_dflash2_and_reject_mixed_configs():
         _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {"conv_kernel_size": 2}, 8, 5120, 248320)
     with pytest.raises(ValueError, match="conv_group_size"):
         _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {**dflash2, "conv_group_size": 7}, 8, 5120, 248320)
+    full_block = _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {**dflash2, "conv_kernel_size": 8}, 8,
+                                   5120, 248320)
+    assert full_block["dflash_conv_kernel_size"] == 8
     with pytest.raises(ValueError, match="block size"):
-        _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {**dflash2, "conv_kernel_size": 8}, 8, 5120, 248320)
+        _dflash2_settings({"architectures": ["DFlash2DraftModel"]}, {**dflash2, "conv_kernel_size": 9}, 8, 5120, 248320)

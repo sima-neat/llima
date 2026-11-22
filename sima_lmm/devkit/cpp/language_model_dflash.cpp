@@ -327,16 +327,18 @@ void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
 
   for (uint16_t query = 0; query < num_tokens; ++query) {
     const uint16_t query_position = token_idx + query;
-    const uint16_t end = bidirectional
-                             ? token_idx + num_tokens
-                             : static_cast<uint16_t>(query_position + 1);
-    const uint16_t begin =
-        layer_type == "sliding_attention"
-            ? std::max<uint16_t>(
-                  cache_begin,
-                  end - std::min<uint16_t>(
-                            end, _cfg.lm_cfg.attn_cfg.sliding_window.value()))
-            : 0;
+    const uint16_t causal_end = query_position + 1;
+    uint16_t end = bidirectional ? token_idx + num_tokens : causal_end;
+    uint16_t begin = 0;
+    if (layer_type == "sliding_attention") {
+      // The window limits keys on both sides of the query.
+      const uint32_t window = _cfg.lm_cfg.attn_cfg.sliding_window.value();
+      begin = std::max<uint16_t>(
+          cache_begin, static_cast<uint16_t>(
+                           causal_end - std::min<uint32_t>(causal_end, window)));
+      end = static_cast<uint16_t>(
+          std::min<uint32_t>(end, query_position + window));
+    }
     std::fill(mask.begin() + static_cast<size_t>(query) * aligned_context +
                   begin - cache_begin,
               mask.begin() + static_cast<size_t>(query) * aligned_context +
@@ -432,7 +434,8 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const bool bidirectional = layer_type == "full_attention";
+    const bool bidirectional =
+        !_cfg.lm_cfg.speculative_decoding_cfg->is_dflash_causal(layer_type);
     if (!active_mask_type.has_value() || *active_mask_type != layer_type) {
       MLAModelWithBuffer::run_queue();
       _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx,

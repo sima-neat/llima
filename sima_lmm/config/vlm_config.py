@@ -657,6 +657,8 @@ class SpeculativeDecodingConfig(BaseConfig):
         centroid_intermediate_top_k: Number of active centroids during draft selection.
         target_layer_ids: Target layers consumed by DFlash context fusion.
         mask_token_id: DFlash mask token filling the proposal block.
+        dflash_is_causal: The DFlash draft's ``is_causal`` for every attention layer; None keeps sliding layers
+            causal and full layers bidirectional.
         dflash_conv_kernel_size: DFlash 2 causal convolution taps per draft layer; 0 for DFlash.
         dflash_conv_group_size: Channels sharing one DFlash 2 dynamic convolution weight.
         dflash_selector_rank: Rank of the DFlash 2 candidate selector codebooks; 0 for DFlash.
@@ -671,6 +673,7 @@ class SpeculativeDecodingConfig(BaseConfig):
     centroid_intermediate_top_k: int = 0
     target_layer_ids: list[int] = field(default_factory=list)
     mask_token_id: int = -1
+    dflash_is_causal: bool | None = None
     dflash_conv_kernel_size: int = 0
     dflash_conv_group_size: int = 0
     dflash_selector_rank: int = 0
