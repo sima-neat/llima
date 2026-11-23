@@ -227,24 +227,42 @@ log "Validated ${#debs[@]} Debian package(s); LLiMa version ${expected_version}.
 # log "Refreshing APT package indexes."
 # run_sudo apt-get update
 
-simulate_output="$(mktemp /tmp/install-llima-apt-simulate.XXXXXX)"
-trap 'rm -f "${simulate_output}"' EXIT
-if ! apt-get install --simulate --reinstall --allow-downgrades "${debs[@]}" >"${simulate_output}" 2>&1; then
-  cat "${simulate_output}" >&2
+apt_log="$(mktemp /tmp/install-llima-apt.XXXXXX)"
+trap 'rm -f "${apt_log}"' EXIT
+if ! apt-get install --simulate --reinstall --allow-downgrades "${debs[@]}" >"${apt_log}" 2>&1; then
+  cat "${apt_log}" >&2
   echo "APT cannot satisfy the bundled LLiMa package transaction." >&2
   exit 1
 fi
-mapfile -t removed_packages < <(awk '$1 == "Remv" {print $2}' "${simulate_output}")
-if [[ "${#removed_packages[@]}" -gt 0 ]]; then
-  for package in "${removed_packages[@]}"; do
-    cat "${simulate_output}" >&2
-    echo "Refusing to install because APT would remove ${package}." >&2
-    exit 1
-  done
+mapfile -t removed_packages < <(awk '$1 == "Remv" || $1 == "Purg" {print $2}' "${apt_log}")
+allowed_removals=()
+for package in "${removed_packages[@]}"; do
+  case "${package%%:*}" in
+    sima-neat|sima-neat-dev) allowed_removals+=("${package%%:*}") ;;
+    *)
+      cat "${apt_log}" >&2
+      echo "Refusing to install because APT would remove ${package}." >&2
+      exit 1
+      ;;
+  esac
+done
+
+removal_options=(--no-remove)
+if (( ${#allowed_removals[@]} )); then
+  # Check APT's locked transaction too. Its v2 hook supplies package, old version,
+  # direction, new version and action. Package names here come from the allowlist above.
+  guard='NR == 1 && $0 != "VERSION 2" {exit 1}
+    NF == 0 {actions = 1}
+    actions && $5 == "**REMOVE**" {
+      if (!index(allowed, " " $1 " ")) {print "Refusing to remove " $1 > "/dev/stderr"; exit 1}
+      print "[install_llima] Removing " $1 " " $2
+    }'
+  removal_options=(-o "DPkg::Tools::Options::/usr/bin/awk::Version=2"
+                   -o "DPkg::Pre-Install-Pkgs::=/usr/bin/awk -v allowed=' ${allowed_removals[*]} ' '${guard}'")
 fi
 
 log "Installing LLiMa packages."
-run_sudo apt-get install -y --reinstall --allow-downgrades "${debs[@]}"
+run_sudo apt-get install -y --reinstall --allow-downgrades "${removal_options[@]}" "${debs[@]}" | tee "${apt_log}"
 
 for deb_path in "${debs[@]}"; do
   package="$(dpkg-deb -f "${deb_path}" Package)"
@@ -262,3 +280,7 @@ if ! command -v llima >/dev/null 2>&1; then
 fi
 llima --help >/dev/null
 log "LLiMa ${expected_version} installed successfully."
+mapfile -t removed_core < <(sed -n 's/^\[install_llima\] Removing //p' "${apt_log}")
+if (( ${#removed_core[@]} )); then
+  log "Removed Core packages: ${removed_core[*]}. Install a matching Core before using NEAT GenAI (sima-cli neat install core)."
+fi
