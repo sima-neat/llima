@@ -39,6 +39,7 @@ struct LanguageCache;
 struct LanguageWorkspace;
 struct LanguageRunState;
 class LanguageExecutor;
+class LanguageRequest;
 // Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
 // (num_tokens, cache_kind, aligned_cache_token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
@@ -296,8 +297,12 @@ class LanguageModel {
         friend struct LanguageCache;
         friend struct LanguageWorkspace;
         friend class VisionLanguageModel;
-        friend class VisionLanguageRequest;
+        friend class LanguageRequest;
         friend class LanguageExecutor;
+        std::optional<std::vector<uint32_t>> _generate_tokens(
+            LanguageRequest& request, std::span<const uint32_t> ids,
+            std::optional<uint16_t> limit, std::optional<ChronoTimer> timer,
+            GenerationPerformanceResult* performance, uint16_t stable_prefix);
         std::optional<std::vector<uint32_t>> _run_model_ordinary(
             std::span<const uint32_t> ids, std::optional<ChronoTimer> timer,
             uint16_t stable_prefix, GenerationPerformanceResult* performance);

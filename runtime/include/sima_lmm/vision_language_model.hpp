@@ -26,7 +26,8 @@ namespace llima {
 class CLI;
 class WEB;
 struct LanguageRunnerState;
-class VisionLanguageRequest;
+class LanguageRequest;
+struct PreprocessedChat;
 struct VlmConfig;
 class VisionModel;
 
@@ -127,9 +128,9 @@ class VisionLanguageModel {
         const VlmConfig& config() const;
         std::optional<std::vector<uint32_t>> benchmark_chat(
             const Chat& chat, const GenerationOptions& options, ChatBenchmark& benchmark);
-        std::optional<std::vector<uint32_t>> generate_chat_tokens(
-            VisionLanguageRequest& request, const Chat& chat, const GenerationOptions& options,
-            GenerationPerformanceResult* performance, ChatBenchmark* benchmark = nullptr);
+        PreprocessedChat prepare_chat_inputs(
+            LanguageRequest& request, const Chat& chat, const GenerationOptions& options,
+            ChatBenchmark* benchmark = nullptr);
 };
 
 }

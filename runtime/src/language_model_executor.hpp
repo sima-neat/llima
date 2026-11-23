@@ -1,6 +1,6 @@
 #pragma once
 
-// Private execution helpers shared by ordinary and speculative algorithms.
+// Private layer binding and scheduling helpers shared by the decoding algorithms.
 #include "language_model_state.hpp"
 #include "runtime_context.hpp"
 
@@ -48,29 +48,6 @@ class LanguageExecutor {
                             LayerOutput output = LayerOutput::AllRows, uint16_t logit_row = 0);
 
     static std::unique_lock<std::recursive_mutex> lock_execution();
-
-    class Run {
-      public:
-        Run(LanguageModel& target, LanguageModel* draft = nullptr,
-            TextStreamer::RequestOptions stream = {}, std::stop_token stop = {},
-            std::optional<std::set<uint32_t>> stop_ids = std::nullopt);
-        ~Run();
-        void complete();
-        bool cancelled() const { return _completed ? _cancelled_at_finish : _request.cancelled(); }
-        bool length_limit_reached() const { return _request.length_limit_reached; }
-        std::optional<std::vector<uint32_t>> generate(std::span<const uint32_t> ids,
-            std::optional<uint16_t> limit, std::optional<ChronoTimer> timer,
-            GenerationPerformanceResult* performance, uint16_t stable_prefix);
-        Run(const Run&) = delete;
-        Run& operator=(const Run&) = delete;
-
-      private:
-        LanguageModel& _target;
-        LanguageModel* _draft;
-        LanguageRequestState _request;
-        bool _completed = false;
-        bool _cancelled_at_finish = false;
-    };
 
   private:
     static Overrides post_rows(LanguageModel& model, uint16_t width, uint8_t layer,

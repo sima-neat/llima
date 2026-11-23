@@ -23,6 +23,7 @@
 #include "language_model.hpp"
 #include "language_model_executor.hpp"
 #include "language_model_state.hpp"
+#include "language_request.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -338,10 +339,32 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         if (performance) *performance = {};
         return std::nullopt;
     }
-    LanguageExecutor::Run run(*this, nullptr, {}, stop, std::move(override_stop_token_ids));
-    auto output = run.generate(input_token_ids, override_max_num_tokens, timer_ttft, performance, stable_prefix_token_count);
-    run.complete();
-    return run.cancelled() ? std::nullopt : output;
+    LanguageRequest request(*this, nullptr, {}, stop, std::move(override_stop_token_ids));
+    auto output = _generate_tokens(request, input_token_ids, override_max_num_tokens,
+                                   timer_ttft, performance, stable_prefix_token_count);
+    request.finish();
+    return request.cancelled() ? std::nullopt : output;
+}
+
+std::optional<std::vector<uint32_t>> LanguageModel::_generate_tokens(
+    LanguageRequest& request, std::span<const uint32_t> ids, std::optional<uint16_t> limit,
+    std::optional<ChronoTimer> timer, GenerationPerformanceResult* performance, uint16_t stable_prefix
+) {
+    if (request.cancelled()) {
+        if (performance) *performance = {};
+        return std::nullopt;
+    }
+    auto& max_tokens = _run->limits().max_num_tokens;
+    if (limit) max_tokens = std::min(*limit, _cfg.pipeline_cfg.max_num_tokens);
+    auto* draft = request.draft();
+    if (!draft) return _run_model_ordinary(ids, timer, stable_prefix, performance);
+    const auto& spec = *_cfg.lm_cfg.speculative_decoding_cfg;
+    if (spec.is_gemma4_mtp())
+        return _run_model_gemma4_mtp(*draft, ids, max_tokens, timer, performance);
+    if (spec.is_dflash())
+        return _run_model_dflash_speculative_decoding(*draft, ids, max_tokens, timer,
+                                                      performance, stable_prefix);
+    return _run_model_eagle3_speculative_decoding(*draft, ids, max_tokens, timer, performance);
 }
 
 std::optional<std::vector<uint32_t>> LanguageModel::_run_model_ordinary(
@@ -413,11 +436,11 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         if (performance_result) *performance_result = {};
         return std::nullopt;
     }
-    LanguageExecutor::Run run(*this, &draft_lm, {}, stop);
-    auto output = run.generate(input_token_ids, override_max_num_tokens, timer_ttft,
-                               performance_result, stable_prefix_token_count);
-    run.complete();
-    return run.cancelled() ? std::nullopt : output;
+    LanguageRequest request(*this, &draft_lm, {}, stop);
+    auto output = _generate_tokens(request, input_token_ids, override_max_num_tokens, timer_ttft,
+                                   performance_result, stable_prefix_token_count);
+    request.finish();
+    return request.cancelled() ? std::nullopt : output;
 }
 
 namespace {
@@ -638,9 +661,9 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     std::span<const uint32_t> continuation_token_ids,
     bool use_group_prefill
 ) {
-    LanguageExecutor::Run run(*this);
+    LanguageRequest request(*this);
     auto result = _score(input_token_ids, continuation_start, continuation_token_ids, use_group_prefill);
-    run.complete();
+    request.finish();
     return result;
 }
 
