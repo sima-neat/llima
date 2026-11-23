@@ -1,3 +1,5 @@
+add_test(runtime.attention_cache "./sima_lmm_attention_cache_test")
+set_tests_properties(runtime.attention_cache PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)
 add_test(runtime.embedding_offload "./sima_lmm_embedding_offload_test")
 set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
 add_test(runtime.embedding_offload_generation "./sima_lmm_embedding_offload_generation_test")

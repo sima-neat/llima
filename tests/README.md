@@ -15,6 +15,15 @@ Compiler tests live under `tests/compilation/`. Runtime tests live under
 `tests/runtime/`. Runtime coverage never falls back to host-only execution or
 mock hardware services.
 
+The attention-cache binding tests also run on a development host with a C++20
+compiler and the Eigen, nlohmann-json, fmt and spdlog development headers.
+
+```bash
+cmake -S tests/runtime/host -B /tmp/llima-host-tests
+cmake --build /tmp/llima-host-tests
+ctest --test-dir /tmp/llima-host-tests --output-on-failure
+```
+
 ### CI test scope selection
 
 Vulcan CI compares feature branches with `develop` and independently decides

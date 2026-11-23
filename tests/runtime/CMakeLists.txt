@@ -1,3 +1,6 @@
+add_subdirectory(host)
+install(TARGETS sima_lmm_attention_cache_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+
 add_executable(sima_lmm_embedding_offload_generation_test embedding_offload_generation_test.cpp)
 target_link_libraries(sima_lmm_embedding_offload_generation_test PRIVATE sima_lmm_runtime)
 add_executable(sima_lmm_embedding_offload_test embedding_offload_test.cpp
@@ -217,6 +220,7 @@ install(
         text_generation_test.cpp
         "${PROJECT_SOURCE_DIR}/runtime/include/sima_lmm/reasoning_parser.hpp"
         "${PROJECT_SOURCE_DIR}/runtime/src/gemma4_mtp_helpers.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/attention_cache.hpp"
         reasoning_parser_test.cpp
         tool_call_parser_test.cpp
         vision_generation_test.cpp
