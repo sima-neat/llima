@@ -741,18 +741,6 @@ void MLAModelWithBuffer::free_all_models(
     }
 }
 
-void MLAModelWithBuffer::_record_buffer_bindings(
-    std::map<std::string, std::vector<MLABuffer**>>& bindings
-) {
-    for (auto* slices : {&_ifms, &_ofms}) {
-        for (auto& slice : *slices) {
-            if (!slice._buf_ptr) continue;
-            if (auto found = bindings.find(slice._buf_ptr->get_name()); found != bindings.end())
-                found->second.push_back(&slice._buf_ptr);
-        }
-    }
-}
-
 void MLAModelWithBuffer::rebind_buffers(
     const std::map<MLABuffer*, MLABuffer*>& replacements
 ) {

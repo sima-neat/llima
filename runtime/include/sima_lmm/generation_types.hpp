@@ -7,10 +7,6 @@
 
 namespace simaai::llima {
 
-// IDs belong to the model that created them.
-enum class SessionId : uint64_t {};
-inline constexpr SessionId kDefaultSession{0};
-
 struct LogLikelihoodResult {
     double logprob;
     bool is_greedy;

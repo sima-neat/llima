@@ -84,7 +84,6 @@ VisionLanguageRequest::VisionLanguageRequest(std::shared_ptr<LanguageRunnerState
         _target_lock.unlock();
     }
     if (options.stop.stop_requested()) return;
-    _target->language_model_ptr->_select_request_sessions(options.session, draft());
     if (chat) {
         markers = _target->structural_tokens(*chat);
         if (!options.preserve_structural_tokens) markers.clear();
@@ -111,7 +110,7 @@ std::optional<uint16_t> context_limit(size_t prompt_size, std::optional<uint16_t
 std::unique_lock<std::mutex> idle_lock(std::mutex& mutex) {
     std::unique_lock lock(mutex, std::try_to_lock);
     if (!lock.owns_lock())
-        throw std::logic_error("Session settings cannot change during a request");
+        throw std::logic_error("Model settings cannot change during a request");
     return lock;
 }
 } // namespace
@@ -152,18 +151,13 @@ void VisionLanguageModel::wait_for_streamer_completion() {
     _state->text_streamer.wait_streaming();
 }
 
-void VisionLanguageModel::set_reloc(const std::string& name) { set_reloc(kDefaultSession, name); }
-void VisionLanguageModel::unset_reloc() { unset_reloc(kDefaultSession); }
-
-void VisionLanguageModel::set_reloc(SessionId session, const std::string& name) {
+void VisionLanguageModel::set_reloc(const std::string& name) {
     auto lock = idle_lock(_state->run_mutex);
-    _state->language_model_ptr->_select_request_sessions(session, nullptr);
     _state->language_model_ptr->set_reloc(name);
 }
 
-void VisionLanguageModel::unset_reloc(SessionId session) {
+void VisionLanguageModel::unset_reloc() {
     auto lock = idle_lock(_state->run_mutex);
-    _state->language_model_ptr->_select_request_sessions(session, nullptr);
     _state->language_model_ptr->unset_reloc();
 }
 
@@ -201,15 +195,14 @@ VisionLanguageModel::VisionLanguageModel(
         // (fetch -> load -> evict), one ELF on disk at a time.
         _vision_model = std::make_unique<VisionModel>(model_path, _state->_files);
     }
-    _state->language_model_ptr.reset(new LanguageModel(
+    _state->language_model_ptr = std::make_unique<LanguageModel>(
         model_path,
         _state->vlm_helper.get_stop_token_ids(),
         _state->vlm_helper.get_image_token_id(),
         _state->vlm_helper.get_pad_token_id(),
         _state->text_streamer,
-        _state->_files,
-        _state->_cfg.lm_cfg.is_speculative_draft()
-    ));
+        _state->_files
+    );
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
     // run_model path.
@@ -485,60 +478,21 @@ void VisionLanguageModel::stop_model() {
     _state->language_model_ptr->stop_model();
 }
 
-
-
 void VisionLanguageModel::set_draft_vlm(VisionLanguageModel* draft) {
     auto lock = idle_lock(_state->run_mutex);
     if (draft == this)
         throw std::invalid_argument("A model cannot draft for itself");
-    const auto previous = _state->draft;
     const auto next = draft ? draft->_state : nullptr;
-    if (previous == next)
-        return;
-    std::unique_lock<std::mutex> previous_lock;
-    if (previous)
-        previous_lock = idle_lock(previous->run_mutex);
-    std::unique_lock<std::mutex> next_lock;
+    if (_state->draft == next) return;
     if (next) {
-        next_lock = idle_lock(next->run_mutex);
-        _state->language_model_ptr->_attach_draft(
-            *next->language_model_ptr, previous ? previous->language_model_ptr.get() : nullptr);
+        auto next_lock = idle_lock(next->run_mutex);
+        _state->language_model_ptr->attach_draft(*next->language_model_ptr);
     } else {
-        _state->language_model_ptr->_detach_draft_sessions(previous->language_model_ptr.get());
+        _state->language_model_ptr->invalidate_prompt_reuse();
     }
     _state->draft = next;
 }
 
-SessionId VisionLanguageModel::create_session() {
-    auto lock = idle_lock(_state->run_mutex);
-    return _state->language_model_ptr->create_session();
-}
-
-void VisionLanguageModel::reset_session(SessionId id) {
-    auto lock = idle_lock(_state->run_mutex);
-    std::unique_lock<std::mutex> draft_lock;
-    if (_state->draft)
-        draft_lock = idle_lock(_state->draft->run_mutex);
-    _state->language_model_ptr->_reset_session(id, _state->draft ? _state->draft->language_model_ptr.get() : nullptr);
-}
-
-void VisionLanguageModel::release_session(SessionId id) {
-    auto lock = idle_lock(_state->run_mutex);
-    std::unique_lock<std::mutex> draft_lock;
-    const auto& draft = _state->draft;
-    if (draft)
-        draft_lock = idle_lock(draft->run_mutex);
-    _state->language_model_ptr->_release_paired_session(id, draft ? draft->language_model_ptr.get() : nullptr);
-}
-
-void VisionLanguageModel::set_session_limit(size_t limit) {
-    auto lock = idle_lock(_state->run_mutex);
-    _state->language_model_ptr->set_session_limit(limit);
-}
-
-size_t VisionLanguageModel::session_memory_bytes(SessionId id) const {
-    return _state->language_model_ptr->session_memory_bytes(id);
-}
 size_t VisionLanguageModel::shared_resource_bytes() const {
     return _state->language_model_ptr->shared_resource_bytes();
 }

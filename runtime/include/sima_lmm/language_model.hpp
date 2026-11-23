@@ -35,10 +35,9 @@ namespace llima {
 struct EmbeddingOffload;
 struct LanguageResources;
 struct LanguageAdapter;
-struct LanguageSession;
+struct LanguageCache;
 struct LanguageWorkspace;
 struct LanguageRunState;
-class SessionManager;
 class LanguageExecutor;
 // Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
 // (num_tokens, cache_kind, aligned_cache_token_idx).
@@ -141,15 +140,6 @@ class LanguageModel {
             GenerationPerformanceResult* performance_result = nullptr
         );
         void attach_draft(LanguageModel& draft);
-        SessionId create_session();
-        void select_session(SessionId id);
-        void reset_session(SessionId id);
-        void release_session(SessionId id);
-        void set_session_limit(size_t limit);
-        SessionId active_session() const;
-        std::vector<SessionId> session_ids() const;
-        size_t session_limit() const;
-        size_t session_memory_bytes(SessionId id) const;
         size_t shared_resource_bytes() const;
         size_t workspace_memory_bytes() const;
 
@@ -158,7 +148,6 @@ class LanguageModel {
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
 
-        // Inspect compiled stages without invalidating their registered session binding slots.
         const LanguageModelMap& get_model_map(const std::string& model_type) const;
         uint16_t set_max_num_tokens(std::optional<uint16_t> max_num_tokens);
         uint16_t get_max_num_tokens() const;
@@ -268,7 +257,7 @@ class LanguageModel {
 
         // Gather the accepted path's scattered KVs (at select_indices) and move
         // them to contiguous positions starting at prev_input_len. Updates
-        // _session->kv_cache_len. Operates on all layers' cache_{key,val}_l{i} buffers.
+        // _cache->kv_cache_len. Operates on all layers' cache_{key,val}_l{i} buffers.
         void compact_kv_after_accept(
             std::span<const uint16_t> select_indices,
             uint16_t prev_input_len
@@ -303,13 +292,8 @@ class LanguageModel {
         void set_kv_cache_len(uint16_t len);
 
     private:
-        // The facade binds draft caches only when selecting a private or public session.
-        LanguageModel(std::filesystem::path model_path, std::set<uint32_t> stop_token_ids,
-                      std::optional<uint32_t> image_token_id, std::optional<uint32_t> pad_token_id,
-                      TextStreamer& text_streamer, std::shared_ptr<FileProvider> files,
-                      bool defer_session_buffers);
         friend struct LanguageResources;
-        friend struct LanguageSession;
+        friend struct LanguageCache;
         friend struct LanguageWorkspace;
         friend class VisionLanguageModel;
         friend class VisionLanguageRequest;
@@ -324,19 +308,16 @@ class LanguageModel {
             std::span<const uint32_t> continuation_ids, bool use_group_prefill);
         void invalidate_prompt_reuse();
         void _validate_eagle3_target() const;
-        void bind_session_adapter();
         void _bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter);
         void set_image_identity(std::string identity);
 
-        friend class SessionManager;
         std::shared_ptr<LanguageResources> _resources;
         const VlmConfig& _cfg;
         const std::filesystem::path& _elf_dir;
         const std::filesystem::path& _devkit_dir;
         const std::shared_ptr<FileProvider>& _files;
         std::shared_ptr<spdlog::logger> _logger;
-        std::unique_ptr<SessionManager> _sessions;
-        std::shared_ptr<LanguageSession> _session;
+        std::unique_ptr<LanguageCache> _cache;
         std::unique_ptr<LanguageWorkspace> _workspace;
         std::unique_ptr<LanguageRunState> _run;
 
@@ -344,16 +325,10 @@ class LanguageModel {
                            const std::string& dtype = "bfloat16", bool align_last_dim = true);
         void _define_resource_buffer(const std::string& name, const std::vector<size_t>& shape,
                                      const std::string& dtype = "bfloat16", bool align_last_dim = true);
-        void _define_session_buffer(const std::string& name, const std::vector<size_t>& shape,
+        void _define_cache_buffer(const std::string& name, const std::vector<size_t>& shape,
                                     const std::string& dtype = "bfloat16", bool align_last_dim = true);
         MLABuffer& get_buffer(const std::string& name);
         bool has_buffer(const std::string& name) const;
-        void _bind_session(const std::shared_ptr<LanguageSession>& selected);
-        void _select_request_sessions(SessionId id, LanguageModel* draft, bool bind_adapter = false);
-        void _attach_draft(LanguageModel& draft, LanguageModel* previous);
-        void _detach_draft_sessions(LanguageModel* draft);
-        void _reset_session(SessionId id, LanguageModel* draft);
-        void _release_paired_session(SessionId id, LanguageModel* draft);
         void _init_attention_bindings();
         void _gather_embedding_rows(
             std::span<const uint32_t> ids, MLABuffer& destination,
@@ -433,7 +408,7 @@ class LanguageModel {
             MLABuffer* value_scale = nullptr;
         };
 
-        void _initialize(bool defer_session_buffers);
+        void _initialize();
         void _finalize();
         void _define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count);
         bool _has_linear_attention_layers() const;
@@ -544,7 +519,7 @@ class LanguageModel {
             std::span<const uint32_t> token_ids, uint16_t num_tokens,
             uint16_t valid_tokens = 0
         );
-        void _init_session_layout();
+        void _init_cache_layout();
         void _compute_and_upload_per_layer_inputs_prefill(
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );

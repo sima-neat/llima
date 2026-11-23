@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc != 1 && argc != 2 && argc != 4)
-            throw std::invalid_argument("Usage: lora_session_test [MODEL_DIRECTORY [ADAPTER_A ADAPTER_B]] | --queue-elf ELF [IDLE_MODEL] | --graph-widths MODEL");
+            throw std::invalid_argument("Usage: lora_adapter_test [MODEL_DIRECTORY [ADAPTER_A ADAPTER_B]] | --queue-elf ELF [IDLE_MODEL] | --graph-widths MODEL");
         const fs::path model = argc > 1 ? fs::absolute(argv[1]) :
             test::resolve_model_dir("SIMA_TEST_LLIMA_TEXT_MODEL", test::kDefaultTextModelName,
                                     "LoRA recovery", "devkit/vlm_config.json");
@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
             fs::create_directory_symlink(model / "npy_files" / argv[2], root / "adapter_a");
             fs::create_directory_symlink(model / "npy_files" / argv[3], root / "adapter_b");
         }
-        connect({}, "/tmp/llima-lora-session-test.log", spdlog::level::warn);
+        connect({}, "/tmp/llima-lora-adapter-test.log", spdlog::level::warn);
         connected = true;
         const fs::path elf = pre_elf(package.path / "elf_files");
         const auto sizes = port_lengths(elf);
@@ -254,7 +254,6 @@ int main(int argc, char** argv) {
             chat.clear_system_prompt();
             chat.add_query("Translate: the sky is blue.");
             auto generate = [&] {
-                target.reset_session(kDefaultSession);
                 auto result = target.generate(chat, {.max_new_tokens = 32}).text;
                 require(!result.empty(), "Expected generated text");
                 return result;
@@ -281,9 +280,9 @@ int main(int argc, char** argv) {
         disconnect();
     } catch (const std::exception& error) {
         if (connected) { try { disconnect(); } catch (...) {} }
-        std::cerr << "LoRA session test failed: " << error.what() << '\n';
+        std::cerr << "LoRA adapter test failed: " << error.what() << '\n';
         return 1;
     }
-    std::cout << "LoRA session test passed\n";
+    std::cout << "LoRA adapter test passed\n";
     return 0;
 }

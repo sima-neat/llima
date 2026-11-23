@@ -1,4 +1,4 @@
-"""Run the direct and facade session suites against a deployed target/draft pair."""
+"""Run the direct and facade generation suites against a deployed target/draft pair."""
 
 import json
 import os
@@ -32,7 +32,7 @@ def main(binary: str, method: str) -> int:
     if legacy and not configured and resolve(models / legacy)[0] == method:
         bundle = models / legacy
     if not configured and not bundle.exists():
-        print(f"Skipping {method} session test: {bundle} is absent")
+        print(f"Skipping {method} generation test: {bundle} is absent")
         return 77
     actual, target, draft = resolve(bundle)
     if actual != method:

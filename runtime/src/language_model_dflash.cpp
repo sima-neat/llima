@@ -135,7 +135,7 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
   if (prefix_tokens == 0 || prefix_tokens > block_size) {
     throw std::invalid_argument("Invalid DFlash checkpoint prefix length");
   }
-  if (_session->cached_states.empty()) {
+  if (_cache->cached_states.empty()) {
     return;
   }
 
@@ -146,7 +146,7 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
   }
   _resolve_dflash_linear_state(prefix_tokens);
   const uint32_t prefix_index = prefix_tokens - 1;
-  for (auto &state : _session->cached_states) {
+  for (auto &state : _cache->cached_states) {
     std::string source_prefix;
     std::vector<uint32_t> source_begin;
     if (state.layout.buffer_name_prefix == "linear_conv_cache_history_l") {
@@ -174,7 +174,7 @@ void LanguageModel::_save_dflash_state_checkpoint(uint16_t token_count,
       snapshot.assign(source_ptr + source_offset, source_ptr + source_offset + state.layout.tail_bytes);
     }
   }
-  _session->state_checkpoint_positions[*checkpoint_slot] = token_count;
+  _cache->state_checkpoint_positions[*checkpoint_slot] = token_count;
 }
 
 void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
@@ -269,7 +269,7 @@ void LanguageModel::_append_dflash_context(LanguageModel &target_lm,
     model.add_to_queue();
   }
   MLAModelWithBuffer::run_queue();
-  _session->kv_cache_len = token_idx + valid_tokens;
+  _cache->kv_cache_len = token_idx + valid_tokens;
 }
 
 const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
@@ -322,7 +322,7 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
   }
 
   // Drop the noisy block. The next accepted target context overwrites its rows.
-  _session->kv_cache_len = token_idx;
+  _cache->kv_cache_len = token_idx;
   return proposals;
 }
 
@@ -419,9 +419,9 @@ LanguageModel::_run_model_dflash_speculative_decoding(
   uint16_t cached_tokens = _set_input_text_embeds(input_token_ids);
   uint16_t draft_cached_tokens = 0;
   while (draft_cached_tokens < input_token_ids.size() &&
-         draft_cached_tokens < draft_lm._session->cached_token_ids.size() &&
+         draft_cached_tokens < draft_lm._cache->cached_token_ids.size() &&
          input_token_ids[draft_cached_tokens] ==
-             draft_lm._session->cached_token_ids[draft_cached_tokens]) {
+             draft_lm._cache->cached_token_ids[draft_cached_tokens]) {
     ++draft_cached_tokens;
   }
   cached_tokens = _prepare_state_checkpoints_for_prefill(
@@ -432,8 +432,8 @@ LanguageModel::_run_model_dflash_speculative_decoding(
         std::upper_bound(offsets.begin(), offsets.end(), cached_tokens);
     cached_tokens = next_offset == offsets.begin() ? 0 : *std::prev(next_offset);
   }
-  _session->kv_cache_len = cached_tokens;
-  draft_lm._session->kv_cache_len = cached_tokens;
+  _cache->kv_cache_len = cached_tokens;
+  draft_lm._cache->kv_cache_len = cached_tokens;
 
   const uint16_t prompt_len = input_token_ids.size();
   const uint16_t prefill_width =
@@ -441,9 +441,9 @@ LanguageModel::_run_model_dflash_speculative_decoding(
                               : block_size;
   uint32_t anchor = 0;
   if (cached_tokens == prompt_len) {
-    anchor = cached_tokens < _session->cached_token_ids.size()
-                 ? _session->cached_token_ids[cached_tokens]
-                 : _session->cached_first_generated_token;
+    anchor = cached_tokens < _cache->cached_token_ids.size()
+                 ? _cache->cached_token_ids[cached_tokens]
+                 : _cache->cached_first_generated_token;
   }
   for (uint16_t offset = cached_tokens; offset < prompt_len;
        offset += prefill_width) {
@@ -464,12 +464,12 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     _notify_interrupt();
     return std::nullopt;
   }
-  _session->kv_cache_len = prompt_len;
-  draft_lm._session->kv_cache_len = prompt_len;
-  _session->cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
-  draft_lm._session->cached_token_ids = _session->cached_token_ids;
-  _session->cached_first_generated_token = anchor;
-  draft_lm._session->cached_first_generated_token = anchor;
+  _cache->kv_cache_len = prompt_len;
+  draft_lm._cache->kv_cache_len = prompt_len;
+  _cache->cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
+  draft_lm._cache->cached_token_ids = _cache->cached_token_ids;
+  _cache->cached_first_generated_token = anchor;
+  draft_lm._cache->cached_first_generated_token = anchor;
 
   std::vector<uint32_t> output{anchor};
   const double first_duration = timer_ttft->stop();
@@ -486,13 +486,13 @@ LanguageModel::_run_model_dflash_speculative_decoding(
 
   while (!stopped && !cancelled() &&
          output.size() + prompt_len < max_length) {
-    if (_session->kv_cache_len + block_size > _cfg.pipeline_cfg.max_num_tokens) {
+    if (_cache->kv_cache_len + block_size > _cfg.pipeline_cfg.max_num_tokens) {
       // A fixed-width DFlash package cannot safely run a partial final block.
       cache_full = true;
       break;
     }
     ChronoTimer iteration_timer(true);
-    const uint16_t verify_start = _session->kv_cache_len;
+    const uint16_t verify_start = _cache->kv_cache_len;
     const auto &proposals =
         draft_lm._run_dflash_draft(*this, anchor, verify_start, scratch);
     if (cancelled()) {
@@ -520,10 +520,10 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     }
     const uint16_t committed_rows = static_cast<uint16_t>(produced);
     if (_workspace->capture_state_checkpoints) {
-      auto boundary = std::upper_bound(_session->checkpoint_boundaries.begin(),
-                                       _session->checkpoint_boundaries.end(),
+      auto boundary = std::upper_bound(_cache->checkpoint_boundaries.begin(),
+                                       _cache->checkpoint_boundaries.end(),
                                        verify_start + committed_rows);
-      if (boundary != _session->checkpoint_boundaries.begin()) {
+      if (boundary != _cache->checkpoint_boundaries.begin()) {
         --boundary;
         if (*boundary > verify_start) {
           _save_dflash_state_checkpoint(*boundary, *boundary - verify_start);
@@ -533,8 +533,8 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     if (cancelled())
       break;
     _commit_dflash_linear_state(committed_rows);
-    _session->kv_cache_len = verify_start + committed_rows;
-    draft_lm._session->kv_cache_len = verify_start;
+    _cache->kv_cache_len = verify_start + committed_rows;
+    draft_lm._cache->kv_cache_len = verify_start;
     draft_lm._append_dflash_context(*this, block_size, verify_start,
                                     committed_rows);
     const double duration = iteration_timer.stop();
@@ -552,11 +552,11 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     if (cancelled())
       break;
     for (auto* model : {this, &draft_lm}) {
-      model->_session->cached_token_ids.insert(model->_session->cached_token_ids.end(), verify_input.begin(),
+      model->_cache->cached_token_ids.insert(model->_cache->cached_token_ids.end(), verify_input.begin(),
                                       verify_input.begin() + committed_rows);
     }
-    _session->cached_first_generated_token = emitted[produced - 1];
-    draft_lm._session->cached_first_generated_token = _session->cached_first_generated_token;
+    _cache->cached_first_generated_token = emitted[produced - 1];
+    draft_lm._cache->cached_first_generated_token = _cache->cached_first_generated_token;
     anchor = emitted[produced - 1];
     if (produced < emitted.size()) {
       cache_full = true;

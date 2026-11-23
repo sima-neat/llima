@@ -614,9 +614,9 @@ LanguageModel::UpdateInferenceInputsResult LanguageModel::update_inference_input
     new_token += accept_length + 1;
 
     // Cache for next-turn prefix matching. input_ids excludes the bonus, so
-    // it matches target's _session->kv_cache_len after compact_kv_after_accept.
-    _session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    draft_lm._session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    // it matches target's _cache->kv_cache_len after compact_kv_after_accept.
+    _cache->cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    draft_lm._cache->cached_token_ids.assign(input_ids.begin(), input_ids.end());
 
     UpdateInferenceInputsResult result;
     result.input_ids         = std::move(input_ids);
@@ -1142,21 +1142,21 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     get_buffer("global_freq_imag").upload(_resources->global_freq_host.im.data());
 
     // Uploads token embeds and returns the prefix-match length against
-    // _session->cached_token_ids.
+    // _cache->cached_token_ids.
     uint16_t prefix_cached = _set_input_text_embeds(input_ids);
 
     // Full-match early-out: every input token and the prompt length match the
     // tree state saved last turn.
     if (prefix_cached == num_input_tokens
-        && _session->cached_eagle3_prompt_len == num_input_tokens
-        && !_session->cached_draft_tokens.empty()) {
-        result.token              = _session->cached_first_generated_token;
-        result.draft_tokens       = _session->cached_draft_tokens;
-        result.retrieve_indices   = _session->cached_retrieve_indices;
-        result.tree_mask          = _session->cached_tree_mask;
-        result.tree_position_ids  = _session->cached_tree_position_ids;
-        _workspace->eagle3_stable_kv          = _session->cached_eagle3_stable_kv;
-        draft_lm._workspace->eagle3_stable_kv = draft_lm._session->cached_eagle3_stable_kv;
+        && _cache->cached_eagle3_prompt_len == num_input_tokens
+        && !_cache->cached_draft_tokens.empty()) {
+        result.token              = _cache->cached_first_generated_token;
+        result.draft_tokens       = _cache->cached_draft_tokens;
+        result.retrieve_indices   = _cache->cached_retrieve_indices;
+        result.tree_mask          = _cache->cached_tree_mask;
+        result.tree_position_ids  = _cache->cached_tree_position_ids;
+        _workspace->eagle3_stable_kv          = _cache->cached_eagle3_stable_kv;
+        draft_lm._workspace->eagle3_stable_kv = draft_lm._cache->cached_eagle3_stable_kv;
         result.root_ready_time = std::chrono::steady_clock::now();
         result.time_to_first_token = timer_ttft.stop();
         _notify_first_token(result.token, result.time_to_first_token);
@@ -1216,9 +1216,9 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
 
     // Cache for next-turn prefix matching. Must run BEFORE push_back so
     // input_ids still matches the pre-root-token prefill length.
-    _session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    draft_lm._session->cached_token_ids.assign(input_ids.begin(), input_ids.end());
-    _session->cached_first_generated_token = result.token;
+    _cache->cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    draft_lm._cache->cached_token_ids.assign(input_ids.begin(), input_ids.end());
+    _cache->cached_first_generated_token = result.token;
 
     input_ids.push_back(result.token);
 
@@ -1251,14 +1251,14 @@ LanguageModel::InitTreeResult LanguageModel::initialize_tree(
     result.tree_position_ids  = std::move(topk_result.tree_position_ids);
 
     // Cache tree state for the next turn's full-match early-out.
-    // _session->cached_first_generated_token was set above (before the push_back).
-    _session->cached_draft_tokens       = result.draft_tokens;
-    _session->cached_retrieve_indices   = result.retrieve_indices;
-    _session->cached_tree_mask          = result.tree_mask;
-    _session->cached_tree_position_ids  = result.tree_position_ids;
-    _session->cached_eagle3_prompt_len  = num_input_tokens;
-    _session->cached_eagle3_stable_kv          = _workspace->eagle3_stable_kv;
-    draft_lm._session->cached_eagle3_stable_kv = draft_lm._workspace->eagle3_stable_kv;
+    // _cache->cached_first_generated_token was set above (before the push_back).
+    _cache->cached_draft_tokens       = result.draft_tokens;
+    _cache->cached_retrieve_indices   = result.retrieve_indices;
+    _cache->cached_tree_mask          = result.tree_mask;
+    _cache->cached_tree_position_ids  = result.tree_position_ids;
+    _cache->cached_eagle3_prompt_len  = num_input_tokens;
+    _cache->cached_eagle3_stable_kv          = _workspace->eagle3_stable_kv;
+    draft_lm._cache->cached_eagle3_stable_kv = draft_lm._workspace->eagle3_stable_kv;
 
     return result;
 }
@@ -1302,10 +1302,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
             "stop (pre-init): input_len {} + spec_budget {} > max_length {}",
             input_len, spec_budget, max_length
         );
-        _session->cached_token_ids.clear();
-        draft_lm._session->cached_token_ids.clear();
-        _session->cached_draft_tokens.clear();
-        _session->cached_eagle3_prompt_len = 0;
+        _cache->cached_token_ids.clear();
+        draft_lm._cache->cached_token_ids.clear();
+        _cache->cached_draft_tokens.clear();
+        _cache->cached_eagle3_prompt_len = 0;
         _notify_cache_full();
         return std::nullopt;
     }
@@ -1519,10 +1519,10 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
     // Use CACHE_FULL when generation stopped because the K-cache was exhausted,
     // mirroring non-spec; the streamer prints the "Cache full" notice.
     if (cache_full) {
-        _session->cached_token_ids.clear();
-        draft_lm._session->cached_token_ids.clear();
-        _session->cached_draft_tokens.clear();
-        _session->cached_eagle3_prompt_len = 0;
+        _cache->cached_token_ids.clear();
+        draft_lm._cache->cached_token_ids.clear();
+        _cache->cached_draft_tokens.clear();
+        _cache->cached_eagle3_prompt_len = 0;
         _notify_cache_full();
     } else {
         _notify_stop();

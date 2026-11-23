@@ -40,7 +40,6 @@ private:
 };
 
 struct GenerationOptions {
-    SessionId session = kDefaultSession;
     std::optional<uint16_t> max_new_tokens; // Output budget, excluding the input tokens.
     std::optional<std::set<uint32_t>> stop_token_ids;
     std::stop_token stop; // The caller owns cancellation for this request.
@@ -73,7 +72,7 @@ class VisionLanguageModel {
         VisionLanguageModel(const VisionLanguageModel&) = delete;
         VisionLanguageModel& operator=(const VisionLanguageModel&) = delete;
 
-        // Chat callers use generate(chat, {.session = id}) and read ChatResult::text or token_ids.
+        // Returns generated token IDs, decoded text, metrics and the finish reason.
         ChatResult generate(const Chat& chat, const GenerationOptions& options = {});
         std::vector<uint32_t> run_model(std::span<const uint32_t> input_token_ids,
                                         const GenerationOptions& options = {});
@@ -87,13 +86,6 @@ class VisionLanguageModel {
                                                        const GenerationOptions& options = {});
 
         std::vector<EncodedImage> encode_images(std::span<const cv::Mat> images);
-        SessionId create_session();
-        void reset_session(SessionId id);
-        void release_session(SessionId id);
-        void set_session_limit(size_t limit);
-        // Memory queries are safe in callbacks. Session bytes include the paired draft
-        // and reflect allocations and checkpoints published at request boundaries.
-        size_t session_memory_bytes(SessionId id) const;
         size_t shared_resource_bytes() const;
         size_t workspace_memory_bytes() const;
 
@@ -116,8 +108,6 @@ class VisionLanguageModel {
 
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
-        void set_reloc(SessionId session, const std::string& reloc_name);
-        void unset_reloc(SessionId session);
         void set_enable_thinking(bool enable_thinking);
         bool get_enable_thinking() const;
 

@@ -70,8 +70,6 @@ class LanguageExecutor {
         LanguageRequestState _request;
         bool _completed = false;
         bool _cancelled_at_finish = false;
-        std::shared_ptr<LanguageSession> _previous_draft_session;
-        void restore_draft();
     };
 
   private:

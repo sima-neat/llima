@@ -511,21 +511,10 @@ LanguageExecutor::Run::Run(LanguageModel& target, LanguageModel* draft,
     if (draft) {
         _request.draft_interrupt.emplace(draft->_run->interrupts);
         target.attach_draft(*draft);
-        if (!target._session->draft || draft->_session != target._session->draft) {
-            auto previous = draft->_session;
-            target._select_request_sessions(target.active_session(), draft);
-            _previous_draft_session = std::move(previous);
-        }
+    } else if (target._workspace->speculative_pair) {
+        target.invalidate_prompt_reuse();
     }
-    try {
-        auto execution = lock_execution();
-        target.bind_session_adapter();
-        if (draft) draft->bind_session_adapter();
-        target._run->text_streamer.begin_request(std::move(stream));
-    } catch (...) {
-        restore_draft();
-        throw;
-    }
+    target._run->text_streamer.begin_request(std::move(stream));
     target._run->standalone_start = _request.target_interrupt.initial;
     target._run->active = &_request;
     if (draft) {
@@ -554,17 +543,8 @@ std::optional<std::vector<uint32_t>> LanguageExecutor::Run::generate(
     return _target._run_model_eagle3_speculative_decoding(*_draft, ids, max_tokens, timer, performance);
 }
 
-void LanguageExecutor::Run::restore_draft() {
-    if (_previous_draft_session) {
-        _draft->_bind_session(_previous_draft_session);
-        _draft->bind_session_adapter();
-        _previous_draft_session.reset();
-    }
-}
-
 void LanguageExecutor::Run::complete() {
     _target._run->text_streamer.finish();
-    restore_draft();
     _cancelled_at_finish = _request.cancelled();
     _completed = true;
 }
@@ -576,21 +556,14 @@ LanguageExecutor::Run::~Run() {
         try { _target._run->text_streamer.finish(); } catch (...) {}
     }
     if (!_completed || _cancelled_at_finish) {
-        _target._session->invalidate_reuse();
-        if (_draft) _target._session->draft->invalidate_reuse();
+        _target.invalidate_prompt_reuse();
+        if (_draft) _draft->invalidate_prompt_reuse();
     }
     _target._workspace->capture_state_checkpoints = false;
     _target._workspace->rolling_checkpoint_slot = 0;
     _target._workspace->writable_checkpoint_slots = 0;
-    if (_draft) _target._session->draft->publish_memory_bytes();
-    _target._session->publish_memory_bytes();
     _target._run->active = nullptr;
     if (_draft) _draft->_run->active = nullptr;
-    try {
-        restore_draft();
-    } catch (const std::exception& error) {
-        _target._logger->error("Failed to restore draft adapter: {}", error.what());
-    }
 }
 
 } // namespace simaai::llima

@@ -430,7 +430,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
     }
 
     MLAModelWithBuffer::run_queue();
-    _session->kv_cache_len = static_cast<uint16_t>(token_idx + valid_tokens);
+    _cache->kv_cache_len = static_cast<uint16_t>(token_idx + valid_tokens);
     auto next_token_ids = _argmax_lm_head_rows(
         num_tokens, valid_tokens, token_ids.subspan(1)
     );
@@ -632,12 +632,12 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
 
     // Only committed target rows can be matched on the next request. The
     // physical buffers can also contain rejected drafts or prefill padding.
-    if (_session->cached_token_ids.size() > _session->kv_cache_len) {
-        _session->cached_token_ids.resize(_session->kv_cache_len);
+    if (_cache->cached_token_ids.size() > _cache->kv_cache_len) {
+        _cache->cached_token_ids.resize(_cache->kv_cache_len);
     }
     // The assistant consumes the selected target's KV; it has no reusable
     // private KV or hidden state to restore between requests.
-    draft_lm._session->kv_cache_len = 0;
+    draft_lm._cache->kv_cache_len = 0;
 
     if (input_ids.size() >= max_length) {
         cache_full = true;
@@ -663,7 +663,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
             std::chrono::steady_clock::now() - first_begin
         ).count();
         if (!_run->cancelled()) {
-            _session->kv_cache_len = checked_u16(
+            _cache->kv_cache_len = checked_u16(
                 input_ids.size(), "Gemma4 MTP prompt length"
             );
 
@@ -695,14 +695,14 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
     auto commit_processed_prefix = [&](size_t processed_tokens) {
         const auto processed_end = input_ids.begin()
             + static_cast<std::ptrdiff_t>(processed_tokens);
-        _session->cached_token_ids.assign(input_ids.begin(), processed_end);
-        _session->kv_cache_len = checked_u16(
+        _cache->cached_token_ids.assign(input_ids.begin(), processed_end);
+        _cache->kv_cache_len = checked_u16(
             processed_tokens, "Gemma4 MTP committed KV length"
         );
-        draft_lm._session->kv_cache_len = 0;
+        draft_lm._cache->kv_cache_len = 0;
     };
 
-    uint16_t target_shared_kv_available_len = _session->kv_cache_len;
+    uint16_t target_shared_kv_available_len = _cache->kv_cache_len;
 
     while (
         !cache_full && !stopped
@@ -784,7 +784,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
         );
         if (_run->cancelled())
             break;
-        target_shared_kv_available_len = _session->kv_cache_len;
+        target_shared_kv_available_len = _cache->kv_cache_len;
         const size_t meaningful_verification_rows = draft_token_ids.size() + 1;
         if (
             verification.next_token_ids.empty()

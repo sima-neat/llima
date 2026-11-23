@@ -1,6 +1,6 @@
 #pragma once
 
-// Private resource, session and workspace owners; not an installed API header.
+// Private resource, cache and workspace owners; not an installed API header.
 #include "language_model.hpp"
 #include "embedding_offload.hpp"
 #include "model_resources.hpp"
@@ -25,12 +25,6 @@ struct LanguageResources {
     void load_per_layer_embeddings();
     bool ready = false;
     std::map<std::string, std::weak_ptr<LanguageAdapter>> adapters;
-    struct BufferSpec {
-        std::vector<size_t> shape;
-        std::string dtype;
-        bool align_last_dim;
-    };
-    std::map<std::string, BufferSpec> session_layout;
     std::map<std::string, MLABuffer> buffers;
     std::shared_ptr<EmbeddingOffload> embedding_offload;
     RopeTable master_rope_table;
@@ -42,16 +36,8 @@ struct LanguageResources {
     std::vector<uint32_t> gemma4_token_ordering;
 };
 
-struct LanguageSession {
-    void init_layout(const LanguageSession& prototype);
-    // Readers can inspect the last allocation/checkpoint size during generation.
-    std::atomic<size_t> published_bytes{0};
-    void publish_memory_bytes();
-    std::shared_ptr<LanguageSession> draft;
-    bool buffers_allocated = false;
-    void reset();
+struct LanguageCache {
     void invalidate_reuse();
-    void allocate(const LanguageResources& resources);
     std::map<std::string, MLABuffer> buffers;
     std::vector<uint32_t> cached_token_ids;
     uint32_t cached_first_generated_token = 0;
@@ -67,27 +53,7 @@ struct LanguageSession {
     std::vector<LanguageModel::CachedState> cached_states;
     // Zero marks an unused slot. Slot 0 is reserved for a stable system/tool prefix.
     std::array<uint16_t, LanguageModel::checkpoint_slot_count> state_checkpoint_positions{};
-    std::shared_ptr<LanguageAdapter> adapter;
     std::string image_identity;
-};
-
-// Bounded contexts with stable addresses; callers serialize through the model workspace.
-class SessionManager {
-  public:
-    SessionManager();
-    std::shared_ptr<LanguageSession> get(SessionId id) const;
-    SessionId create(const LanguageSession& prototype);
-    void release(SessionId id);
-    void set_limit(size_t limit);
-    size_t limit() const { std::lock_guard lock(_mutex); return _limit; }
-    std::vector<SessionId> ids() const;
-    SessionId active = kDefaultSession;
-
-  private:
-    mutable std::mutex _mutex;
-    size_t _limit = 4;
-    uint64_t _next = 1;
-    std::map<SessionId, std::shared_ptr<LanguageSession>> _sessions;
 };
 
 struct LanguageModel::DFlashScratch {
@@ -100,21 +66,22 @@ struct LanguageModel::DFlashScratch {
 };
 
 struct LanguageWorkspace {
-    void clear_session_scratch() {
+    void clear_cached_scratch() {
         dflash_resolved_prefix = 0;
         gemma4_mtp_prefill_hidden_state.reset();
         eagle3_tree_mask.reset();
         eagle3_stable_kv = 0;
     }
     std::shared_ptr<LanguageAdapter> bound_adapter;
-    std::weak_ptr<LanguageSession> paired_draft_identity; // The draft runner owns its public session 0.
+    // A target and its current draft share this identity. Reusing either runner with a
+    // different partner requires a cold prefill on both sides.
+    struct SpeculativePair {};
+    std::shared_ptr<SpeculativePair> speculative_pair;
     std::vector<uint8_t> mtp_shared_kv_layers;
     LanguageModel::DFlashScratch dflash;
     std::vector<uint32_t> offload_prompt_ids;
     bool offload_chunk_staging = false;
     std::map<std::string, MLABuffer> buffers;
-    // Stable pointer slots collected once while constructing execution bindings.
-    std::map<std::string, std::vector<MLABuffer**>> session_bindings;
     LanguageModelMap pre_model_map;
     LanguageModelMap cache_model_map;
     LanguageModelMap post_model_map;

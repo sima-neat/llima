@@ -30,31 +30,26 @@ void LanguageModel::_define_resource_buffer(const std::string& name,
     _resources->buffers.try_emplace(name, name, shape, dtype, align_last_dim);
 }
 
-void LanguageModel::_define_session_buffer(const std::string& name,
+void LanguageModel::_define_cache_buffer(const std::string& name,
                                            const std::vector<size_t>& shape,
                                            const std::string& dtype, bool align_last_dim) {
-    if (!_resources->ready) {
-        _resources->session_layout.try_emplace(
-            name, LanguageResources::BufferSpec{shape, dtype, align_last_dim});
-    }
-    _session->buffers.try_emplace(name, name, shape, dtype, align_last_dim);
-    _workspace->session_bindings.try_emplace(name);
+    _cache->buffers.try_emplace(name, name, shape, dtype, align_last_dim);
 }
 
 MLABuffer& LanguageModel::get_buffer(const std::string& name) {
     if (auto it = _workspace->buffers.find(name); it != _workspace->buffers.end())
         return it->second;
-    if (auto it = _session->buffers.find(name); it != _session->buffers.end())
+    if (auto it = _cache->buffers.find(name); it != _cache->buffers.end())
         return it->second;
     return _resources->buffers.at(name);
 }
 
 bool LanguageModel::has_buffer(const std::string& name) const {
-    return _workspace->buffers.contains(name) || _session->buffers.contains(name) ||
+    return _workspace->buffers.contains(name) || _cache->buffers.contains(name) ||
            _resources->buffers.contains(name);
 }
 
-void LanguageModel::_initialize(bool defer_session_buffers) {
+void LanguageModel::_initialize() {
     _logger->info("Language model initialize starting ...");
     _resources->prepare_embeddings();
     _define_buffers();
@@ -62,7 +57,10 @@ void LanguageModel::_initialize(bool defer_session_buffers) {
         for (auto& [name, buffer] : *buffers) buffer.try_allocate();
     }
 
-    if (!defer_session_buffers) _session->allocate(*_resources);
+    for (auto& [name, buffer] : _cache->buffers) {
+        buffer.allocate();
+        buffer.clear();
+    }
 
     // Define and load the models in parallel.
     _define_models();
@@ -195,17 +193,17 @@ void LanguageModel::_define_buffers() {
     std::vector<size_t> conv_cache_shape{conv_working_len, _cfg.lm_cfg.hidden_size};
     for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
         if (_cfg.lm_cfg.layer_types[i] == "conv") {
-            _define_session_buffer(fmt::format("conv_cache_history_l{}", i), conv_cache_shape);
+            _define_cache_buffer(fmt::format("conv_cache_history_l{}", i), conv_cache_shape);
         } else if (_cfg.lm_cfg.layer_types[i] == "linear_attention") {
             const auto& linear_cfg = _linear_attn_cfg();
             const uint16_t linear_conv_working_len = static_cast<uint16_t>(
                 _cfg.pipeline_cfg.input_token_group_size + linear_cfg.conv_kernel_dim - 2
             );
-            _define_session_buffer(
+            _define_cache_buffer(
                 fmt::format("linear_conv_cache_history_l{}", i),
                 {linear_conv_working_len, linear_cfg.get_conv_dim()}
             );
-            _define_session_buffer(
+            _define_cache_buffer(
                 fmt::format("linear_delta_state_history_l{}", i),
                 {
                     1,
@@ -213,7 +211,7 @@ void LanguageModel::_define_buffers() {
                 }
             );
             // Ping-pong state avoids MLA read-after-write corruption during grouped prefill.
-            _define_session_buffer(
+            _define_cache_buffer(
                 fmt::format("linear_delta_state_history_alt_l{}", i),
                 {1, linear_cfg.get_recurrent_state_size()}
             );
@@ -266,8 +264,8 @@ void LanguageModel::_define_buffers() {
             }
             if (!_cfg.lm_cfg.is_kv_shared_layer(i)) {
                 std::string kv_dtype = _cfg.pipeline_cfg.quantize_kv_cache ? "int8" : "bfloat16";
-                _define_session_buffer(fmt::format("cache_key_l{}", i), cache_shape, kv_dtype);
-                _define_session_buffer(fmt::format("cache_val_l{}", i), cache_shape, kv_dtype);
+                _define_cache_buffer(fmt::format("cache_key_l{}", i), cache_shape, kv_dtype);
+                _define_cache_buffer(fmt::format("cache_val_l{}", i), cache_shape, kv_dtype);
                 if (_cfg.pipeline_cfg.quantize_kv_cache) {
                     // Keep the logical C=1 scale shape. MLABuffer aligns each BF16 row to
                     // the 16-byte MLA row required by the physical HWC16 layout.
@@ -276,8 +274,8 @@ void LanguageModel::_define_buffers() {
                         _cfg.pipeline_cfg.max_num_tokens,
                         1
                     };
-                    _define_session_buffer(fmt::format("cache_key_scale_l{}", i), scale_shape);
-                    _define_session_buffer(fmt::format("cache_val_scale_l{}", i), scale_shape);
+                    _define_cache_buffer(fmt::format("cache_key_scale_l{}", i), scale_shape);
+                    _define_cache_buffer(fmt::format("cache_val_scale_l{}", i), scale_shape);
                 }
             }
         }
@@ -630,20 +628,16 @@ void LanguageModel::_init_attention_bindings() {
     if (_cfg.lm_cfg.is_gemma4_mtp_draft())
         return;
     _workspace->attention_binding_buffers.resize(_cfg.lm_cfg.num_hidden_layers);
-    const auto bind = [&](MLABuffer*& slot, const std::string& name) {
-        slot = &get_buffer(name);
-        _workspace->session_bindings.at(name).push_back(&slot);
-    };
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
         if (layer_type != "full_attention" && layer_type != "sliding_attention") continue;
         const auto source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
         auto& buffers = _workspace->attention_binding_buffers[layer_idx];
-        bind(buffers.key, fmt::format("cache_key_l{}", source_layer));
-        bind(buffers.value, fmt::format("cache_val_l{}", source_layer));
+        buffers.key = &get_buffer(fmt::format("cache_key_l{}", source_layer));
+        buffers.value = &get_buffer(fmt::format("cache_val_l{}", source_layer));
         if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            bind(buffers.key_scale, fmt::format("cache_key_scale_l{}", source_layer));
-            bind(buffers.value_scale, fmt::format("cache_val_scale_l{}", source_layer));
+            buffers.key_scale = &get_buffer(fmt::format("cache_key_scale_l{}", source_layer));
+            buffers.value_scale = &get_buffer(fmt::format("cache_val_scale_l{}", source_layer));
         }
     }
 }
@@ -656,9 +650,7 @@ void LanguageModel::_define_model(
     const std::vector<MLABufferSlice>& ifms,
     const std::vector<MLABufferSlice>& ofms
 ) {
-    auto [model, inserted] = models.emplace(key, MLAModelWithBuffer(model_path, ifms, ofms));
-    if (inserted)
-        model->second._record_buffer_bindings(_workspace->session_bindings);
+    models.emplace(key, MLAModelWithBuffer(model_path, ifms, ofms));
 }
 
 
@@ -1456,11 +1448,9 @@ void LanguageModel::_define_draft_fc_models() {
         std::vector<MLABufferSlice> ofms{
             MLABufferSlice{&get_buffer(fmt::format("fc_n{}_output", num_tokens))}
         };
-        auto [model, inserted] = _workspace->fc_model_map.emplace(
+        _workspace->fc_model_map.emplace(
             num_tokens, MLAModelWithBuffer(elf_path, ifms, ofms)
         );
-        if (inserted)
-            model->second._record_buffer_bindings(_workspace->session_bindings);
     }
 }
 
@@ -1482,7 +1472,7 @@ void LanguageModel::_define_dflash_models() {
             if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
                 continue;
             }
-            auto [model, inserted] = _workspace->dflash_state_resolver_model_map.emplace(
+            _workspace->dflash_state_resolver_model_map.emplace(
                 LanguageModelMapKey{single_num_tokens, layer_idx, 0},
                 MLAModelWithBuffer(
                     elf_path,
@@ -1515,8 +1505,6 @@ void LanguageModel::_define_dflash_models() {
                     }
                 )
             );
-            if (inserted)
-                model->second._record_buffer_bindings(_workspace->session_bindings);
         }
         return;
     }
@@ -1565,7 +1553,7 @@ void LanguageModel::_define_dflash_models() {
                 });
             }
             const LanguageModelMapKey key_id{num_tokens, layer_idx, 0};
-            auto [model, inserted] = _workspace->dflash_context_model_map.emplace(
+            _workspace->dflash_context_model_map.emplace(
                 key_id,
                 MLAModelWithBuffer(
                     _files->reserve(fmt::format(
@@ -1586,8 +1574,6 @@ void LanguageModel::_define_dflash_models() {
                     outputs
                 )
             );
-            if (inserted)
-                model->second._record_buffer_bindings(_workspace->session_bindings);
         }
     }
 }

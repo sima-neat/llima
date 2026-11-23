@@ -82,19 +82,19 @@ uint16_t LanguageModel::get_max_num_tokens() const { return _run->limits().max_n
 
 const std::set<uint32_t>& LanguageModel::get_stop_token_ids() const { return _run->limits().stop_token_ids; }
 
-void LanguageModel::clear_cached_token_ids() { _session->cached_token_ids.clear(); }
+void LanguageModel::clear_cached_token_ids() { _cache->cached_token_ids.clear(); }
 
 uint32_t LanguageModel::get_cached_first_generated_token() const {
-    return _session->cached_first_generated_token;
+    return _cache->cached_first_generated_token;
 }
 
 const std::vector<std::vector<Eigen::bfloat16>>& LanguageModel::get_eagle3_intermediate_hidden_states() const {
     return _workspace->eagle3_intermediate_hidden_states;
 }
 
-uint16_t LanguageModel::get_kv_cache_len() const { return _session->kv_cache_len; }
+uint16_t LanguageModel::get_kv_cache_len() const { return _cache->kv_cache_len; }
 
-void LanguageModel::set_kv_cache_len(uint16_t len) { _session->kv_cache_len = len; }
+void LanguageModel::set_kv_cache_len(uint16_t len) { _cache->kv_cache_len = len; }
 
 
 LanguageModel::LanguageModel(
@@ -115,22 +115,13 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer,
     std::shared_ptr<FileProvider> file_provider
-) : LanguageModel(std::move(model_path), std::move(stop_token_ids), image_token_id, pad_token_id,
-                  text_streamer, std::move(file_provider), false) {}
-
-LanguageModel::LanguageModel(
-    std::filesystem::path model_path, std::set<uint32_t> stop_token_ids,
-    std::optional<uint32_t> image_token_id, std::optional<uint32_t> pad_token_id,
-    TextStreamer& text_streamer, std::shared_ptr<FileProvider> file_provider,
-    bool defer_session_buffers
 ) : _resources(LanguageResources::acquire(model_path, std::move(file_provider))),
     _cfg(_resources->cfg),
     _elf_dir(_resources->package->elf_dir),
     _devkit_dir(_resources->package->devkit_dir),
     _files(_resources->package->files),
     _logger(_resources->package->logger),
-    _sessions(std::make_unique<SessionManager>()),
-    _session(_sessions->get(kDefaultSession)),
+    _cache(std::make_unique<LanguageCache>()),
     _workspace(std::make_unique<LanguageWorkspace>()),
     _run(std::make_unique<LanguageRunState>(std::move(stop_token_ids),
         _cfg.pipeline_cfg.max_num_tokens, text_streamer)),
@@ -166,7 +157,7 @@ LanguageModel::LanguageModel(
     );
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
-    _init_session_layout();
+    _init_cache_layout();
 
     // EAGLE3: build the constant tree_mask_init (eye(topk)) once. Only the
     // draft uses it (consumed in topk_generate's depth loop seed and concat).
@@ -184,7 +175,7 @@ LanguageModel::LanguageModel(
         _workspace->eagle3_position_ids.assign(topk, 0);
     }
 
-    _initialize(defer_session_buffers);
+    _initialize();
 }
 
 
@@ -387,7 +378,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_ordinary(
             // Decode.
             _decode(input_token_ids.size(), token_id, durations);
             output_token_ids = std::vector<uint32_t>(
-                _session->cached_token_ids.begin() + output_token_id_begin, _session->cached_token_ids.end()
+                _cache->cached_token_ids.begin() + output_token_id_begin, _cache->cached_token_ids.end()
             );
         }
     }
@@ -452,21 +443,17 @@ void validate_dflash_pair(const VlmConfig& target_cfg, const VlmConfig& draft_cf
 } // namespace
 
 void LanguageModel::attach_draft(LanguageModel& draft_lm) {
-    _attach_draft(draft_lm, nullptr);
-}
-
-void LanguageModel::_attach_draft(LanguageModel& draft_lm, LanguageModel* previous) {
     std::lock_guard lock(RuntimeContext::instance().execution_mutex);
     if (_run->active || draft_lm._run->active)
         throw std::logic_error("Cannot change the target/draft pair during generation");
-    const auto& identity = draft_lm._sessions->get(kDefaultSession);
-    if (_workspace->paired_draft_identity.lock() == identity) return;
     if (!_cfg.lm_cfg.speculative_decoding_cfg || !draft_lm._cfg.lm_cfg.speculative_decoding_cfg)
         throw std::invalid_argument("Both models must contain speculative-decoding configuration");
     const auto& target = *_cfg.lm_cfg.speculative_decoding_cfg;
     const auto& draft = *draft_lm._cfg.lm_cfg.speculative_decoding_cfg;
     if (target.is_draft || !draft.is_draft)
         throw std::invalid_argument("Speculative decoding requires a target paired with a draft");
+    if (_workspace->speculative_pair && _workspace->speculative_pair == draft_lm._workspace->speculative_pair)
+        return;
     if (target.method != draft.method)
         throw std::invalid_argument("Target and draft speculative methods do not match");
 
@@ -491,8 +478,11 @@ void LanguageModel::_attach_draft(LanguageModel& draft_lm, LanguageModel* previo
         else
             throw std::invalid_argument("Unsupported speculative-decoding method: " + target.method);
     }
-    _detach_draft_sessions(previous);
-    _workspace->paired_draft_identity = identity;
+    auto pair = std::make_shared<LanguageWorkspace::SpeculativePair>();
+    invalidate_prompt_reuse();
+    draft_lm.invalidate_prompt_reuse();
+    _workspace->speculative_pair = pair;
+    draft_lm._workspace->speculative_pair = std::move(pair);
 }
 
 uint32_t LanguageModel::run_model_prefill(
@@ -521,10 +511,10 @@ uint32_t LanguageModel::_prefill(
 
     if (num_input_tokens == num_cached_tokens) {
         // All input tokens are already cached.
-        if (num_cached_tokens < _session->cached_token_ids.size())
-            next_token_id = _session->cached_token_ids[num_cached_tokens];
+        if (num_cached_tokens < _cache->cached_token_ids.size())
+            next_token_id = _cache->cached_token_ids[num_cached_tokens];
         else
-            next_token_id = _session->cached_first_generated_token;
+            next_token_id = _cache->cached_first_generated_token;
     } else if (_use_group_token_models) {
         const auto& offsets = _cfg.pipeline_cfg.input_token_group_offsets.value();
         const auto& num_tokens = _cfg.pipeline_cfg.input_token_group_size;
@@ -570,7 +560,7 @@ uint32_t LanguageModel::_prefill(
             }
         }
         if (
-            !_session->cached_states.empty()
+            !_cache->cached_states.empty()
             && last_group_valid_tokens > 0
             && last_group_valid_tokens < group_size
         ) {
@@ -588,13 +578,13 @@ uint32_t LanguageModel::_prefill(
             }
         }
     }
-    _session->cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
+    _cache->cached_token_ids.assign(input_token_ids.begin(), input_token_ids.end());
     auto duration = timer_ttft.value().stop();
     if (num_input_tokens < _run->limits().max_num_tokens) {
         if (durations) durations->push_back(duration);
         _notify_first_token(next_token_id, duration);
     }
-    _session->cached_first_generated_token = next_token_id;
+    _cache->cached_first_generated_token = next_token_id;
     return next_token_id;
 }
 
@@ -619,7 +609,7 @@ void LanguageModel::_decode(uint16_t num_input_tokens, uint32_t token_id,
             _notify_interrupt();
             return;
         }
-        _session->cached_token_ids.emplace_back(token_id);
+        _cache->cached_token_ids.emplace_back(token_id);
         token_id = next_token_id;
 
         auto duration = timer_tps.stop(true);
@@ -727,7 +717,7 @@ LogLikelihoodResult LanguageModel::_score(
     if (!should_group_prefill) {
         // Single-token scoring rewrites the model cache from token zero without going
         // through run_model_prefill(), so the cached-token metadata is no longer valid.
-        _session->cached_token_ids.clear();
+        _cache->cached_token_ids.clear();
         _prepare_state_checkpoints_for_prefill(0);
     }
     if (should_group_prefill) {
@@ -1036,7 +1026,7 @@ uint32_t LanguageModel::run_model_once(
     const bool save_checkpoint = (
         _workspace->capture_state_checkpoints
         && std::binary_search(
-            _session->checkpoint_boundaries.begin(), _session->checkpoint_boundaries.end(), next_token_idx
+            _cache->checkpoint_boundaries.begin(), _cache->checkpoint_boundaries.end(), next_token_idx
         )
     );
     if (save_checkpoint) {
@@ -1156,10 +1146,9 @@ uint32_t LanguageModel::run_model_once(
 void LanguageModel::_finalize() {
     if (!_workspace) return;
     _logger->info("Language model finalize starting ...");
-    // Destroy bindings before their session/workspace buffers and shared resources.
+    // Destroy bindings before their cache and workspace buffers and shared resources.
     _workspace.reset();
-    _sessions.reset();
-    _session = nullptr;
+    _cache = nullptr;
     _resources.reset();
     _logger->info("Language model finalize completed");
 }
@@ -1414,7 +1403,7 @@ void LanguageModel::compact_kv_after_accept(
     }
 
     if (n == 0) {
-        _session->kv_cache_len = prev_input_len;
+        _cache->kv_cache_len = prev_input_len;
         return;
     }
 
@@ -1492,21 +1481,21 @@ void LanguageModel::compact_kv_after_accept(
         }
     }
 
-    _session->kv_cache_len = static_cast<uint16_t>(prev_input_len + n);
+    _cache->kv_cache_len = static_cast<uint16_t>(prev_input_len + n);
 }
 
 
-void LanguageModel::invalidate_prompt_reuse() { _session->invalidate_reuse(); }
+void LanguageModel::invalidate_prompt_reuse() {
+    _cache->invalidate_reuse();
+    _workspace->clear_cached_scratch();
+    _workspace->speculative_pair.reset();
+}
 
 void LanguageModel::set_image_identity(std::string identity) {
-    if (_session->image_identity != identity) {
-        _session->invalidate_reuse();
-        _session->image_identity = std::move(identity);
+    if (_cache->image_identity != identity) {
+        _cache->invalidate_reuse();
+        _cache->image_identity = std::move(identity);
     }
-}
-
-void LanguageModel::bind_session_adapter() {
-    _bind_adapter(_session ? _session->adapter : nullptr);
 }
 
 void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter) {
@@ -1565,10 +1554,7 @@ void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapte
 }
 
 void LanguageModel::set_reloc(const std::string& reloc_name) {
-    if (_session->adapter && _session->adapter->name == reloc_name) {
-        bind_session_adapter();
-        return;
-    }
+    if (_workspace->bound_adapter && _workspace->bound_adapter->name == reloc_name) return;
     if (_files->pulls_files())
         throw std::runtime_error("LoRA requires a local model directory; the asset provider cannot list npy_files");
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
@@ -1621,21 +1607,14 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
     auto& cached = _resources->adapters[reloc_name];
     _bind_adapter(adapter);
     cached = adapter;
-    _session->adapter = std::move(adapter);
-    _session->invalidate_reuse();
-    if (_session->draft) _session->draft->invalidate_reuse();
+    invalidate_prompt_reuse();
 }
 
 void LanguageModel::unset_reloc() {
-    if (!_session->adapter) {
-        bind_session_adapter();
-        return;
-    }
+    if (!_workspace->bound_adapter) return;
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
     _bind_adapter(nullptr);
-    _session->adapter.reset();
-    _session->invalidate_reuse();
-    if (_session->draft) _session->draft->invalidate_reuse();
+    invalidate_prompt_reuse();
 }
 
 uint16_t LanguageModel::set_max_num_tokens(std::optional<uint16_t> max_num_tokens) {
@@ -1699,7 +1678,7 @@ void LanguageModel::_prepare_offloaded_prompt(uint16_t num_tokens, uint16_t toke
 
 uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_token_ids) {
     // Log.
-    _logger->info("Cached token ids: [{}]", fmt::join(_session->cached_token_ids, ", "));
+    _logger->info("Cached token ids: [{}]", fmt::join(_cache->cached_token_ids, ", "));
 
     const uint16_t num_input_tokens = input_token_ids.size();
     if (_resources->embedding_offload) _workspace->offload_prompt_ids.assign(input_token_ids.begin(), input_token_ids.end());
@@ -1732,8 +1711,8 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
                 if (
                     num_images == 0
                     && idx == num_cached_tokens
-                    && idx < _session->cached_token_ids.size()
-                    && input_token_ids[idx] == _session->cached_token_ids[idx]
+                    && idx < _cache->cached_token_ids.size()
+                    && input_token_ids[idx] == _cache->cached_token_ids[idx]
                 )
                     ++num_cached_tokens;
             }
