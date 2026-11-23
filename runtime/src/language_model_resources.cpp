@@ -221,8 +221,8 @@ void LanguageResources::load() {
       cfg.pipeline_cfg.max_num_tokens,
       cfg.lm_cfg.rope_cfg.rope_scaling.rope_type,
       cfg.lm_cfg.rope_cfg.rope_theta,
-      cfg.lm_cfg.rope_cfg.get_rope_dimension_count("full_attention"),
-      cfg.lm_cfg.attn_cfg.get_head_dim("full_attention"),
+      cfg.lm_cfg.rope_cfg.get_rope_dimension_count(LayerType::FullAttention),
+      cfg.lm_cfg.attn_cfg.get_head_dim(LayerType::FullAttention),
       cfg.lm_cfg.rope_cfg.rope_scaling);
   // Save a pristine host copy for sourcing tree-RoPE rows without re-reading
   // the (mutated) device buffer.
@@ -239,8 +239,8 @@ void LanguageResources::load() {
     rope_table = calc_freq_real_imag(
         cfg.pipeline_cfg.max_num_tokens, local_rope_type,
         cfg.lm_cfg.rope_cfg.rope_local_base_freq,
-        cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention"),
-        cfg.lm_cfg.attn_cfg.get_head_dim("sliding_attention"),
+        cfg.lm_cfg.rope_cfg.get_rope_dimension_count(LayerType::SlidingAttention),
+        cfg.lm_cfg.attn_cfg.get_head_dim(LayerType::SlidingAttention),
         cfg.lm_cfg.rope_cfg.rope_scaling);
     // Save a pristine host copy for sourcing tree-RoPE rows in spec verify
     // (mirrors global_freq_host).

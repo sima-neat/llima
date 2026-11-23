@@ -74,7 +74,7 @@ void LanguageExecutor::bind_attention_inputs(LanguageModel& model, MLAModelWithB
             post._bind_ifm(1, scales, {scale_row, 0});
     }
     const uint8_t port = 1 + static_cast<uint8_t>(pre_scale) + static_cast<uint8_t>(eagle_draft);
-    const bool sliding = model._cfg.lm_cfg.layer_types[layer] == "sliding_attention";
+    const bool sliding = model._cfg.lm_cfg.layer_types[layer] == LayerType::SlidingAttention;
     pre._bind_ifm(port,
                   sliding ? model._workspace->local_freq_real : model._workspace->global_freq_real,
                   {rope_row, 0});
@@ -151,7 +151,7 @@ void LanguageExecutor::queue_layer(LanguageModel& model, uint16_t width, uint16_
                                    LayerBindings bindings, LayerOutput output, uint16_t logit_row) {
     const auto& cfg = model._cfg.lm_cfg;
     const auto& type = cfg.layer_types[layer];
-    if (type == "full_attention" || type == "sliding_attention") {
+    if (type == LayerType::FullAttention || type == LayerType::SlidingAttention) {
         auto programs = bind_attention(model, width, position, layer, scales, scale_row);
         if (output == LayerOutput::CacheOnly) {
             programs.pre.add_to_queue(bindings.input);
@@ -181,15 +181,15 @@ void LanguageExecutor::queue_layer(LanguageModel& model, uint16_t width, uint16_
         return;
     }
 
-    if (type != "linear_attention" && type != "conv")
-        throw std::runtime_error("Unsupported layer type: " + type);
+    if (type != LayerType::LinearAttention && type != LayerType::Conv)
+        throw std::runtime_error(fmt::format("Unsupported layer type: {}", layer_type_name(type)));
     const LanguageModelMapKey key{width, layer, 0};
-    auto& program = type == "linear_attention" ? model._workspace->linear_model_map.at(key)
+    auto& program = type == LayerType::LinearAttention ? model._workspace->linear_model_map.at(key)
                                                : model._workspace->conv_model_map.at(key);
     if (model._cfg.pipeline_cfg.quantize_embeddings && layer == 0)
         program._bind_ifm(1, scales, {scale_row, 0});
     program.add_to_queue(bindings.input, bindings.output);
-    if (type == "conv" && output == LayerOutput::LogitsRow) {
+    if (type == LayerType::Conv && output == LayerOutput::LogitsRow) {
         Overrides row;
         if (width > 1)
             row.emplace(0, MLABufferSlice{nullptr, {logit_row, 0}, {1, cfg.hidden_size}});
@@ -230,7 +230,7 @@ LanguageExecutor::AttentionPrograms LanguageExecutor::bind_attention(
 
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     const bool use_sliding_cache = std::get<1>(cache_key) != 0;
-    const char* cache_layer_type = use_sliding_cache ? "sliding_attention" : "full_attention";
+    const LayerType cache_layer_type = use_sliding_cache ? LayerType::SlidingAttention : LayerType::FullAttention;
     const uint16_t cache_mask_size =
         model._get_cache_mask_size(cache_layer_type, eff_num_cached_tokens, !is_single_model);
     const bool use_single_future_token_mask = is_single_model && cache_mask_size > 1;

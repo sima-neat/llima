@@ -165,11 +165,11 @@ void LanguageModel::_define_buffers() {
 
     // Frequency tables.
     _define_buffer_freq_table(
-        "global", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("full_attention")
+        "global", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count(LayerType::FullAttention)
     );
     if (_cfg.lm_cfg.attn_cfg.swa_enable)
         _define_buffer_freq_table(
-            "local", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count("sliding_attention")
+            "local", _cfg.lm_cfg.rope_cfg.get_rope_dimension_count(LayerType::SlidingAttention)
         );
 
     if (_has_linear_attention_layers()) {
@@ -192,9 +192,9 @@ void LanguageModel::_define_buffers() {
     const uint16_t conv_working_len = _cfg.pipeline_cfg.input_token_group_size + _cfg.lm_cfg.conv_L_cache - 2;
     std::vector<size_t> conv_cache_shape{conv_working_len, _cfg.lm_cfg.hidden_size};
     for (uint8_t i = 0; i < _cfg.lm_cfg.num_hidden_layers; ++i) {
-        if (_cfg.lm_cfg.layer_types[i] == "conv") {
+        if (_cfg.lm_cfg.layer_types[i] == LayerType::Conv) {
             _define_cache_buffer(fmt::format("conv_cache_history_l{}", i), conv_cache_shape);
-        } else if (_cfg.lm_cfg.layer_types[i] == "linear_attention") {
+        } else if (_cfg.lm_cfg.layer_types[i] == LayerType::LinearAttention) {
             const auto& linear_cfg = _linear_attn_cfg();
             const uint16_t linear_conv_working_len = static_cast<uint16_t>(
                 _cfg.pipeline_cfg.input_token_group_size + linear_cfg.conv_kernel_dim - 2
@@ -348,7 +348,7 @@ void LanguageModel::_define_buffers() {
     if (
         _use_group_token_models
         && _get_cache_mask_size(
-            "full_attention", _cfg.pipeline_cfg.max_num_tokens, true
+            LayerType::FullAttention, _cfg.pipeline_cfg.max_num_tokens, true
         ) > group_size
     ) {
         define_buffer(
@@ -364,7 +364,7 @@ void LanguageModel::_define_buffers() {
         _use_group_token_models
         && _cfg.lm_cfg.attn_cfg.swa_enable
         && _get_cache_mask_size(
-            "sliding_attention", _cfg.pipeline_cfg.max_num_tokens, true
+            LayerType::SlidingAttention, _cfg.pipeline_cfg.max_num_tokens, true
         ) > group_size
     ) {
         define_buffer(
@@ -400,7 +400,7 @@ void LanguageModel::_define_buffers() {
         // Cache output and post input.
         define_buffer(
             fmt::format("n{}_buffer3", num_tokens),
-            {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size("full_attention")}
+            {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(LayerType::FullAttention)}
         );
 
         if (_uses_per_layer_inputs()) {
@@ -450,7 +450,7 @@ void LanguageModel::_define_buffers() {
         if (_cfg.lm_cfg.attn_cfg.attn_output_gate) {
             define_buffer(
                 fmt::format("n{}_buffer_gate", num_tokens),
-                {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size("full_attention")}
+                {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(LayerType::FullAttention)}
             );
         }
 
@@ -630,7 +630,7 @@ void LanguageModel::_init_attention_bindings() {
     _workspace->attention_binding_buffers.resize(_cfg.lm_cfg.num_hidden_layers);
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-        if (layer_type != "full_attention" && layer_type != "sliding_attention") continue;
+        if (layer_type != LayerType::FullAttention && layer_type != LayerType::SlidingAttention) continue;
         const auto source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
         auto& buffers = _workspace->attention_binding_buffers[layer_idx];
         buffers.key = &get_buffer(fmt::format("cache_key_l{}", source_layer));
@@ -672,7 +672,7 @@ void LanguageModel::_define_attn_models_iter(
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
     const auto& kv_layer_type = _cfg.lm_cfg.layer_types[kv_source_layer];
-    const std::string freq_prefix = layer_type == "sliding_attention" ? "local" : "global";
+    const std::string freq_prefix = layer_type == LayerType::SlidingAttention ? "local" : "global";
     const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
         num_tokens, token_idx, layer_type
     );
@@ -805,8 +805,8 @@ void LanguageModel::_define_attn_models_iter(
     const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
     const bool is_single_model = num_tokens == single_num_tokens;
     const bool use_sliding_cache = std::get<1>(cache_key) != 0;
-    const std::string_view cache_layer_type = (
-        use_sliding_cache ? "sliding_attention" : "full_attention"
+    const LayerType cache_layer_type = (
+        use_sliding_cache ? LayerType::SlidingAttention : LayerType::FullAttention
     );
     const uint16_t cache_mask_size = _get_cache_mask_size(
         cache_layer_type, eff_num_cached_tokens, !is_single_model
@@ -873,7 +873,7 @@ void LanguageModel::_define_attn_models_iter(
         cache_ifms.emplace_back(
             MLABufferSlice{
                 &get_buffer(
-                    cache_layer_type == "sliding_attention"
+                    cache_layer_type == LayerType::SlidingAttention
                         ? "group_sliding_future_token_mask"
                         : "group_future_token_mask"
                 ),
@@ -1170,9 +1170,9 @@ void LanguageModel::_define_moe_post_models(
 
 
 void LanguageModel::_define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx) {
-    if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
+    if (_cfg.lm_cfg.layer_types[layer_idx] == LayerType::Conv) {
         _define_conv_models_iter(num_tokens, layer_idx);
-    } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+    } else if (_cfg.lm_cfg.layer_types[layer_idx] == LayerType::LinearAttention) {
         _define_linear_models_iter(num_tokens, layer_idx);
     }
 }
@@ -1381,8 +1381,8 @@ void LanguageModel::_define_models() {
                 }
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
                     if (
-                        _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-                        || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
+                        _cfg.lm_cfg.layer_types[layer_idx] == LayerType::FullAttention
+                        || _cfg.lm_cfg.layer_types[layer_idx] == LayerType::SlidingAttention
                     ) {
                         _define_attn_models_iter(num_tokens, token_idx, layer_idx);
                     }
@@ -1392,8 +1392,8 @@ void LanguageModel::_define_models() {
             for (const auto& token_idx: _cfg.pipeline_cfg.input_token_group_offsets.value()) {
                 for (uint8_t layer_idx = 0; layer_idx < num_hidden_layers; ++layer_idx) {
                     if (
-                        _cfg.lm_cfg.layer_types[layer_idx] == "full_attention"
-                        || _cfg.lm_cfg.layer_types[layer_idx] == "sliding_attention"
+                        _cfg.lm_cfg.layer_types[layer_idx] == LayerType::FullAttention
+                        || _cfg.lm_cfg.layer_types[layer_idx] == LayerType::SlidingAttention
                     ) {
                         _define_attn_models_iter(num_tokens, token_idx, layer_idx);
                     }
@@ -1469,7 +1469,7 @@ void LanguageModel::_define_dflash_models() {
         ));
         for (uint8_t layer_idx = 0;
              layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-            if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+            if (_cfg.lm_cfg.layer_types[layer_idx] != LayerType::LinearAttention) {
                 continue;
             }
             _workspace->dflash_state_resolver_model_map.emplace(
@@ -1519,7 +1519,7 @@ void LanguageModel::_define_dflash_models() {
     for (const auto num_tokens : widths) {
         for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
             const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-            const char* freq_prefix = layer_type == "sliding_attention" ? "local" : "global";
+            const char* freq_prefix = layer_type == LayerType::SlidingAttention ? "local" : "global";
             const auto freq_dim = _cfg.lm_cfg.rope_cfg.get_rope_dimension_count(layer_type) / 2;
             std::vector<MLABufferSlice> outputs;
             auto& key = get_buffer(fmt::format("cache_key_l{}", layer_idx));

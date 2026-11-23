@@ -183,7 +183,7 @@ bool LanguageModel::_has_linear_attention_layers() const {
     return std::find(
         _cfg.lm_cfg.layer_types.begin(),
         _cfg.lm_cfg.layer_types.end(),
-        "linear_attention"
+        LayerType::LinearAttention
     ) != _cfg.lm_cfg.layer_types.end();
 }
 
@@ -802,7 +802,7 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
 
     MLAModelWithBuffer::run_queue();
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == LayerType::LinearAttention) {
             get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
                 get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
             );
@@ -853,7 +853,7 @@ void LanguageModel::_upload_group_future_token_masks(
 
     auto upload_group_mask = [&](
         const std::string& name,
-        const std::string& layer_type,
+        LayerType layer_type,
         uint16_t cache_token_idx_begin
     ) {
         const uint16_t effective_context = token_idx + num_tokens - cache_token_idx_begin;
@@ -883,14 +883,14 @@ void LanguageModel::_upload_group_future_token_masks(
     };
 
     upload_group_mask(
-        "group_future_token_mask", "full_attention", 0
+        "group_future_token_mask", LayerType::FullAttention, 0
     );
     if (_cfg.lm_cfg.attn_cfg.swa_enable) {
         const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
-            num_tokens, token_idx, "sliding_attention"
+            num_tokens, token_idx, LayerType::SlidingAttention
         );
         upload_group_mask(
-            "group_sliding_future_token_mask", "sliding_attention", cache_token_idx_begin
+            "group_sliding_future_token_mask", LayerType::SlidingAttention, cache_token_idx_begin
         );
     }
 }
@@ -1016,7 +1016,7 @@ uint32_t LanguageModel::run_model_once(
     // Run all the queued models.
     MLAModelWithBuffer::run_queue();
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+        if (_cfg.lm_cfg.layer_types[layer_idx] == LayerType::LinearAttention) {
             get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).swap_storage(
                 get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx))
             );
@@ -1158,9 +1158,9 @@ void LanguageModel::_finalize() {
 
 
 uint16_t LanguageModel::_get_cache_token_idx_begin(
-    uint16_t num_tokens, uint16_t token_idx, const std::string& layer_type
+    uint16_t num_tokens, uint16_t token_idx, LayerType layer_type
 ) const {
-    if (layer_type != "sliding_attention") {
+    if (layer_type != LayerType::SlidingAttention) {
         return 0;
     }
     // Retain the first query's full window for prefill and verification.
@@ -1184,32 +1184,32 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
     const bool is_single_model = num_tokens == single_num_tokens;
     const uint16_t sliding_window = _cfg.lm_cfg.attn_cfg.sliding_window.value_or(0);
     const bool separate_sliding_cache = (
-        layer_type == "sliding_attention"
+        layer_type == LayerType::SlidingAttention
         && _cfg.lm_cfg.attn_cfg.sliding_head_dim.has_value()
         && _cfg.lm_cfg.attn_cfg.sliding_head_dim.value() != _cfg.lm_cfg.attn_cfg.head_dim
     );
     // Bucket differences matter only when the sliding window truncates the context.
     const bool sliding_cache_mask_differs = (
-        layer_type == "sliding_attention"
+        layer_type == LayerType::SlidingAttention
         && !separate_sliding_cache
         && sliding_window < _cfg.pipeline_cfg.max_num_tokens
         && (
-            _get_cache_mask_size("full_attention", sliding_window, true)
-                != _get_cache_mask_size("sliding_attention", sliding_window, true)
-            || _get_cache_mask_size("full_attention", sliding_window, false)
-                != _get_cache_mask_size("sliding_attention", sliding_window, false)
+            _get_cache_mask_size(LayerType::FullAttention, sliding_window, true)
+                != _get_cache_mask_size(LayerType::SlidingAttention, sliding_window, true)
+            || _get_cache_mask_size(LayerType::FullAttention, sliding_window, false)
+                != _get_cache_mask_size(LayerType::SlidingAttention, sliding_window, false)
         )
     );
     const bool use_sliding_cache = (
         separate_sliding_cache
-        || (layer_type == "sliding_attention"
+        || (layer_type == LayerType::SlidingAttention
             && (!is_single_model || _cfg.lm_cfg.is_spec_decode())
             && token_idx + num_tokens > sliding_window)
         || (is_single_model && sliding_cache_mask_differs
             && eff_num_cached_tokens >= sliding_window)
     );
-    const std::string cache_layer_type = (
-        use_sliding_cache ? "sliding_attention" : "full_attention"
+    const LayerType cache_layer_type = (
+        use_sliding_cache ? LayerType::SlidingAttention : LayerType::FullAttention
     );
     const uint16_t cache_mask_size = _get_cache_mask_size(
         cache_layer_type, eff_num_cached_tokens, !is_single_model
@@ -1464,8 +1464,8 @@ void LanguageModel::compact_kv_after_accept(
     // Gather accepted K/V rows and their quantization scales into contiguous positions.
     for (uint8_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
         if (
-            (layer_types[layer_idx] != "full_attention"
-             && layer_types[layer_idx] != "sliding_attention")
+            (layer_types[layer_idx] != LayerType::FullAttention
+             && layer_types[layer_idx] != LayerType::SlidingAttention)
             || _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
         ) {
             continue;

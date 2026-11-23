@@ -72,8 +72,8 @@ template <class Config> struct ModelResources {
           cfg.lm_cfg.layer_types.emplace_back(
               cfg.lm_cfg.attn_cfg.swa_enable &&
                       (layer + 1) % (cfg.lm_cfg.attn_cfg.swa_ratio + 1)
-                  ? "sliding_attention"
-                  : "full_attention");
+                  ? LayerType::SlidingAttention
+                  : LayerType::FullAttention);
       }
     }
   }

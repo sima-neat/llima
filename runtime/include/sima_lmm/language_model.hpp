@@ -438,7 +438,7 @@ class LanguageModel {
             uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx
         ) const;
         uint16_t _get_cache_token_idx_begin(
-            uint16_t num_tokens, uint16_t token_idx, const std::string& layer_type
+            uint16_t num_tokens, uint16_t token_idx, LayerType layer_type
         ) const;
         void _define_state_models_iter(uint16_t num_tokens, uint8_t layer_idx);
         void _define_conv_models_iter(uint16_t num_tokens, uint8_t layer_idx);
@@ -464,10 +464,10 @@ class LanguageModel {
         static constexpr uint16_t LONG_CONTEXT_MIN_TOKENS = 2048;
         static constexpr uint16_t MAX_NUM_TOKENS_ALIGNMENT = 1024;
         uint16_t _get_cache_mask_size(
-            std::string_view layer_type, uint16_t context_length, bool is_group
+            LayerType layer_type, uint16_t context_length, bool is_group
         ) const {
             if (
-                layer_type != "sliding_attention"
+                layer_type != LayerType::SlidingAttention
                 && _cfg.pipeline_cfg.long_context_future_token_mask_size.has_value()
                 && context_length > LONG_CONTEXT_MIN_TOKENS
             ) {
@@ -558,7 +558,7 @@ class LanguageModel {
             uint16_t context_length,
             uint16_t sliding_window = 0
         );
-        uint8_t _find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const;
+        uint8_t _find_gemma4_mtp_target_kv_layer(LayerType layer_type) const;
         std::vector<uint8_t> _prepare_gemma4_mtp_shared_kv_layers(
             const LanguageModel& target_lm
         ) const;

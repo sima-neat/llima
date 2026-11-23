@@ -108,7 +108,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     // stride misaligns rows >= 1 and collapses the tree. Prefill group masks
     // are prepared separately before cache dispatch, so this local buffer is unused.
     const uint16_t mask_bucket = _get_cache_mask_size(
-        "full_attention", seq_len_with_past, false
+        LayerType::FullAttention, seq_len_with_past, false
     );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = is_prefill
@@ -278,8 +278,8 @@ void LanguageModel::_validate_eagle3_target() const {
     if (layers.size() != _cfg.lm_cfg.num_hidden_layers)
         throw std::invalid_argument("EAGLE3 target layer count does not match its configuration");
     for (const auto& type : layers) {
-        if (type != "full_attention")
-            throw std::invalid_argument("EAGLE3 target verification requires full attention, found " + type);
+        if (type != LayerType::FullAttention)
+            throw std::invalid_argument(fmt::format("EAGLE3 target verification requires full attention, found {}", layer_type_name(type)));
     }
 }
 
@@ -346,7 +346,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     // pad_cols must match the cache ELF's compiled stride: rounding up
     // seq_len_with_past to mask_bucket. Wider strides misalign rows >= 1.
     const uint16_t mask_bucket = _get_cache_mask_size(
-        "full_attention", seq_len_with_past, false
+        LayerType::FullAttention, seq_len_with_past, false
     );
     const size_t pad_rows = num_tokens;
     const size_t pad_cols = static_cast<size_t>(

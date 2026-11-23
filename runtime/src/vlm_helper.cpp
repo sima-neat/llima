@@ -254,7 +254,7 @@ PreprocessedChat VlmHelper::preprocess(const Chat& chat, bool load_images) {
     const bool uses_state_checkpoints = group_offsets.has_value() && !group_offsets->empty()
         && std::any_of(
             layer_types.begin(), layer_types.end(),
-            [](const auto& type) { return type == "conv" || type == "linear_attention"; }
+            [](const auto& type) { return type == LayerType::Conv || type == LayerType::LinearAttention; }
         );
     if (
         uses_state_checkpoints

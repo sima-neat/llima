@@ -1,7 +1,12 @@
 #ifndef _SIMA_LLIMA_VLM_CONFIG_
 #define _SIMA_LLIMA_VLM_CONFIG_
 
+#include <algorithm>
+#include <array>
 #include <optional>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -16,6 +21,40 @@ namespace llima {
 
 // Redefines the *Config python classes in sima_lmm/config/vlm_config.py here. Only the fields that
 // are used in the evaluation time is defined.
+
+enum class LayerType { FullAttention, SlidingAttention, LinearAttention, Conv };
+
+inline constexpr std::array<std::string_view, 4> layer_type_names{
+    "full_attention", "sliding_attention", "linear_attention", "conv"
+};
+
+inline std::string_view layer_type_name(LayerType type) {
+    return layer_type_names.at(static_cast<size_t>(type));
+}
+
+struct LayerTypes : std::vector<LayerType> { using std::vector<LayerType>::vector; };
+
+inline void to_json(nlohmann::json& j, const LayerTypes& layers) {
+    j = nlohmann::json::array();
+    for (auto type : layers)
+        j.push_back(layer_type_name(type));
+}
+
+inline void from_json(const nlohmann::json& j, LayerTypes& layers) {
+    LayerTypes parsed;
+    if (!j.is_null()) {
+        for (const auto& entry : j.get_ref<const nlohmann::json::array_t&>()) {
+            if (!entry.is_string())
+                throw std::invalid_argument(fmt::format("Expected a string at layer_types[{}], got {}", parsed.size(), entry.dump()));
+            const auto& name = entry.get_ref<const std::string&>();
+            const auto found = std::find(layer_type_names.begin(), layer_type_names.end(), name);
+            if (found == layer_type_names.end())
+                throw std::invalid_argument(fmt::format("Unknown layer_types[{}]: {}", parsed.size(), entry.dump()));
+            parsed.push_back(static_cast<LayerType>(found - layer_type_names.begin()));
+        }
+    }
+    layers = std::move(parsed);
+}
 
 struct SpeculativeBudget {
     static constexpr uint16_t draft = 5;
@@ -124,8 +163,8 @@ struct RoPEConfig {
     std::optional<uint32_t> sliding_rope_dimension_count;
     RopeScalingConfig rope_scaling;
 
-    uint32_t get_rope_dimension_count(const std::string& layer_type) const {
-        if (layer_type == "sliding_attention" && sliding_rope_dimension_count.has_value()) {
+    uint32_t get_rope_dimension_count(LayerType layer_type) const {
+        if (layer_type == LayerType::SlidingAttention && sliding_rope_dimension_count.has_value()) {
             return sliding_rope_dimension_count.value();
         }
         return rope_dimension_count;
@@ -148,16 +187,16 @@ struct AttentionBlockConfig {
     bool attn_output_gate = false;  // Qwen3.5: per-head sigmoid gate on attention output.
 
 
-    uint32_t get_head_dim(const std::string& layer_type) const {
-        if (layer_type == "sliding_attention" && sliding_head_dim.has_value()) {
+    uint32_t get_head_dim(LayerType layer_type) const {
+        if (layer_type == LayerType::SlidingAttention && sliding_head_dim.has_value()) {
             return sliding_head_dim.value();
         }
         return head_dim;
     }
-    uint32_t get_q_size(const std::string& layer_type) const {
+    uint32_t get_q_size(LayerType layer_type) const {
         return num_attention_heads * get_head_dim(layer_type);
     }
-    uint32_t get_kv_size(const std::string& layer_type) const {
+    uint32_t get_kv_size(LayerType layer_type) const {
         return num_key_value_heads * get_head_dim(layer_type);
     }
 };
@@ -215,7 +254,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     MixtureOfExpertsConfig, num_experts, num_experts_per_tok
 )
 
-struct LayerTypes : std::vector<std::string> { using std::vector<std::string>::vector; };
+
 
 struct LanguageModelConfig {
     TokenEmbedConfig token_cfg;
@@ -308,20 +347,6 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     linear_attn_cfg,
     draft_vocab_size, speculative_decoding_cfg, arch, moe_cfg
 )
-
-
-inline void to_json(nlohmann::json& j, const LayerTypes& v) {
-    j = static_cast<const std::vector<std::string>&>(v);
-}
-
-
-inline void from_json(const nlohmann::json& j, LayerTypes& v) {
-    if (j.is_null()) {
-        v.clear();
-    } else {
-        j.get_to(static_cast<std::vector<std::string>&>(v));
-    }
-}
 
 
 struct PipelineConfig {

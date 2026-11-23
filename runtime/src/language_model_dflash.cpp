@@ -17,8 +17,8 @@ namespace llima {
 
 namespace {
 
-bool is_attention(std::string_view layer_type) {
-  return layer_type == "full_attention" || layer_type == "sliding_attention";
+bool is_attention(LayerType layer_type) {
+  return layer_type == LayerType::FullAttention || layer_type == LayerType::SlidingAttention;
 }
 
 
@@ -46,7 +46,7 @@ void LanguageModel::_bind_dflash_linear_conv_state(uint16_t prefix_tokens) {
   const uint32_t tail_begin = _cfg.pipeline_cfg.input_token_group_size - 1;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
-    if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+    if (_cfg.lm_cfg.layer_types[layer_idx] != LayerType::LinearAttention) {
       continue;
     }
     auto &model = _workspace->linear_model_map.at(
@@ -85,7 +85,7 @@ void LanguageModel::_resolve_dflash_linear_state(uint16_t prefix_tokens) {
   const uint32_t decay_row = prefix_tokens - 1;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
-    if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+    if (_cfg.lm_cfg.layer_types[layer_idx] != LayerType::LinearAttention) {
       continue;
     }
     auto &model = _workspace->dflash_state_resolver_model_map.at(
@@ -113,7 +113,7 @@ void LanguageModel::_commit_dflash_linear_state(uint16_t prefix_tokens) {
 
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
-    if (_cfg.lm_cfg.layer_types[layer_idx] != "linear_attention") {
+    if (_cfg.lm_cfg.layer_types[layer_idx] != LayerType::LinearAttention) {
       continue;
     }
 
@@ -197,7 +197,7 @@ void LanguageModel::_upload_dflash_attention_mask(uint16_t num_tokens,
                              ? token_idx + num_tokens
                              : static_cast<uint16_t>(query_position + 1);
     const uint16_t begin =
-        layer_type == "sliding_attention"
+        layer_type == LayerType::SlidingAttention
             ? std::max<uint16_t>(
                   cache_begin,
                   end - std::min<uint16_t>(
@@ -238,7 +238,7 @@ void LanguageModel::_append_dflash_context(LanguageModel &target_lm,
        ++layer_idx) {
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
     const char *freq_prefix =
-        layer_type == "sliding_attention" ? "local" : "global";
+        layer_type == LayerType::SlidingAttention ? "local" : "global";
     auto &model = _workspace->dflash_context_model_map.at(
         LanguageModelMapKey{num_tokens, layer_idx, 0});
     model._bind_ifm(1, &get_buffer(fmt::format("{}_freq_real", freq_prefix)),
@@ -288,11 +288,11 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
   auto& input = *embedding.values;
   auto* input_scale = embedding.scales;
 
-  std::optional<std::string_view> active_mask_type;
+  std::optional<LayerType> active_mask_type;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     const auto &layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const bool bidirectional = layer_type == "full_attention";
+    const bool bidirectional = layer_type == LayerType::FullAttention;
     if (!active_mask_type.has_value() || *active_mask_type != layer_type) {
       MLAModelWithBuffer::run_queue();
       _upload_dflash_attention_mask(num_tokens, token_idx, layer_idx,
@@ -342,7 +342,7 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
   auto* input_scale = embedding.scales;
 
   MLABuffer *layer_input = nullptr;
-  std::optional<std::string_view> active_mask_type;
+  std::optional<LayerType> active_mask_type;
   for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers;
        ++layer_idx) {
     std::map<uint8_t, MLABufferSlice> inputs;
@@ -373,8 +373,8 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
         active_mask_type = layer_type;
       }
     }
-    if (!is_attention(layer_type) && layer_type != "linear_attention") {
-      throw std::runtime_error("Unsupported DFlash target layer type: " + layer_type);
+    if (!is_attention(layer_type) && layer_type != LayerType::LinearAttention) {
+      throw std::runtime_error(fmt::format("Unsupported DFlash target layer type: {}", layer_type_name(layer_type)));
     }
     LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_scale, 0,
         {.input = input_overrides, .post_input = input_overrides, .output = output_overrides});

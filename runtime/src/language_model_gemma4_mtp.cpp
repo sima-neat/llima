@@ -248,7 +248,7 @@ void LanguageModel::_upload_gemma4_mtp_causal_mask(
     buffer.upload_raw(mask.data(), 0, mask.size() * sizeof(Eigen::bfloat16));
 }
 
-uint8_t LanguageModel::_find_gemma4_mtp_target_kv_layer(std::string_view layer_type) const {
+uint8_t LanguageModel::_find_gemma4_mtp_target_kv_layer(LayerType layer_type) const {
     for (int idx = static_cast<int>(_cfg.lm_cfg.num_hidden_layers) - 1; idx >= 0; --idx) {
         const auto layer_idx = static_cast<uint8_t>(idx);
         if (
@@ -259,7 +259,7 @@ uint8_t LanguageModel::_find_gemma4_mtp_target_kv_layer(std::string_view layer_t
         }
     }
     throw std::runtime_error(fmt::format(
-        "No target KV layer found for Gemma4 MTP layer type {}", layer_type
+        "No target KV layer found for Gemma4 MTP layer type {}", layer_type_name(layer_type)
     ));
 }
 
@@ -284,7 +284,7 @@ std::vector<uint8_t> LanguageModel::_prepare_gemma4_mtp_shared_kv_layers(
     std::vector<uint8_t> source_layers;
     source_layers.reserve(_cfg.lm_cfg.num_hidden_layers);
     for (const auto& layer_type : _cfg.lm_cfg.layer_types) {
-        if (layer_type != "full_attention" && layer_type != "sliding_attention") {
+        if (layer_type != LayerType::FullAttention && layer_type != LayerType::SlidingAttention) {
             throw std::runtime_error("Gemma4 MTP draft supports attention-only assistant layers");
         }
         const uint8_t source_layer = target_lm._find_gemma4_mtp_target_kv_layer(layer_type);
@@ -293,7 +293,7 @@ std::vector<uint8_t> LanguageModel::_prepare_gemma4_mtp_shared_kv_layers(
         if (source_head_dim != consumer_head_dim || source_kv_heads != consumer_kv_heads) {
             throw std::runtime_error(fmt::format(
                 "Gemma4 MTP shared KV shape mismatch for {}: target {}x{}, draft {}x{}",
-                layer_type, source_kv_heads, source_head_dim,
+                layer_type_name(layer_type), source_kv_heads, source_head_dim,
                 consumer_kv_heads, consumer_head_dim
             ));
         }
@@ -342,7 +342,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
 
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-        if (layer_type != "full_attention" && layer_type != "sliding_attention") {
+        if (layer_type != LayerType::FullAttention && layer_type != LayerType::SlidingAttention) {
             throw std::runtime_error(
                 "Gemma4 MTP target supports attention-only language layers"
             );
@@ -356,7 +356,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
         auto& cache_model = _workspace->cache_model_map.at(cache_key);
         auto& post_model = _workspace->post_model_map.at(model_key);
 
-        const bool is_sliding = layer_type == "sliding_attention";
+        const bool is_sliding = layer_type == LayerType::SlidingAttention;
         LanguageExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
             input_embedding_scales_buf, 0, 0);
         LanguageExecutor::bind_kv_outputs(*this, pre_model, layer_idx, token_idx);
@@ -368,9 +368,9 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             token_idx + num_tokens - cache_token_idx_begin
         );
         const bool use_sliding_cache = std::get<1>(cache_key) != 0;
-        const std::string_view cache_layer_type = use_sliding_cache
-            ? std::string_view("sliding_attention")
-            : std::string_view("full_attention");
+        const LayerType cache_layer_type = use_sliding_cache
+            ? LayerType::SlidingAttention
+            : LayerType::FullAttention;
         const uint16_t cache_mask_size = _get_cache_mask_size(
             cache_layer_type, eff_num_cached_tokens, false
         );
@@ -499,7 +499,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
         auto& cache_model = _workspace->cache_model_map.at(cache_key);
         auto& post_model = _workspace->post_model_map.at(model_key);
 
-        const bool is_sliding = layer_type == "sliding_attention";
+        const bool is_sliding = layer_type == LayerType::SlidingAttention;
         LanguageExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
             nullptr, 0, 0);
 
@@ -510,9 +510,9 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
             cache_model_token_idx + num_tokens - cache_token_idx_begin
         );
         const bool use_sliding_cache = std::get<1>(cache_key) != 0;
-        const std::string_view cache_layer_type = use_sliding_cache
-            ? std::string_view("sliding_attention")
-            : std::string_view("full_attention");
+        const LayerType cache_layer_type = use_sliding_cache
+            ? LayerType::SlidingAttention
+            : LayerType::FullAttention;
         const uint16_t cache_mask_size = _get_cache_mask_size(
             cache_layer_type, eff_num_cached_tokens, false
         );

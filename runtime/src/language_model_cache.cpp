@@ -25,9 +25,9 @@ void LanguageModel::_init_cache_layout() {
     std::vector<uint8_t> conv_layers;
     std::vector<uint8_t> linear_layers;
     for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
-        if (_cfg.lm_cfg.layer_types[layer] == "conv")
+        if (_cfg.lm_cfg.layer_types[layer] == LayerType::Conv)
             conv_layers.push_back(layer);
-        else if (_cfg.lm_cfg.layer_types[layer] == "linear_attention")
+        else if (_cfg.lm_cfg.layer_types[layer] == LayerType::LinearAttention)
             linear_layers.push_back(layer);
     }
     if (conv_layers.empty() && linear_layers.empty())
@@ -89,10 +89,10 @@ uint16_t LanguageModel::_prepare_state_checkpoints_for_prefill(uint16_t num_cach
     if (_cache->cached_states.empty()) {
         bool cleared_state = false;
         for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-            if (_cfg.lm_cfg.layer_types[layer_idx] == "conv") {
+            if (_cfg.lm_cfg.layer_types[layer_idx] == LayerType::Conv) {
                 get_buffer(fmt::format("conv_cache_history_l{}", layer_idx)).clear();
                 cleared_state = true;
-            } else if (_cfg.lm_cfg.layer_types[layer_idx] == "linear_attention") {
+            } else if (_cfg.lm_cfg.layer_types[layer_idx] == LayerType::LinearAttention) {
                 get_buffer(fmt::format("linear_conv_cache_history_l{}", layer_idx)).clear();
                 get_buffer(fmt::format("linear_delta_state_history_l{}", layer_idx)).clear();
                 get_buffer(fmt::format("linear_delta_state_history_alt_l{}", layer_idx)).clear();
