@@ -81,12 +81,12 @@ class SessionManager {
     void set_limit(size_t limit);
     size_t limit() const { std::lock_guard lock(_mutex); return _limit; }
     std::vector<SessionId> ids() const;
-    SessionId active = 0;
+    SessionId active = kDefaultSession;
 
   private:
     mutable std::mutex _mutex;
     size_t _limit = 4;
-    SessionId _next = 1;
+    uint64_t _next = 1;
     std::map<SessionId, std::shared_ptr<LanguageSession>> _sessions;
 };
 

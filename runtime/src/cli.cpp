@@ -244,8 +244,8 @@ void CLI::run() {
                 std::cout << std::endl;
             }
         };
-        auto response = _vision_language_model_ptr->run_model(chat, options);
-        if (response.has_value()) {
+        const auto response = _vision_language_model_ptr->generate(chat, options);
+        if (response.finish != ChatResult::Finish::Cancelled) {
             auto answer = trim(std::move(final_response));
             if (answer.empty()) {
                 chat.clear_history();

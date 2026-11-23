@@ -56,7 +56,7 @@ void LanguageSession::invalidate_reuse() {
 }
 
 SessionManager::SessionManager() {
-    _sessions.emplace(0, std::make_shared<LanguageSession>());
+    _sessions.emplace(kDefaultSession, std::make_shared<LanguageSession>());
 }
 
 std::shared_ptr<LanguageSession> SessionManager::get(SessionId id) const {
@@ -73,14 +73,14 @@ SessionId SessionManager::create(const LanguageSession& prototype) {
         throw std::runtime_error("Language session limit reached");
     auto session = std::make_shared<LanguageSession>();
     session->init_layout(prototype);
-    const auto id = _next;
+    const SessionId id{_next};
     _sessions.emplace(id, std::move(session));
     ++_next;
     return id;
 }
 
 void SessionManager::release(SessionId id) {
-    if (id == 0)
+    if (id == kDefaultSession)
         throw std::invalid_argument("The default session cannot be released");
     if (id == active)
         throw std::logic_error("Select another session before releasing the active session");
@@ -106,7 +106,7 @@ void SessionManager::set_limit(size_t limit) {
 SessionId LanguageModel::create_session() {
     if (_run->active)
         throw std::logic_error("Cannot create a session during generation");
-    return _sessions->create(*_sessions->get(0));
+    return _sessions->create(*_sessions->get(kDefaultSession));
 }
 
 void LanguageModel::select_session(SessionId id) {
@@ -122,7 +122,7 @@ void LanguageModel::_select_request_sessions(SessionId id, LanguageModel* draft,
     auto draft_session = target_session->draft;
     if (draft && !draft_session) {
         draft_session = std::make_shared<LanguageSession>();
-        draft_session->init_layout(*draft->_sessions->get(0));
+        draft_session->init_layout(*draft->_sessions->get(kDefaultSession));
     }
 
     // Complete old submissions and allocate both sides before changing either workspace.
@@ -172,7 +172,7 @@ void LanguageModel::_detach_draft_sessions(LanguageModel* draft) {
 
 void LanguageModel::_release_paired_session(SessionId id, LanguageModel* draft) {
     const auto& session = _sessions->get(id);
-    if (id != 0 && draft && session->draft && draft->_session == session->draft)
+    if (id != kDefaultSession && draft && session->draft && draft->_session == session->draft)
         draft->_bind_session(draft->_sessions->get(draft->active_session()));
     release_session(id);
 }
@@ -193,8 +193,8 @@ void LanguageModel::_reset_session(SessionId id, LanguageModel* draft) {
 void LanguageModel::release_session(SessionId id) {
     if (_run->active)
         throw std::logic_error("Cannot release a session during generation");
-    if (_sessions->active == id && id != 0)
-        select_session(0);
+    if (_sessions->active == id && id != kDefaultSession)
+        select_session(kDefaultSession);
     bind_session_adapter();
     _sessions->release(id);
 }

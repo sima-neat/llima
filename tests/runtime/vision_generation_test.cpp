@@ -49,8 +49,8 @@ int main() {
             auto chat = model.create_chat();
             chat.add_image(image);
             chat.add_query("Describe this image in a short phrase.");
-            auto result = model.run_model(chat, 48);
-            if (!result.has_value()) {
+            auto result = model.generate(chat, {.max_new_tokens = 48});
+            if (result.finish == simaai::llima::ChatResult::Finish::Cancelled) {
                 throw std::runtime_error("Vision generation was interrupted");
             }
             cv::Mat rgb;
@@ -59,14 +59,14 @@ int main() {
             simaai::llima::GenerationOptions options;
             options.max_new_tokens = 48;
             options.images = images;
-            model.reset_session(0);
-            const auto from_memory = model.run_model(chat, options);
-            if (from_memory != result) throw std::runtime_error("In-memory image differs from file input");
+            model.reset_session(simaai::llima::kDefaultSession);
+            const auto from_memory = model.generate(chat, options).token_ids;
+            if (from_memory != result.token_ids) throw std::runtime_error("In-memory image differs from file input");
             auto encoded = model.encode_images(images);
             options.images = {};
             options.encoded_images = encoded;
-            model.reset_session(0);
-            if (model.run_model(chat, options) != result)
+            model.reset_session(simaai::llima::kDefaultSession);
+            if (model.generate(chat, options).token_ids != result.token_ids)
                 throw std::runtime_error("Reusable encoded image differs from fresh encoding");
 
             auto pair_chat = model.create_chat();
@@ -82,27 +82,30 @@ int main() {
             simaai::llima::GenerationOptions pair_options;
             pair_options.max_new_tokens = 8;
             pair_options.encoded_images = pair;
-            const auto pair_reference = model.run_model(pair_chat, pair_options);
-            model.reset_session(0);
+            const auto pair_reference = model.generate(pair_chat, pair_options).token_ids;
+            model.reset_session(simaai::llima::kDefaultSession);
             pair_options.images = images;
             pair_options.encoded_images = std::span(pair).last(1);
-            if (!pair_reference || model.run_model(pair_chat, pair_options) != pair_reference)
+            if (pair_reference.empty() || model.generate(pair_chat, pair_options).token_ids != pair_reference)
                 throw std::runtime_error("Mixed fresh and encoded image rows differ from the encoded reference");
 
             const auto alternate = model.create_session();
             images[0] = red;
             options.encoded_images = {};
             options.images = images;
-            const auto reference_red = model.run_model(alternate, chat, options);
-            if (model.run_model(0, chat, options) != reference_red)
+            options.session = alternate;
+            const auto reference_red = model.generate(chat, options).token_ids;
+            options.session = simaai::llima::kDefaultSession;
+            if (reference_red.empty() || model.generate(chat, options).token_ids != reference_red)
                 throw std::runtime_error("Same placeholder tokens reused another image's cache");
             options.images = {};
             options.encoded_images = encoded;
-            if (model.run_model(alternate, chat, options) != result)
+            options.session = alternate;
+            if (model.generate(chat, options).token_ids != result.token_ids)
                 throw std::runtime_error("Alternating images/sessions corrupted encoded-image reuse");
             model.release_session(alternate);
 
-            response = simaai::llima::test::trim(std::move(*result));
+            response = simaai::llima::test::trim(std::move(result.text));
             if (response.empty()) {
                 throw std::runtime_error("Vision generation returned empty text");
             }

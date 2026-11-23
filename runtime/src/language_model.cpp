@@ -130,7 +130,7 @@ LanguageModel::LanguageModel(
     _files(_resources->package->files),
     _logger(_resources->package->logger),
     _sessions(std::make_unique<SessionManager>()),
-    _session(_sessions->get(0)),
+    _session(_sessions->get(kDefaultSession)),
     _workspace(std::make_unique<LanguageWorkspace>()),
     _run(std::make_unique<LanguageRunState>(std::move(stop_token_ids),
         _cfg.pipeline_cfg.max_num_tokens, text_streamer)),
@@ -459,7 +459,7 @@ void LanguageModel::_attach_draft(LanguageModel& draft_lm, LanguageModel* previo
     std::lock_guard lock(RuntimeContext::instance().execution_mutex);
     if (_run->active || draft_lm._run->active)
         throw std::logic_error("Cannot change the target/draft pair during generation");
-    const auto& identity = draft_lm._sessions->get(0);
+    const auto& identity = draft_lm._sessions->get(kDefaultSession);
     if (_workspace->paired_draft_identity.lock() == identity) return;
     if (!_cfg.lm_cfg.speculative_decoding_cfg || !draft_lm._cfg.lm_cfg.speculative_decoding_cfg)
         throw std::invalid_argument("Both models must contain speculative-decoding configuration");

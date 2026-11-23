@@ -66,11 +66,11 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
     draft->set_kv_cache_len(sentinel);
     const auto session = target.create_session();
     const bool mtp = cfg.lm_cfg.is_gemma4_mtp_target();
-    const auto gold_a = generate(0, a, mtp);
+    const auto gold_a = generate(kDefaultSession, a, mtp);
     const auto gold_b = generate(session, b);
     require(draft->get_kv_cache_len() == sentinel, "Direct generation modified the public draft session");
     target.reset_session(session);
-    require(generate(0, a) == gold_a && generate(session, b, mtp) == gold_b,
+    require(generate(kDefaultSession, a) == gold_a && generate(session, b, mtp) == gold_b,
             "Direct speculative sessions disagreed with their fresh references");
     const std::vector<uint32_t> invalid{cfg.lm_cfg.token_cfg.vocab_size};
     rejected([&] { generate(session, invalid, mtp); }, "Direct speculative request accepted an invalid token");
@@ -106,10 +106,12 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
     require(target.get_kv_cache_len() == 0,
             "Replacing a draft runner over the same package retained the old pair's cache");
     draft = std::move(replacement);
-    require(generate(0, a, mtp) == gold_a, "Replacing the draft runner changed greedy output");
+    require(generate(kDefaultSession, a, mtp) == gold_a, "Replacing the draft runner changed greedy output");
     std::cout << "Direct speculative session pairing passed\n";
 }
 
+static_assert(std::is_aggregate_v<GenerationOptions>);
+static_assert(!std::is_convertible_v<uint64_t, SessionId>);
 static_assert(std::is_const_v<std::remove_reference_t<
     decltype(std::declval<LanguageModel&>().get_model_map("pre"))>>);
 
@@ -143,7 +145,7 @@ int main(int argc, char** argv) {
                 draft_root, std::nullopt, std::nullopt, std::move(files));
             const auto unused = draft->create_session();
             draft->release_session(unused);
-            require(draft->session_memory_bytes(0) == 0,
+            require(draft->session_memory_bytes(kDefaultSession) == 0,
                     "Draft setup or releasing an unused session allocated its public cache");
             first->set_draft_vlm(draft.get());
         }
@@ -161,29 +163,29 @@ int main(int argc, char** argv) {
         const auto a = prepare("List the first eight prime numbers, one per line.");
         const auto b = prepare("Write a short paragraph about the moon.");
         auto generate = [&](SessionId id, const auto& input) {
-            return first->run_model(id, input, static_cast<uint16_t>(input.size() + 64));
+            return first->run_model(input, {.session = id, .max_new_tokens = 64});
         };
-        first->reset_session(0);
-        const auto gold_a = generate(0, a);
+        first->reset_session(kDefaultSession);
+        const auto gold_a = generate(kDefaultSession, a);
         if (draft) {
-            require(draft->session_memory_bytes(0) == 0,
+            require(draft->session_memory_bytes(kDefaultSession) == 0,
                     "Target generation wrote the draft's public session");
-            draft->reset_session(0);
-            require(draft->session_memory_bytes(0) == 0,
+            draft->reset_session(kDefaultSession);
+            require(draft->session_memory_bytes(kDefaultSession) == 0,
                     "Reset of an unused public draft session allocated its cache");
-            require(generate(0, a) == gold_a,
+            require(generate(kDefaultSession, a) == gold_a,
                     "Resetting the draft's public session corrupted a paired target cache");
-            const auto branch_after_reset = generate(0, b);
-            first->reset_session(0);
-            require(branch_after_reset == generate(0, b),
+            const auto branch_after_reset = generate(kDefaultSession, b);
+            first->reset_session(kDefaultSession);
+            require(branch_after_reset == generate(kDefaultSession, b),
                     "Resetting the draft's public session corrupted a branched prompt");
 
-            const auto limit = static_cast<uint16_t>(b.size() + 16);
-            const auto reference_repeat = first->run_model_for_ttnt(0, b, limit);
-            first->reset_session(0);
-            require(generate(0, b) == branch_after_reset, "Fresh target output changed");
-            draft->reset_session(0);
-            const auto after_reset = first->run_model_for_ttnt(0, b, limit);
+            const GenerationOptions timing_options{.max_new_tokens = 16};
+            const auto reference_repeat = first->run_model_for_ttnt(b, timing_options);
+            first->reset_session(kDefaultSession);
+            require(generate(kDefaultSession, b) == branch_after_reset, "Fresh target output changed");
+            draft->reset_session(kDefaultSession);
+            const auto after_reset = first->run_model_for_ttnt(b, timing_options);
             require(reference_repeat.accepted_draft_tokens.has_value()
                         && after_reset.accepted_draft_tokens == reference_repeat.accepted_draft_tokens
                         && after_reset.generated_tokens == reference_repeat.generated_tokens,
@@ -192,14 +194,14 @@ int main(int argc, char** argv) {
                 {"generated_tokens", after_reset.generated_tokens},
                 {"accepted_draft_tokens", *after_reset.accepted_draft_tokens}}.dump() << '\n';
         }
-        first->reset_session(0);
-        const auto gold_b = generate(0, b);
+        first->reset_session(kDefaultSession);
+        const auto gold_b = generate(kDefaultSession, b);
         require(!gold_a.empty() && !gold_b.empty(), "Fresh references are empty");
-        first->reset_session(0);
-        require(generate(0, a) == gold_a, "Default session reset changed the reference");
+        first->reset_session(kDefaultSession);
+        require(generate(kDefaultSession, a) == gold_a, "Default session reset changed the reference");
         const auto shared = first->shared_resource_bytes();
         const auto workspace = first->workspace_memory_bytes();
-        const SessionId sa = 0;
+        const SessionId sa = kDefaultSession;
         const auto sb = first->create_session();
         require(first->session_memory_bytes(sb) == 0,
                 "Unused session allocated device buffers or recurrent checkpoint snapshots");
@@ -217,7 +219,7 @@ int main(int argc, char** argv) {
             {"session_bytes", first->session_memory_bytes(sa)}, {"token_ids", gold_a}}.dump() << '\n';
         first->set_session_limit(2);
         rejected([&] { first->create_session(); }, "Session limit was ignored");
-        rejected([&] { first->reset_session(999999); }, "Unknown session was accepted");
+        rejected([&] { first->reset_session(SessionId{999999}); }, "Unknown session was accepted");
         first->release_session(sb);
         const auto replacement = first->create_session();
         require(replacement != sb, "Released session handle was reused");
@@ -242,22 +244,20 @@ int main(int argc, char** argv) {
         cancel_chat.clear_system_prompt();
         cancel_chat.set_enable_thinking(false);
         cancel_chat.add_query("Write a long detailed story about a journey through space.");
-        const auto cancelled = first->run_model(sa, cancel_chat, 512);
+        const auto cancelled = first->generate(cancel_chat, {.session = sa, .max_new_tokens = 512});
         first->wait_for_streamer_completion();
         require(busy_rejected, "A busy workspace operation was not rejected from the callback");
-        require(!cancelled.has_value(), "Cancelled request returned a completed response");
+        require(cancelled.finish == ChatResult::Finish::Cancelled, "Cancelled request returned a completed response");
         first->set_info_callback([](const std::string&, double) {});
         require(generate(sa, a) == gold_a, "Cancellation recovery differs from fresh reference");
         const std::vector<uint32_t> invalid{cfg.lm_cfg.token_cfg.vocab_size};
-        rejected([&] { first->run_model(sa, invalid, 64); }, "Out-of-vocabulary token was accepted");
+        rejected([&] { first->run_model(invalid, {.session = sa, .max_new_tokens = 64}); }, "Out-of-vocabulary token was accepted");
         first->wait_for_streamer_completion();
         require(generate(sa, b) == gold_b, "Exception recovery differs from fresh reference");
         std::cout << json{{"case", "cancel_exception_recovery"}, {"runtime_ok", true}}.dump() << '\n';
 
         if (draft && cfg.lm_cfg.is_dflash()) {
-            GenerationOptions block_options;
-            block_options.max_new_tokens = 128;
-            block_options.stop_token_ids = std::set<uint32_t>{};
+            GenerationOptions block_options{.session = sa, .max_new_tokens = 128, .stop_token_ids = std::set<uint32_t>{}};
             bool stopped_after_verification = false;
             bool signalled_full = false;
             block_options.info_callback = [&](const std::string& key, double) {
@@ -267,8 +267,8 @@ int main(int argc, char** argv) {
                 }
                 if (key == "FULL") signalled_full = true;
             };
-            const auto interrupted = first->run_model(sa, cancel_chat, block_options);
-            require(!interrupted && stopped_after_verification && !signalled_full,
+            const auto interrupted = first->generate(cancel_chat, block_options);
+            require(interrupted.finish == ChatResult::Finish::Cancelled && stopped_after_verification && !signalled_full,
                     "DFlash reported successful completion or a full cache after cancellation");
             require(generate(sa, a) == gold_a, "DFlash block cancellation left stale state");
         }
@@ -278,15 +278,14 @@ int main(int argc, char** argv) {
         std::atomic<unsigned> request_chunks = 0;
         first->set_text_callback([&](const std::string&, bool, bool) { ++default_chunks; });
         first->set_info_callback([&](const std::string&, double) { ++default_events; });
-        GenerationOptions options;
-        options.max_new_tokens = 16;
+        GenerationOptions options{.session = sa, .max_new_tokens = 16};
         options.text_callback = [&](const std::string&, bool, bool) { ++request_chunks; };
         auto option_chat = first->create_chat();
         option_chat.add_query("Name three planets.");
-        require(first->run_model(sa, option_chat, options).has_value(), "Request options failed");
+        require(first->generate(option_chat, options).finish != ChatResult::Finish::Cancelled, "Request options failed");
         require(request_chunks > 0 && default_chunks == 0, "Request callback did not replace the default");
         require(default_events > 0, "Overriding text suppressed the default info callback");
-        first->run_model(sa, option_chat, 16);
+        first->generate(option_chat, {.session = sa, .max_new_tokens = 16});
         require(default_chunks > 0, "Request callback leaked into a later request");
         first->set_text_callback([](const std::string&, bool, bool) {});
         first->set_info_callback([](const std::string&, double) {});
@@ -295,7 +294,7 @@ int main(int argc, char** argv) {
         options.info_callback = [](const std::string& key, double) {
             if (key == "ttft") throw std::runtime_error("Intentional request callback failure");
         };
-        rejected([&] { first->run_model(sa, option_chat, options); }, "Callback exception was swallowed");
+        rejected([&] { first->generate(option_chat, options); }, "Callback exception was swallowed");
         require(generate(sa, a) == gold_a, "Callback exception left the next request corrupted");
 
         unsigned completions = 0;
@@ -305,7 +304,7 @@ int main(int argc, char** argv) {
                 first->stop_model();
             }
         };
-        require(!first->run_model(sa, option_chat, options),
+        require(first->generate(option_chat, options).finish == ChatResult::Finish::Cancelled,
                 "Cancellation from the terminal callback arrived after result assembly");
         require(completions == 1, "Streaming completion was delivered more than once");
 
@@ -341,6 +340,11 @@ int main(int argc, char** argv) {
         require(skipped.finish == ChatResult::Finish::Cancelled && skipped.token_ids.empty()
                     && skipped.text.empty() && skipped.performance.generated_tokens == 0,
                 "An already-cancelled request generated output");
+        require(first->run_model(a, options).empty(), "Pre-cancelled token generation returned tokens");
+        rejected([&] { first->run_model_for_ttnt(a, options); }, "Pre-cancelled timing request succeeded");
+        rejected([&] { first->run_model_for_logits(a, options); }, "Pre-cancelled logits request succeeded");
+        rejected([&] { first->run_model_for_loglikelihood(a, 0, a, options); },
+                 "Pre-cancelled log-likelihood request succeeded");
         options.stop = current.get_token();
         options.info_callback = [&](const std::string& key, double) {
             if (key == "END" || key == "FULL") current.request_stop();
@@ -350,26 +354,28 @@ int main(int argc, char** argv) {
                 "A terminal callback cancelled too late to affect ChatResult");
         first->release_session(options.session);
 
-        const auto timing = first->run_model_for_ttnt(sa, a);
+        const auto timing = first->run_model_for_ttnt(a, {.session = sa});
         require(timing.generated_tokens > 1, "Nested prefill leaked its output limit into decode");
         require(generate(sa, a) == gold_a, "Performance request left stale prompt state");
         if (!draft) {
             const std::set<uint32_t> no_stops;
-            const auto limit = static_cast<uint16_t>(a.size() + 4);
-            const auto four_tokens = first->run_model(sa, a, limit, no_stops);
+            GenerationOptions limits{.session = sa, .max_new_tokens = 4, .stop_token_ids = no_stops};
+            const auto four_tokens = first->run_model(a, limits);
             require(four_tokens.size() == 4, "Ordinary generation ignored the token budget");
             for (uint16_t budget : {0, 1, 4, 40}) {
-                const auto metrics = first->run_model_for_ttnt(sa, a, a.size() + budget, no_stops);
+                const auto metrics = first->run_model_for_ttnt(a,
+                    {.session = sa, .max_new_tokens = budget, .stop_token_ids = no_stops});
                 require(metrics.generated_tokens == budget && metrics.token_durations.size() == budget,
                         "Ordinary timing must report exactly one sample per emitted token");
             }
-            const auto stopped = first->run_model_for_ttnt(sa, a, limit, std::set{four_tokens.front()});
+            limits.stop_token_ids = std::set{four_tokens.front()};
+            const auto stopped = first->run_model_for_ttnt(a, limits);
             require(stopped.generated_tokens == 1 && stopped.token_durations.size() == 1,
                     "An immediate stop token must have exactly one timing sample");
         }
         if (cfg.pipeline_cfg.return_logits && !draft) {
             const auto suffix = std::span<const uint32_t>(b).last(2);
-            first->run_model_for_loglikelihood(sa, b, b.size() - 2, suffix);
+            first->run_model_for_loglikelihood(b, b.size() - 2, suffix, {.session = sa});
             require(generate(sa, a) == gold_a, "Scoring left stale generation history");
         }
         std::cout << json{{"case", "metrics_scoring_recovery"}, {"runtime_ok", true}}.dump() << '\n';
@@ -385,10 +391,10 @@ int main(int argc, char** argv) {
         }
         survivor->set_text_callback([](const std::string&, bool, bool) {});
         first->reset_session(sa);
-        survivor->reset_session(0);
+        survivor->reset_session(kDefaultSession);
         auto concurrent_a = std::async(std::launch::async, [&] { return generate(sa, a); });
         auto concurrent_b = std::async(std::launch::async, [&] {
-            return survivor->run_model(b, static_cast<uint16_t>(b.size() + 64));
+            return survivor->run_model(b, {.max_new_tokens = 64});
         });
         const auto result_a = concurrent_a.get();
         const auto result_b = concurrent_b.get();
@@ -396,7 +402,7 @@ int main(int argc, char** argv) {
         require(result_b == gold_b, "Concurrent second workspace differs from its fresh reference");
         std::cout << json{{"case", "concurrent_workspaces"}, {"runtime_ok", true}}.dump() << '\n';
         if (draft) {
-            require(survivor->run_model(a, static_cast<uint16_t>(a.size() + 64)) == gold_a,
+            require(survivor->run_model(a, {.max_new_tokens = 64}) == gold_a,
                     "Shared draft workspace changed the new target's output");
             require(generate(sa, a) == gold_a,
                     "Another target corrupted this target's paired draft context");
@@ -411,17 +417,17 @@ int main(int argc, char** argv) {
             });
             auto teardown_chat = survivor->create_chat();
             teardown_chat.add_query("Name one planet.");
-            require(survivor->run_model(teardown_chat, 16).has_value(),
+            require(survivor->generate(teardown_chat, {.max_new_tokens = 16}).finish != ChatResult::Finish::Cancelled,
                     "Callback teardown of another target sharing this draft failed");
             require(!first, "The callback did not release the other target");
             survivor->set_info_callback([](const std::string&, double) {});
         } else {
             first->set_info_callback([&](const std::string& key, double) {
                 if (key == "END" || key == "FULL")
-                    require(survivor->run_model(a, static_cast<uint16_t>(a.size() + 64)) == gold_a,
+                    require(survivor->run_model(a, {.max_new_tokens = 64}) == gold_a,
                             "Cross-model callback generation differs from the reference");
             });
-            require(first->run_model(option_chat, 16).has_value(),
+            require(first->generate(option_chat, {.max_new_tokens = 16}).finish != ChatResult::Finish::Cancelled,
                     "Cross-model callback generation blocked completion");
             first.reset();
         }
@@ -436,8 +442,9 @@ int main(int argc, char** argv) {
         detached_chat.add_query("Name a planet.");
         require(detached_chat.get_last_query() == "Name a planet.", "Chat retained a released helper");
         detached_chat.update_last_query("Name one planet only.");
-        require(survivor->run_model(detached_chat, 16).has_value(), "Detached chat cannot use the surviving model");
-        require(survivor->run_model(a, static_cast<uint16_t>(a.size() + 64)) == gold_a,
+        require(survivor->generate(detached_chat, {.max_new_tokens = 16}).finish != ChatResult::Finish::Cancelled,
+                "Detached chat cannot use the surviving model");
+        require(survivor->run_model(a, {.max_new_tokens = 64}) == gold_a,
                 "Releasing one wrapper unloaded or corrupted the surviving wrapper");
         active_model = nullptr;
         survivor.reset();

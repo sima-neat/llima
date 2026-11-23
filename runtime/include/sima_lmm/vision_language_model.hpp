@@ -40,15 +40,15 @@ private:
 };
 
 struct GenerationOptions {
-    std::optional<uint16_t> max_new_tokens;
+    SessionId session = kDefaultSession;
+    std::optional<uint16_t> max_new_tokens; // Output budget, excluding the input tokens.
     std::optional<std::set<uint32_t>> stop_token_ids;
+    std::stop_token stop; // The caller owns cancellation for this request.
     std::optional<TextStreamer::InfoCallback> info_callback;
     std::optional<TextStreamer::TextCallback> text_callback;
     // Raw images fill the first chat placeholders, followed by pre-encoded images.
     std::span<const cv::Mat> images;
     std::span<const EncodedImage> encoded_images;
-    SessionId session = kDefaultSession;
-    std::stop_token stop; // The caller owns cancellation for this request.
     bool performance_summary = true;
     bool preserve_structural_tokens = true; // Keep active tool/reasoning markers in text and chunks.
     bool reject_oversized_prompt = false;   // Throw when the prompt cannot fit a generated token.
@@ -73,53 +73,24 @@ class VisionLanguageModel {
         VisionLanguageModel(const VisionLanguageModel&) = delete;
         VisionLanguageModel& operator=(const VisionLanguageModel&) = delete;
 
-        // Returns token IDs and text with the structural markers used by tool/reasoning parsers.
+        // Chat callers use generate(chat, {.session = id}) and read ChatResult::text or token_ids.
         ChatResult generate(const Chat& chat, const GenerationOptions& options = {});
-        std::optional<std::string> run_model(
-            const Chat& chat,
-            std::optional<uint16_t> max_new_tokens = std::nullopt
-        );
-        std::optional<std::string> run_model(const Chat& chat, const GenerationOptions& options);
-        std::optional<std::string> run_model(SessionId session, const Chat& chat,
-                                            const GenerationOptions& options);
-        std::vector<uint32_t> run_model(
-            std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
-        );
-        std::vector<Eigen::bfloat16> run_model_for_logits(
-            std::span<const uint32_t> input_token_ids
-        );
+        std::vector<uint32_t> run_model(std::span<const uint32_t> input_token_ids,
+                                        const GenerationOptions& options = {});
+        std::vector<Eigen::bfloat16> run_model_for_logits(std::span<const uint32_t> input_token_ids,
+                                                          const GenerationOptions& options = {});
         LogLikelihoodResult run_model_for_loglikelihood(
-            std::span<const uint32_t> input_token_ids,
-            size_t continuation_start,
-            std::span<const uint32_t> continuation_token_ids,
-            bool use_group_prefill = true
-        );
-        GenerationPerformanceResult run_model_for_ttnt(
-            std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt
-        );
+            std::span<const uint32_t> input_token_ids, size_t continuation_start,
+            std::span<const uint32_t> continuation_token_ids, const GenerationOptions& options = {},
+            bool use_group_prefill = true);
+        GenerationPerformanceResult run_model_for_ttnt(std::span<const uint32_t> input_token_ids,
+                                                       const GenerationOptions& options = {});
+
         std::vector<EncodedImage> encode_images(std::span<const cv::Mat> images);
         SessionId create_session();
         void reset_session(SessionId id);
         void release_session(SessionId id);
         void set_session_limit(size_t limit);
-        std::optional<std::string> run_model(SessionId session, const Chat& chat,
-                                            std::optional<uint16_t> max_new_tokens = std::nullopt);
-        std::vector<uint32_t> run_model(SessionId session, std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt);
-        std::vector<Eigen::bfloat16> run_model_for_logits(SessionId session,
-            std::span<const uint32_t> input_token_ids);
-        LogLikelihoodResult run_model_for_loglikelihood(SessionId session,
-            std::span<const uint32_t> input_token_ids, size_t continuation_start,
-            std::span<const uint32_t> continuation_token_ids, bool use_group_prefill = true);
-        GenerationPerformanceResult run_model_for_ttnt(SessionId session,
-            std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt);
         // Memory queries are safe in callbacks. Session bytes include the paired draft
         // and reflect allocations and checkpoints published at request boundaries.
         size_t session_memory_bytes(SessionId id) const;

@@ -254,10 +254,10 @@ int main(int argc, char** argv) {
             chat.clear_system_prompt();
             chat.add_query("Translate: the sky is blue.");
             auto generate = [&] {
-                target.reset_session(0);
-                auto result = target.run_model(chat, 32);
-                require(result && !result->empty(), "Expected generated text");
-                return *result;
+                target.reset_session(kDefaultSession);
+                auto result = target.generate(chat, {.max_new_tokens = 32}).text;
+                require(!result.empty(), "Expected generated text");
+                return result;
             };
             const auto base = generate();
             reject(target, "unknown_width", "graph not present");

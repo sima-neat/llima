@@ -73,14 +73,15 @@ int main(int argc, char** argv) {
                 }
                 model.set_text_callback([](const std::string&, bool, bool) {});
                 if (argc <= 2) {
+                    const GenerationOptions eight_tokens{.max_new_tokens = 8, .stop_token_ids = std::set<uint32_t>{}};
                     for (const size_t count : {8, 127, 128, 129, 257}) {
                         std::vector<uint32_t> ids(count);
                         for (size_t i = 0; i < count; ++i) ids[i] = seed[i % seed.size()];
                         // Exercise scattered rows as well as repeated-token deduplication.
                         if (count == 257)
                             for (size_t i = 0; i < count; ++i) ids[i] = 1000 + 31 * i;
-                        const auto output = model.run_model(ids, count + 8, std::set<uint32_t>{});
-                        const auto repeated = model.run_model(ids, count + 8, std::set<uint32_t>{});
+                        const auto output = model.run_model(ids, eight_tokens);
+                        const auto repeated = model.run_model(ids, eight_tokens);
                         if (output.empty() || output != repeated)
                             throw std::runtime_error("Repeated request mismatch");
                         compare(std::to_string(count), output);
@@ -90,19 +91,20 @@ int main(int argc, char** argv) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         model.stop_model();
                     });
-                    const auto interrupted = model.run_model(long_prompt, 2048, std::set<uint32_t>{});
+                    const auto interrupted = model.run_model(long_prompt,
+                        {.max_new_tokens = 1024, .stop_token_ids = std::set<uint32_t>{}});
                     cancel.join();
                     if (!interrupted.empty()) throw std::runtime_error("Generation did not honor cancellation");
-                    const auto recovered = model.run_model(seed, seed.size() + 8, std::set<uint32_t>{});
+                    const auto recovered = model.run_model(seed, eight_tokens);
                     if (recovered.empty()) throw std::runtime_error("Generation failed after cancellation");
                     compare("after_cancel", recovered);
                     if (model.support_image()) {
                         auto chat = model.create_chat();
                         chat.add_image(test::resolve_asset("sjc.jpg"));
                         chat.add_query("Describe the image briefly.");
-                        const auto result = model.run_model(chat, 12);
-                        if (!result || result->empty()) throw std::runtime_error("Missing image response");
-                        compare("image", *result);
+                        const auto result = model.generate(chat, {.max_new_tokens = 12}).text;
+                        if (result.empty()) throw std::runtime_error("Missing image response");
+                        compare("image", result);
                     }
                     if (cfg["pipeline_cfg"].value("return_logits", false)
                         || cfg["lm_cfg"].value("lm_head_num_splits", 1) > 1) {
@@ -115,7 +117,7 @@ int main(int argc, char** argv) {
                         for (bool grouped : {false, true}) {
                             const auto score = model.run_model_for_loglikelihood(
                                 std::span<const uint32_t>(seed).first(3), 1,
-                                std::span<const uint32_t>(seed).subspan(1, 2), grouped);
+                                std::span<const uint32_t>(seed).subspan(1, 2), {}, grouped);
                             compare(grouped ? "grouped_logprob" : "serial_logprob", score.logprob);
                         }
                     }
@@ -124,13 +126,13 @@ int main(int argc, char** argv) {
                     model.set_draft_vlm(&draft);
                     auto chat = model.create_chat();
                     chat.add_query("Explain why Berlin is the capital of Germany.");
-                    const auto response = model.run_model(chat, 32);
-                    if (!response || response->empty()) throw std::runtime_error("Empty speculative response");
-                    compare("speculative", *response);
-                    const auto repeated = model.run_model(chat, 32);
+                    const auto response = model.generate(chat, {.max_new_tokens = 32}).text;
+                    if (response.empty()) throw std::runtime_error("Empty speculative response");
+                    compare("speculative", response);
+                    const auto repeated = model.generate(chat, {.max_new_tokens = 32}).text;
                     if (repeated != response)
                         throw std::runtime_error("Repeated speculative request mismatch");
-                    compare("speculative_repeat", *repeated);
+                    compare("speculative_repeat", repeated);
                     model.set_draft_vlm(nullptr);
                 }
             }

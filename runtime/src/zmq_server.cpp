@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <openssl/evp.h>
@@ -21,6 +22,15 @@ std::string sha256(const std::string& text) {
     for (size_t i = 0; i < size; ++i)
         result += fmt::format("{:02x}", digest[i]);
     return result;
+}
+
+GenerationOptions token_generation_options(const ZMQRequestMetadata& metadata, size_t prompt_size) {
+    GenerationOptions options;
+    // MoLE sends the total context budget, including the prompt.
+    if (const auto total = metadata.max_num_tokens)
+        options.max_new_tokens = *total - std::min<size_t>(*total, prompt_size);
+    options.stop_token_ids = metadata.stop_token_ids;
+    return options;
 }
 
 }  // namespace
@@ -330,8 +340,7 @@ void ZMQServer::run() {
                     if (request_metadata.type == "generate") {
                         // Given a list of input token ids, return the list of generated token ids.
                         auto result = _vision_language_model_ptr->run_model(
-                            input_token_ids, request_metadata.max_num_tokens,
-                            request_metadata.stop_token_ids
+                            input_token_ids, token_generation_options(request_metadata, input_token_ids.size())
                         );
                         response_metadata.tensor_dtype = "uint32";
                         response_metadata.tensor_shape = {1, result.size()};
@@ -357,7 +366,7 @@ void ZMQServer::run() {
                                 input_token_ids.size() - continuation_token_ids.size()
                             );
                             auto result = _vision_language_model_ptr->run_model_for_loglikelihood(
-                                input_token_ids, continuation_start, continuation_token_ids,
+                                input_token_ids, continuation_start, continuation_token_ids, {},
                                 request_metadata.use_group_prefill
                             );
                             std::array<double, 2> response_data{
@@ -385,8 +394,7 @@ void ZMQServer::run() {
                     } else if (request_metadata.type == "generate_for_perf") {
                         // The first duration is TTFT. Its token counts toward max_num_tokens.
                         auto result = _vision_language_model_ptr->run_model_for_ttnt(
-                            input_token_ids, request_metadata.max_num_tokens,
-                            request_metadata.stop_token_ids
+                            input_token_ids, token_generation_options(request_metadata, input_token_ids.size())
                         );
                         response_metadata.result_type = "token_durations";
                         response_metadata.tensor_dtype = "float64";

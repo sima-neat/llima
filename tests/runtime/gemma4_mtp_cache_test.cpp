@@ -288,12 +288,12 @@ int main(int argc, char** argv) {
                 default_stop == public_reference.end() ? default_stop : default_stop + 1);
             VisionLanguageModel target(target_dir), draft(argv[2]);
             target.set_draft_vlm(&draft);
-            const auto max_tokens = static_cast<uint16_t>(public_prompt.size() + 16);
-            require(target.run_model(public_prompt, max_tokens, std::set<uint32_t>{})
+            const GenerationOptions options{.max_new_tokens = 16};
+            require(target.run_model(public_prompt, {.max_new_tokens = 16, .stop_token_ids = std::set<uint32_t>{}})
                     == public_reference,
                 "Public token-ID generation differs from direct MTP generation");
             require(target.run_model(public_prompt,
-                    static_cast<uint16_t>(public_prompt.size() + 1), std::set<uint32_t>{})
+                    {.max_new_tokens = 1, .stop_token_ids = std::set<uint32_t>{}})
                     == std::vector<uint32_t>{public_reference.front()},
                 "Public token-ID generation ignored the token limit");
 
@@ -301,26 +301,26 @@ int main(int argc, char** argv) {
             const uint32_t stop_token = public_reference[1];
             const auto stop = std::find(public_reference.begin(), public_reference.end(), stop_token);
             const std::vector<uint32_t> stopped_reference(public_reference.begin(), stop + 1);
-            require(target.run_model(public_prompt, max_tokens, std::set<uint32_t>{stop_token})
+            require(target.run_model(public_prompt, {.max_new_tokens = 16, .stop_token_ids = std::set{stop_token}})
                     == stopped_reference,
                 "Public MTP generation ignored the stop-token override");
-            require(target.run_model(public_prompt, max_tokens) == default_reference,
+            require(target.run_model(public_prompt, options) == default_reference,
                 "Public MTP generation did not restore its default stop tokens");
-            const auto performance = target.run_model_for_ttnt(public_prompt, max_tokens);
+            const auto performance = target.run_model_for_ttnt(public_prompt, options);
             require(performance.generated_tokens == default_reference.size()
                     && performance.accepted_draft_tokens.has_value(),
                 "Public timing request did not dispatch through MTP");
 
             bool rejected_empty = false;
             try {
-                target.run_model(std::span<const uint32_t>{}, max_tokens,
-                    std::set<uint32_t>{stop_token});
+                target.run_model(std::span<const uint32_t>{},
+                    {.max_new_tokens = 16, .stop_token_ids = std::set{stop_token}});
             } catch (const std::runtime_error& error) {
                 rejected_empty = std::string(error.what())
                     == "Gemma4 MTP generation requires at least one input token";
             }
             require(rejected_empty, "Public MTP generation did not reject an empty prompt");
-            require(target.run_model(public_prompt, max_tokens) == default_reference,
+            require(target.run_model(public_prompt, options) == default_reference,
                 "Failed token-ID request did not restore its stop tokens");
 
             std::atomic<bool> stream_ended = false;
@@ -329,7 +329,7 @@ int main(int argc, char** argv) {
             });
             auto chat = target.create_chat();
             chat.add_query("What is the capital of Germany?");
-            require(target.run_model(chat, 1).has_value(), "Chat failed after token-ID requests");
+            require(!target.generate(chat, {.max_new_tokens = 1}).token_ids.empty(), "Chat failed after token-ID requests");
             target.wait_for_streamer_completion();
             require(stream_ended.load(), "Token-ID request did not re-enable chat streaming");
             std::cout << "Gemma4 MTP public dispatch tests passed\n";

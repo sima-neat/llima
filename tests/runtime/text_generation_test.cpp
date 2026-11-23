@@ -45,11 +45,11 @@ int main() {
             auto chat = model.create_chat();
             chat.set_system_prompt("You are concise.");
             chat.add_query("What is the capital of Germany?");
-            auto result = model.run_model(chat, 24);
-            if (!result.has_value()) {
+            auto result = model.generate(chat, {.max_new_tokens = 24});
+            if (result.finish == simaai::llima::ChatResult::Finish::Cancelled) {
                 throw std::runtime_error("Text generation was interrupted");
             }
-            response = simaai::llima::test::trim(std::move(*result));
+            response = simaai::llima::test::trim(std::move(result.text));
         }
 
         simaai::llima::disconnect();
