@@ -19,6 +19,7 @@
 #include <spdlog/spdlog.h>
 
 #include "eagle_helpers.hpp"
+#include "gemma4_mtp_helpers.hpp"
 #include "language_model.hpp"
 #include "language_model_executor.hpp"
 #include "language_model_state.hpp"
@@ -466,7 +467,8 @@ void LanguageModel::attach_draft(LanguageModel& draft_lm) {
         if (!draft.speculative_budget || width != draft.speculative_budget + 1
             || draft_lm._cfg.lm_cfg.get_single_num_tokens() != 1)
             throw std::invalid_argument("Gemma4 MTP requires an N1 assistant and budget-plus-one target width");
-        _workspace->mtp_shared_kv_layers = draft_lm._prepare_gemma4_mtp_shared_kv_layers(*this);
+        _workspace->mtp_target_kv = gemma4_mtp_helpers::resolve_target_kv(
+            _cfg, draft_lm._cfg, _workspace->attention_binding_buffers);
     } else {
         if (_cfg.lm_cfg.hidden_size != draft_lm._cfg.lm_cfg.hidden_size ||
             _cfg.lm_cfg.token_cfg.vocab_size != draft_lm._cfg.lm_cfg.token_cfg.vocab_size)

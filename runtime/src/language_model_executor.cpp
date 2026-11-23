@@ -211,8 +211,6 @@ LanguageExecutor::AttentionPrograms LanguageExecutor::bind_attention(
 
     const auto& layer_type = cfg.lm_cfg.layer_types[layer_idx];
     const auto& binding_buffers = model._workspace->attention_binding_buffers.at(layer_idx);
-    const uint16_t single_num_tokens = cfg.lm_cfg.get_single_num_tokens();
-    const bool is_single_model = num_tokens == single_num_tokens;
 
     const uint16_t cache_token_idx_begin =
         model._get_cache_token_idx_begin(num_tokens, token_idx, layer_type);
@@ -228,56 +226,21 @@ LanguageExecutor::AttentionPrograms LanguageExecutor::bind_attention(
 
     bind_kv_outputs(model, pre_model, layer_idx, token_idx);
 
-    const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
-    const bool use_sliding_cache = std::get<1>(cache_key) != 0;
-    const LayerType cache_layer_type = use_sliding_cache ? LayerType::SlidingAttention : LayerType::FullAttention;
-    const uint16_t cache_mask_size =
-        model._get_cache_mask_size(cache_layer_type, eff_num_cached_tokens, !is_single_model);
-    const bool use_single_future_token_mask = is_single_model && cache_mask_size > 1;
-    const bool use_group_future_token_mask = (!is_single_model && cache_mask_size > num_tokens);
-    // IFM 0 is the query buffer. Its pointer, begin, and shape are invariant
-    // for a compact cache key, so only the layer-owned cache inputs are rebound.
-    uint8_t cache_ifm_idx = 1;
-    if (cfg.pipeline_cfg.use_strided_kv_cache) {
-        cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.key, {0, cache_token_idx_begin, 0});
-    } else {
-        cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.key, {cache_token_idx_begin, 0});
-    }
-    if (cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.key_scale,
-                              {0, cache_token_idx_begin, 0});
-    }
-    if (use_group_future_token_mask) {
-        // Group-mask buffer, begin, and shape are fixed by the compact key.
-        ++cache_ifm_idx;
-    } else if (use_single_future_token_mask) {
-        auto& mask = model.get_buffer("future_token_mask");
-        if (cfg.lm_cfg.is_dflash()) {
-            // DFlash uploads the compact [B, aligned_context] mask layout.
-            cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, 0});
-        } else if (cfg.lm_cfg.is_spec_decode()) {
-            cache_model._bind_ifm(cache_ifm_idx++, &mask, {0, cache_token_idx_begin});
-        } else {
-            cache_model._bind_ifm(
-                cache_ifm_idx++, &mask,
-                {static_cast<uint32_t>(cfg.pipeline_cfg.max_num_tokens - eff_num_cached_tokens)});
-        }
-    }
-    // gpt_oss sinks: cache model is layer-shared, so bind this layer's sinks before cached_values.
-    if (cfg.lm_cfg.uses_attention_sinks()) {
-        auto& sinks_buf = model.get_buffer(fmt::format("sinks_l{}", layer_idx));
-        cache_model._bind_ifm(cache_ifm_idx++, &sinks_buf, {0, 0});
-    }
-    if (cfg.pipeline_cfg.use_strided_kv_cache) {
-        cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.value,
-                              {0, cache_token_idx_begin, 0});
-    } else {
-        cache_model._bind_ifm(cache_ifm_idx++, binding_buffers.value, {cache_token_idx_begin, 0});
-    }
-    if (cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_model._bind_ifm(cache_ifm_idx, binding_buffers.value_scale,
-                              {0, cache_token_idx_begin, 0});
-    }
+    const auto& ports = model._workspace->cache_ports.at(cache_key);
+    const CacheWindow window{
+        cache_token_idx_begin, ports.context_width(std::get<2>(cache_key), num_tokens),
+        static_cast<uint32_t>(token_idx) + num_tokens - cache_token_idx_begin,
+        num_tokens
+    };
+    auto rebind = [&](uint8_t port, MLABuffer* buffer, CachePorts::Dimensions begin,
+                      CachePorts::Dimensions) {
+        cache_model._bind_ifm(port, buffer, begin);
+    };
+    // Query, group mask, and shapes are fixed by the cache executable.
+    ports.bind_layer(binding_buffers, cfg, layer_type, window, rebind);
+    if (ports.mask && ports.mask_kind != CacheMask::Group)
+        ports.bind_mask(&model.get_buffer("future_token_mask"), window, cfg.pipeline_cfg.max_num_tokens,
+                        cfg.lm_cfg.is_dflash(), rebind);
 
     // Per-layer post input is invariant because post wrappers remain per layer.
     const uint8_t post_ifm_idx =
@@ -451,48 +414,6 @@ LanguageModel::_argmax_lm_head_rows(uint16_t num_tokens, uint16_t valid_tokens,
         }
     }
     return best_indices;
-}
-
-void LanguageModel::_bind_kv_cache_inputs(LanguageModel& kv_owner, uint8_t source_layer,
-                                          std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
-                                          uint8_t cache_ifm_idx, uint16_t cache_token_idx_begin,
-                                          uint16_t aligned_eff_num_cached_tokens,
-                                          bool has_future_token_mask) {
-    const auto& buffers = kv_owner._workspace->attention_binding_buffers.at(source_layer);
-    const auto& attn_cfg = kv_owner._cfg.lm_cfg.attn_cfg;
-    const uint32_t kv_heads = attn_cfg.num_key_value_heads;
-    const uint32_t head_dim = attn_cfg.get_head_dim(kv_owner._cfg.lm_cfg.layer_types[source_layer]);
-    std::vector<uint32_t> kv_begin;
-    std::vector<uint32_t> kv_shape;
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-        kv_begin = {0, cache_token_idx_begin, 0};
-        kv_shape = {kv_heads, _cfg.pipeline_cfg.max_num_tokens, head_dim};
-    } else {
-        kv_begin = {cache_token_idx_begin, 0};
-        kv_shape = {aligned_eff_num_cached_tokens, kv_heads * head_dim};
-    }
-
-    cache_ifm_map.emplace(std::piecewise_construct, std::forward_as_tuple(cache_ifm_idx++),
-                          std::forward_as_tuple(buffers.key, kv_begin, kv_shape));
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifm_map.emplace(
-            std::piecewise_construct, std::forward_as_tuple(cache_ifm_idx++),
-            std::forward_as_tuple(
-                buffers.key_scale, std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                std::vector<uint32_t>{kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}));
-    }
-    if (has_future_token_mask) {
-        ++cache_ifm_idx;
-    }
-    cache_ifm_map.emplace(std::piecewise_construct, std::forward_as_tuple(cache_ifm_idx),
-                          std::forward_as_tuple(buffers.value, kv_begin, kv_shape));
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifm_map.emplace(
-            std::piecewise_construct, std::forward_as_tuple(cache_ifm_idx + 1),
-            std::forward_as_tuple(
-                buffers.value_scale, std::vector<uint32_t>{0, cache_token_idx_begin, 0},
-                std::vector<uint32_t>{kv_heads, _cfg.pipeline_cfg.max_num_tokens, 1}));
-    }
 }
 
 std::unique_lock<std::recursive_mutex> LanguageExecutor::lock_execution() {

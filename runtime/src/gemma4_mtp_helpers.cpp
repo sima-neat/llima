@@ -10,6 +10,60 @@ namespace simaai {
 namespace llima {
 namespace gemma4_mtp_helpers {
 
+static uint8_t target_kv_layer(const LanguageModelConfig& model, LayerType layer_type) {
+    for (int idx = static_cast<int>(model.num_hidden_layers) - 1; idx >= 0; --idx) {
+        const auto layer_idx = static_cast<uint8_t>(idx);
+        if (
+            !model.is_kv_shared_layer(layer_idx)
+            && model.layer_types[layer_idx] == layer_type
+        ) {
+            return layer_idx;
+        }
+    }
+    throw std::runtime_error(fmt::format(
+        "No target KV layer found for Gemma4 MTP layer type {}", layer_type_name(layer_type)
+    ));
+}
+
+std::vector<CacheLayerBuffers> resolve_target_kv(
+    const VlmConfig& target, const VlmConfig& assistant, std::span<const CacheLayerBuffers> target_buffers
+) {
+    if (assistant.pipeline_cfg.use_strided_kv_cache != target.pipeline_cfg.use_strided_kv_cache) {
+        throw std::runtime_error("Gemma4 MTP target/draft strided-KV settings must match");
+    }
+    if (assistant.pipeline_cfg.quantize_kv_cache != target.pipeline_cfg.quantize_kv_cache) {
+        throw std::runtime_error("Gemma4 MTP target/draft KV quantization settings must match");
+    }
+    if (assistant.pipeline_cfg.max_num_tokens != target.pipeline_cfg.max_num_tokens) {
+        throw std::runtime_error("Gemma4 MTP target/draft max_num_tokens must match");
+    }
+
+    const uint32_t source_kv_heads = target.lm_cfg.attn_cfg.num_key_value_heads;
+    const uint32_t consumer_kv_heads = assistant.lm_cfg.attn_cfg.num_key_value_heads;
+    if (assistant.lm_cfg.layer_types.size() != assistant.lm_cfg.num_hidden_layers) {
+        throw std::runtime_error("Gemma4 MTP assistant layer_types must match num_hidden_layers");
+    }
+    std::vector<CacheLayerBuffers> sources;
+    sources.reserve(assistant.lm_cfg.num_hidden_layers);
+    for (const auto& layer_type : assistant.lm_cfg.layer_types) {
+        if (layer_type != LayerType::FullAttention && layer_type != LayerType::SlidingAttention) {
+            throw std::runtime_error("Gemma4 MTP draft supports attention-only assistant layers");
+        }
+        const uint8_t source_layer = target_kv_layer(target.lm_cfg, layer_type);
+        const uint32_t source_head_dim = target.lm_cfg.attn_cfg.get_head_dim(layer_type);
+        const uint32_t consumer_head_dim = assistant.lm_cfg.attn_cfg.get_head_dim(layer_type);
+        if (source_head_dim != consumer_head_dim || source_kv_heads != consumer_kv_heads) {
+            throw std::runtime_error(fmt::format(
+                "Gemma4 MTP shared KV shape mismatch for {}: target {}x{}, draft {}x{}",
+                layer_type_name(layer_type), source_kv_heads, source_head_dim,
+                consumer_kv_heads, consumer_head_dim
+            ));
+        }
+        sources.push_back(target_buffers[source_layer]);
+    }
+    return sources;
+}
+
 uint16_t draft_query_position(size_t input_length, size_t max_num_tokens) {
     if (input_length == 0) {
         throw std::runtime_error("Gemma4 MTP draft requires at least one input token");

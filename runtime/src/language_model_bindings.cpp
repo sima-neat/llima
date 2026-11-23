@@ -618,27 +618,17 @@ void LanguageModel::_define_buffers() {
         _workspace->local_freq_real = &get_buffer("local_freq_real");
         _workspace->local_freq_imag = &get_buffer("local_freq_imag");
     }
-    // Gemma4 assistants bind the target's KV buffers at each draft step.
     _init_attention_bindings();
 }
 
 
 void LanguageModel::_init_attention_bindings() {
-    // Gemma4 assistants bind the target's KV buffers at each draft step.
-    if (_cfg.lm_cfg.is_gemma4_mtp_draft())
-        return;
-    _workspace->attention_binding_buffers.resize(_cfg.lm_cfg.num_hidden_layers);
-    for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
-        const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-        if (layer_type != LayerType::FullAttention && layer_type != LayerType::SlidingAttention) continue;
-        const auto source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
-        auto& buffers = _workspace->attention_binding_buffers[layer_idx];
-        buffers.key = &get_buffer(fmt::format("cache_key_l{}", source_layer));
-        buffers.value = &get_buffer(fmt::format("cache_val_l{}", source_layer));
-        if (_cfg.pipeline_cfg.quantize_kv_cache) {
-            buffers.key_scale = &get_buffer(fmt::format("cache_key_scale_l{}", source_layer));
-            buffers.value_scale = &get_buffer(fmt::format("cache_val_scale_l{}", source_layer));
-        }
+    auto& layers = _workspace->attention_binding_buffers;
+    layers.reserve(_cfg.lm_cfg.num_hidden_layers);
+    for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
+        layers.push_back(CacheLayerBuffers::for_layer(_cfg, layer, [&](const std::string& name) {
+            return &get_buffer(name);
+        }));
     }
 }
 
@@ -670,8 +660,6 @@ void LanguageModel::_define_attn_models_iter(
     }
 
     const auto& layer_type = _cfg.lm_cfg.layer_types[layer_idx];
-    const auto kv_source_layer = _cfg.lm_cfg.get_kv_source_layer(layer_idx);
-    const auto& kv_layer_type = _cfg.lm_cfg.layer_types[kv_source_layer];
     const std::string freq_prefix = layer_type == LayerType::SlidingAttention ? "local" : "global";
     const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
         num_tokens, token_idx, layer_type
@@ -799,157 +787,36 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
 
-    // Cache model.
     const uint16_t single_num_tokens = _cfg.lm_cfg.get_single_num_tokens();
-    const uint16_t eff_token_idx = token_idx - cache_token_idx_begin;
-    const uint16_t eff_num_cached_tokens = token_idx + num_tokens - cache_token_idx_begin;
-    const bool is_single_model = num_tokens == single_num_tokens;
-    const bool use_sliding_cache = std::get<1>(cache_key) != 0;
-    const LayerType cache_layer_type = (
-        use_sliding_cache ? LayerType::SlidingAttention : LayerType::FullAttention
-    );
-    const uint16_t cache_mask_size = _get_cache_mask_size(
-        cache_layer_type, eff_num_cached_tokens, !is_single_model
-    );
-    const bool use_single_future_token_mask = (
-        is_single_model && cache_mask_size > 1
-    );
-    const bool use_group_future_token_mask = (
-        !is_single_model
-        && cache_mask_size > num_tokens
-    );
-    const uint16_t aligned_eff_token_idx = std::get<2>(cache_key);
-    const uint16_t aligned_eff_num_cached_tokens = use_single_future_token_mask
-        ? aligned_eff_token_idx + 1
-        : aligned_eff_token_idx + num_tokens;
-    std::vector<uint32_t> cache_kv_cache_shape;
-    std::vector<uint32_t> cache_kv_cache_offset;
-    if (_cfg.pipeline_cfg.use_strided_kv_cache) {
-        cache_kv_cache_offset = {0, cache_token_idx_begin, 0};
-        cache_kv_cache_shape = {
-            _cfg.lm_cfg.attn_cfg.num_key_value_heads,
-            _cfg.pipeline_cfg.max_num_tokens,
-            _cfg.lm_cfg.attn_cfg.get_head_dim(kv_layer_type)
-        };
-    } else {
-        cache_kv_cache_offset = {cache_token_idx_begin, 0};
-        cache_kv_cache_shape = {
-            aligned_eff_num_cached_tokens,
-            _cfg.lm_cfg.attn_cfg.get_kv_size(kv_layer_type)
-        };
-    }
-
-    std::vector<MLABufferSlice> cache_ifms{
-        MLABufferSlice{
-            &get_buffer(fmt::format("n{}_buffer2", num_tokens)),
-            {0, 0, 0},
-            {
-                _cfg.lm_cfg.attn_cfg.num_attention_heads,
-                num_tokens,
-                _cfg.lm_cfg.attn_cfg.get_head_dim(layer_type)
-            }
-        },
-        is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
-            ? MLABufferSlice{}
-            : MLABufferSlice{
-                &get_buffer(fmt::format("cache_key_l{}", kv_source_layer)),
-                cache_kv_cache_offset,
-                cache_kv_cache_shape
-            },
-    };
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifms.emplace_back(
-            is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
-                ? MLABufferSlice{}
-                : MLABufferSlice{
-                    &get_buffer(fmt::format("cache_key_scale_l{}", kv_source_layer)),
-                    {0, cache_token_idx_begin, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
-                }
-        );
-    }
-
-    if (use_group_future_token_mask) {
-        cache_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(
-                    cache_layer_type == LayerType::SlidingAttention
-                        ? "group_sliding_future_token_mask"
-                        : "group_future_token_mask"
-                ),
-                {0},
-                {static_cast<uint32_t>(num_tokens) * aligned_eff_num_cached_tokens}
-            }
-        );
-    } else if (use_single_future_token_mask) {
-        if (_cfg.lm_cfg.is_spec_decode()) {
-            // Shift the col begin to cache_token_idx_begin so that buffer col
-            // p ↔ K-row p for any layer type: full (cache_token_idx_begin = 0)
-            // reads cols [0, aligned_eff); sliding reads
-            // [cache_token_idx_begin, cache_token_idx_begin + aligned_eff).
-            // The mask data layout (col c = mask for K[c]) is the same for
-            // both, so no second buffer or layout change is needed.
-            cache_ifms.emplace_back(
-                MLABufferSlice{
-                    &get_buffer("future_token_mask"),
-                    {0, cache_token_idx_begin},
-                    {num_tokens, aligned_eff_num_cached_tokens}
-                }
-            );
-        } else {
-            cache_ifms.emplace_back(
-                MLABufferSlice{
-                    &get_buffer("future_token_mask"),
-                    {(uint32_t)_cfg.pipeline_cfg.max_num_tokens - eff_num_cached_tokens},
-                    {aligned_eff_num_cached_tokens}
-                }
-            );
-        }
-    }
-    // gpt_oss attention sinks slot, right before cached_values (rebound per layer at runtime).
-    if (_cfg.lm_cfg.uses_attention_sinks()) {
-        cache_ifms.emplace_back(
-            MLABufferSlice{
-                &get_buffer(fmt::format("sinks_l{}", layer_idx)),
-                {0, 0},
-                {num_tokens, _cfg.lm_cfg.attn_cfg.num_attention_heads}
-            }
-        );
-    }
-    cache_ifms.emplace_back(
-        is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
-            ? MLABufferSlice{}
-            : MLABufferSlice{
-                &get_buffer(fmt::format("cache_val_l{}", kv_source_layer)),
-                cache_kv_cache_offset,
-                cache_kv_cache_shape
-            }
-    );
-    if (_cfg.pipeline_cfg.quantize_kv_cache) {
-        cache_ifms.emplace_back(
-            is_gemma4_mtp_draft && _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
-                ? MLABufferSlice{}
-                : MLABufferSlice{
-                    &get_buffer(fmt::format("cache_val_scale_l{}", kv_source_layer)),
-                    {0, cache_token_idx_begin, 0},
-                    {_cfg.lm_cfg.attn_cfg.num_key_value_heads, _cfg.pipeline_cfg.max_num_tokens, 1}
-                }
-        );
-    }
-    std::vector<MLABufferSlice> cache_ofms{
-        MLABufferSlice{
-            &get_buffer(fmt::format("n{}_buffer3", num_tokens)),
-            {0, 0},
-            {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}
-        }
-    };
+    MLABufferSlice cache_output{&get_buffer(fmt::format("n{}_buffer3", num_tokens)),
+                                {0, 0}, {num_tokens, _cfg.lm_cfg.attn_cfg.get_q_size(layer_type)}};
     if (define_cache) {
+        const bool single = num_tokens == single_num_tokens;
+        const bool sliding = std::get<1>(cache_key) != 0;
+        const LayerType cache_type = sliding ? LayerType::SlidingAttention : LayerType::FullAttention;
+        const uint16_t effective_length = token_idx + num_tokens - cache_token_idx_begin;
+        const auto mask_size = _get_cache_mask_size(cache_type, effective_length, !single);
+        const auto& ports = _workspace->cache_ports.try_emplace(cache_key, _cfg, num_tokens, mask_size).first->second;
+        const uint16_t aligned_idx = std::get<2>(cache_key);
+        const CacheWindow window{cache_token_idx_begin, ports.context_width(aligned_idx, num_tokens),
+                                 effective_length, num_tokens};
+        std::vector<MLABufferSlice> inputs(ports.count);
+        // The cache consumes the query slice produced by the pre stage.
+        inputs[ports.query] = pre_ofms.front();
+        auto bind = [&](uint8_t port, MLABuffer* buffer, CachePorts::Dimensions begin,
+                        CachePorts::Dimensions shape) {
+            if (buffer) inputs[port] = MLABufferSlice{buffer, begin, shape};
+        };
+        ports.bind_layer(_workspace->attention_binding_buffers.at(layer_idx), _cfg, layer_type, window, bind);
+        if (ports.mask) {
+            const char* name = "future_token_mask";
+            if (ports.mask_kind == CacheMask::Group)
+                name = sliding ? "group_sliding_future_token_mask" : "group_future_token_mask";
+            ports.bind_mask(&get_buffer(name), window, _cfg.pipeline_cfg.max_num_tokens, false, bind);
+        }
         _define_model(
-            _workspace->cache_model_map,
-            cache_key,
-            _get_elf_path_cache(num_tokens, aligned_eff_token_idx, use_sliding_cache),
-            cache_ifms,
-            cache_ofms
+            _workspace->cache_model_map, cache_key,
+            _get_elf_path_cache(num_tokens, aligned_idx, sliding), inputs, {cache_output}
         );
     }
 
@@ -969,7 +836,7 @@ void LanguageModel::_define_attn_models_iter(
         );
     }
     const size_t post_self_attn_idx = post_ifms.size();
-    post_ifms.emplace_back(cache_ofms[0]);
+    post_ifms.emplace_back(cache_output);
     const bool is_group_model = (
         _use_group_token_models
         && num_tokens == _cfg.pipeline_cfg.input_token_group_size

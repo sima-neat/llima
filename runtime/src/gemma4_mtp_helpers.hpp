@@ -9,9 +9,16 @@
 
 #include <Eigen/Core>
 
+#include "attention_cache.hpp"
+
 namespace simaai {
 namespace llima {
 namespace gemma4_mtp_helpers {
+
+// One target-owned cache binding per assistant layer, in assistant execution order.
+std::vector<CacheLayerBuffers> resolve_target_kv(
+    const VlmConfig& target, const VlmConfig& assistant, std::span<const CacheLayerBuffers> target_buffers
+);
 
 uint16_t draft_query_position(size_t input_length, size_t max_num_tokens);
 

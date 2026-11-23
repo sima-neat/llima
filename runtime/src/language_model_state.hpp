@@ -1,6 +1,7 @@
 #pragma once
 
 // Private resource, cache and workspace owners; not an installed API header.
+#include "attention_cache.hpp"
 #include "language_model.hpp"
 #include "embedding_offload.hpp"
 #include "model_resources.hpp"
@@ -77,13 +78,14 @@ struct LanguageWorkspace {
     // different partner requires a cold prefill on both sides.
     struct SpeculativePair {};
     std::shared_ptr<SpeculativePair> speculative_pair;
-    std::vector<uint8_t> mtp_shared_kv_layers;
+    std::vector<CacheLayerBuffers> mtp_target_kv;
     LanguageModel::DFlashScratch dflash;
     std::vector<uint32_t> offload_prompt_ids;
     bool offload_chunk_staging = false;
     std::map<std::string, MLABuffer> buffers;
     LanguageModelMap pre_model_map;
     LanguageModelMap cache_model_map;
+    std::map<LanguageModelMapKey, CachePorts> cache_ports;
     LanguageModelMap post_model_map;
     LanguageModelMap conv_model_map;
     LanguageModelMap conv_final_model_map;
@@ -96,7 +98,7 @@ struct LanguageWorkspace {
     LanguageModelMap dflash_context_model_map;
     LanguageModelMap dflash_state_resolver_model_map;
     uint16_t dflash_resolved_prefix = 0;
-    std::vector<LanguageModel::AttentionBindingBuffers> attention_binding_buffers;
+    std::vector<CacheLayerBuffers> attention_binding_buffers;
     MLABuffer* global_freq_real = nullptr;
     MLABuffer* global_freq_imag = nullptr;
     MLABuffer* local_freq_real = nullptr;

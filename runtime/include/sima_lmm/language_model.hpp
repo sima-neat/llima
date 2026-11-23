@@ -401,13 +401,6 @@ class LanguageModel {
             // Each occupied slot owns the snapshot for one layer at one sequence position.
             std::vector<std::array<std::vector<uint8_t>, checkpoint_slot_count>> checkpoints;
         };
-        struct AttentionBindingBuffers {
-            MLABuffer* key = nullptr;
-            MLABuffer* value = nullptr;
-            MLABuffer* key_scale = nullptr;
-            MLABuffer* value_scale = nullptr;
-        };
-
         void _initialize();
         void _finalize();
         void _define_buffer_freq_table(const std::string& name, uint32_t rope_dimension_count);
@@ -558,25 +551,11 @@ class LanguageModel {
             uint16_t context_length,
             uint16_t sliding_window = 0
         );
-        uint8_t _find_gemma4_mtp_target_kv_layer(LayerType layer_type) const;
-        std::vector<uint8_t> _prepare_gemma4_mtp_shared_kv_layers(
-            const LanguageModel& target_lm
-        ) const;
-        void _bind_kv_cache_inputs(
-            LanguageModel& kv_owner,
-            uint8_t source_layer,
-            std::map<uint8_t, MLABufferSlice>& cache_ifm_map,
-            uint8_t cache_ifm_idx,
-            uint16_t cache_token_idx_begin,
-            uint16_t aligned_eff_num_cached_tokens,
-            bool has_future_token_mask
-        );
         Gemma4MtpTargetBatchResult _run_gemma4_mtp_target_batch(
             uint16_t token_idx, std::span<const uint32_t> token_ids
         );
         Gemma4MtpDraftStepResult _run_gemma4_mtp_draft_step(
             LanguageModel& target_lm,
-            std::span<const uint8_t> shared_kv_layers,
             uint32_t token_id,
             const std::vector<Eigen::bfloat16>& hidden_state,
             uint16_t query_position_id,
