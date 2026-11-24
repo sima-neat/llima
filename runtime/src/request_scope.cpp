@@ -18,10 +18,8 @@ RequestScope::RequestScope(LanguageModel& target, LanguageModel* draft,
         target.invalidate_prompt_reuse();
     }
     target._run->text_streamer.begin_request(std::move(stream));
-    target._run->standalone_start = _request.target_interrupt.initial;
     target._run->active = &_request;
     if (draft) {
-        draft->_run->standalone_start = _request.draft_interrupt->initial;
         draft->_run->active = &_request;
     }
 }

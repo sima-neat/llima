@@ -5,6 +5,7 @@
 #include "language_model.hpp"
 #include "embedding_offload.hpp"
 #include "model_resources.hpp"
+#include <stdexcept>
 
 namespace simaai::llima {
 
@@ -224,21 +225,21 @@ struct RequestState {
     }
 };
 
-// Holds request defaults, the streamer, interrupts, and the active request;
-// also tracks cancellation across standalone prefill/decode calls.
+// Holds fixed request defaults, the streamer, interrupts, and the active request.
 struct RequestControl {
     RequestControl(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
         : defaults{std::move(stops), limit}, text_streamer(streamer) {}
 
-    TokenLimits& limits() { return active ? active->limits : defaults; }
-    bool cancelled() const {
-        return active ? active->cancelled() : interrupts.load(std::memory_order_relaxed) != standalone_start;
+    RequestState& request() const {
+        if (!active) throw std::logic_error("Model execution requires an active request");
+        return *active;
     }
+    TokenLimits& limits() { return request().limits; }
+    bool cancelled() const { return request().cancelled(); }
 
     TokenLimits defaults;
     TextStreamer& text_streamer;
     InterruptCounter interrupts{0};
-    uint64_t standalone_start = 0; // Shared by a standalone prefill/decode pair.
     // Only the serialized execution thread uses this pointer. stop_model() touches only interrupts.
     RequestState* active = nullptr;
 };

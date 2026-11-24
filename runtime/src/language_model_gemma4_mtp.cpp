@@ -514,6 +514,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result
 ) {
+    _run->request();
+    draft_lm._run->request();
     if (input_token_ids.empty()) {
         throw std::runtime_error("Gemma4 MTP generation requires at least one input token");
     }
@@ -558,11 +560,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
         );
         _workspace->gemma4_mtp_prefill_hidden_state.reset();
         const auto first_begin = std::chrono::steady_clock::now();
-        auto first_token = run_model_prefill(
-            input_token_ids,
-            prefill_cached_tokens,
-            timer_ttft
-        );
+        auto first_token = _prefill(input_token_ids, prefill_cached_tokens, timer_ttft, nullptr);
         const double first_duration = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - first_begin
         ).count();

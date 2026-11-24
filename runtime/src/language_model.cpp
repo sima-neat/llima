@@ -338,6 +338,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_generate_tokens(
     RequestScope& request, std::span<const uint32_t> ids, std::optional<uint16_t> limit,
     std::optional<ChronoTimer> timer, GenerationPerformanceResult* performance, uint16_t stable_prefix
 ) {
+    _run->request();
     if (request.cancelled()) {
         if (performance) *performance = {};
         return std::nullopt;
@@ -359,6 +360,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_ordinary(
     std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
     uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
 ) {
+    _run->request();
     if (performance) *performance = {};
     auto* durations = performance ? &performance->token_durations : nullptr;
 
@@ -498,19 +500,11 @@ void LanguageModel::attach_draft(LanguageModel& draft_lm) {
     draft_lm._workspace->speculative_pair = std::move(pair);
 }
 
-uint32_t LanguageModel::run_model_prefill(
-    std::span<const uint32_t> input_token_ids,
-    uint16_t num_cached_tokens,
-    std::optional<ChronoTimer> timer_ttft
-) {
-    if (!_run->active) _run->standalone_start = _run->interrupts.load(std::memory_order_relaxed);
-    return _prefill(input_token_ids, num_cached_tokens, timer_ttft, nullptr);
-}
-
 uint32_t LanguageModel::_prefill(
     std::span<const uint32_t> input_token_ids, uint16_t num_cached_tokens,
     std::optional<ChronoTimer> timer_ttft, std::vector<double>* durations
 ) {
+    _run->request();
     if (_uses_per_layer_inputs())
         _workspace->prompt_per_layer_token_ids = _get_per_layer_token_ids(input_token_ids);
     if (!timer_ttft.has_value())
@@ -604,6 +598,7 @@ uint32_t LanguageModel::_prefill(
 
 void LanguageModel::_decode(uint16_t num_input_tokens, uint32_t token_id,
                             std::vector<double>* durations) {
+    _run->request();
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _run->limits().max_num_tokens; ++token_idx ) {
@@ -655,6 +650,7 @@ LogLikelihoodResult LanguageModel::_score(
     std::span<const uint32_t> continuation_token_ids,
     bool use_group_prefill
 ) {
+    _run->request();
     if (!_cfg.pipeline_cfg.return_logits) {
         throw std::runtime_error(
             "model not compiled with --return_logits; "
@@ -723,7 +719,7 @@ LogLikelihoodResult LanguageModel::_score(
     );
     if (!should_group_prefill) {
         // Single-token scoring rewrites the model cache from token zero without going
-        // through run_model_prefill(), so the cached-token metadata is no longer valid.
+        // through _prefill(), so the cached-token metadata is no longer valid.
         _cache->cached_token_ids.clear();
         _prepare_state_checkpoints_for_prefill(0);
     }
@@ -742,7 +738,7 @@ LogLikelihoodResult LanguageModel::_score(
             // final context token, not stale logits from a previous request.
             num_cached_tokens = static_cast<uint16_t>(prefill_token_count - 1);
         }
-        run_model_prefill(prefill_input_tokens, num_cached_tokens, std::nullopt);
+        _prefill(prefill_input_tokens, num_cached_tokens, std::nullopt, nullptr);
         if (_run->cancelled()) {
             throw std::runtime_error("Loglikelihood group prefill was interrupted");
         }
@@ -910,6 +906,7 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
+    _run->request();
     auto execution = LayerExecutor::lock_execution();
     if (token_idx == 0 && logits_ptr)
         _prepare_state_checkpoints_for_prefill(0);

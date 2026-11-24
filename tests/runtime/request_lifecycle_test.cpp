@@ -28,6 +28,19 @@ void check_cancellation() {
     require(!next.cancelled(), "A legacy interrupt carried over to a new request");
     ++target;
     require(next.cancelled(), "Stopping the target did not interrupt its request");
+
+    TextStreamer stream(nullptr);
+    RequestControl control({}, 32, stream);
+    auto without_request = [&](auto&& operation) {
+        bool rejected = false;
+        try { operation(); } catch (const std::logic_error&) { rejected = true; }
+        require(rejected, "Execution without a request was accepted");
+    };
+    without_request([&] { control.limits(); });
+    without_request([&] { control.cancelled(); });
+    control.active = &next;
+    require(&control.limits() == &next.limits && control.cancelled(),
+            "Execution did not use its active request");
 }
 
 void check_streamer() {

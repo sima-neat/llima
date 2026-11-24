@@ -150,11 +150,6 @@ class LanguageModel {
         friend class LayerExecutor;
         friend struct LanguageModelTestAccess;
 
-        uint32_t run_model_prefill(
-            std::span<const uint32_t> input_token_ids,
-            uint16_t num_cached_tokens,
-            std::optional<ChronoTimer> = std::nullopt
-        );
         uint32_t run_model_once(
             uint16_t num_tokens,
             uint16_t token_idx,
