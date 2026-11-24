@@ -8,20 +8,33 @@ checkpoint or to the output of its matching repository-specific
 `quantization_config` are authoritative.
 
 A configuration may select compiler units from a pre-quantized input for
-debugging. For a pre-quantized input, return only `compile` decisions: `{}`
-for a selected unit and `{"compile": False}` otherwise. Do not return
-`precision`; LLiMa reuses the checkpoint's INT4/INT8 weights and does not
+debugging. For its base weights, return only `compile` decisions: `{}` for a
+selected unit and `{"compile": False}` otherwise. Do not return `precision`
+to change them; LLiMa reuses the checkpoint's INT4/INT8 weights and does not
 requantize them, replace model-specific targets, or reconstruct the
 repository's llm-compressor recipe. Use the pre-quantized example under Select
 Units.
 
+When the build also compiles a LoRA adapter, keep the `lora` mode the adapter
+needs, such as `"LORA_BRANCH"`; `{}` disables LoRA. LoRA adapter compilation
+reads `precision` from the same file for the adapter weights, so set it as the
+installed LLiMa LoRA documentation specifies. It still does not change the
+base weights.
+
+GGUF input is also already quantized: LLiMa reuses its weights and ignores
+`precision`, so select units the same way.
+
 The `precision` examples are for an explicitly approved FP/BF16 fallback only.
-To confirm a pre-quantized input kept its encoded quantization, check that its
-`config.json` has `quantization_config.quant_method` set to
-`compressed-tensors` and that a full compile log reports
-`Generated mode=SOURCE_TO_QUANT` with no `SOURCE_TO_FP` or `FP_TO_QUANT` step.
-The precision printed beside each unit in that log is the unused default. A
-partial compiler-debug output is normally undeployable.
+To confirm a pre-quantized Hugging Face input keeps its encoded quantization,
+check that its `config.json` has `quantization_config.quant_method` set to
+`compressed-tensors`. If it is missing or has another value, such as a native
+AutoGPTQ or AWQ export, LLiMa treats the weights as FP. Stop and report it
+instead of compiling, and use `sima-add-llima-model-support` to assess the
+checkpoint. For a `compressed-tensors` checkpoint, a compile without a stage
+flag (`--source_to_fp`, `--fp_to_quant`, `--model_sdk`, `--compile`) reports
+`Generated mode=SOURCE_TO_QUANT` with no `SOURCE_TO_FP` or `FP_TO_QUANT` step. The precision printed beside
+each unit in that log is the unused default. A partial compiler-debug output
+is normally undeployable.
 
 ## FP/BF16 Fallback
 
@@ -110,10 +123,19 @@ def get_layer_configuration(model_properties, layer):
 ### FP/BF16 Input
 
 Only for an original FP/BF16 checkpoint may a selected unit also set the
-fallback precision, by replacing the final return. Never use it for a
-pre-quantized input:
+fallback precision. Never use this version for a pre-quantized input:
 
 ```python
+SELECTED_PARTS = {"PRE", "POST"}
+SELECTED_INDICES = range(4, 8)
+
+
+def get_layer_configuration(model_properties, layer):
+    selected = (
+        layer["part"] in SELECTED_PARTS
+        and not layer["is_group"]
+        and layer["index"] in SELECTED_INDICES
+    )
     if not selected:
         return {"compile": False}
     return {"precision": "A_BF16_W_INT8"}
