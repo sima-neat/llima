@@ -8,15 +8,20 @@ checkpoint or to the output of its matching repository-specific
 `quantization_config` are authoritative.
 
 A configuration may select compiler units from a pre-quantized input for
-debugging through its `compile` decisions. This selection does not override
-the checkpoint's INT4/INT8 weights. Do not claim that a `precision` return
-value requantizes those weights, replaces model-specific targets, or
-reconstructs the repository's llm-compressor recipe.
+debugging. For a pre-quantized input, return only `compile` decisions: `{}`
+for a selected unit and `{"compile": False}` otherwise. Do not return
+`precision`; LLiMa reuses the checkpoint's INT4/INT8 weights and does not
+requantize them, replace model-specific targets, or reconstruct the
+repository's llm-compressor recipe. Use the pre-quantized example under Select
+Units.
 
-The precision examples below are for an explicitly approved FP/BF16 fallback.
-For a pre-quantized input, follow the installed LLiMa release when selecting
-units and verify that the emitted unit list preserves the checkpoint's encoded
-weight quantization. A partial compiler-debug output is normally undeployable.
+The `precision` examples are for an explicitly approved FP/BF16 fallback only.
+To confirm a pre-quantized input kept its encoded quantization, check that its
+`config.json` has `quantization_config.quant_method` set to
+`compressed-tensors` and that a full compile log reports
+`Generated mode=SOURCE_TO_QUANT` with no `SOURCE_TO_FP` or `FP_TO_QUANT` step.
+The precision printed beside each unit in that log is the unused default. A
+partial compiler-debug output is normally undeployable.
 
 ## FP/BF16 Fallback
 
@@ -82,7 +87,9 @@ images.
 
 ## Select Units
 
-Compile only single-token `PRE`/`POST` units at indices 4–7:
+Compile only single-token `PRE`/`POST` units at indices 4–7.
+
+### Pre-Quantized Input
 
 ```python
 SELECTED_PARTS = {"PRE", "POST"}
@@ -95,6 +102,18 @@ def get_layer_configuration(model_properties, layer):
         and not layer["is_group"]
         and layer["index"] in SELECTED_INDICES
     )
+    if not selected:
+        return {"compile": False}
+    return {}  # Selection only: the checkpoint's encoded weights are kept.
+```
+
+### FP/BF16 Input
+
+Only for an original FP/BF16 checkpoint may a selected unit also set the
+fallback precision, by replacing the final return. Never use it for a
+pre-quantized input:
+
+```python
     if not selected:
         return {"compile": False}
     return {"precision": "A_BF16_W_INT8"}
