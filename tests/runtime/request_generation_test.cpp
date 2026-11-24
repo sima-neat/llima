@@ -53,7 +53,7 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
     };
     auto generate = [&](const std::vector<uint32_t>& prompt) {
         const auto limit = limit_for(prompt);
-        auto result = target.run_model_speculative_decoding(*draft, prompt, {.max_num_tokens = limit});
+        auto result = target.run_model_speculative_decoding(*draft, prompt, {.max_total_tokens = limit});
         require(result && !result->empty(), "Direct speculative generation did not return tokens");
         return *result;
     };
@@ -64,7 +64,8 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
             "Direct speculative calls disagreed with their fresh references");
     const std::vector<uint32_t> invalid{cfg.lm_cfg.token_cfg.vocab_size};
     rejected([&] { generate(invalid); }, "Direct speculative request accepted an invalid token");
-    require(draft->get_kv_cache_len() == 0 && target.get_kv_cache_len() == 0,
+    require(LanguageModelTestAccess::kv_cache_len(*draft) == 0 &&
+                LanguageModelTestAccess::kv_cache_len(target) == 0,
             "A failed direct request retained target or draft cache state");
     require(generate(b) == gold_b, "Direct speculative recovery changed tokens");
     std::atomic<bool> cancelled_on_first_token = false;
@@ -75,24 +76,25 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
         }
     });
     target_stream.enable();
-    const auto interrupted = target.run_model_speculative_decoding(*draft, a, {.max_num_tokens = limit_for(a)});
+    const auto interrupted = target.run_model_speculative_decoding(*draft, a, {.max_total_tokens = limit_for(a)});
     target_stream.disable();
     target_stream.set_info_callback([](const std::string&, double) {});
     require(cancelled_on_first_token, "The direct speculative request did not emit a first-token event");
     require(!interrupted, "Direct speculative generation returned tokens after cancellation");
-    require(draft->get_kv_cache_len() == 0, "Cancellation retained the draft cache");
-    require(target.get_kv_cache_len() == 0, "Cancellation retained the target cache");
+    require(LanguageModelTestAccess::kv_cache_len(*draft) == 0, "Cancellation retained the draft cache");
+    require(LanguageModelTestAccess::kv_cache_len(target) == 0, "Cancellation retained the target cache");
     require(generate(b) == gold_b, "Cancellation changed the next direct request");
-    require(target.get_kv_cache_len() > 0, "Recovery did not populate the target cache");
-    const auto previous_length = target.get_kv_cache_len();
-    const auto previous_draft_length = draft->get_kv_cache_len();
-    rejected([&] { target.run_model_speculative_decoding(target, a, {.max_num_tokens = limit_for(a)}); },
+    require(LanguageModelTestAccess::kv_cache_len(target) > 0, "Recovery did not populate the target cache");
+    const auto previous_length = LanguageModelTestAccess::kv_cache_len(target);
+    const auto previous_draft_length = LanguageModelTestAccess::kv_cache_len(*draft);
+    rejected([&] { target.run_model_speculative_decoding(target, a, {.max_total_tokens = limit_for(a)}); },
              "Direct speculative generation accepted the target as its own draft");
-    require(target.get_kv_cache_len() == previous_length && draft->get_kv_cache_len() == previous_draft_length,
+    require(LanguageModelTestAccess::kv_cache_len(target) == previous_length &&
+                LanguageModelTestAccess::kv_cache_len(*draft) == previous_draft_length,
             "Rejecting an incompatible draft changed a model cache");
     auto replacement = make_draft();
     target.attach_draft(*replacement);
-    require(target.get_kv_cache_len() == 0,
+    require(LanguageModelTestAccess::kv_cache_len(target) == 0,
             "Replacing a draft runner over the same package retained the old pair's cache");
     draft = std::move(replacement);
     require(generate(a) == gold_a, "Replacing the draft runner changed greedy output");
@@ -159,13 +161,13 @@ int main(int argc, char** argv) {
             LanguageModel direct(root, helper.get_stop_token_ids(), helper.get_image_token_id(),
                                  helper.get_pad_token_id(), stream);
             const auto output = direct.run_model(a,
-                {.max_num_tokens = static_cast<uint16_t>(a.size() + 64)});
+                {.max_total_tokens = static_cast<uint16_t>(a.size() + 64)});
             require(output && *output == gold_a, "Automatic token staging changed ordinary output");
-            const auto cached = direct.get_kv_cache_len();
+            const auto cached = LanguageModelTestAccess::kv_cache_len(direct);
             std::stop_source stopped;
             stopped.request_stop();
             require(!direct.run_model(b, {.stop = stopped.get_token()}) &&
-                        direct.get_kv_cache_len() == cached,
+                        LanguageModelTestAccess::kv_cache_len(direct) == cached,
                     "A pre-cancelled token request changed the cache");
         }
         const auto workspace = first->workspace_memory_bytes();

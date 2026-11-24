@@ -47,7 +47,7 @@ using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
 // Options for raw-token execution; the token limit includes the input prompt.
 struct TokenRunOptions {
-    std::optional<uint16_t> max_num_tokens;
+    std::optional<uint16_t> max_total_tokens;
     std::optional<std::set<uint32_t>> stop_token_ids;
     std::stop_token stop;
     std::optional<ChronoTimer> timer_ttft;
@@ -68,9 +68,6 @@ class LanguageModel {
         );
         ~LanguageModel();
 
-        std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
-            std::span<const uint32_t> input_token_ids
-        );
         // Both entry points stage their raw input tokens. Callers serialize access.
         std::optional<std::vector<uint32_t>> run_model(
             std::span<const uint32_t> input_token_ids, const TokenRunOptions& options = {}
@@ -94,9 +91,6 @@ class LanguageModel {
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
 
-        // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
-        uint16_t get_kv_cache_len() const;
-
     private:
         friend struct LanguageAssets;
         friend struct SequenceCache;
@@ -106,6 +100,9 @@ class LanguageModel {
         friend class LayerExecutor;
         friend struct LanguageModelTestAccess;
 
+        std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
+            std::span<const uint32_t> input_token_ids
+        );
         uint32_t run_model_once(
             uint16_t num_tokens,
             uint16_t token_idx,

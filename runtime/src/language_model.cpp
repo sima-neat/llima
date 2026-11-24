@@ -82,8 +82,6 @@ void LanguageModel::stop_model() { _run->interrupts.fetch_add(1, std::memory_ord
 
 const std::set<uint32_t>& LanguageModel::get_stop_token_ids() const { return _run->limits().stop_token_ids; }
 
-uint16_t LanguageModel::get_kv_cache_len() const { return _cache->kv_cache_len; }
-
 void LanguageModel::set_kv_cache_len(uint16_t len) { _cache->kv_cache_len = len; }
 
 
@@ -295,7 +293,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
     }
     RequestScope request(*this, nullptr, {}, options.stop, options.stop_token_ids);
     create_input_buffers(input_token_ids);
-    auto output = _generate_tokens(request, input_token_ids, options.max_num_tokens,
+    auto output = _generate_tokens(request, input_token_ids, options.max_total_tokens,
         options.timer_ttft, options.performance, options.stable_prefix_token_count);
     request.finish();
     return request.cancelled() ? std::nullopt : output;
@@ -379,7 +377,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
     }
     RequestScope request(*this, &draft_lm, {}, options.stop, options.stop_token_ids);
     create_input_buffers(input_token_ids);
-    auto output = _generate_tokens(request, input_token_ids, options.max_num_tokens,
+    auto output = _generate_tokens(request, input_token_ids, options.max_total_tokens,
         options.timer_ttft, options.performance, options.stable_prefix_token_count);
     request.finish();
     return request.cancelled() ? std::nullopt : output;

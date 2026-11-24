@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
                 }
                 trace->reset(cancel ? &target : nullptr);
                 auto tokens = target.run_model_speculative_decoding(
-                    draft, prompt, {.max_num_tokens = static_cast<uint16_t>(prompt.size() + generated)}
+                    draft, prompt, {.max_total_tokens = static_cast<uint16_t>(prompt.size() + generated)}
                 );
                 std::lock_guard<std::mutex> lock(metrics_mutex);
                 require(metrics.cached_tokens.has_value(), "Missing cache reuse metric");
@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
             // physical buffer still contains extra verification rows.
             auto continuation = prompt_a;
             continuation.insert(continuation.end(), a1.tokens->begin(), a1.tokens->end());
-            const auto committed = target.get_kv_cache_len();
+            const auto committed = LanguageModelTestAccess::kv_cache_len(target);
             const auto continuation_warm = run(continuation);
             const auto continuation_cold = cold_reference(continuation);
             require(continuation_warm.tokens == continuation_cold.tokens,
@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
             reset_cache();
             const auto interrupted = run(prompt_a, 16, true);
             require(!interrupted.tokens.has_value(), "Prefill ignored cancellation");
-            require(target.get_kv_cache_len() == 0, "Interrupted target KV remains valid");
+            require(LanguageModelTestAccess::kv_cache_len(target) == 0, "Interrupted target KV remains valid");
             const auto recovered = run(prompt_a);
             require(*recovered.metrics.cached_tokens == 0,
                 "Recovery must recompute from an empty cache");

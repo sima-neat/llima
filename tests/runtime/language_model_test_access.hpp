@@ -1,11 +1,13 @@
 #pragma once
 
 #include "language_model.hpp"
+#include "language_model_state.hpp"
 #include <spdlog/sinks/base_sink.h>
 
 namespace simaai::llima {
 
 struct LanguageModelTestAccess {
+    static uint16_t kv_cache_len(const LanguageModel& model) { return model._cache->kv_cache_len; }
     static void reset_cache(LanguageModel& model) { model.invalidate_prompt_reuse(); }
     static void truncate_kv(LanguageModel& model, uint16_t length) { model.set_kv_cache_len(length); }
 };

@@ -45,6 +45,7 @@ add_executable(
     sima_lmm_gemma4_mtp_cache_test
     gemma4_mtp_cache_test.cpp
 )
+target_include_directories(sima_lmm_gemma4_mtp_cache_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime)
 target_link_libraries(
     sima_lmm_mla_rt_lifecycle_test
@@ -258,6 +259,7 @@ install(TARGETS sima_lmm_request_lifecycle_test RUNTIME DESTINATION lib/sima-lmm
 install(FILES request_lifecycle_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
 
 add_executable(sima_lmm_request_generation_test request_generation_test.cpp)
+target_include_directories(sima_lmm_request_generation_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 target_link_libraries(sima_lmm_request_generation_test PRIVATE sima_lmm_runtime)
 set_target_properties(sima_lmm_request_generation_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 add_test(NAME runtime.request_generation COMMAND sima_lmm_request_generation_test)
