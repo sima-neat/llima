@@ -10,6 +10,13 @@
 #include <stdexcept>
 #include <utility>
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libswresample/swresample.h>
+}
+
 #include <cnpy.h>
 #include <fmt/ranges.h>
 #include <fmt/std.h>

@@ -48,7 +48,7 @@ add_executable(
     gemma4_mtp_cache_test.cpp
 )
 target_include_directories(sima_lmm_gemma4_mtp_cache_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
-target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime)
+target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime minja)
 target_link_libraries(
     sima_lmm_mla_rt_lifecycle_test
     PRIVATE
@@ -63,6 +63,8 @@ target_link_libraries(
     sima_lmm_vision_generation_test
     PRIVATE
         sima_lmm_runtime
+        opencv_imgproc
+        opencv_imgcodecs
 )
 target_link_libraries(
     sima_lmm_asr_transcription_test
@@ -262,7 +264,7 @@ install(FILES request_lifecycle_test.cpp DESTINATION share/sima-lmm/tests/runtim
 
 add_executable(sima_lmm_request_generation_test request_generation_test.cpp)
 target_include_directories(sima_lmm_request_generation_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
-target_link_libraries(sima_lmm_request_generation_test PRIVATE sima_lmm_runtime)
+target_link_libraries(sima_lmm_request_generation_test PRIVATE sima_lmm_runtime minja)
 set_target_properties(sima_lmm_request_generation_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 add_test(NAME runtime.request_generation COMMAND sima_lmm_request_generation_test)
 set_tests_properties(runtime.request_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
@@ -278,7 +280,7 @@ install(TARGETS sima_lmm_request_generation_test RUNTIME DESTINATION lib/sima-lm
 install(FILES request_generation_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
 
 add_executable(sima_lmm_lora_adapter_test lora_adapter_test.cpp)
-target_include_directories(sima_lmm_lora_adapter_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
+target_include_directories(sima_lmm_lora_adapter_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src" "${cnpy_SOURCE_DIR}")
 target_link_libraries(sima_lmm_lora_adapter_test PRIVATE sima_lmm_runtime cnpy-static "${SIMA_LMM_MLART_LIBRARY}")
 set_target_properties(sima_lmm_lora_adapter_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
 add_test(NAME runtime.lora_adapter COMMAND sima_lmm_lora_adapter_test)

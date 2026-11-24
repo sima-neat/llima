@@ -343,24 +343,26 @@ target_compile_options(
     -ffunction-sections
     -fdata-sections
 )
-target_compile_options(${TARGET_RUNTIME} PUBLIC ${HTTPLIB_CFLAGS_OTHER})
+target_compile_options(${TARGET_RUNTIME} PRIVATE ${HTTPLIB_CFLAGS_OTHER})
 
 target_include_directories(
     ${TARGET_RUNTIME}
     PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include/sima_lmm>
-    $<BUILD_INTERFACE:${MSGPACK_CXX_SOURCE_DIR}/include>
-    # cnpy include directory is not automatically added when library is linked.
-    $<BUILD_INTERFACE:${cnpy_SOURCE_DIR}>
-    $<BUILD_INTERFACE:${llama_SOURCE_DIR}/ggml/include>
-    # tokenizers_cpp include directory is not added to tokenizers_c target.
-    $<BUILD_INTERFACE:${tokenizers_cpp_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/runtime/include/sima_lmm>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src"
+        "${MSGPACK_CXX_SOURCE_DIR}/include"
+        "${cnpy_SOURCE_DIR}"
+        "${llama_SOURCE_DIR}/ggml/include"
+        "${tokenizers_cpp_SOURCE_DIR}/include"
 )
-target_include_directories(${TARGET_RUNTIME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src")
-
-target_include_directories(${TARGET_RUNTIME} SYSTEM PUBLIC ${HTTPLIB_INCLUDE_DIRS})
+target_include_directories(${TARGET_RUNTIME} SYSTEM PRIVATE
+    ${HTTPLIB_INCLUDE_DIRS} ${CPPZMQ_INCLUDE_DIRS}
+    ${AVCODEC_INCLUDE_DIRS} ${AVFORMAT_INCLUDE_DIRS}
+    ${AVUTIL_INCLUDE_DIRS} ${SWRESAMPLE_INCLUDE_DIRS}
+)
 
 target_link_libraries(
     ${TARGET_RUNTIME}
@@ -371,26 +373,26 @@ target_link_libraries(
         cnpy-static
         ${SIMA_LMM_HEAP_LIBRARY}
         ${SIMA_LMM_MLART_LIBRARY}
+        opencv_imgproc
+        opencv_imgcodecs
+        ${AVCODEC_LIBRARIES}
+        ${AVFORMAT_LIBRARIES}
+        ${AVUTIL_LIBRARIES}
+        ${SWRESAMPLE_LIBRARIES}
+        ${SIMA_LMM_CPPZMQ_LIBRARIES}
+        PkgConfig::JSONCPP
+        msgpack-cxx
+        minja
+        tokenizers_c
+        ${HTTPLIB_LIBRARY}
+        llama
+        PkgConfig::Readline
     PUBLIC
-    opencv_core
-    opencv_imgproc
-    opencv_imgcodecs
-    ${AVCODEC_LIBRARIES}
-    ${AVFORMAT_LIBRARIES}
-    ${AVUTIL_LIBRARIES}
-    ${SWRESAMPLE_LIBRARIES}
-    ${SIMA_LMM_CPPZMQ_LIBRARIES}
-    PkgConfig::JSONCPP
-    msgpack-cxx
-    fmt::fmt
-    spdlog::spdlog
-    Eigen3::Eigen
-    nlohmann_json::nlohmann_json
-    minja
-    tokenizers_c
-    ${HTTPLIB_LIBRARY}
-    llama
-    PkgConfig::Readline
+        opencv_core
+        fmt::fmt
+        spdlog::spdlog
+        Eigen3::Eigen
+        nlohmann_json::nlohmann_json
 )
 # Search project headers before the platform sysroot.
 target_include_directories(${TARGET_RUNTIME} SYSTEM AFTER PRIVATE
@@ -406,10 +408,14 @@ if(SIMA_LMM_BUILD_PYTHON)
         runtime/devkit/binding.cpp
     )
     target_include_directories(${TARGET_BIND} PRIVATE runtime/src)
+    # The binding exposes frontend classes; these headers remain private to it.
+    target_include_directories(${TARGET_BIND} SYSTEM PRIVATE ${HTTPLIB_INCLUDE_DIRS} ${CPPZMQ_INCLUDE_DIRS})
+    target_compile_options(${TARGET_BIND} PRIVATE ${HTTPLIB_CFLAGS_OTHER})
     target_link_libraries(
         ${TARGET_BIND}
         PRIVATE
         ${TARGET_RUNTIME}
+        msgpack-cxx
     )
     set_target_properties(
         ${TARGET_BIND} PROPERTIES
@@ -443,15 +449,6 @@ install(
     COMPONENT dev
     FILES_MATCHING PATTERN "*.hpp"
 )
-
-# Header-only/public-header dependencies used by the installed LLiMa headers.
-# Do not install headers that are owned by Debian -dev packages into /usr/include:
-# doing so conflicts with normal package ownership (for example nlohmann-json3-dev).
-# Dependencies without a reliable SDK package are still vendored for now.
-install(DIRECTORY "${minja_SOURCE_DIR}/include/minja" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(DIRECTORY "${tokenizers_cpp_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(DIRECTORY "${llama_SOURCE_DIR}/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(DIRECTORY "${llama_SOURCE_DIR}/ggml/include/" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
 
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SimaLMMConfig.cmake.in"

@@ -16,12 +16,7 @@
 #include <fftw3.h>
 #include <spdlog/logger.h>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-#include <libswresample/swresample.h>
-}
+
 
 #include "eigen_types.hpp"
 #include "file_provider.hpp"
