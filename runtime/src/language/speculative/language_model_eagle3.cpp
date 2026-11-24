@@ -1,3 +1,4 @@
+#include <cstring>
 //**************************************************************************
 //||                        SiMa.ai CONFIDENTIAL                          ||
 //||   Unpublished Copyright (c) 2022-2026 SiMa.ai, All Rights Reserved.  ||
@@ -1533,6 +1534,106 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
     return std::vector<uint32_t>(input_ids.begin() + input_len, input_ids.end());
 }
 
+
+void LanguageModel::compact_kv_after_accept(
+    std::span<const uint16_t> select_indices, uint16_t prev_input_len
+) {
+    const size_t n = select_indices.size();
+    const uint8_t num_layers = _cfg.lm_cfg.num_hidden_layers;
+    const auto& layer_types = _cfg.lm_cfg.layer_types;
+    const uint32_t max_num_tokens = _cfg.pipeline_cfg.max_num_tokens;
+    const uint32_t num_kv_heads = _cfg.lm_cfg.attn_cfg.num_key_value_heads;
+
+    if (static_cast<size_t>(prev_input_len) + n > max_num_tokens) {
+        throw std::runtime_error("Accepted EAGLE3 tokens exceed the KV-cache capacity");
+    }
+    for (const auto index : select_indices) {
+        if (index >= max_num_tokens) {
+    throw std::runtime_error("EAGLE3 KV selection index exceeds the cache capacity");
+}
+    }
+
+    if (n == 0) {
+        _cache->kv_cache_len = prev_input_len;
+        return;
+    }
+
+    const auto [min_src_it, max_src_it] = std::minmax_element(
+        select_indices.begin(), select_indices.end()
+    );
+    const size_t min_src_pos = *min_src_it;
+    const size_t max_src_pos = *max_src_it;
+
+    std::vector<uint8_t> tmp;
+    auto compact_buffer = [&](const std::string& name) {
+        auto& buf = get_buffer(name);
+        const auto& shape = buf.get_shape();
+        if (
+            shape.size() != 3 || shape[0] != num_kv_heads
+            || shape[1] != max_num_tokens
+        ) {
+            throw std::runtime_error(fmt::format(
+                "Unsupported EAGLE3 KV buffer shape for {}", name
+            ));
+        }
+        const size_t row_bytes = buf.get_buf_len(
+            std::vector<uint32_t>{1, 1, static_cast<uint32_t>(shape[2])}
+        );
+        const size_t head_stride_bytes = max_num_tokens * row_bytes;
+        tmp.resize(n * row_bytes);
+
+        auto* data = reinterpret_cast<uint8_t*>(buf.get_virtual_addr());
+        for (uint32_t head = 0; head < num_kv_heads; ++head) {
+            const size_t head_offset = static_cast<size_t>(head) * head_stride_bytes;
+            auto* head_base = data + head_offset;
+
+            const size_t source_offset = head_offset + min_src_pos * row_bytes;
+            const size_t source_size = (max_src_pos - min_src_pos + 1) * row_bytes;
+            buf.invalidate_cache(source_offset, source_size);
+
+            for (size_t row = 0; row < n; ++row) {
+                std::memcpy(
+                    tmp.data() + row * row_bytes,
+                    head_base + static_cast<size_t>(select_indices[row]) * row_bytes,
+                    row_bytes
+                );
+            }
+            for (size_t row = 0; row < n; ++row) {
+                std::memcpy(
+                    head_base + (static_cast<size_t>(prev_input_len) + row) * row_bytes,
+                    tmp.data() + row * row_bytes,
+                    row_bytes
+                );
+            }
+
+            const size_t destination_offset =
+                head_offset + static_cast<size_t>(prev_input_len) * row_bytes;
+            buf.flush_cache(destination_offset, n * row_bytes);
+        }
+    };
+
+    // Gather accepted K/V rows and their quantization scales into contiguous positions.
+    for (uint8_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+        if (
+            (layer_types[layer_idx] != LayerType::FullAttention
+             && layer_types[layer_idx] != LayerType::SlidingAttention)
+            || _cfg.lm_cfg.is_kv_shared_layer(layer_idx)
+        ) {
+            continue;
+        }
+
+        for (const std::string& kind : {"cache_key_l", "cache_val_l"}) {
+            compact_buffer(fmt::format("{}{}", kind, layer_idx));
+        }
+        if (_cfg.pipeline_cfg.quantize_kv_cache) {
+            for (const std::string& kind : {"cache_key_scale_l", "cache_val_scale_l"}) {
+                compact_buffer(fmt::format("{}{}", kind, layer_idx));
+            }
+        }
+    }
+
+    _cache->kv_cache_len = static_cast<uint16_t>(prev_input_len + n);
+}
 
 }  // namespace llima
 }  // namespace simaai
