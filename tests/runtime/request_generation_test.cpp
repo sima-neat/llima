@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include "language_model.hpp"
+#include "language_model_test_access.hpp"
 #include "runtime_test_utils.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"
@@ -123,6 +123,7 @@ int main(int argc, char** argv) {
         const auto cfg = json::parse(std::ifstream(root / "devkit/vlm_config.json")).get<VlmConfig>();
         connect({}, "/tmp/llima-request-generation.log", spdlog::level::warn);
         connected = true;
+        auto trace = PrefillTrace::install();
         std::signal(SIGINT, interrupt);
         auto first = std::make_unique<VisionLanguageModel>(root, std::string(""));
         active_model = first.get();
@@ -282,7 +283,12 @@ int main(int argc, char** argv) {
         require(next.finish == ChatResult::Finish::Cancelled && next.token_ids.empty() && next.text.empty(),
                 "A terminal callback cancelled too late to affect ChatResult");
 
+        require(generate(a) == gold_a, "Warming the timing prompt changed generated tokens");
+        trace->reset();
         const auto timing = first->run_model_for_ttnt(a);
+        const auto prefill_positions = trace->positions();
+        require(!prefill_positions.empty() && prefill_positions.front() == 0,
+                "Timing reused a preceding text request instead of starting cold");
         require(timing.generated_tokens > 1, "Nested prefill leaked its output limit into decode");
         require(generate(a) == gold_a, "Performance request left stale prompt state");
         if (!draft) {

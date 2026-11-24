@@ -457,7 +457,11 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     if (request.cancelled()) throw std::runtime_error("Performance request was interrupted");
     auto& language = models.target();
     language.set_image_identity({});
-    if (auto* draft = models.draft()) draft->set_image_identity({});
+    language.invalidate_prompt_reuse();
+    if (auto* draft = models.draft()) {
+        draft->set_image_identity({});
+        draft->invalidate_prompt_reuse();
+    }
     language.create_input_buffers(input_token_ids);
     GenerationPerformanceResult result;
     const auto limit = context_limit(input_token_ids.size(), options.max_new_tokens,

@@ -11,7 +11,6 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
-#include <spdlog/sinks/base_sink.h>
 
 #include "language_model_test_access.hpp"
 #include "setup.hpp"
@@ -25,39 +24,6 @@ using namespace simaai::llima;
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
-
-// Observe the actual grouped/pointwise prefill calls without adding a runtime
-// API just for tests. MTP verification uses its own target-batch entry point.
-class PrefillTrace : public spdlog::sinks::base_sink<std::mutex> {
-public:
-    void reset(LanguageModel* cancel_on_prefill = nullptr) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        positions_.clear();
-        cancel_on_prefill_ = cancel_on_prefill;
-    }
-
-    std::vector<size_t> positions() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return positions_;
-    }
-
-private:
-    void sink_it_(const spdlog::details::log_msg& message) override {
-        const std::string text(message.payload.data(), message.payload.size());
-        constexpr std::string_view prefix = "Processing token no. ";
-        if (!text.starts_with(prefix)) return;
-        positions_.push_back(std::stoul(text.substr(prefix.size())));
-        if (cancel_on_prefill_ != nullptr) {
-            cancel_on_prefill_->stop_model();
-            cancel_on_prefill_ = nullptr;
-        }
-    }
-
-    void flush_() override {}
-
-    std::vector<size_t> positions_;
-    LanguageModel* cancel_on_prefill_ = nullptr;
-};
 
 struct Metrics {
     std::optional<uint32_t> cached_tokens;
@@ -121,18 +87,7 @@ int main(int argc, char** argv) {
 
         connect({}, "/tmp/llima-gemma4-mtp-cache.log", spdlog::level::info);
         connected = true;
-        auto trace = std::make_shared<PrefillTrace>();
-        // Model loggers clone this synchronous logger so trace assertions and
-        // cancellation do not race the asynchronous file-logging worker.
-        auto old_logger = spdlog::get("llima");
-        auto logger = std::make_shared<spdlog::logger>(
-            "llima", old_logger->sinks().begin(), old_logger->sinks().end()
-        );
-        logger->sinks().push_back(trace);
-        logger->set_level(spdlog::level::info);
-        spdlog::drop("llima");
-        spdlog::register_logger(logger);
-        spdlog::set_default_logger(logger);
+        auto trace = PrefillTrace::install();
 
         std::vector<uint32_t> public_prompt, public_reference;
         {
