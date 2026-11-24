@@ -1,5 +1,7 @@
 #pragma once
 
+#include "generation_types.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -26,18 +28,16 @@ enum class ToolCallFormat {
     GptOss,
 };
 
-using PreservedToolCallTokens = std::vector<std::pair<uint32_t, std::string>>;
-
 ToolCallFormat tool_call_format_for_model(std::string_view model_type);
 std::vector<std::string> tool_call_special_tokens(ToolCallFormat format);
-PreservedToolCallTokens resolve_tool_call_special_tokens(
+PreservedTokens resolve_tool_call_special_tokens(
     ToolCallFormat format,
     const Tokenizer& tokenizer
 );
 std::string decode_tool_call_output(
     const Tokenizer& tokenizer,
     const std::vector<uint32_t>& token_ids,
-    const PreservedToolCallTokens& preserved_tokens
+    const PreservedTokens& preserved_tokens
 );
 
 // Parses a model-specific tool-call representation into OpenAI-style calls.

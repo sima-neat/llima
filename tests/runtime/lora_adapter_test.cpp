@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
             chat.clear_system_prompt();
             chat.add_query("Translate: the sky is blue.");
             auto generate = [&] {
-                auto result = target.generate(chat, {.max_new_tokens = 32, .text_callback = [](const std::string&, bool, bool) {}}).text;
+                auto result = target.generate(chat, {.max_new_tokens = 32, .callbacks = {.text = [](const std::string&, bool, bool) {}}}).text;
                 require(!result.empty(), "Expected generated text");
                 return result;
             };

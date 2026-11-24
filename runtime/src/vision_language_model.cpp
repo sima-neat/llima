@@ -30,7 +30,7 @@ struct LanguageRuntime {
           _cfg(resources->cfg), _files(resources->files),
           vlm_helper(_cfg, *_files, std::move(system), std::move(chat_template)),
           text_streamer(vlm_helper.get_tokenizer(), std::nullopt, std::nullopt) {}
-    PreservedToolCallTokens structural_tokens(const Chat& chat);
+    PreservedTokens structural_tokens(const Chat& chat);
     std::shared_ptr<ModelResources<VlmConfig>> resources;
     const VlmConfig& _cfg;
     const std::shared_ptr<FileProvider>& _files;
@@ -76,9 +76,9 @@ ModelLock::ModelLock(std::shared_ptr<LanguageRuntime> target)
 }
 
 TextStreamer::RequestOptions stream_options(
-    const GenerationOptions& options, PreservedToolCallTokens markers = {}, bool streaming = false
+    const GenerationOptions& options, PreservedTokens markers = {}, bool streaming = false
 ) {
-    return {{options.info_callback, options.text_callback}, std::move(markers),
+    return {options.callbacks, std::move(markers),
             options.performance_summary, streaming};
 }
 
@@ -257,8 +257,8 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::benchmark_chat(
     return request.cancelled() ? std::nullopt : std::move(ids);
 }
 
-PreservedToolCallTokens LanguageRuntime::structural_tokens(const Chat& chat) {
-    PreservedToolCallTokens preserved_tokens;
+PreservedTokens LanguageRuntime::structural_tokens(const Chat& chat) {
+    PreservedTokens preserved_tokens;
     auto* tokenizer = vlm_helper.get_tokenizer();
     if (chat.has_tools()) {
         preserved_tokens = resolve_tool_call_special_tokens(tool_call_format, *tokenizer);

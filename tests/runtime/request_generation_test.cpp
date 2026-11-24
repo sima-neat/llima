@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
 
         std::atomic<bool> busy_rejected = false;
         GenerationOptions cancel_options{.max_new_tokens = 512};
-        cancel_options.info_callback = [&](const std::string& key, double) {
+        cancel_options.callbacks.info = [&](const std::string& key, double) {
             if (key != "ttft") return;
             const auto busy = [](auto&& action) {
                 try { action(); } catch (const std::logic_error&) { return true; }
@@ -187,7 +187,7 @@ int main(int argc, char** argv) {
             GenerationOptions block_options{.max_new_tokens = 128, .stop_token_ids = std::set<uint32_t>{}};
             bool stopped_after_verification = false;
             bool signalled_full = false;
-            block_options.info_callback = [&](const std::string& key, double) {
+            block_options.callbacks.info = [&](const std::string& key, double) {
                 if (key == "tps" && !stopped_after_verification) {
                     stopped_after_verification = true;
                     first->stop_model();
@@ -204,11 +204,11 @@ int main(int argc, char** argv) {
         std::atomic<unsigned> request_events = 0;
         std::atomic<unsigned> request_completions = 0;
         GenerationOptions options{.max_new_tokens = 16};
-        options.text_callback = [&](const std::string&, bool end, bool) {
+        options.callbacks.text = [&](const std::string&, bool end, bool) {
             ++request_chunks;
             if (end) ++request_completions;
         };
-        options.info_callback = [&](const std::string&, double) { ++request_events; };
+        options.callbacks.info = [&](const std::string&, double) { ++request_events; };
         auto option_chat = first->create_chat();
         option_chat.add_query("Name three planets.");
         require(first->generate(option_chat, options).finish != ChatResult::Finish::Cancelled, "Request options failed");
@@ -218,19 +218,19 @@ int main(int argc, char** argv) {
         const auto events = request_events.load();
         std::atomic<unsigned> next_chunks = 0;
         first->generate(option_chat, {.max_new_tokens = 16,
-            .text_callback = [&](const std::string&, bool, bool) { ++next_chunks; }});
+            .callbacks = {.text = [&](const std::string&, bool, bool) { ++next_chunks; }}});
         require(next_chunks > 0 && request_chunks == chunks && request_events == events,
                 "Request callbacks leaked into a later request");
         std::cout << json{{"case", "request_callback_isolation"}, {"runtime_ok", true}}.dump() << '\n';
 
-        options.info_callback = [](const std::string& key, double) {
+        options.callbacks.info = [](const std::string& key, double) {
             if (key == "ttft") throw std::runtime_error("Intentional request callback failure");
         };
         rejected([&] { first->generate(option_chat, options); }, "Callback exception was swallowed");
         require(generate(a) == gold_a, "Callback exception left the next request corrupted");
 
         unsigned completions = 0;
-        options.info_callback = [&](const std::string& key, double) {
+        options.callbacks.info = [&](const std::string& key, double) {
             if (key == "END" || key == "FULL") {
                 ++completions;
                 first->stop_model();
@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
         options.stop_token_ids = std::set<uint32_t>{};
         options.performance_summary = false;
         options.preserve_structural_tokens = false;
-        options.info_callback.reset();
+        options.callbacks.info.reset();
         const auto reference = first->generate(option_chat, options);
         require(reference.finish == ChatResult::Finish::Length && !reference.token_ids.empty(),
                 "Expected the token budget to end the request");
@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
 
         std::stop_source current;
         options.stop = current.get_token();
-        options.info_callback = [&](const std::string& key, double) {
+        options.callbacks.info = [&](const std::string& key, double) {
             if (key == "ttft") retired.request_stop();
         };
         auto next = first->generate(option_chat, options);
@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
                 "Stopping a completed request interrupted the next request");
 
         options.stop = retired.get_token();
-        options.info_callback = [](const std::string&, double) { throw std::runtime_error("Pre-cancel callback"); };
+        options.callbacks.info = [](const std::string&, double) { throw std::runtime_error("Pre-cancel callback"); };
         const auto skipped = first->generate(option_chat, options);
         require(skipped.finish == ChatResult::Finish::Cancelled && skipped.token_ids.empty()
                     && skipped.text.empty() && skipped.performance.generated_tokens == 0,
@@ -275,7 +275,7 @@ int main(int argc, char** argv) {
         rejected([&] { first->run_model_for_loglikelihood(a, 0, a, options); },
                  "Pre-cancelled log-likelihood request succeeded");
         options.stop = current.get_token();
-        options.info_callback = [&](const std::string& key, double) {
+        options.callbacks.info = [&](const std::string& key, double) {
             if (key == "END" || key == "FULL") current.request_stop();
         };
         next = first->generate(option_chat, options);
@@ -337,7 +337,7 @@ int main(int argc, char** argv) {
         if (draft) {
             active_model = survivor.get();
             GenerationOptions teardown_options{.max_new_tokens = 16};
-            teardown_options.info_callback = [&](const std::string& key, double) {
+            teardown_options.callbacks.info = [&](const std::string& key, double) {
                 if (key == "END" || key == "FULL") first.reset();
             };
             auto teardown_chat = survivor->create_chat();
@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
             require(!first, "The callback did not release the other target");
         } else {
             GenerationOptions callback_options{.max_new_tokens = 16};
-            callback_options.info_callback = [&](const std::string& key, double) {
+            callback_options.callbacks.info = [&](const std::string& key, double) {
                 if (key == "END" || key == "FULL")
                     require(survivor->run_model(a, {.max_new_tokens = 64}) == gold_a,
                             "Cross-model callback generation differs from the reference");

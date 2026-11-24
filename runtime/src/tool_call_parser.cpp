@@ -737,11 +737,11 @@ std::vector<std::string> tool_call_special_tokens(ToolCallFormat format) {
     }
 }
 
-PreservedToolCallTokens resolve_tool_call_special_tokens(
+PreservedTokens resolve_tool_call_special_tokens(
     ToolCallFormat format,
     const Tokenizer& tokenizer
 ) {
-    PreservedToolCallTokens resolved;
+    PreservedTokens resolved;
     for (const auto& token : tool_call_special_tokens(format)) {
         try {
             resolved.emplace_back(tokenizer.token_to_id(token), token);
@@ -757,7 +757,7 @@ PreservedToolCallTokens resolve_tool_call_special_tokens(
 std::string decode_tool_call_output(
     const Tokenizer& tokenizer,
     const std::vector<uint32_t>& token_ids,
-    const PreservedToolCallTokens& preserved_tokens
+    const PreservedTokens& preserved_tokens
 ) {
     std::string result;
     std::vector<uint32_t> normal_tokens;

@@ -81,8 +81,7 @@ template<class Config> struct ModelResources;
 struct TranscriptionOptions {
     std::string language = "en";
     std::string task = "transcribe";
-    std::optional<TextStreamer::InfoCallback> info_callback;
-    std::optional<TextStreamer::TextCallback> text_callback;
+    StreamCallbacks callbacks;
 };
 
 class WhisperModel {
@@ -114,8 +113,8 @@ class WhisperModel {
                                       const TranscriptionOptions& options);
         TranscriptionResult run_model_from_pcm(std::span<const float> pcm, uint32_t sample_rate,
                                                const TranscriptionOptions& options);
-        void set_info_callback(TextStreamer::InfoCallback callback);
-        void set_text_callback(TextStreamer::TextCallback callback);
+        void set_info_callback(InfoCallback callback);
+        void set_text_callback(TextCallback callback);
         void set_performance_summary_enabled(bool enabled);
         void wait_for_streamer_completion();
         void stop_model();

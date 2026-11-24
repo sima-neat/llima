@@ -50,7 +50,7 @@ void check_streamer() {
     std::string text;
     bool ended = false;
     TextStreamer::RequestOptions options;
-    options.preserved_tokens = TextStreamer::PreservedTokens{{42, "<tool>"}};
+    options.preserved_tokens = PreservedTokens{{42, "<tool>"}};
     options.callbacks.text = [&](const std::string& chunk, bool end, bool) {
         text += chunk;
         ended = end;

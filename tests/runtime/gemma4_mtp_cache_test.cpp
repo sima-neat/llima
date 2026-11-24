@@ -323,7 +323,7 @@ int main(int argc, char** argv) {
 
             std::atomic<bool> stream_ended = false;
             GenerationOptions stream_options{.max_new_tokens = 1};
-            stream_options.text_callback = [&](const std::string&, bool end, bool) {
+            stream_options.callbacks.text = [&](const std::string&, bool end, bool) {
                 if (end) stream_ended.store(true);
             };
             auto chat = target.create_chat();

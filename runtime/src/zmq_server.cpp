@@ -138,7 +138,7 @@ std::string ZMQServer::_generate_multimodal(
     GenerationState state(reasoning_format_for_model(model.config().model_type), metadata.enable_thinking);
     GenerationOptions options;
     options.max_new_tokens = metadata.max_new_tokens;
-    options.info_callback = [&state](const std::string& event, double value) {
+    options.callbacks.info = [&state](const std::string& event, double value) {
         if (event == "ttft" || event == "tps") {
             ++state.tokens;
             if (event == "ttft")
@@ -148,7 +148,7 @@ std::string ZMQServer::_generate_multimodal(
         else if (event == "FULL")
             state.finish_reason = "length";
     };
-    options.text_callback = [&state, for_performance](const std::string& text, bool end, bool from_draft) {
+    options.callbacks.text = [&state, for_performance](const std::string& text, bool end, bool from_draft) {
         if (for_performance)
             return;
         state.raw += text;

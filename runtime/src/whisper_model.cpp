@@ -312,13 +312,13 @@ MLABuffer& WhisperModel::get_buffer(const std::string& name) {
     return _resources->buffers.at(name);
 }
 
-void WhisperModel::set_info_callback(TextStreamer::InfoCallback callback) {
+void WhisperModel::set_info_callback(InfoCallback callback) {
     std::unique_lock lock(_workspace->mutex, std::try_to_lock);
     if (!lock.owns_lock()) throw std::logic_error("ASR defaults cannot change during a request");
     _workspace->text_streamer->set_info_callback(callback);
 }
 
-void WhisperModel::set_text_callback(TextStreamer::TextCallback callback) {
+void WhisperModel::set_text_callback(TextCallback callback) {
     std::unique_lock lock(_workspace->mutex, std::try_to_lock);
     if (!lock.owns_lock()) throw std::logic_error("ASR defaults cannot change during a request");
     _workspace->text_streamer->set_text_callback(callback);
@@ -378,7 +378,7 @@ public:
           _exceptions(std::uncaught_exceptions()) {
         _workspace.is_running.store(true, std::memory_order_relaxed);
         try {
-            _workspace.text_streamer->begin({options.info_callback, options.text_callback});
+            _workspace.text_streamer->begin(options.callbacks);
         } catch (...) {
             _workspace.is_running.store(false, std::memory_order_relaxed);
             throw;

@@ -77,11 +77,11 @@ int main() {
             first->set_text_callback([&](const std::string&, bool, bool) { ++default_callbacks; });
             simaai::llima::TranscriptionOptions options;
             options.language = "auto";
-            options.text_callback = [&](const std::string& chunk, bool done, bool) {
+            options.callbacks.text = [&](const std::string& chunk, bool done, bool) {
                 streamed += chunk;
                 stream_ended = done;
             };
-            options.info_callback = [&](const std::string& key, double) {
+            options.callbacks.info = [&](const std::string& key, double) {
                 // Keep later tokens queued until the first model releases the MLA transaction.
                 if (key == "ttft") nested_transcript = survivor->run_model(audio, "auto").text;
             };
@@ -91,7 +91,7 @@ int main() {
                 throw std::runtime_error("ASR streaming and final transcripts differ");
             first->run_model(audio, "auto");
             if (!default_callbacks) throw std::runtime_error("ASR request callback leaked into defaults");
-            options.info_callback = [](const std::string& key, double) {
+            options.callbacks.info = [](const std::string& key, double) {
                 if (key == "ttft") throw std::runtime_error("Intentional ASR callback failure");
             };
             bool callback_failed = false;

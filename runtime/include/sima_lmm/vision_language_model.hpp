@@ -44,8 +44,7 @@ struct GenerationOptions {
     std::optional<uint16_t> max_new_tokens; // Output budget, excluding the input tokens.
     std::optional<std::set<uint32_t>> stop_token_ids;
     std::stop_token stop; // The caller owns cancellation for this request.
-    std::optional<TextStreamer::InfoCallback> info_callback;
-    std::optional<TextStreamer::TextCallback> text_callback;
+    StreamCallbacks callbacks;
     // Raw images fill the first chat placeholders, followed by pre-encoded images.
     std::span<const cv::Mat> images;
     std::span<const EncodedImage> encoded_images;

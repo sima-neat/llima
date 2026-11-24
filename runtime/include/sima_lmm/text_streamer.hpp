@@ -17,6 +17,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "generation_types.hpp"
 #include "tokenizer.hpp"
 
 namespace simaai {
@@ -46,24 +47,8 @@ struct DecodeCallbackData {
 
 class TextStreamer {
     public:
-        // Callback for timing, cache, and status information.
-        using InfoCallback = std::function<void(const std::string&, double)>;
-        
-        // Callback for finalized text chunks.
-        // Parameters: text, stream_end, from_draft (true when the chunk came
-        // from draft-accepted tokens during speculative decoding). Lets the
-        // sink decide how to render — ANSI for terminal, HTML/metadata for
-        // web, ignored for plain output.
-        using TextCallback = std::function<void(const std::string&, bool, bool)>;
-
-        struct CallbackOverrides {
-            std::optional<InfoCallback> info;
-            std::optional<TextCallback> text;
-        };
-
-        using PreservedTokens = std::vector<std::pair<uint32_t, std::string>>;
         struct RequestOptions {
-            CallbackOverrides callbacks;
+            StreamCallbacks callbacks;
             std::optional<PreservedTokens> preserved_tokens;
             std::optional<bool> performance_summary;
             bool streaming = true;
@@ -77,7 +62,7 @@ class TextStreamer {
         ~TextStreamer();
 
         void begin();
-        void begin(CallbackOverrides callbacks);
+        void begin(StreamCallbacks callbacks);
         void begin_request(RequestOptions options);
         void finish();
         void push(DecodeCallbackData data);
@@ -109,7 +94,6 @@ class TextStreamer {
         void set_preserved_token_ids(
             std::vector<std::pair<uint32_t, std::string>> tokens
         );
-        void set_tool_call_enabled(bool enabled);
         void set_performance_summary_enabled(bool enabled) {
             std::lock_guard<std::mutex> lock(_mutex);
             _defaults.performance_summary = enabled;
@@ -128,7 +112,6 @@ class TextStreamer {
             InfoCallback info;
             TextCallback text;
             std::vector<std::pair<uint32_t, std::string>> preserved_tokens;
-            bool tool_call = false;
             bool performance_summary = true;
         };
         void _begin_locked(RequestOptions options);

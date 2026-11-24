@@ -193,7 +193,7 @@ void CLI::run() {
             std::cout << "Transcribed query: " << std::flush;
             TranscriptionOptions options;
             options.language = language;
-            options.text_callback = [](const std::string& text, bool stream_end, bool) {
+            options.callbacks.text = [](const std::string& text, bool stream_end, bool) {
                 std::cout << text << std::flush;
                 if (stream_end) std::cout << std::endl;
             };
@@ -221,7 +221,7 @@ void CLI::run() {
         };
 
         GenerationOptions options;
-        options.text_callback = [&](const std::string& text, bool stream_end, bool from_draft) {
+        options.callbacks.text = [&](const std::string& text, bool stream_end, bool from_draft) {
             for (auto& event : reasoning_parser.add(text, stream_end, from_draft)) {
                 if (event.reasoning) {
                     if (!saw_reasoning) {

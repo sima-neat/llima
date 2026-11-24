@@ -597,8 +597,8 @@ void WEB::_execute_streaming_audio_transcription(
 
             try {
                 TranscriptionOptions options{language, task};
-                options.info_callback = info_callback;
-                options.text_callback = text_callback;
+                options.callbacks.info = info_callback;
+                options.callbacks.text = text_callback;
                 auto result = _whisper_model_ptr->run_model(_AUDIO_FILE_NAME, options);
                 std::string chunk = _format_audio_sse_chunk(
                     "", task, true, finish_reason.value_or("stop"), ttft_value, tps_value,
@@ -1005,8 +1005,8 @@ void WEB::_execute_streaming_chat(
             };
 
             GenerationOptions options;
-            options.info_callback = info_callback;
-            options.text_callback = text_callback;
+            options.callbacks.info = info_callback;
+            options.callbacks.text = text_callback;
             options.stop = stop;
             try {
                 send_completion(_run_chat(chat, options).finish);
@@ -1085,8 +1085,8 @@ void WEB::_execute_normal_chat(
     };
 
     GenerationOptions options;
-    options.info_callback = info_callback;
-    options.text_callback = text_callback;
+    options.callbacks.info = info_callback;
+    options.callbacks.text = text_callback;
     options.stop = stop;
     if (_run_chat(chat, options).finish == ChatResult::Finish::Length)
         finish_reason = "length";

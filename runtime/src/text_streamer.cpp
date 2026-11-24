@@ -60,12 +60,11 @@ TextStreamer::~TextStreamer() {
 
 void TextStreamer::_begin_locked(RequestOptions options) {
     auto& cb = options.callbacks;
-    const bool preserve = options.preserved_tokens ? !options.preserved_tokens->empty() : _defaults.tool_call;
     _request = {
         cb.info ? std::move(*cb.info) : _defaults.info,
         cb.text ? std::move(*cb.text) : _defaults.text,
         options.preserved_tokens ? std::move(*options.preserved_tokens) : _defaults.preserved_tokens,
-        preserve, options.performance_summary.value_or(_defaults.performance_summary)
+        options.performance_summary.value_or(_defaults.performance_summary)
     };
     _muted = !options.streaming || !_is_enabled;
     _completion_queued = _muted;
@@ -74,7 +73,7 @@ void TextStreamer::_begin_locked(RequestOptions options) {
 
 void TextStreamer::begin() { begin_request({}); }
 
-void TextStreamer::begin(CallbackOverrides callbacks) {
+void TextStreamer::begin(StreamCallbacks callbacks) {
     begin_request({std::move(callbacks)});
 }
 
@@ -207,7 +206,7 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
 void TextStreamer::put(uint32_t token_id, bool from_draft) {
     const auto& settings = _settings();
     // Preserve structural markers only while the current request needs them.
-    if (settings.tool_call && !settings.preserved_tokens.empty()) {
+    if (!settings.preserved_tokens.empty()) {
         const auto preserved = std::find_if(
             settings.preserved_tokens.begin(), settings.preserved_tokens.end(),
             [token_id](const auto& token) { return token.first == token_id; }
@@ -341,12 +340,6 @@ void TextStreamer::set_preserved_token_ids(
     std::lock_guard<std::mutex> lock(_mutex);
     _defaults.preserved_tokens = std::move(tokens);
 }
-
-void TextStreamer::set_tool_call_enabled(bool enabled) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _defaults.tool_call = enabled;
-}
-
 
 void TextStreamer::_on_finalized_text(const std::string& text, bool stream_end) {
     _logger->info("Finalized text: '{}'", text);
