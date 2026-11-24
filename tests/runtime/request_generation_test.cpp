@@ -51,26 +51,22 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
     const auto limit_for = [&](const auto& prompt) {
         return static_cast<uint16_t>(prompt.size() + cfg.lm_cfg.get_single_num_tokens() + 12);
     };
-    auto generate = [&](const std::vector<uint32_t>& prompt, bool direct_mtp = false) {
-        target.create_input_buffers(prompt);
+    auto generate = [&](const std::vector<uint32_t>& prompt) {
         const auto limit = limit_for(prompt);
-        auto result = direct_mtp
-            ? target.run_model_gemma4_mtp(*draft, prompt, limit)
-            : target.run_model_speculative_decoding(*draft, prompt, limit);
+        auto result = target.run_model_speculative_decoding(*draft, prompt, {.max_num_tokens = limit});
         require(result && !result->empty(), "Direct speculative generation did not return tokens");
         return *result;
     };
 
-    const bool mtp = cfg.lm_cfg.is_gemma4_mtp_target();
-    const auto gold_a = generate(a, mtp);
+    const auto gold_a = generate(a);
     const auto gold_b = generate(b);
-    require(generate(a) == gold_a && generate(b, mtp) == gold_b,
+    require(generate(a) == gold_a && generate(b) == gold_b,
             "Direct speculative calls disagreed with their fresh references");
     const std::vector<uint32_t> invalid{cfg.lm_cfg.token_cfg.vocab_size};
-    rejected([&] { generate(invalid, mtp); }, "Direct speculative request accepted an invalid token");
+    rejected([&] { generate(invalid); }, "Direct speculative request accepted an invalid token");
     require(draft->get_kv_cache_len() == 0 && target.get_kv_cache_len() == 0,
             "A failed direct request retained target or draft cache state");
-    require(generate(b, mtp) == gold_b, "Direct speculative recovery changed tokens");
+    require(generate(b) == gold_b, "Direct speculative recovery changed tokens");
     std::atomic<bool> cancelled_on_first_token = false;
     target_stream.set_info_callback([&](const std::string& key, double) {
         if (key == "ttft") {
@@ -79,19 +75,18 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
         }
     });
     target_stream.enable();
-    target.create_input_buffers(a);
-    const auto interrupted = target.run_model_speculative_decoding(*draft, a, limit_for(a));
+    const auto interrupted = target.run_model_speculative_decoding(*draft, a, {.max_num_tokens = limit_for(a)});
     target_stream.disable();
     target_stream.set_info_callback([](const std::string&, double) {});
     require(cancelled_on_first_token, "The direct speculative request did not emit a first-token event");
     require(!interrupted, "Direct speculative generation returned tokens after cancellation");
     require(draft->get_kv_cache_len() == 0, "Cancellation retained the draft cache");
     require(target.get_kv_cache_len() == 0, "Cancellation retained the target cache");
-    require(generate(b, mtp) == gold_b, "Cancellation changed the next direct request");
+    require(generate(b) == gold_b, "Cancellation changed the next direct request");
     require(target.get_kv_cache_len() > 0, "Recovery did not populate the target cache");
     const auto previous_length = target.get_kv_cache_len();
     const auto previous_draft_length = draft->get_kv_cache_len();
-    rejected([&] { target.run_model_speculative_decoding(target, a, limit_for(a)); },
+    rejected([&] { target.run_model_speculative_decoding(target, a, {.max_num_tokens = limit_for(a)}); },
              "Direct speculative generation accepted the target as its own draft");
     require(target.get_kv_cache_len() == previous_length && draft->get_kv_cache_len() == previous_draft_length,
             "Rejecting an incompatible draft changed a model cache");
@@ -100,11 +95,12 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
     require(target.get_kv_cache_len() == 0,
             "Replacing a draft runner over the same package retained the old pair's cache");
     draft = std::move(replacement);
-    require(generate(a, mtp) == gold_a, "Replacing the draft runner changed greedy output");
+    require(generate(a) == gold_a, "Replacing the draft runner changed greedy output");
     std::cout << "Direct speculative pairing passed\n";
 }
 
 static_assert(std::is_aggregate_v<GenerationOptions>);
+static_assert(std::is_aggregate_v<TokenRunOptions>);
 
 }
 
@@ -156,6 +152,22 @@ int main(int argc, char** argv) {
         const auto gold_b = generate(b);
         require(!gold_a.empty() && !gold_b.empty(), "Fresh references are empty");
         require(generate(a) == gold_a && generate(b) == gold_b, "Branched prompt reuse changed output");
+
+        if (!cfg.lm_cfg.is_spec_decode()) {
+            TextStreamer stream(helper.get_tokenizer());
+            stream.disable();
+            LanguageModel direct(root, helper.get_stop_token_ids(), helper.get_image_token_id(),
+                                 helper.get_pad_token_id(), stream);
+            const auto output = direct.run_model(a,
+                {.max_num_tokens = static_cast<uint16_t>(a.size() + 64)});
+            require(output && *output == gold_a, "Automatic token staging changed ordinary output");
+            const auto cached = direct.get_kv_cache_len();
+            std::stop_source stopped;
+            stopped.request_stop();
+            require(!direct.run_model(b, {.stop = stopped.get_token()}) &&
+                        direct.get_kv_cache_len() == cached,
+                    "A pre-cancelled token request changed the cache");
+        }
         const auto workspace = first->workspace_memory_bytes();
 
         std::atomic<bool> busy_rejected = false;

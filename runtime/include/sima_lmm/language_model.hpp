@@ -45,16 +45,18 @@ class RequestScope;
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
+// Options for raw-token execution; the token limit includes the input prompt.
+struct TokenRunOptions {
+    std::optional<uint16_t> max_num_tokens;
+    std::optional<std::set<uint32_t>> stop_token_ids;
+    std::stop_token stop;
+    std::optional<ChronoTimer> timer_ttft;
+    uint16_t stable_prefix_token_count = 0;
+    GenerationPerformanceResult* performance = nullptr;
+};
+
 class LanguageModel {
     public:
-        // Existing disk-loading overload; preserves source compatibility.
-        LanguageModel(
-            std::filesystem::path model_path,
-            std::set<uint32_t> stop_token_ids,
-            std::optional<uint32_t> image_token_id,
-            std::optional<uint32_t> pad_token_id,
-            TextStreamer& text_streamer
-        );
         // Reads the model files through file_provider (nullptr = from disk).
         LanguageModel(
             std::filesystem::path model_path,
@@ -62,70 +64,26 @@ class LanguageModel {
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer,
-            std::shared_ptr<FileProvider> file_provider
+            std::shared_ptr<FileProvider> file_provider = nullptr
         );
-        virtual ~LanguageModel();
+        ~LanguageModel();
 
         std::vector<std::map<uint8_t, MLABufferSlice>> create_input_buffers(
             std::span<const uint32_t> input_token_ids
         );
+        // Both entry points stage their raw input tokens. Callers serialize access.
         std::optional<std::vector<uint32_t>> run_model(
-            std::span<const uint32_t> input_token_ids,
-            std::optional<ChronoTimer> timer_ttft = std::nullopt,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<std::set<uint32_t>> override_stop_token_ids = std::nullopt,
-            uint16_t stable_prefix_token_count = 0
+            std::span<const uint32_t> input_token_ids, const TokenRunOptions& options = {}
         );
-        std::optional<std::vector<uint32_t>> run_model(
-            std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
-            std::optional<uint16_t> override_max_num_tokens,
-            std::optional<std::set<uint32_t>> override_stop_token_ids,
-            uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
-        );
-        std::optional<std::vector<uint32_t>> run_model(
-            std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
-            std::optional<uint16_t> override_max_num_tokens,
-            std::optional<std::set<uint32_t>> override_stop_token_ids,
-            uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance,
-            std::stop_token stop
+        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
+            LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
+            const TokenRunOptions& options = {}
         );
         LogLikelihoodResult run_model_for_loglikelihood(
             std::span<const uint32_t> input_token_ids,
             size_t continuation_start,
             std::span<const uint32_t> continuation_token_ids,
             bool use_group_prefill = true
-        );
-        // Speculative-decoding entry point: target invokes this, passing the
-        // draft as a reference. Returns the newly generated token IDs, or
-        // std::nullopt when generation aborted (e.g. cache full pre-init).
-        // Caller is responsible for serializing concurrent invocations.
-        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
-            LanguageModel& draft_lm,
-            std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<ChronoTimer> timer_ttft = std::nullopt,
-            GenerationPerformanceResult* performance_result = nullptr
-        );
-        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
-            LanguageModel& draft_lm,
-            std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens,
-            std::optional<ChronoTimer> timer_ttft,
-            GenerationPerformanceResult* performance_result,
-            uint16_t stable_prefix_token_count
-        );
-        std::optional<std::vector<uint32_t>> run_model_speculative_decoding(
-            LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
-            GenerationPerformanceResult* performance, uint16_t stable_prefix_token_count,
-            std::stop_token stop
-        );
-        std::optional<std::vector<uint32_t>> run_model_gemma4_mtp(
-            LanguageModel& draft_lm,
-            std::span<const uint32_t> input_token_ids,
-            std::optional<uint16_t> override_max_num_tokens = std::nullopt,
-            std::optional<ChronoTimer> timer_ttft = std::nullopt,
-            GenerationPerformanceResult* performance_result = nullptr
         );
         void attach_draft(LanguageModel& draft);
         size_t shared_resource_bytes() const;
@@ -135,8 +93,6 @@ class LanguageModel {
 
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
-
-
 
         // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
         uint16_t get_kv_cache_len() const;

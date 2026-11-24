@@ -470,6 +470,7 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     request.finish();
     if (request.cancelled() || !output)
         throw std::runtime_error("Performance request was interrupted or has insufficient token capacity");
+    // Profiling requests leave no reusable sequence state behind.
     language.invalidate_prompt_reuse();
     if (auto* draft = models.draft()) draft->invalidate_prompt_reuse();
     return result;

@@ -92,17 +92,6 @@ LanguageModel::LanguageModel(
     std::set<uint32_t> stop_token_ids,
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
-    TextStreamer& text_streamer
-) : LanguageModel(
-        std::move(model_path), std::move(stop_token_ids), image_token_id, pad_token_id,
-        text_streamer, nullptr
-    ) {}
-
-LanguageModel::LanguageModel(
-    std::filesystem::path model_path,
-    std::set<uint32_t> stop_token_ids,
-    std::optional<uint32_t> image_token_id,
-    std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer,
     std::shared_ptr<FileProvider> file_provider
 ) : _resources(LanguageAssets::acquire(model_path, std::move(file_provider))),
@@ -298,38 +287,16 @@ std::vector<std::map<uint8_t, MLABufferSlice>> LanguageModel::create_input_buffe
 
 
 std::optional<std::vector<uint32_t>> LanguageModel::run_model(
-    std::span<const uint32_t> input_token_ids,
-    std::optional<ChronoTimer> timer_ttft,
-    std::optional<uint16_t> override_max_num_tokens,
-    std::optional<std::set<uint32_t>> override_stop_token_ids,
-    uint16_t stable_prefix_token_count
+    std::span<const uint32_t> input_token_ids, const TokenRunOptions& options
 ) {
-    return run_model(input_token_ids, timer_ttft, override_max_num_tokens,
-                     std::move(override_stop_token_ids), stable_prefix_token_count, nullptr);
-}
-
-std::optional<std::vector<uint32_t>> LanguageModel::run_model(
-    std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
-    std::optional<uint16_t> override_max_num_tokens,
-    std::optional<std::set<uint32_t>> override_stop_token_ids,
-    uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
-) {
-    return run_model(input_token_ids, timer_ttft, override_max_num_tokens, std::move(override_stop_token_ids),
-                     stable_prefix_token_count, performance, {});
-}
-
-std::optional<std::vector<uint32_t>> LanguageModel::run_model(
-    std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
-    std::optional<uint16_t> override_max_num_tokens, std::optional<std::set<uint32_t>> override_stop_token_ids,
-    uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance, std::stop_token stop
-) {
-    if (stop.stop_requested()) {
-        if (performance) *performance = {};
+    if (options.stop.stop_requested()) {
+        if (options.performance) *options.performance = {};
         return std::nullopt;
     }
-    RequestScope request(*this, nullptr, {}, stop, std::move(override_stop_token_ids));
-    auto output = _generate_tokens(request, input_token_ids, override_max_num_tokens,
-                                   timer_ttft, performance, stable_prefix_token_count);
+    RequestScope request(*this, nullptr, {}, options.stop, options.stop_token_ids);
+    create_input_buffers(input_token_ids);
+    auto output = _generate_tokens(request, input_token_ids, options.max_num_tokens,
+        options.timer_ttft, options.performance, options.stable_prefix_token_count);
     request.finish();
     return request.cancelled() ? std::nullopt : output;
 }
@@ -338,7 +305,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_generate_tokens(
     RequestScope& request, std::span<const uint32_t> ids, std::optional<uint16_t> limit,
     std::optional<ChronoTimer> timer, GenerationPerformanceResult* performance, uint16_t stable_prefix
 ) {
-    _run->request();
+    _run->require_active_request();
     if (request.cancelled()) {
         if (performance) *performance = {};
         return std::nullopt;
@@ -360,7 +327,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_ordinary(
     std::span<const uint32_t> input_token_ids, std::optional<ChronoTimer> timer_ttft,
     uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance
 ) {
-    _run->request();
+    _run->require_active_request();
     if (performance) *performance = {};
     auto* durations = performance ? &performance->token_durations : nullptr;
 
@@ -404,31 +371,16 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_ordinary(
 
 std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
     LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
-    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result) {
-    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
-                                          timer_ttft, performance_result, 0);
-}
-
-std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
-    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
-    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count) {
-    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
-        timer_ttft, performance_result, stable_prefix_token_count, {});
-}
-
-std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decoding(
-    LanguageModel& draft_lm, std::span<const uint32_t> input_token_ids,
-    std::optional<uint16_t> override_max_num_tokens, std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result, uint16_t stable_prefix_token_count, std::stop_token stop) {
-    if (stop.stop_requested()) {
-        if (performance_result) *performance_result = {};
+    const TokenRunOptions& options
+) {
+    if (options.stop.stop_requested()) {
+        if (options.performance) *options.performance = {};
         return std::nullopt;
     }
-    RequestScope request(*this, &draft_lm, {}, stop);
-    auto output = _generate_tokens(request, input_token_ids, override_max_num_tokens, timer_ttft,
-                                   performance_result, stable_prefix_token_count);
+    RequestScope request(*this, &draft_lm, {}, options.stop, options.stop_token_ids);
+    create_input_buffers(input_token_ids);
+    auto output = _generate_tokens(request, input_token_ids, options.max_num_tokens,
+        options.timer_ttft, options.performance, options.stable_prefix_token_count);
     request.finish();
     return request.cancelled() ? std::nullopt : output;
 }
@@ -504,7 +456,7 @@ uint32_t LanguageModel::_prefill(
     std::span<const uint32_t> input_token_ids, uint16_t num_cached_tokens,
     std::optional<ChronoTimer> timer_ttft, std::vector<double>* durations
 ) {
-    _run->request();
+    _run->require_active_request();
     if (_uses_per_layer_inputs())
         _workspace->prompt_per_layer_token_ids = _get_per_layer_token_ids(input_token_ids);
     if (!timer_ttft.has_value())
@@ -598,7 +550,7 @@ uint32_t LanguageModel::_prefill(
 
 void LanguageModel::_decode(uint16_t num_input_tokens, uint32_t token_id,
                             std::vector<double>* durations) {
-    _run->request();
+    _run->require_active_request();
     ChronoTimer timer_tps(true);
     uint16_t token_idx;
     for (token_idx = num_input_tokens; token_idx < _run->limits().max_num_tokens; ++token_idx ) {
@@ -650,7 +602,7 @@ LogLikelihoodResult LanguageModel::_score(
     std::span<const uint32_t> continuation_token_ids,
     bool use_group_prefill
 ) {
-    _run->request();
+    _run->require_active_request();
     if (!_cfg.pipeline_cfg.return_logits) {
         throw std::runtime_error(
             "model not compiled with --return_logits; "
@@ -775,6 +727,7 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
     auto execution = LayerExecutor::lock_execution();
     constexpr uint16_t num_tokens = 1;
     const uint16_t next_token_idx = token_idx + 1;
+    // PrefillTrace tests parse this message prefix.
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
     // Loglikelihood only needs the single-token decode path to refresh n1_buffer4.
@@ -906,7 +859,7 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
-    _run->request();
+    _run->require_active_request();
     auto execution = LayerExecutor::lock_execution();
     if (token_idx == 0 && logits_ptr)
         _prepare_state_checkpoints_for_prefill(0);
@@ -918,6 +871,7 @@ uint32_t LanguageModel::run_model_once(
         next_token_idx = token_idx + 1;
     }
     auto use_input_tokens = token_idx < num_input_tokens;
+    // PrefillTrace tests parse this message prefix.
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
 
     _upload_group_future_token_masks(num_tokens, token_idx);

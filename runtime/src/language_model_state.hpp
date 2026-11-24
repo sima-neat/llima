@@ -230,12 +230,12 @@ struct RequestControl {
     RequestControl(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
         : defaults{std::move(stops), limit}, text_streamer(streamer) {}
 
-    RequestState& request() const {
+    RequestState& require_active_request() const {
         if (!active) throw std::logic_error("Model execution requires an active request");
         return *active;
     }
-    TokenLimits& limits() { return request().limits; }
-    bool cancelled() const { return request().cancelled(); }
+    TokenLimits& limits() { return require_active_request().limits; }
+    bool cancelled() const { return require_active_request().cancelled(); }
 
     TokenLimits defaults;
     TextStreamer& text_streamer;

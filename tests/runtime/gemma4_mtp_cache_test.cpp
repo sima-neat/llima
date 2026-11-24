@@ -105,15 +105,13 @@ int main(int argc, char** argv) {
 
             auto run = [&](const std::vector<uint32_t>& prompt,
                            uint16_t generated = 16, bool cancel = false) {
-                target.create_input_buffers(prompt);
                 {
                     std::lock_guard<std::mutex> lock(metrics_mutex);
                     metrics = {};
                 }
                 trace->reset(cancel ? &target : nullptr);
-                auto tokens = target.run_model_gemma4_mtp(
-                    draft, prompt, static_cast<uint16_t>(prompt.size() + generated),
-                    std::nullopt, nullptr
+                auto tokens = target.run_model_speculative_decoding(
+                    draft, prompt, {.max_num_tokens = static_cast<uint16_t>(prompt.size() + generated)}
                 );
                 std::lock_guard<std::mutex> lock(metrics_mutex);
                 require(metrics.cached_tokens.has_value(), "Missing cache reuse metric");

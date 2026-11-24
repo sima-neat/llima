@@ -394,8 +394,8 @@ LanguageModel::_run_model_dflash_speculative_decoding(
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult *performance_result,
     uint16_t stable_prefix_token_count) {
-  _run->request();
-  draft_lm._run->request();
+  _run->require_active_request();
+  draft_lm._run->require_active_request();
   if (!timer_ttft.has_value()) {
     timer_ttft = ChronoTimer{true};
   }

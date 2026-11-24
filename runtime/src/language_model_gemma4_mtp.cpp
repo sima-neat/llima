@@ -493,20 +493,6 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     return Gemma4MtpDraftStepResult{next_token, std::move(projected)};
 }
 
-std::optional<std::vector<uint32_t>> LanguageModel::run_model_gemma4_mtp(
-    LanguageModel& draft_lm,
-    std::span<const uint32_t> input_token_ids,
-    std::optional<uint16_t> override_max_num_tokens,
-    std::optional<ChronoTimer> timer_ttft,
-    GenerationPerformanceResult* performance_result
-) {
-    if (!_cfg.lm_cfg.is_gemma4_mtp_target()) {
-        throw std::runtime_error("gemma4_mtp speculative decoding must run on the target model");
-    }
-    return run_model_speculative_decoding(draft_lm, input_token_ids, override_max_num_tokens,
-                                          timer_ttft, performance_result);
-}
-
 std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
     LanguageModel& draft_lm,
     std::span<const uint32_t> input_token_ids,
@@ -514,8 +500,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_gemma4_mtp(
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result
 ) {
-    _run->request();
-    draft_lm._run->request();
+    _run->require_active_request();
+    draft_lm._run->require_active_request();
     if (input_token_ids.empty()) {
         throw std::runtime_error("Gemma4 MTP generation requires at least one input token");
     }

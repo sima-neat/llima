@@ -1274,8 +1274,8 @@ std::optional<std::vector<uint32_t>> LanguageModel::_run_model_eagle3_speculativ
     std::optional<ChronoTimer> timer_ttft,
     GenerationPerformanceResult* performance_result
 ) {
-    _run->request();
-    draft_lm._run->request();
+    _run->require_active_request();
+    draft_lm._run->require_active_request();
 
     if (performance_result != nullptr) {
         *performance_result = GenerationPerformanceResult{};

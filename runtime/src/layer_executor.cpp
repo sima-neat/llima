@@ -221,7 +221,7 @@ LayerExecutor::AttentionPrograms LayerExecutor::bind_attention(
                                             embedding_scale_buf, embedding_scale_row, token_idx);
 
     if (is_gemma4_mtp_draft && cfg.lm_cfg.is_kv_shared_layer(layer_idx)) {
-        throw std::runtime_error("Gemma4 MTP shared-KV binding must use run_model_gemma4_mtp");
+        throw std::runtime_error("Gemma4 MTP shared-KV binding requires the MTP draft execution path");
     }
 
     bind_kv_outputs(model, pre_model, layer_idx, token_idx);
