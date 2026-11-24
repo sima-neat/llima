@@ -71,7 +71,6 @@ int main(int argc, char** argv) {
                         throw std::runtime_error("Automatic offload did not release embedding-table DRAM");
                     std::cout << "Embedding DRAM saved: " << resident_bytes - loaded_bytes << " bytes\n";
                 }
-                model.set_text_callback([](const std::string&, bool, bool) {});
                 if (argc <= 2) {
                     const GenerationOptions eight_tokens{.max_new_tokens = 8, .stop_token_ids = std::set<uint32_t>{}};
                     for (const size_t count : {8, 127, 128, 129, 257}) {
@@ -102,7 +101,7 @@ int main(int argc, char** argv) {
                         auto chat = model.create_chat();
                         chat.add_image(test::resolve_asset("sjc.jpg"));
                         chat.add_query("Describe the image briefly.");
-                        const auto result = model.generate(chat, {.max_new_tokens = 12}).text;
+                        const auto result = model.generate(chat, {.max_new_tokens = 12, .text_callback = [](const std::string&, bool, bool) {}}).text;
                         if (result.empty()) throw std::runtime_error("Missing image response");
                         compare("image", result);
                     }
@@ -126,10 +125,10 @@ int main(int argc, char** argv) {
                     model.set_draft_vlm(&draft);
                     auto chat = model.create_chat();
                     chat.add_query("Explain why Berlin is the capital of Germany.");
-                    const auto response = model.generate(chat, {.max_new_tokens = 32}).text;
+                    const auto response = model.generate(chat, {.max_new_tokens = 32, .text_callback = [](const std::string&, bool, bool) {}}).text;
                     if (response.empty()) throw std::runtime_error("Empty speculative response");
                     compare("speculative", response);
-                    const auto repeated = model.generate(chat, {.max_new_tokens = 32}).text;
+                    const auto repeated = model.generate(chat, {.max_new_tokens = 32, .text_callback = [](const std::string&, bool, bool) {}}).text;
                     if (repeated != response)
                         throw std::runtime_error("Repeated speculative request mismatch");
                     compare("speculative_repeat", repeated);

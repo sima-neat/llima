@@ -138,7 +138,6 @@ int main(int argc, char** argv) {
                 draft_root, std::nullopt, std::nullopt, std::move(files));
             first->set_draft_vlm(draft.get());
         }
-        first->set_text_callback([](const std::string&, bool, bool) {});
         VlmHelper helper(cfg, root / "devkit", std::string(""), std::nullopt);
         std::string prefix;
         for (int i = 0; i < 24; ++i) prefix += "Reference note: keep each answer clear and accurate. ";
@@ -161,7 +160,8 @@ int main(int argc, char** argv) {
         const auto workspace = first->workspace_memory_bytes();
 
         std::atomic<bool> busy_rejected = false;
-        first->set_info_callback([&](const std::string& key, double) {
+        GenerationOptions cancel_options{.max_new_tokens = 512};
+        cancel_options.info_callback = [&](const std::string& key, double) {
             if (key != "ttft") return;
             const auto busy = [](auto&& action) {
                 try { action(); } catch (const std::logic_error&) { return true; }
@@ -171,20 +171,17 @@ int main(int argc, char** argv) {
                          && busy([&] { first->set_reloc("unused"); })
                          && first->workspace_memory_bytes() == workspace;
             first->stop_model();
-        });
+        };
         auto cancel_chat = first->create_chat();
         cancel_chat.clear_system_prompt();
         cancel_chat.set_enable_thinking(false);
         cancel_chat.add_query("Write a long detailed story about a journey through space.");
-        const auto cancelled = first->generate(cancel_chat, {.max_new_tokens = 512});
-        first->wait_for_streamer_completion();
+        const auto cancelled = first->generate(cancel_chat, cancel_options);
         require(busy_rejected, "A busy workspace operation was not rejected from the callback");
         require(cancelled.finish == ChatResult::Finish::Cancelled, "Cancelled request returned a completed response");
-        first->set_info_callback([](const std::string&, double) {});
         require(generate(a) == gold_a, "Cancellation recovery differs from fresh reference");
         const std::vector<uint32_t> invalid{cfg.lm_cfg.token_cfg.vocab_size};
         rejected([&] { first->run_model(invalid, {.max_new_tokens = 64}); }, "Out-of-vocabulary token was accepted");
-        first->wait_for_streamer_completion();
         require(generate(b) == gold_b, "Exception recovery differs from fresh reference");
         std::cout << json{{"case", "cancel_exception_recovery"}, {"runtime_ok", true}}.dump() << '\n';
 
@@ -205,22 +202,27 @@ int main(int argc, char** argv) {
             require(generate(a) == gold_a, "DFlash block cancellation left stale state");
         }
 
-        std::atomic<unsigned> default_chunks = 0;
-        std::atomic<unsigned> default_events = 0;
         std::atomic<unsigned> request_chunks = 0;
-        first->set_text_callback([&](const std::string&, bool, bool) { ++default_chunks; });
-        first->set_info_callback([&](const std::string&, double) { ++default_events; });
+        std::atomic<unsigned> request_events = 0;
+        std::atomic<unsigned> request_completions = 0;
         GenerationOptions options{.max_new_tokens = 16};
-        options.text_callback = [&](const std::string&, bool, bool) { ++request_chunks; };
+        options.text_callback = [&](const std::string&, bool end, bool) {
+            ++request_chunks;
+            if (end) ++request_completions;
+        };
+        options.info_callback = [&](const std::string&, double) { ++request_events; };
         auto option_chat = first->create_chat();
         option_chat.add_query("Name three planets.");
         require(first->generate(option_chat, options).finish != ChatResult::Finish::Cancelled, "Request options failed");
-        require(request_chunks > 0 && default_chunks == 0, "Request callback did not replace the default");
-        require(default_events > 0, "Overriding text suppressed the default info callback");
-        first->generate(option_chat, {.max_new_tokens = 16});
-        require(default_chunks > 0, "Request callback leaked into a later request");
-        first->set_text_callback([](const std::string&, bool, bool) {});
-        first->set_info_callback([](const std::string&, double) {});
+        require(request_chunks > 0 && request_events > 0 && request_completions == 1,
+                "Generation returned before its callbacks completed");
+        const auto chunks = request_chunks.load();
+        const auto events = request_events.load();
+        std::atomic<unsigned> next_chunks = 0;
+        first->generate(option_chat, {.max_new_tokens = 16,
+            .text_callback = [&](const std::string&, bool, bool) { ++next_chunks; }});
+        require(next_chunks > 0 && request_chunks == chunks && request_events == events,
+                "Request callbacks leaked into a later request");
         std::cout << json{{"case", "request_callback_isolation"}, {"runtime_ok", true}}.dump() << '\n';
 
         options.info_callback = [](const std::string& key, double) {
@@ -317,7 +319,6 @@ int main(int argc, char** argv) {
         if (draft) {
             survivor->set_draft_vlm(draft.get());
         }
-        survivor->set_text_callback([](const std::string&, bool, bool) {});
         auto concurrent_a = std::async(std::launch::async, [&] { return generate(a); });
         auto concurrent_b = std::async(std::launch::async, [&] {
             return survivor->run_model(b, {.max_new_tokens = 64});
@@ -337,22 +338,23 @@ int main(int argc, char** argv) {
         auto detached_chat = first->create_chat();
         if (draft) {
             active_model = survivor.get();
-            survivor->set_info_callback([&](const std::string& key, double) {
+            GenerationOptions teardown_options{.max_new_tokens = 16};
+            teardown_options.info_callback = [&](const std::string& key, double) {
                 if (key == "END" || key == "FULL") first.reset();
-            });
+            };
             auto teardown_chat = survivor->create_chat();
             teardown_chat.add_query("Name one planet.");
-            require(survivor->generate(teardown_chat, {.max_new_tokens = 16}).finish != ChatResult::Finish::Cancelled,
+            require(survivor->generate(teardown_chat, teardown_options).finish != ChatResult::Finish::Cancelled,
                     "Callback teardown of another target sharing this draft failed");
             require(!first, "The callback did not release the other target");
-            survivor->set_info_callback([](const std::string&, double) {});
         } else {
-            first->set_info_callback([&](const std::string& key, double) {
+            GenerationOptions callback_options{.max_new_tokens = 16};
+            callback_options.info_callback = [&](const std::string& key, double) {
                 if (key == "END" || key == "FULL")
                     require(survivor->run_model(a, {.max_new_tokens = 64}) == gold_a,
                             "Cross-model callback generation differs from the reference");
-            });
-            require(first->generate(option_chat, {.max_new_tokens = 16}).finish != ChatResult::Finish::Cancelled,
+            };
+            require(first->generate(option_chat, callback_options).finish != ChatResult::Finish::Cancelled,
                     "Cross-model callback generation blocked completion");
             first.reset();
         }

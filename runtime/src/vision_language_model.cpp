@@ -39,7 +39,6 @@ struct LanguageRuntime {
     ToolCallFormat tool_call_format = ToolCallFormat::GenericJson;
     std::unique_ptr<LanguageModel> language_model_ptr;
     std::mutex run_mutex;
-    mutable std::mutex defaults_mutex;
     std::shared_ptr<LanguageRuntime> draft;
 };
 
@@ -111,27 +110,10 @@ bool VisionLanguageModel::support_image() const { return _state->_cfg.support_im
 std::string_view VisionLanguageModel::model_type() const { return _state->_cfg.model_type; }
 
 Chat VisionLanguageModel::create_chat() {
-    std::lock_guard lock(_state->defaults_mutex);
     return Chat(_state->vlm_helper);
 }
 
 ToolCallFormat VisionLanguageModel::tool_call_format() const { return _state->tool_call_format; }
-
-void VisionLanguageModel::set_info_callback(TextStreamer::InfoCallback callback) {
-    std::unique_lock lock(_state->run_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) throw std::logic_error("Callback defaults cannot change during a request");
-    _state->text_streamer.set_info_callback(std::move(callback));
-}
-
-void VisionLanguageModel::set_text_callback(TextStreamer::TextCallback callback) {
-    std::unique_lock lock(_state->run_mutex, std::try_to_lock);
-    if (!lock.owns_lock()) throw std::logic_error("Callback defaults cannot change during a request");
-    _state->text_streamer.set_text_callback(std::move(callback));
-}
-
-void VisionLanguageModel::wait_for_streamer_completion() {
-    _state->text_streamer.wait_streaming();
-}
 
 void VisionLanguageModel::set_reloc(const std::string& name) {
     auto lock = idle_lock(_state->run_mutex);
@@ -141,16 +123,6 @@ void VisionLanguageModel::set_reloc(const std::string& name) {
 void VisionLanguageModel::unset_reloc() {
     auto lock = idle_lock(_state->run_mutex);
     _state->language_model_ptr->unset_reloc();
-}
-
-void VisionLanguageModel::set_enable_thinking(bool enable_thinking) {
-    std::lock_guard lock(_state->defaults_mutex);
-    _state->vlm_helper.set_enable_thinking(enable_thinking);
-}
-
-bool VisionLanguageModel::get_enable_thinking() const {
-    std::lock_guard lock(_state->defaults_mutex);
-    return _state->vlm_helper.get_enable_thinking();
 }
 
 VisionLanguageModel::~VisionLanguageModel() = default;

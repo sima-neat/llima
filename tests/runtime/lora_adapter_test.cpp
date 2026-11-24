@@ -249,12 +249,11 @@ int main(int argc, char** argv) {
         malformed(root / "unknown_graph", "model_n1_pre_layer255_stage1_mla", 1);
         {
             VisionLanguageModel target(package.path);
-            target.set_text_callback([](const std::string&, bool, bool) {});
             auto chat = target.create_chat();
             chat.clear_system_prompt();
             chat.add_query("Translate: the sky is blue.");
             auto generate = [&] {
-                auto result = target.generate(chat, {.max_new_tokens = 32}).text;
+                auto result = target.generate(chat, {.max_new_tokens = 32, .text_callback = [](const std::string&, bool, bool) {}}).text;
                 require(!result.empty(), "Expected generated text");
                 return result;
             };

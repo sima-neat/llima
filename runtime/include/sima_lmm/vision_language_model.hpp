@@ -101,16 +101,8 @@ class VisionLanguageModel {
         std::string_view model_type() const;
         ToolCallFormat tool_call_format() const;
 
-        void set_info_callback(TextStreamer::InfoCallback callback);
-
-        void set_text_callback(TextStreamer::TextCallback callback);
-
-        void wait_for_streamer_completion();
-
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
-        void set_enable_thinking(bool enable_thinking);
-        bool get_enable_thinking() const;
 
     private:
         std::shared_ptr<LanguageRuntime> _state;

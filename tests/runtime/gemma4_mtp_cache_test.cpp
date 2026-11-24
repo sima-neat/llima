@@ -324,13 +324,13 @@ int main(int argc, char** argv) {
                 "Failed token-ID request did not restore its stop tokens");
 
             std::atomic<bool> stream_ended = false;
-            target.set_text_callback([&](const std::string&, bool end, bool) {
+            GenerationOptions stream_options{.max_new_tokens = 1};
+            stream_options.text_callback = [&](const std::string&, bool end, bool) {
                 if (end) stream_ended.store(true);
-            });
+            };
             auto chat = target.create_chat();
             chat.add_query("What is the capital of Germany?");
-            require(!target.generate(chat, {.max_new_tokens = 1}).token_ids.empty(), "Chat failed after token-ID requests");
-            target.wait_for_streamer_completion();
+            require(!target.generate(chat, stream_options).token_ids.empty(), "Chat failed after token-ID requests");
             require(stream_ended.load(), "Token-ID request did not re-enable chat streaming");
             std::cout << "Gemma4 MTP public dispatch tests passed\n";
         }
