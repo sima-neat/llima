@@ -7,7 +7,7 @@
 #include <fmt/format.h>
 #include <limits>
 
-#include "language_model.hpp"
+#include "language/language_model.hpp"
 #include "language/language_model_state.hpp"
 
 namespace simaai {

@@ -2,7 +2,7 @@
 
 // Private resource, cache and workspace owners; not an installed API header.
 #include "language/attention_cache.hpp"
-#include "language_model.hpp"
+#include "language/language_model.hpp"
 #include "language/embedding_offload.hpp"
 #include "package/model_resources.hpp"
 #include <stdexcept>

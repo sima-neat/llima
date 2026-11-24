@@ -12,9 +12,9 @@
 #include <fmt/std.h>
 #include <spdlog/spdlog.h>
 
-#include "eagle_helpers.hpp"
+#include "language/speculative/eagle_helpers.hpp"
 #include "language/speculative/gemma4_mtp_helpers.hpp"
-#include "language_model.hpp"
+#include "language/language_model.hpp"
 #include "language/layer_executor.hpp"
 #include "language/language_model_state.hpp"
 #include "language/request_scope.hpp"

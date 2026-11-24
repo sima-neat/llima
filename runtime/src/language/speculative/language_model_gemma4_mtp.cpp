@@ -12,7 +12,7 @@
 #include <fmt/format.h>
 
 #include "language/speculative/gemma4_mtp_helpers.hpp"
-#include "language_model.hpp"
+#include "language/language_model.hpp"
 #include "language/layer_executor.hpp"
 #include "language/language_model_state.hpp"
 

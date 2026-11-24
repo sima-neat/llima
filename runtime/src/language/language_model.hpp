@@ -24,9 +24,9 @@
 #include "mla_model.hpp"
 #include "vlm_config.hpp"
 #include <spdlog/logger.h>
-#include "eagle_helpers.hpp"
+#include "language/speculative/eagle_helpers.hpp"
 #include "generation_types.hpp"
-#include "rope_utils.hpp"
+#include "language/rope_utils.hpp"
 #include "text_streamer.hpp"
 
 namespace simaai {

@@ -9,7 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include "utils.hpp"
-#include "vlm_helper.hpp"
+#include "vlm/vlm_helper.hpp"
 
 namespace simaai {
 namespace llima {

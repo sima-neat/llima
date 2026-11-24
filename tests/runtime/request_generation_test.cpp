@@ -11,7 +11,7 @@
 #include "runtime_test_utils.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"
-#include "vlm_helper.hpp"
+#include "vlm/vlm_helper.hpp"
 
 using namespace simaai::llima;
 using json = nlohmann::ordered_json;

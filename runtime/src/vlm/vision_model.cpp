@@ -5,7 +5,7 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
-#include "vision_model.hpp"
+#include "vlm/vision_model.hpp"
 #include "package/model_resources.hpp"
 #include "mla_model.hpp"
 #include "mla/runtime_context.hpp"

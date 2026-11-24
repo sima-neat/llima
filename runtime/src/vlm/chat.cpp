@@ -1,7 +1,7 @@
 #include <fmt/ranges.h>
 
 #include "chat.hpp"
-#include "vlm_helper.hpp"
+#include "vlm/vlm_helper.hpp"
 
 namespace simaai {
 namespace llima {

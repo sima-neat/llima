@@ -1,3 +1,5 @@
+# These are internal runtime tests; private headers are never exported to consumers.
+include_directories("${PROJECT_SOURCE_DIR}/runtime/src")
 add_subdirectory(host)
 install(TARGETS sima_lmm_attention_cache_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
 

@@ -36,7 +36,7 @@
 
 #include <fmt/ranges.h>
 
-#include "language_model.hpp"
+#include "language/language_model.hpp"
 #include "language/layer_executor.hpp"
 #include "language/language_model_state.hpp"
 #include "utils.hpp"
