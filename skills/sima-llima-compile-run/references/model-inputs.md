@@ -52,10 +52,10 @@ dequantize differently.
 
 ## Check Support First
 
-Use relevant sections of the matching checkout's `docs/index.md` and
-`docs/compilation_genai.md` for supported
-architectures/sizes, formats, required assets, vision shapes, quantization, and
-flags. Reject unsupported input rather than choosing a similarly named model.
+Use relevant sections of the release-matched `index.md` and
+`compilation_genai.md` guides (see [environments](environments.md)) for
+supported architectures/sizes, formats, required assets, vision shapes,
+quantization, and flags. Reject unsupported input rather than choosing a similarly named model.
 GGUF is not the VLM path.
 
 ## Resolve Access
@@ -93,8 +93,8 @@ accuracy, size, compilation time, TTFT, and TPS.
 For speculative decoding, pass the supported draft model with
 `--draft_model_path`. Compilation produces separate target and draft artifact
 trees under one output parent. Keep those trees separate and pass their parent
-to `llima-deploy`. The matching checkout's `docs/deployment.md` describes
-supported speculative-decoding models; do not assume every draft method is
+to `llima-deploy`. The release-matched `deployment.md` guide (see
+[environments](environments.md)) describes supported speculative-decoding models; do not assume every draft method is
 supported by the installed release.
 
 A normal deployable output contains:

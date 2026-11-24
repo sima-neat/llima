@@ -1,12 +1,16 @@
 # LLiMa Environments
 
-Use CLI help and docs matching the installed release:
+Use CLI help and the LLiMa guides matching the installed release:
 
 - `llima-compile --help`
 - `llima-deploy --help`
 - `llima run --help`
-- `docs/setup.md`, `docs/compilation_genai.md`, `docs/deployment.md`,
-  `docs/runtime.md`
+- the guides at the release tag for the installed LLiMa version,
+  `https://github.com/sima-neat/llima/blob/v<version>/docs/<guide>`:
+  `index.md` (supported models and limitations), `setup.md` (system
+  requirements), `compilation_genai.md` (compilation), `deployment.md`
+  (deployment), and `runtime.md` (LLiMa CLI). If the installed version is
+  unknown, use the latest release and report that.
 
 ## Custom Fine-Tune Quantization Host
 

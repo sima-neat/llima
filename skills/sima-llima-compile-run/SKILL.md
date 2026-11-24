@@ -22,8 +22,9 @@ validation.
 | Select compiler units or configure original FP/BF16 precision | [Configuration files](references/configuration-files.md) |
 | Check compiled artifacts, deploy, or smoke-test on Modalix | Relevant section of [validation](references/validation.md) |
 
-References are bundled with the skill. Repository documentation paths refer to
-a matching LLiMa checkout; use installed CLI help for the active release's flags.
+References are bundled with the skill. LLiMa user guides are linked at the
+installed release's tag (see [environments](references/environments.md)); use
+installed CLI help for the active release's flags.
 
 ## Input and Execution Contracts
 
