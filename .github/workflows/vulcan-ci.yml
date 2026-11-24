@@ -45,8 +45,12 @@ jobs:
           set -euo pipefail
           python3 -m unittest -v \
             tests.ci.test_resolve_test_scope \
+            tests.ci.test_runtime_includes \
             tests.test_ci_sysroot \
             tests.test_platform_package_boundary
+
+      - name: Check runtime include boundaries
+        run: python3 tools/ci/check_runtime_includes.py
 
       - name: Resolve test scope
         id: scope

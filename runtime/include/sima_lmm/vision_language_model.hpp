@@ -23,8 +23,6 @@
 namespace simaai {
 namespace llima {
 
-class CLI;
-class WEB;
 struct LanguageRuntime;
 class RequestScope;
 struct PreprocessedChat;
@@ -106,8 +104,7 @@ class VisionLanguageModel {
     private:
         std::shared_ptr<LanguageRuntime> _state;
         std::unique_ptr<VisionModel> _vision_model;
-        friend class CLI;
-        friend class WEB;
+        // Internal ZMQ benchmarking also uses config() and benchmark_chat().
         friend class ZMQServer;
 
         struct ChatBenchmark {
