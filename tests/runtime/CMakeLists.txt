@@ -4,7 +4,7 @@ install(TARGETS sima_lmm_attention_cache_test RUNTIME DESTINATION lib/sima-lmm/t
 add_executable(sima_lmm_embedding_offload_generation_test embedding_offload_generation_test.cpp)
 target_link_libraries(sima_lmm_embedding_offload_generation_test PRIVATE sima_lmm_runtime)
 add_executable(sima_lmm_embedding_offload_test embedding_offload_test.cpp
-    "${PROJECT_SOURCE_DIR}/runtime/src/embedding_offload.cpp")
+    "${PROJECT_SOURCE_DIR}/runtime/src/language/embedding_offload.cpp")
 target_include_directories(sima_lmm_embedding_offload_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 target_link_libraries(sima_lmm_embedding_offload_test PRIVATE OpenMP::OpenMP_CXX)
 add_test(NAME runtime.embedding_offload COMMAND sima_lmm_embedding_offload_test)
@@ -205,8 +205,8 @@ install(
         CMakeLists.txt
         embedding_offload_generation_test.cpp
         embedding_offload_test.cpp
-        "${PROJECT_SOURCE_DIR}/runtime/src/embedding_offload.hpp"
-        "${PROJECT_SOURCE_DIR}/runtime/src/embedding_offload.cpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/embedding_offload.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/embedding_offload.cpp"
         asr_transcription_test.cpp
         mla_rt_lifecycle_test.cpp
         gemma4_mtp_helpers_test.cpp
@@ -221,8 +221,8 @@ install(
         test_zmq_black_box.py
         text_generation_test.cpp
         "${PROJECT_SOURCE_DIR}/runtime/include/sima_lmm/reasoning_parser.hpp"
-        "${PROJECT_SOURCE_DIR}/runtime/src/gemma4_mtp_helpers.hpp"
-        "${PROJECT_SOURCE_DIR}/runtime/src/attention_cache.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/speculative/gemma4_mtp_helpers.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/attention_cache.hpp"
         reasoning_parser_test.cpp
         tool_call_parser_test.cpp
         vision_generation_test.cpp

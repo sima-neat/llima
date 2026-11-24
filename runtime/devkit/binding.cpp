@@ -12,10 +12,10 @@
 #include <nanobind/stl/vector.h>
 #include <spdlog/spdlog.h>
 
-#include "cli.hpp"
+#include "frontends/cli.hpp"
 #include "setup.hpp"
-#include "web.hpp"
-#include "zmq_server.hpp"
+#include "frontends/web.hpp"
+#include "frontends/zmq_server.hpp"
 
 
 namespace nb = nanobind;

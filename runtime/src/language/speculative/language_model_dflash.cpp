@@ -9,8 +9,8 @@
 
 #include <fmt/format.h>
 #include "language_model.hpp"
-#include "layer_executor.hpp"
-#include "language_model_state.hpp"
+#include "language/layer_executor.hpp"
+#include "language/language_model_state.hpp"
 
 namespace simaai {
 namespace llima {

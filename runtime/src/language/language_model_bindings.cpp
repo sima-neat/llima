@@ -8,7 +8,7 @@
 #include <limits>
 
 #include "language_model.hpp"
-#include "language_model_state.hpp"
+#include "language/language_model_state.hpp"
 
 namespace simaai {
 namespace llima {

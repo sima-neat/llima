@@ -2,7 +2,7 @@
 #include <fmt/std.h>
 #include <fstream>
 
-#include "language_model_state.hpp"
+#include "language/language_model_state.hpp"
 
 namespace simaai::llima {
 namespace {

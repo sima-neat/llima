@@ -1,7 +1,7 @@
 #pragma once
 
 #include "language_model.hpp"
-#include "language_model_state.hpp"
+#include "language/language_model_state.hpp"
 #include <spdlog/sinks/base_sink.h>
 
 namespace simaai::llima {

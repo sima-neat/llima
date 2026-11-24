@@ -3,7 +3,7 @@
 #include <thread>
 #include <nlohmann/json.hpp>
 #include "mla_model.hpp"
-#include "runtime_context.hpp"
+#include "mla/runtime_context.hpp"
 #include "runtime_test_utils.hpp"
 #include "setup.hpp"
 

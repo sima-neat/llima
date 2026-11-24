@@ -1,5 +1,5 @@
-#include "attention_cache.hpp"
-#include "gemma4_mtp_helpers.hpp"
+#include "language/attention_cache.hpp"
+#include "language/speculative/gemma4_mtp_helpers.hpp"
 
 #include <functional>
 #include <iostream>

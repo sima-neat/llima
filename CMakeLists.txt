@@ -358,6 +358,8 @@ target_include_directories(
     $<BUILD_INTERFACE:${tokenizers_cpp_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
+target_include_directories(${TARGET_RUNTIME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src")
+
 target_include_directories(${TARGET_RUNTIME} SYSTEM PUBLIC ${HTTPLIB_INCLUDE_DIRS})
 
 target_link_libraries(

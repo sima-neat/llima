@@ -1,10 +1,10 @@
 #pragma once
 
 // Private resource, cache and workspace owners; not an installed API header.
-#include "attention_cache.hpp"
+#include "language/attention_cache.hpp"
 #include "language_model.hpp"
-#include "embedding_offload.hpp"
-#include "model_resources.hpp"
+#include "language/embedding_offload.hpp"
+#include "package/model_resources.hpp"
 #include <stdexcept>
 
 namespace simaai::llima {

@@ -1,8 +1,8 @@
 #pragma once
 
 // Private layer binding and scheduling helpers shared by the decoding algorithms.
-#include "language_model_state.hpp"
-#include "runtime_context.hpp"
+#include "language/language_model_state.hpp"
+#include "mla/runtime_context.hpp"
 
 namespace simaai::llima {
 

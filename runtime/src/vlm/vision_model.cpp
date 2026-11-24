@@ -6,9 +6,9 @@
 #include <nlohmann/json.hpp>
 
 #include "vision_model.hpp"
-#include "model_resources.hpp"
+#include "package/model_resources.hpp"
 #include "mla_model.hpp"
-#include "runtime_context.hpp"
+#include "mla/runtime_context.hpp"
 
 
 namespace simaai {

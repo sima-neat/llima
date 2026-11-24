@@ -1,6 +1,6 @@
 #pragma once
 
-#include "language_model_state.hpp"
+#include "language/language_model_state.hpp"
 
 namespace simaai::llima {
 

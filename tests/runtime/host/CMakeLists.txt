@@ -9,7 +9,7 @@ find_path(SPDLOG_INCLUDE_DIR spdlog/spdlog.h REQUIRED)
 
 set(runtime_dir "${CMAKE_CURRENT_LIST_DIR}/../../../runtime")
 add_executable(sima_lmm_attention_cache_test attention_cache_test.cpp
-    "${runtime_dir}/src/gemma4_mtp_helpers.cpp")
+    "${runtime_dir}/src/language/speculative/gemma4_mtp_helpers.cpp")
 target_compile_features(sima_lmm_attention_cache_test PRIVATE cxx_std_20)
 target_include_directories(sima_lmm_attention_cache_test PRIVATE
     "${runtime_dir}/src" "${runtime_dir}/include/sima_lmm" "${FMT_INCLUDE_DIR}" "${SPDLOG_INCLUDE_DIR}")

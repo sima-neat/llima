@@ -2,7 +2,7 @@
 #include <cstring>
 #include <iostream>
 
-#include "cli.hpp"
+#include "frontends/cli.hpp"
 #include "reasoning_parser.hpp"
 #include "utils.hpp"
 

@@ -8,7 +8,7 @@
 #include <string>
 
 #include "chat.hpp"
-#include "readline_helper.hpp"
+#include "frontends/readline_helper.hpp"
 #include "utils.hpp"
 #include "vision_language_model.hpp"
 #include "whisper_model.hpp"

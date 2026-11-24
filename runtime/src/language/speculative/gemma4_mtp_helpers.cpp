@@ -1,4 +1,4 @@
-#include "gemma4_mtp_helpers.hpp"
+#include "language/speculative/gemma4_mtp_helpers.hpp"
 
 #include <algorithm>
 #include <limits>

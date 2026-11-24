@@ -18,8 +18,8 @@
 
 #include "utils.hpp"
 #include "whisper_model.hpp"
-#include "model_resources.hpp"
-#include "runtime_context.hpp"
+#include "package/model_resources.hpp"
+#include "mla/runtime_context.hpp"
 
 
 namespace simaai {

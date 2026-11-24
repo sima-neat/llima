@@ -20,7 +20,7 @@
 
 #include "file_provider.hpp"
 #include "mla_model.hpp"
-#include "runtime_context.hpp"
+#include "mla/runtime_context.hpp"
 
 namespace simaai {
 namespace llima {

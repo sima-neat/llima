@@ -1,4 +1,4 @@
-#include "embedding_offload.hpp"
+#include "language/embedding_offload.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -19,11 +19,11 @@
 #include <spdlog/spdlog.h>
 
 #include "eagle_helpers.hpp"
-#include "gemma4_mtp_helpers.hpp"
+#include "language/speculative/gemma4_mtp_helpers.hpp"
 #include "language_model.hpp"
-#include "layer_executor.hpp"
-#include "language_model_state.hpp"
-#include "request_scope.hpp"
+#include "language/layer_executor.hpp"
+#include "language/language_model_state.hpp"
+#include "language/request_scope.hpp"
 #include "utils.hpp"
 
 namespace simaai {

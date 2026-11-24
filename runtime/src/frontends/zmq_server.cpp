@@ -5,7 +5,7 @@
 
 #include <fmt/ranges.h>
 
-#include "zmq_server.hpp"
+#include "frontends/zmq_server.hpp"
 #include "reasoning_parser.hpp"
 #include "vlm_config.hpp"
 

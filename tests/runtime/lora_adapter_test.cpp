@@ -11,7 +11,7 @@
 #include <cnpy.h>
 
 #include "mla_model.hpp"
-#include "runtime_context.hpp"
+#include "mla/runtime_context.hpp"
 #include "runtime_test_utils.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"

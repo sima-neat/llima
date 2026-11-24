@@ -7,8 +7,8 @@
 #include "reasoning_parser.hpp"
 #include "utils.hpp"
 #include "vision_language_model.hpp"
-#include "language_model_state.hpp"
-#include "request_scope.hpp"
+#include "language/language_model_state.hpp"
+#include "language/request_scope.hpp"
 #include "vision_model.hpp"
 #include "vlm_helper.hpp"
 
