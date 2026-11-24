@@ -1,6 +1,6 @@
 ---
 name: sima-llima-compile-run
-description: Quantize supported LLM/VLM fine-tunes, compile with LLiMa, or deploy and validate on Modalix. Excludes repository maintenance and ordinary ONNX models.
+description: Quantize and compile LLMs and VLMs for SiMa Modalix with LLiMa, then deploy and validate them on the device. Use when a user asks to quantize, compile, or quantize and compile an LLM or VLM for Modalix, including compile-only requests, for Llama, Qwen, Qwen-VL, Gemma, Phi, Mistral, LFM2, LLaVA, or PaliGemma models and their fine-tunes, from Hugging Face safetensors, pre-quantized compressed-tensors GPTQ/AWQ/AutoRound checkpoints (including SiMa.ai's), or GGUF (LLMs only), optionally with LoRA adapters; or to deploy, run, or validate a compiled LLM or VLM on Modalix. Not for non-LLM ONNX or PyTorch models, such as vision models (use `sima-model-quantize-compile`), application code around a deployed model (use `neat-application-builder`), LLiMa repository changes (use `sima-contribute-to-llima`), or checkpoint compatibility and new architecture support (use `sima-add-llima-model-support`).
 ---
 
 # Compile and Test LLiMa Models
@@ -8,8 +8,10 @@ description: Quantize supported LLM/VLM fine-tunes, compile with LLiMa, or deplo
 Use the requested model, source format, revision, and precision. If checkpoint
 compatibility is uncertain, use `sima-add-llima-model-support` for that assessment.
 Fixes to an existing compiler/runtime path and Whisper maintenance use
-`sima-contribute-to-llima`. Ordinary ONNX models use the standard Model Compiler
-workflow. Application composition is outside model-level compilation and
+`sima-contribute-to-llima`. ONNX or PyTorch models that are not LLMs or VLMs
+use `sima-model-quantize-compile`. LLiMa compiles a Hugging Face directory or
+a GGUF file, not an ONNX export of an LLM or VLM; ask for the source
+checkpoint. Application composition is outside model-level compilation and
 validation.
 
 ## Load Only the Needed Guidance
