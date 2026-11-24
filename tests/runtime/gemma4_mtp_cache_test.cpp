@@ -13,7 +13,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/sinks/base_sink.h>
 
-#include "language_model.hpp"
+#include "language_model_test_access.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"
 #include "vlm_helper.hpp"
@@ -177,10 +177,8 @@ int main(int argc, char** argv) {
                 return Result{std::move(tokens), metrics, trace->positions()};
             };
             auto reset_cache = [&] {
-                target.clear_cached_token_ids();
-                draft.clear_cached_token_ids();
-                target.set_kv_cache_len(0);
-                draft.set_kv_cache_len(0);
+                LanguageModelTestAccess::reset_cache(target);
+                LanguageModelTestAccess::reset_cache(draft);
             };
             auto cold_reference = [&](const std::vector<uint32_t>& prompt) {
                 reset_cache();
@@ -244,7 +242,7 @@ int main(int argc, char** argv) {
                 "Partial-prefix reuse did not skip the first prefill group");
 
             // A logical KV truncation must win over a longer token history.
-            target.set_kv_cache_len(static_cast<uint16_t>(group));
+            LanguageModelTestAccess::truncate_kv(target, static_cast<uint16_t>(group));
             const auto truncated = run(partial);
             require(*truncated.metrics.cached_tokens == group && truncated.tokens == partial_cold.tokens,
                 "Reuse exceeded the valid KV length after truncation");

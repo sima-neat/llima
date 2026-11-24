@@ -57,6 +57,82 @@ struct SequenceCache {
     std::string image_identity;
 };
 
+struct LanguageModel::InitTreeResult {
+    std::vector<uint32_t> draft_tokens;
+    std::vector<std::vector<int32_t>> retrieve_indices;
+    eagle_helpers::EagleTreeMask tree_mask;  // 4D (1, 1, N, N)
+    std::vector<int32_t> tree_position_ids;
+    std::vector<std::vector<Eigen::bfloat16>> hidden_states;  // 3 captured layers
+    uint32_t token;                                            // root token
+    std::chrono::steady_clock::time_point root_ready_time;
+    double time_to_first_token;
+};
+
+struct LanguageModel::TopkGenerateResult {
+    std::vector<uint32_t> draft_tokens;
+    std::vector<std::vector<int32_t>> retrieve_indices;
+    eagle_helpers::EagleTreeMask tree_mask;  // 4D (1, 1, N, N)
+    std::vector<int32_t> tree_position_ids;
+};
+
+struct LanguageModel::DraftForwardResult {
+    std::vector<Eigen::bfloat16> hidden_states;  // (seq_length, hidden_size)
+    std::vector<Eigen::bfloat16> logits;         // (num_tokens, draft_vocab_size)
+};
+
+struct LanguageModel::Gemma4MtpTargetBatchResult {
+    std::vector<uint32_t> next_token_ids;
+    std::vector<Eigen::bfloat16> hidden_states;
+};
+
+struct LanguageModel::Gemma4MtpDraftStepResult {
+    uint32_t token_id;
+    std::vector<Eigen::bfloat16> projected_hidden_state;  // (backbone_hidden_size)
+};
+
+struct LanguageModel::TargetVerifyResult {
+    std::vector<uint32_t> next_token_ids;                     // target argmax per node
+    std::vector<std::vector<Eigen::bfloat16>> hidden_states;   // 3 captures, each (num_tokens, hidden_size)
+};
+
+struct LanguageModel::TreeDecodingResult {
+    std::vector<int32_t> next_token_ids;          // flat (n_paths × max_depth)
+    std::vector<Eigen::bfloat16> hidden_states;   // flat (K × 3 × hidden_size)
+};
+
+struct LanguageModel::UpdateInferenceInputsResult {
+    std::vector<uint32_t> input_ids;                       // old + accepted + bonus
+    std::vector<uint32_t> draft_tokens;                    // next round's tree tokens
+    std::vector<std::vector<int32_t>> retrieve_indices;    // next round
+    eagle_helpers::EagleTreeMask tree_mask;                // next round
+    std::vector<int32_t> tree_position_ids;                // next round
+    int32_t new_token;                                     // accumulated generated-token count
+    uint32_t bonus_token;
+};
+
+struct LanguageModel::LMHeadLogitView {
+    MLABuffer* buffer;
+    const uint8_t* data;
+    size_t row_bytes;
+    uint32_t vocab_begin;
+    uint32_t width;
+};
+
+struct LanguageModel::MoeHostCache {
+    uint16_t num_tokens = 0;             // the moe_nt this entry serves
+    MLABuffer* values = nullptr;         // n{nt}_router_values
+    MLABuffer* indices = nullptr;        // n{nt}_router_indices
+    MLABuffer* weights = nullptr;        // n{nt}_router_weights
+    std::vector<MLABuffer*> expert_out;  // top_k decode slots or num_experts prefill outputs
+    // Decode only: top_k OFM overrides routing each expert into its combine slot.
+    std::vector<std::map<uint8_t, MLABufferSlice>> slot_ofm;
+    // Host staging, sized once; never reallocated on the critical path.
+    std::vector<Eigen::bfloat16> values_scratch;   // nt * top_k
+    std::vector<int32_t> indices_scratch;          // nt * top_k
+    std::vector<Eigen::bfloat16> weights_scratch;  // nt * num_experts
+    std::vector<uint8_t> activated_scratch;        // num_experts (prefill only)
+};
+
 struct LanguageModel::DFlashScratch {
     std::vector<uint32_t> draft_input_ids;
     std::vector<uint32_t> proposals;

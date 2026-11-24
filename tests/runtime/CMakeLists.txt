@@ -210,6 +210,7 @@ install(
         mla_rt_lifecycle_test.cpp
         gemma4_mtp_helpers_test.cpp
         gemma4_mtp_cache_test.cpp
+        language_model_test_access.hpp
         pytest.ini
         runtime_test_utils.hpp
         test_cli_black_box.py

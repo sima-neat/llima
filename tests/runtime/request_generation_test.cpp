@@ -105,8 +105,6 @@ void check_direct_pair(const std::filesystem::path& target_root, const std::file
 }
 
 static_assert(std::is_aggregate_v<GenerationOptions>);
-static_assert(std::is_const_v<std::remove_reference_t<
-    decltype(std::declval<LanguageModel&>().get_model_map("pre"))>>);
 
 }
 

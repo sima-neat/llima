@@ -1489,33 +1489,6 @@ void LanguageModel::_define_per_layer_models() {
 }
 
 
-const LanguageModelMap& LanguageModel::get_model_map(const std::string& model_type) const {
-    if (model_type == "pre") {
-        return _workspace->pre_model_map;
-    } else if (model_type == "cache") {
-        return _workspace->cache_model_map;
-    } else if (model_type == "post") {
-        return _workspace->post_model_map;
-    } else if (model_type == "conv") {
-        return _workspace->conv_model_map;
-    } else if (model_type == "conv_final") {
-        return _workspace->conv_final_model_map;
-    } else if (model_type == "per_layer") {
-        return _workspace->per_layer_model_map;
-    } else if (model_type == "router") {
-        return _workspace->router_model_map;
-    } else if (model_type == "expert") {
-        return _workspace->expert_model_map;
-    } else if (model_type == "weightedsum") {
-        return _workspace->weightedsum_model_map;
-    } else if (model_type == "linear") {
-        return _workspace->linear_model_map;
-    } else {
-        throw std::runtime_error(std::string("Invalid model type: ") + model_type);
-    }
-}
-
-
 std::filesystem::path LanguageModel::_get_elf_path_pre(uint16_t num_tokens, uint8_t layer_idx) {
     auto elf_file_name = fmt::format(
         "{}_n{}_pre_layer{}_stage1_mla.elf", _cfg.language_model_name, num_tokens, layer_idx

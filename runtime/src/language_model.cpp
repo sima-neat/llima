@@ -80,19 +80,7 @@ LanguageModel::~LanguageModel() { _finalize(); }
 
 void LanguageModel::stop_model() { _run->interrupts.fetch_add(1, std::memory_order_relaxed); }
 
-uint16_t LanguageModel::get_max_num_tokens() const { return _run->limits().max_num_tokens; }
-
 const std::set<uint32_t>& LanguageModel::get_stop_token_ids() const { return _run->limits().stop_token_ids; }
-
-void LanguageModel::clear_cached_token_ids() { _cache->cached_token_ids.clear(); }
-
-uint32_t LanguageModel::get_cached_first_generated_token() const {
-    return _cache->cached_first_generated_token;
-}
-
-const std::vector<std::vector<Eigen::bfloat16>>& LanguageModel::get_eagle3_intermediate_hidden_states() const {
-    return _workspace->eagle3_intermediate_hidden_states;
-}
 
 uint16_t LanguageModel::get_kv_cache_len() const { return _cache->kv_cache_len; }
 
@@ -613,12 +601,6 @@ uint32_t LanguageModel::_prefill(
     return next_token_id;
 }
 
-
-void LanguageModel::run_model_decode(
-    uint16_t num_input_tokens, uint32_t token_id
-) {
-    _decode(num_input_tokens, token_id, nullptr);
-}
 
 void LanguageModel::_decode(uint16_t num_input_tokens, uint32_t token_id,
                             std::vector<double>* durations) {
@@ -1641,33 +1623,6 @@ void LanguageModel::unset_reloc() {
     _bind_adapter(nullptr);
     invalidate_prompt_reuse();
 }
-
-uint16_t LanguageModel::set_max_num_tokens(std::optional<uint16_t> max_num_tokens) {
-    auto original_max_num_tokens = _run->limits().max_num_tokens;
-    if (max_num_tokens.has_value()) {
-        _run->limits().max_num_tokens = std::min(max_num_tokens.value(), _cfg.pipeline_cfg.max_num_tokens);
-    }
-    _logger->info("Setting max_num_tokens: {} -> {}", original_max_num_tokens, _run->limits().max_num_tokens);
-    return original_max_num_tokens;
-}
-
-
-std::set<uint32_t> LanguageModel::set_stop_token_ids(
-    std::optional<std::set<uint32_t>> stop_token_ids
-) {
-    auto original_stop_token_ids = _run->limits().stop_token_ids;
-    if (stop_token_ids.has_value()) {
-        _run->limits().stop_token_ids = stop_token_ids.value();
-    }
-    _logger->info(
-        "Setting stop_token_ids: {} -> {}", original_stop_token_ids, _run->limits().stop_token_ids
-    );
-    return original_stop_token_ids;
-}
-
-
-
-
 
 void LanguageModel::_prepare_offloaded_prompt(uint16_t num_tokens, uint16_t token_idx) {
     auto& state = *_workspace;

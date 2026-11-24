@@ -89,19 +89,6 @@ class LanguageModel {
             uint16_t stable_prefix_token_count, GenerationPerformanceResult* performance,
             std::stop_token stop
         );
-        uint32_t run_model_prefill(
-            std::span<const uint32_t> input_token_ids,
-            uint16_t num_cached_tokens,
-            std::optional<ChronoTimer> = std::nullopt
-        );
-        void run_model_decode(uint16_t num_input_tokens, uint32_t token_id);
-        uint32_t run_model_once(
-            uint16_t num_tokens,
-            uint16_t token_idx,
-            uint16_t num_input_tokens,
-            uint32_t token_id,
-            std::vector<Eigen::bfloat16>* logits_ptr = nullptr
-        );
         LogLikelihoodResult run_model_for_loglikelihood(
             std::span<const uint32_t> input_token_ids,
             size_t continuation_start,
@@ -149,37 +136,40 @@ class LanguageModel {
         void set_reloc(const std::string& reloc_name);
         void unset_reloc();
 
-        const LanguageModelMap& get_model_map(const std::string& model_type) const;
-        uint16_t set_max_num_tokens(std::optional<uint16_t> max_num_tokens);
-        uint16_t get_max_num_tokens() const;
-        std::set<uint32_t> set_stop_token_ids(std::optional<std::set<uint32_t>> stop_token_ids);
-        const std::set<uint32_t>& get_stop_token_ids() const;
-        void clear_cached_token_ids();
-        uint32_t get_cached_first_generated_token() const;
 
-        // Captured hidden states from layers 2, N/2, N-3 during prefill (spec decoding).
-        // Populated by run_model_once when queue is disabled and spec mode is active.
-        const std::vector<std::vector<Eigen::bfloat16>>& get_eagle3_intermediate_hidden_states() const;
+
+        // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
+        uint16_t get_kv_cache_len() const;
+
+    private:
+        friend struct LanguageAssets;
+        friend struct SequenceCache;
+        friend struct LanguageWorkspace;
+        friend class VisionLanguageModel;
+        friend class RequestScope;
+        friend class LayerExecutor;
+        friend struct LanguageModelTestAccess;
+
+        uint32_t run_model_prefill(
+            std::span<const uint32_t> input_token_ids,
+            uint16_t num_cached_tokens,
+            std::optional<ChronoTimer> = std::nullopt
+        );
+        uint32_t run_model_once(
+            uint16_t num_tokens,
+            uint16_t token_idx,
+            uint16_t num_input_tokens,
+            uint32_t token_id,
+            std::vector<Eigen::bfloat16>* logits_ptr = nullptr
+        );
+        const std::set<uint32_t>& get_stop_token_ids() const;
+        void set_kv_cache_len(uint16_t len);
 
         // Result of initialize_tree.
-        struct InitTreeResult {
-            std::vector<uint32_t> draft_tokens;
-            std::vector<std::vector<int32_t>> retrieve_indices;
-            eagle_helpers::EagleTreeMask tree_mask;  // 4D (1, 1, N, N)
-            std::vector<int32_t> tree_position_ids;
-            std::vector<std::vector<Eigen::bfloat16>> hidden_states;  // 3 captured layers
-            uint32_t token;                                            // root token
-            std::chrono::steady_clock::time_point root_ready_time;
-            double time_to_first_token;
-        };
+        struct InitTreeResult;
 
         // Result of topk_generate.
-        struct TopkGenerateResult {
-            std::vector<uint32_t> draft_tokens;
-            std::vector<std::vector<int32_t>> retrieve_indices;
-            eagle_helpers::EagleTreeMask tree_mask;  // 4D (1, 1, N, N)
-            std::vector<int32_t> tree_position_ids;
-        };
+        struct TopkGenerateResult;
 
         // Draft-side tree expansion. `hidden_states` is (seq_length × 3*hidden_size)
         // target captures for prefill, or (K × hidden_size) per-iter for decode.
@@ -192,20 +182,11 @@ class LanguageModel {
         );
 
         // Result of run_eagle3_draft_model (lm_head is fused into post_model).
-        struct DraftForwardResult {
-            std::vector<Eigen::bfloat16> hidden_states;  // (seq_length, hidden_size)
-            std::vector<Eigen::bfloat16> logits;         // (num_tokens, draft_vocab_size)
-        };
+        struct DraftForwardResult;
 
-        struct Gemma4MtpTargetBatchResult {
-            std::vector<uint32_t> next_token_ids;
-            std::vector<Eigen::bfloat16> hidden_states;
-        };
+        struct Gemma4MtpTargetBatchResult;
 
-        struct Gemma4MtpDraftStepResult {
-            uint32_t token_id;
-            std::vector<Eigen::bfloat16> projected_hidden_state;  // (backbone_hidden_size)
-        };
+        struct Gemma4MtpDraftStepResult;
 
         // Draft model forward with lm_head fused. is_prefill picks n128 (with FC
         // fusion on 3*hidden_size captures) vs n5 (single-layer hidden_size input).
@@ -220,10 +201,7 @@ class LanguageModel {
         );
 
         // Result of run_eagle3_target_verify.
-        struct TargetVerifyResult {
-            std::vector<uint32_t> next_token_ids;                     // target argmax per node
-            std::vector<std::vector<Eigen::bfloat16>> hidden_states;   // 3 captures, each (num_tokens, hidden_size)
-        };
+        struct TargetVerifyResult;
 
         // Target verify (n16). position_ids are absolute. Captures hidden states
         // at layers 2, N/2, N-3. KV write offset is baked via model_key.
@@ -233,10 +211,7 @@ class LanguageModel {
         );
 
         // Result of tree_decoding.
-        struct TreeDecodingResult {
-            std::vector<int32_t> next_token_ids;          // flat (n_paths × max_depth)
-            std::vector<Eigen::bfloat16> hidden_states;   // flat (K × 3 × hidden_size)
-        };
+        struct TreeDecodingResult;
 
         // Tree decoding: target verify + retrieve_indices logit gather +
         // concat of the 3 layer captures.
@@ -266,15 +241,7 @@ class LanguageModel {
 
         // Per-iter update after target verify + accept/reject: compacts KV to the
         // accepted path and builds the next tree from the target bonus token.
-        struct UpdateInferenceInputsResult {
-            std::vector<uint32_t> input_ids;                       // old + accepted + bonus
-            std::vector<uint32_t> draft_tokens;                    // next round's tree tokens
-            std::vector<std::vector<int32_t>> retrieve_indices;    // next round
-            eagle_helpers::EagleTreeMask tree_mask;                // next round
-            std::vector<int32_t> tree_position_ids;                // next round
-            int32_t new_token;                                     // accumulated generated-token count
-            uint32_t bonus_token;
-        };
+        struct UpdateInferenceInputsResult;
 
         UpdateInferenceInputsResult update_inference_inputs(
             LanguageModel& draft_lm,
@@ -288,17 +255,6 @@ class LanguageModel {
             uint32_t bonus_token
         );
 
-        // Number of tokens currently in the KV cache (set by prefill, advanced by decode).
-        uint16_t get_kv_cache_len() const;
-        void set_kv_cache_len(uint16_t len);
-
-    private:
-        friend struct LanguageAssets;
-        friend struct SequenceCache;
-        friend struct LanguageWorkspace;
-        friend class VisionLanguageModel;
-        friend class RequestScope;
-        friend class LayerExecutor;
         std::optional<std::vector<uint32_t>> _generate_tokens(
             RequestScope& request, std::span<const uint32_t> ids,
             std::optional<uint16_t> limit, std::optional<ChronoTimer> timer,
@@ -522,13 +478,7 @@ class LanguageModel {
             uint16_t num_tokens, uint16_t token_idx, uint16_t num_input_tokens
         );
         uint32_t _calc_next_token_id(MLABuffer* buf_ptr);
-        struct LMHeadLogitView {
-            MLABuffer* buffer;
-            const uint8_t* data;
-            size_t row_bytes;
-            uint32_t vocab_begin;
-            uint32_t width;
-        };
+        struct LMHeadLogitView;
         void _prepare_lm_head_logit_views(
             uint16_t num_tokens, uint16_t output_rows, std::vector<LMHeadLogitView>& views
         );
@@ -587,20 +537,7 @@ class LanguageModel {
         // ({num_tokens, layer_idx, 0}); the expert map repurposes the third key slot
         // as the expert index ({num_tokens, layer_idx, expert_idx}).
         // Preresolved handles + staging for the MoE host round-trip, one per MoE variant.
-        struct MoeHostCache {
-            uint16_t num_tokens = 0;             // the moe_nt this entry serves
-            MLABuffer* values = nullptr;         // n{nt}_router_values
-            MLABuffer* indices = nullptr;        // n{nt}_router_indices
-            MLABuffer* weights = nullptr;        // n{nt}_router_weights
-            std::vector<MLABuffer*> expert_out;  // top_k decode slots or num_experts prefill outputs
-            // Decode only: top_k OFM overrides routing each expert into its combine slot.
-            std::vector<std::map<uint8_t, MLABufferSlice>> slot_ofm;
-            // Host staging, sized once; never reallocated on the critical path.
-            std::vector<Eigen::bfloat16> values_scratch;   // nt * top_k
-            std::vector<int32_t> indices_scratch;          // nt * top_k
-            std::vector<Eigen::bfloat16> weights_scratch;  // nt * num_experts
-            std::vector<uint8_t> activated_scratch;        // num_experts (prefill only)
-        };
+        struct MoeHostCache;
         std::vector<MoeHostCache> _moe_host;
         void _init_moe_host_cache();
         MoeHostCache& _get_moe_host(uint16_t moe_nt);
