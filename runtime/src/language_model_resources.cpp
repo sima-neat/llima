@@ -18,19 +18,19 @@ void load_whole_file(MLABuffer &buffer, std::istream &stream,
 }
 } // namespace
 
-std::shared_ptr<LanguageResources>
-LanguageResources::acquire(const std::filesystem::path &path,
-                           std::shared_ptr<FileProvider> files) {
+std::shared_ptr<LanguageAssets>
+LanguageAssets::acquire(const std::filesystem::path &path,
+                        std::shared_ptr<FileProvider> files) {
   auto package = ModelResources<VlmConfig>::acquire(path, std::move(files));
   static std::mutex mutex;
   static std::map<std::pair<ModelResources<VlmConfig> *, EmbeddingOffloadMode>,
-                  std::weak_ptr<LanguageResources>>
+                  std::weak_ptr<LanguageAssets>>
       resources;
   std::lock_guard lock(mutex);
   auto &weak = resources[{package.get(), embedding_offload_mode()}];
   if (auto shared = weak.lock())
     return shared;
-  auto shared = std::make_shared<LanguageResources>(std::move(package));
+  auto shared = std::make_shared<LanguageAssets>(std::move(package));
   weak = shared;
   return shared;
 }
@@ -49,7 +49,7 @@ size_t LanguageModel::workspace_memory_bytes() const {
   return bytes;
 }
 
-void LanguageResources::prepare_embeddings() {
+void LanguageAssets::prepare_embeddings() {
   if (ready || cfg.lm_cfg.is_speculative_draft())
     return;
   const auto mode = embedding_offload_mode();
@@ -82,7 +82,7 @@ void LanguageResources::prepare_embeddings() {
   }
 }
 
-void LanguageResources::load() {
+void LanguageAssets::load() {
   if (ready)
     return;
   const bool draft_model = cfg.lm_cfg.is_speculative_draft();
@@ -259,7 +259,7 @@ void LanguageResources::load() {
   ready = true;
 }
 
-void LanguageResources::load_per_layer_embeddings() {
+void LanguageAssets::load_per_layer_embeddings() {
   const auto file_rel =
       "devkit/" + cfg.language_model_name + "_per_layer_embeddings.bin";
   const auto file_name = package->files->get_path(file_rel);

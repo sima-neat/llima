@@ -9,7 +9,7 @@
 
 #include <fmt/format.h>
 #include "language_model.hpp"
-#include "language_model_executor.hpp"
+#include "layer_executor.hpp"
 #include "language_model_state.hpp"
 
 namespace simaai {
@@ -68,7 +68,7 @@ void LanguageModel::_bind_dflash_linear_conv_state(uint16_t prefix_tokens) {
 }
 
 void LanguageModel::_resolve_dflash_linear_state(uint16_t prefix_tokens) {
-  auto execution = LanguageExecutor::lock_execution();
+  auto execution = LayerExecutor::lock_execution();
   const uint16_t block_size = _cfg.lm_cfg.get_single_num_tokens();
   if (prefix_tokens == 0 || prefix_tokens > block_size) {
     throw std::invalid_argument("Invalid DFlash linear-state prefix length");
@@ -217,7 +217,7 @@ void LanguageModel::_append_dflash_context(LanguageModel &target_lm,
                                            uint16_t num_tokens,
                                            uint16_t token_idx,
                                            uint16_t valid_tokens) {
-  auto execution = LanguageExecutor::lock_execution();
+  auto execution = LayerExecutor::lock_execution();
   const auto expected =
       _cfg.lm_cfg.speculative_decoding_cfg.value().target_layer_ids.size();
   if (token_idx + num_tokens > _cfg.pipeline_cfg.max_num_tokens) {
@@ -275,7 +275,7 @@ void LanguageModel::_append_dflash_context(LanguageModel &target_lm,
 const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
     LanguageModel &target_lm, uint32_t anchor_token, uint16_t token_idx,
     DFlashScratch &scratch) {
-  auto execution = LanguageExecutor::lock_execution();
+  auto execution = LayerExecutor::lock_execution();
   const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
   const uint32_t hidden_size = _cfg.lm_cfg.hidden_size;
   const auto mask_token =
@@ -284,7 +284,7 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
   input_ids.assign(num_tokens, static_cast<uint32_t>(mask_token));
   input_ids.front() = anchor_token;
 
-  const auto embedding = LanguageExecutor::stage_tokens(*this, target_lm, input_ids, num_tokens);
+  const auto embedding = LayerExecutor::stage_tokens(*this, target_lm, input_ids, num_tokens);
   auto& input = *embedding.values;
   auto* input_scale = embedding.scales;
 
@@ -303,7 +303,7 @@ const std::vector<uint32_t> &LanguageModel::_run_dflash_draft(
     if (layer_idx == 0) {
       pre_inputs.emplace(0, MLABufferSlice{&input, {0, 0}, {num_tokens, hidden_size}});
     }
-    LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_scale, 0,
+    LayerExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_scale, 0,
         {.input = &pre_inputs, .post_input = layer_idx == 0 ? &pre_inputs : nullptr});
   }
   MLAModelWithBuffer::run_queue();
@@ -330,14 +330,14 @@ std::pair<uint16_t, uint32_t>
 LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
                                          uint16_t token_idx,
                                          DFlashScratch &scratch) {
-  auto execution = LanguageExecutor::lock_execution();
+  auto execution = LayerExecutor::lock_execution();
   const uint16_t num_tokens = _cfg.lm_cfg.get_single_num_tokens();
   if (input_ids.size() != num_tokens) {
     throw std::invalid_argument(
         "DFlash verification input must match the block size");
   }
   _workspace->dflash_resolved_prefix = 0;
-  const auto embedding = LanguageExecutor::stage_tokens(*this, *this, input_ids, num_tokens);
+  const auto embedding = LayerExecutor::stage_tokens(*this, *this, input_ids, num_tokens);
   auto& input = *embedding.values;
   auto* input_scale = embedding.scales;
 
@@ -376,7 +376,7 @@ LanguageModel::_run_dflash_target_verify(std::span<const uint32_t> input_ids,
     if (!is_attention(layer_type) && layer_type != LayerType::LinearAttention) {
       throw std::runtime_error(fmt::format("Unsupported DFlash target layer type: {}", layer_type_name(layer_type)));
     }
-    LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_scale, 0,
+    LayerExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_scale, 0,
         {.input = input_overrides, .post_input = input_overrides, .output = output_overrides});
 
     layer_input = capture_buffer;

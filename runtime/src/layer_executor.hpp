@@ -6,7 +6,7 @@
 
 namespace simaai::llima {
 
-class LanguageExecutor {
+class LayerExecutor {
   public:
     using Overrides = std::map<uint8_t, MLABufferSlice>;
     struct EmbeddingInput {

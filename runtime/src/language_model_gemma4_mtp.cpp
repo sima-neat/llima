@@ -13,7 +13,7 @@
 
 #include "gemma4_mtp_helpers.hpp"
 #include "language_model.hpp"
-#include "language_model_executor.hpp"
+#include "layer_executor.hpp"
 #include "language_model_state.hpp"
 
 namespace simaai {
@@ -265,7 +265,7 @@ void LanguageModel::_upload_gemma4_mtp_causal_mask(
 LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_batch(
     uint16_t token_idx, std::span<const uint32_t> token_ids
 ) {
-    auto execution = LanguageExecutor::lock_execution();
+    auto execution = LayerExecutor::lock_execution();
     const uint16_t verification_width = _cfg.lm_cfg.get_single_num_tokens();
     const uint16_t valid_tokens = checked_u16(token_ids.size(), "Gemma4 MTP target batch");
     const uint16_t num_tokens = verification_width;
@@ -286,14 +286,14 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
     _upload_gemma4_mtp_freq_rows(num_tokens, token_idx, num_tokens);
     std::array<bool, 2> mask_uploaded{};
 
-    const auto embedding = LanguageExecutor::stage_tokens(*this, *this, token_ids, num_tokens);
+    const auto embedding = LayerExecutor::stage_tokens(*this, *this, token_ids, num_tokens);
     auto& input_embeds_buf = *embedding.values;
     auto* input_embedding_scales_buf = embedding.scales;
 
     if (_uses_per_layer_inputs()) {
         _upload_per_layer_embedding_rows(token_ids, num_tokens, valid_tokens);
 
-        auto inputs = LanguageExecutor::per_layer_inputs(*this, &input_embeds_buf,
+        auto inputs = LayerExecutor::per_layer_inputs(*this, &input_embeds_buf,
             input_embedding_scales_buf, 0, num_tokens);
         _workspace->per_layer_model_map.at({num_tokens, 0, 0}).run(&inputs);
     }
@@ -315,9 +315,9 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
         auto& post_model = _workspace->post_model_map.at(model_key);
 
         const bool is_sliding = layer_type == LayerType::SlidingAttention;
-        LanguageExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
+        LayerExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
             input_embedding_scales_buf, 0, 0);
-        LanguageExecutor::bind_kv_outputs(*this, pre_model, layer_idx, token_idx);
+        LayerExecutor::bind_kv_outputs(*this, pre_model, layer_idx, token_idx);
 
         const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
             num_tokens, token_idx, layer_type
@@ -357,7 +357,7 @@ LanguageModel::Gemma4MtpTargetBatchResult LanguageModel::_run_gemma4_mtp_target_
             );
         }
 
-        LanguageExecutor::queue_attention({pre_model, cache_model, post_model},
+        LayerExecutor::queue_attention({pre_model, cache_model, post_model},
             {.input = &ifm_map, .cache = &cache_ifm_map, .post_input = &ifm_map});
     }
 
@@ -381,7 +381,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
     uint16_t query_position_id,
     uint16_t shared_kv_len
 ) {
-    auto execution = LanguageExecutor::lock_execution();
+    auto execution = LayerExecutor::lock_execution();
     const uint32_t backbone_hidden_size = _cfg.lm_cfg.speculative_decoding_cfg->backbone_hidden_size;
     if (hidden_state.size() != backbone_hidden_size) {
         throw std::runtime_error(fmt::format(
@@ -431,7 +431,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
         auto& post_model = _workspace->post_model_map.at(model_key);
 
         const bool is_sliding = layer_type == LayerType::SlidingAttention;
-        LanguageExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
+        LayerExecutor::bind_attention_inputs(*this, pre_model, post_model, layer_idx,
             nullptr, 0, 0);
 
         const uint16_t cache_token_idx_begin = _get_cache_token_idx_begin(
@@ -474,7 +474,7 @@ LanguageModel::Gemma4MtpDraftStepResult LanguageModel::_run_gemma4_mtp_draft_ste
             ifm_map_ptr = &layer0_ifm_map;
         }
 
-        LanguageExecutor::queue_attention({pre_model, cache_model, post_model},
+        LayerExecutor::queue_attention({pre_model, cache_model, post_model},
             {.input = ifm_map_ptr, .cache = &cache_ifm_map, .post_input = ifm_map_ptr});
     }
 

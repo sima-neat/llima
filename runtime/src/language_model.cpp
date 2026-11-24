@@ -21,9 +21,9 @@
 #include "eagle_helpers.hpp"
 #include "gemma4_mtp_helpers.hpp"
 #include "language_model.hpp"
-#include "language_model_executor.hpp"
+#include "layer_executor.hpp"
 #include "language_model_state.hpp"
-#include "language_request.hpp"
+#include "request_scope.hpp"
 #include "utils.hpp"
 
 namespace simaai {
@@ -117,15 +117,15 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer,
     std::shared_ptr<FileProvider> file_provider
-) : _resources(LanguageResources::acquire(model_path, std::move(file_provider))),
+) : _resources(LanguageAssets::acquire(model_path, std::move(file_provider))),
     _cfg(_resources->cfg),
     _elf_dir(_resources->package->elf_dir),
     _devkit_dir(_resources->package->devkit_dir),
     _files(_resources->package->files),
     _logger(_resources->package->logger),
-    _cache(std::make_unique<LanguageCache>()),
+    _cache(std::make_unique<SequenceCache>()),
     _workspace(std::make_unique<LanguageWorkspace>()),
-    _run(std::make_unique<LanguageRunState>(std::move(stop_token_ids),
+    _run(std::make_unique<RequestControl>(std::move(stop_token_ids),
         _cfg.pipeline_cfg.max_num_tokens, text_streamer)),
     _image_token_id(image_token_id),
     _pad_token_id(pad_token_id)
@@ -339,7 +339,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         if (performance) *performance = {};
         return std::nullopt;
     }
-    LanguageRequest request(*this, nullptr, {}, stop, std::move(override_stop_token_ids));
+    RequestScope request(*this, nullptr, {}, stop, std::move(override_stop_token_ids));
     auto output = _generate_tokens(request, input_token_ids, override_max_num_tokens,
                                    timer_ttft, performance, stable_prefix_token_count);
     request.finish();
@@ -347,7 +347,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
 }
 
 std::optional<std::vector<uint32_t>> LanguageModel::_generate_tokens(
-    LanguageRequest& request, std::span<const uint32_t> ids, std::optional<uint16_t> limit,
+    RequestScope& request, std::span<const uint32_t> ids, std::optional<uint16_t> limit,
     std::optional<ChronoTimer> timer, GenerationPerformanceResult* performance, uint16_t stable_prefix
 ) {
     if (request.cancelled()) {
@@ -436,7 +436,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         if (performance_result) *performance_result = {};
         return std::nullopt;
     }
-    LanguageRequest request(*this, &draft_lm, {}, stop);
+    RequestScope request(*this, &draft_lm, {}, stop);
     auto output = _generate_tokens(request, input_token_ids, override_max_num_tokens, timer_ttft,
                                    performance_result, stable_prefix_token_count);
     request.finish();
@@ -661,7 +661,7 @@ LogLikelihoodResult LanguageModel::run_model_for_loglikelihood(
     std::span<const uint32_t> continuation_token_ids,
     bool use_group_prefill
 ) {
-    LanguageRequest request(*this);
+    RequestScope request(*this);
     auto result = _score(input_token_ids, continuation_start, continuation_token_ids, use_group_prefill);
     request.finish();
     return result;
@@ -794,7 +794,7 @@ LogLikelihoodResult LanguageModel::_score(
 void LanguageModel::_run_model_once_for_loglikelihood_logits(
     uint16_t token_idx, uint32_t input_token_id
 ) {
-    auto execution = LanguageExecutor::lock_execution();
+    auto execution = LayerExecutor::lock_execution();
     constexpr uint16_t num_tokens = 1;
     const uint16_t next_token_idx = token_idx + 1;
     _logger->info("Processing token no. {}-{}", token_idx, next_token_idx);
@@ -808,20 +808,20 @@ void LanguageModel::_run_model_once_for_loglikelihood_logits(
     if (_resources->embedding_offload) _gather_embedding_rows({&input_token_id, 1}, *normal_input_buf, normal_scale_buf);
 
     if (_uses_per_layer_inputs()) {
-        auto inputs = LanguageExecutor::per_layer_inputs(*this, normal_input_buf,
+        auto inputs = LayerExecutor::per_layer_inputs(*this, normal_input_buf,
             normal_scale_buf, normal_input_row, 1, input_token_id);
         _workspace->per_layer_model_map.at({num_tokens, 0, 0}).add_to_queue(&inputs);
     }
 
     for (uint8_t layer = 0; layer < _cfg.lm_cfg.num_hidden_layers; ++layer) {
-        LanguageExecutor::Overrides inputs;
+        LayerExecutor::Overrides inputs;
         if (layer == 0) {
             inputs.emplace(0, MLABufferSlice{normal_input_buf, {normal_input_row, 0},
                                              {1, _cfg.lm_cfg.hidden_size}});
         }
         const auto output = layer + 1 == _cfg.lm_cfg.num_hidden_layers
-            ? LanguageExecutor::LayerOutput::LogitsRow : LanguageExecutor::LayerOutput::AllRows;
-        LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer, normal_scale_buf,
+            ? LayerExecutor::LayerOutput::LogitsRow : LayerExecutor::LayerOutput::AllRows;
+        LayerExecutor::queue_layer(*this, num_tokens, token_idx, layer, normal_scale_buf,
                                       normal_input_row, {.input = &inputs, .post_input = &inputs}, output);
     }
 
@@ -928,7 +928,7 @@ uint32_t LanguageModel::run_model_once(
     uint32_t token_id,
     std::vector<Eigen::bfloat16>* logits_ptr
 ) {
-    auto execution = LanguageExecutor::lock_execution();
+    auto execution = LayerExecutor::lock_execution();
     if (token_idx == 0 && logits_ptr)
         _prepare_state_checkpoints_for_prefill(0);
 
@@ -964,7 +964,7 @@ uint32_t LanguageModel::run_model_once(
     }
 
     if (_uses_per_layer_inputs()) {
-        auto inputs = LanguageExecutor::per_layer_inputs(*this, normal_input_buf,
+        auto inputs = LayerExecutor::per_layer_inputs(*this, normal_input_buf,
             normal_scale_buf, normal_input_row, normal_input_num_tokens,
             use_input_tokens ? std::nullopt : std::optional<uint32_t>(token_id));
         _workspace->per_layer_model_map.at({num_tokens, 0, 0}).add_to_queue(&inputs);
@@ -984,11 +984,11 @@ uint32_t LanguageModel::run_model_once(
     );
     MLABuffer* dflash_layer_input = nullptr;
     const auto final_output = num_input_tokens > next_token_idx
-        ? LanguageExecutor::LayerOutput::CacheOnly : LanguageExecutor::LayerOutput::LogitsRow;
+        ? LayerExecutor::LayerOutput::CacheOnly : LayerExecutor::LayerOutput::LogitsRow;
     const uint16_t last_row = next_token_idx - token_idx - 1;
     for (uint8_t layer_idx = 0; layer_idx < _cfg.lm_cfg.num_hidden_layers; ++layer_idx) {
         const bool last_layer = layer_idx + 1 == _cfg.lm_cfg.num_hidden_layers;
-        LanguageExecutor::Overrides inputs;
+        LayerExecutor::Overrides inputs;
         if (layer_idx == 0) {
             inputs.emplace(0, MLABufferSlice{normal_input_buf, {normal_input_row, 0},
                                              {normal_input_num_tokens, _cfg.lm_cfg.hidden_size}});
@@ -999,14 +999,14 @@ uint32_t LanguageModel::run_model_once(
 
         MLABuffer* dflash_capture_buffer = direct_dflash_capture && !last_layer
             ? _get_dflash_hidden_buffer(num_tokens, layer_idx) : nullptr;
-        LanguageExecutor::Overrides outputs;
+        LayerExecutor::Overrides outputs;
         if (dflash_capture_buffer) {
             outputs.emplace(0, MLABufferSlice{dflash_capture_buffer, {0, 0},
                                               {num_tokens, _cfg.lm_cfg.hidden_size}});
         }
-        LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, normal_scale_buf,
+        LayerExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, normal_scale_buf,
             normal_input_row, {.input = &inputs, .post_input = &inputs, .output = &outputs},
-            last_layer ? final_output : LanguageExecutor::LayerOutput::AllRows, last_row);
+            last_layer ? final_output : LayerExecutor::LayerOutput::AllRows, last_row);
         dflash_layer_input = dflash_capture_buffer;
 
         if (
@@ -1082,7 +1082,7 @@ uint32_t LanguageModel::run_model_once(
     uint32_t next_token_id;
     if (num_input_tokens <= next_token_idx) {
         if (_cfg.lm_cfg.is_spec_decode()) {
-            const auto window = LanguageExecutor::logits_window(_cfg.lm_cfg, num_tokens, last_row);
+            const auto window = LayerExecutor::logits_window(_cfg.lm_cfg, num_tokens, last_row);
             const uint32_t row = last_row - window.first;
             const uint16_t logits_num_tokens = window.width;
             const uint32_t vocab_size = _cfg.lm_cfg.get_lm_head_output_size();
@@ -1523,7 +1523,7 @@ void LanguageModel::set_image_identity(std::string identity) {
     }
 }
 
-void LanguageModel::_bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter) {
+void LanguageModel::_bind_adapter(const std::shared_ptr<LoRAAdapter>& adapter) {
     if (_workspace->bound_adapter == adapter) return;
     std::lock_guard lock(RuntimeContext::instance().execution_mutex);
     using Buffers = std::map<std::string, MLABuffer*>;
@@ -1587,7 +1587,7 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
     const auto found = _resources->adapters.find(reloc_name);
     auto adapter = found == _resources->adapters.end() ? nullptr : found->second.lock();
     if (!adapter) {
-        adapter = std::make_shared<LanguageAdapter>();
+        adapter = std::make_shared<LoRAAdapter>();
         adapter->name = reloc_name;
         const auto directory = _devkit_dir.parent_path() / "npy_files" / reloc_name;
         std::map<std::string, size_t> active_graphs;

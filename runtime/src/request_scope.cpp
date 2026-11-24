@@ -1,14 +1,14 @@
-#include "language_request.hpp"
+#include "request_scope.hpp"
 
 namespace simaai::llima {
 
-LanguageRequest::LanguageRequest(LanguageModel& target, LanguageModel* draft,
-                                 TextStreamer::RequestOptions stream, std::stop_token stop,
-                                 std::optional<std::set<uint32_t>> stop_ids)
+RequestScope::RequestScope(LanguageModel& target, LanguageModel* draft,
+                           TextStreamer::RequestOptions stream, std::stop_token stop,
+                           std::optional<std::set<uint32_t>> stop_ids)
     : _target(target), _draft(draft),
       _request{{stop_ids ? std::move(*stop_ids) : target._run->defaults.stop_token_ids,
                 target._run->defaults.max_num_tokens}, std::move(stop),
-               LanguageRequestState::Interrupt(target._run->interrupts), std::nullopt} {
+               RequestState::Interrupt(target._run->interrupts), std::nullopt} {
     if (target._run->active || (draft && draft->_run->active))
         throw std::logic_error("Language model already has an active request");
     if (draft) {
@@ -26,13 +26,13 @@ LanguageRequest::LanguageRequest(LanguageModel& target, LanguageModel* draft,
     }
 }
 
-void LanguageRequest::finish() {
+void RequestScope::finish() {
     _target._run->text_streamer.finish();
     _cancelled_at_finish = _request.cancelled();
     _completed = true;
 }
 
-LanguageRequest::~LanguageRequest() {
+RequestScope::~RequestScope() {
     if (!_completed) {
         MLAModelWithBuffer::discard_queue();
         // Preserve the original exception while releasing request callbacks.

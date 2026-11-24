@@ -8,24 +8,24 @@
 
 namespace simaai::llima {
 
-struct LanguageAdapter {
+struct LoRAAdapter {
     std::string name;
     std::map<std::string, MLABuffer> buffers;
     std::map<size_t, std::map<std::string, MLABuffer*>> bindings; // Runtime program index -> sections.
 };
 
-struct LanguageResources {
-    explicit LanguageResources(std::shared_ptr<ModelResources<VlmConfig>> value)
+struct LanguageAssets {
+    explicit LanguageAssets(std::shared_ptr<ModelResources<VlmConfig>> value)
         : package(std::move(value)), cfg(package->cfg) {}
-    static std::shared_ptr<LanguageResources> acquire(const std::filesystem::path& path,
-                                                      std::shared_ptr<FileProvider> files);
+    static std::shared_ptr<LanguageAssets> acquire(const std::filesystem::path& path,
+                                                   std::shared_ptr<FileProvider> files);
     std::shared_ptr<ModelResources<VlmConfig>> package;
     const VlmConfig& cfg;
     void prepare_embeddings();
     void load();
     void load_per_layer_embeddings();
     bool ready = false;
-    std::map<std::string, std::weak_ptr<LanguageAdapter>> adapters;
+    std::map<std::string, std::weak_ptr<LoRAAdapter>> adapters;
     std::map<std::string, MLABuffer> buffers;
     std::shared_ptr<EmbeddingOffload> embedding_offload;
     RopeTable master_rope_table;
@@ -37,7 +37,7 @@ struct LanguageResources {
     std::vector<uint32_t> gemma4_token_ordering;
 };
 
-struct LanguageCache {
+struct SequenceCache {
     void invalidate_reuse();
     std::map<std::string, MLABuffer> buffers;
     std::vector<uint32_t> cached_token_ids;
@@ -51,7 +51,7 @@ struct LanguageCache {
     size_t cached_eagle3_stable_kv = 0;
     uint16_t kv_cache_len = 0; // tokens in KV cache;
     std::vector<uint16_t> checkpoint_boundaries;
-    std::vector<LanguageModel::CachedState> cached_states;
+    std::vector<LanguageModel::RecurrentCheckpoints> cached_states;
     // Zero marks an unused slot. Slot 0 is reserved for a stable system/tool prefix.
     std::array<uint16_t, LanguageModel::checkpoint_slot_count> state_checkpoint_positions{};
     std::string image_identity;
@@ -73,7 +73,7 @@ struct LanguageWorkspace {
         eagle3_tree_mask.reset();
         eagle3_stable_kv = 0;
     }
-    std::shared_ptr<LanguageAdapter> bound_adapter;
+    std::shared_ptr<LoRAAdapter> bound_adapter;
     // A target and its current draft share this identity. Reusing either runner with a
     // different partner requires a cold prefill on both sides.
     struct SpeculativePair {};
@@ -117,7 +117,7 @@ struct LanguageWorkspace {
     size_t eagle3_stable_kv = 0;
 };
 
-struct LanguageLimits {
+struct TokenLimits {
     std::set<uint32_t> stop_token_ids;
     uint16_t max_num_tokens;
 };
@@ -127,7 +127,7 @@ struct LanguageLimits {
 using InterruptCounter = std::atomic<uint64_t>;
 static_assert(InterruptCounter::is_always_lock_free);
 
-struct LanguageRequestState {
+struct RequestState {
     struct Interrupt {
         explicit Interrupt(const InterruptCounter& counter)
             : counter(counter), initial(counter.load(std::memory_order_relaxed)) {}
@@ -136,7 +136,7 @@ struct LanguageRequestState {
         uint64_t initial;
     };
 
-    LanguageLimits limits;
+    TokenLimits limits;
     std::stop_token stop;
     Interrupt target_interrupt;
     std::optional<Interrupt> draft_interrupt;
@@ -148,21 +148,23 @@ struct LanguageRequestState {
     }
 };
 
-struct LanguageRunState {
-    LanguageRunState(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
+// Holds request defaults, the streamer, interrupts, and the active request;
+// also tracks cancellation across standalone prefill/decode calls.
+struct RequestControl {
+    RequestControl(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
         : defaults{std::move(stops), limit}, text_streamer(streamer) {}
 
-    LanguageLimits& limits() { return active ? active->limits : defaults; }
+    TokenLimits& limits() { return active ? active->limits : defaults; }
     bool cancelled() const {
         return active ? active->cancelled() : interrupts.load(std::memory_order_relaxed) != standalone_start;
     }
 
-    LanguageLimits defaults;
+    TokenLimits defaults;
     TextStreamer& text_streamer;
     InterruptCounter interrupts{0};
     uint64_t standalone_start = 0; // Shared by a standalone prefill/decode pair.
     // Only the serialized execution thread uses this pointer. stop_model() touches only interrupts.
-    LanguageRequestState* active = nullptr;
+    RequestState* active = nullptr;
 };
 
 } // namespace simaai::llima

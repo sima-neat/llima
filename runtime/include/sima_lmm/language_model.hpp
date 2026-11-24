@@ -33,13 +33,13 @@ namespace simaai {
 namespace llima {
 
 struct EmbeddingOffload;
-struct LanguageResources;
-struct LanguageAdapter;
-struct LanguageCache;
+struct LanguageAssets;
+struct LoRAAdapter;
+struct SequenceCache;
 struct LanguageWorkspace;
-struct LanguageRunState;
-class LanguageExecutor;
-class LanguageRequest;
+struct RequestControl;
+class LayerExecutor;
+class RequestScope;
 // Pre/post maps use (num_tokens, layer_idx, 0). Cache maps use
 // (num_tokens, cache_kind, aligned_cache_token_idx).
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
@@ -293,14 +293,14 @@ class LanguageModel {
         void set_kv_cache_len(uint16_t len);
 
     private:
-        friend struct LanguageResources;
-        friend struct LanguageCache;
+        friend struct LanguageAssets;
+        friend struct SequenceCache;
         friend struct LanguageWorkspace;
         friend class VisionLanguageModel;
-        friend class LanguageRequest;
-        friend class LanguageExecutor;
+        friend class RequestScope;
+        friend class LayerExecutor;
         std::optional<std::vector<uint32_t>> _generate_tokens(
-            LanguageRequest& request, std::span<const uint32_t> ids,
+            RequestScope& request, std::span<const uint32_t> ids,
             std::optional<uint16_t> limit, std::optional<ChronoTimer> timer,
             GenerationPerformanceResult* performance, uint16_t stable_prefix);
         std::optional<std::vector<uint32_t>> _run_model_ordinary(
@@ -313,18 +313,18 @@ class LanguageModel {
             std::span<const uint32_t> continuation_ids, bool use_group_prefill);
         void invalidate_prompt_reuse();
         void _validate_eagle3_target() const;
-        void _bind_adapter(const std::shared_ptr<LanguageAdapter>& adapter);
+        void _bind_adapter(const std::shared_ptr<LoRAAdapter>& adapter);
         void set_image_identity(std::string identity);
 
-        std::shared_ptr<LanguageResources> _resources;
+        std::shared_ptr<LanguageAssets> _resources;
         const VlmConfig& _cfg;
         const std::filesystem::path& _elf_dir;
         const std::filesystem::path& _devkit_dir;
         const std::shared_ptr<FileProvider>& _files;
         std::shared_ptr<spdlog::logger> _logger;
-        std::unique_ptr<LanguageCache> _cache;
+        std::unique_ptr<SequenceCache> _cache;
         std::unique_ptr<LanguageWorkspace> _workspace;
-        std::unique_ptr<LanguageRunState> _run;
+        std::unique_ptr<RequestControl> _run;
 
         void define_buffer(const std::string& name, const std::vector<size_t>& shape,
                            const std::string& dtype = "bfloat16", bool align_last_dim = true);
@@ -399,8 +399,8 @@ class LanguageModel {
             bool prefill_single_output = false;
         };
         static constexpr size_t checkpoint_slot_count = 4;
-        struct CachedState {
-            explicit CachedState(const CheckpointLayout& description)
+        struct RecurrentCheckpoints {
+            explicit RecurrentCheckpoints(const CheckpointLayout& description)
                 : layout(description), checkpoints(layout.layer_indices.size()) {}
             CheckpointLayout layout;
             // Each occupied slot owns the snapshot for one layer at one sequence position.

@@ -13,8 +13,8 @@ void require(bool value, const char* message) {
 void check_cancellation() {
     InterruptCounter target{0}, draft{0};
     auto request = [&](std::stop_token token) {
-        return LanguageRequestState{{{}, 32}, token, LanguageRequestState::Interrupt(target),
-                                    LanguageRequestState::Interrupt(draft)};
+        return RequestState{{{}, 32}, token, RequestState::Interrupt(target),
+                            RequestState::Interrupt(draft)};
     };
     std::stop_source first, second;
     auto a = request(first.get_token());

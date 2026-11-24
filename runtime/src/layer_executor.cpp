@@ -1,4 +1,4 @@
-#include "language_model_executor.hpp"
+#include "layer_executor.hpp"
 #include "language_model_state.hpp"
 #include <fmt/format.h>
 #include <exception>
@@ -8,7 +8,7 @@
 
 namespace simaai::llima {
 
-LanguageExecutor::EmbeddingInput LanguageExecutor::stage_tokens(LanguageModel& model,
+LayerExecutor::EmbeddingInput LayerExecutor::stage_tokens(LanguageModel& model,
                                                                 LanguageModel& source,
                                                                 std::span<const uint32_t> ids,
                                                                 uint16_t width,
@@ -25,7 +25,7 @@ LanguageExecutor::EmbeddingInput LanguageExecutor::stage_tokens(LanguageModel& m
     return {values, scales};
 }
 
-LanguageExecutor::Overrides LanguageExecutor::per_layer_inputs(LanguageModel& model,
+LayerExecutor::Overrides LayerExecutor::per_layer_inputs(LanguageModel& model,
                                                                MLABuffer* values, MLABuffer* scales,
                                                                uint32_t row, uint16_t rows,
                                                                std::optional<uint32_t> token) {
@@ -59,7 +59,7 @@ LanguageExecutor::Overrides LanguageExecutor::per_layer_inputs(LanguageModel& mo
     return inputs;
 }
 
-void LanguageExecutor::bind_attention_inputs(LanguageModel& model, MLAModelWithBuffer& pre,
+void LayerExecutor::bind_attention_inputs(LanguageModel& model, MLAModelWithBuffer& pre,
                                              MLAModelWithBuffer& post, uint8_t layer,
                                              MLABuffer* scales, uint32_t scale_row,
                                              uint16_t rope_row) {
@@ -83,7 +83,7 @@ void LanguageExecutor::bind_attention_inputs(LanguageModel& model, MLAModelWithB
                   {rope_row, 0});
 }
 
-void LanguageExecutor::bind_kv_outputs(LanguageModel& model, MLAModelWithBuffer& pre, uint8_t layer,
+void LayerExecutor::bind_kv_outputs(LanguageModel& model, MLAModelWithBuffer& pre, uint8_t layer,
                                        uint16_t position) {
     if (model._cfg.lm_cfg.is_kv_shared_layer(layer))
         return;
@@ -104,7 +104,7 @@ void LanguageExecutor::bind_kv_outputs(LanguageModel& model, MLAModelWithBuffer&
         pre._bind_ofm(port, buffers.value_scale, {0, position, 0});
 }
 
-LanguageExecutor::Overrides LanguageExecutor::post_rows(LanguageModel& model, uint16_t width,
+LayerExecutor::Overrides LayerExecutor::post_rows(LanguageModel& model, uint16_t width,
                                                         uint8_t layer, uint16_t position,
                                                         uint32_t first, uint16_t rows,
                                                         MLABuffer* hidden) {
@@ -133,20 +133,20 @@ LanguageExecutor::Overrides LanguageExecutor::post_rows(LanguageModel& model, ui
     return inputs;
 }
 
-LanguageExecutor::LogitsWindow LanguageExecutor::logits_window(const LanguageModelConfig& cfg,
+LayerExecutor::LogitsWindow LayerExecutor::logits_window(const LanguageModelConfig& cfg,
                                                               uint16_t width, uint16_t row) {
     const uint16_t post_width = cfg.is_speculative_draft() || width == 1 ? width : cfg.get_single_num_tokens();
     const uint16_t first = row >= post_width ? row + 1 - post_width : 0;
     return {first, post_width};
 }
 
-void LanguageExecutor::queue_attention(AttentionPrograms models, LayerBindings bindings) {
+void LayerExecutor::queue_attention(AttentionPrograms models, LayerBindings bindings) {
     models.pre.add_to_queue(bindings.input);
     models.cache.add_to_queue(bindings.cache);
     models.post.add_to_queue(bindings.post_input, bindings.output);
 }
 
-void LanguageExecutor::queue_layer(LanguageModel& model, uint16_t width, uint16_t position,
+void LayerExecutor::queue_layer(LanguageModel& model, uint16_t width, uint16_t position,
                                    uint8_t layer, MLABuffer* scales, uint32_t scale_row,
                                    LayerBindings bindings, LayerOutput output, uint16_t logit_row) {
     const auto& cfg = model._cfg.lm_cfg;
@@ -197,7 +197,7 @@ void LanguageExecutor::queue_layer(LanguageModel& model, uint16_t width, uint16_
     }
 }
 
-LanguageExecutor::AttentionPrograms LanguageExecutor::bind_attention(
+LayerExecutor::AttentionPrograms LayerExecutor::bind_attention(
     LanguageModel& model, uint16_t num_tokens, uint16_t token_idx, uint8_t layer_idx,
     MLABuffer* embedding_scale_buf, uint32_t embedding_scale_row) {
     const auto& cfg = model._cfg;
@@ -416,7 +416,7 @@ LanguageModel::_argmax_lm_head_rows(uint16_t num_tokens, uint16_t valid_tokens,
     return best_indices;
 }
 
-std::unique_lock<std::recursive_mutex> LanguageExecutor::lock_execution() {
+std::unique_lock<std::recursive_mutex> LayerExecutor::lock_execution() {
     return std::unique_lock(RuntimeContext::instance().execution_mutex);
 }
 

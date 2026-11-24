@@ -6,7 +6,7 @@
 
 namespace simaai::llima {
 
-void LanguageCache::invalidate_reuse() {
+void SequenceCache::invalidate_reuse() {
     cached_token_ids.clear();
     cached_first_generated_token = 0;
     cached_draft_tokens.clear();

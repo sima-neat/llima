@@ -36,7 +36,7 @@
 #include <fmt/ranges.h>
 
 #include "language_model.hpp"
-#include "language_model_executor.hpp"
+#include "layer_executor.hpp"
 #include "language_model_state.hpp"
 #include "utils.hpp"
 
@@ -56,7 +56,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     int num_cached_tokens,
     bool is_prefill
 ) {
-    auto execution = LanguageExecutor::lock_execution();
+    auto execution = LayerExecutor::lock_execution();
     const size_t seq_length = input_ids.size();
     const uint16_t num_tokens = is_prefill ? 128 : 5;
     size_t seq_len_with_past = seq_length;
@@ -185,7 +185,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     }
     // Stage token embeds and, when quantized, their per-row dynamic-dequant scales.
     const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
-    const auto embedding = LanguageExecutor::stage_tokens(*this, target_lm, input_ids, num_tokens);
+    const auto embedding = LayerExecutor::stage_tokens(*this, target_lm, input_ids, num_tokens);
     auto& token_embeds_buf = *embedding.values;
     auto* token_embedding_scales_buf = embedding.scales;
 
@@ -246,7 +246,7 @@ LanguageModel::DraftForwardResult LanguageModel::run_eagle3_draft_model(
     // (same buffer pre_model used as IFM[1]); IFM[1] is statically wired.
     std::map<uint8_t, MLABufferSlice> post_ifm_map;
     post_ifm_map.emplace(0, MLABufferSlice{&fc_output_buf});
-    LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, token_embedding_scales_buf,
+    LayerExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, token_embedding_scales_buf,
                                   0, {.input = &pre_ifm_map, .post_input = &post_ifm_map});
 
     // Download both outputs: hidden_states (n{N}_buffer5) and logits
@@ -291,7 +291,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
     std::vector<uint32_t> input_ids,
     std::vector<int32_t> position_ids
 ) {
-    auto execution = LanguageExecutor::lock_execution();
+    auto execution = LayerExecutor::lock_execution();
     if (_run->cancelled())
         return {};
 
@@ -365,7 +365,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
 
     // Stage arbitrary candidate rows into the dtype expected by layer 0.
     const bool use_int8_embedding_staging = _cfg.pipeline_cfg.quantize_embeddings;
-    const auto embedding = LanguageExecutor::stage_tokens(*this, *this, input_ids, num_tokens, &get_buffer("input_embeds"));
+    const auto embedding = LayerExecutor::stage_tokens(*this, *this, input_ids, num_tokens, &get_buffer("input_embeds"));
     auto& input_embeds_buf = *embedding.values;
     auto* input_embedding_scales_buf = embedding.scales;
 
@@ -421,7 +421,7 @@ LanguageModel::TargetVerifyResult LanguageModel::run_eagle3_target_verify(
             )
         );
 
-        LanguageExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_embedding_scales_buf,
+        LayerExecutor::queue_layer(*this, num_tokens, token_idx, layer_idx, input_embedding_scales_buf,
                                       0, {.input = &pre_ifm_map, .post_input = &ifm_map});
 
         // post_model.ofms[0] writes n{N}_buffer1 (next layer's IFM[0]), so

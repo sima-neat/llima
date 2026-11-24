@@ -8,7 +8,7 @@
 #include "utils.hpp"
 #include "vision_language_model.hpp"
 #include "language_model_state.hpp"
-#include "language_request.hpp"
+#include "request_scope.hpp"
 #include "vision_model.hpp"
 #include "vlm_helper.hpp"
 
@@ -22,10 +22,10 @@ struct EncodedImageData {
 };
 
 // Language execution state retained independently of the vision facade.
-struct LanguageRunnerState {
+struct LanguageRuntime {
     friend class VisionLanguageModel;
-    LanguageRunnerState(std::filesystem::path path, std::shared_ptr<FileProvider> provider,
-                        std::optional<std::string> system, std::optional<std::string> chat_template)
+    LanguageRuntime(std::filesystem::path path, std::shared_ptr<FileProvider> provider,
+                    std::optional<std::string> system, std::optional<std::string> chat_template)
         : resources(ModelResources<VlmConfig>::acquire(path, std::move(provider))),
           _cfg(resources->cfg), _files(resources->files),
           vlm_helper(_cfg, *_files, std::move(system), std::move(chat_template)),
@@ -40,7 +40,7 @@ struct LanguageRunnerState {
     std::unique_ptr<LanguageModel> language_model_ptr;
     std::mutex run_mutex;
     mutable std::mutex defaults_mutex;
-    std::shared_ptr<LanguageRunnerState> draft;
+    std::shared_ptr<LanguageRuntime> draft;
 };
 
 namespace {
@@ -48,18 +48,18 @@ namespace {
 // Keeps both language runtimes alive and exclusively available to this caller.
 class ModelLock {
   public:
-    explicit ModelLock(std::shared_ptr<LanguageRunnerState> target);
+    explicit ModelLock(std::shared_ptr<LanguageRuntime> target);
     LanguageModel& target() const { return *_target->language_model_ptr; }
     LanguageModel* draft() const { return _draft ? _draft->language_model_ptr.get() : nullptr; }
 
   private:
-    std::shared_ptr<LanguageRunnerState> _target;
-    std::shared_ptr<LanguageRunnerState> _draft;
+    std::shared_ptr<LanguageRuntime> _target;
+    std::shared_ptr<LanguageRuntime> _draft;
     std::unique_lock<std::mutex> _target_lock;
     std::unique_lock<std::mutex> _draft_lock;
 };
 
-ModelLock::ModelLock(std::shared_ptr<LanguageRunnerState> target)
+ModelLock::ModelLock(std::shared_ptr<LanguageRuntime> target)
     : _target(std::move(target)), _target_lock(_target->run_mutex, std::defer_lock) {
     for (;;) {
         _target_lock.lock();
@@ -168,7 +168,7 @@ VisionLanguageModel::VisionLanguageModel(
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
     std::shared_ptr<FileProvider> file_provider
-) : _state(std::make_shared<LanguageRunnerState>(model_path, file_provider, system_prompt, chat_template))
+) : _state(std::make_shared<LanguageRuntime>(model_path, file_provider, system_prompt, chat_template))
 {
     _state->tool_call_format = tool_call_format_for_model(_state->_cfg.model_type);
     if (_state->_cfg.support_image()) {
@@ -234,8 +234,8 @@ ChatResult VisionLanguageModel::generate(const Chat& chat, const GenerationOptio
 
     auto markers = _state->structural_tokens(chat);
     if (!options.preserve_structural_tokens) markers.clear();
-    LanguageRequest request(models.target(), models.draft(), stream_options(options, markers, true),
-                            options.stop, options.stop_token_ids);
+    RequestScope request(models.target(), models.draft(), stream_options(options, markers, true),
+                         options.stop, options.stop_token_ids);
 
     ChronoTimer timer_ttft(true);
     auto input = prepare_chat_inputs(request, chat, options);
@@ -272,8 +272,8 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::benchmark_chat(
     if (options.stop.stop_requested()) return std::nullopt;
     auto markers = _state->structural_tokens(chat);
     if (!options.preserve_structural_tokens) markers.clear();
-    LanguageRequest request(models.target(), models.draft(), stream_options(options, markers, true),
-                            options.stop, options.stop_token_ids);
+    RequestScope request(models.target(), models.draft(), stream_options(options, markers, true),
+                         options.stop, options.stop_token_ids);
 
     ChronoTimer timer_ttft(true);
     auto input = prepare_chat_inputs(request, chat, options, &benchmark);
@@ -285,7 +285,7 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::benchmark_chat(
     return request.cancelled() ? std::nullopt : std::move(ids);
 }
 
-PreservedToolCallTokens LanguageRunnerState::structural_tokens(const Chat& chat) {
+PreservedToolCallTokens LanguageRuntime::structural_tokens(const Chat& chat) {
     PreservedToolCallTokens preserved_tokens;
     auto* tokenizer = vlm_helper.get_tokenizer();
     if (chat.has_tools()) {
@@ -316,7 +316,7 @@ PreservedToolCallTokens LanguageRunnerState::structural_tokens(const Chat& chat)
 }
 
 PreprocessedChat VisionLanguageModel::prepare_chat_inputs(
-    LanguageRequest& request, const Chat& chat, const GenerationOptions& options,
+    RequestScope& request, const Chat& chat, const GenerationOptions& options,
     ChatBenchmark* benchmark
 ) {
     if (request.cancelled()) return {};
@@ -413,8 +413,8 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
 ) {
     ModelLock models(_state);
     if (options.stop.stop_requested()) return {};
-    LanguageRequest request(models.target(), models.draft(), stream_options(options),
-                            options.stop, options.stop_token_ids);
+    RequestScope request(models.target(), models.draft(), stream_options(options),
+                         options.stop, options.stop_token_ids);
     if (request.cancelled()) return {};
     auto& language = models.target();
     language.set_image_identity({});
@@ -434,8 +434,8 @@ std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
 ) {
     ModelLock models(_state);
     if (options.stop.stop_requested()) throw std::runtime_error("Scoring request was interrupted");
-    LanguageRequest request(models.target(), models.draft(), stream_options(options),
-                            options.stop, options.stop_token_ids);
+    RequestScope request(models.target(), models.draft(), stream_options(options),
+                         options.stop, options.stop_token_ids);
     if (request.cancelled()) throw std::runtime_error("Scoring request was interrupted");
     auto& language = models.target();
     language.set_image_identity({});
@@ -460,8 +460,8 @@ LogLikelihoodResult VisionLanguageModel::run_model_for_loglikelihood(
 ) {
     ModelLock models(_state);
     if (options.stop.stop_requested()) throw std::runtime_error("Scoring request was interrupted");
-    LanguageRequest request(models.target(), models.draft(), stream_options(options),
-                            options.stop, options.stop_token_ids);
+    RequestScope request(models.target(), models.draft(), stream_options(options),
+                         options.stop, options.stop_token_ids);
     if (request.cancelled()) throw std::runtime_error("Scoring request was interrupted");
     auto& language = models.target();
     language.set_image_identity({});
@@ -480,8 +480,8 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
 ) {
     ModelLock models(_state);
     if (options.stop.stop_requested()) throw std::runtime_error("Performance request was interrupted");
-    LanguageRequest request(models.target(), models.draft(), stream_options(options),
-                            options.stop, options.stop_token_ids);
+    RequestScope request(models.target(), models.draft(), stream_options(options),
+                         options.stop, options.stop_token_ids);
     if (request.cancelled()) throw std::runtime_error("Performance request was interrupted");
     auto& language = models.target();
     language.set_image_identity({});

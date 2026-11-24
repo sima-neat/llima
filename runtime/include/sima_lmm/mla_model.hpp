@@ -20,14 +20,14 @@ class FileProvider;  // forward declaration; full type in file_provider.hpp
 class LanguageModel;
 struct RuntimeProgram;
 struct RuntimeRelocation;
-class LanguageExecutor;
+class LayerExecutor;
 
 void connect_mla_rt(const std::vector<std::string>& args);
 void disconnect_mla_rt();
 
 class MLAModelWithBuffer {
     friend class LanguageModel;
-    friend class LanguageExecutor;
+    friend class LayerExecutor;
 
     public:
         MLAModelWithBuffer(

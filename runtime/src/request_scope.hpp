@@ -6,14 +6,14 @@ namespace simaai::llima {
 
 // Owns cancellation, streaming, and cleanup for one language operation.
 // The caller keeps the target and optional draft alive and exclusively available.
-class LanguageRequest {
+class RequestScope {
   public:
-    LanguageRequest(LanguageModel& target, LanguageModel* draft = nullptr,
-                    TextStreamer::RequestOptions stream = {}, std::stop_token stop = {},
-                    std::optional<std::set<uint32_t>> stop_ids = std::nullopt);
-    ~LanguageRequest();
-    LanguageRequest(const LanguageRequest&) = delete;
-    LanguageRequest& operator=(const LanguageRequest&) = delete;
+    RequestScope(LanguageModel& target, LanguageModel* draft = nullptr,
+                 TextStreamer::RequestOptions stream = {}, std::stop_token stop = {},
+                 std::optional<std::set<uint32_t>> stop_ids = std::nullopt);
+    ~RequestScope();
+    RequestScope(const RequestScope&) = delete;
+    RequestScope& operator=(const RequestScope&) = delete;
 
     // Wait for callbacks before recording the final cancellation state.
     void finish();
@@ -24,7 +24,7 @@ class LanguageRequest {
   private:
     LanguageModel& _target;
     LanguageModel* _draft;
-    LanguageRequestState _request;
+    RequestState _request;
     bool _completed = false;
     bool _cancelled_at_finish = false;
 };
