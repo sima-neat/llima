@@ -8,6 +8,19 @@ SourceFormat = Literal["hf", "gguf"]
 
 
 @dataclass(frozen=True)
+class AudioCheckpointCase:
+    model_folder: str
+    repo_id: str
+    revision: str
+
+
+LFM2_AUDIO_CASE = AudioCheckpointCase(
+    "models--LiquidAI--LFM2.5-Audio-1.5B", "LiquidAI/LFM2.5-Audio-1.5B",
+    "95d7e5a0ca706151aa7b7989275a902007a04cbe",
+)
+
+
+@dataclass(frozen=True)
 class ConfigurationCase:
     model_folder: str
     reference_config: str

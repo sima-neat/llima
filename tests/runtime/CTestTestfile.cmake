@@ -1,5 +1,7 @@
 add_test(runtime.embedding_offload "./sima_lmm_embedding_offload_test")
 set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
+add_test(runtime.audio_generation "./sima_lmm_audio_generation_test")
+set_tests_properties(runtime.audio_generation PROPERTIES LABELS "runtime;unit;audio" TIMEOUT 30)
 add_test(runtime.embedding_offload_generation "./sima_lmm_embedding_offload_generation_test")
 set_tests_properties(runtime.embedding_offload_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
 

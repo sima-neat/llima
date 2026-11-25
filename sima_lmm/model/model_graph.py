@@ -893,10 +893,16 @@ class ModelGraph(SimaBuilder):
         expert_idx: int = -1,
         de_interleave: bool = False,
         swiglu_limit: float | None = None,
+        activation_token_block_size: int | None = None,
     ) -> NodeOrHandle:
         """Build dense or expert MLPs, optionally using GPT-OSS's clamped SwiGLU."""
         if len(projections) not in (2, 3):
             raise ValueError("MLP needs two projection names or three names in gate/up/down order")
+        if activation_token_block_size is not None:
+            if type(activation_token_block_size) is not int or activation_token_block_size <= 0:
+                raise ValueError("MLP activation token block size must be a positive integer")
+            if swiglu_limit is not None:
+                raise ValueError("Token-blocked activation does not support clamped SwiGLU")
         ranks = lora_ranks or {}
 
         def project(proj, node, bounds=None):
@@ -925,7 +931,19 @@ class ModelGraph(SimaBuilder):
             glu = self.mul(gate, self.sigmoid(self.mul(gate, self.constant([1.702]))))
             hidden = self.mul(self.add(up, self.constant([1.0])), glu)
         else:
-            hidden = self.activation(project(projections[0], data), activation)
+            gate = project(projections[0], data)
+            shape = tensor_type(gate).shape
+            if activation_token_block_size is not None and shape[2] > activation_token_block_size:
+                if shape[0] != 1 or shape[1] != 1:
+                    raise ValueError("MLP activation token blocking requires [1,1,T,C]")
+                pieces = []
+                for begin in range(0, shape[2], activation_token_block_size):
+                    part = self.slice(gate, start=begin,
+                                      stop=min(begin + activation_token_block_size, shape[2]), axis=2)
+                    pieces.append(self.activation(part, activation))
+                hidden = self.concat(pieces, 2)
+            else:
+                hidden = self.activation(gate, activation)
             if len(projections) == 3:
                 hidden = self.mul(hidden, project(projections[1], data))
         output = project(projections[-1], hidden)

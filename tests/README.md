@@ -96,7 +96,7 @@ representative; cover configuration variants with small hermetic tests.
 
 - Location: `tests/compilation/unit/`
 - Marker: `compiler_unit`
-- Expected cases: 447
+- Expected cases: 514
 
 Fast, hermetic tests that run before model inputs are downloaded:
 
@@ -198,7 +198,7 @@ are not stored in the repository or artifact cache.
 
 - Location: `tests/compilation/graph_integration/`
 - Marker: `compiler_graph_integration`
-- Expected cases: 34 standard and 6 high-memory
+- Expected cases: 38 standard and 6 high-memory
 
 This group validates:
 
