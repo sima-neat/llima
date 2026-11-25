@@ -155,7 +155,7 @@ class BaseModel(ABC):
         weight_patch_record_dir: If set, the MLA compile is recorded as a weight patch template
             into this directory (n2a_compiler mlc/compiler/weight_patching.py).
         weight_patch_template_dir: If set, the MLA ELF is built from the weight patch template in
-            this directory when the compiled program matches it; otherwise it compiles in full.
+            this directory with the template's DRAM sources; otherwise it compiles in full.
             gen_files_from_model_list compiles the model that records this directory first.
         use_dram_embed: Write the MLA DRAM constants to binary files that the assembler embeds
             (.dram_embed) instead of .mlc text rows; the ELF is the same.

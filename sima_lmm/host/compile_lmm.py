@@ -319,7 +319,7 @@ def main():
         "--weight_patching", action=argparse.BooleanOptionalAction, default=False,
         help="Compile one transformer layer per part and precision, and build the other layers' "
              "ELFs from it by writing in their weights. Output is identical to a full compile; "
-             "layers whose compiled program differs are compiled in full."
+             "layers that cannot be built from the template are compiled in full."
     )
     group.add_argument(
         "--dram_embed", action=argparse.BooleanOptionalAction, default=False,
