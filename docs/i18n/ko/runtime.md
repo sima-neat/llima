@@ -83,3 +83,21 @@ CLI 모드에서 `llima run`을 실행하면 프롬프트에서 다음 명령어
 
 `llima run`을 사용하여 모델을 검증한 후,
 [GenAI 모델](/develop-apps/development-workflow/genai-model/)을 사용하여 일반적인 API 엔드포인트를 통해 서비스를 제공하거나, C++ 또는 Python 애플리케이션에서 직접 사용하십시오.
+
+## 독립적인 프롬프트 컨텍스트 재사용
+
+C++ 애플리케이션은 `ModelOptions.max_kv_cache_slots`(기본값 1)로 제한된 풀을 로드하고 `GenerationOptions.cache_id`로 컨텍스트를 선택할 수 있습니다.
+
+```cpp
+#include <sima_lmm/vision_language_model.hpp>
+
+simaai::llima::VisionLanguageModel model(model_dir, simaai::llima::ModelOptions{4});
+auto chat = model.create_chat();
+chat.add_query("Hello");
+simaai::llima::GenerationOptions options;
+options.cache_id = "assistant";
+auto result = model.generate(chat, options);
+model.remove_kv_cache("assistant");
+```
+
+매번 전체 프롬프트 또는 기록을 보내세요. ID는 재사용할 접두사 상태를 선택하며 애플리케이션 메시지를 저장하지 않습니다. ID를 생략한 기존 컨텍스트도 슬롯 하나를 사용합니다. 장치 캐시 저장소는 생성 시 할당되고 가중치와 실행 작업 공간은 공유됩니다. `kv_cache_bytes_per_slot()`은 슬롯당 장치 바이트 수를, `kv_cache_count()`는 기존 컨텍스트를 포함한 할당 수를 반환합니다. `remove_kv_cache()`는 이름이 지정된 연결을, `clear_kv_caches()`는 모든 연결을 해제하지만 물리적 할당은 유지합니다. 한도에 도달한 상태에서 새 ID를 요청하면 `KVCacheCapacityError`가 발생하며 자동 제거는 없습니다. 수명 주기 호출은 유휴 모델에서만 가능하며 생성 중에는 거부됩니다. 취소는 선택된 컨텍스트를 무효화하고 LoRA 변경은 모든 컨텍스트를 무효화합니다. 추측 디코딩의 대상과 초안은 슬롯 한도가 같아야 합니다. 옵션과 메트릭 추가로 값 형식의 레이아웃이 변경되므로 일치하는 LLiMa 헤더와 라이브러리로 소비자를 다시 빌드하세요.

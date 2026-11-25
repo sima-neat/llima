@@ -204,9 +204,13 @@ uint16_t LanguageModel::_set_input_text_embeds(std::span<const uint32_t> input_t
     }
     _workspace->has_image_token = num_images > 0;
 
-    _run->text_streamer.push(
-        DecodeCallbackType::CACHED_PROMPT_TOKENS, num_cached_tokens, 0.0
-    );
+    auto& request = _run->require_active_request();
+    if (request.metrics_model == this) {
+        _run->text_streamer.push(
+            DecodeCallbackType::CACHED_PROMPT_TOKENS, num_cached_tokens, 0.0
+        );
+        request.cached_prompt_tokens = num_cached_tokens;
+    }
     _logger->info("Number of tokens cached: {:d}", num_cached_tokens);
     return num_cached_tokens;
 }

@@ -104,3 +104,8 @@ add_test(runtime.lora_adapter "./sima_lmm_lora_adapter_test")
 set_tests_properties(runtime.lora_adapter PROPERTIES LABELS "devkit;runtime;genai;lora" RESOURCE_LOCK mla TIMEOUT 600)
 add_test(runtime.program_lifetime "./sima_lmm_runtime_program_lifetime_test")
 set_tests_properties(runtime.program_lifetime PROPERTIES LABELS "devkit;runtime" RESOURCE_LOCK mla TIMEOUT 120)
+
+add_test(runtime.cache_slots "./sima_lmm_cache_slots_test")
+set_tests_properties(runtime.cache_slots PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)
+add_test(runtime.kv_cache_sessions "./sima_lmm_kv_cache_sessions_test")
+set_tests_properties(runtime.kv_cache_sessions PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)

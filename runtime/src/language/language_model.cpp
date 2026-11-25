@@ -38,7 +38,8 @@ LanguageModel::LanguageModel(
     std::optional<uint32_t> image_token_id,
     std::optional<uint32_t> pad_token_id,
     TextStreamer& text_streamer,
-    std::shared_ptr<FileProvider> file_provider
+    std::shared_ptr<FileProvider> file_provider,
+    size_t max_kv_cache_slots
 ) : _resources(LanguageAssets::acquire(model_path, std::move(file_provider))),
     _cfg(_resources->cfg),
     _elf_dir(_resources->package->elf_dir),
@@ -46,6 +47,7 @@ LanguageModel::LanguageModel(
     _files(_resources->package->files),
     _logger(_resources->package->logger),
     _cache(std::make_unique<SequenceCache>()),
+    _cache_ids(max_kv_cache_slots),
     _workspace(std::make_unique<LanguageWorkspace>()),
     _run(std::make_unique<RequestControl>(std::move(stop_token_ids),
         _cfg.pipeline_cfg.max_num_tokens, text_streamer)),
@@ -82,6 +84,12 @@ LanguageModel::LanguageModel(
     _need_argmax = _cfg.lm_cfg.lm_head_num_splits > 1 || _cfg.pipeline_cfg.return_logits;
 
     _init_cache_layout();
+    for (size_t i = 0; i < max_kv_cache_slots; ++i) {
+        auto cache = std::make_unique<SequenceCache>();
+        cache->checkpoint_boundaries = _cache->checkpoint_boundaries;
+        cache->cached_states = _cache->cached_states;
+        _cache_slots.emplace_back(std::move(cache));
+    }
 
     // EAGLE3: build the constant tree_mask_init (eye(topk)) once. Only the
     // draft uses it (consumed in topk_generate's depth loop seed and concat).
@@ -111,10 +119,20 @@ void LanguageModel::_initialize() {
         for (auto& [name, buffer] : *buffers) buffer.try_allocate();
     }
 
+    const auto slot_bytes = kv_cache_bytes_per_slot();
+    if (slot_bytes && _cache_ids.capacity() > std::numeric_limits<size_t>::max() / slot_bytes)
+        throw std::overflow_error("KV cache pool allocation size overflows size_t");
     for (auto& [name, buffer] : _cache->buffers) {
         buffer.allocate();
         buffer.clear();
     }
+    // Slot zero starts in the stable active wrapper; its parked descriptor is empty.
+    // Every other physical context is allocated up front with the same layout.
+    for (size_t i = 1; i < _cache_slots.size(); ++i)
+        for (auto& [name, buffer] : _cache_slots[i]->buffers) {
+            buffer.allocate();
+            buffer.clear();
+        }
 
     // Define and load the models in parallel.
     _define_models();
@@ -185,7 +203,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model(
         if (options.performance) *options.performance = {};
         return std::nullopt;
     }
-    RequestScope request(*this, nullptr, {}, options.stop, options.stop_token_ids);
+    RequestScope request(*this, nullptr, {}, options.stop, options.stop_token_ids, options.cache_id);
     create_input_buffers(input_token_ids);
     auto output = _generate_tokens(request, input_token_ids, options.max_total_tokens,
         options.timer_ttft, options.performance, options.stable_prefix_token_count);
@@ -205,14 +223,23 @@ std::optional<std::vector<uint32_t>> LanguageModel::_generate_tokens(
     auto& max_tokens = _run->limits().max_num_tokens;
     if (limit) max_tokens = std::min(*limit, _cfg.pipeline_cfg.max_num_tokens);
     auto* draft = request.draft();
-    if (!draft) return _run_model_ordinary(ids, timer, stable_prefix, performance);
-    const auto& spec = *_cfg.lm_cfg.speculative_decoding_cfg;
-    if (spec.is_gemma4_mtp())
-        return _run_model_gemma4_mtp(*draft, ids, max_tokens, timer, performance);
-    if (spec.is_dflash())
-        return _run_model_dflash_speculative_decoding(*draft, ids, max_tokens, timer,
-                                                      performance, stable_prefix);
-    return _run_model_eagle3_speculative_decoding(*draft, ids, max_tokens, timer, performance);
+    const auto& state = _run->require_active_request();
+    _run->text_streamer.push(DecodeCallbackType::CACHE_CREATED, 0, state.cache_created ? 1.0 : 0.0);
+    auto output = [&] {
+        if (!draft) return _run_model_ordinary(ids, timer, stable_prefix, performance);
+        const auto& spec = *_cfg.lm_cfg.speculative_decoding_cfg;
+        if (spec.is_gemma4_mtp())
+            return _run_model_gemma4_mtp(*draft, ids, max_tokens, timer, performance);
+        if (spec.is_dflash())
+            return _run_model_dflash_speculative_decoding(*draft, ids, max_tokens, timer,
+                                                          performance, stable_prefix);
+        return _run_model_eagle3_speculative_decoding(*draft, ids, max_tokens, timer, performance);
+    }();
+    if (performance) {
+        performance->cache_created = state.cache_created;
+        performance->cached_prompt_tokens = state.cached_prompt_tokens;
+    }
+    return output;
 }
 
 std::optional<std::vector<uint32_t>> LanguageModel::_run_model_ordinary(
@@ -269,7 +296,7 @@ std::optional<std::vector<uint32_t>> LanguageModel::run_model_speculative_decodi
         if (options.performance) *options.performance = {};
         return std::nullopt;
     }
-    RequestScope request(*this, &draft_lm, {}, options.stop, options.stop_token_ids);
+    RequestScope request(*this, &draft_lm, {}, options.stop, options.stop_token_ids, options.cache_id);
     create_input_buffers(input_token_ids);
     auto output = _generate_tokens(request, input_token_ids, options.max_total_tokens,
         options.timer_ttft, options.performance, options.stable_prefix_token_count);
@@ -304,6 +331,8 @@ void LanguageModel::attach_draft(LanguageModel& draft_lm) {
     std::lock_guard lock(RuntimeContext::instance().execution_mutex);
     if (_run->active || draft_lm._run->active)
         throw std::logic_error("Cannot change the target/draft pair during generation");
+    if (_cache_ids.capacity() != draft_lm._cache_ids.capacity())
+        throw std::invalid_argument("Target and draft must configure the same max_kv_cache_slots");
     if (!_cfg.lm_cfg.speculative_decoding_cfg || !draft_lm._cfg.lm_cfg.speculative_decoding_cfg)
         throw std::invalid_argument("Both models must contain speculative-decoding configuration");
     const auto& target = *_cfg.lm_cfg.speculative_decoding_cfg;
@@ -338,8 +367,8 @@ void LanguageModel::attach_draft(LanguageModel& draft_lm) {
             throw std::invalid_argument("Unsupported speculative-decoding method: " + target.method);
     }
     auto pair = std::make_shared<LanguageWorkspace::SpeculativePair>();
-    invalidate_prompt_reuse();
-    draft_lm.invalidate_prompt_reuse();
+    invalidate_all_prompt_reuse();
+    draft_lm.invalidate_all_prompt_reuse();
     _workspace->speculative_pair = pair;
     draft_lm._workspace->speculative_pair = std::move(pair);
 }
@@ -786,6 +815,7 @@ void LanguageModel::_finalize() {
     _logger->info("Language model finalize starting ...");
     // Destroy bindings before their cache and workspace buffers and shared resources.
     _workspace.reset();
+    _cache_slots.clear();
     _cache = nullptr;
     _resources.reset();
     _logger->info("Language model finalize completed");
@@ -887,7 +917,6 @@ LanguageModelMapKey LanguageModel::_get_cache_model_key(
 void LanguageModel::invalidate_prompt_reuse() {
     _cache->invalidate_reuse();
     _workspace->clear_cached_scratch();
-    _workspace->speculative_pair.reset();
 }
 
 void LanguageModel::set_image_identity(std::string identity) {

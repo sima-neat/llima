@@ -1,14 +1,18 @@
 #ifndef _SIMA_LLIMA_VISION_LANGUAGE_MODEL_
 #define _SIMA_LLIMA_VISION_LANGUAGE_MODEL_
 
+#include <concepts>
 #include <filesystem>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <span>
 #include <stop_token>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -53,6 +57,12 @@ struct GenerationOptions {
     bool performance_summary = true;
     bool preserve_structural_tokens = true; // Keep active tool/reasoning markers in text and chunks.
     bool reject_oversized_prompt = false;   // Throw when the prompt cannot fit a generated token.
+    std::optional<std::string> cache_id; // Omitted selects the legacy context, which consumes one slot.
+};
+
+// Each slot owns full model-specific KV/recurrent storage. Weights and workspace are shared.
+struct ModelOptions {
+    size_t max_kv_cache_slots = 1;
 };
 
 // Public entry point for text and image/text generation, scoring and image encoding.
@@ -71,6 +81,19 @@ class VisionLanguageModel {
             std::optional<std::string> system_prompt,
             std::optional<std::string> chat_template,
             std::shared_ptr<FileProvider> file_provider
+        );
+        // Constrain the options overload so legacy calls with an empty braced
+        // system prompt still resolve to the disk-loading overload above.
+        template<class Options> requires std::same_as<Options, ModelOptions>
+        VisionLanguageModel(std::filesystem::path model_path, Options options)
+            : VisionLanguageModel(std::move(model_path), std::nullopt, std::nullopt,
+                                  nullptr, options) {}
+        VisionLanguageModel(
+            std::filesystem::path model_path,
+            std::optional<std::string> system_prompt,
+            std::optional<std::string> chat_template,
+            std::shared_ptr<FileProvider> file_provider,
+            ModelOptions options
         );
         ~VisionLanguageModel();
         VisionLanguageModel(const VisionLanguageModel&) = delete;
@@ -92,6 +115,10 @@ class VisionLanguageModel {
         std::vector<EncodedImage> encode_images(std::span<const cv::Mat> images);
         size_t shared_resource_bytes() const;
         size_t workspace_memory_bytes() const;
+        size_t kv_cache_count() const;
+        size_t kv_cache_bytes_per_slot() const;
+        bool remove_kv_cache(const std::string& cache_id);
+        void clear_kv_caches();
 
         void stop_model();
 

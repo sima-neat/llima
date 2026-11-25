@@ -82,3 +82,21 @@ CLIモードで`llima run`が起動したら、プロンプトで次のコマン
 ## Neat を使ってアプリケーションを構築しましょう。
 
 `llima run` を使用してモデルを検証した後、[、GenAI モデル ](/develop-apps/development-workflow/genai-model/) を、一般的な API エンドポイントを通じて提供するか、C++ または Python アプリケーションから直接使用してください。
+
+## 独立したプロンプトコンテキストの再利用
+
+C++ アプリケーションは `ModelOptions.max_kv_cache_slots`（既定値は 1）で上限付きプールを読み込み、`GenerationOptions.cache_id` でコンテキストを選択できます。
+
+```cpp
+#include <sima_lmm/vision_language_model.hpp>
+
+simaai::llima::VisionLanguageModel model(model_dir, simaai::llima::ModelOptions{4});
+auto chat = model.create_chat();
+chat.add_query("Hello");
+simaai::llima::GenerationOptions options;
+options.cache_id = "assistant";
+auto result = model.generate(chat, options);
+model.remove_kv_cache("assistant");
+```
+
+毎回、完全なプロンプトまたは履歴を送信してください。ID は再利用するプレフィックス状態を選択し、アプリケーションのメッセージは保存しません。ID を省略した従来のコンテキストも 1 スロットを使用します。デバイスのキャッシュ領域は構築時に確保され、重みと実行ワークスペースは共有されます。`kv_cache_bytes_per_slot()` はスロットごとのデバイスバイト数、`kv_cache_count()` は従来のコンテキストを含む割り当て数を返します。`remove_kv_cache()` は指定した関連付けを、`clear_kv_caches()` はすべての関連付けを解除しますが、物理領域は保持します。上限で新しい ID を要求すると `KVCacheCapacityError` が発生し、自動削除はありません。ライフサイクル操作はモデルがアイドル状態のときだけ使用でき、生成中の呼び出しは拒否されます。キャンセルは選択した状態を、LoRA の変更はすべての状態を無効化します。投機的デコードのターゲットとドラフトには同じスロット上限が必要です。オプションとメトリクスの追加により値型のレイアウトが変わるため、対応する LLiMa ヘッダーとライブラリで利用側を再ビルドしてください。

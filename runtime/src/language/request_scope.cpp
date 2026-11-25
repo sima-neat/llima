@@ -4,19 +4,25 @@ namespace simaai::llima {
 
 RequestScope::RequestScope(LanguageModel& target, LanguageModel* draft,
                            TextStreamer::RequestOptions stream, std::stop_token stop,
-                           std::optional<std::set<uint32_t>> stop_ids)
+                           std::optional<std::set<uint32_t>> stop_ids,
+                           std::optional<std::string> cache_id)
     : _target(target), _draft(draft),
       _request{{stop_ids ? std::move(*stop_ids) : target._run->defaults.stop_token_ids,
                 target._run->defaults.max_num_tokens}, std::move(stop),
                RequestState::Interrupt(target._run->interrupts), std::nullopt} {
     if (target._run->active || (draft && draft->_run->active))
         throw std::logic_error("Language model already has an active request");
+    target._cache_ids.check_available(cache_id);
+    if (draft) draft->_cache_ids.check_available(cache_id);
     if (draft) {
         _request.draft_interrupt.emplace(draft->_run->interrupts);
         target.attach_draft(*draft);
     } else if (target._workspace->speculative_pair) {
-        target.invalidate_prompt_reuse();
+        target.invalidate_all_prompt_reuse();
     }
+    _request.metrics_model = &target;
+    _request.cache_created = target._select_cache(cache_id);
+    if (draft) draft->_select_cache(cache_id);
     target._run->text_streamer.begin_request(std::move(stream));
     target._run->active = &_request;
     if (draft) {

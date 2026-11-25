@@ -98,3 +98,33 @@ After validating your model with `llima run`, see
 [GenAI Model](/develop-apps/development-workflow/genai-model/) to serve it
 through common API endpoints or use it directly from a C++ or Python
 application.
+
+## Reuse independent prompt contexts
+
+C++ applications can load a bounded pool with `ModelOptions.max_kv_cache_slots`
+(default one) and select a context with `GenerationOptions.cache_id`:
+
+```cpp
+#include <sima_lmm/vision_language_model.hpp>
+
+simaai::llima::VisionLanguageModel model(model_dir, simaai::llima::ModelOptions{4});
+auto chat = model.create_chat();
+chat.add_query("Hello");
+simaai::llima::GenerationOptions options;
+options.cache_id = "assistant";
+auto result = model.generate(chat, options);
+model.remove_kv_cache("assistant");
+```
+
+Send the complete prompt/history every time. IDs select reusable prefix state;
+they do not store application messages. The unnamed legacy context also consumes
+a slot. Device cache storage is allocated at construction; weights and execution
+workspace are shared. `kv_cache_bytes_per_slot()` reports device bytes per slot
+and `kv_cache_count()` counts assigned IDs, including the legacy context.
+`remove_kv_cache()` releases a named association, and `clear_kv_caches()` releases
+all associations while retaining physical allocations. New IDs at capacity raise
+`KVCacheCapacityError`; there is no automatic eviction. Lifecycle calls require
+an idle model and reject calls made during generation. Cancellation invalidates
+the selected context; changing LoRA invalidates all contexts. A speculative
+target and draft must have equal slot limits. Rebuild consumers against matching
+LLiMa headers and library; the added options and metrics change value-type layouts.

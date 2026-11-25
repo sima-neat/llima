@@ -373,6 +373,13 @@ The shared environment contract is:
 
 Models are retained on the runner between CI runs.
 
+The `runtime.cache_slots` unit test checks bounded named and legacy slot assignment
+without a model. `runtime.kv_cache_sessions` uses the selected text model to
+alternate two independent contexts, compare cold and warm outputs and metrics,
+reject over-capacity requests, remove and reuse slots, clear assignments, and
+verify that cancellation leaves the other context reusable. Both are included
+in the runtime extras package.
+
 ### C++ runtime tests
 
 CTest executes serially with a dispatcher resource lock:

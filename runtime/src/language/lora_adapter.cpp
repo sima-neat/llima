@@ -130,14 +130,14 @@ void LanguageModel::set_reloc(const std::string& reloc_name) {
     auto& cached = _resources->adapters[reloc_name];
     _bind_adapter(adapter);
     cached = adapter;
-    invalidate_prompt_reuse();
+    invalidate_all_prompt_reuse();
 }
 
 void LanguageModel::unset_reloc() {
     if (!_workspace->bound_adapter) return;
     std::lock_guard execution_lock(RuntimeContext::instance().execution_mutex);
     _bind_adapter(nullptr);
-    invalidate_prompt_reuse();
+    invalidate_all_prompt_reuse();
 }
 
 } // namespace simaai::llima

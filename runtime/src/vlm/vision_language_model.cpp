@@ -143,7 +143,20 @@ VisionLanguageModel::VisionLanguageModel(
     std::optional<std::string> system_prompt,
     std::optional<std::string> chat_template,
     std::shared_ptr<FileProvider> file_provider
-) : _state(std::make_shared<LanguageRuntime>(model_path, file_provider, system_prompt, chat_template))
+) : VisionLanguageModel(std::move(model_path), std::move(system_prompt), std::move(chat_template),
+                        std::move(file_provider), {}) {}
+
+VisionLanguageModel::VisionLanguageModel(
+    std::filesystem::path model_path,
+    std::optional<std::string> system_prompt,
+    std::optional<std::string> chat_template,
+    std::shared_ptr<FileProvider> file_provider,
+    ModelOptions options
+) : _state([&] {
+    if (!options.max_kv_cache_slots)
+        throw std::invalid_argument("max_kv_cache_slots must be positive");
+    return std::make_shared<LanguageRuntime>(model_path, file_provider, system_prompt, chat_template);
+}())
 {
     _state->tool_call_format = tool_call_format_for_model(_state->_cfg.model_type);
     if (_state->_cfg.support_image()) {
@@ -158,7 +171,7 @@ VisionLanguageModel::VisionLanguageModel(
         _state->vlm_helper.get_image_token_id(),
         _state->vlm_helper.get_pad_token_id(),
         _state->text_streamer,
-        _state->_files
+        _state->_files, options.max_kv_cache_slots
     );
 
     // Dummy-query warmup. Skipped in spec mode: drafts have no standalone
@@ -178,6 +191,8 @@ VisionLanguageModel::VisionLanguageModel(
 
     // Pre-warm OMP thread pool to avoid libgomp first-call cost.
     warmup_omp();
+    // Constructor warmup is not an application cache association.
+    _state->language_model_ptr->clear_kv_caches();
 }
 
 
@@ -210,7 +225,7 @@ ChatResult VisionLanguageModel::generate(const Chat& chat, const GenerationOptio
     auto markers = _state->structural_tokens(chat);
     if (!options.preserve_structural_tokens) markers.clear();
     RequestScope request(models.target(), models.draft(), stream_options(options, markers, true),
-                         options.stop, options.stop_token_ids);
+                         options.stop, options.stop_token_ids, options.cache_id);
 
     ChronoTimer timer_ttft(true);
     auto input = prepare_chat_inputs(request, chat, options);
@@ -248,7 +263,7 @@ std::optional<std::vector<uint32_t>> VisionLanguageModel::benchmark_chat(
     auto markers = _state->structural_tokens(chat);
     if (!options.preserve_structural_tokens) markers.clear();
     RequestScope request(models.target(), models.draft(), stream_options(options, markers, true),
-                         options.stop, options.stop_token_ids);
+                         options.stop, options.stop_token_ids, options.cache_id);
 
     ChronoTimer timer_ttft(true);
     auto input = prepare_chat_inputs(request, chat, options, &benchmark);
@@ -389,7 +404,7 @@ std::vector<uint32_t> VisionLanguageModel::run_model(
     ModelLock models(_state);
     if (options.stop.stop_requested()) return {};
     RequestScope request(models.target(), models.draft(), stream_options(options),
-                         options.stop, options.stop_token_ids);
+                         options.stop, options.stop_token_ids, options.cache_id);
     if (request.cancelled()) return {};
     auto& language = models.target();
     language.set_image_identity({});
@@ -410,7 +425,7 @@ std::vector<Eigen::bfloat16> VisionLanguageModel::run_model_for_logits(
     ModelLock models(_state);
     if (options.stop.stop_requested()) throw std::runtime_error("Scoring request was interrupted");
     RequestScope request(models.target(), models.draft(), stream_options(options),
-                         options.stop, options.stop_token_ids);
+                         options.stop, options.stop_token_ids, options.cache_id);
     if (request.cancelled()) throw std::runtime_error("Scoring request was interrupted");
     auto& language = models.target();
     language.set_image_identity({});
@@ -436,7 +451,7 @@ LogLikelihoodResult VisionLanguageModel::run_model_for_loglikelihood(
     ModelLock models(_state);
     if (options.stop.stop_requested()) throw std::runtime_error("Scoring request was interrupted");
     RequestScope request(models.target(), models.draft(), stream_options(options),
-                         options.stop, options.stop_token_ids);
+                         options.stop, options.stop_token_ids, options.cache_id);
     if (request.cancelled()) throw std::runtime_error("Scoring request was interrupted");
     auto& language = models.target();
     language.set_image_identity({});
@@ -456,7 +471,7 @@ GenerationPerformanceResult VisionLanguageModel::run_model_for_ttnt(
     ModelLock models(_state);
     if (options.stop.stop_requested()) throw std::runtime_error("Performance request was interrupted");
     RequestScope request(models.target(), models.draft(), stream_options(options),
-                         options.stop, options.stop_token_ids);
+                         options.stop, options.stop_token_ids, options.cache_id);
     if (request.cancelled()) throw std::runtime_error("Performance request was interrupted");
     auto& language = models.target();
     language.set_image_identity({});
@@ -494,7 +509,7 @@ void VisionLanguageModel::set_draft_vlm(VisionLanguageModel* draft) {
         auto next_lock = idle_lock(next->run_mutex);
         _state->language_model_ptr->attach_draft(*next->language_model_ptr);
     } else {
-        _state->language_model_ptr->invalidate_prompt_reuse();
+        _state->language_model_ptr->invalidate_all_prompt_reuse();
     }
     _state->draft = next;
 }
@@ -504,6 +519,32 @@ size_t VisionLanguageModel::shared_resource_bytes() const {
 }
 size_t VisionLanguageModel::workspace_memory_bytes() const {
     return _state->language_model_ptr->workspace_memory_bytes();
+}
+
+size_t VisionLanguageModel::kv_cache_count() const {
+    auto lock = idle_lock(_state->run_mutex);
+    return _state->language_model_ptr->kv_cache_count();
+}
+
+size_t VisionLanguageModel::kv_cache_bytes_per_slot() const {
+    return _state->language_model_ptr->kv_cache_bytes_per_slot();
+}
+
+bool VisionLanguageModel::remove_kv_cache(const std::string& id) {
+    auto lock = idle_lock(_state->run_mutex);
+    std::unique_lock<std::mutex> draft_lock;
+    if (_state->draft) draft_lock = idle_lock(_state->draft->run_mutex);
+    const bool removed = _state->language_model_ptr->remove_kv_cache(id);
+    if (_state->draft) _state->draft->language_model_ptr->remove_kv_cache(id);
+    return removed;
+}
+
+void VisionLanguageModel::clear_kv_caches() {
+    auto lock = idle_lock(_state->run_mutex);
+    std::unique_lock<std::mutex> draft_lock;
+    if (_state->draft) draft_lock = idle_lock(_state->draft->run_mutex);
+    _state->language_model_ptr->clear_kv_caches();
+    if (_state->draft) _state->draft->language_model_ptr->clear_kv_caches();
 }
 
 }

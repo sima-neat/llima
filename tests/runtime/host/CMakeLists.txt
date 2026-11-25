@@ -17,3 +17,10 @@ target_link_libraries(sima_lmm_attention_cache_test PRIVATE Eigen3::Eigen nlohma
 target_compile_definitions(sima_lmm_attention_cache_test PRIVATE FMT_HEADER_ONLY SPDLOG_FMT_EXTERNAL)
 add_test(NAME runtime.attention_cache COMMAND sima_lmm_attention_cache_test)
 set_tests_properties(runtime.attention_cache PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)
+
+add_executable(sima_lmm_cache_slots_test cache_slots_test.cpp)
+target_compile_features(sima_lmm_cache_slots_test PRIVATE cxx_std_20)
+target_include_directories(sima_lmm_cache_slots_test PRIVATE
+    "${runtime_dir}/src" "${runtime_dir}/include/sima_lmm")
+add_test(NAME runtime.cache_slots COMMAND sima_lmm_cache_slots_test)
+set_tests_properties(runtime.cache_slots PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)

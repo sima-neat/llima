@@ -175,6 +175,9 @@ void TextStreamer::pop_forever(std::stop_token thread_stop_token) {
                 case DecodeCallbackType::CACHED_PROMPT_TOKENS:
                     _request.info("cached_prompt_tokens", data.token_id);
                     break;
+                case DecodeCallbackType::CACHE_CREATED:
+                    _request.info("cache_created", data.duration);
+                    break;
                 default:
                     throw std::runtime_error(
                         fmt::format("Unsupported callback type: {}", static_cast<uint32_t>(data.type))

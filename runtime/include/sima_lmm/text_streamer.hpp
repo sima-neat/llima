@@ -33,7 +33,8 @@ enum class DecodeCallbackType : uint32_t {
     TPS = 2,
     CACHE_FULL = 3,
     STOP = 4,
-    CACHED_PROMPT_TOKENS = 5
+    CACHED_PROMPT_TOKENS = 5,
+    CACHE_CREATED = 6
 };
 
 

@@ -10,7 +10,8 @@ class RequestScope {
   public:
     RequestScope(LanguageModel& target, LanguageModel* draft = nullptr,
                  TextStreamer::RequestOptions stream = {}, std::stop_token stop = {},
-                 std::optional<std::set<uint32_t>> stop_ids = std::nullopt);
+                 std::optional<std::set<uint32_t>> stop_ids = std::nullopt,
+                 std::optional<std::string> cache_id = std::nullopt);
     ~RequestScope();
     RequestScope(const RequestScope&) = delete;
     RequestScope& operator=(const RequestScope&) = delete;

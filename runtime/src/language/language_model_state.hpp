@@ -46,6 +46,7 @@ struct LanguageAssets {
 // between requests on one language model.
 struct SequenceCache {
     void invalidate_reuse();
+    void exchange(SequenceCache& other);
     std::map<std::string, MLABuffer> buffers;
     std::vector<uint32_t> cached_token_ids;
     uint32_t cached_first_generated_token = 0;
@@ -241,6 +242,9 @@ struct RequestState {
     Interrupt target_interrupt;
     std::optional<Interrupt> draft_interrupt;
     bool length_limit_reached = false;
+    bool cache_created = false;
+    uint32_t cached_prompt_tokens = 0;
+    const LanguageModel* metrics_model = nullptr;
 
     bool cancelled() const {
         return stop.stop_requested() || target_interrupt.fired() ||

@@ -83,3 +83,21 @@ modalix:~$ llima run Qwen3-VL-4B-Instruct-GPTQ-a16w4
 
 在用 `llima run` 驗證您的模型後，請參閱
 [GenAI 模型 ](/develop-apps/development-workflow/genai-model/)，以便透過通用的 API 端點來部署它，或直接從 C++ 或 Python 應用程式中使用它。
+
+## 重複使用獨立的提示詞上下文
+
+C++ 應用程式可透過 `ModelOptions.max_kv_cache_slots`（預設為 1）載入有容量上限的集區，並以 `GenerationOptions.cache_id` 選擇上下文。
+
+```cpp
+#include <sima_lmm/vision_language_model.hpp>
+
+simaai::llima::VisionLanguageModel model(model_dir, simaai::llima::ModelOptions{4});
+auto chat = model.create_chat();
+chat.add_query("Hello");
+simaai::llima::GenerationOptions options;
+options.cache_id = "assistant";
+auto result = model.generate(chat, options);
+model.remove_kv_cache("assistant");
+```
+
+每次都應傳送完整提示詞或歷史記錄。ID 用於選擇可重複使用的前綴狀態，不會儲存應用程式訊息。省略 ID 的既有上下文也會使用一個槽位。裝置快取空間在建構時配置，權重和執行工作區則共用。`kv_cache_bytes_per_slot()` 回報每個槽位的裝置位元組數，`kv_cache_count()` 回報包含既有上下文的已指派數量。`remove_kv_cache()` 解除具名關聯，`clear_kv_caches()` 解除所有關聯，但保留實體配置。容量已滿時要求新 ID 會引發 `KVCacheCapacityError`，不會自動淘汰。生命週期呼叫需要閒置模型，生成期間的呼叫會遭拒絕。取消會使所選上下文失效，變更 LoRA 會使所有上下文失效。推測解碼的目標與草稿必須具有相同槽位上限。新增選項與指標會改變值型別的配置，因此請使用相符的 LLiMa 標頭與程式庫重新建置使用端。

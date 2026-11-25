@@ -3,11 +3,18 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace simaai::llima {
+
+// A new cache identity cannot be assigned until an existing identity is removed.
+class KVCacheCapacityError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // Timing/status events and finalized text chunks for one request.
 // Text callbacks receive (text, stream_end, from_draft).
@@ -33,6 +40,8 @@ struct GenerationPerformanceResult {
     std::vector<double> token_durations;
     uint32_t generated_tokens = 0;
     std::optional<uint32_t> accepted_draft_tokens;
+    uint32_t cached_prompt_tokens = 0;
+    bool cache_created = false;
 };
 
 // Completed generation output: token IDs, decoded text, finish reason and performance.

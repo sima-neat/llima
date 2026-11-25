@@ -1,10 +1,83 @@
 #include "language/language_model_state.hpp"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <fmt/format.h>
 
 namespace simaai::llima {
+
+void SequenceCache::exchange(SequenceCache& other) {
+    // Buffer objects remain at stable addresses in the compiled bindings.
+    // Their allocation identity travels with storage, refreshing MLA imports.
+    if (buffers.size() != other.buffers.size())
+        throw std::logic_error("KV-cache slot layouts differ");
+    for (const auto& [name, buffer] : buffers)
+        if (buffer.get_allocation_size() != other.buffers.at(name).get_allocation_size())
+            throw std::logic_error("KV-cache slot allocation sizes differ");
+    for (auto& [name, buffer] : buffers)
+        buffer.swap_storage(other.buffers.at(name));
+    cached_token_ids.swap(other.cached_token_ids);
+    std::swap(cached_first_generated_token, other.cached_first_generated_token);
+    cached_draft_tokens.swap(other.cached_draft_tokens);
+    cached_retrieve_indices.swap(other.cached_retrieve_indices);
+    std::swap(cached_tree_mask, other.cached_tree_mask);
+    cached_tree_position_ids.swap(other.cached_tree_position_ids);
+    std::swap(cached_eagle3_prompt_len, other.cached_eagle3_prompt_len);
+    std::swap(cached_eagle3_stable_kv, other.cached_eagle3_stable_kv);
+    std::swap(kv_cache_len, other.kv_cache_len);
+    checkpoint_boundaries.swap(other.checkpoint_boundaries);
+    cached_states.swap(other.cached_states);
+    state_checkpoint_positions.swap(other.state_checkpoint_positions);
+    image_identity.swap(other.image_identity);
+}
+
+bool LanguageModel::_select_cache(const std::optional<std::string>& id) {
+    const auto selection = _cache_ids.acquire(id);
+    if (_active_cache_slot != selection.index) {
+        _cache->exchange(*_cache_slots.at(_active_cache_slot));
+        _cache->exchange(*_cache_slots.at(selection.index));
+        _active_cache_slot = selection.index;
+        _workspace->clear_cached_scratch();
+    }
+    return selection.created;
+}
+
+size_t LanguageModel::kv_cache_count() const { return _cache_ids.count(); }
+
+size_t LanguageModel::kv_cache_bytes_per_slot() const {
+    size_t bytes = 0;
+    for (const auto& [name, buffer] : _cache->buffers) {
+        const auto size = buffer.get_allocation_size();
+        if (size > std::numeric_limits<size_t>::max() - bytes)
+            throw std::overflow_error("KV cache slot allocation size overflows size_t");
+        bytes += size;
+    }
+    return bytes;
+}
+
+bool LanguageModel::remove_kv_cache(const std::string& id) {
+    const auto index = _cache_ids.remove(id);
+    if (!index) return false;
+    auto& cache = *index == _active_cache_slot ? *_cache : *_cache_slots.at(*index);
+    cache.invalidate_reuse();
+    cache.image_identity.clear();
+    if (*index == _active_cache_slot) _workspace->clear_cached_scratch();
+    return true;
+}
+
+void LanguageModel::invalidate_all_prompt_reuse() {
+    invalidate_prompt_reuse();
+    _workspace->speculative_pair.reset();
+    for (auto& cache : _cache_slots) cache->invalidate_reuse();
+}
+
+void LanguageModel::clear_kv_caches() {
+    invalidate_all_prompt_reuse();
+    _cache->image_identity.clear();
+    for (auto& cache : _cache_slots) cache->image_identity.clear();
+    _cache_ids.clear();
+}
 
 void SequenceCache::invalidate_reuse() {
     cached_token_ids.clear();

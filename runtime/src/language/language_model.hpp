@@ -28,6 +28,7 @@
 #include "generation_types.hpp"
 #include "language/rope_utils.hpp"
 #include "text_streamer.hpp"
+#include "language/cache_slots.hpp"
 
 namespace simaai {
 namespace llima {
@@ -53,6 +54,7 @@ struct TokenRunOptions {
     std::optional<ChronoTimer> timer_ttft;
     uint16_t stable_prefix_token_count = 0;
     GenerationPerformanceResult* performance = nullptr;
+    std::optional<std::string> cache_id;
 };
 
 // Runs token prefill, decoding and scoring with shared model data.
@@ -66,7 +68,8 @@ class LanguageModel {
             std::optional<uint32_t> image_token_id,
             std::optional<uint32_t> pad_token_id,
             TextStreamer& text_streamer,
-            std::shared_ptr<FileProvider> file_provider = nullptr
+            std::shared_ptr<FileProvider> file_provider = nullptr,
+            size_t max_kv_cache_slots = 1
         );
         ~LanguageModel();
 
@@ -87,6 +90,10 @@ class LanguageModel {
         void attach_draft(LanguageModel& draft);
         size_t shared_resource_bytes() const;
         size_t workspace_memory_bytes() const;
+        size_t kv_cache_count() const;
+        size_t kv_cache_bytes_per_slot() const;
+        bool remove_kv_cache(const std::string& id);
+        void clear_kv_caches();
 
         void stop_model();
 
@@ -218,6 +225,8 @@ class LanguageModel {
         LogLikelihoodResult _score(std::span<const uint32_t> ids, size_t continuation_start,
             std::span<const uint32_t> continuation_ids, bool use_group_prefill);
         void invalidate_prompt_reuse();
+        void invalidate_all_prompt_reuse();
+        bool _select_cache(const std::optional<std::string>& id);
         void _validate_eagle3_target() const;
         void _bind_adapter(const std::shared_ptr<LoRAAdapter>& adapter);
         void set_image_identity(std::string identity);
@@ -229,6 +238,11 @@ class LanguageModel {
         const std::shared_ptr<FileProvider>& _files;
         std::shared_ptr<spdlog::logger> _logger;
         std::unique_ptr<SequenceCache> _cache;
+        // Programs retain pointers to _cache's buffer objects. Inactive slots
+        // exchange allocation handles with those stable objects, never KV bytes.
+        std::vector<std::unique_ptr<SequenceCache>> _cache_slots;
+        CacheSlots _cache_ids;
+        size_t _active_cache_slot = 0;
         std::unique_ptr<LanguageWorkspace> _workspace;
         std::unique_ptr<RequestControl> _run;
 

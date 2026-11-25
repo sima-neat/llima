@@ -34,6 +34,8 @@ void LanguageModel::_define_cache_buffer(const std::string& name,
                                            const std::vector<size_t>& shape,
                                            const std::string& dtype, bool align_last_dim) {
     _cache->buffers.try_emplace(name, name, shape, dtype, align_last_dim);
+    for (auto& cache : _cache_slots)
+        cache->buffers.try_emplace(name, name, shape, dtype, align_last_dim);
 }
 
 MLABuffer& LanguageModel::get_buffer(const std::string& name) {
