@@ -1,12 +1,26 @@
 # LLiMa Environments
 
-Use CLI help and docs matching the installed release:
+Use CLI help and the LLiMa guides matching the installed release:
 
 - `llima-compile --help`
 - `llima-deploy --help`
 - `llima run --help`
-- `docs/setup.md`, `docs/compilation_genai.md`, `docs/deployment.md`,
-  `docs/runtime.md`
+- the guides at the release tag for the installed LLiMa version,
+  `https://github.com/sima-neat/llima/blob/v<version>/docs/<guide>`:
+  `index.md` (supported models and limitations), `setup.md` (system
+  requirements), `compilation_genai.md` (compilation), `deployment.md`
+  (deployment), and `runtime.md` (LLiMa CLI).
+
+The CLIs do not print a version. Read it on the host where the step runs:
+
+```bash
+python3 -m pip show sima-lmm                      # compilation host, Model Compiler environment
+dpkg-query -W -f='${Version}\n' sima-lmm-core    # Modalix
+```
+
+Use `v` plus its `<major>.<minor>.<patch>` part as the tag. When LLiMa is not
+installed yet, use the version being installed. Do not substitute newer guides;
+if the version cannot be determined, report that instead.
 
 ## Custom Fine-Tune Quantization Host
 

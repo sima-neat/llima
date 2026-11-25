@@ -30,8 +30,9 @@ as failure.
 
 For speculative decoding, validate that the output parent contains one target
 tree and one draft tree, each with its own `sima_files/` directory. Keep the two
-trees separate and deploy their parent in one command. See the matching
-checkout's `docs/deployment.md` for supported speculative-decoding models.
+trees separate and deploy their parent in one command. See the release-matched
+`deployment.md` guide (see [environments](environments.md)) for supported
+speculative-decoding models.
 
 ## Deploy
 
