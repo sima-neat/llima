@@ -10,6 +10,7 @@ import numpy as np
 
 from sima_lmm.model.base import BaseModel
 from sima_lmm.model.language_cache_model import LanguageCacheModel
+from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_part_base import LanguagePostBaseModel
 from sima_lmm.model.language_post_model import LanguagePostModel
 from sima_lmm.model.model_graph import ModelGraph
@@ -29,6 +30,15 @@ class AudioLanguagePostModel(LanguagePostModel):
     def _build_post_transformer(self, graph, input_node):
         prefix = self.hf_model.language_model_param_base_name
         return [graph.rms_norm(f"{prefix}.embedding_norm", input_node)]
+
+
+class AudioBackboneConvModel(LanguageConvModel):
+    """Preserve backbone MLP activation rounding with 32-token regions."""
+    _mlp_activation_token_block_size = 32
+
+
+class AudioBackbonePostModel(AudioLanguagePostModel):
+    _mlp_activation_token_block_size = 32
 
 
 class AudioDepthPostModel(LanguagePostModel):
@@ -53,6 +63,10 @@ class AudioFinalConvModel(LanguagePostBaseModel):
         mlp = self._build_mlp(graph, f"{base}.feed_forward", [norm])
         hidden = graph.add(residual, mlp)
         graph.save([graph.rms_norm(f"{prefix}.embedding_norm", hidden)])
+
+
+class AudioBackboneFinalConvModel(AudioFinalConvModel):
+    _mlp_activation_token_block_size = 32
 
 
 @dataclass

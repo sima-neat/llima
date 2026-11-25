@@ -22,7 +22,10 @@ int main(int argc, char** argv) {
             }
             output.write(reinterpret_cast<const char*>(hidden.data()), hidden.size()*sizeof(float));
         };
-        for (size_t length : {2, 7, 15, 16, 17, 31, 43}) {
+        constexpr std::array<size_t, 22> lengths{
+            2, 7, 15, 16, 17, 31, 32, 33, 43, 63, 64, 65,
+            95, 96, 97, 127, 128, 129, 191, 192, 193, 212};
+        for (size_t length : lengths) {
             model.reset();
             std::vector<float> input;
             for (size_t token = 0; token < length; ++token) {
@@ -36,7 +39,7 @@ int main(int argc, char** argv) {
         }
         output.close();
         if (!output) throw std::runtime_error("Cannot write prefill comparison output");
-        std::cout << "Saved 28 prefix/continuation states, width=" << model.hidden_size() << '\n';
+        std::cout << "Saved " << lengths.size()*4 << " prefix/continuation states, width=" << model.hidden_size() << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n'; return 1;

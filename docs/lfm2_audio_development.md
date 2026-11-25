@@ -252,9 +252,10 @@ fresh packaging with current source requires a current compile manifest.
 
 ## Validation and limits
 
-The fast compiler suite has 504 cases. Added hermetic cases cover ingestion,
-BF16 loading, depth rotary conversion, projection bias/slicing and subsampling
-boundaries. Four checkpoint-backed integration cases cover conv-cache updates,
+The fast compiler suite has 514 cases. Added hermetic cases cover ingestion,
+BF16 loading, depth rotary conversion, projection bias/slicing, subsampling
+boundaries and token-blocked MLP activation equivalence. Four checkpoint-backed
+integration cases cover conv-cache updates,
 attention prefill, final normalization and the depth-head epsilon. Additional
 pinned-source checks:
 
@@ -379,8 +380,9 @@ schedule is retained. First audio under 200 ms and a hard 80 ms deadline for
 every frame have not been achieved; early text bursts can cause audio gaps of
 about 302 ms. Input still requires the complete utterance.
 
-The prefill regression helper saves seven prefix lengths (2, 7, 15, 16, 17,
-31, 43), each followed by three continuation tokens. Run it on Modalix against
+The prefill regression helper saves 22 prefix lengths from 2 through 212 tokens,
+including boundaries around 16-, 32- and 64-token groups, each followed by three
+continuation tokens. Run it on Modalix against
 the same bundle with the baseline and candidate private libraries, then compare
 the two output files:
 
@@ -391,7 +393,8 @@ LD_LIBRARY_PATH=/path/to/candidate/lib:$LD_LIBRARY_PATH \
 cmp /tmp/baseline-prefill.f32 /tmp/candidate-prefill.f32
 ```
 
-All 28 states, each 2,048 dimensions, matched bit for bit on SDK 3.0.0 Modalix.
+The original seven-length check saved 28 states, each 2,048 dimensions; all
+matched bit for bit on SDK 3.0.0 Modalix.
 One-frame versus 12-frame decoder waveforms were not bit-identical (selected
 PCM comparison: SNR 30.57 dB); independent Whisper transcribed the one-frame
 reply correctly. This does not establish broad speech-quality equivalence.
@@ -543,3 +546,61 @@ covers dense-reference frontend goldens and nonfinite power behavior. This is
 selected-case equivalence, not corpus-level speech-quality validation. The
 30-second profile, live demo and delivery ZIP are unchanged. The under-200 ms
 first-audio target remains open.
+
+## 15-second backbone prefill optimization, 2026-11-25
+
+The audio backbone now processes MLP activations in regions of at most 32
+tokens, while retaining full-group dense projections. This permits a tested
+64-token prefill profile. The change applies only to the audio backbone;
+single-token execution and groups up to 32 retain their existing graph path.
+The default group remains 16. Encoder, depth and detokenizer graphs retain
+their existing activation path.
+
+The original 64-token experiment above had a numerical discrepancy in the
+feed-forward path. Its mixer/residual and pre-down-projection outputs matched
+quantized SDK execution separately; splitting only the activation restored
+complete-layer hardware agreement. This narrows the problem to compilation of
+that region, without establishing the compiler's exact internal cause. The old
+64-token artifacts remain unsuitable; compile the revised source into a fresh
+directory:
+
+```bash
+python scripts/gen_models--liquidai--lfm2_audio.py /path/to/snapshot \
+  -o /path/to/audio-15s-prefill64-build \
+  --audio-frames 1501 --group-size 64 --decoder-frames 1
+```
+
+Paired warm server measurements use the same optimized CPU frontend library,
+BF16 activations/KV, INT8 compute weights, 1,024-token context and unchanged
+text/audio schedule. Each fixture uses four requests with the first discarded;
+the table reports medians after input upload, excluding recording, network and
+browser playback. Timing requests cancel after first PCM.
+
+| Input and metric | 32-token prefill | Revised 64-token prefill |
+| --- | --- | --- |
+| Full 15-second input: backbone prefill | 260.57 ms | 164.39 ms |
+| Full 15-second input: first visible text | 352.71 ms | 256.71 ms |
+| Full 15-second input: first playable PCM | 620.27 ms | 521.25 ms |
+| Same 1.44-second clip: first visible text | 130.52 ms | 96.46 ms |
+| Same 1.44-second clip: first playable PCM | 396.54 ms | 361.16 ms |
+
+The 212-token full-input prompt uses four prefill passes instead of seven.
+Prefill time falls about 36.9%, and first PCM about 16.0%. Single-token
+generation, depth generation and waveform decoding are unchanged; the roughly
+260 ms text-to-audio interval remains, as does the under-200 ms target.
+
+The development candidate contains 104 ELFs: 24 freshly compiled prefill units
+and 80 explicitly audited reused units. Original artifact signatures are
+preserved. All five representative component classes match quantized SDK
+outputs bit for bit on Modalix. The expanded prefix test matches all 88 states
+bit for bit against the 32-token runtime, including continuation after prompts
+up to 212 tokens. A full speech run also matches text and all 587,520 PCM16
+samples exactly; the varied-sentence ASR result is unchanged. These are
+selected-case comparisons against the quantized baseline, not full-model
+floating parity or broad speech-quality validation.
+
+Both 15-second profiles reach the 320-step generation cap on that speech
+fixture, producing 24.48 seconds of output. Matching that run does not establish
+correct natural stopping. This quality limit needs separate diagnosis. The
+30-second profile, live demo and delivery ZIP are unchanged; SDK 3.0.1 release
+validation remains open.

@@ -109,3 +109,44 @@ def test_audio_subsampling_preserves_physical_length_boundaries(tmp_path, quanti
         expected = output(hidden).numpy()
     np.testing.assert_allclose(actual[:, 0, :expected.shape[1]], expected,
                                rtol=2e-5 if quantizable else .03, atol=2e-6 if quantizable else .003)
+
+
+@dataclass
+class _MlpActivationBlockModel(BaseModel):
+    length: int
+    token_block_size: int | None
+
+    def generate_graph(self, layer_cfg, quantizable):
+        graph = ModelGraph(self, {"hidden": (1, 1, self.length, 16)}, quantizable)
+        graph.save([graph.mlp(
+            "mlp", graph.inputs["hidden"], "silu", projections=("w1", "w3", "w2"),
+            activation_token_block_size=self.token_block_size,
+        )])
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize("length", [1, 32, 48, 64, 96])
+def test_audio_mlp_activation_blocks_preserve_values(tmp_path, quantizable, length):
+    rng = np.random.default_rng(617)
+    weights = {"w1": rng.normal(0, .03, (32, 16)).astype(np.float32),
+               "w3": rng.normal(0, .03, (32, 16)).astype(np.float32),
+               "w2": rng.normal(0, .03, (16, 32)).astype(np.float32)}
+    source = LocalHuggingFaceModel(tmp_path, {}, {}, {}, {}, {}, params={
+        f"mlp.{name}.weight": value for name, value in weights.items()
+    })
+    values = rng.normal(0, .1, (1, 1, length, 16)).astype(activation_dtype(quantizable))
+    plain = _MlpActivationBlockModel(
+        VlmConfig(), "plain", hf_model=source, length=length, token_block_size=None,
+    )
+    blocked = _MlpActivationBlockModel(
+        VlmConfig(), "blocked", hf_model=source, length=length, token_block_size=32,
+    )
+    expected = _graph(plain, quantizable).run(hidden=values)[0]
+    actual = _graph(blocked, quantizable).run(hidden=values)[0]
+    np.testing.assert_array_equal(actual, expected)
+    if quantizable:
+        hidden = torch.from_numpy(values)
+        gate = nn.functional.silu(nn.functional.linear(hidden, torch.from_numpy(weights["w1"])))
+        up = nn.functional.linear(hidden, torch.from_numpy(weights["w3"]))
+        reference = nn.functional.linear(gate * up, torch.from_numpy(weights["w2"])).numpy()
+        np.testing.assert_allclose(actual, reference, rtol=3e-5, atol=1e-6)

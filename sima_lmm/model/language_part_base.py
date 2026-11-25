@@ -38,6 +38,7 @@ class LanguagePartBaseModel(BaseModel):
             lora_ranks=ranks, merged_lora=merged_lora, expert_idx=expert_idx,
             de_interleave=self.cfg.lm_cfg.arch == LlmArchType.GPT_OSS,
             swiglu_limit=self.cfg.lm_cfg.mlp_cfg.swiglu_limit,
+            activation_token_block_size=getattr(self, "_mlp_activation_token_block_size", None),
         )
 
     @property

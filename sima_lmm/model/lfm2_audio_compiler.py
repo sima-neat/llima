@@ -11,6 +11,7 @@ from sima_lmm.model.language_conv_model import LanguageConvModel
 from sima_lmm.model.language_pre_model import LanguagePreModel
 from sima_lmm.model.lfm2_audio_model import (
     AudioAdapterModel, AudioCacheModel, AudioConformerLayerModel, AudioDepthPostModel,
+    AudioBackboneConvModel, AudioBackbonePostModel, AudioBackboneFinalConvModel,
     AudioEncoderSubsamplingModel, AudioFinalConvModel, AudioLanguagePostModel, AudioProjectionModel,
 )
 
@@ -80,16 +81,19 @@ def plan_audio_components(
                 prefix = f"{component}_n{length}_layer{index}"
                 common = dict(sima_path=output, hf_model=source, num_tokens=length, layer_idx=index)
                 if kind == "conv":
-                    add(component, "conv", LanguageConvModel(
+                    conv_model = AudioBackboneConvModel if component == "backbone" else LanguageConvModel
+                    add(component, "conv", conv_model(
                         config, prefix + "_conv", final_softcapping=None, **common
                     ))
                     if index == config.lm_cfg.num_hidden_layers - 1:
-                        add(component, "final", AudioFinalConvModel(
+                        final_model = AudioBackboneFinalConvModel if component == "backbone" else AudioFinalConvModel
+                        add(component, "final", final_model(
                             config, prefix + "_final", final_softcapping=None, **common
                         ))
                 else:
                     add(component, "pre", LanguagePreModel(config, prefix + "_pre", **common))
-                    post = AudioDepthPostModel if depth else AudioLanguagePostModel
+                    post = (AudioDepthPostModel if depth else
+                            AudioBackbonePostModel if component == "backbone" else AudioLanguagePostModel)
                     add(component, "post", post(config, prefix + "_post", final_softcapping=None, **common))
             add(component, "cache", AudioCacheModel(
                 config, f"{component}_n{length}_cache{capacity}", sima_path=output, hf_model=source,
