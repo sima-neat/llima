@@ -511,3 +511,35 @@ with both encoder buckets. The cause of the full-length failure is unresolved;
 these results establish compilation and selected latency, not reliable
 30-second ASR. Full numerical/quality validation and SDK 3.0.1 release validation
 remain open. The live demo and existing delivery ZIP are unchanged.
+
+## 15-second CPU frontend optimization, 2026-11-25
+
+The CPU mel filter projection now skips leading and trailing zero coefficients.
+Ranges retain complete four-float groups to preserve the original Modalix
+multiply/add rounding, and nonfinite power values retain the dense path's
+zero-times-infinity behavior. The encoder reuses its existing 104-ELF runtime.
+
+Warm measurements for the same full 15-second synthetic input and unchanged
+32-token prefill / one-frame decoder profile:
+
+| Stage | Before | After |
+| --- | --- | --- |
+| CPU frontend | 168.41 ms | 32.45 ms |
+| Complete encoder | 43.75 ms | 43.69 ms |
+| Input processing | 212.13 ms | 76.15 ms |
+| First visible text | 487.98 ms | 351.99 ms |
+| First playable PCM | 752.66 ms | 616.08 ms |
+
+First-PCM latency falls about 18.1% in this scenario. For the same short
+1.44-second input using the 15-second encoder, first text is 129.08 ms and
+first PCM is 392.99 ms. Timing methods and exclusions match the preceding
+measurements; these are resident server timings after input upload.
+
+Frontend outputs match the original bit for bit across 14 fixtures, including
+speech, silence, impulses, random and very short inputs, sparse edge/gapped
+filters and overflow handling. Complete encoder embeddings also match bit for
+bit for the short and full 15-second timing inputs. The native regression test
+covers dense-reference frontend goldens and nonfinite power behavior. This is
+selected-case equivalence, not corpus-level speech-quality validation. The
+30-second profile, live demo and delivery ZIP are unchanged. The under-200 ms
+first-audio target remains open.

@@ -123,6 +123,37 @@ void waveform() {
     chunks.insert(chunks.end(), tail.begin(), tail.end());
     assert(whole.size() == 17 * 320 && whole == chunks);
 }
+void frontend() {
+    std::vector<float> window(400, 1.f), filters(128 * 257, 0.f), pcm(511);
+    for (size_t i = 0; i < pcm.size(); ++i) pcm[i] = (static_cast<int>(i % 29) - 14) / 16.f;
+    filters[257] = 1.f;
+    filters[2 * 257 + 256] = 1.f;
+    filters[3 * 257] = 1.f;
+    filters[3 * 257 + 37] = .5f;
+    filters[3 * 257 + 256] = 2.f;
+    const std::array<float, 5> triangle{.2f, .4f, 1.f, .4f, .2f};
+    std::copy(triangle.begin(), triangle.end(), filters.begin() + 4 * 257 + 91);
+    for (size_t i = 0; i < 257; ++i) filters[5 * 257 + i] = (i % 11) / 16.f;
+    AudioFeatureExtractor extractor(window, filters);
+    const auto output = extractor.process(pcm);
+    // Golden values from the original dense frontend: empty, first/last-bin,
+    // gapped, triangular and dense filters, including the final zero frame.
+    const std::array<float, 24> expected{
+        0.f, 0.f, 0.f, 0.f,
+        0x1.a550b6p-3f, -0x1.163ba8p+0f, 0x1.c3232p-1f, 0.f,
+        -0x1.1e642cp-1f, -0x1.30b696p-1f, 0x1.278d62p+0f, 0.f,
+        0x1.29cf6ap-1f, -0x1.2797eap+0f, 0x1.25607ep-1f, 0.f,
+        -0x1.357888p-1f, -0x1.197d8ep-1f, 0x1.277b0cp+0f, 0.f,
+        -0x1.26bb32p+0f, 0x1.ff33eap-2f, 0x1.4ddc98p-1f, 0.f,
+    };
+    assert(output.frames == 4 && output.values.size() == 128 * 4);
+    for (size_t i = 0; i < expected.size(); ++i) assert(std::abs(output.values[i] - expected[i]) < 3e-6f);
+    for (size_t i = expected.size(); i < output.values.size(); ++i) assert(output.values[i] == 0.f);
+    // Zero coefficients must still participate when finite PCM overflows the
+    // power calculation, retaining the dense frontend's 0*Inf -> NaN behavior.
+    std::fill(pcm.begin(), pcm.end(), 1e38f);
+    assert(std::isnan(extractor.process(pcm).values[0]));
+}
 } // namespace
 
 std::vector<float> read_floats(const char* path) {
@@ -157,5 +188,6 @@ int main(int argc, char** argv) {
     generation_modes();
     sampling();
     waveform();
+    frontend();
     std::cout << "Audio generation and waveform checks passed\n";
 }

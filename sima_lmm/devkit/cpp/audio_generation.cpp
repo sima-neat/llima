@@ -212,12 +212,26 @@ void AudioWaveformSynthesizer::reset() {
 
 struct AudioFeatureExtractor::Impl {
     std::vector<float> window, filters;
+    std::array<size_t, 128> filter_begin{}, filter_end{};
     double* time = nullptr;
     fftw_complex* frequency = nullptr;
     fftw_plan plan = nullptr;
     Impl(std::span<const float> source_window, std::span<const float> source_filters)
         : window(source_window.begin(), source_window.end()), filters(source_filters.begin(), source_filters.end()) {
         if (window.size() != 400 || filters.size() != 128 * 257) throw std::invalid_argument("Invalid log-mel assets");
+        for (size_t feature = 0; feature < filter_begin.size(); ++feature) {
+            size_t begin = 0, end = 257;
+            while (begin < end && filters[feature * 257 + begin] == 0.f) ++begin;
+            while (end > begin && filters[feature * 257 + end - 1] == 0.f) --end;
+            // Retain complete four-float groups so the Modalix compiler uses
+            // the same multiply/add rounding as the original dense loop.
+            if (begin < end) {
+                begin = begin / 4 * 4;
+                end = std::min(size_t{257}, (end + 3) / 4 * 4);
+            }
+            filter_begin[feature] = begin;
+            filter_end[feature] = end;
+        }
         time = fftw_alloc_real(512);
         frequency = fftw_alloc_complex(257);
         if (!time || !frequency) {
@@ -263,9 +277,17 @@ AudioMelFeatures AudioFeatureExtractor::process(std::span<const float> pcm) {
             const float magnitude = std::sqrt(real * real + imaginary * imaginary);
             power[bin] = magnitude * magnitude;
         }
+        const bool finite_power = std::all_of(power.begin(), power.end(), [](float value) {
+            return std::isfinite(value);
+        });
         for (size_t feature = 0; feature < 128; ++feature) {
             float energy = 0.f;
-            for (size_t bin = 0; bin < 257; ++bin) energy += state.filters[feature * 257 + bin] * power[bin];
+            // Omit only leading/trailing zero coefficients, keeping nonzero
+            // additions in their original order. Preserve 0*Inf/NaN behavior
+            // when finite PCM overflows the float power calculation.
+            const size_t begin = finite_power ? state.filter_begin[feature] : 0;
+            const size_t end = finite_power ? state.filter_end[feature] : power.size();
+            for (size_t bin = begin; bin < end; ++bin) energy += state.filters[feature * 257 + bin] * power[bin];
             result.values[feature * result.frames + frame] = std::log(energy + 0x1.p-24f);
         }
     }
