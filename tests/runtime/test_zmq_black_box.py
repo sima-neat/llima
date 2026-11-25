@@ -90,6 +90,17 @@ def test_zmq_generate_request_and_remote_stop(tmp_path):
         assert len(response[1]) == generated_tokens * 4
         assert response_metadata["infer_time_ns"] > 0
 
+        for budget in (0, 1, 8):
+            request = {**metadata, "type": "generate_for_perf", "max_num_tokens": 1 + budget,
+                       "stop_token_ids": []}
+            client.send_multipart([msgpack.packb(request, use_bin_type=True), struct.pack("=I", 0)])
+            header, payload = client.recv_multipart()
+            profile = msgpack.unpackb(header, raw=False)
+            assert profile["result_type"] == "token_durations"
+            assert profile["generated_tokens"] == budget
+            assert profile["tensor_shape"] == [1, budget]
+            assert all(math.isfinite(t) and t > 0 for t in struct.unpack(f"={budget}d", payload))
+
         client.send(b"stop")
         process.wait(timeout=30)
         output = process.stdout.read() if process.stdout is not None else ""

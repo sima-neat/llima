@@ -26,14 +26,14 @@ sima-cli playbooks install \
 | 컴파일 | `sima_lmm/model/`, `sima_lmm/preproc/` | 모델 구성 요소, 양자화, 그래프, 전처리 |
 | 호스트 도구 | `sima_lmm/host/` | 컴파일하고, 배포하고, LoRA를 적용하고, 벤치마크 진입 지점을 설정합니다. |
 | 평가 | `sima_lmm/mole/` | MoLE 워크플로우 |
-| 런타임 CLI | `sima_lmm/devkit/` | Python CLI를 사용한 오케스트레이션 및 모델 관리 |
-| C++ 런타임 | `sima_lmm/devkit/cpp/` | 모델, 토크나이저, MLA, CLI/HTTP/ZMQ 구현, 그리고 내부 CLI 바인딩 |
+| 런타임 CLI | `runtime/devkit/` | Python CLI를 사용한 오케스트레이션 및 모델 관리 |
+| C++ 런타임 | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` | 모델, 토크나이저, MLA, CLI/HTTP/ZMQ 구현, 그리고 내부 CLI 바인딩 |
 | 테스트 | `tests/` | 컴파일러 및 Modalix 런타임 테스트 |
 | 포장 | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | 데비안, 휠, 그리고 아티팩트 패키징 |
 | 지속적 통합/캐시 | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | 빌드, 테스트, 모델 캐시 생성 |
 | 문서/기술 | `README.md`, `docs/`, `skills/` | 사용자, 기여자, 그리고 플레이북 안내 |
 
-컴파일러 전용 종속성은 `sima_lmm/devkit/` 또는 Modalix 런타임 패키지에 포함되어서는 안 됩니다.
+컴파일러 전용 종속성은 `runtime/` 또는 Modalix 런타임 패키지에 포함되어서는 안 됩니다.
 
 ## 개발 환경
 
@@ -98,7 +98,7 @@ python scripts/gen_models--openai--whisper.py \
 
 Whisper 모델 리포지토리에는 인코더 계층마다 하나의 ELF가 포함됩니다. 런타임은 인코더 ELF가 하나로 통합된 기존 리포지토리를 지원하지 않습니다. 계층화된 모델을 다운로드하거나 현재 LLiMa 버전으로 체크포인트를 다시 컴파일하십시오.
 
-컴파일러 변경 사항은 일반적으로 `sima_lmm/config/whisper_config.py`, `sima_lmm/model/whisper_*.py` 및 스크립트에 영향을 미치고, 런타임 변경 사항은 `sima_lmm/devkit/cpp/whisper_*`에 영향을 미칩니다. `tests/README.md`에 설명된 패키지된 C++ ASR 런타임 테스트와 Modalix의 대표 오디오를 사용하여 유효성을 검사합니다. 이것은 일반적인 ASR 아키텍처 프레임워크가 아닌 Whisper에 특정한 경로입니다.
+컴파일러 변경 사항은 일반적으로 `sima_lmm/config/whisper_config.py`, `sima_lmm/model/whisper_*.py` 및 스크립트에 영향을 미치고, 런타임 변경 사항은 `runtime/src/whisper_*.cpp`에 영향을 미칩니다. `tests/README.md`에 설명된 패키지된 C++ ASR 런타임 테스트와 Modalix의 대표 오디오를 사용하여 유효성을 검사합니다. 이것은 일반적인 ASR 아키텍처 프레임워크가 아닌 Whisper에 특정한 경로입니다.
 
 ### 네이티브 그래프 컴포넌트
 

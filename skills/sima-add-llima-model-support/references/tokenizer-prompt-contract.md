@@ -35,7 +35,7 @@ the generated DevKit directory contains an asset that the C++ runtime can load.
 5. Compare reference and Minja rendering exactly.
 6. Trace host loading in `sima_lmm/preproc/vlm_helper.py`, asset packaging in
    `sima_lmm/model/base.py::gen_devkit_files`, and runtime loading in
-   `sima_lmm/devkit/cpp/{vlm_helper,tokenizer}.*`.
+   `runtime/src/{vlm_helper,tokenizer}.cpp`.
 7. Verify that the actual tokenizer file extension and representation survive
    packaging; do not assume custom source files are copied or executable on
    Modalix.

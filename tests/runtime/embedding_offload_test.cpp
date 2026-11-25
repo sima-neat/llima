@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <unistd.h>
 
-#include "embedding_offload.hpp"
+#include "language/embedding_offload.hpp"
 
 namespace {
 void require(bool condition, const char* message) {

@@ -171,17 +171,12 @@ void test_disk_does_not_pull_files() {
 }
 
 void test_provider_root_alias_is_rejected() {
-    using Base = simaai::llima::BaseModel<simaai::llima::WhisperConfig>;
-    struct RootProbe : Base {
-        RootProbe(const std::filesystem::path& root, std::shared_ptr<FileProvider> files)
-            : Base(root, std::move(files)) {}
-    };
     TempModel model;
     const auto alias = model.root / "alias";
     std::filesystem::create_directory_symlink(model.root, alias);
     bool rejected = false;
     try {
-        RootProbe probe(alias, std::make_shared<DiskFileProvider>(model.root));
+        simaai::llima::WhisperModel probe(alias, std::make_shared<DiskFileProvider>(model.root));
     } catch (const std::invalid_argument& e) {
         rejected = std::string(e.what()).find("FileProvider ELF location") != std::string::npos;
     }

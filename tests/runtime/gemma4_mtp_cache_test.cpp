@@ -11,11 +11,11 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
-#include <spdlog/sinks/base_sink.h>
 
-#include "language_model.hpp"
+#include "language_model_test_access.hpp"
 #include "setup.hpp"
 #include "vision_language_model.hpp"
+#include "vlm/vlm_helper.hpp"
 
 namespace {
 
@@ -24,39 +24,6 @@ using namespace simaai::llima;
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
-
-// Observe the actual grouped/pointwise prefill calls without adding a runtime
-// API just for tests. MTP verification uses its own target-batch entry point.
-class PrefillTrace : public spdlog::sinks::base_sink<std::mutex> {
-public:
-    void reset(LanguageModel* cancel_on_prefill = nullptr) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        positions_.clear();
-        cancel_on_prefill_ = cancel_on_prefill;
-    }
-
-    std::vector<size_t> positions() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return positions_;
-    }
-
-private:
-    void sink_it_(const spdlog::details::log_msg& message) override {
-        const std::string text(message.payload.data(), message.payload.size());
-        constexpr std::string_view prefix = "Processing token no. ";
-        if (!text.starts_with(prefix)) return;
-        positions_.push_back(std::stoul(text.substr(prefix.size())));
-        if (cancel_on_prefill_ != nullptr) {
-            cancel_on_prefill_->stop_model();
-            cancel_on_prefill_ = nullptr;
-        }
-    }
-
-    void flush_() override {}
-
-    std::vector<size_t> positions_;
-    LanguageModel* cancel_on_prefill_ = nullptr;
-};
 
 struct Metrics {
     std::optional<uint32_t> cached_tokens;
@@ -120,18 +87,7 @@ int main(int argc, char** argv) {
 
         connect({}, "/tmp/llima-gemma4-mtp-cache.log", spdlog::level::info);
         connected = true;
-        auto trace = std::make_shared<PrefillTrace>();
-        // Model loggers clone this synchronous logger so trace assertions and
-        // cancellation do not race the asynchronous file-logging worker.
-        auto old_logger = spdlog::get("llima");
-        auto logger = std::make_shared<spdlog::logger>(
-            "llima", old_logger->sinks().begin(), old_logger->sinks().end()
-        );
-        logger->sinks().push_back(trace);
-        logger->set_level(spdlog::level::info);
-        spdlog::drop("llima");
-        spdlog::register_logger(logger);
-        spdlog::set_default_logger(logger);
+        auto trace = PrefillTrace::install();
 
         std::vector<uint32_t> public_prompt, public_reference;
         {
@@ -149,15 +105,13 @@ int main(int argc, char** argv) {
 
             auto run = [&](const std::vector<uint32_t>& prompt,
                            uint16_t generated = 16, bool cancel = false) {
-                target.create_input_buffers(prompt);
                 {
                     std::lock_guard<std::mutex> lock(metrics_mutex);
                     metrics = {};
                 }
                 trace->reset(cancel ? &target : nullptr);
-                auto tokens = target.run_model_gemma4_mtp(
-                    draft, prompt, static_cast<uint16_t>(prompt.size() + generated),
-                    std::nullopt, nullptr
+                auto tokens = target.run_model_speculative_decoding(
+                    draft, prompt, {.max_total_tokens = static_cast<uint16_t>(prompt.size() + generated)}
                 );
                 std::lock_guard<std::mutex> lock(metrics_mutex);
                 require(metrics.cached_tokens.has_value(), "Missing cache reuse metric");
@@ -176,10 +130,8 @@ int main(int argc, char** argv) {
                 return Result{std::move(tokens), metrics, trace->positions()};
             };
             auto reset_cache = [&] {
-                target.clear_cached_token_ids();
-                draft.clear_cached_token_ids();
-                target.set_kv_cache_len(0);
-                draft.set_kv_cache_len(0);
+                LanguageModelTestAccess::reset_cache(target);
+                LanguageModelTestAccess::reset_cache(draft);
             };
             auto cold_reference = [&](const std::vector<uint32_t>& prompt) {
                 reset_cache();
@@ -219,7 +171,7 @@ int main(int argc, char** argv) {
             // physical buffer still contains extra verification rows.
             auto continuation = prompt_a;
             continuation.insert(continuation.end(), a1.tokens->begin(), a1.tokens->end());
-            const auto committed = target.get_kv_cache_len();
+            const auto committed = LanguageModelTestAccess::kv_cache_len(target);
             const auto continuation_warm = run(continuation);
             const auto continuation_cold = cold_reference(continuation);
             require(continuation_warm.tokens == continuation_cold.tokens,
@@ -243,7 +195,7 @@ int main(int argc, char** argv) {
                 "Partial-prefix reuse did not skip the first prefill group");
 
             // A logical KV truncation must win over a longer token history.
-            target.set_kv_cache_len(static_cast<uint16_t>(group));
+            LanguageModelTestAccess::truncate_kv(target, static_cast<uint16_t>(group));
             const auto truncated = run(partial);
             require(*truncated.metrics.cached_tokens == group && truncated.tokens == partial_cold.tokens,
                 "Reuse exceeded the valid KV length after truncation");
@@ -256,7 +208,7 @@ int main(int argc, char** argv) {
             reset_cache();
             const auto interrupted = run(prompt_a, 16, true);
             require(!interrupted.tokens.has_value(), "Prefill ignored cancellation");
-            require(target.get_kv_cache_len() == 0, "Interrupted target KV remains valid");
+            require(LanguageModelTestAccess::kv_cache_len(target) == 0, "Interrupted target KV remains valid");
             const auto recovered = run(prompt_a);
             require(*recovered.metrics.cached_tokens == 0,
                 "Recovery must recompute from an empty cache");
@@ -287,12 +239,12 @@ int main(int argc, char** argv) {
                 default_stop == public_reference.end() ? default_stop : default_stop + 1);
             VisionLanguageModel target(target_dir), draft(argv[2]);
             target.set_draft_vlm(&draft);
-            const auto max_tokens = static_cast<uint16_t>(public_prompt.size() + 16);
-            require(target.run_model(public_prompt, max_tokens, std::set<uint32_t>{})
+            const GenerationOptions options{.max_new_tokens = 16};
+            require(target.run_model(public_prompt, {.max_new_tokens = 16, .stop_token_ids = std::set<uint32_t>{}})
                     == public_reference,
                 "Public token-ID generation differs from direct MTP generation");
             require(target.run_model(public_prompt,
-                    static_cast<uint16_t>(public_prompt.size() + 1), std::set<uint32_t>{})
+                    {.max_new_tokens = 1, .stop_token_ids = std::set<uint32_t>{}})
                     == std::vector<uint32_t>{public_reference.front()},
                 "Public token-ID generation ignored the token limit");
 
@@ -300,36 +252,36 @@ int main(int argc, char** argv) {
             const uint32_t stop_token = public_reference[1];
             const auto stop = std::find(public_reference.begin(), public_reference.end(), stop_token);
             const std::vector<uint32_t> stopped_reference(public_reference.begin(), stop + 1);
-            require(target.run_model(public_prompt, max_tokens, std::set<uint32_t>{stop_token})
+            require(target.run_model(public_prompt, {.max_new_tokens = 16, .stop_token_ids = std::set{stop_token}})
                     == stopped_reference,
                 "Public MTP generation ignored the stop-token override");
-            require(target.run_model(public_prompt, max_tokens) == default_reference,
+            require(target.run_model(public_prompt, options) == default_reference,
                 "Public MTP generation did not restore its default stop tokens");
-            const auto performance = target.run_model_for_ttnt(public_prompt, max_tokens);
+            const auto performance = target.run_model_for_ttnt(public_prompt, options);
             require(performance.generated_tokens == default_reference.size()
                     && performance.accepted_draft_tokens.has_value(),
                 "Public timing request did not dispatch through MTP");
 
             bool rejected_empty = false;
             try {
-                target.run_model(std::span<const uint32_t>{}, max_tokens,
-                    std::set<uint32_t>{stop_token});
+                target.run_model(std::span<const uint32_t>{},
+                    {.max_new_tokens = 16, .stop_token_ids = std::set{stop_token}});
             } catch (const std::runtime_error& error) {
                 rejected_empty = std::string(error.what())
                     == "Gemma4 MTP generation requires at least one input token";
             }
             require(rejected_empty, "Public MTP generation did not reject an empty prompt");
-            require(target.run_model(public_prompt, max_tokens) == default_reference,
+            require(target.run_model(public_prompt, options) == default_reference,
                 "Failed token-ID request did not restore its stop tokens");
 
             std::atomic<bool> stream_ended = false;
-            target.set_text_callback([&](const std::string&, bool end, bool) {
+            GenerationOptions stream_options{.max_new_tokens = 1};
+            stream_options.callbacks.text = [&](const std::string&, bool end, bool) {
                 if (end) stream_ended.store(true);
-            });
+            };
             auto chat = target.create_chat();
             chat.add_query("What is the capital of Germany?");
-            require(target.run_model(chat, 1).has_value(), "Chat failed after token-ID requests");
-            target.wait_for_streamer_completion();
+            require(!target.generate(chat, stream_options).token_ids.empty(), "Chat failed after token-ID requests");
             require(stream_ended.load(), "Token-ID request did not re-enable chat streaming");
             std::cout << "Gemma4 MTP public dispatch tests passed\n";
         }

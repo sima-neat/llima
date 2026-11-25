@@ -1,8 +1,13 @@
+# These are internal runtime tests; private headers are never exported to consumers.
+include_directories("${PROJECT_SOURCE_DIR}/runtime/src")
+add_subdirectory(host)
+install(TARGETS sima_lmm_attention_cache_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+
 add_executable(sima_lmm_embedding_offload_generation_test embedding_offload_generation_test.cpp)
 target_link_libraries(sima_lmm_embedding_offload_generation_test PRIVATE sima_lmm_runtime)
 add_executable(sima_lmm_embedding_offload_test embedding_offload_test.cpp
-    "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp")
-target_include_directories(sima_lmm_embedding_offload_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
+    "${PROJECT_SOURCE_DIR}/runtime/src/language/embedding_offload.cpp")
+target_include_directories(sima_lmm_embedding_offload_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 target_link_libraries(sima_lmm_embedding_offload_test PRIVATE OpenMP::OpenMP_CXX)
 add_test(NAME runtime.embedding_offload COMMAND sima_lmm_embedding_offload_test)
 set_tests_properties(runtime.embedding_offload PROPERTIES LABELS "runtime;unit" TIMEOUT 30)
@@ -37,11 +42,13 @@ add_executable(
     sima_lmm_gemma4_mtp_helpers_test
     gemma4_mtp_helpers_test.cpp
 )
+target_include_directories(sima_lmm_gemma4_mtp_helpers_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
 add_executable(
     sima_lmm_gemma4_mtp_cache_test
     gemma4_mtp_cache_test.cpp
 )
-target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime)
+target_include_directories(sima_lmm_gemma4_mtp_cache_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
+target_link_libraries(sima_lmm_gemma4_mtp_cache_test PRIVATE sima_lmm_runtime minja)
 target_link_libraries(
     sima_lmm_mla_rt_lifecycle_test
     PRIVATE
@@ -56,6 +63,8 @@ target_link_libraries(
     sima_lmm_vision_generation_test
     PRIVATE
         sima_lmm_runtime
+        opencv_imgproc
+        opencv_imgcodecs
 )
 target_link_libraries(
     sima_lmm_asr_transcription_test
@@ -200,12 +209,13 @@ install(
         CMakeLists.txt
         embedding_offload_generation_test.cpp
         embedding_offload_test.cpp
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.hpp"
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/embedding_offload.cpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/embedding_offload.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/embedding_offload.cpp"
         asr_transcription_test.cpp
         mla_rt_lifecycle_test.cpp
         gemma4_mtp_helpers_test.cpp
         gemma4_mtp_cache_test.cpp
+        language_model_test_access.hpp
         pytest.ini
         runtime_test_utils.hpp
         test_cli_black_box.py
@@ -214,8 +224,9 @@ install(
         test_python_runtime_lifecycle.py
         test_zmq_black_box.py
         text_generation_test.cpp
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/reasoning_parser.hpp"
-        "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp/gemma4_mtp_helpers.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/include/sima_lmm/reasoning_parser.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/speculative/gemma4_mtp_helpers.hpp"
+        "${PROJECT_SOURCE_DIR}/runtime/src/language/attention_cache.hpp"
         reasoning_parser_test.cpp
         tool_call_parser_test.cpp
         vision_generation_test.cpp
@@ -233,7 +244,6 @@ install(
 
 foreach(provider_test IN ITEMS file_provider file_provider_routing)
     add_executable(sima_lmm_${provider_test}_test ${provider_test}_test.cpp)
-    target_include_directories(sima_lmm_${provider_test}_test PRIVATE "${PROJECT_SOURCE_DIR}/sima_lmm/devkit/cpp")
     target_link_libraries(sima_lmm_${provider_test}_test PRIVATE sima_lmm_runtime)
     add_test(NAME runtime.${provider_test} COMMAND sima_lmm_${provider_test}_test)
     set_tests_properties(runtime.${provider_test} PROPERTIES LABELS "devkit;runtime;provider" TIMEOUT 900)
@@ -242,3 +252,49 @@ endforeach()
 set_tests_properties(runtime.file_provider_routing PROPERTIES LABELS "devkit;runtime;long" RESOURCE_LOCK mla)
 install(FILES file_provider_test.cpp file_provider_routing_test.cpp
     DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
+
+add_executable(sima_lmm_request_lifecycle_test request_lifecycle_test.cpp)
+target_include_directories(sima_lmm_request_lifecycle_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
+target_link_libraries(sima_lmm_request_lifecycle_test PRIVATE sima_lmm_runtime)
+set_target_properties(sima_lmm_request_lifecycle_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+add_test(NAME runtime.request_lifecycle COMMAND sima_lmm_request_lifecycle_test)
+set_tests_properties(runtime.request_lifecycle PROPERTIES LABELS "devkit;runtime;unit" TIMEOUT 30)
+install(TARGETS sima_lmm_request_lifecycle_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+install(FILES request_lifecycle_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
+
+add_executable(sima_lmm_request_generation_test request_generation_test.cpp)
+target_include_directories(sima_lmm_request_generation_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
+target_link_libraries(sima_lmm_request_generation_test PRIVATE sima_lmm_runtime minja)
+set_target_properties(sima_lmm_request_generation_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+add_test(NAME runtime.request_generation COMMAND sima_lmm_request_generation_test)
+set_tests_properties(runtime.request_generation PROPERTIES LABELS "devkit;runtime;genai;long" RESOURCE_LOCK mla TIMEOUT 900)
+foreach(method IN ITEMS eagle3 dflash gemma4_mtp)
+    add_test(NAME runtime.speculative_request_generation.${method}
+        COMMAND /usr/bin/python3 ${CMAKE_CURRENT_SOURCE_DIR}/run_speculative_generation_test.py
+                $<TARGET_FILE:sima_lmm_request_generation_test> ${method})
+    set_tests_properties(runtime.speculative_request_generation.${method} PROPERTIES
+        LABELS "devkit;runtime;genai;speculative;long" RESOURCE_LOCK mla TIMEOUT 900 SKIP_RETURN_CODE 77)
+endforeach()
+install(FILES run_speculative_generation_test.py DESTINATION lib/sima-lmm/tests COMPONENT extras)
+install(TARGETS sima_lmm_request_generation_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+install(FILES request_generation_test.cpp DESTINATION share/sima-lmm/tests/runtime COMPONENT extras)
+
+add_executable(sima_lmm_lora_adapter_test lora_adapter_test.cpp)
+target_include_directories(sima_lmm_lora_adapter_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src" "${cnpy_SOURCE_DIR}")
+target_link_libraries(sima_lmm_lora_adapter_test PRIVATE sima_lmm_runtime cnpy-static "${SIMA_LMM_MLART_LIBRARY}")
+set_target_properties(sima_lmm_lora_adapter_test PROPERTIES INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+add_test(NAME runtime.lora_adapter COMMAND sima_lmm_lora_adapter_test)
+set_tests_properties(runtime.lora_adapter PROPERTIES LABELS "devkit;runtime;genai;lora" RESOURCE_LOCK mla TIMEOUT 600)
+install(TARGETS sima_lmm_lora_adapter_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+
+# This regression uses a private header, so only its binary is shipped in extras.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime_program_lifetime_test.cpp")
+    add_executable(sima_lmm_runtime_program_lifetime_test runtime_program_lifetime_test.cpp)
+    target_include_directories(sima_lmm_runtime_program_lifetime_test PRIVATE "${PROJECT_SOURCE_DIR}/runtime/src")
+    target_link_libraries(sima_lmm_runtime_program_lifetime_test PRIVATE sima_lmm_runtime)
+    set_target_properties(sima_lmm_runtime_program_lifetime_test PROPERTIES
+        INSTALL_RPATH "$ORIGIN/../..;${CMAKE_INSTALL_FULL_LIBDIR}")
+    add_test(NAME runtime.program_lifetime COMMAND sima_lmm_runtime_program_lifetime_test)
+    set_tests_properties(runtime.program_lifetime PROPERTIES LABELS "devkit;runtime" RESOURCE_LOCK mla TIMEOUT 120)
+    install(TARGETS sima_lmm_runtime_program_lifetime_test RUNTIME DESTINATION lib/sima-lmm/tests COMPONENT extras)
+endif()

@@ -61,6 +61,7 @@ DEVKIT_PATHS = frozenset(
         ".gitmodules",
         "CMakeLists.txt",
         "build.sh",
+        "sima_lmm/devkit",
         "toolchain-sima.cmake",
         "tools/install_llima.sh",
     }
@@ -68,8 +69,8 @@ DEVKIT_PATHS = frozenset(
 
 DEVKIT_PATH_PREFIXES = (
     "cmake/",
+    "runtime/",
     "sima_lmm/assets/",
-    "sima_lmm/devkit/",
     "tests/runtime/",
     "third_party/",
 )
@@ -91,6 +92,8 @@ TEST_NEUTRAL_PATHS = frozenset(
         "sima_lmm/host/deploy_lora.py",
         "tests/README.md",
         "tests/__init__.py",
+        "tests/ci/test_runtime_includes.py",
+        "tools/ci/check_runtime_includes.py",
         "tests/test_cmake_package_compatibility.py",
         "tests/test_install_llima_safety.py",
         "tools/install_mole.sh",

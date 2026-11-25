@@ -26,14 +26,14 @@ sima-cli playbooks install \
 | 編譯 | `sima_lmm/model/`, `sima_lmm/preproc/` | 模型組件、量化、圖表和預處理。 |
 | 主機工具 | `sima_lmm/host/` | 編譯、部署、LoRA，以及進行基準測試，以評估程式的進入點。 |
 | 評估 | `sima_lmm/mole/` | MoLE 工作流程 |
-| 執行階段 CLI | `sima_lmm/devkit/` | Python CLI 流程協調與模型管理 |
-| C++ 執行階段 | `sima_lmm/devkit/cpp/` | 模型、權杖化器、MLA、CLI/HTTP/ZMQ 的實作，以及內部 CLI 繫結。 |
+| 執行階段 CLI | `runtime/devkit/` | Python CLI 流程協調與模型管理 |
+| C++ 執行階段 | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` | 模型、權杖化器、MLA、CLI/HTTP/ZMQ 的實作，以及內部 CLI 繫結。 |
 | 測試 | `tests/` | 編譯器和 Modalix 執行階段測試 |
 | 包裝 | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian、wheel 格式，以及成品組裝。 |
 | 持續整合/快取 | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | 建立、測試和快取模型。 |
 | 檔案/技能 | `README.md`, `docs/`, `skills/` | 使用者、貢獻者和《Playbooks》指南 |
 
-僅編譯時所需的相依性不應納入 `sima_lmm/devkit/` 或 Modalix 執行階段套件。
+僅編譯時所需的相依性不應納入 `runtime/` 或 Modalix 執行階段套件。
 
 ## 開發環境
 
@@ -97,7 +97,7 @@ python scripts/gen_models--openai--whisper.py \
 
 Whisper 模型儲存庫中，每個編碼器層各有一個 ELF。執行階段不支援編碼器 ELF 為單一整體的舊版儲存庫；請下載分層模型，或使用目前的 LLiMa 版本重新編譯檢查點。
 
-編譯器變更通常會影響 `sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py` 和腳本；執行階段變更會影響 `sima_lmm/devkit/cpp/whisper_*`。使用封裝的 C++ ASR 執行階段測試進行驗證，該測試的相關檔案位於 `tests/README.md` 中，並使用 Modalix 上的代表性音訊進行測試。這是一個 Whisper 專用的路徑，而不是一個通用的 ASR 架構框架。
+編譯器變更通常會影響 `sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py` 和腳本；執行階段變更會影響 `runtime/src/whisper_*.cpp`。使用封裝的 C++ ASR 執行階段測試進行驗證，該測試的相關檔案位於 `tests/README.md` 中，並使用 Modalix 上的代表性音訊進行測試。這是一個 Whisper 專用的路徑，而不是一個通用的 ASR 架構框架。
 
 ### 原生圖元件
 

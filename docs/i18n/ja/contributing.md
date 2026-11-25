@@ -26,14 +26,14 @@ sima-cli playbooks install \
 | コンパイル | `sima_lmm/model/`, `sima_lmm/preproc/` | モデルの構成要素、量子化、グラフ、および前処理 |
 | ホストツール | `sima_lmm/host/` | コンパイル、デプロイ、LoRA、およびエントリポイントのベンチマークを実施します。 |
 | 評価 | `sima_lmm/mole/` | MoLE ワークフロー |
-| ランタイム CLI | `sima_lmm/devkit/` | Python CLIによるオーケストレーションとモデル管理 |
-| C++ ランタイム | `sima_lmm/devkit/cpp/` | モデル、トークナイザー、MLA、CLI/HTTP/ZMQの実装、および内部CLIバインディング。 |
+| ランタイム CLI | `runtime/devkit/` | Python CLIによるオーケストレーションとモデル管理 |
+| C++ ランタイム | `runtime/src/`, `runtime/include/sima_lmm/`, `runtime/devkit/binding.cpp` | モデル、トークナイザー、MLA、CLI/HTTP/ZMQの実装、および内部CLIバインディング。 |
 | テスト | `tests/` | コンパイラとModalixのランタイムテスト |
 | パッケージ | `CMakeLists.txt`, `cmake/`, `build*.sh`, `tools/install_*.sh` | Debian、wheel、およびアーティファクトの組み立て |
 | CI/キャッシュ | `.github/workflows/`, `tools/ci/`, `tools/hf-safetensors/` | ビルド、テスト、およびモデルキャッシュの作成 |
 | ドキュメント/スキル | `README.md`, `docs/`, `skills/` | ユーザー、コントリビューター、およびプレイブックに関するガイダンス |
 
-コンパイラのみに依存するパッケージは、`sima_lmm/devkit/` または Modalix のランタイムパッケージに含めてはなりません。
+コンパイラのみに依存するパッケージは、`runtime/` または Modalix のランタイムパッケージに含めてはなりません。
 
 ## 開発環境
 
@@ -98,7 +98,7 @@ python scripts/gen_models--openai--whisper.py \
 
 Whisper モデルリポジトリには、エンコーダーのレイヤーごとに 1 つの ELF が含まれます。ランタイムは、エンコーダー ELF が単一にまとめられた従来のリポジトリをサポートしていません。レイヤー化されたモデルをダウンロードするか、現在の LLiMa バージョンでチェックポイントを再コンパイルしてください。
 
-コンパイラの変更は通常、`sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py`、およびスクリプトに影響します。ランタイムの変更は、`sima_lmm/devkit/cpp/whisper_*` に影響します。`tests/README.md` に記載されているパッケージ化された C++ ASR ランタイムテストと、Modalix の代表的なオーディオを使用して検証します。これは、一般的な ASR アーキテクチャフレームワークではなく、Whisper に固有のパスです。
+コンパイラの変更は通常、`sima_lmm/config/whisper_config.py`、`sima_lmm/model/whisper_*.py`、およびスクリプトに影響します。ランタイムの変更は、`runtime/src/whisper_*.cpp` に影響します。`tests/README.md` に記載されているパッケージ化された C++ ASR ランタイムテストと、Modalix の代表的なオーディオを使用して検証します。これは、一般的な ASR アーキテクチャフレームワークではなく、Whisper に固有のパスです。
 
 ### ネイティブグラフコンポーネント
 

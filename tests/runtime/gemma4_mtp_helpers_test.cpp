@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "gemma4_mtp_helpers.hpp"
+#include "language/speculative/gemma4_mtp_helpers.hpp"
 
 namespace {
 

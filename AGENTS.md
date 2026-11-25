@@ -16,7 +16,7 @@ setup, graph development, validation commands, and contribution policy.
 
 1. Classify the primary surface:
    - compiler: `sima_lmm/config`, `hf`, `gguf`, `host`, `model`, `preproc`;
-   - runtime: `sima_lmm/devkit` and `sima_lmm/devkit/cpp`;
+   - runtime: `runtime/`;
    - evaluation: `sima_lmm/mole`;
    - packaging: `CMakeLists.txt`, `build*.sh`, `cmake`, `deps`, installers;
    - CI/tests: `.github/workflows`, `tools/ci`, `tests`; or
@@ -96,3 +96,13 @@ Keep skills procedural and move conditional detail into direct references.
 A change is ready when affected tests pass, compatibility and documentation
 impact are addressed, unavailable model/hardware checks are explicit, and the
 final summary reports validation and residual risk.
+
+## Runtime component boundaries
+
+- Group implementations under `runtime/src/{vlm,language,whisper,text,mla,package,frontends}`.
+- Keep installed headers in `runtime/include/sima_lmm`; include private headers from
+  the `runtime/src` root, for example `"language/language_model.hpp"`.
+- Run `python3 tools/ci/check_runtime_includes.py` after changing runtime includes.
+  Its explicit exceptions cover startup wiring and deferred ELF file access.
+- CLI and HTTP use the public model API. ZMQ's private benchmark access is
+  documented beside its friend declaration in `vision_language_model.hpp`.

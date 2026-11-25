@@ -38,7 +38,9 @@ The Model Compiler tooling is delivered as a Python wheel:
 
 ## Install Runtime Packages
 
-Install the latest LLiMa runtime on a Modalix 3.0.0 DevKit with `sima-cli`:
+For NEAT applications, `sima-cli neat install core` installs Core with its matching LLiMa runtime.
+For standalone LLiMa development, use the command below. APT can remove incompatible
+`sima-neat` and `sima-neat-dev` packages during this install.
 
 ```bash
 sima-cli neat install llima
