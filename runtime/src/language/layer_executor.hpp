@@ -6,24 +6,29 @@
 
 namespace simaai::llima {
 
+// Binds buffers and queues layer programs shared by the decoding algorithms.
 class LayerExecutor {
   public:
     using Overrides = std::map<uint8_t, MLABufferSlice>;
+    // Borrowed embedding values and optional quantization scales ready for layer input.
     struct EmbeddingInput {
         MLABuffer* values;
         MLABuffer* scales;
     };
     enum class LayerOutput { AllRows, CacheOnly, LogitsRow };
+    // First hidden-state row and compiled post-stage width needed for a selected logits row.
     struct LogitsWindow {
         uint16_t first;
         uint16_t width;
     };
     static LogitsWindow logits_window(const LanguageModelConfig& cfg, uint16_t width, uint16_t row);
+    // Borrowed pre, cache and post programs selected for one attention-layer execution.
     struct AttentionPrograms {
         MLAModelWithBuffer& pre;
         MLAModelWithBuffer& cache;
         MLAModelWithBuffer& post;
     };
+    // Optional borrowed port overrides for one layer submission; null uses existing bindings.
     struct LayerBindings {
         Overrides* input = nullptr;
         Overrides* cache = nullptr;

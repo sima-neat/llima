@@ -37,6 +37,7 @@ enum class DecodeCallbackType : uint32_t {
 };
 
 
+// Queued token or status event consumed by the streaming worker.
 struct DecodeCallbackData {
     DecodeCallbackType type;
     uint32_t token_id;
@@ -45,8 +46,11 @@ struct DecodeCallbackData {
 };
 
 
+// Decodes queued tokens and delivers text and status callbacks on a worker thread.
+// Keeps request settings separate from defaults and waits for callbacks when finishing.
 class TextStreamer {
     public:
+        // Per-request overrides for callbacks, preserved markers, reporting and streaming.
         struct RequestOptions {
             StreamCallbacks callbacks;
             std::optional<PreservedTokens> preserved_tokens;
@@ -108,6 +112,7 @@ class TextStreamer {
         void wait_streaming();
 
     private:
+        // Resolved callbacks and output settings used as defaults or for the active request.
         struct Settings {
             InfoCallback info;
             TextCallback text;

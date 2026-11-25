@@ -17,6 +17,8 @@
 namespace simaai {
 namespace llima {
 
+// Interactive frontend that owns its loaded models and conversation.
+// Translates terminal commands into generation, transcription and adapter operations.
 class EXPORT CLI {
     public:
         CLI(

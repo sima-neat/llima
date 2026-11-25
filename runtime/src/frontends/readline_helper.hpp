@@ -13,13 +13,14 @@
 namespace simaai {
 namespace llima {
 
-// Helper class to support bash-completion
+// One node in the CLI completion grammar, with child commands or a path argument.
 struct CompletionNode {
     std::string token;
     std::vector<CompletionNode> children;
     bool expects_path = false;
 };
 
+// Installs CLI completion callbacks and loads/saves readline history for its lifetime.
 class ReadlineSupport {
 public:
     static constexpr size_t DEFAULT_MAX_ENTRIES = 1000;

@@ -14,6 +14,7 @@
 namespace simaai {
 namespace llima {
 
+// Per-encoder working buffers, program bindings and mutex for serialized execution.
 struct VisionWorkspace {
     std::map<std::string, MLABuffer> buffers;
     std::vector<std::unique_ptr<MLAModelWithBuffer>> models;

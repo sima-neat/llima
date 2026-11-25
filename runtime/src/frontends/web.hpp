@@ -28,6 +28,7 @@ enum class ChatProtocol {
     OllamaGenerate,
 };
 
+// HTTP frontend that owns models and adapts OpenAI/Ollama requests and streaming responses.
 class EXPORT WEB {
     public:
         WEB(

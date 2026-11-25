@@ -10,6 +10,8 @@ namespace simaai::llima {
 
 class MLABuffer;
 
+// Borrowed KV, scale and attention-sink buffers for one layer.
+// Resolves shared-KV layers to their source buffers.
 struct CacheLayerBuffers {
     MLABuffer* key = nullptr;
     MLABuffer* value = nullptr;
@@ -41,6 +43,7 @@ struct CacheLayerBuffers {
     }
 };
 
+// Visible KV range and query count used to construct or update attention-cache slices.
 struct CacheWindow {
     uint32_t begin;             // First visible KV row in the backing buffer.
     uint32_t length;            // Compiled cache ELF's aligned context width.
@@ -50,6 +53,8 @@ struct CacheWindow {
 
 enum class CacheMask { None, Group, Single, Speculative };
 
+// Defines cache-stage input positions and slice layouts from the compiled configuration.
+// Used by both binding construction and execution to keep optional inputs consistent.
 struct CachePorts {
     static constexpr uint8_t query = 0;
     static constexpr uint8_t key = 1;

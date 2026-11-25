@@ -22,6 +22,7 @@ namespace simaai {
 namespace llima {
 
 
+// Prepared prompt text, token IDs, reusable-prefix length and image tensors for one request.
 struct PreprocessedChat {
     std::string formatted_prompt;
     std::vector<uint32_t> input_token_ids;

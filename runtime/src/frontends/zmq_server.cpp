@@ -125,6 +125,7 @@ std::string ZMQServer::_generate_multimodal(
     }
     chat.set_messages(std::move(effective_messages));
     chat.set_enable_thinking(metadata.enable_thinking);
+    // Accumulates text, reasoning parsing and metrics for one multimodal ZMQ request.
     struct GenerationState {
         uint32_t tokens = 0;
         std::string finish_reason;

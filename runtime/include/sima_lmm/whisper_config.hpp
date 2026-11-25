@@ -9,6 +9,7 @@
 namespace simaai {
 namespace llima {
 
+// Compiled Whisper architecture, decoder options and language-token mapping.
 struct WhisperConfig{
     std::string model_type;
     uint32_t d_model;

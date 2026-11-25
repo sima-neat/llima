@@ -21,6 +21,7 @@ namespace simaai {
 namespace llima {
 
 
+// MessagePack request header describing the payload, operation and token budget.
 struct ZMQRequestMetadata {
     std::string type;
     std::string tensor_dtype;
@@ -40,6 +41,7 @@ struct ZMQRequestMetadata {
 };
 
 
+// MessagePack response header describing the output payload, metrics or error.
 struct ZMQResponseMetadata {
     std::string tensor_dtype;
     std::vector<size_t> tensor_shape;
@@ -61,6 +63,7 @@ struct ZMQResponseMetadata {
 };
 
 
+// Owns the ZMQ socket and loaded models for token, scoring and benchmark requests.
 class EXPORT ZMQServer {
     public:
         ZMQServer(

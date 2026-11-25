@@ -47,12 +47,16 @@ nlohmann::json try_parse_tool_calls(
     const std::vector<std::string>& allowed_tool_names
 );
 
+// Buffers streamed output until it can separate ordinary text from model-specific
+// tool calls, then emits text chunks or parsed call lists.
 class ToolCallStreamParser {
     public:
+        // Ordinary streamed text with its target/draft attribution.
         struct Content {
             std::string text;
             bool from_draft = false;
         };
+        // Parsed OpenAI-style tool calls emitted as one stream event.
         struct ToolCalls {
             nlohmann::json calls;
         };

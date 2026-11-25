@@ -24,6 +24,7 @@ void LanguageModel::_bind_adapter(const std::shared_ptr<LoRAAdapter>& adapter) {
     if (_workspace->bound_adapter == adapter) return;
     std::lock_guard lock(RuntimeContext::instance().execution_mutex);
     using Buffers = std::map<std::string, MLABuffer*>;
+    // Pending adapter binding update with retained relocations for commit or rollback.
     struct Change {
         MLAModelWithBuffer& model;
         Buffers buffers;

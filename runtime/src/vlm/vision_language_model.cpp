@@ -15,13 +15,16 @@
 namespace simaai {
 namespace llima {
 
+// Owns encoded image bytes and their identity.
+// A weak reference to the vision package validates later reuse.
 struct EncodedImageData {
     std::weak_ptr<ModelResources<VlmConfig>> resources;
     std::string identity;
     std::vector<std::vector<std::byte>> outputs;
 };
 
-// Language execution state retained independently of the vision facade.
+// Shared language model, prompt helper, streamer and request lock.
+// Targets retain an attached draft's runtime after the draft wrapper is destroyed.
 struct LanguageRuntime {
     friend class VisionLanguageModel;
     LanguageRuntime(std::filesystem::path path, std::shared_ptr<FileProvider> provider,

@@ -32,6 +32,7 @@ inline std::string_view layer_type_name(LayerType type) {
     return layer_type_names.at(static_cast<size_t>(type));
 }
 
+// Layer kinds read from the compiled package's JSON string list.
 struct LayerTypes : std::vector<LayerType> { using std::vector<LayerType>::vector; };
 
 inline void to_json(nlohmann::json& j, const LayerTypes& layers) {
@@ -56,11 +57,13 @@ inline void from_json(const nlohmann::json& j, LayerTypes& layers) {
     layers = std::move(parsed);
 }
 
+// Token-budget constants for draft proposal and target verification.
 struct SpeculativeBudget {
     static constexpr uint16_t draft = 5;
     static constexpr uint16_t target = 16;
 };
 
+// Compiled image sizes, patch layout and vision-encoder feature dimensions.
 struct VisionModelConfig {
     std::vector<uint16_t> image_sizes;
     bool cls_embed;
@@ -121,18 +124,21 @@ inline void from_json(const nlohmann::json& j, VisionModelConfig& v) {
 }
 
 
+// Number of language-model token positions occupied by each encoded image.
 struct MMConnectionConfig {
     uint16_t mm_tokens_per_image;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(MMConnectionConfig, mm_tokens_per_image)
 
 
+// Vocabulary size used to locate token embedding rows.
 struct TokenEmbedConfig {
     uint32_t vocab_size;
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(TokenEmbedConfig, vocab_size)
 
 
+// Model-specific scaling parameters used to build rotary position tables.
 struct RopeScalingConfig {
     double factor;
     double low_freq_factor;
@@ -156,6 +162,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 
+// Rotary frequencies and dimensions for full and sliding attention layers.
 struct RoPEConfig {
     double rope_theta;
     double rope_local_base_freq;
@@ -176,6 +183,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 
+// Attention head dimensions, KV layout and sliding-window settings.
 struct AttentionBlockConfig {
     uint8_t num_attention_heads;
     uint8_t num_key_value_heads;
@@ -205,6 +213,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     swa_enable, swa_ratio, sliding_window, attn_output_gate
 )
 
+// Dimensions of linear-attention heads, convolution history and recurrent state.
 struct LinearAttentionConfig {
     uint32_t conv_kernel_dim = 0;
     uint32_t key_head_dim = 0;
@@ -224,6 +233,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     num_value_heads
 )
 
+// Compiled speculative method, target/draft role and method-specific dimensions.
 struct SpeculativeDecodingConfig {
     std::string method = "eagle3";
     bool is_draft = false;
@@ -246,6 +256,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     centroid_intermediate_top_k, target_layer_ids, mask_token_id
 )
 
+// Total expert count and the number selected for each token.
 struct MixtureOfExpertsConfig {
     uint16_t num_experts;
     uint16_t num_experts_per_tok;
@@ -256,6 +267,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 
 
 
+// Compiled language architecture and layer layout used to choose programs and buffers.
 struct LanguageModelConfig {
     TokenEmbedConfig token_cfg;
     RoPEConfig rope_cfg;
@@ -349,6 +361,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 
+// Compiled context capacity, prefill block sizes, output mode and tensor layouts.
 struct PipelineConfig {
     std::optional<std::string> system_prompt;
     std::optional<std::string> chat_template;
@@ -370,6 +383,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 
+// Vision program names; accepts one name or an array in the package JSON.
 struct VisionModelNames : std::vector<std::string> {
     using std::vector<std::string>::vector;
 };
@@ -397,6 +411,8 @@ inline void from_json(const nlohmann::json& j, VisionModelNames& names) {
 }
 
 
+// Runtime configuration for a compiled text or vision/language package, including
+// its model components, program names and pipeline settings.
 struct VlmConfig {
     std::string model_name;
     std::string model_type;

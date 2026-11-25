@@ -7,6 +7,7 @@
 
 namespace nlohmann {
 
+// Maps optional values to JSON values, using null for an empty optional.
 template <typename T>
 struct adl_serializer<std::optional<T>> {
     static void to_json(json& j, const std::optional<T>& value) {

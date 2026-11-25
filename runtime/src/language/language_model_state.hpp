@@ -9,12 +9,16 @@
 
 namespace simaai::llima {
 
+// Loaded adapter buffers and their per-program relocation bindings.
+// Retained by a workspace while bound to its programs.
 struct LoRAAdapter {
     std::string name;
     std::map<std::string, MLABuffer> buffers;
     std::map<size_t, std::map<std::string, MLABuffer*>> bindings; // Runtime program index -> sections.
 };
 
+// Shared loaded language-model data, including embeddings and original position tables.
+// Compatible model instances reuse these assets while keeping separate caches and workspaces.
 struct LanguageAssets {
     explicit LanguageAssets(std::shared_ptr<ModelResources<VlmConfig>> value)
         : package(std::move(value)), cfg(package->cfg) {}
@@ -38,6 +42,8 @@ struct LanguageAssets {
     std::vector<uint32_t> gemma4_token_ordering;
 };
 
+// Retains KV data, recurrent checkpoints and prompt-reuse information
+// between requests on one language model.
 struct SequenceCache {
     void invalidate_reuse();
     std::map<std::string, MLABuffer> buffers;
@@ -58,6 +64,7 @@ struct SequenceCache {
     std::string image_identity;
 };
 
+// Initial EAGLE3 proposal tree, captured target features and first-token timing.
 struct LanguageModel::InitTreeResult {
     std::vector<uint32_t> draft_tokens;
     std::vector<std::vector<int32_t>> retrieve_indices;
@@ -69,6 +76,7 @@ struct LanguageModel::InitTreeResult {
     double time_to_first_token;
 };
 
+// Draft proposal tree and the masks/indices needed to verify its candidate paths.
 struct LanguageModel::TopkGenerateResult {
     std::vector<uint32_t> draft_tokens;
     std::vector<std::vector<int32_t>> retrieve_indices;
@@ -76,31 +84,37 @@ struct LanguageModel::TopkGenerateResult {
     std::vector<int32_t> tree_position_ids;
 };
 
+// Hidden states and vocabulary logits produced by one EAGLE3 draft forward pass.
 struct LanguageModel::DraftForwardResult {
     std::vector<Eigen::bfloat16> hidden_states;  // (seq_length, hidden_size)
     std::vector<Eigen::bfloat16> logits;         // (num_tokens, draft_vocab_size)
 };
 
+// Target predictions and hidden states for a batch of Gemma 4 MTP candidate tokens.
 struct LanguageModel::Gemma4MtpTargetBatchResult {
     std::vector<uint32_t> next_token_ids;
     std::vector<Eigen::bfloat16> hidden_states;
 };
 
+// One MTP draft token and its projected hidden state for the next draft step.
 struct LanguageModel::Gemma4MtpDraftStepResult {
     uint32_t token_id;
     std::vector<Eigen::bfloat16> projected_hidden_state;  // (backbone_hidden_size)
 };
 
+// Target predictions and captured features for all nodes in an EAGLE3 proposal tree.
 struct LanguageModel::TargetVerifyResult {
     std::vector<uint32_t> next_token_ids;                     // target argmax per node
     std::vector<std::vector<Eigen::bfloat16>> hidden_states;   // 3 captures, each (num_tokens, hidden_size)
 };
 
+// Target predictions rearranged by candidate path, with the captured tree hidden states.
 struct LanguageModel::TreeDecodingResult {
     std::vector<int32_t> next_token_ids;          // flat (n_paths × max_depth)
     std::vector<Eigen::bfloat16> hidden_states;   // flat (K × 3 × hidden_size)
 };
 
+// Accepted sequence, bonus token and prepared proposal tree for the next EAGLE3 round.
 struct LanguageModel::UpdateInferenceInputsResult {
     std::vector<uint32_t> input_ids;                       // old + accepted + bonus
     std::vector<uint32_t> draft_tokens;                    // next round's tree tokens
@@ -111,6 +125,7 @@ struct LanguageModel::UpdateInferenceInputsResult {
     uint32_t bonus_token;
 };
 
+// Borrowed host view of one LM-head output shard and its vocabulary range.
 struct LanguageModel::LMHeadLogitView {
     MLABuffer* buffer;
     const uint8_t* data;
@@ -119,6 +134,7 @@ struct LanguageModel::LMHeadLogitView {
     uint32_t width;
 };
 
+// Reusable router/expert buffer references and host staging for one compiled token width.
 struct LanguageModel::MoeHostCache {
     uint16_t num_tokens = 0;             // the moe_nt this entry serves
     MLABuffer* values = nullptr;         // n{nt}_router_values
@@ -134,6 +150,7 @@ struct LanguageModel::MoeHostCache {
     std::vector<uint8_t> activated_scratch;        // num_experts (prefill only)
 };
 
+// Reusable proposal, verification, mask and logit-view storage for DFlash decoding.
 struct LanguageModel::DFlashScratch {
     std::vector<uint32_t> draft_input_ids;
     std::vector<uint32_t> proposals;
@@ -143,6 +160,8 @@ struct LanguageModel::DFlashScratch {
     std::vector<Eigen::bfloat16> attention_mask;
 };
 
+// Working buffers, compiled-program bindings and scratch owned by one language runner.
+// Reused across requests; retained sequence history is owned by SequenceCache.
 struct LanguageWorkspace {
     void clear_cached_scratch() {
         dflash_resolved_prefix = 0;
@@ -194,6 +213,7 @@ struct LanguageWorkspace {
     size_t eagle3_stable_kv = 0;
 };
 
+// Stop-token IDs and the total token ceiling, including the prompt, for execution.
 struct TokenLimits {
     std::set<uint32_t> stop_token_ids;
     uint16_t max_num_tokens;
@@ -204,7 +224,10 @@ struct TokenLimits {
 using InterruptCounter = std::atomic<uint64_t>;
 static_assert(InterruptCounter::is_always_lock_free);
 
+// Limits, caller cancellation and interrupt baselines for one active operation.
+// The target and optional draft refer to this same state for the request lifetime.
 struct RequestState {
+    // Borrowed interrupt counter plus its value at request start; detects later interrupts.
     struct Interrupt {
         explicit Interrupt(const InterruptCounter& counter)
             : counter(counter), initial(counter.load(std::memory_order_relaxed)) {}
@@ -225,7 +248,8 @@ struct RequestState {
     }
 };
 
-// Holds fixed request defaults, the streamer, interrupts, and the active request.
+// Per-model request defaults, streamer reference, interrupt counter and active-request pointer.
+// The active state is borrowed from RequestScope for the duration of execution.
 struct RequestControl {
     RequestControl(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
         : defaults{std::move(stops), limit}, text_streamer(streamer) {}

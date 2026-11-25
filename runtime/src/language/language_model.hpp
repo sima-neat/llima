@@ -55,6 +55,8 @@ struct TokenRunOptions {
     GenerationPerformanceResult* performance = nullptr;
 };
 
+// Executes token prefill, decoding and scoring using shared assets.
+// Owns one sequence cache and reusable workspace; callers serialize access.
 class LanguageModel {
     public:
         // Reads the model files through file_provider (nullptr = from disk).
@@ -286,6 +288,7 @@ class LanguageModel {
             std::optional<ChronoTimer> timer_ttft,
             GenerationPerformanceResult* performance_result
         );
+        // Describes the layers and byte layout of one recurrent or convolution state family.
         struct CheckpointLayout {
             // Hidden-layer indices belonging to this stateful family.
             std::vector<uint8_t> layer_indices;
@@ -303,6 +306,7 @@ class LanguageModel {
             bool prefill_single_output = false;
         };
         static constexpr size_t checkpoint_slot_count = 4;
+        // Owns per-layer state snapshots at saved sequence positions for prompt-prefix reuse.
         struct RecurrentCheckpoints {
             explicit RecurrentCheckpoints(const CheckpointLayout& description)
                 : layout(description), checkpoints(layout.layer_indices.size()) {}

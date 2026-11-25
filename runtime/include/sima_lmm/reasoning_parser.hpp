@@ -20,8 +20,11 @@ enum class ReasoningFormat {
 ReasoningFormat reasoning_format_for_model(std::string_view model_type);
 std::array<std::string_view, 2> reasoning_special_tokens(ReasoningFormat format);
 
+// Tracks model-specific reasoning markers across streamed chunks.
+// Emits reasoning and answer text while retaining draft-token attribution.
 class ReasoningStreamParser {
     public:
+        // One parsed text chunk, labeled as reasoning or answer and as target or draft output.
         struct Event {
             std::string text;
             bool reasoning = false;

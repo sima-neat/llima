@@ -13,6 +13,8 @@
 namespace simaai {
 namespace llima {
 
+// Resizes, normalizes and arranges images into the compiled vision encoder input.
+// The referenced model configuration must outlive this processor.
 class ImageProcessor {
     public:
         ImageProcessor(

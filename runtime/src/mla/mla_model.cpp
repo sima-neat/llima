@@ -26,6 +26,7 @@ namespace simaai {
 namespace llima {
 namespace {
 
+// Owns a submitted run's program, relocations and buffer imports until execution or discard.
 struct QueuedRun {
     QueuedRun() = default;
     QueuedRun(QueuedRun&&) noexcept = default;

@@ -32,6 +32,8 @@ extern "C" {
 namespace simaai {
 namespace llima {
 
+// Per-model preprocessing, decoder buffers, tokenizer, streamer and program bindings.
+// Its mutex serializes transcription requests.
 struct WhisperWorkspace {
     WhisperWorkspace(std::shared_ptr<FileProvider> files, const std::filesystem::path& identity)
         : preprocessor(std::move(files), identity), is_running(false) {}
@@ -55,6 +57,7 @@ namespace {
 std::mutex& fftw_planner_mutex() { static std::mutex mutex; return mutex; }
 }
 
+// Shared mel filters and window coefficients used by Whisper preprocessors.
 struct WhisperPreprocessResources {
     explicit WhisperPreprocessResources(std::unique_ptr<std::istream> config,
                                         std::shared_ptr<FileProvider> provider = nullptr)
@@ -145,7 +148,7 @@ ArrayXXbf WhisperPreprocessor::preprocess_pcm(
 
 
 namespace {
-// Helper deleters for FFmpeg RAII
+// Releases FFmpeg audio objects when their owning smart pointers are destroyed.
 struct FFmpegDeleter {
     void operator()(AVFormatContext* p) { avformat_close_input(&p); }
     void operator()(AVCodecContext* p) { avcodec_free_context(&p); }
@@ -369,6 +372,7 @@ WhisperModel::WhisperModel(std::filesystem::path model_path, std::shared_ptr<Fil
 }
 
 
+// Generated token IDs and transcription metadata before final text decoding.
 struct WhisperDecodeResult {
     std::vector<uint32_t> tokens;
     std::string language;
@@ -378,6 +382,8 @@ struct WhisperDecodeResult {
 };
 
 namespace {
+// Locks the transcription workspace and starts callbacks for one request.
+// Waits for callbacks before decoding the result and cleans up queued work on failure.
 class WhisperRequest {
 public:
     WhisperRequest(WhisperWorkspace& workspace, const TranscriptionOptions& options)

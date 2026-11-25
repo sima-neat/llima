@@ -10,6 +10,7 @@
 namespace simaai {
 namespace llima {
 
+// Host-side real and imaginary rotary position values indexed by token position.
 struct RopeTable {
     std::vector<Eigen::bfloat16> re;
     std::vector<Eigen::bfloat16> im;

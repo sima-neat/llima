@@ -13,6 +13,7 @@ namespace simaai::llima {
 
 class RuntimeContext;
 class MLABuffer;
+// Shared ownership of one DMA-buffer import, tagged with its MLA connection generation.
 struct RuntimeBufferImport {
     RuntimeContext* context;
     uint32_t id;
@@ -26,6 +27,8 @@ struct RuntimeRelocation {
     // Keep the zero binding with the candidate until its native update succeeds.
     std::shared_ptr<const RuntimeRelocation> neutral;
 };
+// Shared native program and relocation state.
+// Unloading is deferred while queued runs still retain the program.
 struct RuntimeProgram {
     RuntimeContext* context;
     size_t index;
@@ -38,6 +41,8 @@ struct RuntimeProgram {
     std::shared_ptr<const RuntimeRelocation> active_reloc; // Null selects the base model.
 };
 
+// Process-wide MLA connection and native program/buffer registry.
+// Its execution mutex serializes hardware calls and registry changes.
 class RuntimeContext {
   public:
     static RuntimeContext& instance();

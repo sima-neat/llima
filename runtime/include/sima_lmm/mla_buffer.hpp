@@ -19,6 +19,8 @@ typedef struct simaai_dmabuf simaai_dmabuf_t;
 namespace simaai {
 namespace llima {
 
+// Owns a DMA allocation with tensor shape, type and MLA row-padding information.
+// Handles host transfers and cache maintenance for the allocation.
 class MLABuffer {
     public:
         MLABuffer(
@@ -110,6 +112,8 @@ inline std::ostream& operator<<(std::ostream& s, const MLABuffer& buf) {
 }
 
 
+// Non-owning tensor region used to bind part of an MLABuffer to a program port.
+// The backing buffer must remain alive while the slice is used.
 class MLABufferSlice {
     friend class MLAModelWithBuffer;
 

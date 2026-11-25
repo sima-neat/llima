@@ -41,6 +41,7 @@
 namespace simaai {
 namespace llima {
 
+// Measures elapsed time from start(); stop() returns seconds unless a unit is supplied.
 class ChronoTimer {
     public:
         ChronoTimer(bool start_now = false) {
@@ -213,6 +214,7 @@ void set_sample_image_file_name(std::filesystem::path file_name);
 void set_sample_audio_file_name(std::filesystem::path file_name);
 
 
+// Top values and their original column indices, grouped by input row.
 template <typename T>
 struct TopKResult {
     std::vector<std::vector<T>> values;

@@ -25,6 +25,8 @@ class LayerExecutor;
 void connect_mla_rt(const std::vector<std::string>& args);
 void disconnect_mla_rt();
 
+// Binds a compiled ELF program to input/output buffer slices and relocation data.
+// Shares the native program with other bindings; queued runs retain its native resources.
 class MLAModelWithBuffer {
     friend class LanguageModel;
     friend class LayerExecutor;

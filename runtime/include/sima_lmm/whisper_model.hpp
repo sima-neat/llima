@@ -35,6 +35,8 @@ struct WhisperPreprocessResources;
 struct WhisperWorkspace;
 struct WhisperDecodeResult;
 
+// Converts audio files or PCM samples into Whisper log-mel inputs.
+// Shares filter/window data and owns its FFT plan and working buffers.
 class WhisperPreprocessor {
     public:
         WhisperPreprocessor(const std::filesystem::path& devkit_dir);
@@ -73,14 +75,18 @@ using WhisperDecoderModelMap = std::map<WhisperDecoderModelMapKey, MLAModelWithB
 
 template<class Config> struct ModelResources;
 
+// Language, task and streaming callbacks selected for one transcription request.
 struct TranscriptionOptions {
     std::string language = "en";
     std::string task = "transcribe";
     StreamCallbacks callbacks;
 };
 
+// Runs audio encoding and autoregressive transcription or translation.
+// Shares package assets and owns a workspace whose mutex serializes requests.
 class WhisperModel {
     public:
+        // Decoded transcript with the selected language, task and speech-confidence values.
         struct TranscriptionResult {
             std::string text;
             std::string language;
@@ -153,6 +159,7 @@ class WhisperModel {
         std::filesystem::path _get_elf_path_decoder_language_detect() const;
         void _run_encoder();
         bool _is_auto_language(const std::string& language) const;
+        // Language candidate index and no-speech probability from the detection graph.
         struct LanguageDetectResult {
             uint32_t language_index;
             float no_speech_prob;

@@ -15,6 +15,7 @@ EmbeddingOffloadMode embedding_offload_mode();
 bool embedding_file_on_nvme(const std::filesystem::path& path);
 bool embedding_device_on_nvme(const std::filesystem::path& device);
 
+// Owns an open embedding file and gathers requested rows into caller-provided memory.
 class DiskEmbeddingTable {
 public:
     DiskEmbeddingTable(const std::filesystem::path& path, size_t rows, size_t row_bytes);
@@ -31,6 +32,7 @@ private:
     std::filesystem::path _path;
 };
 
+// Owns the disk-backed token and optional per-layer embedding tables shared by a model.
 struct EmbeddingOffload {
     std::unique_ptr<DiskEmbeddingTable> normal;
     std::unique_ptr<DiskEmbeddingTable> per_layer;

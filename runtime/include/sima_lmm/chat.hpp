@@ -15,6 +15,8 @@ namespace llima {
 
 class VlmHelper;
 
+// Caller-owned conversation messages, tools, image paths and thinking settings.
+// Pass it to generate() and add responses to retain conversation history.
 class Chat {
     public:
         Chat(VlmHelper& vlm_helper);

@@ -14,6 +14,8 @@ namespace simaai {
 namespace llima {
 
 
+// Common text/token conversion interface for Hugging Face and GGUF backends.
+// Factories return an owning pointer to the selected implementation.
 class Tokenizer {
     public:
         virtual ~Tokenizer() {};

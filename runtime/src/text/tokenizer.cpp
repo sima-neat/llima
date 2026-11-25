@@ -13,9 +13,9 @@ namespace llima {
 
 namespace {
 
-// Reimplement Tokenizer class using tokenizers-cpp's C apis based on
+// Hugging Face tokenizer backed by tokenizers-cpp; owns its native tokenizer handle.
+// Supports explicit special-token handling; based on
 // https://github.com/mlc-ai/tokenizers-cpp/blob/main/src/huggingface_tokenizer.cc
-// to expose the Encode and Decode function with add_special_tokens argument.
 class HFTokenizer : public Tokenizer {
     public:
         explicit HFTokenizer(const std::filesystem::path tokenizer_json_file_name) {
@@ -84,6 +84,7 @@ class HFTokenizer : public Tokenizer {
 };
 
 
+// Uses a vocabulary-only llama.cpp model for GGUF tokenization and owns that model.
 class GGUFTokenizer : public Tokenizer {
     public:
         explicit GGUFTokenizer(const std::filesystem::path gguf_file_name) {

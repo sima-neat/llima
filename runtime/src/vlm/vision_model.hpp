@@ -22,6 +22,8 @@ namespace llima {
 template<class Config> struct ModelResources;
 struct VisionWorkspace;
 
+// Runs the compiled image encoder and projection into language-model inputs.
+// Shares package resources and owns the encoder workspace.
 class VisionModel {
     public:
         // Existing disk-loading overload; preserves source compatibility.

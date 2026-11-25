@@ -30,6 +30,8 @@ struct VlmConfig;
 class VisionModel;
 
 struct EncodedImageData;
+// Shared handle to reusable vision-encoder output.
+// It can be supplied only to a model with the matching vision package.
 class EncodedImage {
 public:
     EncodedImage() = default;
@@ -38,6 +40,8 @@ private:
     friend class VisionLanguageModel;
 };
 
+// Limits, callbacks, cancellation and optional images for one generation request.
+// Image spans borrow caller-owned storage for the duration of the call.
 struct GenerationOptions {
     std::optional<uint16_t> max_new_tokens; // Output budget, excluding the input tokens.
     std::optional<std::set<uint32_t>> stop_token_ids;
@@ -51,6 +55,8 @@ struct GenerationOptions {
     bool reject_oversized_prompt = false;   // Throw when the prompt cannot fit a generated token.
 };
 
+// Public entry point for text and image/text generation, scoring and image encoding.
+// Coordinates the language runtime and optional vision encoder, serializing inference calls.
 class VisionLanguageModel {
     public:
         // Existing disk-loading overload; preserves source compatibility.
@@ -107,6 +113,7 @@ class VisionLanguageModel {
         // Internal ZMQ benchmarking also uses config() and benchmark_chat().
         friend class ZMQServer;
 
+        // Inputs and collected prompt metadata for one internal cold-start chat measurement.
         struct ChatBenchmark {
             uint16_t max_context;
             GenerationPerformanceResult* performance;

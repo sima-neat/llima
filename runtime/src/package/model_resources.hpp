@@ -43,6 +43,8 @@ std::shared_ptr<Resource> acquire_package_resource(
   return created;
 }
 
+// Shared configuration, file provider and logging for one model-package identity.
+// Whisper also keeps its shared asset buffers here.
 template <class Config> struct ModelResources {
   static std::shared_ptr<ModelResources>
   acquire(const std::filesystem::path &path,
