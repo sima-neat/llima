@@ -135,6 +135,44 @@ def relative_position_table(length: int, width: int) -> np.ndarray:
     return table[None, None]
 
 
+def _conformer_relative_shift(graph: ModelGraph, values, length: int, heads: int):
+    """Select relative-position scores through aligned copies, without Conv."""
+    width = 16
+    rounded = ((length + width - 1) // width) * width
+    channels = 2 * rounded + width
+    zeros = graph.constant(np.zeros((1, heads, length, channels - 2 * length), np.float32))
+    padded = graph.concat([values, zeros], 3)
+    blocks = channels // width
+    flattened = graph.reshape(padded, (1, heads, length * blocks, width))
+    groups = {}
+    for row in range(length):
+        begin = length - row
+        start = row * blocks + begin // width
+        cropped = graph.create_slice_node(
+            flattened, [start], [start + rounded // width + 1], [1], [2]
+        )
+        groups.setdefault(begin % width, []).append((row, cropped))
+    rows = [None] * length
+    for offset, entries in sorted(groups.items()):
+        # Packing queries into height keeps each head independent. Selecting
+        # between adjacent 16-channel blocks bounds the native channel shuffle
+        # to 32 channels, instead of shuffling the complete score tensor.
+        combined = graph.concat([cropped for _, cropped in entries], 1)
+        count = rounded // width
+        left = graph.create_slice_node(combined, [0], [count], [1], [2])
+        right = graph.create_slice_node(combined, [1], [count + 1], [1], [2])
+        paired = graph.concat([left, right], 3)
+        selected = graph.create_slice_node(paired, [offset], [offset + width], [1], [3])
+        selected = graph.reshape(selected, (1, heads * len(entries), 1, rounded))
+        if rounded != length:
+            selected = graph.create_slice_node(selected, [0], [length], [1], [3])
+        for index, (row, _) in enumerate(entries):
+            rows[row] = graph.create_slice_node(
+                selected, [index * heads], [(index + 1) * heads], [1], [1]
+            )
+    return graph.concat(rows, 2)
+
+
 @dataclass
 class AudioConformerLayerModel(BaseModel):
     num_tokens: int
@@ -176,11 +214,14 @@ class AudioConformerLayerModel(BaseModel):
         bd = graph.matmul(graph.add(q, graph.constant(bias_v)), position, transpose_b=True)
         # rel_shift(q, k) is exactly padded_bd[q, T-q+k]. Select each row's
         # contiguous interval directly, avoiding an unaligned reshape to 2*T-1.
-        shifted = []
-        for row in range(length):
-            values = graph.slice(bd, start=row, stop=row + 1, axis=2)
-            shifted.append(graph.slice(values, start=length - row, stop=2 * length - row, axis=3))
-        bd = graph.concat(shifted, 2)
+        if length > 32:
+            bd = _conformer_relative_shift(graph, bd, length, heads)
+        else:
+            shifted = []
+            for row in range(length):
+                values = graph.slice(bd, start=row, stop=row + 1, axis=2)
+                shifted.append(graph.slice(values, start=length - row, stop=2 * length - row, axis=3))
+            bd = graph.concat(shifted, 2)
         scores = graph.mul(graph.add(ac, bd), graph.constant([(width // heads) ** -0.5]))
         valid = graph.inputs["attention_valid"]
         invalid = graph.add(graph.mul(valid, graph.constant([-1.])), graph.constant([1.]))

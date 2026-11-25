@@ -63,6 +63,22 @@ build, generation already scans the compiled cache shape. Exactly four seconds
 of 16 kHz PCM produces 401 mel frames, so a 400-frame bucket is insufficient;
 the larger encoder still requires compilation and device validation.
 
+Exactly 15 and 30 seconds produce 1,501 and 3,001 mel frames, respectively,
+and 188 and 376 encoder positions after subsampling. Set `--audio-frames 1501`
+or `--audio-frames 3001` in separate build directories. `--component encoder`
+selects its 19 units for a partial build; packaging still requires all planned
+components. Reusing unchanged components requires verifying source behavior,
+configuration, tensor interfaces and archive identity, rather than relabeling
+old archives with new graph signatures.
+
+Encoder sequences above 32 positions use an aligned, grouped copy for the
+relative-position shift. The shift adds no quantized convolution: small native
+channel shuffles select between adjacent 16-channel blocks, then restore the
+original query and head order. This avoids dense one-hot selector weights and
+their extra quantization. The default 32-position encoder retains its existing
+graph path. This layout change preserves the encoder's public tensor shapes;
+larger input windows still require their own compiled encoder units.
+
 For per-frame PCM output, compile with `--decoder-frames 1`. The tested
 lower-latency profile additionally uses `--group-size 32`:
 
@@ -236,7 +252,7 @@ fresh packaging with current source requires a current compile manifest.
 
 ## Validation and limits
 
-The fast compiler suite has 490 cases. Added hermetic cases cover ingestion,
+The fast compiler suite has 504 cases. Added hermetic cases cover ingestion,
 BF16 loading, depth rotary conversion, projection bias/slicing and subsampling
 boundaries. Four checkpoint-backed integration cases cover conv-cache updates,
 attention prefill, final normalization and the depth-head epsilon. Additional
@@ -424,3 +440,74 @@ passed continuation checks but made no meaningful end-to-end timing difference.
 Neither source rewrite was retained. Per-ELF profiling showed about 31.7 ms of
 MLA tile execution within a roughly 34 ms backbone step, limiting the saving
 available from launch overhead alone.
+
+## Longer input windows, 2026-11-25
+
+The grouped relative-shift path was compiled for 188 and 376 encoder positions
+(15 and 30 seconds). Both shifts match their BF16 input selections exactly on
+Modalix. A complete floating Conformer layer matches its original computation
+exactly at both lengths, and the compiled layer matches quantized SDK execution
+with full and partial valid masks. At 188 positions, layer0 improved from
+3.165 ms to 1.960 ms, about 38%, and its ELF decreased from 35.34 MB to
+20.57 MB. These are layer measurements; a complete original 15-second encoder
+was not available for a measured full-encoder speedup comparison.
+
+Old and new quantized layer0 outputs are not bit-identical: their relative L2
+difference is 0.02846 on the same random-input fixture. Errors against the
+common FP32 reference are 0.09191 before and 0.09205 after; removing selector
+convolutions changes rounding without changing floating computation. This
+selected comparison is not a model-level accuracy result. The full hermetic
+compiler suite passed all 504 tests without skips.
+
+The following warm measurements use 32-token prefill, a one-frame decoder and
+BF16/INT8 compute on Modalix with the installed SDK 3.0.0 development compiler
+(frontend master.403, MLC master.194). Each row uses an input clip as long as
+its compiled window. The existing 2.5-second model was remeasured without
+recompilation.
+
+| Window and input duration | CPU frontend | Complete encoder | Input processing | First playable PCM |
+| --- | --- | --- | --- | --- |
+| 2.5 seconds | 28.17 ms | 11.43 ms | 39.58 ms | 387.61 ms |
+| 15 seconds | 168.41 ms | 43.75 ms | 212.13 ms | 752.66 ms |
+| 30 seconds | 341.03 ms | 92.52 ms | 433.53 ms | 1,195.57 ms |
+
+Input processing uses seven warm native trials, excluding the lazy first run,
+model loading, reset, file I/O and generation. First-PCM numbers use three warm
+HTTP requests after excluding the first, measured after server request receipt;
+they exclude recording, upload/network and browser playback. Timing requests
+cancel after the first PCM chunk, so they do not measure a completed answer.
+The full-duration fixtures repeat the same synthetic question with short gaps.
+First-PCM timing also depends on the generated response and interleave schedule.
+
+For the same 1.44-second input, the 15-second encoder takes 41.42 ms versus
+11.23 ms with the 2.5-second build; first PCM takes 405.56 ms versus 375.49 ms.
+The 30-second build takes 87.22 ms in the encoder and 453.60 ms to first PCM
+for that same short input. The larger static encoder bucket therefore affects
+short inputs too. A longer actual utterance additionally increases frontend
+and language-model prefill work. The under-200 ms first-audio target remains open.
+
+Each long-window development runtime contains 104 ELFs: 18 freshly compiled
+encoder units and 86 audited reused units, including the unchanged subsampling
+stem. Reuse preserves original artifact signatures and checks source behavior,
+configuration, interfaces and hashes; these partial fresh builds are not
+complete fresh-compilation manifests or portable delivery packages.
+
+Known short speech transcribes correctly, and a separate varied-sentence
+15-second synthetic fixture preserves the expected instructions (with “nine”
+written as “9”). The repeated-question full-window ASR fixture can loop and is
+not a quality pass. Cross-window embedding equality and corpus-level speech
+quality are not established. The unchanged 30-second subsampling stem also
+shows a relative L2 difference of 0.008499 against quantized SDK execution for
+full random input, while a short valid prefix matches exactly. A split-stem
+experiment changed quantization behavior without removing the discrepancy and
+was not adopted.
+
+Full-length 30-second ASR is not ready: a 65-word synthetic paragraph padded
+to 30 seconds produced a conversational response instead of a transcription.
+The same paragraph trimmed to its 19.325-second spoken length transcribed
+correctly in the same runtime, while a slowed, nearly full spoken 30-second
+variant also failed. The 15-second instructions fixture transcribed correctly
+with both encoder buckets. The cause of the full-length failure is unresolved;
+these results establish compilation and selected latency, not reliable
+30-second ASR. Full numerical/quality validation and SDK 3.0.1 release validation
+remain open. The live demo and existing delivery ZIP are unchanged.

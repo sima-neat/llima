@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from unittest.mock import patch
 
 import numpy as np
@@ -7,7 +8,10 @@ from torch import nn
 
 from sima_lmm.config.vlm_config import VlmConfig
 from sima_lmm.hf.hf_transformer import LocalHuggingFaceModel
-from sima_lmm.model.lfm2_audio_model import AudioEncoderSubsamplingModel, AudioProjectionModel
+from sima_lmm.model.base import BaseModel
+from sima_lmm.model.lfm2_audio_model import (
+    AudioEncoderSubsamplingModel, AudioProjectionModel, _conformer_relative_shift,
+)
 from sima_lmm.model.model_graph import ModelGraph, activation_dtype
 
 
@@ -22,6 +26,33 @@ def _graph(model, quantizable):
     with patch.object(ModelGraph, "save", save):
         model.generate_graph({}, quantizable)
     return captured[0]
+
+
+@dataclass
+class _RelativeShiftModel(BaseModel):
+    length: int
+    heads: int = 2
+
+    def generate_graph(self, layer_cfg, quantizable):
+        graph = ModelGraph(self, {"scores": (1, self.heads, self.length, 2 * self.length)}, quantizable)
+        graph.save([_conformer_relative_shift(graph, graph.inputs["scores"], self.length, self.heads)])
+
+
+@pytest.mark.parametrize("quantizable", [True, False])
+@pytest.mark.parametrize("length", [32, 33, 48, 51, 64, 188, 376])
+def test_audio_relative_shift_preserves_source_layout(tmp_path, quantizable, length):
+    source = LocalHuggingFaceModel(tmp_path, {}, {}, {}, {}, {}, params={})
+    model = _RelativeShiftModel(VlmConfig(), "relative_shift", hf_model=source, length=length)
+    values = np.random.default_rng(39).normal(0, .1, (1, 2, length, 2 * length)).astype(
+        activation_dtype(quantizable)
+    )
+    actual = _graph(model, quantizable).run(scores=values)[0]
+    # Transformer-XL's reference shift: flatten away the first T values, then
+    # recover rows of width 2*T-1 and retain the first T keys in each row.
+    expected = values.reshape(1, 2, 2 * length, length)[:, :, 1:].reshape(
+        1, 2, length, 2 * length - 1
+    )[..., :length]
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("quantizable", [True, False])
