@@ -51,7 +51,7 @@ nlohmann::json try_parse_tool_calls(
 // tool calls, then emits text chunks or parsed call lists.
 class ToolCallStreamParser {
     public:
-        // Ordinary streamed text with its target/draft attribution.
+        // Ordinary text with a flag indicating whether it came from the draft model.
         struct Content {
             std::string text;
             bool from_draft = false;

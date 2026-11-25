@@ -83,7 +83,7 @@ struct TranscriptionOptions {
 };
 
 // Runs audio encoding and autoregressive transcription or translation.
-// Shares package assets and owns a workspace whose mutex serializes requests.
+// Shares package assets and owns its working state. Runs one request at a time.
 class WhisperModel {
     public:
         // Decoded transcript with the selected language, task and speech-confidence values.

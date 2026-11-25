@@ -47,7 +47,7 @@ struct LanguageRuntime {
 
 namespace {
 
-// Keeps both language runtimes alive and exclusively available to this caller.
+// Keeps the target and any attached draft alive and locks them for this call.
 class ModelLock {
   public:
     explicit ModelLock(std::shared_ptr<LanguageRuntime> target);

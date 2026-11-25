@@ -41,7 +41,7 @@
 namespace simaai {
 namespace llima {
 
-// Measures elapsed time from start(); stop() returns seconds unless a unit is supplied.
+// Measures elapsed time from start(). stop() returns seconds unless a unit is supplied.
 class ChronoTimer {
     public:
         ChronoTimer(bool start_now = false) {

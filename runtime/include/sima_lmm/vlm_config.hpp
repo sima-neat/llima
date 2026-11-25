@@ -383,7 +383,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
 )
 
 
-// Vision program names; accepts one name or an array in the package JSON.
+// Vision program names. Accepts one name or an array in the package JSON.
 struct VisionModelNames : std::vector<std::string> {
     using std::vector<std::string>::vector;
 };

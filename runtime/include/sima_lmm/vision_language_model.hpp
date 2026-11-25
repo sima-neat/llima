@@ -41,7 +41,7 @@ private:
 };
 
 // Limits, callbacks, cancellation and optional images for one generation request.
-// Image spans borrow caller-owned storage for the duration of the call.
+// The caller must keep the supplied image storage alive until the call returns.
 struct GenerationOptions {
     std::optional<uint16_t> max_new_tokens; // Output budget, excluding the input tokens.
     std::optional<std::set<uint32_t>> stop_token_ids;
@@ -56,7 +56,7 @@ struct GenerationOptions {
 };
 
 // Public entry point for text and image/text generation, scoring and image encoding.
-// Coordinates the language runtime and optional vision encoder, serializing inference calls.
+// Coordinates the language runtime and optional vision encoder. Runs one inference call at a time.
 class VisionLanguageModel {
     public:
         // Existing disk-loading overload; preserves source compatibility.
@@ -113,7 +113,7 @@ class VisionLanguageModel {
         // Internal ZMQ benchmarking also uses config() and benchmark_chat().
         friend class ZMQServer;
 
-        // Inputs and collected prompt metadata for one internal cold-start chat measurement.
+        // Settings and prompt details for an internal benchmark that starts without cached tokens.
         struct ChatBenchmark {
             uint16_t max_context;
             GenerationPerformanceResult* performance;

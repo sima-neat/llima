@@ -30,9 +30,8 @@ uint32_t find_and_replace_all(
 
 
 namespace {
-// The legacy VlmHelper constructor gets the devkit folder itself, while the
-// provider API names files from the model root ("devkit/tokenizer.json").
-// Drop that prefix and read from the given folder, whatever it is called.
+// Adapts paths such as devkit/tokenizer.json to a supplied devkit folder.
+// Removes the devkit/ prefix before reading through DiskFileProvider.
 class DevkitDirProvider final : public FileProvider {
     public:
         explicit DevkitDirProvider(std::filesystem::path devkit_dir)

@@ -43,7 +43,7 @@ struct CacheLayerBuffers {
     }
 };
 
-// Visible KV range and query count used to construct or update attention-cache slices.
+// Identifies which cached KV rows are visible and how many query tokens use them.
 struct CacheWindow {
     uint32_t begin;             // First visible KV row in the backing buffer.
     uint32_t length;            // Compiled cache ELF's aligned context width.

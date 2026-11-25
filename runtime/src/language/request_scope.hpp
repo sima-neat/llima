@@ -5,7 +5,7 @@
 namespace simaai::llima {
 
 // Owns cancellation, streaming, and cleanup for one language operation.
-// The caller keeps the target and optional draft alive and exclusively available.
+// The caller must keep the target and optional draft alive and prevent concurrent use.
 class RequestScope {
   public:
     RequestScope(LanguageModel& target, LanguageModel* draft = nullptr,

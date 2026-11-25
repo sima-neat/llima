@@ -45,7 +45,7 @@ class RequestScope;
 using LanguageModelMapKey = std::tuple<uint16_t, uint8_t, uint16_t>;
 using LanguageModelMap = std::map<LanguageModelMapKey, MLAModelWithBuffer>;
 
-// Options for raw-token execution; the token limit includes the input prompt.
+// Options for raw-token execution. The token limit includes the input prompt.
 struct TokenRunOptions {
     std::optional<uint16_t> max_total_tokens;
     std::optional<std::set<uint32_t>> stop_token_ids;
@@ -55,8 +55,8 @@ struct TokenRunOptions {
     GenerationPerformanceResult* performance = nullptr;
 };
 
-// Executes token prefill, decoding and scoring using shared assets.
-// Owns one sequence cache and reusable workspace; callers serialize access.
+// Runs token prefill, decoding and scoring with shared model data.
+// Owns one cache and working buffers. The caller must prevent simultaneous requests.
 class LanguageModel {
     public:
         // Reads the model files through file_provider (nullptr = from disk).
@@ -288,7 +288,7 @@ class LanguageModel {
             std::optional<ChronoTimer> timer_ttft,
             GenerationPerformanceResult* performance_result
         );
-        // Describes the layers and byte layout of one recurrent or convolution state family.
+        // Describes which recurrent or convolution layers to save and their state layout in memory.
         struct CheckpointLayout {
             // Hidden-layer indices belonging to this stateful family.
             std::vector<uint8_t> layer_indices;

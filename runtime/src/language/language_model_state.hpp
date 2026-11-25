@@ -125,7 +125,7 @@ struct LanguageModel::UpdateInferenceInputsResult {
     uint32_t bonus_token;
 };
 
-// Borrowed host view of one LM-head output shard and its vocabulary range.
+// References one LM-head output buffer and records which vocabulary entries it covers.
 struct LanguageModel::LMHeadLogitView {
     MLABuffer* buffer;
     const uint8_t* data;
@@ -134,7 +134,7 @@ struct LanguageModel::LMHeadLogitView {
     uint32_t width;
 };
 
-// Reusable router/expert buffer references and host staging for one compiled token width.
+// Reuses router/expert buffer references and CPU working arrays for one compiled token count.
 struct LanguageModel::MoeHostCache {
     uint16_t num_tokens = 0;             // the moe_nt this entry serves
     MLABuffer* values = nullptr;         // n{nt}_router_values
@@ -160,8 +160,8 @@ struct LanguageModel::DFlashScratch {
     std::vector<Eigen::bfloat16> attention_mask;
 };
 
-// Working buffers, compiled-program bindings and scratch owned by one language runner.
-// Reused across requests; retained sequence history is owned by SequenceCache.
+// Owns reusable working buffers, program bindings and temporary data for one language model.
+// SequenceCache stores the sequence history kept between requests.
 struct LanguageWorkspace {
     void clear_cached_scratch() {
         dflash_resolved_prefix = 0;
@@ -213,7 +213,7 @@ struct LanguageWorkspace {
     size_t eagle3_stable_kv = 0;
 };
 
-// Stop-token IDs and the total token ceiling, including the prompt, for execution.
+// Stop-token IDs and total token limit, including the prompt.
 struct TokenLimits {
     std::set<uint32_t> stop_token_ids;
     uint16_t max_num_tokens;
@@ -224,10 +224,10 @@ struct TokenLimits {
 using InterruptCounter = std::atomic<uint64_t>;
 static_assert(InterruptCounter::is_always_lock_free);
 
-// Limits, caller cancellation and interrupt baselines for one active operation.
-// The target and optional draft refer to this same state for the request lifetime.
+// Holds limits, cancellation and interrupt-counter snapshots for one operation.
+// The target and optional draft use this state until the request ends.
 struct RequestState {
-    // Borrowed interrupt counter plus its value at request start; detects later interrupts.
+    // References a counter and remembers its starting value to detect new interrupts.
     struct Interrupt {
         explicit Interrupt(const InterruptCounter& counter)
             : counter(counter), initial(counter.load(std::memory_order_relaxed)) {}
@@ -248,8 +248,8 @@ struct RequestState {
     }
 };
 
-// Per-model request defaults, streamer reference, interrupt counter and active-request pointer.
-// The active state is borrowed from RequestScope for the duration of execution.
+// Stores default limits and links a model to its streamer and current request.
+// RequestScope owns the request state. The interrupt counter belongs to this model.
 struct RequestControl {
     RequestControl(std::set<uint32_t> stops, uint16_t limit, TextStreamer& streamer)
         : defaults{std::move(stops), limit}, text_streamer(streamer) {}

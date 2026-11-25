@@ -33,7 +33,7 @@ namespace simaai {
 namespace llima {
 
 // Per-model preprocessing, decoder buffers, tokenizer, streamer and program bindings.
-// Its mutex serializes transcription requests.
+// Its mutex allows only one transcription request at a time.
 struct WhisperWorkspace {
     WhisperWorkspace(std::shared_ptr<FileProvider> files, const std::filesystem::path& identity)
         : preprocessor(std::move(files), identity), is_running(false) {}

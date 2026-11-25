@@ -22,7 +22,7 @@ struct StreamCallbacks {
 
 using PreservedTokens = std::vector<std::pair<uint32_t, std::string>>;
 
-// Continuation log-probability and whether every scored token matches greedy decoding.
+// Log-probability of the continuation and whether greedy decoding would produce every scored token.
 struct LogLikelihoodResult {
     double logprob;
     bool is_greedy;
